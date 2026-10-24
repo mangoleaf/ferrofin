@@ -21,7 +21,7 @@
 
 use ferrofin_util::string_extensions::{lower_invariant, upper_invariant};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -155,19 +155,10 @@ impl FerrofinPeopleRepository {
         name: &str,
         fallback: &str,
     ) -> Result<String, ServiceError> {
-        if self.identity.is_some() {
-            let stored: Option<String> = sqlx::query_scalar(
-                r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "CleanName" = ?2
-                   ORDER BY "SortName", "Id" LIMIT 1"#,
-            )
-            .bind(PERSON_TYPE_NAME)
-            .bind(crate::text_util::get_clean_value(name))
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(db_err)?;
-            if let Some(stored) = stored {
-                return Ok(stored);
-            }
+        if self.identity.is_some()
+            && let Some(stored) = person_item_by_clean_name(&mut **tx, name).await?
+        {
+            return Ok(stored);
         }
         Ok(self
             .resolved_person_item_id(tx, name)
@@ -528,23 +519,164 @@ type PersonRepairRow = (
     String,
 );
 
-/// Dedupes credited people case-insensitively by `(name, person_type)`, matching
-/// the C# `DistinctBy(name.ToLower + "-" + type)` and preserving first-seen order
-/// (which becomes the credit `ListOrder`).
+/// Dedupes credits case-insensitively by `(name, person_type, role)`, matching
+/// v12.2 `UpdatePeople`'s `DistinctBy((LoweredName, PersonType, LoweredRole))`
+/// over trimmed names and roles (jellyfin/jellyfin#17466: one person can hold
+/// several credits of one type, a Writer for the Novel and the Screenplay).
+/// Keeps first-seen order and casing; the order becomes the credit `ListOrder`.
 pub(crate) fn dedupe_people(people: &[PeopleEntity]) -> Vec<&PeopleEntity> {
-    let mut seen = std::collections::HashSet::new();
-    let mut deduped: Vec<&PeopleEntity> = Vec::new();
-    for person in people {
-        let key = format!(
-            "{}-{}",
-            person.name.trim().to_lowercase(),
-            person.person_type.clone().unwrap_or_default()
-        );
-        if seen.insert(key) {
-            deduped.push(person);
-        }
+    let mut seen = HashSet::new();
+    people
+        .iter()
+        .filter(|person| seen.insert((person_key(person), credit_role(person).to_lowercase())))
+        .collect()
+}
+
+/// A credit's person: `(lower-cased trimmed name, person type)`, the key of
+/// one `Peoples` row.
+fn person_key(person: &PeopleEntity) -> (String, String) {
+    (
+        person.name.trim().to_lowercase(),
+        person.person_type.clone().unwrap_or_default(),
+    )
+}
+
+/// A credit's role as `UpdatePeople` stores it: trimmed, `""` when missing.
+fn credit_role(person: &PeopleEntity) -> &str {
+    person.role.as_deref().map(str::trim).unwrap_or_default()
+}
+
+/// A credit's identity: its person key (see `person_key`) and lower-cased
+/// role, as [`dedupe_people`] keys a credit.
+type CreditKey = ((String, String), String);
+
+/// One credit row an item already maps.
+struct StoredCredit {
+    /// The credit's [`CreditKey`].
+    key: CreditKey,
+    /// The role in its stored casing.
+    role: String,
+    /// The `Peoples` row the credit maps to.
+    people_id: String,
+    list_order: Option<i64>,
+    sort_order: Option<i64>,
+}
+
+/// v12.2 `UpdatePeople`'s `mappingsAreUnchanged`: as many stored credits as
+/// incoming ones, and every stored credit matches an incoming one by
+/// (lower name, person type, lower role) with the same `ListOrder` (its
+/// position in `credits`) and the same `SortOrder`.
+fn credits_unchanged(stored: &[StoredCredit], credits: &[&PeopleEntity]) -> bool {
+    if stored.len() != credits.len() {
+        return false;
     }
-    deduped
+    let incoming: HashMap<CreditKey, (i64, Option<i64>)> = credits
+        .iter()
+        .enumerate()
+        .map(|(list_order, person)| {
+            (
+                (person_key(person), credit_role(person).to_lowercase()),
+                (
+                    i64::try_from(list_order).unwrap_or(i64::MAX),
+                    person.sort_order,
+                ),
+            )
+        })
+        .collect();
+    stored.iter().all(|credit| {
+        incoming
+            .get(&credit.key)
+            .is_some_and(|&(list_order, sort_order)| {
+                credit.list_order == Some(list_order) && credit.sort_order == sort_order
+            })
+    })
+}
+
+/// The `Person` item already stored under `name`'s clean name, the match the
+/// library resolver uses.
+async fn person_item_by_clean_name<'e>(
+    executor: impl sqlx::Executor<'e, Database = Sqlite>,
+    name: &str,
+) -> Result<Option<String>, ServiceError> {
+    sqlx::query_scalar(
+        r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1 AND "CleanName" = ?2
+           ORDER BY "SortName", "Id" LIMIT 1"#,
+    )
+    .bind(PERSON_TYPE_NAME)
+    .bind(crate::text_util::get_clean_value(name))
+    .fetch_optional(executor)
+    .await
+    .map_err(db_err)
+}
+
+/// A person item's `Overview`: `None` when the item does not exist,
+/// `Some(None)` when it has no biography.
+async fn person_overview<'e>(
+    executor: impl sqlx::Executor<'e, Database = Sqlite>,
+    item_id: &str,
+) -> Result<Option<Option<String>>, ServiceError> {
+    sqlx::query_scalar(r#"SELECT "Overview" FROM "BaseItems" WHERE "Id" = ?1"#)
+        .bind(item_id)
+        .fetch_optional(executor)
+        .await
+        .map_err(db_err)
+}
+
+/// What `update_people` hands back for one credited person: the item, whether
+/// it still lacks a biography (new people and those scanned before
+/// biographies existed get one fetched), and the credit's artwork and
+/// provider id.
+fn written_person(
+    item_id: &str,
+    person: &PeopleEntity,
+    overview: Option<&str>,
+) -> Option<WrittenPerson> {
+    Some(WrittenPerson {
+        id: Uuid::parse_str(item_id).ok()?,
+        needs_details: overview.is_none_or(str::is_empty),
+        image_url: person
+            .primary_image_url
+            .as_deref()
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned),
+        provider_id: person.provider_id.filter(|id| *id > 0),
+    })
+}
+
+/// Inserts `item_id`'s credit rows, one per credit, in credit order, each
+/// `credits[i]` mapped to the `Peoples` row `people_ids[i]`.
+async fn insert_credit_rows(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    item_id: Uuid,
+    people_ids: &[String],
+    credits: &[&PeopleEntity],
+    stored_roles: &HashMap<CreditKey, String>,
+) -> Result<(), ServiceError> {
+    for (list_order, (people_id, person)) in people_ids.iter().zip(credits).enumerate() {
+        // `person.Role = person.Role?.Trim() ?? string.Empty`
+        // (v12.2 `PeopleRepository.cs:117`), in its stored casing.
+        let role = credit_role(person);
+        let role = stored_roles
+            .get(&(person_key(person), role.to_lowercase()))
+            .map_or(role, String::as_str);
+        sqlx::query(
+            r#"INSERT INTO "PeopleBaseItemMap"
+               ("ItemId", "PeopleId", "Role", "ListOrder", "SortOrder")
+               VALUES (?1, ?2, ?3, ?4, ?5)"#,
+        )
+        .bind(guid_to_db(item_id))
+        .bind(people_id)
+        .bind(role)
+        .bind(i64::try_from(list_order).unwrap_or(i64::MAX))
+        // `SortOrder = credit.Person.SortOrder` (`PeopleRepository.cs:
+        // 146,218,231`): the credit's own order (TMDB billing, NFO
+        // `<sortorder>`), NULL when it has none — not the list position.
+        .bind(person.sort_order)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    }
+    Ok(())
 }
 
 /// Whether a person-type filter value is valid (C# `IsValidPersonType` =
@@ -644,7 +776,8 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery, 
         qb.push(format!(
             r#" AND ferrofin_upper_invariant({alias}."Name") LIKE "#
         ));
-        qb.push_bind(format!("%{}%", upper_invariant(contains)));
+        qb.push_bind(format!("%{}%", like_literal(&upper_invariant(contains))));
+        qb.push(r" ESCAPE '\'");
     }
     if let Some(prefix) = filter
         .name_starts_with
@@ -654,7 +787,8 @@ fn push_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalPeopleQuery, 
         qb.push(format!(
             r#" AND ferrofin_upper_invariant({alias}."Name") LIKE "#
         ));
-        qb.push_bind(format!("{}%", upper_invariant(prefix)));
+        qb.push_bind(format!("{}%", like_literal(&upper_invariant(prefix))));
+        qb.push(r" ESCAPE '\'");
     }
     if let Some(less) = filter
         .name_less_than
@@ -911,6 +1045,157 @@ fn by_name_page_query(filter: &InternalPeopleQuery) -> QueryBuilder<Sqlite> {
 }
 
 impl FerrofinPeopleRepository {
+    /// `SelectMany(MapCredits)` (v12.2 `PeopleRepository.cs:84,360-368`): a
+    /// page of `item_id`'s people, each expanded into one entry per credit it
+    /// holds on the item, in `ListOrder` — a Writer of the Novel and the
+    /// Screenplay is two entries. A person with no credit row stays as is.
+    ///
+    /// The role is read back VERBATIM: `UpdatePeople` stores a missing role as
+    /// `string.Empty` and `Map` reads `Role = mapping?.Role` with no
+    /// coalescing, so a roleless credit comes back as `""` and is serialized
+    /// as `"Role": ""`. Folding `''` to NULL would drop the field off the wire.
+    async fn credits_of(
+        &self,
+        item_id: Uuid,
+        people: Vec<PeopleEntity>,
+    ) -> Result<Vec<PeopleEntity>, ServiceError> {
+        /// One credit row: its role and sort order.
+        type Credit = (Option<String>, Option<i64>);
+        let credits: Vec<(String, Option<String>, Option<i64>)> = sqlx::query_as(
+            r#"SELECT "PeopleId", "Role", "SortOrder" FROM "PeopleBaseItemMap"
+               WHERE "ItemId" = ?1 ORDER BY "ListOrder""#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        let mut by_person: HashMap<String, Vec<Credit>> = HashMap::new();
+        for (people_id, role, sort_order) in credits {
+            by_person
+                .entry(people_id)
+                .or_default()
+                .push((role, sort_order));
+        }
+        Ok(people
+            .into_iter()
+            .flat_map(|person| match by_person.remove(&person.id) {
+                Some(credits) => credits
+                    .into_iter()
+                    .map(|(role, sort_order)| PeopleEntity {
+                        role,
+                        sort_order,
+                        ..person.clone()
+                    })
+                    .collect(),
+                None => vec![person],
+            })
+            .collect())
+    }
+
+    /// The credits `item_id` already maps, keyed like the incoming ones
+    /// (person key and lower-cased role).
+    ///
+    /// Two readers: the unchanged check ([`credits_unchanged`]), and the write
+    /// path, where a credit whose role differs from its stored one only in
+    /// case keeps the stored casing, as upstream keeps the existing mapping
+    /// (`UpdatePeople_RoleCaseChanged_KeepsExistingMapping`).
+    async fn stored_credits(&self, item_id: Uuid) -> Result<Vec<StoredCredit>, ServiceError> {
+        #[allow(clippy::type_complexity)] // one row of the read
+        let stored: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<i64>,
+        )> = sqlx::query_as(
+            r#"SELECT p."Name", p."PersonType", m."Role", m."PeopleId", m."ListOrder", m."SortOrder"
+               FROM "PeopleBaseItemMap" m
+               JOIN "Peoples" p ON p."Id" = m."PeopleId" WHERE m."ItemId" = ?1"#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(stored
+            .into_iter()
+            .map(
+                |(name, person_type, role, people_id, list_order, sort_order)| {
+                    let role = role.unwrap_or_default();
+                    StoredCredit {
+                        key: (
+                            (name.trim().to_lowercase(), person_type.unwrap_or_default()),
+                            role.to_lowercase(),
+                        ),
+                        role,
+                        people_id,
+                        list_order,
+                        sort_order,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// The people an unchanged credit list names, in credit order, read
+    /// without a write: each `Person` item the write path would resolve
+    /// ([`person_item_id_for_write`](Self::person_item_id_for_write)) with its
+    /// biography state. `None` when one of them has no item yet, which only
+    /// the write path creates.
+    async fn unchanged_people(
+        &self,
+        credits: &[&PeopleEntity],
+        stored: &[StoredCredit],
+    ) -> Result<Option<Vec<WrittenPerson>>, ServiceError> {
+        // The unwired seam keys a person's item on its `Peoples` row.
+        let people_ids: HashMap<&(String, String), &str> = stored
+            .iter()
+            .map(|credit| (&credit.key.0, credit.people_id.as_str()))
+            .collect();
+        let mut written = Vec::with_capacity(credits.len());
+        let mut seen = HashSet::new();
+        for person in credits {
+            let key = person_key(person);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let item_id = if self.identity.is_some() {
+                person_item_by_clean_name(self.db.pool(), person.name.trim()).await?
+            } else {
+                people_ids.get(&key).map(|id| (*id).to_owned())
+            };
+            let Some(item_id) = item_id else {
+                return Ok(None);
+            };
+            let Some(overview) = person_overview(self.db.pool(), &item_id).await? else {
+                return Ok(None);
+            };
+            written.extend(written_person(&item_id, person, overview.as_deref()));
+        }
+        Ok(Some(written))
+    }
+
+    /// `Directory.CreateDirectory(path)` for each credited person of a written
+    /// update: C# creates the person's metadata folder as part of writing the
+    /// row (`SavePeopleMetadataAsync`), and a real 10.11.8 install has
+    /// `/config/metadata/People/A/Alice Parity` on disk. Made after the
+    /// commit, the ordering `by_name_store::ensure` uses, so a filesystem
+    /// failure can never be the reason a person lookup 404s. Best-effort.
+    async fn create_person_directories(&self, credits: &[&PeopleEntity]) {
+        let mut seen = HashSet::new();
+        for person in credits {
+            if !seen.insert(person_key(person)) {
+                continue;
+            }
+            let Some(path) = self.person_metadata_path(person.name.trim()) else {
+                continue;
+            };
+            if let Err(e) = tokio::fs::create_dir_all(&path).await {
+                tracing::debug!(%path, error = %e, "could not create person metadata directory");
+            }
+        }
+    }
+
     /// Fallback total when the by-name page is empty (past the last row).
     ///
     /// Uses the same two shapes as the page query, for the same reason: an
@@ -1035,28 +1320,11 @@ impl PeopleRepository for FerrofinPeopleRepository {
             return self.get_people_by_name(filter).await;
         }
         let mut rows = {
-            // Item-scoped credits carry the credited role (a character name)
-            // from the map row, like the C# `GetPeople` projection — without it
-            // every cast entry renders roleless on the detail page.
-            //
-            // The role is read back VERBATIM: `PeopleRepository.UpdatePeople`
-            // normalizes a null role to `string.Empty` on write
-            // (v10.11.8 `PeopleRepository.cs:77-80`) and `Map` reads
-            // `Role = mapping?.Role` with no coalescing
-            // (v10.11.8 `PeopleRepository.cs:157`), so a roleless credit comes
-            // back as `""` and is serialized as `"Role": ""`. Folding `''` to
-            // NULL here would drop the field off the wire entirely.
-            //
-            // The item id is a canonically formatted GUID (hyphenated hex), so
-            // inlining it is injection-safe.
-            let cols = format!(
-                r#"p."Id", p."Name", p."PersonType",
-                   (SELECT mr."Role" FROM "PeopleBaseItemMap" mr
-                    WHERE mr."PeopleId" = p."Id" AND mr."ItemId" = '{}'
-                    ORDER BY mr."ListOrder" LIMIT 1) AS "Role""#,
-                guid_to_db(filter.item_id)
-            );
-            let mut qb = base_query(&cols, filter);
+            // One row per person here; [`Self::credits_of`] then expands each
+            // into its credits on the item, carrying the credited role (a
+            // character name) and sort order from the map rows.
+            let cols = r#"p."Id", p."Name", p."PersonType", NULL AS "Role""#;
+            let mut qb = base_query(cols, filter);
             push_predicates(&mut qb, filter, "p");
             qb.push(
                 r#" ORDER BY (SELECT MIN(mo."ListOrder") FROM "PeopleBaseItemMap" mo
@@ -1080,6 +1348,7 @@ impl PeopleRepository for FerrofinPeopleRepository {
             let limit = usize::try_from(filter.limit).unwrap_or(usize::MAX);
             rows.truncate(limit);
         }
+        let rows = self.credits_of(filter.item_id, rows).await?;
         Ok(QueryResult::new(Some(start), Some(total), rows))
     }
 
@@ -1103,8 +1372,8 @@ impl PeopleRepository for FerrofinPeopleRepository {
         }
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let mut qb = QueryBuilder::<Sqlite>::new(
-                // The role is read back VERBATIM, like the single-item
-                // projection above: `UpdatePeople` normalizes a null role to
+                // The role is read back VERBATIM, as in `credits_of`:
+                // `UpdatePeople` normalizes a null role to
                 // `string.Empty` on write (v10.11.8 `PeopleRepository.cs:77-80`)
                 // and `Map` reads `Role = mapping?.Role` with no coalescing
                 // (`:157`), so a roleless credit is serialized as `"Role": ""`.
@@ -1155,10 +1424,23 @@ impl PeopleRepository for FerrofinPeopleRepository {
         people: &[PeopleEntity],
     ) -> Result<Vec<WrittenPerson>, ServiceError> {
         let deduped = dedupe_people(people);
-        // The metadata directories of the rows this call creates, made AFTER
-        // the commit — the same ordering `by_name_store::ensure` uses, so a
-        // filesystem failure can never be the reason a person lookup 404s.
-        let mut created_paths: Vec<Option<String>> = Vec::new();
+        // Read before the write transaction: its first statement must be the write.
+        let stored = self.stored_credits(item_id).await?;
+        // v12.2 `UpdatePeople`: "Most library scans refresh unchanged local
+        // metadata. Avoid opening a write transaction when the item's people
+        // mappings, order and roles are unchanged." What upstream's caller
+        // still does then (`SavePeopleMetadataAsync`) is answered by reads;
+        // like it, nothing is created for a person whose item already exists,
+        // folder included.
+        if credits_unchanged(&stored, &deduped)
+            && let Some(written) = self.unchanged_people(&deduped, &stored).await?
+        {
+            return Ok(written);
+        }
+        let stored_roles: HashMap<CreditKey, String> = stored
+            .into_iter()
+            .map(|credit| (credit.key, credit.role))
+            .collect();
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         // Clear this item's credit rows first. Doing a write as the transaction's
@@ -1182,7 +1464,15 @@ impl PeopleRepository for FerrofinPeopleRepository {
         let person_type_name = stored_type_name(BaseItemKind::Person);
         let mut people_ids: Vec<String> = Vec::with_capacity(deduped.len());
         let mut written: Vec<WrittenPerson> = Vec::with_capacity(deduped.len());
+        // One `Peoples` row per (name, type), whatever number of credits
+        // (roles) it holds on this item.
+        let mut person_ids: HashMap<(String, String), String> = HashMap::new();
         for person in &deduped {
+            let key = person_key(person);
+            if let Some(id) = person_ids.get(&key) {
+                people_ids.push(id.clone());
+                continue;
+            }
             let name = person.name.trim();
             // `COLLATE NOCASE`, not `LOWER(…) = LOWER(…)`: the latter is an
             // expression whose meaning depends on whether SQLite was built with
@@ -1230,65 +1520,17 @@ impl PeopleRepository for FerrofinPeopleRepository {
             if let Some(type_name) = person_type_name {
                 self.insert_person_item(&mut tx, type_name, name, &item_id)
                     .await?;
-                created_paths.push(self.person_metadata_path(name));
             }
 
-            // Enrich (fetch a biography for) any person whose item has no overview
-            // yet — new people and those scanned before biographies existed.
-            let overview: Option<String> =
-                sqlx::query_scalar(r#"SELECT "Overview" FROM "BaseItems" WHERE "Id" = ?1"#)
-                    .bind(&item_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(db_err)?
-                    .flatten();
-            let needs_details = overview.is_none_or(|o| o.is_empty());
-
-            if let Ok(pid) = Uuid::parse_str(&item_id) {
-                written.push(WrittenPerson {
-                    id: pid,
-                    needs_details,
-                    image_url: person
-                        .primary_image_url
-                        .as_deref()
-                        .filter(|u| !u.is_empty())
-                        .map(str::to_owned),
-                    provider_id: person.provider_id.filter(|id| *id > 0),
-                });
-            }
+            let overview = person_overview(&mut *tx, &item_id).await?.flatten();
+            written.extend(written_person(&item_id, person, overview.as_deref()));
+            person_ids.insert(key, id.clone());
             people_ids.push(id);
         }
 
-        // Rebuild this item's credit rows, preserving each credited role.
-        for (list_order, (people_id, person)) in people_ids.iter().zip(deduped.iter()).enumerate() {
-            sqlx::query(
-                r#"INSERT INTO "PeopleBaseItemMap"
-                   ("ItemId", "PeopleId", "Role", "ListOrder", "SortOrder")
-                   VALUES (?1, ?2, ?3, ?4, ?5)"#,
-            )
-            .bind(guid_to_db(item_id))
-            .bind(people_id)
-            .bind(person.role.clone().unwrap_or_default())
-            .bind(i64::try_from(list_order).unwrap_or(i64::MAX))
-            // `SortOrder = credit.Person.SortOrder` (`PeopleRepository.cs:
-            // 146,218,231`): the credit's own order (TMDB billing, NFO
-            // `<sortorder>`), NULL when it has none — not the list position.
-            .bind(person.sort_order)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        }
-
+        insert_credit_rows(&mut tx, item_id, &people_ids, &deduped, &stored_roles).await?;
         tx.commit().await.map_err(db_err)?;
-        // `Directory.CreateDirectory(path)` — C# creates the person's metadata
-        // folder as part of writing the row (`SavePeopleMetadataAsync`), and a
-        // real 10.11.8 install has `/config/metadata/People/A/Alice Parity` on
-        // disk. Best-effort: the row is already committed and correct.
-        for path in created_paths.into_iter().flatten() {
-            if let Err(e) = tokio::fs::create_dir_all(&path).await {
-                tracing::debug!(%path, error = %e, "could not create person metadata directory");
-            }
-        }
+        self.create_person_directories(&deduped).await;
         Ok(written)
     }
 
@@ -1403,6 +1645,25 @@ pub(crate) async fn seed_people_row(db: &Database, id: uuid::Uuid, name: &str, p
         .execute(db.writer())
         .await
         .expect("seed people row");
+}
+
+/// Test-only: how many `Peoples` rows there are, so the raw SQL stays inside
+/// the repository boundary.
+#[cfg(test)]
+pub(crate) async fn people_row_count(db: &Database) -> i64 {
+    sqlx::query_scalar(r#"SELECT COUNT(*) FROM "Peoples""#)
+        .fetch_one(db.pool())
+        .await
+        .expect("count people rows")
+}
+
+/// `term` as the body of a `LIKE … ESCAPE '\'` pattern that matches it
+/// literally: `\`, `%` and `_` are escaped, as EF Core's literal
+/// `Contains`/`StartsWith` translations treat them (`PeopleRepository`).
+fn like_literal(term: &str) -> String {
+    term.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 #[cfg(test)]
@@ -1597,6 +1858,58 @@ mod tests {
         let people = batched.get(&movie).expect("item present");
         assert_eq!(role_of(people, "Bob Parity"), Some("Lead".to_owned()));
         assert_eq!(role_of(people, "Carol Ferrofin"), Some(String::new()));
+    }
+
+    /// Upstream filters with `Name.ToUpper().Contains(x)` / `StartsWith(x)`
+    /// (`PeopleRepository.ApplyQueryFilter`), literal matches: a `%`, `_` or
+    /// `\` in the term matches only itself, never as a `LIKE` wildcard.
+    #[tokio::test]
+    async fn people_name_filters_match_wildcard_characters_literally() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        let repo = FerrofinPeopleRepository::new(db);
+        repo.update_people(
+            movie,
+            &[
+                person("Ann_Lee", "Actor"),
+                person("AnnXLee", "Actor"),
+                person("100% Pure", "Actor"),
+                person("1000 Pure", "Actor"),
+                person(r"Back\Slash", "Actor"),
+            ],
+        )
+        .await
+        .unwrap();
+        let names = |query: InternalPeopleQuery| {
+            let repo = &repo;
+            async move {
+                let mut names: Vec<String> = repo
+                    .get_people(&query)
+                    .await
+                    .unwrap()
+                    .items
+                    .into_iter()
+                    .map(|p| p.name)
+                    .collect();
+                names.sort();
+                names
+            }
+        };
+        let contains = |term: &str| InternalPeopleQuery {
+            name_contains: Some(term.to_owned()),
+            ..Default::default()
+        };
+        let starts = |term: &str| InternalPeopleQuery {
+            name_starts_with: Some(term.to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(names(contains("n_l")).await, ["Ann_Lee"]);
+        assert_eq!(names(contains("%")).await, ["100% Pure"]);
+        assert_eq!(names(contains("_")).await, ["Ann_Lee"]);
+        assert_eq!(names(contains(r"k\s")).await, [r"Back\Slash"]);
+        assert_eq!(names(starts("100%")).await, ["100% Pure"]);
+        assert_eq!(names(starts("ann_")).await, ["Ann_Lee"]);
     }
 
     #[rstest::rstest]
@@ -1972,6 +2285,395 @@ mod tests {
         assert_eq!(result.items[0].name, "Alice");
         assert_eq!(result.items[1].name, "Bob");
         assert_eq!(result.items[2].name, "Carol");
+    }
+
+    /// v12.2 `GetPeople` for an item: one `PersonInfo` per credit
+    /// (`MapCredits`, in `ListOrder`), paged and counted by person.
+    #[tokio::test]
+    async fn get_people_for_item_returns_every_credit_of_a_person() {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db);
+        repo.update_people(
+            item,
+            &[
+                credit("Ann", "Writer", "Novel"),
+                credit("Bo", "Director", ""),
+                credit("Ann", "Writer", "Screenplay"),
+            ],
+        )
+        .await
+        .expect("update");
+
+        let query = InternalPeopleQuery {
+            item_id: item,
+            ..Default::default()
+        };
+        let result = repo.get_people(&query).await.expect("get");
+        assert_eq!(result.total_record_count, 2, "two people");
+        let credits: Vec<(&str, &str)> = result
+            .items
+            .iter()
+            .map(|p| (p.name.as_str(), p.role.as_deref().unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            credits,
+            [("Ann", "Novel"), ("Ann", "Screenplay"), ("Bo", "")]
+        );
+    }
+
+    fn credit(name: &str, person_type: &str, role: &str) -> PeopleEntity {
+        PeopleEntity {
+            role: Some(role.to_owned()),
+            ..person(name, person_type)
+        }
+    }
+
+    /// Runs `update_people` once per credit list on one item, then reads back
+    /// the item's credit rows in `ListOrder`, every `Peoples` id (after each
+    /// run) and how many people the last run reported written.
+    async fn update_people_runs(
+        runs: &[&[PeopleEntity]],
+    ) -> (
+        Vec<(String, String, String)>,
+        Vec<String>,
+        Vec<Vec<String>>,
+        usize,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        let mut ids_after_each = Vec::new();
+        let mut written = 0;
+        for people in runs {
+            written = repo
+                .update_people(item, people)
+                .await
+                .expect("update")
+                .len();
+            let mut ids: Vec<String> = sqlx::query_scalar(r#"SELECT "Id" FROM "Peoples""#)
+                .fetch_all(db.pool())
+                .await
+                .expect("people");
+            ids.sort();
+            ids_after_each.push(ids);
+        }
+        let maps: Vec<(String, String, String)> = sqlx::query_as(
+            r#"SELECT p."Name", p."PersonType", m."Role" FROM "PeopleBaseItemMap" m
+               JOIN "Peoples" p ON p."Id" = m."PeopleId"
+               WHERE m."ItemId" = ?1 ORDER BY m."ListOrder""#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .expect("maps");
+        let people = ids_after_each.last().cloned().unwrap_or_default();
+        (maps, people, ids_after_each, written)
+    }
+
+    fn row(name: &str, person_type: &str, role: &str) -> (String, String, String) {
+        (name.to_owned(), person_type.to_owned(), role.to_owned())
+    }
+
+    /// `UpdatePeople_SamePersonAndTypeWithDifferentRoles_KeepsEveryCredit`
+    /// (v12.2 `PeopleRepositoryUpdatePeopleTests`): a credit is
+    /// (name, type, role), one person row per (name, type).
+    #[tokio::test]
+    async fn update_people_keeps_every_role_of_one_person() {
+        let (maps, people, _, written) = update_people_runs(&[&[
+            credit("Person A", "Writer", "Novel"),
+            credit("Person A", "Writer", "Screenplay"),
+        ]])
+        .await;
+        assert_eq!(people.len(), 1);
+        assert_eq!(written, 1, "one person to enrich, whatever its credits");
+        assert_eq!(
+            maps,
+            [
+                row("Person A", "Writer", "Novel"),
+                row("Person A", "Writer", "Screenplay")
+            ]
+        );
+    }
+
+    /// `UpdatePeople_CreditsDifferingOnlyInCase_AreDeduped`.
+    #[tokio::test]
+    async fn update_people_dedupes_credits_differing_only_in_case() {
+        let (maps, people, _, _) = update_people_runs(&[&[
+            credit("Person A", "Actor", "Hero"),
+            credit("person a", "Actor", "hero"),
+        ]])
+        .await;
+        assert_eq!(people.len(), 1);
+        assert_eq!(maps, [row("Person A", "Actor", "Hero")]);
+    }
+
+    /// `UpdatePeople_SamePersonAsDifferentTypes_CreatesOnePersonPerType`.
+    #[tokio::test]
+    async fn update_people_creates_one_person_per_type() {
+        let (maps, people, _, _) = update_people_runs(&[&[
+            credit("Person A", "Actor", "Hero"),
+            credit("Person A", "Director", ""),
+        ]])
+        .await;
+        assert_eq!(people.len(), 2);
+        assert_eq!(maps.len(), 2);
+    }
+
+    /// `UpdatePeople_RepeatedUpdate_ReusesMappingsAndRefreshesOrder`,
+    /// `UpdatePeople_CreditRemoved_DropsOnlyThatMapping` and
+    /// `UpdatePeople_RoleCaseChanged_KeepsExistingMapping`.
+    #[tokio::test]
+    async fn update_people_rewrites_order_drops_removed_and_keeps_role_casing() {
+        let (maps, _, ids, _) = update_people_runs(&[
+            &[
+                credit("Person A", "Actor", "Hero"),
+                credit("Person B", "Actor", "Sidekick"),
+            ],
+            &[
+                credit("Person B", "Actor", "Sidekick"),
+                credit("Person A", "Actor", "Hero"),
+            ],
+        ])
+        .await;
+        assert_eq!(ids[0], ids[1], "the person rows are reused");
+        assert_eq!(
+            maps,
+            [
+                row("Person B", "Actor", "Sidekick"),
+                row("Person A", "Actor", "Hero")
+            ]
+        );
+
+        let (maps, _, _, _) = update_people_runs(&[
+            &[
+                credit("Person A", "Writer", "Novel"),
+                credit("Person A", "Writer", "Screenplay"),
+            ],
+            &[credit("Person A", "Writer", "Novel")],
+        ])
+        .await;
+        assert_eq!(maps, [row("Person A", "Writer", "Novel")]);
+
+        let (maps, _, _, _) = update_people_runs(&[
+            &[credit("Person A", "Actor", "Hero")],
+            &[credit("Person A", "Actor", "HERO")],
+        ])
+        .await;
+        assert_eq!(maps, [row("Person A", "Actor", "Hero")]);
+    }
+
+    /// A repository over a fresh database with one movie, whose person ids
+    /// follow Jellyfin's derivation when `identity` is set (as the composition
+    /// root wires it) and the `Peoples` row id otherwise (the unwired seam).
+    async fn people_lab(identity: bool) -> (ferrofin_db::Database, Uuid, FerrofinPeopleRepository) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        let repo = if identity {
+            repo.with_identity(
+                crate::item_type_lookup::IdDerivation::Jellyfin {
+                    program_data_path: Some("/data".to_owned()),
+                },
+                "/data/metadata/People".to_owned(),
+            )
+        } else {
+            repo
+        };
+        (db, item, repo)
+    }
+
+    /// Logs every write to the tables a credit update touches
+    /// (`PeopleBaseItemMap`, `Peoples`, `BaseItems`) into `people_writes`, as
+    /// `"{table} {op}"`.
+    async fn log_people_writes(db: &ferrofin_db::Database) {
+        sqlx::query(r#"CREATE TABLE "people_writes" ("Op" TEXT NOT NULL)"#)
+            .execute(db.writer())
+            .await
+            .expect("log table");
+        for trigger in [
+            r#"CREATE TRIGGER "log_map_insert" AFTER INSERT ON "PeopleBaseItemMap"
+               BEGIN INSERT INTO "people_writes" VALUES ('map INSERT'); END"#,
+            r#"CREATE TRIGGER "log_map_update" AFTER UPDATE ON "PeopleBaseItemMap"
+               BEGIN INSERT INTO "people_writes" VALUES ('map UPDATE'); END"#,
+            r#"CREATE TRIGGER "log_map_delete" AFTER DELETE ON "PeopleBaseItemMap"
+               BEGIN INSERT INTO "people_writes" VALUES ('map DELETE'); END"#,
+            r#"CREATE TRIGGER "log_peoples_insert" AFTER INSERT ON "Peoples"
+               BEGIN INSERT INTO "people_writes" VALUES ('Peoples INSERT'); END"#,
+            r#"CREATE TRIGGER "log_peoples_update" AFTER UPDATE ON "Peoples"
+               BEGIN INSERT INTO "people_writes" VALUES ('Peoples UPDATE'); END"#,
+            r#"CREATE TRIGGER "log_items_insert" AFTER INSERT ON "BaseItems"
+               BEGIN INSERT INTO "people_writes" VALUES ('BaseItems INSERT'); END"#,
+            r#"CREATE TRIGGER "log_items_update" AFTER UPDATE ON "BaseItems"
+               BEGIN INSERT INTO "people_writes" VALUES ('BaseItems UPDATE'); END"#,
+        ] {
+            sqlx::query(trigger)
+                .execute(db.writer())
+                .await
+                .expect("log trigger");
+        }
+    }
+
+    async fn people_writes(db: &ferrofin_db::Database) -> Vec<String> {
+        sqlx::query_scalar(r#"SELECT "Op" FROM "people_writes""#)
+            .fetch_all(db.pool())
+            .await
+            .expect("people writes")
+    }
+
+    /// `UnchangedCredits_DoNotWriteOrLookUpAllPeople` (v12.2
+    /// `PeopleUpdateQueryTests`, jellyfin/jellyfin#18004): credits that match
+    /// the stored ones (name and role compared case-insensitively, the same
+    /// order) leave the item's credit rows untouched, and the stored role keeps
+    /// its casing.
+    #[rstest::rstest]
+    #[case("Hero", false)]
+    #[case("HERO", false)]
+    #[case("Hero", true)]
+    #[case("HERO", true)]
+    #[tokio::test]
+    async fn unchanged_credits_do_not_rewrite_the_items_credits(
+        #[case] role: &str,
+        #[case] identity: bool,
+    ) {
+        let (db, item, repo) = people_lab(identity).await;
+        repo.update_people(item, &[credit("Actor", "Actor", "Hero")])
+            .await
+            .expect("first update");
+        log_people_writes(&db).await;
+
+        repo.update_people(item, &[credit("actor", "Actor", role)])
+            .await
+            .expect("second update");
+        assert_eq!(people_writes(&db).await, Vec::<String>::new());
+        let roles: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Role" FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1"#)
+                .bind(guid_to_db(item))
+                .fetch_all(db.pool())
+                .await
+                .expect("roles");
+        assert_eq!(roles, ["Hero"]);
+    }
+
+    /// `SortOrderChange_IsPersisted`: the credit's own order is part of what
+    /// "unchanged" compares.
+    #[tokio::test]
+    async fn a_sort_order_change_is_persisted() {
+        let (db, item, repo) = people_lab(true).await;
+        let ordered = |sort_order| PeopleEntity {
+            sort_order: Some(sort_order),
+            ..person("Actor", "Actor")
+        };
+        repo.update_people(item, &[ordered(1)])
+            .await
+            .expect("first");
+        repo.update_people(item, &[ordered(2)])
+            .await
+            .expect("second");
+        let sort_orders: Vec<Option<i32>> = sqlx::query_scalar(
+            r#"SELECT "SortOrder" FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1"#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .expect("sort orders");
+        assert_eq!(sort_orders, [Some(2)]);
+    }
+
+    /// An unchanged update still answers what a written one would: every
+    /// credited person, in credit order, with its enrichment inputs, so the
+    /// caller's biography and artwork fetch behaves as before. A credit list
+    /// that empties the item still clears it.
+    #[rstest::rstest]
+    #[case(false)]
+    #[case(true)]
+    #[tokio::test]
+    async fn an_unchanged_update_returns_the_people_a_write_would(#[case] identity: bool) {
+        let (db, item, repo) = people_lab(identity).await;
+        let credits = [
+            PeopleEntity {
+                primary_image_url: Some("https://img/a.jpg".to_owned()),
+                provider_id: Some(7),
+                ..credit("Person A", "Actor", "Hero")
+            },
+            credit("Person A", "Actor", "Villain"),
+            credit("Person B", "Director", ""),
+        ];
+        let project = |written: Vec<ferrofin_traits::persistence::WrittenPerson>| {
+            written
+                .into_iter()
+                .map(|w| (w.id, w.needs_details, w.image_url, w.provider_id))
+                .collect::<Vec<_>>()
+        };
+        let first = project(repo.update_people(item, &credits).await.expect("first"));
+        log_people_writes(&db).await;
+        let again = project(repo.update_people(item, &credits).await.expect("again"));
+        assert_eq!(people_writes(&db).await, Vec::<String>::new());
+        assert_eq!(again, first);
+        assert_eq!(first.len(), 2, "one per person, whatever its credits");
+
+        repo.update_people(item, &[]).await.expect("cleared");
+        assert_eq!(
+            people_writes(&db).await,
+            ["map DELETE", "map DELETE", "map DELETE"]
+        );
+    }
+
+    /// Unchanged credits whose person item has gone (a by-name cleanup, a
+    /// hand edit) take the write path, which recreates the item: only a write
+    /// creates one.
+    #[tokio::test]
+    async fn unchanged_credits_recreate_a_missing_person_item() {
+        let (db, item, repo) = people_lab(true).await;
+        let credits = [credit("Actor", "Actor", "Hero")];
+        let first = repo.update_people(item, &credits).await.expect("first");
+        let person = guid_to_db(first[0].id);
+        sqlx::query(r#"DELETE FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&person)
+            .execute(db.writer())
+            .await
+            .expect("drop the person item");
+
+        let again = repo.update_people(item, &credits).await.expect("again");
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].id, first[0].id);
+        let restored: Option<String> =
+            sqlx::query_scalar(r#"SELECT "Name" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&person)
+                .fetch_optional(db.pool())
+                .await
+                .expect("person item");
+        assert_eq!(restored.as_deref(), Some("Actor"));
+    }
+
+    /// `UpdatePeople` trims every credit's role and stores a missing one as
+    /// `""` (v12.2 `PeopleRepository.cs:114-118`).
+    #[rstest::rstest]
+    #[case(Some(" Himself "), "Himself")]
+    #[case(Some("   "), "")]
+    #[case(None, "")]
+    #[tokio::test]
+    async fn update_people_stores_the_role_trimmed(
+        #[case] role: Option<&str>,
+        #[case] stored: &str,
+    ) {
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let repo = FerrofinPeopleRepository::new(db.clone());
+        let mut credit = person("Narrator", "Actor");
+        credit.role = role.map(str::to_owned);
+        repo.update_people(item, &[credit]).await.expect("update");
+        let roles: Vec<String> =
+            sqlx::query_scalar(r#"SELECT "Role" FROM "PeopleBaseItemMap" WHERE "ItemId" = ?1"#)
+                .bind(guid_to_db(item))
+                .fetch_all(db.pool())
+                .await
+                .expect("roles");
+        assert_eq!(roles, [stored]);
     }
 
     #[tokio::test]

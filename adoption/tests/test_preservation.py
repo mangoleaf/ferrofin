@@ -17,15 +17,78 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from metadata import CheckError
-from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, UPGRADED_FROM_10, comparable, compare, expectation,
-                          normalize, run_matrix, seed_failures, seed_state, validate, validate_oracle,
-                          validate_seed_state, same_artwork, verify_database)
+from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, PAGE_SIZE, UPGRADED_FROM_10, all_items, comparable,
+                          compare, expectation, normalize, run_matrix, seed_failures, seed_state, validate,
+                          validate_oracle, validate_seed_state, same_artwork, verify_database)
 from synthetic import VERSIONS, FRESH_INSTALL
 import synthetic_fixture
 from synthetic_fixture import USERS, drop_dangling_chain, seed_database, wait_for_live_members
 from watch_history import orphaned_items
 from unchanged_scan import TABLES, audit, assert_unchanged, check
 from test_user_accounts import fixture as account_fixture
+
+
+class AllItemsTest(unittest.TestCase):
+    """The snapshot reads every item of a library, not the first PAGE_SIZE."""
+
+    class Server:
+        """GET /Items over `count` items, honouring startIndex and limit as Jellyfin does."""
+
+        def __init__(self, count, total=None):
+            self.rows = [{"Id": f"{index:032x}"} for index in range(count)]
+            self.total = len(self.rows) if total is None else total
+            self.requests = []
+
+        def get(self, path, **query):
+            self.requests.append(query)
+            start, limit = query["startIndex"], query["limit"]
+            return {"Items": self.rows[start:start + limit], "TotalRecordCount": self.total}
+
+    def test_a_library_larger_than_a_page_is_read_whole_in_order(self):
+        server = self.Server(PAGE_SIZE * 2 + 500)
+        items = all_items(server, userId="u", recursive="true")
+        self.assertEqual([row["Id"] for row in items], [row["Id"] for row in server.rows])
+        self.assertEqual([request["startIndex"] for request in server.requests], [0, PAGE_SIZE, 2 * PAGE_SIZE])
+        self.assertTrue(all(request["limit"] == PAGE_SIZE and request["userId"] == "u" for request in server.requests))
+
+    def test_a_library_of_exactly_one_page_is_one_request(self):
+        server = self.Server(PAGE_SIZE)
+        self.assertEqual(len(all_items(server)), PAGE_SIZE)
+        self.assertEqual(len(server.requests), 1)
+
+    def test_an_empty_library_is_one_request_and_no_items(self):
+        server = self.Server(0)
+        self.assertEqual(all_items(server), [])
+        self.assertEqual(len(server.requests), 1)
+
+    def test_a_server_that_counts_more_than_it_serves_is_an_error_not_a_short_snapshot_or_a_loop(self):
+        server = self.Server(3, total=10)
+        with self.assertRaisesRegex(CheckError, "served 3 of the 10 items"):
+            all_items(server)
+        self.assertEqual(len(server.requests), 2)
+
+    def test_a_response_with_no_count_fails_loudly_instead_of_stopping_after_one_page(self):
+        class NoCount(self.Server):
+            def get(self, path, **query):
+                page = super().get(path, **query)
+                del page["TotalRecordCount"]
+                return page
+
+        with self.assertRaises(KeyError):
+            all_items(NoCount(PAGE_SIZE + 1))
+        with self.assertRaises(KeyError):   # also when the first page is empty
+            all_items(NoCount(0))
+
+    def test_an_item_on_two_pages_is_an_error_not_a_quietly_shorter_snapshot(self):
+        class Shifting(self.Server):
+            def get(self, path, **query):
+                page = super().get(path, **query)
+                if query["startIndex"]:   # the order moved between requests: the last item came back again
+                    page["Items"] = [self.rows[PAGE_SIZE - 1]] + page["Items"][:-1]
+                return page
+
+        with self.assertRaisesRegex(CheckError, "on two pages"):
+            all_items(Shifting(PAGE_SIZE + 10))
 
 
 class WriteAuditTest(unittest.TestCase):
@@ -244,6 +307,8 @@ def canned_10_11_8(path):
                 IsFavorite INTEGER NOT NULL, LastPlayedDate TEXT, Likes INTEGER, PlayCount INTEGER NOT NULL,
                 PlaybackPositionTicks INTEGER NOT NULL, Played INTEGER NOT NULL, Rating REAL,
                 SubtitleStreamIndex INTEGER, RetentionDate TEXT, PRIMARY KEY (ItemId, UserId, CustomDataKey));
+            CREATE TABLE MediaSegments (Id TEXT NOT NULL PRIMARY KEY, EndTicks INTEGER NOT NULL, ItemId TEXT NOT NULL,
+                SegmentProviderId TEXT NOT NULL, StartTicks INTEGER NOT NULL, Type INTEGER NOT NULL);
             INSERT INTO Users VALUES ('{ADULT}', '{USERS[1]}'), ('{CHILD}', '{USERS[2]}');
             INSERT INTO BaseItems (Id, Type, Name, ParentId, TopParentId, SeriesId, SeasonId, OfficialRating)
               VALUES ('{guid(0x5e)}', 'MediaBrowser.Controller.Entities.TV.Season', 'Season 1', NULL, '{guid(0x70)}', NULL, NULL, 'G'),
@@ -425,6 +490,38 @@ class SeededAdoptionTest(unittest.TestCase):
         self.assertEqual(chain[1][1], chain[0][0])
         self.assertTrue(chain[0][0].isupper() and '-' in chain[0][0], 'ids are spelled like the source rows')
         self.assertEqual(history, [(chain[1][0], self.seeds['orphan_history']['key'], 1, 3)])
+
+    def test_media_segments_land_on_the_locked_movie_under_the_plugins_provider_id(self):
+        with closing(sqlite3.connect(self.source)) as conn:
+            rows = conn.execute('SELECT ItemId, SegmentProviderId, Type, StartTicks, EndTicks FROM MediaSegments '
+                                'ORDER BY Type').fetchall()
+        # GetProviderId("Intro Skipper"): MD5 of "intro skipper" in UTF-16LE, as a .NET Guid.
+        provider = 'b0338b450421c081992860f1d02f261f'
+        self.assertEqual(rows, [(guid(3), provider, 4, 5_700_000_000, 6_000_000_000),
+                                (guid(3), provider, 5, 0, 300_000_000)])
+
+    def test_a_fixture_with_an_empty_digest_table_fails_its_build(self):
+        from table_digests import TABLES
+        db = str(Path(self.source).with_name('populated.db'))
+        with closing(sqlite3.connect(db)) as conn, conn:
+            for table in TABLES:
+                conn.execute(f'CREATE TABLE "{table}" (Id INTEGER)')
+                conn.execute(f'INSERT INTO "{table}" VALUES (1)')
+        synthetic_fixture.require_populated(db)
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute('DELETE FROM "KeyframeData"')
+        with self.assertRaisesRegex(CheckError, r"no rows in KeyframeData$"):
+            synthetic_fixture.require_populated(db)
+        # A fixture without seed_database may lack only what it writes.
+        with closing(sqlite3.connect(db)) as conn, conn:
+            conn.execute('INSERT INTO "KeyframeData" VALUES (1)')
+            conn.execute('DELETE FROM "MediaSegments"')
+        synthetic_fixture.require_populated(db, synthetic_fixture.SEEDED_ONLY)
+        with self.assertRaisesRegex(CheckError, r"no rows in MediaSegments$"):
+            synthetic_fixture.require_populated(db)
+        # A table the schema lacks fails the same way.
+        with self.assertRaisesRegex(CheckError, "no rows in MediaStreamInfos"):
+            synthetic_fixture.require_populated(self.source)
 
     def test_linked_children_seeds_land_beside_the_live_member(self):
         linked = self.seeds['linked_children']
@@ -743,6 +840,77 @@ class SeededAdoptionTest(unittest.TestCase):
             run_matrix(self.dir, 'unused-image', None, 0)
         self.assertFalse((self.dir / 'work').exists())
 
+    def test_a_refused_matrix_leaves_the_last_report_alone(self):
+        # a refusal (no oracle; a recipe change; a previous run's copy still in work/) happens before any fixture starts,
+        # and starting a report forgets the previous one: the failure report the error tells the user to inspect must survive
+        from synthetic import recipe
+        work = self.dir / 'work'
+        work.mkdir()
+        (work / 'results.jsonl').write_text('{"event": "run", "title": "the earlier run", "started": 1}\n')
+        (work / 'report.html').write_text('<p>the earlier run</p>')
+        with self.assertRaisesRegex(CheckError, 'oracle missing'):
+            run_matrix(self.dir, 'unused-image', None, 0)
+        for name in (ORACLE, UPGRADED_FROM_10):
+            ready = self.dir / name
+            ready.mkdir()
+            (ready / 'synthetic-ready.json').write_text(json.dumps({'recipe': recipe()}))
+            (ready / 'preservation.json').write_text('{}')
+        stale = self.dir / VERSIONS[0][0]   # a fixture of an older recipe
+        stale.mkdir()
+        (stale / 'synthetic-ready.json').write_text(json.dumps({'fixture': VERSIONS[0][0], 'recipe': 'an older recipe'}))
+        with self.assertRaisesRegex(CheckError, 'recipe changed'):
+            run_matrix(self.dir, 'unused-image', VERSIONS[0][0], 0)
+        self.assertEqual((work / 'report.html').read_text(), '<p>the earlier run</p>')
+        self.assertIn('the earlier run', (work / 'results.jsonl').read_text())
+
+    def test_an_error_that_stops_the_matrix_is_a_failed_check_in_the_report_unless_a_check_recorded_it(self):
+        import adoption_report as report
+        from unittest import mock
+        import preservation
+        for error, recorded_already, expected in ((OSError('docker went away'), False, 'OSError: docker went away'),
+                                                  (CheckError('scan did not finish'), False, 'CheckError: scan did not finish'),
+                                                  (CheckError('already recorded'), True, None)):
+            with self.subTest(str(error)):
+                root = self.dir / ('case-' + str(abs(hash(str(error)))))
+                root.mkdir()
+                if recorded_already:
+                    error.recorded = True
+
+                def stops(root_, image, only, port, recorder, error=error):
+                    recorder.start('matrix')
+                    recorder.begin('fx', 'matrix', '12.2')
+                    recorder.where = ('fx', 'after scan')
+                    raise error
+
+                with mock.patch.object(preservation, '_run_matrix', stops), self.assertRaises(type(error)):
+                    preservation.run_matrix(root, 'unused-image', None, 0)
+                (row,) = report.load(root / 'work')[1]
+                stopped = [c for c in row['checks'] if c['check'] == 'run stopped']
+                self.assertEqual([(c['stage'], c['detail']) for c in stopped], [('after scan', expected)] if expected else [])
+                self.assertIn('INCOMPLETE', (root / 'work' / 'report.html').read_text())   # the page is built however it ended
+
+    def test_an_error_after_a_fixture_finished_is_not_charged_to_it(self):
+        # the end-of-run summary of a run where some fixture failed, and the refusal at the start of the next fixture,
+        # come after the last fixture's row: its passing page must stay passing
+        import adoption_report as report
+        from unittest import mock
+        import preservation
+
+        def two_fixtures_then_the_summary(root, image, only, port, recorder):
+            recorder.start('matrix')
+            for name, verdict in (('a', 'FAIL'), ('b', 'PASS')):
+                recorder.begin(name, 'matrix', '12.2')
+                recorder.where = (name, 'after scan')
+                recorder.check(name, 'after scan', 'user accounts', verdict)
+                recorder.row(name, 'matrix', '12.2', verdict)
+            raise CheckError('a after adoption: user accounts')
+
+        with mock.patch.object(preservation, '_run_matrix', two_fixtures_then_the_summary), self.assertRaises(CheckError):
+            preservation.run_matrix(self.dir, 'unused-image', None, 0)
+        rows = {r['fixture']: report.row_verdict(r) for r in report.load(self.dir / 'work')[1]}
+        self.assertEqual(rows, {'a': 'FAIL', 'b': 'PASS'})
+        self.assertFalse(any(c['check'] == 'run stopped' for r in report.load(self.dir / 'work')[1] for c in r['checks']))
+
     def test_the_matrix_skips_the_fresh_install_fixture(self):
         # A first-run install carries no seeds, so run_matrix skips it instead of raising
         # "lacks the database seeds" / "no completed baseline"; run.sh validates it live. The
@@ -755,8 +923,26 @@ class SeededAdoptionTest(unittest.TestCase):
             (ready / 'preservation.json').write_text('{}')
         (fresh,) = FRESH_INSTALL
         run_matrix(self.dir, 'unused-image', fresh, 0)  # must not raise, must start no container
-        self.assertFalse((self.dir / 'work').exists())
+        self.assertFalse((self.dir / 'work').exists())   # no copy of it was made, and nothing started a report
         self.assertFalse((self.dir / fresh).exists())
+
+    def test_the_matrix_records_each_comparison_and_a_check_that_raises_before_it_goes_on(self):
+        import adoption_report as report
+        from preservation import note, recorded
+        recorder = report.Recorder(self.dir / 'work')
+        recorder.start('matrix')
+        self.assertEqual(note(recorder, 'fx', 'adoption', 'user accounts', []), [])
+        self.assertEqual(note(recorder, 'fx', 'adoption', 'table digests', ['Peoples row lost', 'Chapters changed']),
+                         ['Peoples row lost', 'Chapters changed'])
+        self.assertEqual(recorded(recorder, 'fx', 'adoption', 'boot log', lambda value: value + 1, 41), 42)
+        def refuses():
+            raise CheckError('synthetic database integrity check failed')
+        with self.assertRaisesRegex(CheckError, 'integrity'):
+            recorded(recorder, 'fx', 'adoption', 'integrity_check', refuses)
+        checks = report.load(self.dir / 'work')[1][0]['checks']
+        self.assertEqual([(c['check'], c['verdict'], c['detail']) for c in checks],
+                         [('user accounts', 'PASS', ''), ('table digests', 'FAIL', 'Peoples row lost; Chapters changed'),
+                          ('boot log', 'PASS', ''), ('integrity_check', 'FAIL', 'synthetic database integrity check failed')])
 
     def test_every_release_maps_to_its_adopted_generation(self):
         self.assertEqual({version: GENERATIONS[version] for _, version, _ in VERSIONS},
@@ -798,14 +984,20 @@ class FreshInstallBuildTest(unittest.TestCase):
         server.return_value.__enter__.return_value = api
         with patch.object(self.synthetic, "server", server), \
                 patch.object(self.synthetic, "seed", return_value={"version": 1}) as seed, \
-                patch.object(self.synthetic, "wait_for_live_members"), \
+                patch.object(self.synthetic, "wait_for_live_members") as wait_for_live_members, \
                 patch.object(self.synthetic, "seed_database") as seed_database, \
+                patch.object(self.synthetic, "require_populated") as require_populated, \
                 patch("preservation.snapshot", return_value={}), \
                 patch("preservation.validate"):
             self.synthetic.build(self.root, self.fresh, 0)
         config = self.root / self.fresh
         seed.assert_called_once()                       # seeded through the 12.2 API
         seed_database.assert_not_called()               # but none of the aged stopped-DB states
+        # 12.2 keeps linked children in their own table, so the 10.11 wait would never end;
+        # only seed_database needs it.
+        wait_for_live_members.assert_not_called()
+        # Every digest table must hold rows, bar those only seed_database fills.
+        require_populated.assert_called_once_with(config / "data/jellyfin.db", synthetic_fixture.SEEDED_ONLY)
         self.assertFalse((config / "seeds.json").exists())
         ready = json.loads((config / "synthetic-ready.json").read_text())
         self.assertEqual(ready["fixture"], self.fresh)  # still a completed, usable fixture

@@ -27,8 +27,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use ferrofin_db::Database;
-use ferrofin_db::entities::base_items::{BaseItemEntity, KeyframeDataEntity};
-use ferrofin_db::store::{datetime_to_db, guid_to_db};
+use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_db::store::datetime_to_db;
 #[cfg(test)]
 use ferrofin_model::configuration::LibraryOptions;
 use ferrofin_model::data::{BaseItemKind, MediaType};
@@ -42,7 +42,7 @@ use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
 use ferrofin_traits::chapters::ChapterManager;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
-use ferrofin_traits::media_encoding::MediaEncoder;
+use ferrofin_traits::media_encoding::{KeyframeExtractor, MediaEncoder};
 use ferrofin_traits::media_segments::MediaSegmentManager;
 use ferrofin_traits::options::{InternalItemsQuery, SourceType};
 use ferrofin_traits::persistence::KeyframeRepository;
@@ -101,27 +101,44 @@ async fn page(
 // ---------------------------------------------------------------------------
 
 /// "Keyframe Extractor" — extracts keyframes from video files to create more
-/// precise HLS playlists. Port of `KeyframeExtractionScheduledTask` over the
-/// ffprobe extractor in `ferrofin-keyframes` (the upstream cache decorator's
-/// "already extracted" check becomes a stored-row check).
+/// precise HLS playlists. Port of `KeyframeExtractionScheduledTask`: each video
+/// goes through the keyframe extractors, metadata-based ones first
+/// (`OrderByDescending(IsMetadataBased)`), until one yields keyframes. The
+/// extractors' repository cache skips videos already extracted and stores the
+/// rest.
 pub struct KeyframeExtractionTask {
     library: Arc<dyn LibraryManager>,
-    keyframes: Arc<dyn KeyframeRepository>,
-    encoder: Arc<dyn MediaEncoder>,
+    extractors: Vec<Arc<dyn KeyframeExtractor>>,
 }
 
 impl KeyframeExtractionTask {
-    /// Builds the task over the library, keyframe-repository and encoder seams.
+    /// Builds the task over the library and the registered keyframe
+    /// extractors ([`crate::keyframe_extractors::keyframe_extractors`]): the
+    /// ffprobe and Matroska extractors behind the keyframe-repository cache.
     #[must_use]
     pub fn new(
         library: Arc<dyn LibraryManager>,
         keyframes: Arc<dyn KeyframeRepository>,
         encoder: Arc<dyn MediaEncoder>,
     ) -> Self {
+        Self::with_extractors(
+            library,
+            crate::keyframe_extractors::keyframe_extractors(keyframes, encoder),
+        )
+    }
+
+    /// Builds the task over the library and the given keyframe extractors,
+    /// which it orders metadata-based first.
+    #[must_use]
+    pub fn with_extractors(
+        library: Arc<dyn LibraryManager>,
+        mut extractors: Vec<Arc<dyn KeyframeExtractor>>,
+    ) -> Self {
+        // A stable sort, as `OrderByDescending` is.
+        extractors.sort_by_key(|e| !e.is_metadata_based());
         Self {
             library,
-            keyframes,
-            encoder,
+            extractors,
         }
     }
 }
@@ -143,14 +160,18 @@ impl ScheduledTask for KeyframeExtractionTask {
         LIBRARY
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `KeyframeExtractionScheduledTask.cs:55-65`: every library video,
+        // a movie's alternate versions included (`IncludeOwnedItems`).
         let query = InternalItemsQuery {
             include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
+            media_types: vec![MediaType::Video],
             is_virtual_item: Some(false),
+            source_types: vec![SourceType::Library],
             recursive: true,
+            include_owned_items: true,
             ..InternalItemsQuery::default()
         };
         let total = self.library.get_count(&query).await?.max(0);
-        let probe = self.encoder.probe_path();
         let mut done = 0i32;
         let mut start_index = 0i32;
         while start_index < total {
@@ -164,33 +185,18 @@ impl ScheduledTask for KeyframeExtractionTask {
                 let Ok(item_id) = Uuid::parse_str(&item.id) else {
                     continue;
                 };
-                let Some(path) = item.path.clone().filter(|p| Path::new(p).exists()) else {
+                // Only local files supported.
+                let Some(path) = item.path.as_deref().filter(|p| Path::new(p).exists()) else {
                     continue;
                 };
-                // Already extracted → skip (the C# cache decorator's role).
-                if !self.keyframes.get_keyframe_data(item_id).await?.is_empty() {
-                    continue;
-                }
-                let probe = probe.clone();
-                let extracted = tokio::task::spawn_blocking(move || {
-                    ferrofin_keyframes::ff_probe::get_keyframe_data(&probe, &path)
-                })
-                .await
-                .map_err(|e| ServiceError::backend(format!("keyframe task panicked: {e}")))?;
-                match extracted {
-                    Ok(data) => {
-                        let entity = KeyframeDataEntity {
-                            item_id: guid_to_db(item_id),
-                            keyframe_ticks: Some(
-                                serde_json::to_string(&data.keyframe_ticks)
-                                    .map_err(|e| ServiceError::backend(e.to_string()))?,
-                            ),
-                            total_duration: data.total_duration,
-                        };
-                        self.keyframes.save_keyframe_data(item_id, &entity).await?;
-                    }
-                    Err(e) => {
-                        tracing::warn!(item = %item.id, error = %e, "keyframe extraction failed");
+                for extractor in &self.extractors {
+                    // The cache stores what an extractor extracts.
+                    if extractor
+                        .try_extract_keyframes(item_id, path)
+                        .await
+                        .is_some()
+                    {
+                        break;
                     }
                 }
             }
@@ -223,17 +229,39 @@ pub struct TokioFfmpegRunner;
 #[async_trait]
 impl FfmpegRunner for TokioFfmpegRunner {
     async fn run_stderr(&self, program: &str, args: &[String]) -> Result<String, ServiceError> {
-        let output = tokio::process::Command::new(program)
+        let child = tokio::process::Command::new(program)
             .args(args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
             // Task cancel = future drop; the child must not outlive it.
             .kill_on_drop(true)
-            .output()
-            .await
+            .spawn()
             .map_err(|e| ServiceError::backend(format!("failed to start {program}: {e}")))?;
+        lower_normalization_priority(&child, program);
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| ServiceError::backend(format!("failed to run {program}: {e}")))?;
         Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+    }
+}
+
+/// `AudioNormalizationTask` runs its ffmpeg at `BelowNormal`. Upstream warns
+/// on every failure; here the first failure warns and the rest go to debug,
+/// so the log volume does not grow with the library (LOGGING.md).
+fn lower_normalization_priority(child: &tokio::process::Child, program: &str) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Err(error) = ferrofin_util::process_priority::set_process_priority(
+        child,
+        ferrofin_util::process_priority::ProcessPriority::BelowNormal,
+    ) else {
+        return;
+    };
+    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!(path = program, %error, "error setting ffmpeg process priority");
+    } else {
+        tracing::warn!(path = program, %error, "error setting ffmpeg process priority");
     }
 }
 
@@ -654,15 +682,17 @@ impl ScheduledTask for ChapterImagesTask {
         // A set, and lowercased once: the lookup is per video, and a history
         // that has grown to thousands of entries turns a linear scan per video
         // into O(videos × history).
-        let mut failed: std::collections::BTreeSet<String> =
-            std::fs::read_to_string(&fail_history_path)
-                .map(|text| {
-                    text.split('|')
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_lowercase)
-                        .collect()
-                })
-                .unwrap_or_default();
+        // Lossy: the file is only ever appended to, so a key torn mid-write by
+        // a crash must cost that one key, not the whole history.
+        let mut failed: std::collections::BTreeSet<String> = std::fs::read(&fail_history_path)
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .split('|')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_lowercase)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // A blocklist this large is almost always the fingerprint of a past
         // systemic failure (an unwritable temp directory failing every
@@ -679,7 +709,6 @@ impl ScheduledTask for ChapterImagesTask {
         }
 
         let total = videos.len().max(1);
-        let mut history_dirty = false;
         for (index, video) in videos.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
             progress.report(100.0 * (index as f64) / total as f64);
@@ -688,57 +717,49 @@ impl ScheduledTask for ChapterImagesTask {
             };
             let modified = crate::chapter_image_extractor::date_modified_ticks(video.date_modified);
             let history_key = format!("{path}{modified}").to_lowercase();
-            let success = match self
+            // Source records extraction failures, not repository/service
+            // errors: those fail the run and blocklist nothing. Only an
+            // attempted extraction can fail, so a key is never appended twice.
+            let success = self
                 .refresh_video(video, !failed.contains(&history_key))
-                .await
-            {
-                Ok(success) => success,
-                Err(error) => {
-                    // Source records extraction failures, not repository/service
-                    // errors. Flush genuine failures already seen before failing.
-                    write_failure_history(&fail_history_path, &failed, history_dirty)?;
-                    return Err(error);
-                }
-            };
+                .await?;
             if !success {
+                append_failure_history(&fail_history_path, &history_key)?;
                 failed.insert(history_key);
-                history_dirty = true;
             }
         }
-        write_failure_history(&fail_history_path, &failed, history_dirty)?;
         progress.report(100.0);
         Ok(())
     }
 }
 
-/// Persists the chapter-image failure history, if the run added to it.
-///
-/// Written once per run rather than per failure: rewriting the whole file each
-/// time made a systemic failure quadratic in the history's own size.
-fn write_failure_history(
-    path: &Path,
-    failed: &std::collections::BTreeSet<String>,
-    dirty: bool,
-) -> Result<(), ServiceError> {
-    if dirty {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                ServiceError::backend(format!(
-                    "cannot create chapter failure history directory `{}`: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-        std::fs::write(path, failed.iter().cloned().collect::<Vec<_>>().join("|")).map_err(
-            |error| {
-                ServiceError::backend(format!(
-                    "cannot write chapter failure history `{}`: {error}",
-                    path.display()
-                ))
-            },
-        )?;
+/// Records one extraction failure in the chapter-image failure history as soon
+/// as it happens, as upstream does, so a run the scheduler stops (max runtime,
+/// dashboard Stop, shutdown: its future is dropped) keeps every failure it
+/// found. An append (`|key`, the `|`-separated format upstream reads) instead
+/// of upstream's whole-file rewrite: rewriting per failure made a systemic
+/// failure quadratic in the history's own size.
+fn append_failure_history(path: &Path, key: &str) -> Result<(), ServiceError> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            ServiceError::backend(format!(
+                "cannot create chapter failure history directory `{}`: {error}",
+                parent.display()
+            ))
+        })?;
     }
-    Ok(())
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| write!(file, "|{key}"))
+        .map_err(|error| {
+            ServiceError::backend(format!(
+                "cannot write chapter failure history `{}`: {error}",
+                path.display()
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -767,13 +788,24 @@ const PERSON_TYPE: &str = "MediaBrowser.Controller.Entities.Person";
 pub struct PeopleValidationTask {
     db: Database,
     providers: Arc<dyn ProviderManager>,
+    library: Arc<dyn LibraryManager>,
 }
 
 impl PeopleValidationTask {
-    /// Builds the task over the database and provider-manager seams.
+    /// Builds the task over the database and provider-manager seams, and the
+    /// library manager (the run is skipped, as upstream, while a library scan
+    /// runs).
     #[must_use]
-    pub fn new(db: Database, providers: Arc<dyn ProviderManager>) -> Self {
-        Self { db, providers }
+    pub fn new(
+        db: Database,
+        providers: Arc<dyn ProviderManager>,
+        library: Arc<dyn LibraryManager>,
+    ) -> Self {
+        Self {
+            db,
+            providers,
+            library,
+        }
     }
 
     /// Phase 1: merge duplicate people and drop orphans.
@@ -964,6 +996,12 @@ impl ScheduledTask for PeopleValidationTask {
         vec![interval_hours(7 * 24)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `PeopleValidationTask.ExecuteAsync`: its heavy writes contend with a
+        // library scan's, so the run waits for the next trigger.
+        if self.library.is_scan_running() {
+            tracing::info!("skipping people validation: a library scan is running");
+            return Ok(());
+        }
         self.dedupe_and_orphans().await?;
         progress.report(33.0);
         self.validate_person_items().await?;
@@ -1037,13 +1075,17 @@ impl ScheduledTask for SubtitleDownloadTask {
             progress.report(100.0);
             return Ok(());
         }
+        // `SubtitleScheduledTask.cs:97-107`: a movie's alternate versions are
+        // candidates too (`IncludeOwnedItems`).
         let videos = self
             .library
             .get_item_list(&InternalItemsQuery {
                 include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
+                media_types: vec![MediaType::Video],
                 is_virtual_item: Some(false),
                 source_types: vec![SourceType::Library],
                 recursive: true,
+                include_owned_items: true,
                 ..InternalItemsQuery::default()
             })
             .await?;
@@ -1175,6 +1217,215 @@ impl ScheduledTask for LyricDownloadTask {
     }
 }
 
+/// `TmdbUpcomingEpisodesTask.DefaultIntervalDays`: the task's interval when
+/// the TMDb settings page's `MissingEpisodeRefreshIntervalDays` is not a
+/// positive number of days.
+const TMDB_UPCOMING_DEFAULT_INTERVAL_DAYS: i32 = 7;
+
+/// The "Refresh upcoming and missing episodes (TheMovieDb)" task — port of
+/// `TmdbUpcomingEpisodesTask` (v12.2,
+/// `MediaBrowser.Providers/Plugins/Tmdb/TV/TmdbUpcomingEpisodesTask.cs`).
+///
+/// Re-runs the TMDb missing/unaired episode provider on the interval the TMDb
+/// settings page sets, so a series whose files never change still gains the
+/// episodes TMDb announces: each series with a TMDb id that has not ended,
+/// and each in a library not opted in (whatever its status, so the provider
+/// prunes what it created there), gets the refresh `ValidateChildren` gives
+/// it — a path-scoped refresh scan, whose closing pass runs the provider.
+/// With both options off or no library opted in, it removes every virtual
+/// episode the provider created, and every virtual season of its left empty.
+pub struct TmdbUpcomingEpisodesTask {
+    tmdb: Arc<ferrofin_providers::TmdbClient>,
+    library: Arc<dyn LibraryManager>,
+    interval_days: std::sync::atomic::AtomicI32,
+}
+
+impl TmdbUpcomingEpisodesTask {
+    /// Builds the task over the TMDb client (its settings) and the library
+    /// manager (the series, their refresh and the deletes).
+    #[must_use]
+    pub fn new(
+        tmdb: Arc<ferrofin_providers::TmdbClient>,
+        library: Arc<dyn LibraryManager>,
+    ) -> Self {
+        Self {
+            tmdb,
+            library,
+            interval_days: std::sync::atomic::AtomicI32::new(TMDB_UPCOMING_DEFAULT_INTERVAL_DAYS),
+        }
+    }
+
+    /// Takes the TMDb settings page's `MissingEpisodeRefreshIntervalDays`
+    /// for the default trigger (`GetDefaultTriggers`): a value that is not a
+    /// positive number of days keeps the default.
+    pub fn set_interval_days(&self, days: i32) {
+        let days = if days > 0 {
+            days
+        } else {
+            TMDB_UPCOMING_DEFAULT_INTERVAL_DAYS
+        };
+        self.interval_days
+            .store(days, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `RemoveAllVirtualItems`: every virtual episode with a TMDb id, then
+    /// every virtual season with a TMDb id that is left with no episode.
+    async fn remove_all_virtual_items(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        let options = ferrofin_traits::options::DeleteOptions {
+            delete_file_location: false,
+            ..ferrofin_traits::options::DeleteOptions::default()
+        };
+        let virtual_of = |kind| InternalItemsQuery {
+            include_item_types: vec![kind],
+            is_virtual_item: Some(true),
+            has_tmdb_id: Some(true),
+            recursive: true,
+            ..InternalItemsQuery::default()
+        };
+        let episodes = self
+            .library
+            .get_item_ids(&virtual_of(BaseItemKind::Episode))
+            .await?;
+        for (i, id) in episodes.iter().enumerate() {
+            tracing::info!(
+                item_id = %id,
+                "removing a virtual episode: the TMDb missing episode provider is disabled"
+            );
+            if let Err(err) = self.library.delete_item(*id, &options).await {
+                tracing::warn!(item_id = %id, %err, "could not remove the virtual episode");
+            }
+            #[allow(clippy::cast_precision_loss)] // a progress ratio
+            progress.report(95.0 * (i + 1) as f64 / episodes.len() as f64);
+        }
+        for season in self
+            .library
+            .get_item_ids(&virtual_of(BaseItemKind::Season))
+            .await?
+        {
+            let episodes = self
+                .library
+                .get_item_ids(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Episode],
+                    ancestor_ids: vec![season],
+                    recursive: true,
+                    limit: Some(1),
+                    ..InternalItemsQuery::default()
+                })
+                .await?;
+            if episodes.is_empty()
+                && let Err(err) = self.library.delete_item(season, &options).await
+            {
+                tracing::warn!(item_id = %season, %err, "could not remove the virtual season");
+            }
+        }
+        progress.report(100.0);
+        Ok(())
+    }
+
+    /// `IsEnabledForLibrary`: one of `series`' collection folders is opted in.
+    async fn library_enabled(
+        &self,
+        series: Uuid,
+        settings: &ferrofin_providers::tmdb::MissingEpisodeSettings,
+    ) -> Result<bool, ServiceError> {
+        Ok(self
+            .library
+            .get_ancestors(series)
+            .await?
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .any(|id| settings.library_enabled(id)))
+    }
+}
+
+#[allow(clippy::unnecessary_literal_bound)]
+#[async_trait]
+impl ScheduledTask for TmdbUpcomingEpisodesTask {
+    fn key(&self) -> &str {
+        "TmdbRefreshUpcomingEpisodes"
+    }
+    fn name(&self) -> &str {
+        "Refresh upcoming and missing episodes (TheMovieDb)"
+    }
+    fn description(&self) -> &str {
+        "Checks TheMovieDb for newly announced episodes and creates virtual entries for unaired and missing episodes, according to the TMDb plugin settings. When both options are disabled, removes any virtual entries previously created."
+    }
+    fn category(&self) -> &str {
+        LIBRARY
+    }
+    fn default_triggers(&self) -> Vec<TaskTriggerInfo> {
+        let days = self
+            .interval_days
+            .load(std::sync::atomic::Ordering::Relaxed);
+        vec![interval_hours(i64::from(days) * 24)]
+    }
+    async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        let settings = self.tmdb.missing_episode_settings().await;
+        self.set_interval_days(settings.refresh_interval_days);
+        if !settings.imports() || settings.enabled_libraries.is_empty() {
+            return self.remove_all_virtual_items(progress).await;
+        }
+        let candidates = self
+            .library
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Series],
+                has_tmdb_id: Some(true),
+                recursive: true,
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let mut series = Vec::new();
+        for row in candidates {
+            let Ok(id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            // An ended series in an opted-in library cannot change.
+            let ended = crate::item_data::read_series_status(row.data.as_deref())
+                .is_some_and(|status| status.eq_ignore_ascii_case("Ended"));
+            if !ended || !self.library_enabled(id, &settings).await? {
+                series.push(row);
+            }
+        }
+        if series.is_empty() {
+            progress.report(100.0);
+            return Ok(());
+        }
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: ferrofin_traits::providers::MetadataRefreshMode::Default,
+            image_refresh_mode: ferrofin_traits::providers::MetadataRefreshMode::ValidationOnly,
+            ..MetadataRefreshOptions::default()
+        };
+        for (i, row) in series.iter().enumerate() {
+            if let Some(path) = row.path.clone().filter(|p| !p.is_empty()) {
+                match self
+                    .library
+                    .run_refresh_scan(
+                        ferrofin_traits::library::ScanTarget::Paths(vec![path]),
+                        &options,
+                    )
+                    .await
+                {
+                    Ok(true) => {}
+                    // Stopped (the host shutting down): cancelled, not completed.
+                    Ok(false) => {
+                        progress.stopped();
+                        return Ok(());
+                    }
+                    Err(err) => tracing::warn!(
+                        item_id = %row.id,
+                        %err,
+                        "could not refresh the series' upcoming episodes"
+                    ),
+                }
+            }
+            #[allow(clippy::cast_precision_loss)] // a progress ratio
+            progress.report(100.0 * (i + 1) as f64 / series.len() as f64);
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Generate Trickplay Images
 // ---------------------------------------------------------------------------
@@ -1254,7 +1505,7 @@ impl ScheduledTask for TrickplayImagesTask {
                 if !crate::trickplay_manager::is_library_video(item) {
                     continue;
                 }
-                let folders = self.folders.get_virtual_folders().await?;
+                let folders = self.folders.library_folders().await?;
                 let options = ferrofin_model::entities_media::owning_library(
                     &folders,
                     item.top_parent_id.as_deref(),
@@ -1405,7 +1656,8 @@ impl ScheduledTask for MediaSegmentExtractionTask {
 mod tests {
     use std::sync::Mutex;
 
-    use ferrofin_db::entities::base_items::MediaStreamInfoEntity;
+    use ferrofin_db::entities::base_items::{KeyframeDataEntity, MediaStreamInfoEntity};
+    use ferrofin_db::store::guid_to_db;
     use ferrofin_model::configuration::MediaPathInfo;
     use ferrofin_model::entities::CollectionTypeOptions;
     use ferrofin_model::entities::MediaStreamType as StreamTypeEnum;
@@ -1419,6 +1671,40 @@ mod tests {
     use super::*;
     use crate::db_error::media_stream_type_disc;
     use crate::test_support::{library_manager_over, seed_item, seed_named_item, test_db};
+
+    /// Audio normalization's ffmpeg runs below normal priority, as upstream's
+    /// `AudioNormalizationTask` sets it — unless this host refuses it (raising
+    /// a priority past `RLIMIT_NICE`), when it keeps the one it started with.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_normalization_ffmpeg_runs_below_normal_priority() {
+        use super::FfmpegRunner as _;
+        let own: i32 = String::from_utf8_lossy(
+            &std::process::Command::new("nice")
+                .output()
+                .expect("run nice")
+                .stdout,
+        )
+        .trim()
+        .parse()
+        .expect("a number");
+        let probe = tokio::process::Command::new("sleep")
+            .arg("5")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep");
+        let below_normal = ferrofin_util::process_priority::ProcessPriority::BelowNormal;
+        let expected =
+            match ferrofin_util::process_priority::set_process_priority(&probe, below_normal) {
+                Ok(()) => below_normal.nice(),
+                Err(_) => own,
+            };
+        let stderr = super::TokioFfmpegRunner
+            .run_stderr("sh", &["-c".to_owned(), "sleep 0.3; nice >&2".to_owned()])
+            .await
+            .expect("sh runs");
+        assert_eq!(stderr.trim().parse::<i32>().expect("a number"), expected);
+    }
 
     // -- pure helpers -------------------------------------------------------
 
@@ -1452,7 +1738,7 @@ mod tests {
             _name: &str,
             _collection_type: Option<CollectionTypeOptions>,
             _options: &LibraryOptions,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
             unimplemented!("fake")
         }
         async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
@@ -1823,6 +2109,11 @@ mod tests {
         chapters: Mutex<Vec<ChapterInfo>>,
         fail_read: std::sync::atomic::AtomicBool,
         fail_save: std::sync::atomic::AtomicBool,
+        /// Reads past this many never return (a hung extraction), after
+        /// notifying `stalled`.
+        stall_after_reads: std::sync::atomic::AtomicUsize,
+        reads: std::sync::atomic::AtomicUsize,
+        stalled: tokio::sync::Notify,
     }
 
     #[async_trait]
@@ -1851,6 +2142,15 @@ mod tests {
         async fn get_chapters(&self, _item_id: Uuid) -> Result<Vec<ChapterInfo>, ServiceError> {
             if self.fail_read.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(ServiceError::backend("temporary chapter read failure"));
+            }
+            let reads = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if reads
+                >= self
+                    .stall_after_reads
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.stalled.notify_one();
+                std::future::pending::<()>().await;
             }
             Ok(self.chapters.lock().expect("lock").clone())
         }
@@ -2286,6 +2586,7 @@ mod tests {
         let path = media.path().join("film.mkv");
         std::fs::write(&path, b"x").expect("write");
         set_path(&db, movie, &path.to_string_lossy()).await;
+        set_media_type(&db, movie, "Video").await;
 
         // A German audio track satisfies "ger" via skip-if-audio-matches;
         // "eng" has nothing and must be searched + downloaded.
@@ -2787,7 +3088,11 @@ mod tests {
         .await;
 
         let providers = Arc::new(RecordingProviders::default());
-        let task = PeopleValidationTask::new(db.clone(), providers.clone());
+        let task = PeopleValidationTask::new(
+            db.clone(),
+            providers.clone(),
+            crate::test_support::library_manager_over(db.clone()),
+        );
         assert_eq!(task.key(), "RefreshPeople");
         task.execute(&TaskProgress::default()).await.expect("run");
 
@@ -2840,6 +3145,40 @@ mod tests {
         );
     }
 
+    /// `PeopleValidationTask.ExecuteAsync` returns at once while a library
+    /// scan runs (`IsScanRunning`): its de-duplication and person refreshes
+    /// are heavy writes that would contend with the scan's. The skipped run
+    /// still succeeds, so the task records `Completed`.
+    #[tokio::test]
+    async fn people_validation_skips_while_a_library_scan_runs() {
+        let db = test_db().await;
+        let person = Uuid::from_u128(0xC1);
+        seed_named_item(&db, person, BaseItemKind::Person, "Jane Doe").await;
+        crate::people_repository::seed_people_row(&db, Uuid::from_u128(0xC2), "Jane Doe", "Actor")
+            .await;
+        crate::people_repository::seed_people_row(&db, Uuid::from_u128(0xC3), "Jane Doe", "Actor")
+            .await;
+        let providers = Arc::new(RecordingProviders::default());
+        let task = PeopleValidationTask::new(
+            db.clone(),
+            providers.clone(),
+            crate::test_support::library_manager_mid_scan(db.clone()).await,
+        );
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("skip is Ok");
+
+        assert_eq!(
+            crate::people_repository::people_row_count(&db).await,
+            2,
+            "the duplicate is not merged during a scan"
+        );
+        assert!(
+            providers.refreshed.lock().expect("lock").is_empty(),
+            "no person is refreshed during a scan"
+        );
+        assert!(progress.current().abs() < f64::EPSILON, "nothing ran");
+    }
+
     /// The image/overview pass fetches only the half a person lacks: a
     /// person with an overview but no image asks a `FullRefresh` of its
     /// images and `ValidationOnly` of its metadata.
@@ -2859,7 +3198,11 @@ mod tests {
         )
         .await;
         let providers = Arc::new(RecordingProviders::default());
-        let task = PeopleValidationTask::new(db.clone(), providers.clone());
+        let task = PeopleValidationTask::new(
+            db.clone(),
+            providers.clone(),
+            crate::test_support::library_manager_over(db.clone()),
+        );
         task.refresh_new_person_items(&TaskProgress::default(), 0.0, 1.0)
             .await
             .expect("new people");
@@ -2986,6 +3329,8 @@ mod tests {
         let (done, fresh) = (Uuid::from_u128(0xB1), Uuid::from_u128(0xB2));
         for (id, name) in [(done, "done.mkv"), (fresh, "fresh.mkv")] {
             seed_item(&db, id, BaseItemKind::Movie).await;
+            // The task asks for video items only.
+            set_media_type(&db, id, "Video").await;
             let path = media.path().join(name);
             std::fs::write(&path, b"x").expect("write");
             set_path(&db, id, &path.to_string_lossy()).await;
@@ -3000,23 +3345,174 @@ mod tests {
             .await
             .expect("seed keyframes");
 
-        // The fake probe path is /bin/false: extraction "runs" and yields
-        // empty data, which must not fail the task.
-        let task = KeyframeExtractionTask::new(
-            library,
+        // A probe that finds nothing, behind the repository cache: the
+        // extracted item is served from its row, the new one reaches the
+        // probe, and an empty answer must not fail the task.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let probe = crate::keyframe_extractors::CachedKeyframeExtractor::new(
             Arc::clone(&keyframes),
-            Arc::new(FakeEncoder {
-                fail_extract: false,
+            Arc::new(LoggingExtractor {
+                name: "probe",
+                metadata_based: false,
+                answers_for: ".none",
+                log: Arc::clone(&log),
             }),
+            "probe",
         );
+        let task = KeyframeExtractionTask::with_extractors(library, vec![Arc::new(probe)]);
         assert_eq!(task.key(), "KeyframeExtraction");
         assert!(task.default_triggers().is_empty());
         task.execute(&TaskProgress::default()).await.expect("run");
 
+        assert_eq!(*log.lock().expect("log"), ["probe:fresh.mkv"]);
         // The pre-extracted item is untouched.
         let kept = keyframes.get_keyframe_data(done).await.expect("kept");
         assert_eq!(kept[0].total_duration, 42);
         assert_eq!(kept[0].keyframe_ticks.as_deref(), Some("[1,2,3]"));
+        // The failed probe stored nothing for the new item.
+        assert!(
+            keyframes
+                .get_keyframe_data(fresh)
+                .await
+                .expect("read")
+                .is_empty()
+        );
+    }
+
+    /// A keyframe extractor that logs `name:file` for each call and answers
+    /// for files ending in `answers_for`.
+    struct LoggingExtractor {
+        name: &'static str,
+        metadata_based: bool,
+        answers_for: &'static str,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl KeyframeExtractor for LoggingExtractor {
+        fn is_metadata_based(&self) -> bool {
+            self.metadata_based
+        }
+
+        async fn try_extract_keyframes(
+            &self,
+            _item_id: Uuid,
+            file_path: &str,
+        ) -> Option<ferrofin_keyframes::keyframe_data::KeyframeData> {
+            let file = Path::new(file_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.log
+                .lock()
+                .expect("log")
+                .push(format!("{}:{file}", self.name));
+            file.ends_with(self.answers_for)
+                .then(|| ferrofin_keyframes::keyframe_data::KeyframeData::new(10, vec![0]))
+        }
+    }
+
+    #[tokio::test]
+    async fn keyframe_task_tries_metadata_extractors_first_and_stops_at_the_first_answer() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let library = library_manager_over(db.clone());
+        let (mkv, mp4, gone) = (
+            Uuid::from_u128(0xB3),
+            Uuid::from_u128(0xB4),
+            Uuid::from_u128(0xB5),
+        );
+        for (id, name) in [(mkv, "a.mkv"), (mp4, "b.mp4")] {
+            seed_item(&db, id, BaseItemKind::Movie).await;
+            set_media_type(&db, id, "Video").await;
+            let path = media.path().join(name);
+            std::fs::write(&path, b"x").expect("write");
+            set_path(&db, id, &path.to_string_lossy()).await;
+        }
+        // A video whose file is gone: the task finds it and skips it.
+        seed_item(&db, gone, BaseItemKind::Episode).await;
+        set_media_type(&db, gone, "Video").await;
+        set_path(&db, gone, &media.path().join("gone.mkv").to_string_lossy()).await;
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        // Registered ffprobe first, as upstream registers them.
+        let task = KeyframeExtractionTask::with_extractors(
+            library,
+            vec![
+                Arc::new(LoggingExtractor {
+                    name: "ffprobe",
+                    metadata_based: false,
+                    answers_for: "",
+                    log: Arc::clone(&log),
+                }),
+                Arc::new(LoggingExtractor {
+                    name: "matroska",
+                    metadata_based: true,
+                    answers_for: ".mkv",
+                    log: Arc::clone(&log),
+                }),
+            ],
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        let mut calls = log.lock().expect("log").clone();
+        calls.sort();
+        // The Matroska extractor answers for the `.mkv`, so ffprobe never sees
+        // it; the `.mp4` falls through to ffprobe; the missing file is skipped.
+        assert_eq!(calls, ["ffprobe:b.mp4", "matroska:a.mkv", "matroska:b.mp4"]);
+    }
+
+    /// `KeyframeExtractionScheduledTask` queries with `IncludeOwnedItems`: a
+    /// movie's alternate version gets keyframes too, not only its primary.
+    #[tokio::test]
+    async fn keyframe_task_extracts_alternate_versions_too() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let (primary, alternate) = (Uuid::from_u128(0xC1), Uuid::from_u128(0xC2));
+        // A movie row over a real file of that name, written here.
+        let movie = |id: Uuid, name: &str, version_of: Option<Uuid>| {
+            let path = media.path().join(name);
+            std::fs::write(&path, b"x").expect("write");
+            BaseItemEntity {
+                id: guid_to_db(id),
+                type_: crate::item_type_lookup::stored_type_name(BaseItemKind::Movie)
+                    .expect("Movie has a stored type")
+                    .to_owned(),
+                name: Some(name.to_owned()),
+                path: Some(path.to_string_lossy().into_owned()),
+                media_type: Some("Video".to_owned()),
+                // A local alternate version is owned by its primary.
+                owner_id: version_of.map(guid_to_db),
+                primary_version_id: version_of.map(guid_to_db),
+                ..BaseItemEntity::default()
+            }
+        };
+        crate::FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[
+                movie(primary, "Heat.mkv", None),
+                movie(alternate, "Heat - 2160p.mkv", Some(primary)),
+            ])
+            .await
+            .expect("seed the versions");
+
+        // An extractor that answers for every file, so the log shows which
+        // items the task's query reached.
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let task = KeyframeExtractionTask::with_extractors(
+            library_manager_over(db.clone()),
+            vec![Arc::new(LoggingExtractor {
+                name: "ffprobe",
+                metadata_based: false,
+                answers_for: "",
+                log: Arc::clone(&log),
+            })],
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        let mut calls = log.lock().expect("log").clone();
+        calls.sort();
+        assert_eq!(calls, ["ffprobe:Heat - 2160p.mkv", "ffprobe:Heat.mkv"]);
     }
 
     // -- Extract Chapter Images ----------------------------------------------
@@ -3037,25 +3533,45 @@ mod tests {
         Arc<FakeChapters>,
         ChapterImagesTask,
     ) {
+        chapter_task_fixture_for(fail_extract, &["film.mkv"]).await
+    }
+
+    /// [`chapter_task_fixture`] over one video per file name; returns the
+    /// first video's id.
+    async fn chapter_task_fixture_for(
+        fail_extract: bool,
+        files: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        Uuid,
+        Arc<FakeChapters>,
+        ChapterImagesTask,
+    ) {
         let db = test_db().await;
         let media = tempfile::tempdir().expect("tempdir");
         let library = library_manager_over(db.clone());
 
         let movie = Uuid::from_u128(0xC1);
-        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
-        set_media_type(&db, movie, "Video").await;
-        let path = media.path().join("film.mkv");
-        std::fs::write(&path, b"x").expect("write");
-        set_path(&db, movie, &path.to_string_lossy()).await;
-        let mut video = crate::test_support::fetch_item(&db, movie).await;
-        video.run_time_ticks = Some(1_800_000_000);
-        video.data = Some(r#"{"DefaultVideoStreamIndex":0}"#.to_owned());
-        crate::test_support::save_item(&db, &video).await;
+        for (offset, file) in (0u128..).zip(files) {
+            let id = Uuid::from_u128(0xC1 + offset);
+            seed_named_item(&db, id, BaseItemKind::Movie, file).await;
+            set_media_type(&db, id, "Video").await;
+            let path = media.path().join(file);
+            std::fs::write(&path, b"x").expect("write");
+            set_path(&db, id, &path.to_string_lossy()).await;
+            let mut video = crate::test_support::fetch_item(&db, id).await;
+            video.run_time_ticks = Some(1_800_000_000);
+            video.data = Some(r#"{"DefaultVideoStreamIndex":0}"#.to_owned());
+            crate::test_support::save_item(&db, &video).await;
+        }
 
         let chapters = Arc::new(FakeChapters {
             chapters: Mutex::new(vec![chapter_at(0), chapter_at(600_000_000)]),
             fail_read: std::sync::atomic::AtomicBool::new(false),
             fail_save: std::sync::atomic::AtomicBool::new(false),
+            stall_after_reads: std::sync::atomic::AtomicUsize::new(usize::MAX),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+            stalled: tokio::sync::Notify::new(),
         });
         let streams = FakeStreams(vec![MediaStreamInfoEntity {
             item_id: movie.to_string(),
@@ -3131,6 +3647,36 @@ mod tests {
                 .expect("history written");
         assert!(history.contains("film.mkv"));
         drop(media);
+    }
+
+    // The scheduler stops a run (4 h max runtime, dashboard Stop, shutdown) by
+    // aborting its future; a failure found before that must already be on
+    // disk, or the next run retries it — upstream writes it per failure.
+    #[tokio::test]
+    async fn a_failure_is_recorded_before_an_aborted_run_reaches_the_end() {
+        let (media, _movie, chapters, task) =
+            chapter_task_fixture_for(true, &["first.mkv", "second.mkv"]).await;
+        chapters
+            .stall_after_reads
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let run = tokio::spawn(async move { task.execute(&TaskProgress::default()).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            chapters.stalled.notified(),
+        )
+        .await
+        .expect("the second video's read stalls");
+        run.abort();
+        assert!(run.await.expect_err("aborted").is_cancelled());
+
+        let history =
+            std::fs::read_to_string(media.path().join("cache").join("chapter-failures.txt"))
+                .expect("history written before the abort");
+        assert_eq!(
+            history.split('|').filter(|key| !key.is_empty()).count(),
+            1,
+            "exactly the one video that failed before the abort: {history}"
+        );
     }
 
     #[tokio::test]
@@ -3263,18 +3809,32 @@ mod tests {
     }
 
     #[test]
-    fn failure_history_write_errors_are_reported_and_clean_runs_need_no_history_write() {
+    fn failure_history_appends_create_the_directory_and_report_write_errors() {
         let temp = tempfile::tempdir().unwrap();
         let history = temp.path().join("chapter-failures.txt");
         std::fs::create_dir(&history).unwrap();
-        let failures = std::collections::BTreeSet::from(["film.mkv123".to_owned()]);
-        assert!(write_failure_history(&history, &failures, false).is_ok());
-        let error = write_failure_history(&history, &failures, true)
+        let error = append_failure_history(&history, "film.mkv123")
             .expect_err("history I/O failure fails execution");
         assert!(error.to_string().contains("chapter-failures.txt"));
+
+        // An existing history (upstream's or an earlier run's) keeps its
+        // entries; each failure adds one `|`-separated key.
         let nested = temp.path().join("new-cache/chapter-failures.txt");
-        write_failure_history(&nested, &failures, true).unwrap();
-        assert_eq!(std::fs::read_to_string(nested).unwrap(), "film.mkv123");
+        append_failure_history(&nested, "film.mkv123").unwrap();
+        append_failure_history(&nested, "other.mkv456").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(nested).unwrap(),
+            "|film.mkv123|other.mkv456"
+        );
+        // A whole-file history (upstream's `Join('|')`, or this task's before
+        // it appended) keeps its entries.
+        let rewritten = temp.path().join("rewritten.txt");
+        std::fs::write(&rewritten, "a.mkv1|b.mkv2").unwrap();
+        append_failure_history(&rewritten, "c.mkv3").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(rewritten).unwrap(),
+            "a.mkv1|b.mkv2|c.mkv3"
+        );
     }
 
     // The failure mode that cost a real library every chapter image: the
@@ -3322,5 +3882,95 @@ mod tests {
 
         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755)).expect("restore");
         drop(media);
+    }
+
+    /// `TmdbUpcomingEpisodesTask` with the TMDb settings at their defaults
+    /// (both options off): `RemoveAllVirtualItems` removes the provider's
+    /// virtual episodes (virtual, with a TMDb id) and its virtual season left
+    /// empty, and nothing else.
+    #[tokio::test]
+    async fn tmdb_upcoming_episodes_turned_off_removes_what_the_provider_created() {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+
+        let db = test_db().await;
+        let library = library_manager_over(db.clone());
+        let persistence = crate::FerrofinItemPersistenceService::new(db.clone());
+        let (season, ours, theirs, file) = (
+            Uuid::from_u128(0x71),
+            Uuid::from_u128(0x72),
+            Uuid::from_u128(0x73),
+            Uuid::from_u128(0x74),
+        );
+        let row = |id: Uuid, kind: BaseItemKind, virtual_item: bool| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: crate::item_type_lookup::stored_type_name(kind)
+                .expect("type")
+                .to_owned(),
+            name: Some(format!("{id}")),
+            is_virtual_item: virtual_item,
+            is_folder: kind == BaseItemKind::Season,
+            path: (!virtual_item).then(|| format!("/tv/Show/{id}.mkv")),
+            ..BaseItemEntity::default()
+        };
+        persistence
+            .save_items(&[
+                row(season, BaseItemKind::Season, true),
+                BaseItemEntity {
+                    parent_id: Some(guid_to_db(season)),
+                    ..row(ours, BaseItemKind::Episode, true)
+                },
+                row(theirs, BaseItemKind::Episode, true),
+                row(file, BaseItemKind::Episode, false),
+            ])
+            .await
+            .expect("save");
+        persistence
+            .set_ancestors(ours, &[season])
+            .await
+            .expect("ancestors");
+        for id in [season, ours, file] {
+            persistence
+                .save_provider_id(id, "Tmdb", "63057")
+                .await
+                .expect("tmdb id");
+        }
+
+        let task = TmdbUpcomingEpisodesTask::new(
+            Arc::new(ferrofin_providers::TmdbClient::new()),
+            Arc::clone(&library),
+        );
+        assert_eq!(task.key(), "TmdbRefreshUpcomingEpisodes");
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        let alive = |id| {
+            let library = Arc::clone(&library);
+            async move { library.get_item_by_id(id).await.expect("read").is_some() }
+        };
+        assert!(!alive(ours).await, "the provider's virtual episode goes");
+        assert!(!alive(season).await, "and its emptied virtual season");
+        assert!(
+            alive(theirs).await,
+            "another provider's virtual episode stays"
+        );
+        assert!(alive(file).await, "a file's episode stays");
+    }
+
+    /// `GetDefaultTriggers`: every `MissingEpisodeRefreshIntervalDays` days,
+    /// 7 when the setting is not a positive number of days.
+    #[tokio::test]
+    async fn tmdb_upcoming_episodes_runs_on_the_settings_interval() {
+        let task = TmdbUpcomingEpisodesTask::new(
+            Arc::new(ferrofin_providers::TmdbClient::new()),
+            library_manager_over(test_db().await),
+        );
+        let days = |task: &TmdbUpcomingEpisodesTask| {
+            task.default_triggers()[0].interval_ticks.expect("interval")
+                / (24 * 3600 * TICKS_PER_SECOND)
+        };
+        assert_eq!(days(&task), 7);
+        task.set_interval_days(3);
+        assert_eq!(days(&task), 3);
+        task.set_interval_days(0);
+        assert_eq!(days(&task), 7);
     }
 }

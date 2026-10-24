@@ -8,7 +8,9 @@
 //! - `GetUserDataKeys` derives keys from stored metadata through the shared
 //!   user-data key repository, also used by retention recovery.
 //! - Reads use the table rather than the C# in-memory cache. Successful writes
-//!   notify the weak NFO listener with the source `UserDataSaved` reason.
+//!   notify the weak NFO listener with the source `UserDataSaved` reason, and
+//!   the user's sessions in batches (`UserDataChangeNotifier`, see
+//!   [`FerrofinUserDataManager::set_user_data_changed_sink`]).
 //! - `UpdatePlayState` needs the item's runtime + kind (for the resume-point
 //!   heuristics); those are read from the `BaseItems` row rather than a
 //!   pre-loaded domain object.
@@ -17,9 +19,10 @@
 //! `MinResumeDurationSeconds`, `MinAudiobookResume`, `MaxAudiobookResume`) are
 //! read live from the injected [`ServerConfigurationManager`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future as _;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -39,25 +42,90 @@ use ferrofin_traits::library::{
 use ferrofin_traits::persistence::ItemCountService;
 
 use crate::db_error::db_err;
+use crate::dto_service::parse_media_type;
 use crate::item_type_lookup::kind_from_type_name;
 use crate::kinds::{supports_played_status, supports_position_ticks_resume};
 use crate::user_data_key_repository::extra_type_name;
 use crate::user_data_keys::{KeySource, user_data_keys, uses_provider_ids};
 
+/// `RunTimeTicks`, `Type`, `MediaType` and `ExtraType` of one `BaseItems` row.
+type PlayStateRow = (Option<i64>, String, Option<String>, Option<i32>);
+
+/// What the play-state paths read about one item: its runtime and kind, and
+/// the two C# virtuals, resolved from the row's `MediaType` (a playlist's
+/// played state) and `ExtraType` (a video extra's resume).
+struct PlayStateItem {
+    runtime_ticks: i64,
+    kind: BaseItemKind,
+    /// `SupportsPlayedStatus`.
+    played_status: bool,
+    /// `SupportsPositionTicksResume`.
+    resume: bool,
+}
+
 /// One tick is 100 nanoseconds; there are 10,000,000 ticks per second (the
 /// .NET `TimeSpan.TicksPerSecond` the C# resume math uses).
 const TICKS_PER_SECOND: i64 = 10_000_000;
 
-/// Where the user-data manager announces user data it saved on its own —
-/// the other versions [`FerrofinUserDataManager`]'s played-state propagation
-/// wrote — as the `UserDataChanged` message the request paths push for the
-/// item they saved (upstream's `UserDataSaved` event, which
-/// `UserDataChangedNotifier` turns into that message for every save).
+/// The rating from which an item counts as liked (`UserItemData.MinLikeValue`).
+const MIN_LIKE_VALUE: f64 = 6.5;
+
+/// How long saves are gathered before each user's sessions hear one
+/// `UserDataChanged` (`UserDataChangeNotifier.UpdateDuration`). The window
+/// opens at a batch's first save and is never extended.
+///
+/// FLAGGED as a candidate setting — plausible range 100 ms…5 s, default
+/// upstream's.
+const USER_DATA_CHANGE_WINDOW: Duration = Duration::from_millis(500);
+
+/// The batch size at which a batch is sent before its window closes
+/// (`UserDataChangeNotifier.MaxBatchSize`). It counts the items saved;
+/// upstream also counts the parents it adds, which are looked up here only
+/// when the batch is sent.
+///
+/// FLAGGED as a candidate setting — plausible range 100…10 000, default
+/// upstream's.
+const USER_DATA_CHANGE_MAX_BATCH: usize = 2000;
+
+/// The saves waiting for the next `UserDataChanged` of each user.
+#[derive(Default)]
+struct PendingChanges {
+    /// User → the items saved, in save order, without repeats.
+    users: HashMap<Uuid, (Vec<Uuid>, HashSet<Uuid>)>,
+    /// How many items the batch holds, over every user.
+    count: usize,
+    /// The open batch's number, while its window runs.
+    batch: Option<u64>,
+    /// The number the next batch gets.
+    next: u64,
+}
+
+impl PendingChanges {
+    /// Ends the open batch and returns what it gathered.
+    fn take(&mut self) -> HashMap<Uuid, Vec<Uuid>> {
+        self.batch = None;
+        self.count = 0;
+        std::mem::take(&mut self.users)
+            .into_iter()
+            .map(|(user, (items, _))| (user, items))
+            .collect()
+    }
+}
+
+/// Where the user-data manager sends the `UserDataChanged` message of each
+/// batch of saves to a user's sessions: upstream's `UserDataChangeNotifier`,
+/// which hears every `UserDataSaved`.
 #[async_trait]
 pub trait UserDataChangedSink: Send + Sync {
     /// Sends one serialized `UserDataChanged` message (`data`) to every
     /// session of `user_id`. Best-effort: delivery never fails a save.
     async fn user_data_changed(&self, user_id: Uuid, data: &str);
+
+    /// Whether `user_id` has a session that would hear the message, so a
+    /// batch nobody would hear costs no reads. The default answers `true`.
+    async fn has_listener(&self, _user_id: Uuid) -> bool {
+        true
+    }
 }
 
 /// [`UserDataChangedSink`] over the session manager, held weakly: the
@@ -78,6 +146,13 @@ impl UserDataChangedSink for SessionUserDataSink {
                 .await;
         }
     }
+
+    async fn has_listener(&self, user_id: Uuid) -> bool {
+        match self.0.upgrade() {
+            Some(sessions) => sessions.has_listener_for_user(user_id).await,
+            None => false,
+        }
+    }
 }
 
 /// The concrete user-data manager.
@@ -86,10 +161,12 @@ pub struct FerrofinUserDataManager {
     db: Database,
     config: Arc<dyn ServerConfigurationManager>,
     save_listener: Arc<OnceLock<Weak<dyn UserDataSaveListener>>>,
-    /// Where propagated saves are announced, set by the composition root
-    /// once the session manager exists ([`Self::set_user_data_changed_sink`]).
-    /// Unset (unit tests), they are announced nowhere.
+    /// Where saves are announced, set by the composition root once the
+    /// session manager exists ([`Self::set_user_data_changed_sink`]). Unset
+    /// (unit tests), they are announced nowhere.
     changed: Arc<std::sync::OnceLock<Arc<dyn UserDataChangedSink>>>,
+    /// The saves waiting to be announced.
+    pending: Arc<Mutex<PendingChanges>>,
     /// Where a played mark on a container finds the items it applies to,
     /// set by the composition root once the library manager exists
     /// ([`Self::set_container_members`]), and where a user-data read finds
@@ -122,6 +199,7 @@ impl FerrofinUserDataManager {
             config,
             save_listener: Arc::new(OnceLock::new()),
             changed: Arc::new(std::sync::OnceLock::new()),
+            pending: Arc::new(Mutex::new(PendingChanges::default())),
             members: Arc::new(OnceLock::new()),
         }
     }
@@ -139,10 +217,12 @@ impl FerrofinUserDataManager {
         let _ = self.members.set(ContainerMembers { library, counts });
     }
 
-    /// Sets where the user data this manager saves on its own (the other
-    /// versions of a video marked played or unplayed) is announced. The
-    /// first call wins; it closes the session manager ↔ user-data manager
-    /// cycle after both exist.
+    /// Sets where the user data this manager saves is announced, as
+    /// upstream's `UserDataChangeNotifier` does: every save but a playback
+    /// progress report, gathered per user for [`USER_DATA_CHANGE_WINDOW`],
+    /// each item with its owner or parent, so a season's or series' unplayed
+    /// count refreshes too. The first call wins; it closes the session
+    /// manager ↔ user-data manager cycle after both exist.
     pub fn set_user_data_changed_sink(&self, sink: Arc<dyn UserDataChangedSink>) {
         let _ = self.changed.set(sink);
     }
@@ -161,6 +241,7 @@ impl FerrofinUserDataManager {
     }
 
     async fn notify_saved(&self, user_id: Uuid, item_id: Uuid, reason: UserDataSaveReason) {
+        self.record_change(user_id, item_id, reason);
         let Some(listener) = self.save_listener.get().and_then(Weak::upgrade) else {
             return;
         };
@@ -183,6 +264,107 @@ impl FerrofinUserDataManager {
         }
     }
 
+    /// `OnUserDataManagerUserDataSaved`: adds a save to the user's batch,
+    /// opening a batch window if none runs. A playback progress report is
+    /// not announced, and a batch that reaches [`USER_DATA_CHANGE_MAX_BATCH`]
+    /// goes out at once.
+    fn record_change(&self, user_id: Uuid, item_id: Uuid, reason: UserDataSaveReason) {
+        if reason == UserDataSaveReason::PlaybackProgress || self.changed.get().is_none() {
+            return;
+        }
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        let (items, seen) = pending.users.entry(user_id).or_default();
+        if seen.insert(item_id) {
+            items.push(item_id);
+            pending.count += 1;
+        }
+        if pending.batch.is_none() {
+            let batch = pending.next;
+            pending.next += 1;
+            pending.batch = Some(batch);
+            let this = self.clone();
+            drop(tokio::spawn(async move {
+                tokio::time::sleep(USER_DATA_CHANGE_WINDOW).await;
+                this.send_batch(Some(batch)).await;
+            }));
+        }
+        if pending.count >= USER_DATA_CHANGE_MAX_BATCH {
+            let changes = pending.take();
+            drop(pending);
+            let this = self.clone();
+            drop(tokio::spawn(
+                async move { this.send_changes(changes).await },
+            ));
+        }
+    }
+
+    /// `UpdateTimerCallback`: sends batch `batch`, unless it already went out
+    /// because it filled up.
+    async fn send_batch(&self, batch: Option<u64>) {
+        let changes = match self.pending.lock() {
+            Ok(mut pending) if pending.batch == batch => pending.take(),
+            _ => return,
+        };
+        self.send_changes(changes).await;
+    }
+
+    /// Sends each user one `UserDataChanged` listing their saved items and,
+    /// one level up for the indicators, each item's owner or else its parent
+    /// (`GetOwner() ?? GetParent()`). Best-effort: a failed read sends what
+    /// it can.
+    async fn send_changes(&self, changes: HashMap<Uuid, Vec<Uuid>>) {
+        use crate::video_versions::{DbVersionReader, VersionRowReader as _};
+        let Some(sink) = self.changed.get() else {
+            return;
+        };
+        for (user_id, items) in changes {
+            if !sink.has_listener(user_id).await {
+                continue;
+            }
+            let rows = DbVersionReader(&self.db)
+                .rows_by_id(&items)
+                .await
+                .unwrap_or_default();
+            let up: HashMap<Uuid, Uuid> = rows
+                .iter()
+                .filter_map(|row| {
+                    let id = Uuid::parse_str(&row.id).ok()?;
+                    let above = [&row.owner_id, &row.parent_id]
+                        .into_iter()
+                        .find_map(|id| id.as_deref().and_then(|id| Uuid::parse_str(id).ok()))?;
+                    Some((id, above))
+                })
+                .collect();
+            let mut listed = Vec::with_capacity(items.len() * 2);
+            let mut seen = HashSet::new();
+            for item in items {
+                for id in std::iter::once(item).chain(up.get(&item).copied()) {
+                    if seen.insert(id) {
+                        listed.push(id);
+                    }
+                }
+            }
+            let mut user_data_list = Vec::with_capacity(listed.len());
+            for id in listed {
+                if let Ok(Some(dto)) = self.get_user_data_dto(id, user_id).await {
+                    user_data_list.push(dto);
+                }
+            }
+            if user_data_list.is_empty() {
+                continue;
+            }
+            let info = ferrofin_model::session::UserDataChangeInfo {
+                user_id,
+                user_data_list,
+            };
+            if let Ok(data) = serde_json::to_string(&info) {
+                sink.user_data_changed(user_id, &data).await;
+            }
+        }
+    }
+
     /// Resolves attached rows using the current item's source key order.
     /// Provider keys precede the own GUID; an unmatched legacy row remains a
     /// fallback rather than being filtered out before resolution.
@@ -191,6 +373,16 @@ impl FerrofinUserDataManager {
         item_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<UserDataEntity>, ServiceError> {
+        let (rows, keys) = self.rows_and_keys(item_id, user_id).await?;
+        Ok(Self::preferred_row(&rows, &keys))
+    }
+
+    /// The user's stored rows on the item, and the item's current keys.
+    async fn rows_and_keys(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(Vec<UserDataEntity>, Vec<String>), ServiceError> {
         let keys = self.keys_for(item_id).await?;
         let rows = sqlx::query_as::<_, UserDataEntity>(
             r#"SELECT * FROM "UserData" WHERE "ItemId" = ?1 AND "UserId" = ?2"#,
@@ -200,7 +392,26 @@ impl FerrofinUserDataManager {
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(Self::preferred_row(&rows, &keys))
+        Ok((rows, keys))
+    }
+
+    /// [`Self::read_row`], or the row `GetUserData` answers for an item the
+    /// user never wrote (`UserDataManager.cs:373-376`): empty, keyed by the
+    /// item's first user-data key, which is its id when it has no item row.
+    /// One key derivation serves both the row lookup and the empty row's key.
+    async fn read_or_unwritten_row(
+        &self,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<UserDataEntity, ServiceError> {
+        let (rows, keys) = self.rows_and_keys(item_id, user_id).await?;
+        Ok(Self::preferred_row(&rows, &keys).unwrap_or_else(|| {
+            let mut row = Self::empty_row(item_id, user_id);
+            if let Some(first) = keys.into_iter().next() {
+                row.custom_data_key = first;
+            }
+            row
+        }))
     }
 
     /// Pinned ResolveUserDataRow: exact current-key priority, then the first
@@ -240,27 +451,39 @@ impl FerrofinUserDataManager {
         )
     }
 
-    /// Reads the item's runtime ticks and [`BaseItemKind`], for the play-state
-    /// heuristics. A missing item yields `None`.
+    /// Reads what the play-state heuristics need about an item: its runtime
+    /// ticks and kind, and its `SupportsPlayedStatus`/`SupportsPositionTicksResume`
+    /// resolved from the row's `MediaType` and `ExtraType`. A missing item
+    /// yields `None`.
     async fn item_runtime_and_kind(
         &self,
         item_id: Uuid,
-    ) -> Result<Option<(i64, BaseItemKind)>, ServiceError> {
-        let row: Option<(Option<i64>, String)> = sqlx::query_as(
-            r#"SELECT "RunTimeTicks", "Type" FROM "BaseItems" WHERE "Id" = ?1 LIMIT 1"#,
+    ) -> Result<Option<PlayStateItem>, ServiceError> {
+        let row: Option<PlayStateRow> = sqlx::query_as(
+            r#"SELECT "RunTimeTicks", "Type", "MediaType", "ExtraType" FROM "BaseItems"
+               WHERE "Id" = ?1 LIMIT 1"#,
         )
         .bind(guid_to_db(item_id))
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
 
-        Ok(row.map(|(ticks, type_name)| {
-            (
-                ticks.unwrap_or(0),
-                // Unknown stored types default to Folder (a conservative choice that
-                // disables the position-resume heuristics).
-                kind_from_type_name(&type_name).unwrap_or(BaseItemKind::Folder),
-            )
+        Ok(row.map(|(ticks, type_name, media_type, extra_type)| {
+            // Unknown stored types default to Folder (a conservative choice that
+            // disables the position-resume heuristics).
+            let kind = kind_from_type_name(&type_name).unwrap_or(BaseItemKind::Folder);
+            PlayStateItem {
+                runtime_ticks: ticks.unwrap_or(0),
+                kind,
+                played_status: supports_played_status(
+                    kind,
+                    parse_media_type(media_type.as_deref()),
+                ),
+                resume: supports_position_ticks_resume(
+                    kind,
+                    extra_type.and_then(crate::dto_service::extra_type_from_disc),
+                ),
+            }
         }))
     }
 
@@ -291,7 +514,50 @@ impl FerrofinUserDataManager {
         for key in &keys {
             Self::upsert_one(&mut tx, row, key).await?;
         }
+        // An unparseable id has no derived keys to tell retired rows from.
+        if item_id.is_some() {
+            Self::update_retired(&mut tx, row, &keys).await?;
+        }
         tx.commit().await.map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Brings the user's rows of the item under keys it no longer reports to
+    /// `row`'s values, as `SaveUserData` does after its per-key upserts (v12.2
+    /// `UserDataManager.cs:79-92`). They are kept, not deleted: the key set
+    /// is briefly incomplete mid-refresh, and a deleted and re-added item
+    /// reattaches by them. Without this the any-row filters (`IsFavorite`,
+    /// `IsPlayed`, `IsResumable`) match a stale row the item's DTO no longer
+    /// reads. `RetentionDate` stays untouched, as on [`Self::upsert_one`].
+    async fn update_retired(
+        tx: &mut sqlx::SqliteConnection,
+        row: &UserDataEntity,
+        keys: &[String],
+    ) -> Result<(), ServiceError> {
+        let keys = serde_json::to_string(keys).map_err(|e| ServiceError::backend(e.to_string()))?;
+        sqlx::query(
+            r#"UPDATE "UserData" SET
+                 "AudioStreamIndex" = ?4, "IsFavorite" = ?5, "LastPlayedDate" = ?6,
+                 "Likes" = ?7, "PlayCount" = ?8, "PlaybackPositionTicks" = ?9,
+                 "Played" = ?10, "Rating" = ?11, "SubtitleStreamIndex" = ?12
+               WHERE "ItemId" = ?1 AND "UserId" = ?2
+                 AND "CustomDataKey" NOT IN (SELECT value FROM json_each(?3))"#,
+        )
+        .bind(&row.item_id)
+        .bind(&row.user_id)
+        .bind(keys)
+        .bind(row.audio_stream_index)
+        .bind(row.is_favorite)
+        .bind(opt_datetime_to_db(row.last_played_date))
+        .bind(row.rating.map(|rating| rating >= MIN_LIKE_VALUE))
+        .bind(row.play_count)
+        .bind(row.playback_position_ticks)
+        .bind(row.played)
+        .bind(row.rating)
+        .bind(row.subtitle_stream_index)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
         Ok(())
     }
 
@@ -333,7 +599,7 @@ impl FerrofinUserDataManager {
         .bind(row.audio_stream_index)
         .bind(row.is_favorite)
         .bind(opt_datetime_to_db(row.last_played_date))
-        .bind(row.rating.map(|rating| rating >= 6.5))
+        .bind(row.rating.map(|rating| rating >= MIN_LIKE_VALUE))
         .bind(row.play_count)
         .bind(row.playback_position_ticks)
         .bind(row.played)
@@ -364,6 +630,149 @@ impl FerrofinUserDataManager {
             retention_date: None,
             subtitle_stream_index: None,
         }
+    }
+
+    /// Saves `row` after a report that changed only the remembered tracks:
+    /// the same save, announcement and played-state propagation as a report
+    /// with a position (`OnPlaybackProgress`'s `if (changed)` block).
+    async fn save_track_change(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        row: &UserDataEntity,
+        reason: UserDataSaveReason,
+    ) -> Result<(), ServiceError> {
+        self.upsert_row(row).await?;
+        self.notify_saved(user_id, item_id, reason).await;
+        if row.played {
+            self.propagate_played_state(user_id, item_id, true, true)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Saves a play-state report — the shared body of
+    /// [`UserDataManager::update_play_state_with_reason`] and
+    /// [`UserDataManager::update_play_progress`]. With `streams`, the reported
+    /// tracks are kept as `UpdatePlaybackSettings` keeps them, in the same save,
+    /// and a report with no position saves when they change (jellyfin#16501's
+    /// `if (tracksChanged) changed = true`).
+    async fn save_play_state(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        reason: UserDataSaveReason,
+        streams: Option<ferrofin_traits::library::ReportedStreams>,
+    ) -> Result<bool, ServiceError> {
+        let config = self.config.configuration().await?;
+        let PlayStateItem {
+            runtime_ticks,
+            kind,
+            played_status,
+            resume,
+        } = self
+            .item_runtime_and_kind(item_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("item {item_id}")))?;
+
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
+        let tracks_changed = streams.is_some_and(|streams| {
+            streams.apply_to(&mut row.audio_stream_index, &mut row.subtitle_stream_index)
+        });
+
+        let Some(mut position_ticks) = reported_position_ticks else {
+            if reason == UserDataSaveReason::PlaybackFinished {
+                // Source SessionManager's successful stop without a position
+                // counts a completed play before its PlaybackFinished event.
+                row.play_count += 1;
+                row.played = played_status;
+                row.playback_position_ticks = 0;
+                row.last_played_date = Some(chrono::Utc::now());
+                self.upsert_row(&row).await?;
+                self.notify_saved(user_id, item_id, reason).await;
+                return Ok(true);
+            }
+            // jellyfin#16501: a report with no position still saves a
+            // changed track choice (`if (tracksChanged) changed = true`).
+            if tracks_changed {
+                self.save_track_change(user_id, item_id, &row, reason)
+                    .await?;
+            }
+            return Ok(false);
+        };
+        let has_runtime = runtime_ticks > 0;
+        let is_audiobook = matches!(kind, BaseItemKind::AudioBook);
+        let is_book = matches!(kind, BaseItemKind::Book);
+        let mut played_to_completion = false;
+
+        if position_ticks > 0 && has_runtime && !is_audiobook && !is_book {
+            #[allow(clippy::cast_precision_loss)]
+            let pct_in = (position_ticks as f64 / runtime_ticks as f64) * 100.0;
+
+            if pct_in < f64::from(config.min_resume_pct) {
+                position_ticks = 0;
+            } else if pct_in > f64::from(config.max_resume_pct)
+                || position_ticks >= runtime_ticks - TICKS_PER_SECOND
+            {
+                position_ticks = 0;
+                row.played = true;
+                played_to_completion = true;
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let duration_seconds = runtime_ticks as f64 / TICKS_PER_SECOND as f64;
+                if duration_seconds < f64::from(config.min_resume_duration_seconds) {
+                    position_ticks = 0;
+                    row.played = true;
+                    played_to_completion = true;
+                }
+            }
+        } else if position_ticks > 0 && has_runtime && is_audiobook {
+            #[allow(clippy::cast_precision_loss)]
+            let position_minutes = position_ticks as f64 / TICKS_PER_SECOND as f64 / 60.0;
+            #[allow(clippy::cast_precision_loss)]
+            let remaining_minutes =
+                (runtime_ticks - position_ticks) as f64 / TICKS_PER_SECOND as f64 / 60.0;
+            if position_minutes < f64::from(config.min_audiobook_resume) {
+                position_ticks = 0;
+            } else if remaining_minutes < f64::from(config.max_audiobook_resume)
+                || position_ticks >= runtime_ticks
+            {
+                position_ticks = 0;
+                row.played = true;
+                played_to_completion = true;
+            }
+        } else if !has_runtime {
+            row.played = true;
+            played_to_completion = true;
+            position_ticks = 0;
+        }
+
+        if !played_status {
+            position_ticks = 0;
+            row.played = false;
+        }
+        if !resume {
+            position_ticks = 0;
+        }
+
+        row.playback_position_ticks = position_ticks;
+        if played_to_completion || position_ticks > 0 {
+            row.last_played_date = Some(chrono::Utc::now());
+        }
+        self.upsert_row(&row).await?;
+        self.notify_saved(user_id, item_id, reason).await;
+        // "A completed version marks every alternate version played and
+        // clears their resume points" — `if (data.Played == true && item is
+        // Video playedVideo) playedVideo.PropagatePlayedState(user, true)`
+        // after the progress and the stop save (`SessionManager.cs:
+        // 1001-1006,1206-1211`).
+        if row.played {
+            self.propagate_played_state(user_id, item_id, true, true)
+                .await?;
+        }
+
+        Ok(played_to_completion)
     }
 
     /// Gives every other version of a video the played state just set on
@@ -418,21 +827,18 @@ impl FerrofinUserDataManager {
             return Ok(());
         }
         let versions = VersionRows::load(&reader, &[item]).await?;
-        let mut saved: Vec<UserItemDataDto> = Vec::new();
         for version in versions.all_version_ids(item) {
             if version == item_id {
                 continue;
             }
-            let stored = self.read_row(version, user_id).await?;
+            let mut row = self.read_or_unwritten_row(version, user_id).await?;
             let row = if played {
-                let mut row = stored.unwrap_or_else(|| Self::empty_row(version, user_id));
                 row.played = true;
                 if reset_position {
                     row.playback_position_ticks = 0;
                 }
                 row
             } else {
-                let mut row = stored.unwrap_or_else(|| Self::empty_row(version, user_id));
                 row.played = false;
                 row.play_count = 0;
                 row.playback_position_ticks = 0;
@@ -441,32 +847,12 @@ impl FerrofinUserDataManager {
             };
             self.upsert_row(&row).await?;
             // Each version's save is a `TogglePlayed` `SaveUserData`
-            // (`Video.PropagatePlayedState`), which the NFO saver hears too.
+            // (`Video.PropagatePlayedState`), which the NFO saver and the
+            // user's sessions hear too.
             self.notify_saved(user_id, version, UserDataSaveReason::TogglePlayed)
                 .await;
-            saved.push(to_dto(&row, version));
         }
-        // The request path announces only the video it saved, so the
-        // versions are announced here, together.
-        self.announce(user_id, saved).await;
         Ok(())
-    }
-
-    /// Announces user data this manager saved on its own as one
-    /// `UserDataChanged` message. Each save is a `UserDataSaved` upstream,
-    /// which the user's sessions hear as `UserDataChanged`.
-    async fn announce(&self, user_id: Uuid, saved: Vec<UserItemDataDto>) {
-        if let Some(sink) = self.changed.get()
-            && !saved.is_empty()
-        {
-            let info = ferrofin_model::session::UserDataChangeInfo {
-                user_id,
-                user_data_list: saved,
-            };
-            if let Ok(data) = serde_json::to_string(&info) {
-                sink.user_data_changed(user_id, &data).await;
-            }
-        }
     }
 
     /// The items a played mark on `item_id` applies to, or `None` when it is
@@ -543,8 +929,9 @@ impl FerrofinUserDataManager {
     ///
     /// One write per member, as upstream's per-item `SaveUserData` — not one
     /// transaction around them all, which would hold the single writer for a
-    /// whole library's mark and stall every playback report meanwhile. The
-    /// members saved are announced together, even when a later one failed.
+    /// whole library's mark and stall every playback report meanwhile. Each
+    /// save is announced as it lands, so the members saved before a failing
+    /// one are announced too.
     async fn mark_container(
         &self,
         user_id: Uuid,
@@ -552,25 +939,12 @@ impl FerrofinUserDataManager {
         played: bool,
         date_played: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<UserItemDataDto, ServiceError> {
-        let mut saved = Vec::with_capacity(container.leaves.len());
-        let mut failed = None;
         for &leaf in &container.leaves {
-            let marked = if played {
-                self.mark_item_played(user_id, leaf, date_played).await
+            if played {
+                self.mark_item_played(user_id, leaf, date_played).await?;
             } else {
-                self.mark_item_unplayed(user_id, leaf).await
-            };
-            match marked {
-                Ok(dto) => saved.push(dto),
-                Err(error) => {
-                    failed = Some(error);
-                    break;
-                }
+                self.mark_item_unplayed(user_id, leaf).await?;
             }
-        }
-        self.announce(user_id, saved).await;
-        if let Some(error) = failed {
-            return Err(error);
         }
         if !played {
             self.clear_own_play_state(user_id, container.id).await?;
@@ -622,7 +996,11 @@ impl FerrofinUserDataManager {
             .unwrap_or_else(|| to_dto(&Self::empty_row(container.id, user_id), container.id));
         if let Some(members) = self.members.get()
             && kind_from_type_name(&container.root.type_).is_some_and(|kind| {
-                crate::kinds::supports_user_data_from_children(kind) && supports_played_status(kind)
+                crate::kinds::supports_user_data_from_children(kind)
+                    && supports_played_status(
+                        kind,
+                        parse_media_type(container.root.media_type.as_deref()),
+                    )
             })
         {
             let counts = self
@@ -660,6 +1038,46 @@ impl FerrofinUserDataManager {
         counts.get_played_and_total_count(&query, id).await
     }
 
+    /// Folds the completion of `item`'s version played last into `dto`, its
+    /// own user data — `GetResumeUserData(user, item)?.ApplyTo(dto)`
+    /// (v12.2 `UserDataManager.cs:263-357, 424`). A video that is a version
+    /// itself, or that no row names as its primary, is left alone after at
+    /// most one indexed read; only a video with versions reads its group and
+    /// their user data.
+    async fn apply_version_resume(
+        &self,
+        dto: &mut UserItemDataDto,
+        item: &BaseItemEntity,
+        item_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), ServiceError> {
+        use crate::video_versions::{DbVersionReader, VersionRows, resume_user_data};
+        if item.primary_version_id.is_some()
+            || !kind_from_type_name(&item.type_).is_some_and(crate::kinds::is_video)
+        {
+            return Ok(());
+        }
+        let has_versions: bool = sqlx::query_scalar(
+            r#"SELECT EXISTS (SELECT 1 FROM "BaseItems" x
+                              WHERE x."PrimaryVersionId" = ?1 AND x."Id" <> ?1)"#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_one(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        if !has_versions {
+            return Ok(());
+        }
+        let versions = VersionRows::load(&DbVersionReader(&self.db), &[item]).await?;
+        let data = self
+            .get_user_data_dtos(&versions.all_version_ids(item), user_id)
+            .await?;
+        if let Some(resume) = resume_user_data(&versions, item, |id| data.get(&id)) {
+            resume.apply_to(dto);
+        }
+        Ok(())
+    }
+
     /// `item.FillUserDataDtoValues(dto, userData, null, user, options)` as
     /// `GetUserDataDto(item, user)` runs it (v12.2 UserDataManager.cs:411-427),
     /// chosen by class: a `Folder` (Folder.cs:2024-2081) takes its played
@@ -689,10 +1107,15 @@ impl FerrofinUserDataManager {
         // the folder gates below, as `supports_played_status` excludes it.
         if !crate::kinds::is_folder(kind) {
             crate::dto_service::fill_leaf_played_percentage(dto, item.run_time_ticks);
-            return Ok(());
+            // `GetResumeUserData(user, item)?.ApplyTo(dto)` (UserDataManager.cs:424).
+            return self
+                .apply_version_resume(dto, &item, item_id, user_id)
+                .await;
         }
         // No item DTO, so only the `SupportsPlayedStatus` half applies.
-        if !(crate::kinds::supports_user_data_from_children(kind) && supports_played_status(kind)) {
+        if !(crate::kinds::supports_user_data_from_children(kind)
+            && supports_played_status(kind, parse_media_type(item.media_type.as_deref())))
+        {
             return Ok(());
         }
         let Some(user) = crate::item_repository::query_user(&self.db, user_id).await? else {
@@ -713,10 +1136,7 @@ impl FerrofinUserDataManager {
         item_id: Uuid,
         date_played: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<UserItemDataDto, ServiceError> {
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
 
         // A supplied date is a fresh play → increment the count.
         if date_played.is_some() {
@@ -749,10 +1169,7 @@ impl FerrofinUserDataManager {
         user_id: Uuid,
         item_id: Uuid,
     ) -> Result<UserItemDataDto, ServiceError> {
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
 
         row.play_count = 0;
         row.playback_position_ticks = 0;
@@ -933,6 +1350,7 @@ fn key_source<'a>(
             .filter(|a| !a.is_empty()),
         extra_type: item.extra_type.and_then(extra_type_name),
         run_time_ticks: item.run_time_ticks,
+        channel_name_key: crate::user_data_keys::live_tv_channel_name_key_enabled(),
     }
 }
 
@@ -956,7 +1374,7 @@ fn to_dto(row: &UserDataEntity, item_id: Uuid) -> UserItemDataDto {
         playback_position_ticks: row.playback_position_ticks,
         play_count: row.play_count,
         is_favorite: row.is_favorite,
-        likes: row.rating.map(|rating| rating >= 6.5),
+        likes: row.rating.map(|rating| rating >= MIN_LIKE_VALUE),
         last_played_date: row.last_played_date,
         played: row.played,
         key: row.custom_data_key.clone(),
@@ -1002,10 +1420,7 @@ impl UserDataManager for FerrofinUserDataManager {
             ));
         }
         // C# loads the existing row, applies only the set fields, then saves.
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
 
         if let Some(v) = user_data.playback_position_ticks {
             row.playback_position_ticks = v;
@@ -1065,10 +1480,7 @@ impl UserDataManager for FerrofinUserDataManager {
         item_id: Uuid,
         user_id: Uuid,
     ) -> Result<Option<UserItemDataDto>, ServiceError> {
-        let row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let row = self.read_or_unwritten_row(item_id, user_id).await?;
         let mut dto = to_dto(&row, item_id);
         self.fill_user_data_dto_values(&mut dto, item_id, user_id)
             .await?;
@@ -1081,13 +1493,35 @@ impl UserDataManager for FerrofinUserDataManager {
         user_id: Uuid,
     ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
         let mut map = self.stored_user_data_dtos(item_ids, user_id).await?;
-        // Items without a stored row get the empty-row DTO, matching the
-        // per-item path's `unwrap_or_else(empty_row)` fallback. With only an id
-        // in hand the synthetic key can only be the guid; the row-aware form
-        // (`get_user_data_dtos_for_rows`) derives the real one.
+        // Items without a stored row get the empty-row DTO keyed by their first
+        // user-data key (`GetUserDataBatch`'s `keys[0]`, `UserDataManager.cs:251`),
+        // derived for all of them in one batch. An id with no item row keeps
+        // the id as its key.
+        let mut unwritten: Vec<String> = item_ids
+            .iter()
+            .filter(|id| !map.contains_key(id))
+            .map(|&id| guid_to_db(id))
+            .collect();
+        unwritten.sort_unstable();
+        unwritten.dedup();
+        if unwritten.is_empty() {
+            return Ok(map);
+        }
+        let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
+        let first_keys: HashMap<String, String> =
+            crate::user_data_key_repository::load_keys_for_items(&mut conn, &unwritten)
+                .await?
+                .into_iter()
+                .filter_map(|(id, keys)| Some((id, keys.into_iter().next()?)))
+                .collect();
         for &item_id in item_ids {
-            map.entry(item_id)
-                .or_insert_with(|| to_dto(&Self::empty_row(item_id, user_id), item_id));
+            map.entry(item_id).or_insert_with(|| {
+                let mut row = Self::empty_row(item_id, user_id);
+                if let Some(first) = first_keys.get(&guid_to_db(item_id)) {
+                    row.custom_data_key.clone_from(first);
+                }
+                to_dto(&row, item_id)
+            });
         }
         Ok(map)
     }
@@ -1175,10 +1609,7 @@ impl UserDataManager for FerrofinUserDataManager {
         // Assign the like directly (including `None`) so a clear persists — the
         // merge path in `save_user_data` can only ever *set* a like. Port of C#
         // `UpdateUserItemRatingInternal` (`userData.Likes = likes; Save(...)`).
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
         row.likes = likes;
         row.rating = likes.map(|likes| if likes { 10.0 } else { 1.0 });
         self.upsert_row(&row).await?;
@@ -1209,103 +1640,31 @@ impl UserDataManager for FerrofinUserDataManager {
         reported_position_ticks: Option<i64>,
         reason: UserDataSaveReason,
     ) -> Result<bool, ServiceError> {
-        let config = self.config.configuration().await?;
-        let (runtime_ticks, kind) = self
-            .item_runtime_and_kind(item_id)
-            .await?
-            .ok_or_else(|| ServiceError::not_found(format!("item {item_id}")))?;
+        self.save_play_state(user_id, item_id, reported_position_ticks, reason, None)
+            .await
+    }
 
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
-
-        let Some(mut position_ticks) = reported_position_ticks else {
-            if reason == UserDataSaveReason::PlaybackFinished {
-                // Source SessionManager's successful stop without a position
-                // counts a completed play before its PlaybackFinished event.
-                row.play_count += 1;
-                row.played = supports_played_status(kind);
-                row.playback_position_ticks = 0;
-                row.last_played_date = Some(chrono::Utc::now());
-                self.upsert_row(&row).await?;
-                self.notify_saved(user_id, item_id, reason).await;
-                return Ok(true);
-            }
-            return Ok(false);
-        };
-        let has_runtime = runtime_ticks > 0;
-        let is_audiobook = matches!(kind, BaseItemKind::AudioBook);
-        let is_book = matches!(kind, BaseItemKind::Book);
-        let mut played_to_completion = false;
-
-        if position_ticks > 0 && has_runtime && !is_audiobook && !is_book {
-            #[allow(clippy::cast_precision_loss)]
-            let pct_in = (position_ticks as f64 / runtime_ticks as f64) * 100.0;
-
-            if pct_in < f64::from(config.min_resume_pct) {
-                position_ticks = 0;
-            } else if pct_in > f64::from(config.max_resume_pct)
-                || position_ticks >= runtime_ticks - TICKS_PER_SECOND
-            {
-                position_ticks = 0;
-                row.played = true;
-                played_to_completion = true;
-            } else {
-                #[allow(clippy::cast_precision_loss)]
-                let duration_seconds = runtime_ticks as f64 / TICKS_PER_SECOND as f64;
-                if duration_seconds < f64::from(config.min_resume_duration_seconds) {
-                    position_ticks = 0;
-                    row.played = true;
-                    played_to_completion = true;
-                }
-            }
-        } else if position_ticks > 0 && has_runtime && is_audiobook {
-            #[allow(clippy::cast_precision_loss)]
-            let position_minutes = position_ticks as f64 / TICKS_PER_SECOND as f64 / 60.0;
-            #[allow(clippy::cast_precision_loss)]
-            let remaining_minutes =
-                (runtime_ticks - position_ticks) as f64 / TICKS_PER_SECOND as f64 / 60.0;
-            if position_minutes < f64::from(config.min_audiobook_resume) {
-                position_ticks = 0;
-            } else if remaining_minutes < f64::from(config.max_audiobook_resume)
-                || position_ticks >= runtime_ticks
-            {
-                position_ticks = 0;
-                row.played = true;
-                played_to_completion = true;
-            }
-        } else if !has_runtime {
-            row.played = true;
-            played_to_completion = true;
-            position_ticks = 0;
-        }
-
-        if !supports_played_status(kind) {
-            position_ticks = 0;
-            row.played = false;
-        }
-        if !supports_position_ticks_resume(kind) {
-            position_ticks = 0;
-        }
-
-        row.playback_position_ticks = position_ticks;
-        if played_to_completion || position_ticks > 0 {
-            row.last_played_date = Some(chrono::Utc::now());
-        }
-        self.upsert_row(&row).await?;
-        self.notify_saved(user_id, item_id, reason).await;
-        // "A completed version marks every alternate version played and
-        // clears their resume points" — `if (data.Played == true && item is
-        // Video playedVideo) playedVideo.PropagatePlayedState(user, true)`
-        // after the progress and the stop save (`SessionManager.cs:
-        // 1001-1006,1206-1211`).
-        if row.played {
-            self.propagate_played_state(user_id, item_id, true, true)
+    async fn update_play_progress(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        streams: ferrofin_traits::library::ReportedStreams,
+    ) -> Result<bool, ServiceError> {
+        let played = self
+            .save_play_state(
+                user_id,
+                item_id,
+                reported_position_ticks,
+                UserDataSaveReason::PlaybackProgress,
+                Some(streams),
+            )
+            .await?;
+        if streams.resets_selections() {
+            self.reset_playback_stream_selections(user_id, item_id)
                 .await?;
         }
-
-        Ok(played_to_completion)
+        Ok(played)
     }
 
     async fn mark_played(
@@ -1364,17 +1723,14 @@ impl UserDataManager for FerrofinUserDataManager {
         // non-resumable; a rewatch of a played, resumable item (episode/movie)
         // defers the stamp to the progress/stop path so that barely-started
         // rewatches don't advance Next Up.
-        let mut row = self
-            .read_row(item_id, user_id)
-            .await?
-            .unwrap_or_else(|| Self::empty_row(item_id, user_id));
+        let mut row = self.read_or_unwritten_row(item_id, user_id).await?;
         row.play_count += 1;
-        let kind = self.item_runtime_and_kind(item_id).await?.map(|(_, k)| k);
-        let resumable = kind.is_some_and(supports_position_ticks_resume);
+        let item = self.item_runtime_and_kind(item_id).await?;
+        let resumable = item.as_ref().is_some_and(|item| item.resume);
         if !row.played || !resumable {
             row.last_played_date = Some(chrono::Utc::now());
         }
-        if kind.is_some_and(|k| supports_played_status(k) && !supports_position_ticks_resume(k)) {
+        if item.is_some_and(|item| item.played_status && !item.resume) {
             row.played = true;
         }
         self.upsert_row(&row).await?;
@@ -2153,6 +2509,236 @@ mod tests {
         assert!(favorited.iter().all(|f| *f), "every row carries it");
     }
 
+    /// `UserDataManagerTests.SaveUserData_RowUnderRetiredKey_IsKeptInAgreement`
+    /// (v12.2): a save keeps the user's row under a key the item no longer
+    /// reports, which a re-added item reattaches by, but brings it to the
+    /// saved values, so a stale position cannot hold the item in Continue
+    /// Watching once it is played.
+    #[tokio::test]
+    async fn a_save_keeps_a_retired_key_row_in_agreement() {
+        let db = test_db().await;
+        let (user, item, other) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        seed_user(&db, user).await;
+        crate::test_support::seed_named_user(&db, other, "other").await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        seed_provider_id(&db, item, "Tmdb", "700391").await;
+        for who in [user, other] {
+            sqlx::query(
+                r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite",
+                       "PlayCount","PlaybackPositionTicks","Played")
+                   VALUES (?1, ?2, 'Old Key', 0, 0, 111, 0)"#,
+            )
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(who))
+            .execute(db.writer())
+            .await
+            .expect("seed retired row");
+        }
+
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        mgr.save_user_data(
+            user,
+            item,
+            &UpdateUserItemDataDto {
+                played: Some(true),
+                playback_position_ticks: Some(0),
+                ..UpdateUserItemDataDto::default()
+            },
+        )
+        .await
+        .expect("save");
+
+        let rows: Vec<(String, String, bool, i64)> = sqlx::query_as(
+            r#"SELECT "UserId", "CustomDataKey", "Played", "PlaybackPositionTicks"
+               FROM "UserData" WHERE "ItemId" = ?1 ORDER BY 1, 2"#,
+        )
+        .bind(guid_to_db(item))
+        .fetch_all(db.pool())
+        .await
+        .expect("rows");
+        let (mine, theirs): (Vec<_>, Vec<_>) =
+            rows.into_iter().partition(|row| row.0 == guid_to_db(user));
+        let mut keys: Vec<&str> = mine.iter().map(|row| row.1.as_str()).collect();
+        keys.sort_unstable();
+        let mut expected = vec![item.to_string(), "700391".to_owned(), "Old Key".to_owned()];
+        expected.sort_unstable();
+        assert_eq!(keys, expected, "the retired row is kept");
+        assert!(
+            mine.iter().all(|row| row.2 && row.3 == 0),
+            "every row agrees: {mine:?}"
+        );
+        assert_eq!(
+            theirs,
+            [(guid_to_db(other), "Old Key".to_owned(), false, 111)],
+            "another user's row is left alone"
+        );
+    }
+
+    /// The resume list matches any row of the user, so a retired-key row's
+    /// stale position kept a finished movie in Continue Watching
+    /// (upstream issue 12195) until the save brought that row along.
+    #[tokio::test]
+    async fn a_finished_item_leaves_resume_despite_a_retired_key_row() {
+        use ferrofin_traits::options::InternalItemsQuery;
+        use ferrofin_traits::persistence::ItemRepository as _;
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        seed_provider_id(&db, item, "Tmdb", "700391").await;
+        crate::test_support::seed_library_over(&db, &[item]).await;
+        sqlx::query(
+            r#"INSERT INTO "UserData" ("ItemId","UserId","CustomDataKey","IsFavorite",
+                   "PlayCount","PlaybackPositionTicks","Played")
+               VALUES (?1, ?2, 'Old Key', 0, 0, 24000000000, 0)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(guid_to_db(user_id))
+        .execute(db.writer())
+        .await
+        .expect("seed retired row");
+        let repository = crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        );
+        let resume = || async {
+            repository
+                .get_item_list(&InternalItemsQuery {
+                    user: Some(user.clone()),
+                    is_resumable: Some(true),
+                    ..InternalItemsQuery::default()
+                })
+                .await
+                .expect("resume")
+                .len()
+        };
+        assert_eq!(resume().await, 1, "half watched under the old key");
+
+        FerrofinUserDataManager::new(db.clone(), config())
+            .save_user_data(
+                user_id,
+                item,
+                &UpdateUserItemDataDto {
+                    played: Some(true),
+                    playback_position_ticks: Some(0),
+                    ..UpdateUserItemDataDto::default()
+                },
+            )
+            .await
+            .expect("finish");
+        assert_eq!(resume().await, 0, "finished");
+    }
+
+    /// An item the user never wrote reports its first user-data key, as
+    /// `GetUserData`'s `new UserItemData { Key = item.GetUserDataKeys()[0] }`
+    /// and `GetUserDataBatch`'s `keys[0]` do: the TMDb id for a movie that has
+    /// one, its id for one that has none. An id with no item row keeps the id.
+    #[rstest::rstest]
+    #[case::provider_key(Some("700391"), true, "700391")]
+    #[case::no_provider(None, true, "00000000-0000-0000-0000-000000000002")]
+    #[case::no_item(None, false, "00000000-0000-0000-0000-000000000002")]
+    #[tokio::test]
+    async fn a_never_written_item_reports_its_first_user_data_key(
+        #[case] tmdb: Option<&str>,
+        #[case] stored: bool,
+        #[case] key: &str,
+    ) {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        if stored {
+            seed_item(&db, item, BaseItemKind::Movie).await;
+        }
+        if let Some(tmdb) = tmdb {
+            seed_provider_id(&db, item, "Tmdb", tmdb).await;
+        }
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+
+        let one = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("dto");
+        assert_eq!(one.key, key);
+        assert!(!one.is_favorite && !one.played);
+        let batch = mgr.get_user_data_dtos(&[item], user).await.expect("batch");
+        assert_eq!(batch[&item].key, key, "the batch read agrees");
+    }
+
+    /// An episode never written reports its series-derived first key, from
+    /// the per-item and the batch read alike.
+    #[tokio::test]
+    async fn a_never_written_episode_reports_its_series_derived_key() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let series = Uuid::from_u128(2);
+        let episode = Uuid::from_u128(3);
+        seed_user(&db, user).await;
+        seed_item(&db, series, BaseItemKind::Series).await;
+        seed_provider_id(&db, series, "Tvdb", "343498").await;
+        crate::test_support::seed_episode(&db, episode, "series-key", 1, 2, false, None).await;
+        let mut row = fetch_item(&db, episode).await;
+        row.series_id = Some(guid_to_db(series));
+        crate::test_support::save_item(&db, &row).await;
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+
+        let one = mgr
+            .get_user_data_dto(episode, user)
+            .await
+            .expect("read")
+            .expect("dto");
+        // The series' keys are `[343498, <series id>]`; an episode drops the
+        // series' own id and suffixes `SSSEEE`.
+        assert_eq!(one.key, "343498001002");
+        let batch = mgr
+            .get_user_data_dtos(&[episode, episode], user)
+            .await
+            .expect("batch");
+        assert_eq!(batch[&episode].key, "343498001002");
+    }
+
+    /// The writes that answer with the saved row's DTO.
+    #[derive(Debug, Clone, Copy)]
+    enum FirstWrite {
+        MarkPlayed,
+        MarkUnplayed,
+        SetLikes,
+    }
+
+    /// A write on a never-written item answers with the key its rows were
+    /// saved under, as upstream's re-read through `GetUserData` does, not
+    /// the item id.
+    #[rstest::rstest]
+    #[case::mark_played(FirstWrite::MarkPlayed)]
+    #[case::mark_unplayed(FirstWrite::MarkUnplayed)]
+    #[case::set_likes(FirstWrite::SetLikes)]
+    #[tokio::test]
+    async fn a_first_write_answers_with_the_first_user_data_key(#[case] write: FirstWrite) {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let item = Uuid::from_u128(2);
+        seed_user(&db, user).await;
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        seed_provider_id(&db, item, "Tmdb", "700391").await;
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+
+        let answered = match write {
+            FirstWrite::MarkPlayed => mgr.mark_played(user, item, None).await,
+            FirstWrite::MarkUnplayed => mgr.mark_unplayed(user, item).await,
+            FirstWrite::SetLikes => mgr.set_likes(user, item, Some(true)).await,
+        }
+        .expect("write");
+        assert_eq!(answered.key, "700391");
+        let read = mgr
+            .get_user_data_dto(item, user)
+            .await
+            .expect("read")
+            .expect("dto");
+        assert_eq!(read.key, answered.key, "the write and the read agree");
+    }
+
     /// A row written by Jellyfin under a provider key alone must be readable.
     ///
     /// The guid row is normally present too (the id is the last key Jellyfin
@@ -2747,6 +3333,44 @@ mod tests {
             .expect("read")
             .expect("some");
         assert_eq!(dto.playback_position_ticks, position);
+    }
+
+    /// Upstream's overrides reach the play-state paths: `Audio` never resumes
+    /// (`BaseItem.cs:190`), so a song is played outright at start and drops a
+    /// reported position; so does a trailer extra (`Video.cs:63-88`). A movie
+    /// keeps its position (`update_play_state_midway_keeps_resume_point`).
+    #[tokio::test]
+    async fn songs_and_trailer_extras_never_keep_a_resume_point() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let runtime = 3600 * TICKS_PER_SECOND;
+        let song = Uuid::from_u128(0x50);
+        let trailer = Uuid::from_u128(0x51);
+        seed_item(&db, song, BaseItemKind::Audio).await;
+        seed_item(&db, trailer, BaseItemKind::Video).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = ?1"#)
+            .bind(runtime)
+            .execute(db.writer())
+            .await
+            .expect("set runtime");
+        sqlx::query(r#"UPDATE "BaseItems" SET "ExtraType" = 2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(trailer))
+            .execute(db.writer())
+            .await
+            .expect("mark trailer extra");
+        let mgr = FerrofinUserDataManager::new(db, config());
+
+        for item in [song, trailer] {
+            mgr.record_playback_start(user, item).await.expect("start");
+            let row = mgr.read_row(item, user).await.expect("read").expect("row");
+            assert!(row.played, "played outright at start: {item}");
+            mgr.update_play_state(user, item, Some(runtime / 2))
+                .await
+                .expect("stop");
+            let row = mgr.read_row(item, user).await.expect("read").expect("row");
+            assert_eq!(row.playback_position_ticks, 0, "no resume point: {item}");
+        }
     }
 
     #[tokio::test]
@@ -4037,6 +4661,56 @@ mod tests {
         .unwrap();
     }
 
+    /// A single read of a primary's user data — the one `UserDataChanged`
+    /// pushes and the played/favorite responses carry — takes its completion
+    /// from the version played last (`GetUserDataDto` →
+    /// `GetResumeUserData(user, item)?.ApplyTo(dto)`, UserDataManager.cs:424):
+    /// finished on the 4K copy after the versions were grouped, the movie
+    /// reads played, its own resume bar cleared. The version read directly
+    /// keeps its own data.
+    #[tokio::test]
+    async fn a_primary_read_takes_the_completion_of_the_version_played_last() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (primary, _alt1, alt2) = version_group(&db).await;
+        let (mgr, _library) = container_manager(&db);
+        let finished = chrono::DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        mgr.save_user_data(
+            user,
+            primary,
+            &UpdateUserItemDataDto {
+                playback_position_ticks: Some(36_000_000_000),
+                last_played_date: Some(finished - chrono::Duration::days(30)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        mgr.save_user_data(
+            user,
+            alt2,
+            &UpdateUserItemDataDto {
+                played: Some(true),
+                last_played_date: Some(finished),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let movie = data(&mgr, primary, user).await;
+        assert!(movie.played, "finished on the 4K version");
+        assert_eq!(movie.last_played_date, Some(finished));
+        assert_eq!(movie.playback_position_ticks, 0);
+        assert_eq!(movie.played_percentage, None);
+        let version = data(&mgr, alt2, user).await;
+        assert_eq!(version.item_id, alt2);
+        assert!(version.played);
+    }
+
     /// Both alternate versions are marked played, and their positions reset
     /// so a watched version does not linger in "Continue Watching"; their
     /// other state (the play count) stays.
@@ -4119,9 +4793,10 @@ mod tests {
         }
     }
 
-    /// Records each announced `UserDataChanged` message.
+    /// Records each announced `UserDataChanged` message; with `deaf`, the
+    /// user has no session that would hear one.
     #[derive(Default)]
-    struct RecordingSink(std::sync::Mutex<Vec<(Uuid, serde_json::Value)>>);
+    struct RecordingSink(std::sync::Mutex<Vec<(Uuid, serde_json::Value)>>, bool);
 
     #[async_trait]
     impl UserDataChangedSink for RecordingSink {
@@ -4131,28 +4806,134 @@ mod tests {
                 .unwrap()
                 .push((user_id, serde_json::from_str(data).unwrap()));
         }
+
+        async fn has_listener(&self, _user_id: Uuid) -> bool {
+            !self.1
+        }
+    }
+
+    /// The messages sent once `count` of them have arrived, or after a
+    /// deadline well past the window, so a loaded host does not fail the test.
+    async fn sent_after_window(
+        sink: &RecordingSink,
+        count: usize,
+    ) -> Vec<(Uuid, serde_json::Value)> {
+        let deadline = tokio::time::Instant::now() + USER_DATA_CHANGE_WINDOW * 10;
+        loop {
+            let sent = sink.0.lock().unwrap().clone();
+            if sent.len() >= count || tokio::time::Instant::now() >= deadline {
+                return sent;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Whether nothing was sent through the window that would have sent it.
+    async fn nothing_sent_after_window(sink: &RecordingSink) -> bool {
+        tokio::time::sleep(USER_DATA_CHANGE_WINDOW + Duration::from_millis(250)).await;
+        sink.0.lock().unwrap().is_empty()
+    }
+
+    /// The item ids a `UserDataChanged` message lists, in order.
+    fn listed(info: &serde_json::Value) -> Vec<String> {
+        info["UserDataList"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["ItemId"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// `UserDataChangeNotifier`: the saves of one window reach each user's
+    /// sessions as one `UserDataChanged`, each item followed by its parent
+    /// (`GetOwner() ?? GetParent()`), and a playback progress report is
+    /// never announced.
+    #[tokio::test]
+    async fn saves_are_announced_in_one_batch_with_their_parents_and_progress_is_not() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let (series, season) = (Uuid::from_u128(0x5E0), Uuid::from_u128(0x5E1));
+        let (ep1, ep2) = (Uuid::from_u128(0xE1), Uuid::from_u128(0xE2));
+        seed_show(
+            &db,
+            series,
+            season,
+            &[(ep1, false, None), (ep2, false, None)],
+        )
+        .await;
+        let (mgr, _library) = container_manager(&db);
+        let sink = Arc::new(RecordingSink::default());
+        mgr.set_user_data_changed_sink(sink.clone());
+
+        mgr.update_play_state(user, ep1, Some(1_000)).await.unwrap();
+        assert!(
+            nothing_sent_after_window(&sink).await,
+            "a progress report is not announced"
+        );
+
+        mgr.mark_item_played(user, ep1, None).await.unwrap();
+        mgr.set_likes(user, ep2, Some(true)).await.unwrap();
+        mgr.mark_item_played(user, ep1, None).await.unwrap();
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "nothing before the window closes"
+        );
+        let sent = sent_after_window(&sink, 1).await;
+        assert_eq!(sent.len(), 1, "one message for the batch");
+        assert_eq!(sent[0].0, user);
+        assert_eq!(
+            listed(&sent[0].1),
+            [ep1, season, ep2].map(|id| id.simple().to_string()),
+            "each item once, with its season"
+        );
+        let season_data = &sent[0].1["UserDataList"][1];
+        assert_eq!(
+            season_data["UnplayedItemCount"], 1,
+            "the season's count refreshed"
+        );
+    }
+
+    /// A user with no session that would hear the batch is sent nothing.
+    #[tokio::test]
+    async fn a_batch_nobody_would_hear_is_not_sent() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        seed_user(&db, user).await;
+        let item = Uuid::from_u128(30);
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let mgr = FerrofinUserDataManager::new(db, config());
+        let sink = Arc::new(RecordingSink(std::sync::Mutex::default(), true));
+        mgr.set_user_data_changed_sink(sink.clone());
+
+        mgr.mark_item_played(user, item, None).await.unwrap();
+        assert!(nothing_sent_after_window(&sink).await);
     }
 
     /// Each version the propagation saved is announced to the user's
-    /// sessions as `UserDataChanged` (upstream fires `UserDataSaved` per
-    /// save); the primary itself is the request path's to announce.
+    /// sessions with the video itself (upstream fires `UserDataSaved` per
+    /// save, which the notifier batches).
     #[tokio::test]
     async fn propagated_played_state_is_announced_for_each_other_version() {
         let db = test_db().await;
         let user = Uuid::from_u128(1);
         seed_user(&db, user).await;
         let (primary, alt1, alt2) = version_group(&db).await;
+        // Never-written versions with keys of their own: each announcement
+        // carries the version's first user-data key, not its id.
+        seed_provider_id(&db, alt1, "Tmdb", "1111").await;
+        seed_provider_id(&db, alt2, "Tmdb", "2222").await;
         let mgr = FerrofinUserDataManager::new(db, config());
         let sink = Arc::new(RecordingSink::default());
         mgr.set_user_data_changed_sink(sink.clone());
 
         mgr.mark_played(user, primary, None).await.unwrap();
 
-        let sent = sink.0.lock().unwrap().clone();
+        let sent = sent_after_window(&sink, 1).await;
         assert_eq!(sent.len(), 1, "one message for the group");
         let (to, info) = &sent[0];
         assert_eq!(*to, user);
-        let mut items: Vec<(String, bool)> = info["UserDataList"]
+        let mut items: Vec<(String, bool, String)> = info["UserDataList"]
             .as_array()
             .unwrap()
             .iter()
@@ -4160,22 +4941,28 @@ mod tests {
                 (
                     d["ItemId"].as_str().unwrap().to_owned(),
                     d["Played"].as_bool().unwrap(),
+                    d["Key"].as_str().unwrap().to_owned(),
                 )
             })
             .collect();
         items.sort();
         let mut want = vec![
-            (alt1.simple().to_string(), true),
-            (alt2.simple().to_string(), true),
+            // The primary has no provider id of its own, so its first key is
+            // its id.
+            (primary.simple().to_string(), true, primary.to_string()),
+            (alt1.simple().to_string(), true, "1111".to_owned()),
+            (alt2.simple().to_string(), true, "2222".to_owned()),
         ];
         want.sort();
         assert_eq!(items, want);
 
-        // A video with no versions announces nothing of its own.
+        // A video with no versions announces only itself.
         let solo = Uuid::from_u128(30);
         seed_item(&mgr.db, solo, BaseItemKind::Movie).await;
         mgr.mark_played(user, solo, None).await.unwrap();
-        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        let sent = sent_after_window(&sink, 2).await;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(listed(&sent[1].1), [solo.simple().to_string()]);
     }
 
     #[tokio::test]
@@ -4282,9 +5069,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows, 5, "the primary and its four other versions");
-        let last = sink.0.lock().unwrap().last().cloned().unwrap();
-        assert_eq!(last.0, other);
-        assert_eq!(last.1["UserDataList"].as_array().map(Vec::len), Some(4));
+        // Both users' saves may share one window, whose users go out in no
+        // set order.
+        let sent = sent_after_window(&sink, 2).await;
+        let (_, theirs) = sent.iter().find(|(to, _)| *to == other).unwrap();
+        assert_eq!(
+            theirs["UserDataList"].as_array().map(Vec::len),
+            Some(5),
+            "the primary and its four other versions"
+        );
     }
 
     /// A user-data manager whose container marks reach their members through
@@ -4428,9 +5221,13 @@ mod tests {
             dto.key, "73739",
             "the series' first user-data key, as its item DTO derives it, not its guid"
         );
-        let sent = sink.0.lock().unwrap().clone();
+        let sent = sent_after_window(&sink, 1).await;
         assert_eq!(sent.len(), 1, "one message for the episodes");
-        assert_eq!(sent[0].1["UserDataList"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            listed(&sent[0].1),
+            [ep1, season, ep2].map(|id| id.simple().to_string()),
+            "the episodes and, one level up, their season"
+        );
 
         let dto = mgr.mark_unplayed(user, series).await.unwrap();
         assert!(!data(&mgr, ep1, user).await.played);

@@ -28,7 +28,8 @@ use serde::Deserialize;
 /// candidate setting is already exposed as [`Config::port`].
 pub const DEFAULT_HTTP_PORT: u16 = 8096;
 
-/// Default TCP port for the HTTPS endpoint (TLS termination is deferred).
+/// Default TCP port for the HTTPS endpoint, served when the network
+/// configuration enables HTTPS and its certificate loads.
 ///
 /// `8920` is the Jellyfin parity value (`ServerConfiguration.HttpsServerPortNumber`).
 /// FLAGGED as a magic number, same rationale as [`DEFAULT_HTTP_PORT`].
@@ -54,6 +55,15 @@ const DATABASE_FILE_NAME: &str = "ferrofin.db";
 
 /// ASP.NET's `HostOptions.ShutdownTimeout` default, which Jellyfin runs with.
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u32 = 30;
+
+/// Minimum period, in milliseconds, between pushes of a dashboard WebSocket
+/// stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). The client names
+/// the period in its `*Start` subscription; Ferrofin floors it because it drives
+/// these streams on a timer — each tick recomputes and resends the full snapshot
+/// — unlike upstream's event-driven `BasePeriodicWebSocketListener`, where the
+/// period is only a debounce ceiling. 100 ms allows far faster updates than
+/// jellyfin-web's 1500 ms while bounding the worst case for a hostile client.
+const DEFAULT_WS_MIN_STREAM_PERIOD_MS: u32 = 100;
 
 /// Command-line arguments — the highest-precedence configuration layer.
 ///
@@ -135,6 +145,7 @@ struct FileConfig {
     metrics_sample_interval: Option<u32>,
     metrics_scan_duration_buckets: Option<Vec<f64>>,
     shutdown_timeout_secs: Option<u32>,
+    websocket_min_stream_period_ms: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
     scan_directory_cache_records: Option<u32>,
@@ -152,6 +163,7 @@ struct FileConfig {
     wasm_write_content_mb: Option<u32>,
     wasm_subtitle_extract_mb: Option<u32>,
     playback_metrics_queue: Option<u32>,
+    quick_connect_pending_per_ip: Option<u32>,
 }
 
 /// The `db_pool` value in `config.toml`: an explicit SQLite connection count,
@@ -292,7 +304,9 @@ pub struct Config {
     /// HTTP port to listen on. Default [`DEFAULT_HTTP_PORT`].
     pub port: u16,
 
-    /// HTTPS port (TLS deferred). Default [`DEFAULT_HTTPS_PORT`].
+    /// HTTPS port, listened on beside the HTTP port when the network
+    /// configuration's `EnableHttps` is on and its certificate loads. Default
+    /// [`DEFAULT_HTTPS_PORT`].
     pub https_port: u16,
 
     /// Publicly reachable server URL advertised to clients
@@ -437,6 +451,13 @@ pub struct Config {
     /// `config.toml` > 30.
     pub shutdown_timeout_secs: u32,
 
+    /// Minimum period (milliseconds) between pushes of a dashboard WebSocket
+    /// stream; the client-chosen Sessions / ScheduledTasksInfo /
+    /// ActivityLogEntry period is clamped up to it. Resolved
+    /// `FERROFIN_WS_MIN_STREAM_PERIOD_MS` env > `websocket_min_stream_period_ms`
+    /// in `config.toml` > 100. See [`DEFAULT_WS_MIN_STREAM_PERIOD_MS`].
+    pub websocket_min_stream_period_ms: u32,
+
     /// Library-scan progress cadence: emit a progress `info!` every N items.
     /// `None` = the 100-item default; `0` disables progress logs. Resolved in
     /// order: `FERROFIN_SCAN_PROGRESS_EVERY` env, then `scan_progress_every` in
@@ -498,7 +519,8 @@ pub struct Config {
 
     /// Per-plugin event queue depth for WASM plugins. `None` = the 256
     /// default. A full queue drops events for that plugin only (events are
-    /// hints; the DB is the truth). Resolved
+    /// hints; the DB is the truth), and web requests may hold at most half
+    /// of it. Resolved
     /// `FERROFIN_WASM_EVENT_QUEUE_CAPACITY` env >
     /// `wasm_event_queue_capacity` in `config.toml` > default; zero is
     /// treated as unset.
@@ -551,6 +573,13 @@ pub struct Config {
     /// Resolved `FERROFIN_PLAYBACK_METRICS_QUEUE` env >
     /// `playback_metrics_queue` in `config.toml` > default.
     pub playback_metrics_queue: Option<u32>,
+
+    /// Unauthorized Quick Connect requests one remote IP may hold at once;
+    /// the next `POST /QuickConnect/Initiate` from that IP drops its oldest.
+    /// `None`/zero = `ferrofin_core::quick_connect_manager::DEFAULT_PENDING_PER_IP` (10). Jellyfin has no
+    /// cap. Resolved `FERROFIN_QUICK_CONNECT_PENDING_PER_IP` env >
+    /// `quick_connect_pending_per_ip` in `config.toml` > default.
+    pub quick_connect_pending_per_ip: Option<u32>,
 
     /// Concurrent media-decode budget for WASM plugin analysis
     /// (`extract-audio`/`extract-frames`). `None`/zero = a quarter of the
@@ -769,6 +798,9 @@ impl Config {
             shutdown_timeout_secs: parse_var(env, "FERROFIN_SHUTDOWN_TIMEOUT_SECS")
                 .or(file.shutdown_timeout_secs)
                 .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
+            websocket_min_stream_period_ms: parse_var(env, "FERROFIN_WS_MIN_STREAM_PERIOD_MS")
+                .or(file.websocket_min_stream_period_ms)
+                .unwrap_or(DEFAULT_WS_MIN_STREAM_PERIOD_MS),
             scan_progress_every: parse_var(env, "FERROFIN_SCAN_PROGRESS_EVERY")
                 .or(file.scan_progress_every),
             scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
@@ -812,6 +844,8 @@ impl Config {
                 .or(file.wasm_subtitle_extract_mb),
             playback_metrics_queue: parse_var(env, "FERROFIN_PLAYBACK_METRICS_QUEUE")
                 .or(file.playback_metrics_queue),
+            quick_connect_pending_per_ip: parse_var(env, "FERROFIN_QUICK_CONNECT_PENDING_PER_IP")
+                .or(file.quick_connect_pending_per_ip),
         })
     }
 
@@ -959,6 +993,7 @@ impl Config {
             metrics_sample_interval: None,
             metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
+            websocket_min_stream_period_ms: DEFAULT_WS_MIN_STREAM_PERIOD_MS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
             scan_directory_cache_records: None,
@@ -976,6 +1011,7 @@ impl Config {
             wasm_write_content_mb: None,
             wasm_subtitle_extract_mb: None,
             playback_metrics_queue: None,
+            quick_connect_pending_per_ip: None,
         }
     }
 }
@@ -1232,6 +1268,23 @@ mod tests {
         assert!(cfg.ffmpeg_path.is_none());
         // With no XDG/HOME the system location is used.
         assert_eq!(cfg.data_dir, PathBuf::from(SYSTEM_DATA_DIR));
+        assert_eq!(
+            cfg.websocket_min_stream_period_ms,
+            DEFAULT_WS_MIN_STREAM_PERIOD_MS
+        );
+    }
+
+    #[test]
+    fn websocket_min_stream_period_resolves_env_over_default() {
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            cfg.websocket_min_stream_period_ms,
+            DEFAULT_WS_MIN_STREAM_PERIOD_MS
+        );
+
+        let env = FakeEnv::new().with("FERROFIN_WS_MIN_STREAM_PERIOD_MS", "250");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.websocket_min_stream_period_ms, 250);
     }
 
     #[test]
@@ -1722,6 +1775,24 @@ mod tests {
         };
         let cfg = Config::load_from(cli, &env).unwrap();
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+    }
+
+    #[test]
+    fn quick_connect_pending_per_ip_env_beats_file() {
+        let unset = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(unset.quick_connect_pending_per_ip, None);
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "quick_connect_pending_per_ip = 4\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let from_file = Config::load_from(cli(), &FakeEnv::new()).unwrap();
+        assert_eq!(from_file.quick_connect_pending_per_ip, Some(4));
+        let env = FakeEnv::new().with("FERROFIN_QUICK_CONNECT_PENDING_PER_IP", "20");
+        let from_env = Config::load_from(cli(), &env).unwrap();
+        assert_eq!(from_env.quick_connect_pending_per_ip, Some(20));
     }
 
     #[test]

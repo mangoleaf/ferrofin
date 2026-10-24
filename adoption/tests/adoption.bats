@@ -3,6 +3,8 @@
 # Nothing here needs docker, a Jellyfin database or external services: tests use canned
 # logs and smoke outputs, throwaway SQLite files and a local HTTP server.
 
+bats_require_minimum_version 1.5.0   # run --separate-stderr
+
 setup() {
   ADOPTION="$BATS_TEST_DIRNAME/.."
   # shellcheck source=adoption/lib.sh
@@ -230,6 +232,10 @@ EOS
 
 # --- run.sh command line -----------------------------------------------------------
 
+bin_first() { # the fake binaries in $TMP/bin win over the real ones (a function: shellcheck reads a @test body as a subshell)
+  PATH="$TMP/bin:$PATH"
+}
+
 fake_docker() { # a docker on PATH that has every image and no containers
   mkdir -p bin; cat > bin/docker <<'EOS'
 #!/usr/bin/env bash
@@ -270,7 +276,10 @@ EOS
   # eleven paths, each on its own port
   run bash -c "grep -oE '^  \"[0-9.]+\\|jellyfin-[^|]+\\|[0-9]+\"' \"\$1\" | cut -d'|' -f3 | sort | uniq -d" _ "$ADOPTION/run.sh"
   [ -z "$output" ]
-  [ "$(grep -cE '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh")" -eq 11 ]
+  [ "$(grep -E '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh" | grep -vc -e '-messy|' -e '-scale|')" -eq 11 ]
+  # and the two messy copies and the scale copy, on ports of their own (the uniqueness check above covers them too)
+  [ "$(grep -cE '^  "[0-9.]+\|jellyfin-[^|]*-messy\|' "$ADOPTION/run.sh")" -eq 2 ]
+  [ "$(grep -cE '^  "[0-9.]+\|jellyfin-[^|]*-scale\|' "$ADOPTION/run.sh")" -eq 1 ]
 }
 
 @test "run.sh and build-fixtures.sh carry a fresh-install 12.2 row that adopts as 12.2.0" {
@@ -420,6 +429,13 @@ built_fixtures() { # every fixture built at the current recipe, carrying its rel
     sqlite3 "fixtures/jellyfin-${f%:*}/data/jellyfin.db" "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${f#*:}) INSERT INTO __EFMigrationsHistory SELECT i, '9' FROM n;"
   done
+  # the messy copies are built, so build-fixtures.sh's messy.py step finds nothing to do
+  for f in jellyfin-10.11.11-messy jellyfin-12.2-messy; do
+    mkdir -p "fixtures/$f"; echo '{}' > "fixtures/$f/messy-oracle.json"
+    echo '{"shapes": {"deleted_user": {}, "dangling_owner_extra": {}, "duplicate_paths": {}}}' > "fixtures/$f/messy.json"
+  done
+  # and the scale copy, so scale.py's step finds nothing to do either
+  mkdir -p fixtures/jellyfin-10.11.11-scale; echo '{}' > fixtures/jellyfin-10.11.11-scale/scale.json
 }
 
 @test "build-fixtures.sh: pulls the release of each fixture still to build, and 10.11.8, before building" {
@@ -491,6 +507,47 @@ EOS
   # the copy lands in work/run/, clear of synthetic.py run's work/<fixture>
   [ -d fixtures/work/run/jellyfin-12.0 ]
   [ ! -e fixtures/work/jellyfin-12.0 ]
+  # it is a failed row in the report too: the fixture began, and its row says why it never started
+  [ "$(jq -r 'select(.event == "row") | [.fixture, .verdict] | join(" ")' fixtures/work/run/results.jsonl)" = "jellyfin-12.0 FAIL" ]
+  jq -r 'select(.event == "row") | .detail' fixtures/work/run/results.jsonl | grep -q "metadata baseline"
+  grep -q "metadata baseline" fixtures/work/run/report.html
+}
+
+@test "run.sh: a broken or missing report module changes neither the verdict, the exit status nor the output" {
+  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
+  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json
+  printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  image|run|restart|rm|logs) exit 0;;
+  inspect) echo false; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  run --separate-stderr "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  normal_status=$status; normal_output=$output
+  [ "$normal_status" -eq 1 ]
+  [ -f fixtures/work/run/report.html ]
+  # shellcheck disable=SC2154  # $stderr is set by bats' run --separate-stderr
+  [[ "$stderr" != *"report"* ]]   # a run that wrote its page says nothing about it
+  # the same run from a copy of the harness whose report module crashes, then from one that has none
+  cp -r "$ADOPTION" copy
+  printf 'raise SystemExit(7)\n' > copy/adoption_report.py
+  rm -rf fixtures/work
+  run --separate-stderr copy/run.sh --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ "$status" -eq "$normal_status" ]
+  [ "$output" = "$normal_output" ]            # stdout is the same
+  [[ "$stderr" == *"report: not written"* ]]   # and the missing page is said, on stderr
+  [ ! -e fixtures/work/run/report.html ]
+  rm copy/adoption_report.py; rm -rf fixtures/work
+  run --separate-stderr copy/run.sh --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ "$status" -eq "$normal_status" ]
+  [ "$output" = "$normal_output" ]
+  [[ "$stderr" == *"report: not written"* ]]
 }
 
 @test "synthetic adoption checks detect missing scenarios, changed membership and redundant writes" {
@@ -508,15 +565,273 @@ EOS
   [ "$status" -eq 0 ]
 }
 
+@test "clean value: the Python derivation matches the Rust get_clean_value oracle" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_clean_value.py
+  [ "$status" -eq 0 ]
+}
+
 @test "run.sh and synthetic.py run: the table baseline is taken before the container starts and checked at every stage" {
-  snapshot=$(grep -nF 'table_digests.py" snapshot' "$ADOPTION/run.sh" | cut -d: -f1)
-  start=$(grep -nF 'docker run -d' "$ADOPTION/run.sh" | cut -d: -f1)
+  snapshot=$(grep -nF 'table_digests.py" snapshot' "$ADOPTION/run.sh" | head -n 1 | cut -d: -f1)
+  start=$(grep -nF 'docker run -d' "$ADOPTION/run.sh" | head -n 1 | cut -d: -f1)
   [ -n "$snapshot" ] && [ "$snapshot" -lt "$start" ]
   grep -qF 'table_digests.py" check' "$ADOPTION/run.sh"
   # metadata_check runs after adoption, after restart and after scan
   [ "$(grep -c '^  metadata_check "after' "$ADOPTION/run.sh")" -eq 3 ]
-  grep -qF 'changed += table_digests.compare(' "$ADOPTION/preservation.py"
+  grep -qF 'table_changed = table_digests.compare(' "$ADOPTION/preservation.py"
+  grep -qF 'changed += record("table digests", table_changed)' "$ADOPTION/preservation.py"
   grep -qF 'tables_before, table_digests.snapshot(db, tables_before, reauthenticated=reauth))' "$ADOPTION/preservation.py"
+}
+
+@test "messy rows: each shape's seeder and end-state reader, and the comparison with Jellyfin 12.2's record" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_messy.py
+  [ "$status" -eq 0 ]
+}
+
+# A messy fixture copy holding every shape (the deleted user's tables empty, the dangling extra
+# absent, one duplicate-path row), with the manifest and the oracle record messy.py reads: the
+# record says Jellyfin 12.2 left the same, except for the duplicate path it records as given.
+messy_fixture() { # messy_fixture <original-kept> <oracle original> <oracle duplicate>
+  local t zeros=
+  mkdir -p messy
+  sqlite3 messy/jellyfin.db "CREATE TABLE BaseItems (Id TEXT PRIMARY KEY, Path TEXT, OwnerId TEXT);
+    INSERT INTO BaseItems (Id, Path) VALUES ('$(printf 'a%.0s' {1..32})', '/p');"
+  for t in UserData Permissions Preferences Devices DisplayPreferences; do
+    sqlite3 messy/jellyfin.db "CREATE TABLE \"$t\" (UserId TEXT);"
+    zeros="$zeros${zeros:+, }\"$t\": 0"
+  done
+  [ "$1" = yes ] || sqlite3 messy/jellyfin.db "DELETE FROM BaseItems"
+  # a lineage no divergence is ever written for, so the oracle record decides
+  printf '{"lineage": "test", "shapes": {"deleted_user": {"user": "%s"}, "dangling_owner_extra": {"extra": "%s", "owner": "%s"},
+    "duplicate_paths": {"path": "/p", "original": "%s", "duplicate": "%s"}}}' \
+    "$(printf 'c%.0s' {1..32})" "$(printf 'd%.0s' {1..32})" "$(printf 'e%.0s' {1..32})" \
+    "$(printf 'a%.0s' {1..32})" "$(printf 'b%.0s' {1..32})" > messy/messy.json
+  printf '{"shapes": {"deleted_user": {"outcome": "booted", "state": {"deleted_user": {%s}}},
+    "dangling_owner_extra": {"outcome": "booted", "state": {"dangling_owner_extra": {"exists": false, "owner": null}}},
+    "duplicate_paths": {"outcome": "booted", "state": {"duplicate_paths": {"original": %s, "duplicate": %s}}}}}' \
+    "$zeros" "$2" "$3" > messy/messy-oracle.json
+}
+
+@test "check_messy: a shape that ends as Jellyfin 12.2 left it says nothing" {
+  messy_fixture yes true false
+  run adoption_check_messy messy/jellyfin.db messy
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+}
+
+@test "check_messy: a shape that ends differently names the shape and both states" {
+  messy_fixture no true false
+  run adoption_check_messy messy/jellyfin.db messy
+  [[ "$output" == "messy: duplicate_paths: "*"expected"*"Jellyfin 12.2"* ]]
+}
+
+@test "check_messy: a checker that cannot run is a reason, never a pass" {
+  messy_fixture yes true false
+  rm messy/messy-oracle.json
+  run adoption_check_messy messy/jellyfin.db messy
+  [[ "$output" == "messy: the checker failed: "* ]]
+}
+
+@test "run.sh: --only a clean fixture never reaches the messy rows, and a messy fixture that is not built is skipped and named" {
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "${#lines[@]}" -eq 1 ]
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ "$status" -eq 0 ]
+  [[ "${lines[0]}" == SKIP*12.2.0*jellyfin-12.2-messy*"fixture missing" ]]
+}
+
+# A database holding every table table_digests.py reads, with nothing in it.
+empty_adoption_db() { # empty_adoption_db <file>
+  local t
+  sqlite3 "$1" 'CREATE TABLE Users (Id TEXT PRIMARY KEY); CREATE TABLE BaseItems (Id TEXT PRIMARY KEY, Path TEXT, OwnerId TEXT);'
+  for t in MediaStreamInfos AttachmentStreamInfos Chapters TrickplayInfos MediaSegments KeyframeData ItemValues \
+           ItemValuesMap Peoples PeopleBaseItemMap DisplayPreferences ItemDisplayPreferences \
+           CustomItemDisplayPreferences Devices DeviceOptions ApiKeys ActivityLogs; do
+    sqlite3 "$1" "CREATE TABLE \"$t\" (Id INTEGER PRIMARY KEY, UserId TEXT, ItemId TEXT, DeviceId TEXT);"
+  done
+}
+
+@test "check_tables: nothing lost says nothing; a lost row is named; an unreadable baseline is a reason" {
+  empty_adoption_db t.db
+  sqlite3 t.db "INSERT INTO ApiKeys (Id) VALUES (1)"
+  python3 "$ADOPTION/table_digests.py" snapshot t.db base.json
+  run adoption_check_tables t.db base.json
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  sqlite3 t.db "DELETE FROM ApiKeys"
+  run adoption_check_tables t.db base.json
+  [[ "$output" == "tables: 1 difference(s), first: ApiKeys row 1 is gone" ]]
+  run adoption_check_tables t.db missing.json
+  [[ "$output" == "tables: "*"difference(s), first: table digest check could not read"* ]]
+}
+
+@test "run.sh: a messy fixture whose container exits fails at once, naming it, instead of waiting out the deadlines" {
+  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
+  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json
+  printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
+  # image inspect succeeds; every container "has exited" (State.Running false); nothing else is asked
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  image|run|restart|rm|logs) exit 0;;
+  inspect) echo false; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  start=$SECONDS
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ "$status" -eq 1 ]
+  [[ "$output" == FAIL*12.2.0*jellyfin-12.2-messy*"never became ready"*"second boot never ready"* ]]
+  [[ "$output" == *"messy: "* ]]   # the shape checker ran and said why it could not pass
+  [ $((SECONDS - start)) -lt 60 ]
+  [[ "$output" != *"unexpected docker"* ]]
+  # the report: every check's verdict was recorded, and the page says what failed and why
+  work=fixtures/work/run
+  [ "$(jq -s '[.[] | select(.event == "row")] | .[0] | [.fixture, .kind, .expected, .verdict] | join(" ")' -r "$work/results.jsonl")" = "jellyfin-12.2-messy messy 12.2.0 FAIL" ]
+  [ "$(jq -s '[.[] | select(.event == "check" and .verdict == "FAIL")] | length' "$work/results.jsonl")" -ge 2 ]
+  grep -q "jellyfin-12.2-messy" "$work/report.html"
+  grep -q "never became ready" "$work/report.html"
+  grep -q "messy shapes end as Jellyfin 12.2 left them" "$work/report.html"
+  grep -q ">FAIL<" "$work/report.html"
+}
+
+@test "run.sh: a skipped fixture is a SKIP row in the report, which is written even when nothing ran" {
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "$status" -eq 0 ]
+  [ "$(jq -r 'select(.event == "row") | [.fixture, .verdict, .detail] | join("|")' fixtures/work/run/results.jsonl)" = "jellyfin-12.0|SKIP|fixture missing" ]
+  grep -q "NOTHING RAN" fixtures/work/run/report.html
+}
+
+@test "run.sh: a run that is terminated still leaves a report, listing the fixture it was on as unfinished" {
+  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
+  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json
+  printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
+  # every container "is running" and never answers: the row waits for it
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  image|run|restart|rm|logs) exit 0;;
+  inspect) echo true; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  setsid "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy &
+  leader=$!
+  for _ in $(seq 1 40); do grep -q '"begin"' fixtures/work/run/results.jsonl 2>/dev/null && break; sleep 0.25; done
+  grep -q '"begin"' fixtures/work/run/results.jsonl
+  kill -TERM -- "-$leader"
+  status=0; wait "$leader" || status=$?
+  [ "$status" -eq 143 ]
+  grep -q "INCOMPLETE" fixtures/work/run/report.html
+  grep -q "jellyfin-12.2-messy" fixtures/work/run/report.html
+}
+
+@test "adoption report: recording, verdicts, the page and the viewer's listing" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_adoption_report.py
+  [ "$status" -eq 0 ]
+}
+
+@test "build-fixtures.sh: the messy copies are built last, after the schema diff" {
+  [ "$(grep -n 'messy.py" build' "$ADOPTION/build-fixtures.sh" | cut -d: -f1)" -gt "$(grep -n 'jellyfin-12.2-schema.sql: ' "$ADOPTION/build-fixtures.sh" | cut -d: -f1)" ]
+}
+
+@test "scale fixture: cloning, survival check, disk requirement, sampling and recording" {
+  run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_scale.py
+  [ "$status" -eq 0 ]
+}
+
+# A scale fixture: the table shapes table_digests.py reads, and one cloned item.
+scale_fixture() { # scale_fixture <directory>
+  mkdir -p "$1/data"
+  empty_adoption_db "$1/data/jellyfin.db"
+  sqlite3 "$1/data/jellyfin.db" "INSERT INTO BaseItems VALUES ('A', '/media/movies/scale-00001/a.mkv', NULL)"
+}
+
+@test "check_scale: nothing lost says nothing; a lost clone is named; an unreadable baseline is a reason" {
+  scale_fixture f
+  python3 "$ADOPTION/scale.py" counts f/data/jellyfin.db base.json
+  run adoption_check_scale f/data/jellyfin.db base.json
+  [ "$status" -eq 0 ]
+  [ -z "$output" ]
+  sqlite3 f/data/jellyfin.db "DELETE FROM BaseItems"
+  run adoption_check_scale f/data/jellyfin.db base.json
+  [[ "$output" == "scale: BaseItems: 1 rows before, 0 after"* ]]
+  run adoption_check_scale f/data/jellyfin.db missing.json
+  [[ "$output" == "scale: the checker failed: scale: "* ]]
+}
+
+@test "run.sh: the scale fixture is skipped, named, when it is not built, and --only a clean fixture never reaches it" {
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
+  [ "$status" -eq 0 ]
+  [[ "${lines[0]}" == SKIP*10.11.11*jellyfin-10.11.11-scale*"fixture missing" ]]
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
+  [ "${#lines[@]}" -eq 1 ]
+}
+
+@test "run.sh: the scale row refuses, naming the disk it needs, before it copies or starts anything" {
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  scale_fixture fixtures/jellyfin-10.11.11-scale
+  truncate -s 8T fixtures/jellyfin-10.11.11-scale/data/jellyfin.db   # a sparse database no disk has six times over
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
+  [ "$status" -eq 1 ]
+  [[ "$output" == FAIL*10.11.11*jellyfin-10.11.11-scale*"needs "*" free in "*"6x the 8192.0 GiB database"* ]]
+  [ ! -e fixtures/work/run/jellyfin-10.11.11-scale ]
+  [[ "$output" != *"unexpected docker"* ]]
+}
+
+@test "run.sh: a scale fixture whose container exits fails at once, saying which numbers were not measured" {
+  mkdir -p bin fixtures/oracle fixtures/media
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  scale_fixture fixtures/jellyfin-10.11.11-scale
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  image|run|restart|rm|logs) exit 0;;
+  inspect) echo false; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  start=$SECONDS
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
+  [ "$status" -eq 1 ]
+  [[ "$output" == FAIL*10.11.11*jellyfin-10.11.11-scale*"never became ready"*"second boot never ready"* ]]
+  [[ "$output" == *"not measured: "* ]]     # the numbers that could not be taken are named, never defaulted
+  [ $((SECONDS - start)) -lt 60 ]
+  [[ "$output" != *"unexpected docker"* ]]
+}
+
+@test "run.sh: the scale row gives up on a server that never answers after ADOPTION_SCALE_TIMEOUT, on both boots" {
+  mkdir -p bin fixtures/oracle fixtures/media
+  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  scale_fixture fixtures/jellyfin-10.11.11-scale
+  # the container stays up and never answers; without the limit the first wait alone is 30 minutes
+  cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  image|run|restart|rm|logs) exit 0;;
+  inspect) echo true; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  start=$SECONDS
+  ADOPTION_SCALE_TIMEOUT=1 run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
+  [ "$status" -eq 1 ]
+  [[ "$output" == FAIL*jellyfin-10.11.11-scale*"never became ready"*"second boot never ready"* ]]
+  [ $((SECONDS - start)) -lt 60 ]
+}
+
+@test "build-fixtures.sh: the scale copy is built after the messy copies, the last step" {
+  [ "$(grep -n 'scale.py" build' "$ADOPTION/build-fixtures.sh" | cut -d: -f1)" -gt "$(grep -n 'messy.py" build' "$ADOPTION/build-fixtures.sh" | cut -d: -f1)" ]
 }
 
 @test "populated upgrade: user state, boot checks and the runner's refusals" {

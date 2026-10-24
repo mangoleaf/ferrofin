@@ -53,6 +53,136 @@ pub trait SourceFetcher: Send + Sync {
     async fn fetch_with_status(&self, url: &str) -> Result<(u16, String), ServiceError> {
         self.fetch(url).await.map(|body| (200, body))
     }
+
+    /// Fetches an XMLTV listings document: [`fetch`](Self::fetch), except that
+    /// a gzipped source is decompressed. Port of
+    /// `XmlTvListingsProvider.UnzipIfNeededAndCopy`, which decides on the URL
+    /// after redirects, or the path, with any query stripped: `.gz` or
+    /// `.gzip`.
+    ///
+    /// The default is plain [`fetch`](Self::fetch), so a text-only fake keeps
+    /// working; the real fetcher decompresses.
+    async fn fetch_listings(&self, url: &str) -> Result<String, ServiceError> {
+        self.fetch(url).await
+    }
+
+    /// Sends `request` and answers its status and body, whatever the status.
+    ///
+    /// The Schedules Direct API needs more than a `GET`: a `POST`/`PUT` with a
+    /// JSON body and a `token` header, and the error code a failed response
+    /// carries in its body (`SchedulesDirect.Request<T>`), which a fetch that
+    /// fails on a non-success status would throw away.
+    ///
+    /// The default serves a header-less `GET` through
+    /// [`fetch_with_status`](Self::fetch_with_status), so a text-only fake keeps
+    /// working, and refuses anything else; the real fetcher sends it all.
+    async fn send(&self, request: SourceRequest) -> Result<SourceResponse, ServiceError> {
+        if request.method != RequestMethod::Get
+            || !request.headers.is_empty()
+            || request.json.is_some()
+        {
+            return Err(ServiceError::backend(format!(
+                "this fetcher cannot send a {:?} request to {}",
+                request.method, request.url
+            )));
+        }
+        let (status, body) = self.fetch_with_status(&request.url).await?;
+        Ok(SourceResponse {
+            status,
+            body: body.into_bytes(),
+        })
+    }
+}
+
+/// The HTTP method of a [`SourceRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestMethod {
+    /// `GET`.
+    Get,
+    /// `POST`.
+    Post,
+    /// `PUT`.
+    Put,
+}
+
+/// A request for [`SourceFetcher::send`].
+///
+/// Its `Debug` prints header names but not their values, and the body's
+/// length but not its bytes: they carry credentials (Schedules Direct's
+/// `token` header, its `/token` body).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SourceRequest {
+    /// The method.
+    pub method: RequestMethod,
+    /// The absolute URL.
+    pub url: String,
+    /// Extra request headers, as `(name, value)`.
+    pub headers: Vec<(String, String)>,
+    /// A JSON body, sent as `application/json; charset=utf-8`
+    /// (`JsonContent.Create` upstream).
+    pub json: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for SourceRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceRequest")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("json_bytes", &self.json.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
+impl SourceRequest {
+    /// A request with no headers and no body.
+    #[must_use]
+    pub fn new(method: RequestMethod, url: impl Into<String>) -> Self {
+        Self {
+            method,
+            url: url.into(),
+            headers: Vec::new(),
+            json: None,
+        }
+    }
+
+    /// Adds the header `name: value`.
+    #[must_use]
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// Sets the JSON body.
+    #[must_use]
+    pub fn json(mut self, body: Vec<u8>) -> Self {
+        self.json = Some(body);
+        self
+    }
+}
+
+/// What [`SourceFetcher::send`] answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceResponse {
+    /// The HTTP status code.
+    pub status: u16,
+    /// The response body.
+    pub body: Vec<u8>,
+}
+
+impl SourceResponse {
+    /// Whether the status is `2xx` (`HttpResponseMessage.IsSuccessStatusCode`).
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
 }
 
 /// The `User-Agent` the real fetcher presents, mirroring the product header
@@ -121,6 +251,43 @@ fn is_http(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
+/// Whether a listings source is gzipped, as `UnzipIfNeededAndCopy` decides:
+/// the extension of `name` (a URL after redirects, or a path) with any query
+/// stripped is `.gz` or `.gzip`, ignoring case.
+fn is_gzip_name(name: &str) -> bool {
+    let name = name.split('?').next().unwrap_or(name);
+    std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("gz") || extension.eq_ignore_ascii_case("gzip")
+        })
+}
+
+/// Decompresses a gzipped listings document and decodes it as UTF-8 (lossily,
+/// like `.text()` on a response that names no charset). Every gzip member is
+/// read, as .NET's `GZipStream` reads concatenated members. It runs on the
+/// blocking pool, because an EPG can run to tens of megabytes.
+async fn gunzip<B>(name: &str, bytes: B) -> Result<String, ServiceError>
+where
+    B: AsRef<[u8]> + Send + 'static,
+{
+    let context = format!("extract gz {name}");
+    let text = tokio::task::spawn_blocking(move || {
+        let mut text = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::MultiGzDecoder::new(bytes.as_ref()),
+            &mut text,
+        )
+        .map(|_| text)
+    })
+    .await
+    .map_err(|e| LiveTvError::io(context.clone(), std::io::Error::other(e)))?
+    .map_err(|e| LiveTvError::io(context, e))?;
+    Ok(String::from_utf8(text)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
 #[async_trait]
 impl SourceFetcher for ReqwestFetcher {
     async fn fetch(&self, url: &str) -> Result<String, ServiceError> {
@@ -181,6 +348,33 @@ impl SourceFetcher for ReqwestFetcher {
         }
     }
 
+    async fn fetch_listings(&self, url: &str) -> Result<String, ServiceError> {
+        if is_http(url) {
+            let resp = self.get(url).await?;
+            let final_url = resp.url().to_string();
+            if !is_gzip_name(&final_url) {
+                return resp
+                    .text()
+                    .await
+                    .map_err(|e| LiveTvError::http(format!("read {url}"), e).into());
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| LiveTvError::http(format!("read {url}"), e))?;
+            gunzip(&final_url, bytes).await
+        } else {
+            let path = url.strip_prefix("file://").unwrap_or(url);
+            if !is_gzip_name(path) {
+                return self.fetch(url).await;
+            }
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| LiveTvError::io(format!("read {path}"), e))?;
+            gunzip(path, bytes).await
+        }
+    }
+
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, ServiceError> {
         if is_http(url) {
             self.get(url)
@@ -195,6 +389,40 @@ impl SourceFetcher for ReqwestFetcher {
                 .await
                 .map_err(|e| LiveTvError::io(format!("read {path}"), e).into())
         }
+    }
+
+    async fn send(&self, request: SourceRequest) -> Result<SourceResponse, ServiceError> {
+        let method = match request.method {
+            RequestMethod::Get => reqwest::Method::GET,
+            RequestMethod::Post => reqwest::Method::POST,
+            RequestMethod::Put => reqwest::Method::PUT,
+        };
+        let mut builder = self.client.request(method, &request.url);
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        if let Some(json) = request.json {
+            builder = builder
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/json; charset=utf-8",
+                )
+                .body(json);
+        }
+        let url = &request.url;
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| LiveTvError::http(format!("fetch {url}"), e))?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| LiveTvError::http(format!("read {url}"), e))?;
+        Ok(SourceResponse {
+            status,
+            body: body.to_vec(),
+        })
     }
 }
 
@@ -330,6 +558,267 @@ mod tests {
             .expect("fetch");
         assert_eq!(body, "#EXTM3U\n");
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// `UnzipIfNeededAndCopy`'s test: the extension, query stripped, is `.gz`
+    /// or `.gzip` in any case.
+    #[rstest::rstest]
+    #[case("/epg/guide.xml.gz", true)]
+    #[case("GUIDE.XML.GZIP", true)]
+    #[case("http://host/epg.gz?token=1", true)]
+    #[case("http://host/guide.xml", false)]
+    #[case("http://host/guide.xml?name=a.gz", false)]
+    #[case("http://host/epg.tgz", false)]
+    fn gzip_is_decided_by_the_extension(#[case] name: &str, #[case] gzipped: bool) {
+        assert_eq!(super::is_gzip_name(name), gzipped);
+    }
+
+    fn gzipped(text: &str) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(text.as_bytes()).expect("compress");
+        encoder.finish().expect("finish")
+    }
+
+    /// A guide gzipped as several concatenated members (as some EPG builders
+    /// write them) is read in full, as `GZipStream` reads it.
+    #[tokio::test]
+    async fn every_gzip_member_is_read() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let gz = dir.path().join("guide.xml.gz");
+        let mut members = gzipped("<tv>");
+        members.extend(gzipped("</tv>"));
+        tokio::fs::write(&gz, members).await.expect("write");
+        assert_eq!(
+            ReqwestFetcher::new()
+                .fetch_listings(gz.to_str().unwrap())
+                .await
+                .expect("gz"),
+            "<tv></tv>"
+        );
+    }
+
+    /// A local `.xml.gz` guide is read decompressed; a plain one as it is.
+    #[tokio::test]
+    async fn a_local_gzipped_guide_is_decompressed() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let gz = dir.path().join("guide.xml.gz");
+        tokio::fs::write(&gz, gzipped("<tv></tv>"))
+            .await
+            .expect("write");
+        let fetcher = ReqwestFetcher::new();
+        assert_eq!(
+            fetcher
+                .fetch_listings(gz.to_str().unwrap())
+                .await
+                .expect("gz"),
+            "<tv></tv>"
+        );
+        let plain = dir.path().join("guide.xml");
+        tokio::fs::write(&plain, "<tv/>").await.expect("write");
+        assert_eq!(
+            fetcher
+                .fetch_listings(plain.to_str().unwrap())
+                .await
+                .expect("plain"),
+            "<tv/>"
+        );
+        // Not gzip after all: an extraction error, not a garbled guide.
+        let fake = dir.path().join("fake.xml.gz");
+        tokio::fs::write(&fake, "<tv/>").await.expect("write");
+        assert!(
+            fetcher
+                .fetch_listings(fake.to_str().unwrap())
+                .await
+                .is_err()
+        );
+    }
+
+    /// Answers each connection in turn with the next canned response.
+    fn serve_sequence(responses: Vec<Vec<u8>>) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            for response in responses {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buffer = [0_u8; 4096];
+                    let _ = stream.read(&mut buffer);
+                    let _ = stream.write_all(&response);
+                }
+            }
+        });
+        base
+    }
+
+    /// `UnzipIfNeededAndCopy` decides on the URL after redirects: a feed URL
+    /// without an extension that redirects to `guide.xml.gz` is decompressed.
+    #[tokio::test]
+    async fn a_redirect_to_a_gzipped_guide_is_decompressed() {
+        let body = gzipped("<tv><channel id=\"a\"/></tv>");
+        let mut ok = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        ok.extend_from_slice(&body);
+        let base = serve_sequence(vec![
+            b"HTTP/1.1 302 Found\r\nLocation: /guide.xml.gz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            ok,
+        ]);
+        let text = ReqwestFetcher::new()
+            .fetch_listings(&format!("{base}/epg?id=1"))
+            .await
+            .expect("fetch");
+        assert_eq!(text, "<tv><channel id=\"a\"/></tv>");
+    }
+
+    #[tokio::test]
+    async fn the_default_fetch_listings_delegates_to_fetch() {
+        struct TextOnly;
+        #[async_trait::async_trait]
+        impl SourceFetcher for TextOnly {
+            async fn fetch(
+                &self,
+                url: &str,
+            ) -> Result<String, ferrofin_traits::error::ServiceError> {
+                Ok(format!("body of {url}"))
+            }
+        }
+        assert_eq!(
+            TextOnly.fetch_listings("x.gz").await.expect("fetch"),
+            "body of x.gz"
+        );
+    }
+
+    /// One-shot HTTP server that answers `response` and hands back the raw
+    /// request it read (request line, headers and body).
+    fn serve_recording(response: &'static [u8]) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                // Read until the declared body has arrived.
+                loop {
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    request.extend_from_slice(&buffer[..read]);
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+                        if read == 0 {
+                            break;
+                        }
+                        continue;
+                    };
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':')
+                                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= length || read == 0 {
+                        break;
+                    }
+                }
+                let _ = sender.send(String::from_utf8_lossy(&request).into_owned());
+                let _ = stream.write_all(response);
+            }
+        });
+        (base, receiver)
+    }
+
+    /// `SchedulesDirect.Request<T>` reads the error code out of a failed
+    /// response's body, so `send` answers a `4xx` with its body instead of
+    /// failing, and sends the method, the headers and the JSON body it was given.
+    #[tokio::test]
+    async fn send_delivers_method_headers_and_json_and_keeps_an_error_body() {
+        let (base, received) = serve_recording(
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"code\":4003}",
+        );
+        let response = ReqwestFetcher::new()
+            .send(
+                super::SourceRequest::new(super::RequestMethod::Post, format!("{base}/token"))
+                    .header("token", "abc")
+                    .json(br#"{"username":"u"}"#.to_vec()),
+            )
+            .await
+            .expect("send");
+        assert_eq!(response.status, 400);
+        assert!(!response.is_success());
+        assert_eq!(response.body, br#"{"code":4003}"#);
+
+        let request = received.recv().expect("request");
+        assert!(request.starts_with("POST /token HTTP/1.1\r\n"), "{request}");
+        let lower = request.to_ascii_lowercase();
+        assert!(lower.contains("\r\ntoken: abc\r\n"), "{request}");
+        assert!(
+            lower.contains("\r\ncontent-type: application/json; charset=utf-8\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.ends_with("\r\n\r\n{\"username\":\"u\"}"),
+            "{request}"
+        );
+    }
+
+    /// A text-only fake serves a plain `GET` through `fetch_with_status` and
+    /// refuses what it cannot send rather than silently dropping the body.
+    #[tokio::test]
+    async fn the_default_send_serves_only_a_plain_get() {
+        struct TextOnly;
+        #[async_trait::async_trait]
+        impl SourceFetcher for TextOnly {
+            async fn fetch(
+                &self,
+                url: &str,
+            ) -> Result<String, ferrofin_traits::error::ServiceError> {
+                Ok(format!("body of {url}"))
+            }
+        }
+        let got = TextOnly
+            .send(super::SourceRequest::new(super::RequestMethod::Get, "x"))
+            .await
+            .expect("get");
+        assert_eq!((got.status, got.body), (200, b"body of x".to_vec()));
+        assert!(got_is_success_for(200) && !got_is_success_for(301));
+
+        for request in [
+            super::SourceRequest::new(super::RequestMethod::Post, "x"),
+            super::SourceRequest::new(super::RequestMethod::Get, "x").header("token", "t"),
+            super::SourceRequest::new(super::RequestMethod::Get, "x").json(b"[]".to_vec()),
+        ] {
+            assert!(TextOnly.send(request).await.is_err());
+        }
+    }
+
+    /// Header values and the body carry credentials: `Debug` prints neither.
+    #[test]
+    fn a_requests_debug_hides_header_values_and_the_body() {
+        let request = super::SourceRequest::new(super::RequestMethod::Post, "https://sd/token")
+            .header("token", "s3cr3t-token")
+            .json(br#"{"password":"hash"}"#.to_vec());
+        let printed = format!("{request:?}");
+        assert!(
+            printed.contains("token") && printed.contains("https://sd/token"),
+            "{printed}"
+        );
+        assert!(
+            !printed.contains("s3cr3t-token") && !printed.contains("hash"),
+            "{printed}"
+        );
+    }
+
+    fn got_is_success_for(status: u16) -> bool {
+        super::SourceResponse {
+            status,
+            body: Vec::new(),
+        }
+        .is_success()
     }
 
     #[tokio::test]

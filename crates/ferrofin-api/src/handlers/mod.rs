@@ -989,8 +989,6 @@ pub const VERIFIED: &[Verified] = &[
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
-            VERSION_RESUME_DATA_DIVERGENCE,
-            USER_DATA_RETIRED_KEYS_DIVERGENCE,
         ],
         refs: &[],
     },
@@ -1061,6 +1059,48 @@ pub const VERIFIED: &[Verified] = &[
                push_order_expression DatePlayed)",
         date: "2026-10-19",
         divergences: RESUME_DIVERGENCES,
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/UserImage",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "PostUserImage",
+        ferrofin: "handlers/images.rs post_user_image → handlers/items.rs resolve_user, \
+               handlers/users.rs assert_can_update_user, handlers/image_upload.rs \
+               (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
+               to_extension, decode_base64) → ferrofin-core user_manager.rs \
+               save_profile_image",
+        date: "2026-10-20",
+        divergences: &[
+            "The body is decoded in full before anything is written, so a body the decoder \
+         rejects is a 400 that changes nothing. Upstream clears the old profile image row \
+         first and decodes while copying, so invalid base64 fails mid-copy with a 500 \
+         (FormatException) and leaves the user with no profile image. FromBase64Transform \
+         also silently drops a trailing partial group (fewer than four characters): an \
+         unpadded or short padded final group (`aGk`, `aG=`) loses its last bytes, and a \
+         third `=` or a partial group after the padding is ignored. Ferrofin decodes the \
+         final group in full and refuses the other two with a 400. Jellyfin bugs not \
+         ported.",
+            "The body is read as UTF-8 text before the user and the Content-Type are \
+         checked, so a body that is not UTF-8 is the extractor's 400 whatever the user or \
+         type; upstream resolves the user and checks the type first, and fails such a body \
+         with a 500 while decoding. Jellyfin bug not ported.",
+            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
+         Fix path: gl-24.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/UserImage",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "DeleteUserImage",
+        ferrofin: "handlers/images.rs delete_user_image → handlers/items.rs resolve_user, \
+               handlers/users.rs assert_can_update_user → ferrofin-core user_manager.rs \
+               clear_profile_image",
+        date: "2026-10-20",
+        divergences: &[],
         refs: &[],
     },
     Verified {
@@ -1156,6 +1196,170 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[],
         refs: &[],
     },
+    Verified {
+        method: "post",
+        path: "/Branding/Splashscreen",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "UploadCustomSplashscreen",
+        ferrofin: "handlers/branding.rs upload_splashscreen → handlers/image_upload.rs \
+               (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
+               to_extension, decode_base64)",
+        date: "2026-10-20",
+        divergences: &[
+            "The body is decoded in full before anything is written, and the location is \
+         recorded only after the file is: a body the decoder rejects is a 400 that changes \
+         nothing. Upstream records the new SplashscreenLocation first and decodes while \
+         copying, so invalid base64 fails mid-copy with a 500 (FormatException), and any \
+         write failure leaves the recorded location pointing at a missing or truncated \
+         file. FromBase64Transform also silently drops a trailing partial group (fewer \
+         than four characters): an unpadded or short padded final group (`aGk`, `aG=`) \
+         loses its last bytes, and a third `=` or a partial group after the padding is \
+         ignored. Ferrofin decodes the final group in full and refuses the other two with \
+         a 400. Jellyfin bugs not ported.",
+            "The body is read as UTF-8 text before the Content-Type is checked, so a body \
+         that is not UTF-8 is the extractor's 400 whatever its type; upstream checks the \
+         type first and fails such a body with a 500 while decoding. Jellyfin bug not \
+         ported.",
+            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
+         Fix path: gl-24.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Users/AuthenticateWithQuickConnect",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "AuthenticateWithQuickConnect",
+        ferrofin: "handlers/users.rs authenticate_with_quick_connect, authentication_result → \
+               ferrofin-core quick_connect_manager.rs get_authorized_request (the result \
+               authorize_request stored)",
+        date: "2026-10-20",
+        divergences: &[
+            "The User member is built at the exchange, from the user as it is then, where \
+         upstream returns the UserDto it snapshotted when the code was authorized, up to \
+         10 minutes stale (a user deleted meanwhile gets the bare id/name DTO); the \
+         session, token and ServerId are the stored ones on both. Jellyfin bug not \
+         ported.",
+            "The 401 (Quick Connect disabled) and 404 (unknown or expired secret) bodies are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/QuickConnect/Initiate",
+        upstream_file: "Jellyfin.Api/Controllers/QuickConnectController.cs",
+        upstream_method: "InitiateQuickConnect",
+        ferrofin: "handlers/quick_connect.rs initiate → ferrofin-core quick_connect_manager.rs \
+               try_connect (make_room, draw_free_code)",
+        date: "2026-10-20",
+        divergences: &[
+            "A drawn code that a pending request already holds is drawn again; upstream \
+         TryConnect's `_currentRequests[code] = result` overwrites the other device's \
+         request, so authorizing that code would pair the wrong device. Jellyfin bug not \
+         ported. Once all 900,000 codes are pending, Initiate fails with 500 instead.",
+            "Each remote IP holds at most FERROFIN_QUICK_CONNECT_PENDING_PER_IP (default 10) \
+         unauthorized requests, and the next Initiate from that IP drops its oldest, whose \
+         poll then gets 404 as an expired one does; authorized requests are exempt. \
+         Upstream has no cap, so the anonymous endpoint can grow the map toward the whole \
+         code space.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/LiveTv/ListingProviders",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "AddListingProvider",
+        ferrofin: "handlers/live_tv.rs add_listing_provider → ferrofin-livetv manager.rs \
+               save_listing_provider (ListingsBackend::of, validate_xmltv, \
+               store_listing_provider) → schedules_direct/mod.rs SchedulesDirect::validate \
+               (ListingsManager.SaveListingProvider, XmlTvListingsProvider.Validate, \
+               SchedulesDirect.Validate)",
+        date: "2026-10-21",
+        divergences: &[
+            "An XMLTV provider without a Path is a 400; upstream's Validate dereferences \
+         the null path and answers a NullReferenceException 500. Jellyfin bug not ported.",
+            "Schedules Direct's /token body is serialized, so a username with a quote or a \
+         backslash stays valid JSON; upstream concatenates it into the body raw. Jellyfin \
+         bug not ported.",
+            "SchedulesDirect.GetTokenInternal logs the session token at info; Ferrofin never \
+         logs the password, its hash or the token. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/ListingProviders/Lineups",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetLineups",
+        ferrofin: "handlers/live_tv.rs get_lineups → ferrofin-livetv manager.rs get_lineups \
+               (ListingsBackend::of, provider_channels) → schedules_direct/mod.rs \
+               SchedulesDirect::get_lineups (ListingsManager.GetLineups, \
+               XmlTvListingsProvider.GetLineups, SchedulesDirect.GetHeadends)",
+        date: "2026-10-21",
+        divergences: &[
+            "A blank id is a 404 whatever the type; upstream calls \
+         GetProvider(type).GetLineups(null, …), which is a 404 for an unknown type but \
+         dereferences the null provider (500) for xmltv and SchedulesDirect. Jellyfin bug \
+         not ported.",
+            "The country and postal code are percent-encoded into Schedules Direct's \
+         headends query; upstream concatenates them raw, so a value holding `&` or `#` \
+         changes the query. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Items/{itemId}/ContentType",
+        upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",
+        upstream_method: "UpdateItemContentType",
+        ferrofin: "handlers/item_update.rs update_item_content_type → ferrofin-core \
+               library_manager.rs containing_folder_path (BaseItem/Video/Playlist and the \
+               by-name ContainingFolderPath overrides) → ferrofin-model \
+               content_type_overrides.rs with_content_type_override",
+        date: "2026-10-21",
+        divergences: &[
+            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/System/Configuration/{key}",
+        upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
+        upstream_method: "GetNamedConfiguration",
+        ferrofin: "handlers/config.rs get_named_configuration → ferrofin-core \
+               configuration_manager.rs get_named_configuration and get_encoding_options \
+               (read_named; BaseConfigurationManager.GetConfiguration and \
+               LoadConfiguration, the seven ConfigurationStore registrations) → \
+               encoding_response for encoding, the Live TV manager's tuner and provider rows \
+               for livetv",
+        date: "2026-10-23",
+        divergences: &[
+            "The stored document is reread on every call instead of cached from the first load \
+         until a save, so a hand-edited file applies without a restart, and a document that \
+         does not parse is logged at warn once per change of the file where upstream logs it \
+         at error once.",
+            "A stored document that exists but cannot be read is a 500, and so is a save of \
+         encoding (the one store with a validator) over it. LoadConfiguration catches every \
+         exception but IOException, so upstream serves the defaults for a permission-denied \
+         read (UnauthorizedAccessException, logged at error) and for a directory in the \
+         file's place (File.Exists is false), and only other I/O errors fail. Jellyfin quirk \
+         not ported: serving the defaults lets the next save replace a document nobody saw.",
+            "database always reads as Jellyfin-SQLite without locking, the document Jellyfin \
+         writes on its first start: Ferrofin has no other database provider and refuses to \
+         save another (owner decision 2026-10-23).",
+            "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
+         the database rather than in the document; when they cannot be read the lists are \
+         empty and the failure is logged.",
+            "For a caller who is not an administrator, livetv's TunerHosts[].Url and \
+         ListingProviders[].Password are blanked; upstream's plain [Authorize] serves those \
+         credentials to every signed-in user (owner decision 2026-10-23).",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
@@ -1220,26 +1424,14 @@ const RESUME_DIVERGENCES: &[&str] = &[
     "BuildHasDescendantFilter's LinkedChildren arm is not emitted: the only folder kinds \
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",
-    VERSION_RESUME_DATA_DIVERGENCE,
-    USER_DATA_RETIRED_KEYS_DIVERGENCE,
     "A resumable Series or Season row's UnplayedItemCount / PlayedPercentage / Played \
      count each leaf's own played row; v12.2's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
      alternate-version arm in item_count_service's played statements (gl-441).",
+    "Resume positions that Ferrofin builds before gl-46 saved for songs and for Sample, \
+     ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
+     until they are played again; new plays no longer save one. Fix path: gl-717.",
 ];
-
-/// Included in the /Shows/NextUp and /UserItems/Resume divergence lists.
-const VERSION_RESUME_DATA_DIVERGENCE: &str = "VersionResumeData.ApplyTo is not ported \
-     (DtoService via UserDataManager.GetResumeUserDataBatch): a returned video's UserData \
-     is its own row, where v12 takes Played, LastPlayedDate and the resume position from \
-     the most recently played version of its group. The write-side propagate_played_state \
-     covers finishing a version through playback. Fix path: gl-47.";
-
-/// Included in the /Shows/NextUp and /UserItems/Resume divergence lists.
-const USER_DATA_RETIRED_KEYS_DIVERGENCE: &str = "v12.2 SaveUserData also rewrites the \
-     user's rows under keys the item no longer reports; Ferrofin writes the current keys \
-     only, so a stale-key row can keep an item played or in progress here. Fix path: \
-     gl-398.";
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).
 const fn str_eq(a: &str, b: &str) -> bool {

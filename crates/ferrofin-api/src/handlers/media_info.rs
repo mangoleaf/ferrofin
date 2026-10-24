@@ -9,6 +9,7 @@
 //! sources, matching Jellyfin's two actions.
 
 use axum::extract::{Path, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -18,9 +19,12 @@ use ferrofin_model::dlna::{
     DeviceProfile, DlnaProfileType, MediaOptions, StreamBuilder, TranscoderSupport,
 };
 use ferrofin_model::dto::MediaSourceInfo;
-use ferrofin_model::media_info::{LiveStreamRequest, LiveStreamResponse, PlaybackInfoResponse};
+use ferrofin_model::media_info::{
+    LiveStreamRequest, LiveStreamResponse, MediaProtocol, PlaybackInfoResponse,
+};
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::PlayMethod;
+use ferrofin_traits::net::RequestContext;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -31,48 +35,50 @@ use crate::handlers::items::{
 };
 use crate::state::AppState;
 
-/// The server's transcode capabilities, fed to the [`StreamBuilder`] so it knows
-/// which codecs a non-direct-play source can be transcoded to. Reflects the codecs
-/// the ffmpeg build ships with (matching Jellyfin's default encoder set).
-struct FerrofinTranscoderSupport;
+/// The server's transcode capabilities the [`StreamBuilder`] asks, for one
+/// request: `MediaEncoder` as `ITranscoderSupport` (`MediaEncoder.cs`, v12.2).
+struct FerrofinTranscoderSupport<'a> {
+    /// The probed ffmpeg's encoders (`SupportsEncoder`).
+    encoders: &'a dyn ferrofin_traits::media_encoding::EncoderSupport,
+    /// `EncodingOptions.EnableSubtitleExtraction`, read for this request.
+    enable_subtitle_extraction: bool,
+}
 
-impl TranscoderSupport for FerrofinTranscoderSupport {
+impl<'a> FerrofinTranscoderSupport<'a> {
+    /// The capabilities `state` has now: its probed encoders and the current
+    /// encoding options' subtitle extraction setting.
+    async fn current(state: &'a AppState) -> Result<Self, ApiError> {
+        Ok(Self {
+            encoders: state.encoder_support.as_ref(),
+            enable_subtitle_extraction: state
+                .config
+                .get_encoding_options()
+                .await?
+                .enable_subtitle_extraction,
+        })
+    }
+}
+
+impl TranscoderSupport for FerrofinTranscoderSupport<'_> {
+    /// `CanEncodeToAudioCodec`: opus and mp3 are asked as their ffmpeg
+    /// encoders, `libopus` and `libmp3lame`; every other codec by its name.
     fn can_encode_to_audio_codec(&self, codec: &str) -> bool {
-        matches!(
-            codec.to_ascii_lowercase().as_str(),
-            "aac"
-                | "mp3"
-                | "libmp3lame"
-                | "ac3"
-                | "eac3"
-                | "opus"
-                | "libopus"
-                | "flac"
-                | "vorbis"
-                | "libvorbis"
-                | "alac"
-                | "wav"
-                | "pcm_s16le"
-        )
+        let encoder = if codec.eq_ignore_ascii_case("opus") {
+            "libopus"
+        } else if codec.eq_ignore_ascii_case("mp3") {
+            "libmp3lame"
+        } else {
+            codec
+        };
+        self.encoders.supports_encoder(encoder)
     }
-    fn can_encode_to_subtitle_codec(&self, codec: &str) -> bool {
-        matches!(
-            codec.to_ascii_lowercase().as_str(),
-            "srt" | "subrip" | "ass" | "ssa" | "vtt" | "webvtt" | "ttml" | "mov_text"
-        )
+    /// `CanEncodeToSubtitleCodec`: always, as upstream answers.
+    fn can_encode_to_subtitle_codec(&self, _codec: &str) -> bool {
+        true
     }
-    fn can_extract_subtitles(&self, codec: &str) -> bool {
-        // Text-based subtitle streams extract to text; image-based ones cannot.
-        !matches!(
-            codec.to_ascii_lowercase().as_str(),
-            "hdmv_pgs_subtitle"
-                | "pgssub"
-                | "dvd_subtitle"
-                | "dvdsub"
-                | "dvb_subtitle"
-                | "dvbsub"
-                | "xsub"
-        )
+    /// `CanExtractSubtitles`: the `EnableSubtitleExtraction` setting.
+    fn can_extract_subtitles(&self, _codec: &str) -> bool {
+        self.enable_subtitle_extraction
     }
 }
 
@@ -211,6 +217,111 @@ async fn resolve_playback_media_sources(
     Ok(sources)
 }
 
+/// The route Live TV serves a shared stream's buffer under.
+const LIVE_STREAM_FILES_ROUTE: &str = "/LiveTv/LiveStreamFiles/";
+
+/// `MediaInfoHelper.RewritePublishedLiveStreamPath`: points an opened live
+/// stream's buffer URL, built on the loopback address for the server's own
+/// ffmpeg and recorder, at the URL this request reached the server by. Only
+/// the response copy changes: the stream the media-source manager holds keeps
+/// its local path. A smart URL that cannot be resolved leaves the path as it
+/// is rather than failing an open that already holds a tuner.
+async fn publish_live_stream_path(
+    state: &AppState,
+    client: &RequestContext,
+    source: &mut MediaSourceInfo,
+) {
+    // Opened live streams always carry a LiveStreamId; this excludes pre-open
+    // and plugin/remote sources.
+    if non_blank(source.live_stream_id.as_deref()).is_none() {
+        return;
+    }
+    let smart_api_url = match state.app_host.get_smart_api_url(client).await {
+        Ok(url) => url,
+        Err(err) => {
+            tracing::warn!(%err, "could not resolve the request's API URL; the live stream path is left as it is");
+            return;
+        }
+    };
+    let base_url = state.app_host.base_url();
+    match published_live_stream_path(
+        &smart_api_url,
+        source.path.as_deref(),
+        source.protocol,
+        &base_url,
+    ) {
+        Some(published) => source.path = Some(published),
+        None if source.path.as_deref().is_some_and(|path| {
+            path.to_ascii_lowercase()
+                .contains(&LIVE_STREAM_FILES_ROUTE.to_ascii_lowercase())
+        }) =>
+        {
+            tracing::debug!(
+                media_source_id = ?source.id,
+                "not rewriting the live stream path: it did not resolve under the request's \
+                 smart API URL and base URL"
+            );
+        }
+        None => {}
+    }
+}
+
+/// `MediaInfoHelper.GetPublishedLiveStreamPath`: `local_path` re-based on
+/// `smart_api_url`, or `None` when it is not a server-hosted HTTP
+/// `[base_url]/LiveTv/LiveStreamFiles/…` URL. The query is kept and a fragment
+/// dropped; `base_url` is appended to the smart URL unless its path already
+/// ends with it.
+fn published_live_stream_path(
+    smart_api_url: &str,
+    local_path: Option<&str>,
+    protocol: MediaProtocol,
+    base_url: &str,
+) -> Option<String> {
+    if protocol != MediaProtocol::Http {
+        return None;
+    }
+    // `Uri.TryCreate(.., Absolute)`; `PathAndQuery` never carries a fragment.
+    let local: axum::http::Uri = local_path?.split('#').next()?.parse().ok()?;
+    local.scheme()?;
+    let mut relative = local.path_and_query()?.as_str();
+    if !base_url.is_empty() {
+        let prefix = format!("{base_url}/");
+        if !relative
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
+        {
+            return None;
+        }
+        relative = &relative[base_url.len()..];
+    }
+    if !relative
+        .get(..LIVE_STREAM_FILES_ROUTE.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(LIVE_STREAM_FILES_ROUTE))
+    {
+        return None;
+    }
+    let mut published = smart_api_url.trim_end_matches('/').to_owned();
+    if !base_url.is_empty() {
+        let includes_base_url = published
+            .parse::<axum::http::Uri>()
+            .ok()
+            .filter(|uri| uri.scheme().is_some())
+            .is_some_and(|uri| {
+                let path = percent_encoding::percent_decode_str(uri.path()).decode_utf8_lossy();
+                let path = path.trim_end_matches('/');
+                path.len()
+                    .checked_sub(base_url.len())
+                    .and_then(|at| path.get(at..))
+                    .is_some_and(|tail| tail.eq_ignore_ascii_case(base_url))
+            });
+        if !includes_base_url {
+            published.push_str(base_url);
+        }
+    }
+    published.push_str(relative);
+    Some(published)
+}
+
 /// `MediaInfoHelper.SortMediaSources` (the v12 form): the queried item's own
 /// source first (it carries the user's resume state for that version), then
 /// direct-playable files, direct-playable or -streamable sources, files, and
@@ -220,7 +331,6 @@ fn sort_media_sources(
     max_bitrate: Option<i32>,
     preferred_item_id: Uuid,
 ) {
-    use ferrofin_model::media_info::MediaProtocol;
     let preferred_id =
         (!preferred_item_id.is_nil()).then(|| preferred_item_id.simple().to_string());
     sources.sort_by_key(|s| {
@@ -251,6 +361,7 @@ fn sort_media_sources(
 async fn playback_info(
     state: &AppState,
     auth: &ferrofin_traits::options::AuthorizationInfo,
+    client: &RequestContext,
     item_id: Uuid,
     request: PlaybackRequest,
 ) -> Result<PlaybackInfoResponse, ApiError> {
@@ -274,6 +385,10 @@ async fn playback_info(
             play_session_id: None,
             error_code: Some(ferrofin_model::dlna::PlaybackErrorCode::NoCompatibleStream),
         });
+    }
+    // `GetPlaybackInfo` rewrites its clones before any device-specific data.
+    for source in &mut media_sources {
+        publish_live_stream_path(state, client, source).await;
     }
 
     // Stamp `HasSegments` from the media-segment store (upstream
@@ -375,10 +490,13 @@ async fn playback_info(
                 always_burn_in_subtitle_when_transcoding: request
                     .selection
                     .always_burn_in_subtitle_when_transcoding,
+                // Upstream passes the posted profile and `OpenMediaSource` falls
+                // back to the device's; this is that profile already resolved.
+                device_profile: request.profile.clone(),
                 direct_play_protocols: vec![ferrofin_model::media_info::MediaProtocol::Http],
             };
-            // The same open as `POST /LiveStreams/Open`.
-            media_sources = vec![state.media_sources.open_live_stream(&open).await?];
+            // The same open as `POST /LiveStreams/Open` (`OpenMediaSource`).
+            media_sources = vec![open_media_source(state, auth, client, &open).await?];
         }
     }
 
@@ -387,6 +505,90 @@ async fn playback_info(
         play_session_id: Some(play_session_id),
         error_code: None,
     })
+}
+
+/// `MediaInfoHelper.OpenMediaSource`: opens the live stream `request` names,
+/// publishes its path for the client, and negotiates the opened source against
+/// the request's device profile, else the one the device last reported, as
+/// PlaybackInfo negotiates a source (`SetDeviceSpecificData` with transcoding
+/// and stream copy allowed). Without either profile, an existing transcoding
+/// URL is tagged with the live stream. Last, the source's container list is
+/// narrowed to the one the profile plays (`NormalizeMediaSourceContainer`).
+async fn open_media_source(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    client: &RequestContext,
+    request: &LiveStreamRequest,
+) -> Result<MediaSourceInfo, ApiError> {
+    let mut source = state.media_sources.open_live_stream(request).await?;
+    publish_live_stream_path(state, client, &mut source).await;
+    let stored;
+    let profile = if let Some(profile) = &request.device_profile {
+        Some(profile)
+    } else {
+        stored = state
+            .devices
+            .get_capabilities(auth.device_id.as_deref())
+            .await?
+            .device_profile;
+        stored.as_ref()
+    };
+    if let Some(profile) = profile {
+        let item = state
+            .library
+            .get_item_by_id(request.item_id)
+            .await?
+            .ok_or_else(|| ApiError::NotFound(format!("item {}", request.item_id)))?;
+        let user = resolve_user_opt(state, auth, Some(request.user_id)).await?;
+        let negotiation = PlaybackRequest {
+            user_id: Some(request.user_id),
+            max_streaming_bitrate: request.max_streaming_bitrate,
+            // The track picks apply to the opened source (its own id).
+            media_source_id: source.id.clone(),
+            selection: StreamSelection {
+                audio_stream_index: request.audio_stream_index,
+                subtitle_stream_index: request.subtitle_stream_index,
+                max_audio_channels: request.max_audio_channels,
+                start_time_ticks: request.start_time_ticks,
+                always_burn_in_subtitle_when_transcoding: request
+                    .always_burn_in_subtitle_when_transcoding,
+            },
+            flags: PlaybackFlags {
+                enable_direct_play: request.enable_direct_play,
+                enable_direct_stream: request.enable_direct_stream,
+                ..PlaybackFlags::default()
+            },
+            ..PlaybackRequest::default()
+        };
+        set_device_specific_data(
+            state,
+            auth,
+            user.as_ref(),
+            request.user_id,
+            request.item_id,
+            item.media_type.as_deref(),
+            std::slice::from_mut(&mut source),
+            profile,
+            &negotiation,
+            request.play_session_id.as_deref().unwrap_or_default(),
+        )
+        .await?;
+    } else if let Some(url) = source
+        .transcoding_url
+        .as_mut()
+        .filter(|url| !url.trim().is_empty())
+    {
+        url.push_str("&LiveStreamId=");
+        url.push_str(source.live_stream_id.as_deref().unwrap_or_default());
+    }
+    source.container =
+        ferrofin_model::dlna::stream_builder::normalize_media_source_format_into_single_container(
+            source.container.as_deref(),
+            profile,
+            ferrofin_model::dlna::DlnaProfileType::Video,
+            None,
+        );
+    Ok(source)
 }
 
 /// `MediaInfoHelper.SetDeviceSpecificData` over every source of an item: the
@@ -413,6 +615,7 @@ async fn set_device_specific_data(
         .max_streaming_bitrate
         .or(profile.max_streaming_bitrate);
     let max_streaming_bitrate = playback_bitrate_limit(state, auth, &policy, client_limit).await?;
+    let support = FerrofinTranscoderSupport::current(state).await?;
     let mut decisions = Vec::new();
     for source in media_sources {
         // Use the item's media type rather than the presence of a video stream:
@@ -450,6 +653,7 @@ async fn set_device_specific_data(
             request.flags,
             &policy,
             is_audio,
+            &support,
         );
         if let Some(decision) = decision {
             decisions.push((source.id.clone(), decision));
@@ -735,7 +939,7 @@ impl StreamDecision {
 /// item takes the audio one (its own direct play/remux/transcode rules and
 /// `/audio/…` URLs), everything else the video one.
 fn optimal_stream(
-    support: &FerrofinTranscoderSupport,
+    support: &FerrofinTranscoderSupport<'_>,
     options: &MediaOptions,
     is_audio: bool,
 ) -> Option<ferrofin_model::dlna::StreamInfo> {
@@ -766,6 +970,7 @@ fn apply_stream_decision(
     flags: PlaybackFlags,
     policy: &ferrofin_model::users::UserPolicy,
     is_audio: bool,
+    support: &FerrofinTranscoderSupport<'_>,
 ) -> Option<StreamDecision> {
     // MediaInfoHelper applies this again after negotiation, which may promote
     // a remux to Transcode. Audio-only sources require the audio permission;
@@ -799,8 +1004,7 @@ fn apply_stream_decision(
         stream_selection.always_burn_in_subtitle_when_transcoding;
     options.media_sources = vec![source.clone()];
 
-    let support = FerrofinTranscoderSupport;
-    let mut stream = optimal_stream(&support, &options, is_audio)?;
+    let mut stream = optimal_stream(support, &options, is_audio)?;
     stream.start_position_ticks = stream_selection.start_time_ticks.unwrap_or(0);
 
     let profile_type = if is_audio {
@@ -826,13 +1030,13 @@ fn apply_stream_decision(
             stream,
             token,
             play_session_id,
-            &support,
+            support,
         ));
     }
     if stream.play_method == PlayMethod::DirectPlay {
         source.supports_direct_play = true;
         source.supports_direct_stream = true;
-        apply_subtitle_delivery(source, &stream, &support, token);
+        apply_subtitle_delivery(source, &stream, support, token);
         return Some(StreamDecision {
             play_method: "DirectPlay",
             transcode_reasons: String::new(),
@@ -849,7 +1053,7 @@ fn apply_stream_decision(
             play_session_id,
             flags,
             force_remote,
-            &support,
+            support,
         ));
     }
     // Not direct-play: deliver an HLS transcode. The negotiated codecs (typically
@@ -878,7 +1082,7 @@ fn apply_stream_decision(
     // `apply_subtitle_delivery`. When they disagreed the transcode burned the
     // track in while the client also rendered the external VTT it was promised
     // — the same subtitle twice on screen.
-    set_hls_subtitle_delivery(&mut stream, source, profile, &container, &support);
+    set_hls_subtitle_delivery(&mut stream, source, profile, &container, support);
 
     // Adopt the HLS transcoding profile's audio-channel cap. The builder can
     // label this a raw-copy DirectStream (video copied, incompatible audio left
@@ -901,7 +1105,7 @@ fn apply_stream_decision(
     // error rather than silently transcoding.
     if !source.supports_transcoding {
         source.supports_transcoding = false;
-        apply_subtitle_delivery(source, &stream, &support, token);
+        apply_subtitle_delivery(source, &stream, support, token);
         return Some(StreamDecision::transcode(&stream));
     }
     // The playback-session id rides the transcode URL so the spawned job is
@@ -920,7 +1124,7 @@ fn apply_stream_decision(
     source.transcoding_url = Some(transcoding_url);
     source.transcoding_sub_protocol = MediaStreamProtocol::hls;
     source.transcoding_container = Some(container.clone());
-    apply_subtitle_delivery(source, &stream, &support, token);
+    apply_subtitle_delivery(source, &stream, support, token);
     Some(StreamDecision::transcode(&stream))
 }
 
@@ -937,7 +1141,7 @@ fn audio_transcode_decision(
     play_session_id: &str,
     flags: PlaybackFlags,
     force_remote: bool,
-    support: &FerrofinTranscoderSupport,
+    support: &FerrofinTranscoderSupport<'_>,
 ) -> StreamDecision {
     source.supports_direct_play = false;
     source.supports_direct_stream = false;
@@ -969,7 +1173,7 @@ fn force_remote_delivery(
     mut stream: ferrofin_model::dlna::StreamInfo,
     token: Option<&str>,
     play_session_id: &str,
-    support: &FerrofinTranscoderSupport,
+    support: &FerrofinTranscoderSupport<'_>,
 ) -> StreamDecision {
     source.supports_direct_play = false;
     source.supports_direct_stream = false;
@@ -1000,7 +1204,7 @@ fn set_hls_subtitle_delivery(
     source: &MediaSourceInfo,
     profile: &DeviceProfile,
     container: &str,
-    support: &FerrofinTranscoderSupport,
+    support: &FerrofinTranscoderSupport<'_>,
 ) {
     if let Some(index) = stream.subtitle_stream_index
         && let Some(sub) = source
@@ -1039,7 +1243,7 @@ fn set_hls_subtitle_delivery(
 fn apply_subtitle_delivery(
     source: &mut MediaSourceInfo,
     stream: &ferrofin_model::dlna::StreamInfo,
-    support: &FerrofinTranscoderSupport,
+    support: &FerrofinTranscoderSupport<'_>,
     token: Option<&str>,
 ) {
     source.default_audio_stream_index = stream.audio_stream_index;
@@ -1080,6 +1284,7 @@ async fn get_playback_info(
     RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<PlaybackInfoQuery>,
+    parts: Parts,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
     // The GET form carries no device profile, so every source keeps its static
     // (direct-play) shape.
@@ -1088,7 +1293,10 @@ async fn get_playback_info(
         flags: flags_from(&query, None),
         ..PlaybackRequest::default()
     };
-    Ok(Json(playback_info(&state, &auth, item_id, request).await?))
+    let client = super::system::context_from_parts(&state, &parts);
+    Ok(Json(
+        playback_info(&state, &auth, &client, item_id, request).await?,
+    ))
 }
 
 /// The `POST /Items/{itemId}/PlaybackInfo` body — the client's device profile,
@@ -1187,6 +1395,7 @@ async fn post_playback_info(
     RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
     Query(query): Query<PlaybackInfoQuery>,
+    parts: Parts,
     body: Option<JsonBody<PlaybackInfoBody>>,
 ) -> Result<Json<PlaybackInfoResponse>, ApiError> {
     let mut body = body.map(|JsonBody(b)| b).unwrap_or_default();
@@ -1227,7 +1436,10 @@ async fn post_playback_info(
         },
         flags: flags_from(&query, Some(&body)),
     };
-    Ok(Json(playback_info(&state, &auth, item_id, request).await?))
+    let client = super::system::context_from_parts(&state, &parts);
+    Ok(Json(
+        playback_info(&state, &auth, &client, item_id, request).await?,
+    ))
 }
 
 /// Query parameters for `POST /LiveStreams/Open`.
@@ -1287,8 +1499,8 @@ struct OpenLiveStreamQuery {
 ///
 /// Every scalar the query carries may instead arrive here — jellyfin-web and the
 /// Android clients POST the whole request as a body — and the query wins where
-/// both are present (C# `openToken ?? openLiveStreamDto?.OpenToken`). The device
-/// profile it may also carry is not yet honoured.
+/// both are present (C# `openToken ?? openLiveStreamDto?.OpenToken`). Its device
+/// profile, which only the body carries, negotiates the opened source.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -1329,6 +1541,8 @@ struct OpenLiveStreamDto {
     always_burn_in_subtitle_when_transcoding: Option<bool>,
     /// The protocols the client will direct-play.
     direct_play_protocols: Option<Vec<ferrofin_model::media_info::MediaProtocol>>,
+    /// The client's device profile, to negotiate the opened source against.
+    device_profile: Option<DeviceProfile>,
 }
 
 /// `POST /LiveStreams/Open` — open a media source and return its live stream.
@@ -1338,8 +1552,8 @@ struct OpenLiveStreamDto {
 /// [`LiveStreamRequest`] and handed to
 /// [`MediaSourceManager::open_live_stream`](ferrofin_traits::library::MediaSourceManager::open_live_stream),
 /// which redeems the open token — for a Live TV channel that opens the tuner —
-/// probes the result and registers it in the open-stream table. The posted
-/// device profile is not yet honoured.
+/// probes the result and registers it in the open-stream table; the opened
+/// source is then negotiated ([`open_media_source`]).
 #[utoipa::path(
     post,
     path = "/LiveStreams/Open",
@@ -1350,6 +1564,7 @@ async fn open_live_stream(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
     Query(query): Query<OpenLiveStreamQuery>,
+    parts: Parts,
     body: Option<JsonBody<OpenLiveStreamDto>>,
 ) -> Result<Json<LiveStreamResponse>, ApiError> {
     let dto = body.map(|JsonBody(dto)| dto).unwrap_or_default();
@@ -1360,7 +1575,8 @@ async fn open_live_stream(
     // stream — and a tuner — under another account's identity.
     let effective = effective_user_id(&state, &auth, query.user_id.or(dto.user_id)).await?;
     let request = live_stream_request(query, dto, effective);
-    let media_source = state.media_sources.open_live_stream(&request).await?;
+    let client = super::system::context_from_parts(&state, &parts);
+    let media_source = open_media_source(&state, &auth, &client, &request).await?;
     Ok(Json(LiveStreamResponse::new(media_source)))
 }
 
@@ -1403,6 +1619,8 @@ fn live_stream_request(
             .always_burn_in_subtitle_when_transcoding
             .or(dto.always_burn_in_subtitle_when_transcoding)
             .unwrap_or(false),
+        // `openLiveStreamDto?.DeviceProfile`: the query has no such field.
+        device_profile: dto.device_profile,
         direct_play_protocols: dto
             .direct_play_protocols
             .unwrap_or_else(|| vec![ferrofin_model::media_info::MediaProtocol::Http]),
@@ -1501,6 +1719,74 @@ crate::query::query_parameters! {
     OpenLiveStreamQuery {} => [("post", "/LiveStreams/Open")];
     CloseLiveStreamQuery {} => [("post", "/LiveStreams/Close")];
     BitrateTestQuery {} => [("get", "/Playback/BitrateTest")];
+}
+
+#[cfg(test)]
+mod published_live_stream_path_tests {
+    use super::published_live_stream_path;
+    use ferrofin_model::media_info::MediaProtocol;
+
+    /// `MediaInfoHelperTests.LiveStreamFilesPath`.
+    const LIVE: &str = "/LiveTv/LiveStreamFiles/abc/stream.ts";
+
+    /// `MediaInfoHelperTests.GetPublishedLiveStreamPath_VariousInputs_ReturnsExpected`
+    /// (v12.2), row for row.
+    #[rstest::rstest]
+    #[case("https://media.example.com", &format!("http://172.19.0.3:8096{LIVE}"), MediaProtocol::Http, "", Some(format!("https://media.example.com{LIVE}")))]
+    #[case("https://media.example.com/", &format!("http://172.19.0.3:8096{LIVE}?token=1"), MediaProtocol::Http, "", Some(format!("https://media.example.com{LIVE}?token=1")))]
+    #[case("https://media.example.com", &format!("http://172.19.0.3:8096{LIVE}#fragment"), MediaProtocol::Http, "", Some(format!("https://media.example.com{LIVE}")))]
+    #[case("https://media.example.com", &format!("https://172.19.0.3:8920{LIVE}"), MediaProtocol::Http, "", Some(format!("https://media.example.com{LIVE}")))]
+    #[case("https://media.example.com", &format!("http://192.168.1.10:8096{LIVE}"), MediaProtocol::Http, "", Some(format!("https://media.example.com{LIVE}")))]
+    #[case("https://media.example.com:8920", &format!("http://172.19.0.3:8096{LIVE}"), MediaProtocol::Http, "", Some(format!("https://media.example.com:8920{LIVE}")))]
+    #[case("https://media.example.com", &format!("http://172.19.0.3:8096/jellyfin{LIVE}"), MediaProtocol::Http, "/jellyfin", Some(format!("https://media.example.com/jellyfin{LIVE}")))]
+    #[case("https://jellyfin", &format!("http://172.19.0.3:8096/jellyfin{LIVE}"), MediaProtocol::Http, "/jellyfin", Some(format!("https://jellyfin/jellyfin{LIVE}")))]
+    #[case("https://media.example.com/jellyfin", &format!("http://172.19.0.3:8096/jellyfin{LIVE}"), MediaProtocol::Http, "/jellyfin", Some(format!("https://media.example.com/jellyfin{LIVE}")))]
+    #[case("https://media.example.com/jellyfin/", &format!("http://172.19.0.3:8096/jellyfin{LIVE}"), MediaProtocol::Http, "/jellyfin", Some(format!("https://media.example.com/jellyfin{LIVE}")))]
+    #[case("https://media.example.com", &format!("http://172.19.0.3:8096/jellyfin2{LIVE}"), MediaProtocol::Http, "/jellyfin", None)]
+    #[case(
+        "https://media.example.com",
+        "/media/livetv/buffer/abc/stream.ts",
+        MediaProtocol::File,
+        "",
+        None
+    )]
+    #[case(
+        "https://media.example.com",
+        "not a uri",
+        MediaProtocol::Http,
+        "",
+        None
+    )]
+    fn get_published_live_stream_path_various_inputs_returns_expected(
+        #[case] smart_api_url: &str,
+        #[case] local_path: &str,
+        #[case] protocol: MediaProtocol,
+        #[case] base_url: &str,
+        #[case] expected: Option<String>,
+    ) {
+        assert_eq!(
+            published_live_stream_path(smart_api_url, Some(local_path), protocol, base_url),
+            expected
+        );
+    }
+
+    /// `OpenMediaSource_NotAPublishableLiveStreamFilesPath_PathUnchanged`: a
+    /// tuner's own URL, a file, another server route and a library `.strm`
+    /// are never rewritten.
+    #[rstest::rstest]
+    #[case(MediaProtocol::Http, "http://192.168.1.50:5004/live/channel1.ts")]
+    #[case(MediaProtocol::File, "/media/livetv/buffer/abc/stream.ts")]
+    #[case(MediaProtocol::Http, "http://172.19.0.3:8096/Videos/abc/stream.ts")]
+    #[case(MediaProtocol::Http, "http://172.19.0.3:8096/library/movie.strm")]
+    fn a_path_outside_the_live_stream_buffer_is_left_alone(
+        #[case] protocol: MediaProtocol,
+        #[case] path: &str,
+    ) {
+        assert_eq!(
+            published_live_stream_path("https://media.example.com", Some(path), protocol, ""),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1777,6 +2063,7 @@ mod tests {
                 super::PlaybackFlags::default(),
                 &policy,
                 false,
+                &support(),
             );
             // SetDeviceSpecificSubtitleInfo stamps the decision's reasons.
             assert!(
@@ -1907,6 +2194,7 @@ mod tests {
                         flags,
                         &policy,
                         false,
+                        &support(),
                     );
                     assert_eq!(source.supports_direct_play, direct && !(is_remote && force));
                     let url = source.transcoding_url.as_deref().unwrap_or_default();
@@ -1941,6 +2229,7 @@ mod tests {
                         flags,
                         &denied,
                         false,
+                        &support(),
                     );
                     assert!(
                         !source.supports_transcoding,
@@ -2014,6 +2303,7 @@ mod tests {
                         flags,
                         &policy,
                         !is_video,
+                        &support(),
                     );
                     let expected = client_allows
                         && (policy.enable_audio_playback_transcoding
@@ -2141,6 +2431,7 @@ mod tests {
                 ..ferrofin_model::users::UserPolicy::default()
             },
             false,
+            &support(),
         )
         .expect("a decision");
         assert_eq!(decision.play_method, "Transcode");
@@ -2239,6 +2530,7 @@ mod tests {
                 flags,
                 &policy,
                 true,
+                &support(),
             )
         };
 
@@ -2301,20 +2593,51 @@ mod tests {
         }
     }
 
+    /// `MediaEncoder` as `ITranscoderSupport`: an audio codec is encodable
+    /// when the probed build has its encoder, opus and mp3 asked as
+    /// `libopus` and `libmp3lame`; any subtitle codec is; and extraction
+    /// follows `EnableSubtitleExtraction`, whatever the codec.
     #[test]
-    fn transcoder_support_reports_the_ffmpeg_audio_codecs() {
-        let s = FerrofinTranscoderSupport;
-        // Browser-transcode targets the decision relies on.
-        assert!(s.can_encode_to_audio_codec("aac"));
+    fn transcoder_support_asks_the_probed_encoders_and_the_extraction_setting() {
+        let s = support();
         assert!(s.can_encode_to_audio_codec("AAC"), "case-insensitive");
         assert!(s.can_encode_to_audio_codec("opus"));
-        assert!(s.can_encode_to_audio_codec("ac3"));
-        // Codecs ffmpeg only decodes (so a source can't be transcoded *to* them).
-        assert!(!s.can_encode_to_audio_codec("dts"));
-        assert!(!s.can_encode_to_audio_codec("truehd"));
-        // Image subtitles can't be extracted to text; text subs can.
-        assert!(s.can_extract_subtitles("subrip"));
-        assert!(!s.can_extract_subtitles("hdmv_pgs_subtitle"));
+        assert!(s.can_encode_to_audio_codec("mp3"));
+        assert!(!s.can_encode_to_audio_codec("truehd"), "not in the build");
+        assert!(s.can_extract_subtitles("hdmv_pgs_subtitle"));
+        let build = Encoders(&["aac", "opus", "mp3"]);
+        let bare = FerrofinTranscoderSupport {
+            encoders: &build,
+            enable_subtitle_extraction: false,
+        };
+        assert!(
+            !bare.can_encode_to_audio_codec("opus"),
+            "opus needs libopus"
+        );
+        assert!(
+            !bare.can_encode_to_audio_codec("mp3"),
+            "mp3 needs libmp3lame"
+        );
+        assert!(bare.can_encode_to_subtitle_codec("anything"));
+        assert!(!bare.can_extract_subtitles("subrip"));
+    }
+
+    /// An ffmpeg build's encoder list, compared ignoring case.
+    struct Encoders(&'static [&'static str]);
+
+    impl ferrofin_traits::media_encoding::EncoderSupport for Encoders {
+        fn supports_encoder(&self, encoder: &str) -> bool {
+            self.0.iter().any(|e| e.eq_ignore_ascii_case(encoder))
+        }
+    }
+
+    /// The negotiation's capabilities with a common ffmpeg build's encoders
+    /// and extraction on (the setting's default).
+    fn support() -> FerrofinTranscoderSupport<'static> {
+        FerrofinTranscoderSupport {
+            encoders: &crate::test_support::CommonEncoders,
+            enable_subtitle_extraction: true,
+        }
     }
 }
 

@@ -40,6 +40,12 @@ const AUTH: &str = r#"MediaBrowser Client="Generated Images", Device="Test Rig",
 const RED: [u8; 3] = [180, 30, 30];
 const BLUE: [u8; 3] = [30, 30, 180];
 
+/// `colour` under the black rectangle at alpha `0x78` a library tile (a thumb
+/// collage) draws over its backdrop, as `StripCollageBuilder` does.
+fn dimmed(colour: [u8; 3]) -> [u8; 3] {
+    colour.map(|c| u8::try_from((u16::from(c) * (255 - 0x78) + 127) / 255).unwrap_or(u8::MAX))
+}
+
 /// jellyfin-web's "Refresh metadata" with "Replace all images" ticked.
 const REPLACE_IMAGES: &str = "MetadataRefreshMode=FullRefresh&ImageRefreshMode=FullRefresh&ReplaceAllMetadata=false&ReplaceAllImages=true";
 
@@ -292,7 +298,7 @@ async fn replacing_a_genres_or_librarys_images_redraws_its_collage() {
         .row_id(BaseItemKind::CollectionFolder, "Movies")
         .await;
     harness
-        .wait_for_primary_colour("the scan's library tile", library, RED)
+        .wait_for_primary_colour("the scan's library tile", library, dimmed(RED))
         .await;
     assert_eq!(
         harness
@@ -304,7 +310,11 @@ async fn replacing_a_genres_or_librarys_images_redraws_its_collage() {
         StatusCode::NO_CONTENT
     );
     harness
-        .wait_for_primary_colour("the refresh to redraw the library tile", library, BLUE)
+        .wait_for_primary_colour(
+            "the refresh to redraw the library tile",
+            library,
+            dimmed(BLUE),
+        )
         .await;
 
     // A library's refresh, once its closing passes are done, has not
@@ -314,7 +324,7 @@ async fn replacing_a_genres_or_librarys_images_redraws_its_collage() {
         .row_id(BaseItemKind::UserRootFolder, "Media Folders")
         .await;
     harness
-        .wait_for_primary_colour("the scan's root image", root, RED)
+        .wait_for_primary_colour("the scan's root image", root, dimmed(RED))
         .await;
     assert_eq!(
         harness
@@ -323,7 +333,7 @@ async fn replacing_a_genres_or_librarys_images_redraws_its_collage() {
         StatusCode::NO_CONTENT
     );
     harness
-        .wait_for_primary_colour("the refresh to recopy the root image", root, BLUE)
+        .wait_for_primary_colour("the refresh to recopy the root image", root, dimmed(BLUE))
         .await;
     drop(harness.wired);
 }

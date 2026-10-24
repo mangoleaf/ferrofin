@@ -153,8 +153,13 @@ async fn websocket_upgrade(
 #[derive(Clone)]
 struct SocketCaller {
     session_id: String,
+    /// Nil for an API-key socket, whose session has no user.
     user_id: uuid::Uuid,
     is_admin: bool,
+    /// The socket authenticated with an API key: its session has no user and
+    /// it sees every session (`SessionInfoWebSocketListener` applies no user
+    /// filter to an API key).
+    is_api_key: bool,
 }
 
 /// Why an authenticated socket carries no session — kept distinct so the logs
@@ -162,8 +167,8 @@ struct SocketCaller {
 /// server bug that would silently drop SyncPlay/push delivery).
 #[derive(Clone, Copy)]
 enum SessionlessReason {
-    /// The socket authenticated with an API key, which has no device row.
-    ApiKey,
+    /// An API-key socket's session could not be opened.
+    ApiKeySessionFailed,
     /// A token was presented but the session manager could not resolve it.
     TokenUnresolved,
     /// The token resolved to a session that carries no session id.
@@ -174,7 +179,7 @@ impl SessionlessReason {
     /// The value logged in the `reason` field.
     fn as_str(self) -> &'static str {
         match self {
-            Self::ApiKey => "api-key",
+            Self::ApiKeySessionFailed => "api-key-session-failed",
             Self::TokenUnresolved => "token-unresolved",
             Self::SessionWithoutId => "session-without-id",
         }
@@ -190,17 +195,46 @@ impl SessionlessReason {
 /// client, and with the caller's address, which upstream's `GetSession` records
 /// on every connect (`GetNormalizedRemoteIP`).
 ///
+/// An API key has no device row, so its socket gets the session upstream's
+/// `RequestHelpers.GetSession` logs for it instead: one with no user
+/// (`LogSessionActivity(client, version, deviceId, device, remoteIp, null)`),
+/// keyed by the client and device the auth layer filled in for the key.
+/// The key is upstream's `{appName}{deviceId}`, so a key whose name and
+/// supplied `DeviceId` equal a signed-in client's would share that client's
+/// session (and clear its user), exactly as upstream; without a supplied
+/// `DeviceId` the key's device is the server's system id, which no user
+/// session carries.
+///
 /// [`get_session_by_authentication_token`]: ferrofin_traits::session::SessionManager::get_session_by_authentication_token
 async fn resolve_caller(
     state: &AppState,
     info: &AuthorizationInfo,
 ) -> Result<SocketCaller, SessionlessReason> {
-    // TODO: upstream `RequestHelpers.GetSession` gives an API-key socket a
-    // session with no user (`LogSessionActivity(..., user: null)`), so it is
-    // greeted and can subscribe. Porting it needs
-    // `SessionManager::log_session_activity` to take an optional user.
     if info.is_api_key {
-        return Err(SessionlessReason::ApiKey);
+        let session = state
+            .sessions
+            .log_session_activity(
+                info.client.as_deref().unwrap_or_default(),
+                info.version.as_deref().unwrap_or_default(),
+                info.device_id.as_deref().unwrap_or_default(),
+                info.device.as_deref().unwrap_or_default(),
+                info.remote_endpoint.as_deref().unwrap_or_default(),
+                None,
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "websocket API-key session could not be opened");
+                SessionlessReason::ApiKeySessionFailed
+            })?;
+        let session_id = session.id.ok_or(SessionlessReason::SessionWithoutId)?;
+        // An API key is elevated (`is_administrator_identity`), so it may
+        // subscribe to the activity log as upstream's listener allows.
+        return Ok(SocketCaller {
+            session_id,
+            user_id: session.user_id,
+            is_admin: true,
+            is_api_key: true,
+        });
     }
     let token = info
         .token
@@ -230,6 +264,7 @@ async fn resolve_caller(
         session_id,
         user_id: session.user_id,
         is_admin,
+        is_api_key: false,
     })
 }
 
@@ -335,6 +370,22 @@ fn parse_inbound(text: &str) -> Option<Inbound> {
 /// The default stream period when the subscription's `Data` is absent or
 /// malformed — jellyfin-web subscribes with "0,1500".
 const DEFAULT_STREAM_MILLIS: u64 = 1500;
+
+/// Fallback minimum period between pushes of a dashboard stream, used when the
+/// composition root does not configure one (chiefly unit tests). The server
+/// injects the operator-configured floor
+/// (`FERROFIN_WS_MIN_STREAM_PERIOD_MS`, default 100 ms) via
+/// [`crate::AppState::with_websocket_min_stream_period`]; this constant only
+/// backs a bare [`crate::AppState::new`] so client-chosen periods are floored
+/// even then.
+///
+/// The floor exists because Ferrofin drives these streams on a timer — each
+/// tick recomputes and sends the full snapshot — whereas upstream's
+/// `BasePeriodicWebSocketListener` is event-driven and sends only when a
+/// session/playback event fires (the client period is a debounce ceiling
+/// there, never a poll clock). Without a floor a client could ask for a 1 ms
+/// period and turn each tick into back-to-back `get_sessions`/activity work.
+pub(crate) const DEFAULT_WS_MIN_STREAM_PERIOD: Duration = Duration::from_millis(100);
 
 /// Parses the `"initialDelayMs,periodMs"` subscription payload (the C#
 /// `BasePeriodicWebSocketListener` Data convention) into the stream period.
@@ -520,10 +571,13 @@ async fn handle_socket(
     // it wakes every `IntervalFactor * WebSocketLostTimeout` and only sends a
     // `ForceKeepAlive` to a socket that has been SILENT for longer than
     // `ForceKeepAliveFactor * WebSocketLostTimeout`, where "silent" is reset by
-    // the client's own `KeepAlive`. A socket past the full timeout leaves the
-    // watchlist (`RemoveWebSocket`) and is never prodded again — upstream does
-    // not close it either, which is the `// TODO: handle session relative to the
-    // lost webSocket` still standing at SessionWebSocketListener.cs:246.
+    // the client's own `KeepAlive`. A socket past the full timeout is lost:
+    // upstream removes it from the watchlist and disposes it (since 12.0-rc3,
+    // jellyfin/jellyfin#17079), which ends the receive, so its session and
+    // SyncPlay seat go with it. Here the loop ends and the teardown below runs.
+    // Every socket has a session upstream (`RequestHelpers.GetSession`), but a
+    // sessionless one here (see `resolve_caller`) is only dropped from the
+    // watch, as before: nothing told it to send `KeepAlive`.
     //
     // A fixed 60 s metronome — what this loop used to run — is neither: it kept
     // prodding a socket the client was actively talking on, and its cadence
@@ -544,7 +598,7 @@ async fn handle_socket(
     // (each is `None` until subscribed). Only a socket with a session may
     // subscribe — the streams answer as the socket's user — and the activity
     // stream is an administrator's alone (`may_subscribe`).
-    let mut streams = Streams::default();
+    let mut streams = Streams::new(state.websocket_min_stream_period);
     let mut task_updates = None;
 
     if open {
@@ -594,15 +648,15 @@ async fn handle_socket(
                     break;
                 },
                 _ = keepalive.tick(), if watched => {
-                    if !keep_alive_watchdog(
-                        &mut socket, &overflowed, last_keep_alive, &mut watched).await
+                    if !keep_alive_watchdog(&mut socket, &overflowed, last_keep_alive,
+                        caller.is_some(), &mut watched).await
                     {
                         break;
                     }
                 }
                 () = tick(&mut streams.sessions) => {
                     if let Some(c) = caller.as_ref()
-                        && let Some(msg) = sessions_message(&state, c.user_id).await
+                        && let Some(msg) = sessions_message(&state, c.user_id, c.is_api_key).await
                         && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
                     {
                         break;
@@ -652,7 +706,7 @@ fn log_task_subscription(inbound: Inbound, session: bool) {
 async fn unregister_socket(state: &AppState, registration: Option<Registration>) {
     if let Some((sid, bus, token)) = registration {
         end_session_if_last_socket(bus.as_ref(), &sid, token, || {
-            state.sessions.report_session_ended(&sid)
+            state.sessions.close_if_needed(&sid)
         })
         .await;
     }
@@ -723,17 +777,26 @@ enum KeepAlive {
     /// so prompt it with another `ForceKeepAlive`.
     Prod,
     /// `lost` — silent past the whole `WebSocketLostTimeout`. Upstream drops it
-    /// from the watchlist (`RemoveWebSocket`) and does NOT close it: the
-    /// `// TODO: handle session relative to the lost webSocket` at :246 stands.
+    /// from the watchlist and disposes it (`KeepAliveSockets`, since 12.0-rc3),
+    /// so the socket closes and its session ends.
     Lost,
+    /// `lost`, but the socket has no session to end: it only leaves the watch.
+    /// Upstream gives every socket a session (an API key's has no user, which
+    /// Ferrofin ports too); a socket here is sessionless only when that failed
+    /// ([`SessionlessReason`]), and such a socket was never greeted.
+    Unwatch,
 }
 
 /// Classifies one watchdog tick. The two bands are half-open exactly as the C#
 /// writes them: `inactive` is `elapsed > force && elapsed < timeout`, `lost` is
 /// `elapsed >= timeout`, so a socket exactly at the timeout is lost, not prodded.
-fn keep_alive_action(silent_secs: f64) -> KeepAlive {
+fn keep_alive_action(silent_secs: f64, has_session: bool) -> KeepAlive {
     if silent_secs >= KEEPALIVE_LOST_SECS {
-        KeepAlive::Lost
+        if has_session {
+            KeepAlive::Lost
+        } else {
+            KeepAlive::Unwatch
+        }
     } else if silent_secs > KEEPALIVE_FORCE_AFTER_SECS {
         KeepAlive::Prod
     } else {
@@ -742,18 +805,26 @@ fn keep_alive_action(silent_secs: f64) -> KeepAlive {
 }
 
 /// One tick of `SessionWebSocketListener.KeepAliveSockets` for a single socket.
-/// Returns whether the socket loop should continue.
+/// Returns whether the socket loop should continue: a lost socket with a
+/// session ends it.
 async fn keep_alive_watchdog(
     socket: &mut WebSocket,
     overflowed: &tokio::sync::Notify,
     last_keep_alive: tokio::time::Instant,
+    has_session: bool,
     watched: &mut bool,
 ) -> bool {
-    match keep_alive_action(last_keep_alive.elapsed().as_secs_f64()) {
+    let silent_secs = last_keep_alive.elapsed().as_secs_f64();
+    match keep_alive_action(silent_secs, has_session) {
         KeepAlive::Quiet => true,
         KeepAlive::Lost => {
+            // Upstream: `Lost {0} WebSockets.` at Information.
+            tracing::info!(silent_s = silent_secs, "websocket keep-alive lost; closing");
+            false
+        }
+        KeepAlive::Unwatch => {
             *watched = false;
-            tracing::debug!("websocket keep-alive lost; no longer watched");
+            tracing::debug!("sessionless websocket keep-alive lost; no longer watched");
             true
         }
         KeepAlive::Prod => {
@@ -775,24 +846,31 @@ struct Streams {
     /// Only activity entries created after this instant are streamed (advanced
     /// on every send, so each entry is delivered once).
     activity_since: chrono::DateTime<chrono::Utc>,
+    /// The floor every armed stream's period is clamped up to (see
+    /// [`DEFAULT_WS_MIN_STREAM_PERIOD`]).
+    min_period: Duration,
 }
 
-impl Default for Streams {
-    fn default() -> Self {
+impl Streams {
+    /// A fresh, unsubscribed stream set whose periods are floored at
+    /// `min_period` (the operator-configured minimum stream period).
+    fn new(min_period: Duration) -> Self {
         Self {
             sessions: None,
             tasks: None,
             activity: None,
             activity_since: chrono::Utc::now(),
+            min_period,
         }
     }
-}
 
-impl Streams {
     /// Arms or cancels a stream for one subscription message.
     fn apply(&mut self, inbound: Inbound) {
+        // Floor the client-chosen period: a tiny period would otherwise make
+        // each tick recompute and resend the full snapshot back to back.
+        let min_period = self.min_period;
         let arm = |period: Duration| {
-            let mut interval = tokio::time::interval(period);
+            let mut interval = tokio::time::interval(period.max(min_period));
             // First send one period from now, not immediately.
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.reset();
@@ -837,11 +915,16 @@ fn envelope(message_type: &str, data: &serde_json::Value) -> String {
 }
 
 /// The `Sessions` stream payload: the session list as the subscribing user
-/// sees it (the session manager applies the caller's visibility).
-async fn sessions_message(state: &AppState, user_id: uuid::Uuid) -> Option<String> {
+/// sees it (the session manager applies the caller's visibility; an API key
+/// sees every session).
+async fn sessions_message(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    is_api_key: bool,
+) -> Option<String> {
     let sessions = state
         .sessions
-        .get_sessions(user_id, None, None, None, false)
+        .get_sessions(user_id, None, None, None, is_api_key)
         .await
         .ok()?;
     Some(envelope("Sessions", &serde_json::to_value(sessions).ok()?))
@@ -1005,12 +1088,40 @@ fn force_keep_alive_message() -> String {
 mod tests {
     use super::{
         Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_FORCE_AFTER_SECS, KEEPALIVE_LOST_SECS,
-        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, SocketCaller, action_for,
+        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, SocketCaller, Streams, action_for,
         force_keep_alive_message, keep_alive_ack, keep_alive_action, may_subscribe, parse_inbound,
         push_sink, visible_tasks,
     };
     use axum::extract::ws::Message;
+    use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn stream_period_is_floored_at_the_configured_minimum() {
+        // A hostile or misconfigured client asks for a 1 ms period on every
+        // stream; each must be clamped up to the floor so a tick cannot become
+        // back-to-back `get_sessions`/activity work.
+        let floor = Duration::from_millis(100);
+        let mut streams = Streams::new(floor);
+        streams.apply(Inbound::SessionsStart(Duration::from_millis(1)));
+        streams.apply(Inbound::TasksStart(Duration::from_millis(1)));
+        streams.apply(Inbound::ActivityStart(Duration::from_millis(1)));
+        assert_eq!(streams.sessions.as_ref().unwrap().period(), floor);
+        assert_eq!(streams.tasks.as_ref().unwrap().period(), floor);
+        assert_eq!(streams.activity.as_ref().unwrap().period(), floor);
+    }
+
+    #[tokio::test]
+    async fn stream_period_above_the_floor_is_left_untouched() {
+        // jellyfin-web subscribes with 1500 ms, comfortably above the floor, so
+        // the floor must not slow a well-behaved client down.
+        let mut streams = Streams::new(Duration::from_millis(100));
+        streams.apply(Inbound::SessionsStart(Duration::from_millis(1500)));
+        assert_eq!(
+            streams.sessions.as_ref().unwrap().period(),
+            Duration::from_millis(1500)
+        );
+    }
 
     #[tokio::test]
     async fn captured_transitions_precede_periodic_snapshots_and_stop_unsubscribes() {
@@ -1112,6 +1223,7 @@ mod tests {
             session_id: "s".to_owned(),
             user_id: uuid::Uuid::nil(),
             is_admin,
+            is_api_key: false,
         };
         let period = std::time::Duration::from_secs(1);
         assert!(!may_subscribe(
@@ -1129,6 +1241,13 @@ mod tests {
                 assert!(may_subscribe(&caller(false), inbound), "{inbound:?}");
             }
         }
+        // An API key is elevated, so `ActivityLogWebSocketListener` admits it.
+        let api_key = SocketCaller {
+            is_admin: true,
+            is_api_key: true,
+            ..caller(true)
+        };
+        assert!(may_subscribe(&api_key, Inbound::ActivityStart(period)));
     }
 
     #[test]
@@ -1310,6 +1429,31 @@ mod tests {
         );
     }
 
+    /// The last socket's close ends the session through `close_if_needed` (C#
+    /// `CloseIfNeededAsync`, which releases the session's live stream first),
+    /// never through `report_session_ended`, which is a logout's and releases
+    /// nothing. `FakeSessions` answers `close_if_needed` and leaves
+    /// `report_session_ended` unimplemented, so the panic is the assertion:
+    /// the test passes only if the close never reports a logout.
+    #[tokio::test]
+    async fn the_last_socket_close_closes_the_session_rather_than_logging_it_out() {
+        let state = crate::test_support::fake_state();
+        let bus = std::sync::Arc::new(FakeBus {
+            still_connected: false,
+            removed: std::sync::Mutex::new(Vec::new()),
+        });
+        let registration: super::Registration = (
+            "sess-1".to_owned(),
+            bus.clone() as std::sync::Arc<dyn ferrofin_traits::session_bus::SessionMessageBus>,
+            7,
+        );
+        super::unregister_socket(&state, Some(registration)).await;
+        assert_eq!(
+            *bus.removed.lock().expect("fake bus mutex"),
+            vec![("sess-1".to_owned(), 7)]
+        );
+    }
+
     /// The C# guard `if (!session.SessionControllers.Any(i => i.IsSessionActive))`:
     /// a stale socket closing after the client reconnected must not end the
     /// session out from under the live one.
@@ -1365,14 +1509,16 @@ mod tests {
         // `IntervalFactor * WebSocketLostTimeout`: the watchdog wakes far more
         // often than it speaks, so most ticks must be silent.
         for quiet in [0.0, 1.0, 12.0, 24.0, 44.9, KEEPALIVE_FORCE_AFTER_SECS] {
-            assert_eq!(keep_alive_action(quiet), KeepAlive::Quiet, "{quiet}");
+            assert_eq!(keep_alive_action(quiet, true), KeepAlive::Quiet, "{quiet}");
         }
         for prod in [45.1, 48.0, 59.9] {
-            assert_eq!(keep_alive_action(prod), KeepAlive::Prod, "{prod}");
+            assert_eq!(keep_alive_action(prod, true), KeepAlive::Prod, "{prod}");
         }
-        // `elapsed >= WebSocketLostTimeout` is `lost`, not one last prod.
+        // `elapsed >= WebSocketLostTimeout` is `lost`, not one last prod: a
+        // socket with a session closes, a sessionless one only leaves the watch.
         for lost in [KEEPALIVE_LOST_SECS, 60.1, 600.0] {
-            assert_eq!(keep_alive_action(lost), KeepAlive::Lost, "{lost}");
+            assert_eq!(keep_alive_action(lost, true), KeepAlive::Lost, "{lost}");
+            assert_eq!(keep_alive_action(lost, false), KeepAlive::Unwatch, "{lost}");
         }
         // ...and the bands are the C# factors of the one timeout the client is
         // told about in the `ForceKeepAlive` payload.

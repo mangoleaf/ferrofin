@@ -9,7 +9,13 @@
 //! - scheduled-task runs and metadata lookups `send().await` on the queue
 //!   and await a typed reply;
 //! - events are fire-and-forget `try_send`s — when a slow guest's queue is
-//!   full the event is dropped (with a debug log), never the server's time.
+//!   full the event is dropped (with a debug log), never the server's time;
+//! - web requests (`/Plugins/{id}/web/*`, reachable without authentication)
+//!   never wait either: they `try_send`, and together they may hold at most
+//!   [`web_request_slots`] of the queue (half), queued or running. Beyond
+//!   that, or when the queue is full, a request is turned away at once with
+//!   [`RequestError::Busy`], so a flood of them cannot fill the queue that
+//!   scans, tasks and events share.
 //!
 //! The async `send().await` suspends (rather than parking a tokio worker)
 //! when the queue is full, which is the right trade — but it is an
@@ -71,6 +77,35 @@ pub const INSTANCES_PER_PLUGIN: usize = 64;
 /// making `FERROFIN_WASM_CALL_TIMEOUT_SECS` map 1:1 onto ticks.
 pub const EPOCH_TICK: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// How many of a plugin's `queue_capacity` command slots its web requests
+/// may hold at once, queued or running: half, and at least one (owner
+/// decision 2026-10-20). The anonymous web route can then never fill the
+/// queue that scans, tasks and events share.
+#[must_use]
+pub fn web_request_slots(queue_capacity: usize) -> usize {
+    (queue_capacity / 2).max(1)
+}
+
+/// Why [`RuntimeHandle::handle_request`] produced no guest response.
+#[derive(Debug)]
+pub enum RequestError {
+    /// The plugin cannot take another web request now: web requests already
+    /// hold their [`web_request_slots`], or the queue is full. Not a plugin
+    /// failure; the caller may retry later.
+    Busy(String),
+    /// The guest or host failed the call, the breaker is open, or the
+    /// runtime thread is gone.
+    Failed(String),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(message) | Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
 /// The guest analysis result plus a host-only live-policy observation.
 #[derive(Debug)]
 pub struct ScanMediaOutcome {
@@ -106,6 +141,9 @@ pub enum Command {
         config: String,
         /// Receives the guest's response (or the host/trap error text).
         reply: tokio::sync::oneshot::Sender<Result<crate::bindings::types::PluginResponse, String>>,
+        /// One of the plugin's [`web_request_slots`], freed once the guest is
+        /// done with this request.
+        slot: tokio::sync::OwnedSemaphorePermit,
     },
     /// Offer the guest one library item for media analysis.
     ScanMedia {
@@ -159,7 +197,7 @@ pub struct InstanceSpec {
     /// Guest-call deadline in epoch ticks (1 tick = [`EPOCH_TICK`]).
     pub timeout_ticks: u64,
     /// The shared blocking HTTP client behind `http-fetch`.
-    pub http: Arc<reqwest::blocking::Client>,
+    pub http: Arc<crate::capabilities::GuestHttp>,
     /// Whether this plugin may reach private/loopback HTTP destinations.
     pub private_http_allowed: bool,
     /// The manager handles behind the E2 capabilities (installed post-load).
@@ -240,6 +278,8 @@ pub fn arm_deadline(store: &mut Store<HostState>, ticks: u64) {
 pub struct RuntimeHandle {
     sender: Sender<Command>,
     dead: Arc<AtomicBool>,
+    /// The [`web_request_slots`] that web requests take before queueing.
+    web_slots: Arc<tokio::sync::Semaphore>,
     plugin_name: String,
 }
 
@@ -280,31 +320,56 @@ impl RuntimeHandle {
 
     /// Routes one HTTP request to the guest and awaits its response.
     ///
+    /// The request never waits for queue room: when web requests already
+    /// hold all their [`web_request_slots`], or the queue is full, it is
+    /// turned away at once. Its slot travels with the command and frees when
+    /// the guest is done, so a caller that hangs up keeps holding it until
+    /// then.
+    ///
     /// # Errors
-    /// The guest/host error text, the breaker being open, or the runtime
-    /// thread being gone.
+    /// [`RequestError::Busy`] when the plugin has no room for the request;
+    /// [`RequestError::Failed`] with the guest/host error text, the breaker
+    /// being open, or the runtime thread being gone.
     pub async fn handle_request(
         &self,
         request: crate::bindings::types::PluginRequest,
         config: String,
-    ) -> Result<crate::bindings::types::PluginResponse, String> {
+    ) -> Result<crate::bindings::types::PluginResponse, RequestError> {
         if self.is_dead() {
-            return Err(format!(
+            return Err(RequestError::Failed(format!(
                 "plugin `{}` is disabled until restart after {BREAKER_LIMIT} consecutive failures",
                 self.plugin_name
-            ));
+            )));
         }
+        let busy = || {
+            RequestError::Busy(format!(
+                "plugin `{}` is busy; retry the request later",
+                self.plugin_name
+            ))
+        };
+        let Ok(slot) = Arc::clone(&self.web_slots).try_acquire_owned() else {
+            return Err(busy());
+        };
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.sender
-            .send(Command::HandleRequest {
-                request,
-                config,
-                reply,
-            })
-            .await
-            .map_err(|_| "plugin runtime thread has exited".to_owned())?;
+        match self.sender.try_send(Command::HandleRequest {
+            request,
+            config,
+            reply,
+            slot,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => return Err(busy()),
+            Err(TrySendError::Closed(_)) => {
+                return Err(RequestError::Failed(
+                    "plugin runtime thread has exited".to_owned(),
+                ));
+            }
+        }
         rx.await
-            .map_err(|_| "plugin runtime dropped the request reply".to_owned())?
+            .map_err(|_| {
+                RequestError::Failed("plugin runtime dropped the request reply".to_owned())
+            })?
+            .map_err(RequestError::Failed)
     }
 
     /// Offers the guest one item for media analysis and awaits its outcome.
@@ -440,6 +505,9 @@ pub fn spawn(
     let handle = RuntimeHandle {
         sender,
         dead: Arc::clone(&dead),
+        web_slots: Arc::new(tokio::sync::Semaphore::new(web_request_slots(
+            queue_capacity,
+        ))),
         plugin_name: spec.plugin_name.clone(),
     };
     std::thread::Builder::new()
@@ -520,7 +588,8 @@ fn run_loop(
                 request,
                 config,
                 reply,
-            } => dispatch_request(spec, store, instance, &request, config, reply),
+                slot,
+            } => dispatch_request(spec, store, instance, &request, config, reply, slot),
             Command::RemoteImages {
                 item,
                 config,
@@ -614,7 +683,8 @@ fn refuse(command: Command, plugin_name: &str) {
         Command::RunTask { reply, .. } => {
             let _ = reply.send(Err(message));
         }
-        Command::HandleRequest { reply, .. } => {
+        Command::HandleRequest { reply, slot, .. } => {
+            drop(slot);
             let _ = reply.send(Err(message));
         }
         Command::RemoteImages { reply, .. } => {
@@ -639,10 +709,15 @@ fn dispatch_request(
     request: &crate::bindings::types::PluginRequest,
     config: String,
     reply: tokio::sync::oneshot::Sender<Result<crate::bindings::types::PluginResponse, String>>,
+    slot: tokio::sync::OwnedSemaphorePermit,
 ) -> bool {
     store.data_mut().config_json = config;
     arm_deadline(store, spec.timeout_ticks);
-    match instance.call_handle_request(&mut *store, request) {
+    let outcome = instance.call_handle_request(&mut *store, request);
+    // Free the web slot before answering, so the caller's next request never
+    // finds it still taken.
+    drop(slot);
+    match outcome {
         Ok(response) => {
             let _ = reply.send(Ok(response));
             false
@@ -683,5 +758,24 @@ fn dispatch_scan(
             }));
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::web_request_slots;
+
+    #[rstest]
+    #[case::default_queue(256, 128)]
+    #[case::even(4, 2)]
+    #[case::odd_rounds_down(3, 1)]
+    #[case::one_slot_queue_still_serves_the_web(1, 1)]
+    fn web_requests_get_half_the_queue_and_at_least_one_slot(
+        #[case] queue_capacity: usize,
+        #[case] slots: usize,
+    ) {
+        assert_eq!(web_request_slots(queue_capacity), slots);
     }
 }

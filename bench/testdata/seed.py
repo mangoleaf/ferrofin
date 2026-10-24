@@ -97,7 +97,7 @@ def drain(api, settle=30, label=""):
     time.sleep(settle)
 
 
-def refresh_and_wait(api, timeout):
+def refresh_and_wait(api, timeout, poll=2):
     """The refresh POST is asynchronous: Idle alone does not prove a scan ran."""
     tasks = [t for t in api.get("/ScheduledTasks") if t.get("Key") == "RefreshLibrary"]
     if len(tasks) != 1:
@@ -116,7 +116,7 @@ def refresh_and_wait(api, timeout):
                 raise RuntimeError(f"library scan failed: {result.get('Status')}")
             if task.get("State") == "Idle":
                 return result
-        time.sleep(2)
+        time.sleep(poll)
     raise RuntimeError("library scan did not complete before its deadline")
 
 
@@ -163,6 +163,27 @@ def prepare_jellyfin(url, ids_path, summary_path, out):
     with open(out, "w") as f:
         json.dump(result, f, indent=2)
     print(json.dumps({"version": info["Version"], "counts": counts, "multi_version_groups": versions}), flush=True)
+
+
+def scan_library(url, ids_path, out):
+    """One full library scan of a benchmark server's disposable config, requested and awaited
+    the way the Jellyfin preparation does it, so both servers are measured after the same
+    12.x scan work (album-artist people, library view images, …) and not one of them only."""
+    with open(ids_path) as f:
+        ids = json.load(f)
+    api = Api(url, timeout=10, attempts=1)
+    api.token = ids["token"]
+    timeout = int(os.environ.get("PREPARE_TIMEOUT_S", "1800"))
+    deadline = time.monotonic() + timeout
+    while running_tasks(api):
+        if time.monotonic() >= deadline:
+            raise RuntimeError("startup tasks did not drain before the library scan")
+        time.sleep(2)
+    t0 = time.monotonic()
+    scan = refresh_and_wait(api, timeout)
+    with open(out, "w") as f:
+        json.dump({"scan": scan, "elapsed_s": round(time.monotonic() - t0, 1)}, f, indent=2)
+    print(f"library scan {scan.get('Status')} in {time.monotonic() - t0:.0f}s", flush=True)
 
 
 def normalized_id(value):
@@ -360,9 +381,9 @@ def export_existing_pools(url, ids_path):
     print("exported source pools: " + json.dumps({k: len(ids["pools"][k]) for k in ("movies", "series", "terms")}))
 
 
-def main():
-    url, out = sys.argv[1], sys.argv[2]
-    api = Api(url)
+def setup(api):
+    """Startup wizard (admin bench/bench) and the three libraries, without a scan; returns
+    the admin's id and leaves `api` authenticated. bench/scan.py times the scan after it."""
     wait_ready(api)
     print("wizard", flush=True)
     api.post("/Startup/Configuration", {"UICulture": "en-US", "MetadataCountryCode": "US", "PreferredMetadataLanguage": "en"})
@@ -382,7 +403,14 @@ def main():
             "TypeOptions": [{"Type": t, "MetadataFetchers": [], "ImageFetchers": []} for t in TYPES]}
     for name, ctype, path in LIBS:
         api.post("/Library/VirtualFolders", {"LibraryOptions": {**opts, "PathInfos": [{"Path": path}]}},
-                 name=name, collectionType=ctype, paths=[path], refreshLibrary=False)
+                 name=name, collectionType=ctype, paths=[path], refreshLibrary="false")  # v1.3.2 and older reject "False"
+    return uid
+
+
+def main():
+    url, out = sys.argv[1], sys.argv[2]
+    api = Api(url)
+    uid = setup(api)
     api.post("/Library/Refresh")
     time.sleep(5)  # let the scan task leave Idle before drain() looks at it
     drain(api, settle=5, label="scan: ")
@@ -449,6 +477,8 @@ if __name__ == "__main__":
         compare_states(*sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "--prepare-jellyfin":
         prepare_jellyfin(*sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "--scan":
+        scan_library(*sys.argv[2:])
     elif len(sys.argv) > 1 and sys.argv[1] == "--export-pools":
         export_existing_pools(*sys.argv[2:])
     else:

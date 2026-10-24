@@ -5,9 +5,12 @@
 //! a set of `FileSystemWatcher`s over each library root and, on a debounce timer,
 //! feeds changed paths back into the library refresh pipeline. Two behaviors of
 //! that class live on this seam:
-//! - **self-suppression:** while the server itself is writing under a path
-//!   (metadata save, image download) it registers the path as "temporarily
-//!   ignored" so the resulting change events do not trigger a redundant refresh.
+//! - **self-suppression:** the server's own writers (subtitle and lyric saves
+//!   and deletes, NFO and image saves, box-set and playlist folders) bracket
+//!   each file they write ([`SelfWriteGuard`]), as upstream's call
+//!   `ReportFileSystemChangeBeginning`/`Complete`. A change to a bracketed
+//!   path, under it, or to the folder holding it is ignored, and stays ignored
+//!   for [`SELF_WRITE_SETTLE`] after the write, since its events arrive late.
 //!   That set is the in-memory state this type owns.
 //! - **watch lifecycle:** `Start`/`Stop` begin/stop watching, delegated to the
 //!   injected [`FileSystemWatcher`] so the real inotify wrapper is supplied at
@@ -17,22 +20,26 @@
 //! queues a (coalescing) **path-scoped** scan through the injected
 //! [`LibraryScanTrigger`] (the composition root passes the library manager), so
 //! only the item each changed path belongs to — the nearest existing item at or
-//! above it, and its subtree — is refreshed. Like the C# timer, a
-//! burst of changes **debounces**: each report (re)arms a settle window of
-//! `LibraryMonitorDelay` seconds (read live from the injected configuration
-//! manager, or fixed via [`FerrofinLibraryMonitor::with_debounce`]) and the scan
-//! dispatches only once the window lapses with no further changes. A zero
-//! delay dispatches immediately. Without a trigger attached (unit tests) a
-//! change is logged only.
+//! above it, and its subtree — is refreshed. Like the C# `FileRefresher`s, a
+//! burst of changes **debounces**: a report joins the settle group of a related
+//! path (equal, nested or a sibling — `CreateRefresher`) or opens its own, each
+//! report (re)arms its group's window of `LibraryMonitorDelay` seconds (read
+//! live from the injected configuration manager, or fixed via
+//! [`FerrofinLibraryMonitor::with_debounce`]), and a group's scan dispatches
+//! once its own window lapses with no further changes. Unrelated paths settle
+//! independently, so a file that never stops being written holds back only its
+//! own group. A zero delay dispatches immediately. Without a trigger attached
+//! (unit tests) a change is logged only.
 //!
 //! A report carries its source — the watcher's [`ScanTrigger::Watcher`], the
 //! *arr webhooks' [`ScanTrigger::Webhook`] — only as a label: both go through
 //! the same debounce and the same refresh, exactly as upstream sends both into
-//! one `ReportFileSystemChanged`. A settle window's batch is one scan, tagged
-//! with the source of the window's first report (its logs and metrics say
+//! one `ReportFileSystemChanged`. A settle group's batch is one scan, tagged
+//! with the source of the group's first report (its logs and metrics say
 //! who started it, not who else joined).
 
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,38 +48,109 @@ use tokio::time::Instant;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryMonitor, ScanTrigger};
+use ferrofin_traits::library::{LibraryMonitor, ScanTrigger, SelfWriteGuard};
 
 use crate::resolvers::FileSystemWatcher;
 
-/// The debounce accumulator: paths reported since the last dispatch, the
-/// source of the window's first report, the settle deadline (re-armed by
-/// every report), and whether a worker task is currently waiting on that
-/// deadline.
+/// The debounce accumulator: the open settle groups, and whether a worker task
+/// is currently waiting on their deadlines.
 struct PendingChanges {
-    /// Changed paths accumulated in the current settle window.
-    paths: HashSet<String>,
-    /// Who reported the window's first path: the batch's scan carries it as
-    /// its trigger (a label only — the batch is one scan whoever joined it).
-    trigger: ScanTrigger,
-    /// When the current window lapses (last report + delay, clamped by
-    /// [`Self::hard_deadline`]).
-    deadline: Instant,
-    /// The ceiling on [`Self::deadline`] for the current batch: the first
-    /// report of the batch plus [`MAX_SETTLE_WINDOWS`] delays. Without it the
-    /// window is re-armed by every report and a source that never goes quiet
-    /// (a download directory, a recording being written) defers the scan
-    /// forever while `paths` grows without bound.
-    hard_deadline: Instant,
+    /// The groups still settling (upstream's `_activeRefreshers`).
+    groups: Vec<PendingGroup>,
     /// Whether a debounce worker task is alive and will dispatch.
     worker_running: bool,
 }
 
-/// How many settle delays a batch may be deferred before it is dispatched
+/// One settle group, the port of upstream's `FileRefresher`: related reported
+/// paths, the source of the group's first report, and the group's own settle
+/// deadline (re-armed by every report that joins it).
+struct PendingGroup {
+    /// The group's path (`FileRefresher.Path`) that later reports are related
+    /// to: the first report's, rebased to a reported parent of it or to the
+    /// folder it shares with a reported sibling.
+    anchor: String,
+    /// Changed paths accumulated in the group's settle window.
+    paths: HashSet<String>,
+    /// Who reported the group's first path: the batch's scan carries it as
+    /// its trigger (a label only — the batch is one scan whoever joined it).
+    trigger: ScanTrigger,
+    /// When the group's window lapses (last report + delay, clamped by
+    /// [`Self::hard_deadline`]).
+    deadline: Instant,
+    /// The ceiling on [`Self::deadline`] for this group: its first report
+    /// plus [`MAX_SETTLE_WINDOWS`] delays. Without it the window is re-armed
+    /// by every report and a source that never goes quiet (a download
+    /// directory, a recording being written) defers the scan forever while
+    /// `paths` grows without bound. Upstream's timers have no such ceiling.
+    hard_deadline: Instant,
+}
+
+impl PendingChanges {
+    /// When the next group lapses, if any is open.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.groups.iter().map(|group| group.deadline).min()
+    }
+
+    /// The settle group `path` joins, opening one if no group is related to
+    /// it: the port of `LibraryMonitor.CreateRefresher`. The first group whose
+    /// path is equal to `path`, contains it, is contained by it (the group is
+    /// rebased to `path`) or is its sibling (rebased to their shared folder)
+    /// takes it.
+    ///
+    /// Divergence: upstream's sibling rebase also adds the shared folder to
+    /// the paths it refreshes. Ferrofin scans only the reported paths (each
+    /// refreshes the nearest item at or above it), so two sibling imports do
+    /// not become a refresh of their whole folder, often the library root.
+    ///
+    /// A linear scan of the open groups per report, as upstream's; few groups
+    /// are open at once in practice.
+    fn group_for(
+        &mut self,
+        path: &str,
+        trigger: ScanTrigger,
+        now: Instant,
+        delay: Duration,
+    ) -> &mut PendingGroup {
+        let reported = Path::new(path);
+        let folder = reported.parent();
+        let related = self.groups.iter().position(|group| {
+            let anchor = Path::new(&group.anchor);
+            reported.starts_with(anchor)
+                || anchor.starts_with(reported)
+                || (folder.is_some() && anchor.parent() == folder)
+        });
+        if let Some(index) = related {
+            let group = &mut self.groups[index];
+            let anchor = Path::new(&group.anchor);
+            let rebased = if reported.starts_with(anchor) {
+                None
+            } else if anchor.starts_with(reported) {
+                Some(path.to_owned())
+            } else {
+                folder.map(|f| f.to_string_lossy().into_owned())
+            };
+            if let Some(rebased) = rebased {
+                group.anchor = rebased;
+            }
+            return group;
+        }
+        self.groups.push(PendingGroup {
+            anchor: path.to_owned(),
+            paths: HashSet::new(),
+            trigger,
+            deadline: now,
+            hard_deadline: now + delay * MAX_SETTLE_WINDOWS,
+        });
+        let last = self.groups.len() - 1;
+        &mut self.groups[last]
+    }
+}
+
+/// How many settle delays a group may be deferred before it is dispatched
 /// regardless of continuing reports.
 ///
-/// This is the bound on the accumulator: `paths` can hold at most one entry per
-/// distinct path reported within `LibraryMonitorDelay × MAX_SETTLE_WINDOWS`,
+/// This is the bound on the accumulator: the groups can hold at most one entry
+/// per distinct path reported within `LibraryMonitorDelay × MAX_SETTLE_WINDOWS`,
 /// rather than one per path reported since the server started. It is also what
 /// makes a continuously-written library root scan at all — with a purely
 /// sliding window it never does.
@@ -81,8 +159,8 @@ struct PendingChanges {
 /// the default 60 s `LibraryMonitorDelay`).
 const MAX_SETTLE_WINDOWS: u32 = 10;
 
-/// Hard cap on accumulated paths: reaching it dispatches the batch immediately
-/// instead of waiting the window out.
+/// Hard cap on one group's accumulated paths: reaching it dispatches the group
+/// immediately instead of waiting its window out.
 ///
 /// Paths are **dispatched**, never dropped — a dropped path is a change the
 /// library never learns about. So this bounds how large one batch gets, not how
@@ -126,7 +204,8 @@ pub trait LibraryScanTrigger: Send + Sync {
 
 fn _assert_object_safe_library_scan_trigger(_: &dyn LibraryScanTrigger) {}
 
-/// Supplies the filesystem roots the monitor should watch.
+/// Supplies the filesystem roots the monitor should watch, and every library
+/// location, which its watcher's metadata-only filter treats as a root.
 ///
 /// Resolved fresh on every [`LibraryMonitor::start`], so a monitor restart
 /// after a library-structure change (folder added/removed, realtime option
@@ -138,6 +217,14 @@ fn _assert_object_safe_library_scan_trigger(_: &dyn LibraryScanTrigger) {}
 pub trait WatchRootsSource: Send + Sync {
     /// The root paths to watch right now.
     async fn watch_roots(&self) -> Vec<String>;
+
+    /// Every library location right now, real-time monitored or not: what a
+    /// change is attributed to, since a scan matches a changed path against
+    /// every library. A library without real-time monitoring can sit inside
+    /// a watched one. The default is [`Self::watch_roots`].
+    async fn library_locations(&self) -> Vec<String> {
+        self.watch_roots().await
+    }
 }
 
 #[async_trait]
@@ -152,7 +239,17 @@ impl<T: WatchRootsSource + ?Sized> WatchRootsSource for Arc<T> {
     async fn watch_roots(&self) -> Vec<String> {
         (**self).watch_roots().await
     }
+
+    async fn library_locations(&self) -> Vec<String> {
+        (**self).library_locations().await
+    }
 }
+
+/// How long a path the server wrote stays ignored once the write is over
+/// (`ReportFileSystemChangeComplete`, `LibraryMonitor.cs:93-98`): watcher
+/// events for a write often arrive long after it, up to 45 seconds over a
+/// network share. Upstream hardcodes it, with no setting.
+pub const SELF_WRITE_SETTLE: Duration = Duration::from_secs(45);
 
 /// The concrete library monitor.
 ///
@@ -208,10 +305,7 @@ impl FerrofinLibraryMonitor {
             suppressed: Arc::new(Mutex::new(HashSet::new())),
             refresh_target: None,
             pending: Arc::new(Mutex::new(PendingChanges {
-                paths: HashSet::new(),
-                trigger: ScanTrigger::Watcher,
-                deadline: Instant::now(),
-                hard_deadline: Instant::now(),
+                groups: Vec::new(),
                 worker_running: false,
             })),
             flush: Arc::new(tokio::sync::Notify::new()),
@@ -262,55 +356,79 @@ impl FerrofinLibraryMonitor {
         }
     }
 
-    /// Waits out the settle window (re-armed by each new report) and then
-    /// dispatches one scan for the whole batch, whichever sources reported
-    /// its paths, tagged with the source of the window's first report. Runs
-    /// on its own task; exactly one worker is alive while changes are
-    /// pending.
+    /// Waits out each settle group's window (re-armed by each report that
+    /// joins it) and dispatches one scan per lapsed group, whichever sources
+    /// reported its paths, tagged with the source of the group's first
+    /// report. Runs on its own task; exactly one worker is alive while changes
+    /// are pending.
     async fn debounce_worker(self) {
         loop {
-            let deadline = self
-                .pending
-                .lock()
-                .expect("pending set not poisoned")
-                .deadline;
+            let deadline = {
+                let mut pending = self.pending.lock().expect("pending set not poisoned");
+                // Only this worker removes groups, and it exits when it empties
+                // them, so a group is always open here; stand down if not.
+                let Some(deadline) = pending.next_deadline() else {
+                    pending.worker_running = false;
+                    return;
+                };
+                deadline
+            };
             // Racing the sleep against `flush` is what lets the size cap take
             // effect while the worker is already asleep past that point. A
-            // spurious wake simply re-reads the deadline and sleeps again.
+            // spurious wake simply re-reads the deadlines and sleeps again.
             tokio::select! {
                 () = tokio::time::sleep_until(deadline) => {}
                 () = self.flush.notified() => {}
             }
-            let (paths, trigger) = {
+            let (lapsed, done) = {
                 let mut pending = self.pending.lock().expect("pending set not poisoned");
-                // A report during the sleep pushed the deadline out — keep waiting.
-                if Instant::now() < pending.deadline {
-                    continue;
+                // A report during the sleep may have pushed a deadline out; a
+                // group still settling stays for the next pass.
+                let now = Instant::now();
+                let (lapsed, open): (Vec<_>, Vec<_>) = std::mem::take(&mut pending.groups)
+                    .into_iter()
+                    .partition(|group| group.deadline <= now);
+                pending.groups = open;
+                let done = pending.groups.is_empty();
+                if done {
+                    pending.worker_running = false;
                 }
-                pending.worker_running = false;
-                (std::mem::take(&mut pending.paths), pending.trigger)
+                (lapsed, done)
             };
-            if !paths.is_empty() {
+            if !lapsed.is_empty() {
                 tracing::info!(
-                    changes = paths.len(),
-                    trigger = trigger.as_str(),
-                    "library changes settled; queueing scan"
+                    groups = lapsed.len(),
+                    changes = lapsed.iter().map(|group| group.paths.len()).sum::<usize>(),
+                    "library changes settled; queueing scans"
+                );
+            }
+            for group in lapsed {
+                tracing::debug!(
+                    path = group.anchor,
+                    changes = group.paths.len(),
+                    trigger = group.trigger.as_str(),
+                    "settle group lapsed; queueing its scan"
                 );
                 if let Some(library) = &self.refresh_target
                     && let Err(err) = library
-                        .queue_scan_paths(paths.into_iter().collect(), trigger)
+                        .queue_scan_paths(group.paths.into_iter().collect(), group.trigger)
                         .await
                 {
                     tracing::warn!(%err, "failed to queue debounced library scan");
                 }
             }
-            return;
+            if done {
+                return;
+            }
         }
     }
 
-    /// Whether `path` (or an ancestor of it) is currently suppressed. Mirrors C#
-    /// `IsPathLocked` — a change under a directory the server is writing is
-    /// ignored.
+    /// Whether a change to `path` is one of the server's own writes, as
+    /// `ReportFileSystemChanged` decides (`LibraryMonitor.cs:396-411`): `path`
+    /// is a path being written, lies under one, or is the folder holding one
+    /// ("go up a level"). Paths compare as `ManagedFileSystem.AreEqual` and
+    /// `ContainsSubPath` compare them: trailing separators ignored, and case
+    /// too on Windows only.
     ///
     /// # Panics
     ///
@@ -320,9 +438,14 @@ impl FerrofinLibraryMonitor {
     #[must_use]
     pub fn is_path_suppressed(&self, path: &str) -> bool {
         let guard = self.suppressed.lock().expect("suppressed set not poisoned");
-        guard
-            .iter()
-            .any(|p| path == p || path.starts_with(&format!("{p}/")))
+        guard.iter().any(|written| {
+            paths_equal(written, path)
+                || contains_sub_path(written, path)
+                || Path::new(written)
+                    .parent()
+                    .map(|parent| parent.to_string_lossy())
+                    .is_some_and(|parent| !parent.is_empty() && paths_equal(&parent, path))
+        })
     }
 }
 
@@ -331,6 +454,12 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
     async fn start(&self) -> Result<(), ServiceError> {
         let mut roots = self.roots.watch_roots().await;
         roots.sort();
+        // Every library location is a library root to the metadata-only
+        // filter: the nested ones skipped below, and those of libraries
+        // without real-time monitoring inside a watched one. Read after the
+        // watch roots, whose listing refreshes the libraries it comes from.
+        self.watcher
+            .set_library_roots(&self.roots.library_locations().await);
         let mut watched_roots: Vec<String> = Vec::new();
         for root in roots {
             // `LibraryMonitor.Start` / `ContainsParentFolder`: a recursive
@@ -366,10 +495,7 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
         if path.is_empty() {
             return Err(ServiceError::invalid_input("path can't be empty"));
         }
-        self.suppressed
-            .lock()
-            .expect("suppressed set not poisoned")
-            .insert(path.to_owned());
+        SelfWriteGuard::begin(self, path);
         Ok(())
     }
 
@@ -381,13 +507,7 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
         if path.is_empty() {
             return Err(ServiceError::invalid_input("path can't be empty"));
         }
-        self.suppressed
-            .lock()
-            .expect("suppressed set not poisoned")
-            .remove(path);
-        if refresh_path {
-            self.report_file_system_changed(path).await?;
-        }
+        SelfWriteGuard::complete(self, path, refresh_path);
         Ok(())
     }
 
@@ -400,7 +520,95 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
     }
 }
 
+/// `ReportFileSystemChangeBeginning` / `ReportFileSystemChangeComplete`
+/// (`LibraryMonitor.cs:79-99`), for the server's own writers.
+impl SelfWriteGuard for FerrofinLibraryMonitor {
+    fn begin(&self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        self.suppressed
+            .lock()
+            .expect("suppressed set not poisoned")
+            .insert(path.to_owned());
+    }
+
+    /// The path stays ignored for [`SELF_WRITE_SETTLE`] more, then is let go
+    /// (and, with `refresh_path`, reported as changed) by a task of its own,
+    /// as upstream's `async void` does. Without a runtime to run that task on
+    /// (no caller today) it is let go at once, and a `refresh_path` report,
+    /// which needs one, is dropped.
+    fn complete(&self, path: &str, refresh_path: bool) {
+        if path.is_empty() {
+            return;
+        }
+        let monitor = self.clone();
+        let written = path.to_owned();
+        let settle = async move {
+            tokio::time::sleep(SELF_WRITE_SETTLE).await;
+            monitor.release(&written, refresh_path).await;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(settle);
+            }
+            Err(_) => {
+                self.suppressed
+                    .lock()
+                    .expect("suppressed set not poisoned")
+                    .remove(path);
+            }
+        }
+    }
+}
+
+/// `ManagedFileSystem.AreEqual`: the same path, trailing separators aside,
+/// ignoring case on Windows only.
+fn paths_equal(a: &str, b: &str) -> bool {
+    let (a, b) = (trim_separators(a), trim_separators(b));
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// `ManagedFileSystem.ContainsSubPath`: `path` lies under `parent`, an
+/// anchored prefix ending at a separator.
+fn contains_sub_path(parent: &str, path: &str) -> bool {
+    let parent = trim_separators(parent);
+    let starts = if cfg!(windows) {
+        path.get(..parent.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(parent))
+    } else {
+        path.starts_with(parent)
+    };
+    path.len() > parent.len()
+        && starts
+        && (parent.ends_with(std::path::is_separator)
+            || path[parent.len()..].starts_with(std::path::is_separator))
+}
+
+/// `Path.TrimEndingDirectorySeparator`: a root stays as it is.
+fn trim_separators(path: &str) -> &str {
+    let trimmed = path.trim_end_matches(std::path::is_separator);
+    if trimmed.is_empty() { path } else { trimmed }
+}
+
 impl FerrofinLibraryMonitor {
+    /// The end of [`SelfWriteGuard::complete`]'s settle: `path` is no longer
+    /// ignored, and with `refresh_path` it is reported as changed (an error
+    /// there is logged, as upstream's `catch` does).
+    async fn release(&self, path: &str, refresh_path: bool) {
+        self.suppressed
+            .lock()
+            .expect("suppressed set not poisoned")
+            .remove(path);
+        if refresh_path && let Err(err) = self.report_file_system_changed(path).await {
+            tracing::error!(path, %err, "failed to report a written path as changed");
+        }
+    }
+
     /// `ReportFileSystemChanged`: queues the refresh of what `path` belongs
     /// to, debounced with every other report whatever its source. `trigger`
     /// labels the batch's scan only when this is the window's first report.
@@ -414,6 +622,23 @@ impl FerrofinLibraryMonitor {
         // `/Library/Media/Updated` report reaches only this check.
         if crate::resolvers::should_ignore_path(path) {
             tracing::trace!(path, "change ignored (ignore patterns)");
+            return Ok(());
+        }
+        // `DotIgnoreIgnoreRule.ShouldIgnore` (`LibraryMonitor.cs:389`): nor
+        // does a path a `.ignore` file hides. The lookup stats the path's
+        // folders, so it stays off the async workers.
+        let owned = path.to_owned();
+        let hidden = tokio::task::spawn_blocking(move || {
+            let is_dir = Path::new(&owned).is_dir();
+            crate::dot_ignore::DotIgnoreRule::default().should_ignore(&owned, is_dir)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(path, %error, ".ignore lookup failed; the change is not filtered by it");
+            false
+        });
+        if hidden {
+            tracing::trace!(path, "change ignored (.ignore file)");
             return Ok(());
         }
         if self.is_path_suppressed(path) {
@@ -438,8 +663,9 @@ impl FerrofinLibraryMonitor {
             }
             return Ok(());
         }
-        // Accumulate the path and (re)arm the settle window; the single worker
-        // task dispatches once the window lapses with no further reports.
+        // Accumulate the path into its settle group and (re)arm the group's
+        // window; the single worker task dispatches each group once its own
+        // window lapses with no further reports.
         //
         // The re-arm is clamped two ways, because a purely sliding window is
         // unbounded in both time and memory: a source that keeps reporting
@@ -450,20 +676,17 @@ impl FerrofinLibraryMonitor {
         let (spawn_worker, wake_worker) = {
             let mut pending = self.pending.lock().expect("pending set not poisoned");
             let now = Instant::now();
-            if pending.paths.is_empty() {
-                pending.hard_deadline = now + delay * MAX_SETTLE_WINDOWS;
-                pending.trigger = trigger;
-            }
-            pending.paths.insert(path.to_owned());
-            let previous = pending.deadline;
-            pending.deadline = std::cmp::min(now + delay, pending.hard_deadline);
-            if pending.paths.len() >= MAX_PENDING_PATHS {
-                pending.deadline = now;
+            let previous = pending.next_deadline();
+            let group = pending.group_for(path, trigger, now, delay);
+            group.paths.insert(path.to_owned());
+            group.deadline = std::cmp::min(now + delay, group.hard_deadline);
+            if group.paths.len() >= MAX_PENDING_PATHS {
+                group.deadline = now;
             }
             let spawn = !std::mem::replace(&mut pending.worker_running, true);
-            // Only a *lowered* deadline needs a wake; a raised one is picked up
-            // when the worker's current sleep ends.
-            (spawn, !spawn && pending.deadline < previous)
+            // Only a *lowered* earliest deadline needs a wake; a raised one is
+            // picked up when the worker's current sleep ends.
+            (spawn, !spawn && pending.next_deadline() < previous)
         };
         if spawn_worker {
             tokio::spawn(self.clone().debounce_worker());
@@ -598,7 +821,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn suppression_spans_a_change_window() {
         let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![]);
         let dir = "/media/movies/Solaris";
@@ -615,6 +838,11 @@ mod tests {
             .report_file_system_change_complete(dir, false)
             .await
             .expect("complete");
+        assert!(
+            monitor.is_path_suppressed(dir),
+            "still, while events settle"
+        );
+        tokio::time::sleep(SELF_WRITE_SETTLE + Duration::from_secs(1)).await;
         assert!(!monitor.is_path_suppressed(dir));
     }
 
@@ -802,6 +1030,11 @@ mod tests {
         assert_eq!(batches[0].len(), 1_000, "every reported path, once");
     }
 
+    /// An import of 25 movies, each reported as its new folder and then its
+    /// file (as the watcher sees them), is one group: the folders are
+    /// siblings and each file sits under one of them. Files reported alone
+    /// into distinct existing folders settle as one group each
+    /// (`related_paths_settle_as_one_group`).
     #[tokio::test(start_paused = true)]
     async fn burst_of_changes_settles_into_one_scan() {
         let library = Arc::new(CountingLibrary::default());
@@ -809,10 +1042,15 @@ mod tests {
             .with_refresh_target(library.clone())
             .with_debounce(Duration::from_mins(1));
         for i in 0..25 {
-            monitor
-                .report_file_system_changed(&format!("/media/movies/m{i}/m{i}.mkv"))
-                .await
-                .expect("report");
+            for path in [
+                format!("/media/movies/m{i}"),
+                format!("/media/movies/m{i}/m{i}.mkv"),
+            ] {
+                monitor
+                    .report_file_system_changed(&path)
+                    .await
+                    .expect("report");
+            }
         }
         // Nothing dispatches inside the settle window…
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -962,6 +1200,71 @@ mod tests {
         );
     }
 
+    /// A file that never stops being written holds back only its own group:
+    /// a change in another library settles after one delay, as an unrelated
+    /// upstream `FileRefresher` does, not at the writer's hard deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_never_quiet_writer_does_not_hold_back_unrelated_changes() {
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_mins(1));
+        monitor
+            .report_file_system_changed("/media/tv/Show/Season 1/e1.mkv")
+            .await
+            .expect("report");
+        for _ in 0..4 {
+            monitor
+                .report_file_system_changed("/media/downloads/movie.mkv.part")
+                .await
+                .expect("report");
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+        assert_eq!(
+            *library.batches.lock().unwrap(),
+            vec![vec!["/media/tv/Show/Season 1/e1.mkv".to_owned()]],
+            "the TV change settled at 60s; the writer is still being written"
+        );
+    }
+
+    /// `CreateRefresher`'s grouping: a path joins a settle group whose path
+    /// is equal to it, contains it, is contained by it, or is its sibling;
+    /// anything else settles on its own.
+    #[rstest::rstest]
+    #[case::equal("/m/tv/Show/S1/e1.mkv", "/m/tv/Show/S1/e1.mkv", 1)]
+    #[case::child("/m/tv/Show", "/m/tv/Show/S1/e1.mkv", 1)]
+    #[case::parent("/m/tv/Show/S1/e1.mkv", "/m/tv/Show", 1)]
+    #[case::sibling("/m/tv/Show/S1/e1.mkv", "/m/tv/Show/S1/e2.mkv", 1)]
+    #[case::cousins("/m/tv/Show/S1/e1.mkv", "/m/tv/Show/S2/e1.mkv", 2)]
+    #[case::name_prefix_only("/m/tv", "/m/tv2/x.mkv", 2)]
+    #[tokio::test(start_paused = true)]
+    async fn related_paths_settle_as_one_group(
+        #[case] first: &str,
+        #[case] second: &str,
+        #[case] dispatches: usize,
+    ) {
+        let library = Arc::new(PathsLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone())
+            .with_debounce(Duration::from_secs(5));
+        for path in [first, second] {
+            monitor
+                .report_file_system_changed(path)
+                .await
+                .expect("report");
+        }
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let batches = library.batches.lock().unwrap();
+        assert_eq!(batches.len(), dispatches, "{batches:?}");
+        let mut reported: Vec<&str> = batches.iter().flatten().map(String::as_str).collect();
+        reported.sort_unstable();
+        reported.dedup();
+        let mut expected = vec![first, second];
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(reported, expected, "only the reported paths are scanned");
+    }
+
     #[tokio::test]
     async fn a_second_batch_after_dispatch_scans_again() {
         tokio::time::pause();
@@ -1002,6 +1305,94 @@ mod tests {
             .expect("report");
         monitor.report_webhook_change(path).await.expect("report");
         assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// `ReportFileSystemChangeComplete` (`LibraryMonitor.cs:79-99`) keeps a
+    /// written path ignored for 45 s after the write, since watcher events
+    /// often arrive late, and `ReportFileSystemChanged` (`:396-411`) also
+    /// ignores a change to the folder holding it. A folder further up is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_write_stays_ignored_for_a_while_with_its_folder() {
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        let scans = || library.scans.load(std::sync::atomic::Ordering::SeqCst);
+        let dir = "/media/movies/Solaris";
+        let file = format!("{dir}/Solaris.en.srt");
+        monitor
+            .report_file_system_change_beginning(&file)
+            .await
+            .expect("begin");
+        monitor
+            .report_file_system_change_complete(&file, false)
+            .await
+            .expect("complete");
+        for path in [file.clone(), dir.to_owned(), format!("{dir}/")] {
+            monitor
+                .report_file_system_changed(&path)
+                .await
+                .expect("report");
+        }
+        assert_eq!(scans(), 0, "the write and its folder stay ignored");
+        monitor
+            .report_file_system_changed("/media/movies")
+            .await
+            .expect("report");
+        assert_eq!(scans(), 1, "a folder further up is not");
+
+        tokio::time::sleep(Duration::from_secs(46)).await;
+        monitor
+            .report_file_system_changed(&file)
+            .await
+            .expect("report");
+        assert_eq!(scans(), 2, "the write is no longer ignored");
+    }
+
+    /// `ReportFileSystemChangeComplete(path, refreshPath: true)` reports the
+    /// path as changed once it is let go, not while the write settles.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_completed_with_a_refresh_is_reported_once_released() {
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        let scans = || library.scans.load(std::sync::atomic::Ordering::SeqCst);
+        let file = "/media/tv/recordings/Show.ts";
+        SelfWriteGuard::begin(&monitor, file);
+        SelfWriteGuard::complete(&monitor, file, true);
+        monitor
+            .report_file_system_changed(file)
+            .await
+            .expect("report");
+        assert_eq!(scans(), 0, "still settling");
+        tokio::time::sleep(SELF_WRITE_SETTLE + Duration::from_secs(1)).await;
+        assert_eq!(scans(), 1, "reported when released");
+        assert!(!monitor.is_path_suppressed(file));
+    }
+
+    /// `ReportFileSystemChanged` also returns when a `.ignore` file hides
+    /// the path (`LibraryMonitor.cs:389`); a path its rules keep still scans.
+    #[tokio::test]
+    async fn a_dot_ignored_path_does_not_scan() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let movies = tmp.path().join("movies");
+        std::fs::create_dir_all(movies.join("Private")).expect("mkdir");
+        std::fs::write(movies.join("Private/.ignore"), "").expect(".ignore");
+        std::fs::write(movies.join(".ignore"), "*.part\n").expect(".ignore");
+        let library = Arc::new(CountingLibrary::default());
+        let monitor = FerrofinLibraryMonitor::new(Arc::new(FakeWatcher::default()), vec![])
+            .with_refresh_target(library.clone());
+        for hidden in ["Private/Home Video.mkv", "Private", "Heat.mkv.part"] {
+            monitor
+                .report_file_system_changed(&movies.join(hidden).to_string_lossy())
+                .await
+                .expect("report");
+        }
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+        monitor
+            .report_file_system_changed(&movies.join("Heat.mkv").to_string_lossy())
+            .await
+            .expect("report");
+        assert_eq!(library.scans.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ workspace = true
 ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-common.workspace = true
-ferrofin-util.workspace = true
+ferrofin-util = { workspace = true, features = ["tokio"] }
 async-trait.workspace = true
 tokio = { workspace = true }
 serde.workspace = true
@@ -32,3 +32,6 @@ notify.workspace = true
 [dev-dependencies]
 rstest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+# Log-level assertions: a repeated settings-read failure must not log above debug.
+tracing-subscriber.workspace = true

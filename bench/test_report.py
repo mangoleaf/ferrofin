@@ -17,6 +17,7 @@ import oracle
 import report
 import coldstart
 import mem_sample
+import scan
 import ttfs
 from testdata import seed
 
@@ -217,7 +218,8 @@ class ReportTests(unittest.TestCase):
     def test_mixed_conditions_and_images_are_rejected(self):
         original = json.loads((self.b / 'run.json').read_text())
         for key, value in [('rate_loaded', 50), ('window_s', 5), ('memory_limit', '1g'),
-                           ('server_cpus', '4-7'), ('ids_sha256', 'changed'), ('screens_sha256', 'changed'), ('background_policy', 1)]:
+                           ('server_cpus', '4-7'), ('ids_sha256', 'changed'), ('screens_sha256', 'changed'), ('background_policy', 1),
+                           ('scan_policy', 1)]:
             with self.subTest(key=key):
                 self.write(self.b / 'run.json', {**original, key: value})
                 with self.assertRaisesRegex(ValueError, key):
@@ -348,6 +350,11 @@ class ReportTests(unittest.TestCase):
         self.edit(self.a / 'run.json', lambda x: x.update(restarts=1))
         self.edit(self.a / 'ferrofin/coldstart.json', lambda x: x.update(runs=x['runs'][:1]))
         self.assertIsNone(dict(self.build()['ttfs'])[report.README_TTFS[0]]['ferrofin'].flag)
+
+    def test_cold_start_attempt_bound_separates_run_sets(self):
+        self.assertFalse(report.incompatible([str(self.a), str(self.b)]))
+        self.edit(self.a / 'run.json', lambda x: x.update(coldstart_attempt_timeout_ms=100))
+        self.assertIn('coldstart_attempt_timeout_ms', report.incompatible([str(self.a), str(self.b)]))
 
     def test_swapped_counts_between_request_keys_fail(self):
         for server, counts in [('jellyfin', [1, 2]), ('ferrofin', [2, 1])]:
@@ -581,6 +588,21 @@ class PreparationTests(unittest.TestCase):
         api.post.assert_called_once_with('/Library/Refresh')
         self.assertEqual(api.get.call_count, 4)
         self.assertEqual(sleep.call_count, 2)
+
+    @patch.object(seed.time, 'sleep')
+    def test_in_run_scan_waits_for_startup_tasks_then_records_the_completed_scan(self, sleep):
+        # Ferrofin gets the same one full scan the Jellyfin preparation gave its config.
+        done = self.task(end='2026-09-15T01:00:00Z')
+        api = Mock()
+        api.get.side_effect = [[{'Name': 'startup', 'State': 'Running'}], [self.task()],  # draining
+                               [self.task()], done]                                       # the scan
+        with tempfile.TemporaryDirectory() as tmp, patch.object(seed, 'Api', return_value=api):
+            ids, out = Path(tmp)/'ids.json', Path(tmp)/'scan.json'
+            ids.write_text(json.dumps({'token': 't'}))
+            seed.scan_library('http://server', str(ids), str(out))
+            self.assertEqual(json.loads(out.read_text())['scan'], done['LastExecutionResult'])
+        self.assertEqual(api.token, 't')
+        api.post.assert_called_once_with('/Library/Refresh')
 
     def test_failed_scan_is_not_ready(self):
         api = Mock()
@@ -1110,6 +1132,34 @@ class InstrumentTests(unittest.TestCase):
                 coldstart.restart('owned','http://localhost',{},.01)
         self.assertTrue(finished.is_set())
 
+    def test_only_the_readiness_connect_is_bounded_by_the_attempt_timeout(self):
+        # A stalled connect must not hold the next attempt back for the whole TCP retransmit,
+        # but a slow first response is still the server's first response.
+        import threading
+        connects, reads, paths = [], [], []
+        class Conn:
+            def __init__(self, host, port, timeout):
+                connects.append(timeout)
+                self.sock = Mock(settimeout=reads.append)
+            def connect(self):
+                if len(connects) == 1:
+                    raise TimeoutError('stalled SYN')
+            def request(self, method, path, headers): paths.append(path)
+            def getresponse(self): return Mock(status=200)
+            def close(self): pass
+        with patch.dict(os.environ, {'COLDSTART_ATTEMPT_TIMEOUT_MS': '100', 'HTTP_TIMEOUT_S': '10'}), \
+             patch.object(coldstart.http.client, 'HTTPConnection', Conn):
+            self.assertIsNotNone(coldstart.poll('http://localhost:1/UserViews?userId=u', {}, 300, .001,
+                                                threading.Event(), threading.Event()))
+        self.assertEqual(connects, [.1, .1])
+        self.assertEqual(reads, [10.0])
+        self.assertEqual(paths, ['/UserViews?userId=u'])
+        connects.clear(); reads.clear()
+        with patch.dict(os.environ, {'COLDSTART_ATTEMPT_TIMEOUT_MS': '100', 'HTTP_TIMEOUT_S': '10'}), \
+             patch.object(coldstart.http.client, 'HTTPConnection', Conn):
+            coldstart.poll('http://localhost:1/UserViews?userId=u', {}, .05, .001, threading.Event(), threading.Event())
+        self.assertEqual((connects, reads), ([.05, .05], [.05]))  # neither bound outlasts the deadline
+
     def test_restart_poller_is_running_before_start_and_joined(self):
         import threading
         events=[]
@@ -1236,7 +1286,7 @@ class GateTests(unittest.TestCase):
         self.assertFalse(out.exists())
 
     def test_driver_retags_each_run_stops_on_a_wrong_image_and_restores_the_tag(self):
-        plan = {'schedule': gate.schedule('ab', {'a': 'old', 'b': 'new'}, 3),
+        plan = {'mode': 'ab', 'schedule': gate.schedule('ab', {'a': 'old', 'b': 'new'}, 3),
                 'images': {'a': {'id': 'sha256:old'}, 'b': {'id': 'sha256:new'}}}
         calls = []
 
@@ -1261,7 +1311,7 @@ class GateTests(unittest.TestCase):
         self.assertFalse((self.root / '03-a').exists())
 
     def test_a_run_that_cannot_start_stops_the_session_with_its_own_exit(self):
-        plan = {'schedule': gate.schedule('aa', {'a': 'x'}, 2), 'images': {'a': {'id': 'sha256:x'}}}
+        plan = {'mode': 'aa', 'schedule': gate.schedule('aa', {'a': 'x'}, 2), 'images': {'a': {'id': 'sha256:x'}}}
         with patch.object(gate, 'docker', lambda *a: ''), patch.object(gate, 'run_sh', lambda cmd: 1):
             with self.assertRaisesRegex(SystemExit, r'01-a failed \(run.sh exit 1\)'):
                 gate.run_session(str(self.root), plan, None)
@@ -1302,6 +1352,202 @@ class GateTests(unittest.TestCase):
         self.assertEqual(noise['proposed_cells'], {})
         self.assertEqual({r['verdict'] for r in noise['false_alarms'].values()}, {'within noise'})
         self.assertIn('Noise per cell', (aa / 'report.html').read_text())
+
+    def viewer(self, target):
+        status, _, body = report.handle(target, {'benchmark': str(self.root), 'adoption': None, 'parity': None})
+        return status, body.decode('utf-8')
+
+    def test_ab_verdicts_reach_the_candidate_runs_in_the_viewer(self):
+        out = self.session('ab', [10, 20, 10, 20, 10, 20])
+        for name in ('01-a', '02-b'):  # what run.sh left beside each run, before the gate judged it
+            (out / name / 'report.html').write_text('<p>written by run.sh</p>')
+        gate.render(str(out))
+        runs = [n for n, _ in report.discover('benchmark', str(self.root))]
+        self.assertEqual(sorted(runs), ['gate-ab'] + [f'gate-ab/0{i}-{r}' for i, r in zip(range(1, 7), 'ababab')])
+        status, tab = self.viewer('/benchmark')
+        self.assertEqual(status, 200)
+        self.assertIn("href='/report/benchmark/gate-ab/02-b'", tab)
+        self.assertEqual(self.viewer('/report/benchmark/gate-ab%2F02-b'), self.viewer('/report/benchmark/gate-ab/02-b'))
+        self.assertEqual(self.viewer('/report/benchmark/gate-ab/02-b/x')[0], 404)
+        # all 13 screens and endpoints doubled; the two memory cells did not move
+        tally = 'A/B gate — 13 regressed, 0 not comparable, 2 within noise, 0 improved'
+        for name in ('02-b', '04-b', '06-b'):
+            with self.subTest(name):
+                cells = report.load_verdicts([str(out / name)])
+                self.assertEqual(next(c for c in cells if c['cell'] == 'loaded/screens/home'),
+                                 {'cell': 'loaded/screens/home', 'verdict': 'regressed', 'baseline': 10, 'candidate': 20,
+                                  'unit': 'ms', 'delta_pct': 100.0})
+                status, page = self.viewer('/report/benchmark/gate-ab/' + name)
+                self.assertEqual(status, 200)
+                self.assertIn(tally, page)
+                self.assertIn(tally, (out / name / 'report.html').read_text())  # the static report too
+        self.assertIsNone(report.load_verdicts([str(out / '01-a')]))  # the previous release is not judged
+        self.assertEqual((out / '01-a' / 'report.html').read_text(), '<p>written by run.sh</p>')
+        status, page = self.viewer('/benchmark?run=gate-ab%2F02-b&run=gate-ab%2F04-b&baseline=gate-ab%2F01-a')
+        self.assertEqual(status, 200)
+        self.assertIn(tally, page)
+        aa = self.session('aa', [10, 10])
+        gate.render(str(aa))
+        self.assertFalse(any(aa.glob('*/ab-verdicts.json')))
+
+    def test_a_cell_the_gate_could_not_judge_reaches_the_viewer_with_its_reason(self):
+        out = self.session('ab', [10, 20, 10, 20, 10, 20])
+        self.edit(out / '04-b/ferrofin/k6-loaded.json', lambda x: x['screens']['home'].update(ok=0.5))
+        gate.render(str(out))
+        cell = next(c for c in report.load_verdicts([str(out / '02-b')]) if c['cell'] == 'loaded/screens/home')
+        self.assertEqual(cell['verdict'], 'not comparable')
+        self.assertIn('measured requests failed', cell['reason'])
+        page = self.viewer('/report/benchmark/gate-ab/02-b')[1]
+        self.assertIn("class='verdict not-comparable'>not comparable: measured requests failed", page)
+
+    def test_a_verdict_reason_is_text_and_shown_escaped(self):
+        cell = {'cell': 'loaded/screens/home', 'verdict': 'not comparable', 'reason': '<b>status 500</b>'}
+        self.assertIn(': &lt;b&gt;status 500&lt;/b&gt;</td>', report.verdict_html([cell]))
+        run = self.root / 'run'
+        self.write(run / 'ab-verdicts.json', {'cells': [dict(cell, reason=5)]})
+        with self.assertRaisesRegex(ValueError, 'ab-verdicts.json'):
+            report.load_verdicts([str(run)])
+
+    def test_viewer_cells_are_the_gated_rows_in_the_viewer_shape(self):
+        rows = {'loaded/screens/home': {'unit': 'ms', 'verdict': 'regressed', 'diff': 10, 'pct': 100.0, 'slower': 3,
+                                        'a_median': 10, 'b_median': 20, 'gated': True},
+                'loaded/endpoints/x': {'unit': 'ms', 'verdict': 'regressed', 'diff': 0.4, 'pct': 80.0, 'slower': 3,
+                                       'a_median': 0.5, 'b_median': 0.9, 'gated': False},
+                'unloaded/screens/y': {'unit': 'ms', 'verdict': 'not comparable', 'reason': 'missing values', 'gated': True}}
+        self.assertEqual(gate.viewer_cells(rows), [
+            {'cell': 'loaded/screens/home', 'verdict': 'regressed', 'baseline': 10, 'candidate': 20, 'unit': 'ms', 'delta_pct': 100.0},
+            {'cell': 'unloaded/screens/y', 'verdict': 'not comparable', 'baseline': None, 'candidate': None, 'unit': 'ms',
+             'delta_pct': None, 'reason': 'missing values'}])
+
+    def scan_session(self, name, candidate_walls):
+        """A scan session: the previous release scans in 100 s every run, the candidate in
+        `candidate_walls` (one per pair); memory and migration are equal on both sides."""
+        out = self.root / name
+        plan = {'mode': 'scan', 'name': name, 'date': '2026-10-20T00:00:00+00:00',
+                'schedule': gate.schedule('scan', {'a': 'old', 'b': 'new'}, len(candidate_walls)),
+                'images': {'a': {'ref': 'old', 'id': 'sha256:old'}, 'b': {'ref': 'new', 'id': 'sha256:new'}}}
+        walls = iter(w for b in candidate_walls for w in (100, b))
+        for run, _, _ in plan['schedule']:
+            self.write(out / run / 'scan.json', {'scan': {'wall_s': next(walls), 'peak_anon_mib': 500},
+                                                 'migration': {'wall_s': 2.5, 'peak_anon_mib': 300}})
+        self.write(out / 'gate.json', plan)
+        return out
+
+    def test_scan_session_blocks_a_slower_scan_and_passes_a_self_ab(self):
+        md, block = gate.render(str(self.scan_session('slower', [120, 118, 121])))
+        self.assertEqual(block, ['scan/wall time'])
+        self.assertIn('**BLOCKED**', md)
+        page = (self.root / 'slower' / 'report.html').read_text()
+        self.assertIn("class='delta bad'>regressed", page)
+        self.assertIn('migration/peak anon', page)
+        md, block = gate.render(str(self.scan_session('self', [101, 99, 100])))
+        self.assertEqual(block, [])
+        rows = json.loads((self.root / 'self' / 'verdict.json').read_text())['verdicts']
+        self.assertEqual({r['verdict'] for r in rows.values()}, {'within noise'})
+        self.assertEqual(set(rows), {c[0] for c in gate.SCAN_CELLS})
+
+    def test_a_rendered_gate_session_is_listed_with_its_own_report(self):
+        out = self.scan_session('gate-scan', [100, 100, 100])
+        self.assertEqual(report.discover('benchmark', str(self.root)), [])  # not rendered yet: nothing to open
+        gate.render(str(out))
+        listed = report.discover('benchmark', str(self.root))
+        self.assertEqual([n for n, _ in listed], ['gate-scan'])  # its runs hold scan.json, not run.json
+        self.assertIn('gate scan', listed[0][1])
+        status, tab = self.viewer('/benchmark')
+        self.assertIn("href='/report/benchmark/gate-scan'", tab)
+        status, page = self.viewer('/report/benchmark/gate-scan')
+        self.assertEqual(status, 200)
+        self.assertEqual(page, (out / 'report.html').read_text())
+        self.assertIn('scan/wall time', page)
+
+    def test_scan_session_without_a_measurement_is_a_readable_error(self):
+        out = self.scan_session('partial', [100, 100, 100])
+        (out / '06-b' / 'scan.json').unlink()
+        with self.assertRaisesRegex(ValueError, '06-b has no scan.json'):
+            gate.render(str(out))
+
+    def test_scan_driver_runs_scan_py_on_the_image_id_and_stops_at_a_failure(self):
+        plan = {'mode': 'scan', 'schedule': gate.schedule('scan', {'a': 'old', 'b': 'new'}, 3),
+                'images': {'a': {'ref': 'old', 'id': 'sha256:old'}, 'b': {'ref': 'new', 'id': 'sha256:new'}}}
+        cmds = []
+
+        def run(cmd, wrong=None, fail=None):
+            cmds.append(cmd)
+            out = Path(cmd[-1])
+            if out.name == fail:
+                return 1
+            self.write(out / 'scan.json', {'image_id': 'sha256:old' if out.name == wrong else cmd[2]})
+            return 0
+
+        with patch.object(gate, 'docker', Mock(side_effect=AssertionError('nothing is retagged'))):
+            with patch.object(gate, 'run_sh', lambda cmd: run(cmd, fail='02-b')):
+                with self.assertRaisesRegex(SystemExit, r'02-b failed \(scan.py exit 1\)'):
+                    gate.run_session(str(self.root / 's1'), plan, '/data')
+            self.assertEqual([c[1:] for c in cmds],
+                             [[str(Path(gate.BENCH) / 'scan.py'), 'sha256:old', '/data', str(self.root / 's1' / '01-a')],
+                              [str(Path(gate.BENCH) / 'scan.py'), 'sha256:new', '/data', str(self.root / 's1' / '02-b')]])
+            with patch.object(gate, 'run_sh', lambda cmd: run(cmd, wrong='04-b')):
+                with self.assertRaisesRegex(SystemExit, '04-b measured sha256:old, not new'):
+                    gate.run_session(str(self.root / 's2'), plan, '/data')
+
+    def test_scan_dry_run_lists_scan_runs_and_starts_nothing(self):
+        out = self.root / 'session'
+        result = subprocess.run([sys.executable, str(Path(__file__).parent / 'gate.py'), 'scan', 'old', 'new',
+                                 '--dry-run', '--out', str(out)], capture_output=True, text=True,
+                                env=dict(os.environ, PATH=''))  # no docker reachable
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count('scan.py'), 6)
+        self.assertNotIn('run.sh', result.stdout)
+        self.assertFalse(out.exists())
+
+    def test_scan_peak_is_the_largest_anon_sample_inside_the_span(self):
+        path = self.root / 'mem.csv'
+        mib = 2 ** 20
+        path.write_text('t,anon,file\n' + ''.join(f'{t},{a * mib},0\n' for t, a in
+                                                  [(9.9, 900), (10.0, 100), (10.5, 400), (11.0, 300), (11.1, 800)]))
+        self.assertEqual(scan.peak_anon_mib(path, 10.0, 11.0), 400)
+        with self.assertRaisesRegex(RuntimeError, 'no memory sample'):
+            scan.peak_anon_mib(path, 12, 13)
+
+    def test_scan_cleanup_never_masks_the_measurement_error_and_always_removes_the_container(self):
+        def server():
+            s = scan.Server.__new__(scan.Server)  # no docker create
+            s.d, s.sampler = str(self.root), None
+            return s
+
+        calls = []
+
+        def docker(*args):
+            calls.append(args)
+            raise RuntimeError('docker rm: no such container')
+
+        with patch.object(scan, 'docker', docker), patch.object(scan.subprocess, 'run'), \
+                patch('sys.stderr', new_callable=io.StringIO):
+            with self.assertRaisesRegex(ValueError, 'the measurement failed'):
+                with server():
+                    raise ValueError('the measurement failed')
+            with self.assertRaisesRegex(RuntimeError, 'docker rm'):
+                with server():
+                    pass
+        self.assertEqual(calls, [('rm', '-f', 'bench-scan')] * 2)
+
+    def test_migration_copy_turns_the_realtime_monitor_off(self):
+        lib = self.root / 'root' / 'default' / 'Movies'
+        lib.mkdir(parents=True)
+        (lib / 'options.xml').write_text('<LibraryOptions><EnableRealtimeMonitor>true</EnableRealtimeMonitor></LibraryOptions>')
+        scan.disable_realtime_monitor(self.root)
+        self.assertIn('<EnableRealtimeMonitor>false</EnableRealtimeMonitor>', (lib / 'options.xml').read_text())
+        with self.assertRaisesRegex(RuntimeError, 'no library options'):
+            scan.disable_realtime_monitor(self.root / 'empty')
+
+    def test_scan_counts_fail_on_fewer_items_and_record_more(self):
+        summary = {'movies': 3001, 'series': 250, 'episodes': 7490, 'albums': 800, 'tracks': 8000}
+        by_type = {'Movie': 3041, 'Series': 250, 'Episode': 7490, 'MusicAlbum': 800, 'Audio': 8000}
+        api = Mock(get=lambda path, includeItemTypes, **q: {'TotalRecordCount': by_type[includeItemTypes]})
+        self.assertEqual(scan.counts(api, 'u', summary)['movies'], 3041)  # v1.3.2 lists alternate versions
+        by_type['Episode'] = 7489
+        with self.assertRaisesRegex(RuntimeError, r"fewer items.*'episodes': '7489 \(fixture 7490\)'"):
+            scan.counts(api, 'u', summary)
 
     def test_a_gate_run_refuses_a_stale_oracle_pin_before_anything_starts(self):
         out = self.root / 'session'

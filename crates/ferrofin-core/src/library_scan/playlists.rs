@@ -313,6 +313,7 @@ impl LibraryScanner {
                 id,
                 entity,
                 ancestors,
+                generated_names: Vec::new(),
             },
         );
     }

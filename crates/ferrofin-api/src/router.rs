@@ -4,13 +4,13 @@
 //! route never 404s. Unit 1 (INFRA) points them all at the shared
 //! `not_implemented` stub (`501`); later waves register real handlers over the
 //! matching entries. The router also mounts the health probes, the OpenAPI spec,
-//! the auth-context middleware, and permissive CORS + tracing.
+//! the auth-context middleware, CORS from the configured `CorsHosts`
+//! ([`crate::cors`]) and tracing.
 
 use axum::extract::{MatchedPath, Request};
 use axum::response::Response;
 use axum::routing::{MethodRouter, delete, get, head, post};
 use axum::{Router, middleware};
-use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 
@@ -48,6 +48,8 @@ fn stub_for(method: &str) -> Option<MethodRouter<AppState>> {
 /// both are contract/programming errors caught by the crate's tests, never by
 /// runtime input.
 pub fn create_router(state: AppState) -> Router {
+    let health_checkers = state.health_checkers.clone();
+    let config = state.config.clone();
     let mut api: Router<AppState> = Router::new();
     for (method, path) in axum_routes() {
         // Skip the shared `501` stub for any `(method, path)` a real handler
@@ -66,6 +68,7 @@ pub fn create_router(state: AppState) -> Router {
     // Mount the real First-Light handlers over the (now-skipped) stub slots.
     api = handlers::register(api);
 
+    let response_time_state = state.clone();
     api.layer(middleware::from_fn_with_state(
         state.clone(),
         auth_context_layer,
@@ -83,7 +86,7 @@ pub fn create_router(state: AppState) -> Router {
         crate::request_culture::request_culture_layer,
     ))
     .with_state(state)
-    .merge(ferrofin_health::health_router(Vec::new()))
+    .merge(ferrofin_health::health_router(health_checkers))
     .merge(spec_router())
     // Route-templated per-request span (traces group by endpoint, not raw URL);
     // a sampled request's `trace_id` is stamped on for log↔trace correlation.
@@ -95,12 +98,23 @@ pub fn create_router(state: AppState) -> Router {
             .on_request(record_trace_id)
             .on_response(record_status),
     )
-    .layer(CorsLayer::permissive())
+    // `UseCors()` with `CorsPolicyProvider`: the policy follows the live
+    // `CorsHosts` on every request.
+    .layer(middleware::from_fn_with_state(
+        config,
+        crate::cors::cors_layer,
+    ))
     // Jellyfin's `UseResponseCompression()`. Outermost so it also covers the
     // health and OpenAPI routes, exactly as ASP.NET's middleware covers
     // everything mounted under the base URL. Only the allow-listed media types
     // are touched, so images and the streaming paths are unaffected.
     .layer(compression_layer())
+    // `ResponseTimeMiddleware` sits outside compression in Startup, so every
+    // response, health and OpenAPI included, carries `X-Response-Time-ms`.
+    .layer(middleware::from_fn_with_state(
+        response_time_state,
+        crate::response_time::response_time_layer,
+    ))
 }
 
 /// Whether an OTLP endpoint is configured, i.e. whether a span exporter will

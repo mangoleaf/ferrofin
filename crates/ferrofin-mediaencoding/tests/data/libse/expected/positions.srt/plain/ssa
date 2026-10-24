@@ -1,0 +1,22 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: untitled
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Arial,20,16777215,65535,0,0,0,0,1,1,1,2,10,10,10,0,1
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: Marked=0,0:00:01.00,0:00:01.90,*Default,NTP,0000,0000,0000,,{\an1}Position 1
+Dialogue: Marked=0,0:00:02.00,0:00:02.90,*Default,NTP,0000,0000,0000,,{\an2}Position 2
+Dialogue: Marked=0,0:00:03.00,0:00:03.90,*Default,NTP,0000,0000,0000,,{\an3}Position 3
+Dialogue: Marked=0,0:00:04.00,0:00:04.90,*Default,NTP,0000,0000,0000,,{\an4}Position 4
+Dialogue: Marked=0,0:00:05.00,0:00:05.90,*Default,NTP,0000,0000,0000,,{\an5}Position 5
+Dialogue: Marked=0,0:00:06.00,0:00:06.90,*Default,NTP,0000,0000,0000,,{\an6}Position 6
+Dialogue: Marked=0,0:00:07.00,0:00:07.90,*Default,NTP,0000,0000,0000,,{\an7}Position 7
+Dialogue: Marked=0,0:00:08.00,0:00:08.90,*Default,NTP,0000,0000,0000,,{\an8}Position 8
+Dialogue: Marked=0,0:00:09.00,0:00:09.90,*Default,NTP,0000,0000,0000,,{\an9}Position 9

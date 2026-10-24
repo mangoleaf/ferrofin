@@ -393,14 +393,15 @@ impl VirtualFolderInfo {
             .max_by_key(|location| location.len())
     }
 
-    /// Whether `top_parent_id` (a stored `TopParentId`, any GUID form) is
-    /// this library's collection folder.
-    fn is_collection_folder(&self, top_parent_id: &str) -> bool {
+    /// Whether `id` (a stored item id such as a `TopParentId`, in any GUID
+    /// form) is this library's collection folder.
+    #[must_use]
+    pub fn is_collection_folder(&self, id: &str) -> bool {
         match (
             self.item_id
                 .as_deref()
                 .and_then(|id| uuid::Uuid::parse_str(id).ok()),
-            uuid::Uuid::parse_str(top_parent_id).ok(),
+            uuid::Uuid::parse_str(id).ok(),
         ) {
             (Some(own), Some(top)) => own == top,
             _ => false,
@@ -1068,6 +1069,16 @@ impl MediaStream {
             return (VideoRange::Unknown, VideoRangeType::Unknown);
         }
 
+        let color_transfer = self.color_transfer.as_deref();
+        let is_pq = color_transfer.is_some_and(|t| t.eq_ignore_ascii_case("smpte2084"));
+        let is_hlg = color_transfer.is_some_and(|t| t.eq_ignore_ascii_case("arib-std-b67"));
+        // Invalid DV only retains HDR when the base layer explicitly signals PQ or HLG.
+        let base_video_range = if is_pq || is_hlg {
+            VideoRange::Hdr
+        } else {
+            VideoRange::Sdr
+        };
+
         let codec_tag = self.codec_tag.as_deref();
         let dv_profile = self.dv_profile;
         let rpu_present_flag = self.rpu_present_flag == Some(1);
@@ -1092,7 +1103,7 @@ impl MediaStream {
                     Some(4) => (VideoRange::Hdr, VideoRangeType::DoviWithHlg),
                     Some(2) => (VideoRange::Sdr, VideoRangeType::DoviWithSdr),
                     // Out of Dolby Spec files should be marked as invalid.
-                    _ => (VideoRange::Hdr, VideoRangeType::DoviInvalid),
+                    _ => (base_video_range, VideoRangeType::DoviInvalid),
                 },
                 Some(7) => (VideoRange::Hdr, VideoRangeType::DoviWithEl),
                 Some(10) => match dv_bl_compat_id {
@@ -1101,10 +1112,28 @@ impl MediaStream {
                     Some(2) => (VideoRange::Sdr, VideoRangeType::DoviWithSdr),
                     Some(4) => (VideoRange::Hdr, VideoRangeType::DoviWithHlg),
                     // Out of Dolby Spec files should be marked as invalid.
-                    _ => (VideoRange::Hdr, VideoRangeType::DoviInvalid),
+                    _ => (base_video_range, VideoRangeType::DoviInvalid),
                 },
                 _ => (VideoRange::Sdr, VideoRangeType::Sdr),
             };
+
+            // A base layer whose colours do not match its declared
+            // compatibility makes the stream invalid (jellyfin#17806).
+            let expected_transfer = match dv_range_set.1 {
+                VideoRangeType::DoviWithHdr10 | VideoRangeType::DoviWithEl => Some("smpte2084"),
+                VideoRangeType::DoviWithHlg => Some("arib-std-b67"),
+                _ => None,
+            };
+            let matches_ci = |value: Option<&str>, expected: &str| {
+                value.is_some_and(|v| v.eq_ignore_ascii_case(expected))
+            };
+            if let Some(expected_transfer) = expected_transfer
+                && (!matches_ci(self.color_space.as_deref(), "bt2020nc")
+                    || !matches_ci(color_transfer, expected_transfer)
+                    || !matches_ci(self.color_primaries.as_deref(), "bt2020"))
+            {
+                return (base_video_range, VideoRangeType::DoviInvalid);
+            }
 
             if self.hdr10_plus_present_flag == Some(true) {
                 return match dv_range_set.1 {
@@ -1121,15 +1150,13 @@ impl MediaStream {
             return dv_range_set;
         }
 
-        let color_transfer = self.color_transfer.as_deref();
-
-        if color_transfer.is_some_and(|t| t.eq_ignore_ascii_case("smpte2084")) {
+        if is_pq {
             return if self.hdr10_plus_present_flag == Some(true) {
                 (VideoRange::Hdr, VideoRangeType::Hdr10Plus)
             } else {
                 (VideoRange::Hdr, VideoRangeType::Hdr10)
             };
-        } else if color_transfer.is_some_and(|t| t.eq_ignore_ascii_case("arib-std-b67")) {
+        } else if is_hlg {
             return (VideoRange::Hdr, VideoRangeType::Hlg);
         }
 
@@ -1932,11 +1959,7 @@ mod tests {
         );
 
         // Profile 8 compat 1 → DoviWithHdr10; with HDR10+ flag → DoviWithHdr10Plus.
-        let mut p8 = stream(MediaStreamType::Video);
-        p8.dv_profile = Some(8);
-        p8.rpu_present_flag = Some(1);
-        p8.bl_present_flag = Some(1);
-        p8.dv_bl_signal_compatibility_id = Some(1);
+        let mut p8 = self::dovi(8, 1);
         assert_eq!(p8.video_range_type(), VideoRangeType::DoviWithHdr10);
         p8.hdr10_plus_present_flag = Some(true);
         assert_eq!(p8.video_range_type(), VideoRangeType::DoviWithHdr10Plus);
@@ -1964,13 +1987,23 @@ mod tests {
         );
     }
 
-    /// A DoVi video stream at `profile`/`compat`, with RPU+BL present.
+    /// A DoVi video stream at `profile`/`compat`, with RPU+BL present and
+    /// the base-layer colours its compatibility id declares: BT.2020 with
+    /// HLG for compat 4, BT.709 for compat 2, BT.2020 with PQ otherwise.
     fn dovi(profile: i32, compat: i32) -> MediaStream {
         let mut s = stream(MediaStreamType::Video);
         s.dv_profile = Some(profile);
         s.rpu_present_flag = Some(1);
         s.bl_present_flag = Some(1);
         s.dv_bl_signal_compatibility_id = Some(compat);
+        let (space, transfer, primaries) = match compat {
+            4 => ("bt2020nc", "arib-std-b67", "bt2020"),
+            2 => ("bt709", "bt709", "bt709"),
+            _ => ("bt2020nc", "smpte2084", "bt2020"),
+        };
+        s.color_space = Some(space.to_owned());
+        s.color_transfer = Some(transfer.to_owned());
+        s.color_primaries = Some(primaries.to_owned());
         s
     }
 
@@ -2004,6 +2037,194 @@ mod tests {
         let mut tagged = stream(MediaStreamType::Video);
         tagged.codec_tag = Some("dvh1".to_owned());
         assert_eq!(tagged.video_range_type(), VideoRangeType::Sdr);
+    }
+
+    // Transliterated from upstream's `MediaStreamVideoRangeTests` (v12.2,
+    // `tests/Jellyfin.Model.Tests/Entities/MediaStreamVideoRangeTests.cs`).
+
+    /// Upstream's `CreateDovi`: RPU and base layer present, an enhancement
+    /// layer for profile 7, and the given base-layer colours.
+    fn create_dovi(
+        profile: i32,
+        compatibility_id: i32,
+        (space, transfer, primaries): (Option<&str>, Option<&str>, Option<&str>),
+        hdr10_plus: bool,
+    ) -> MediaStream {
+        MediaStream {
+            stream_type: MediaStreamType::Video,
+            dv_profile: Some(profile),
+            dv_bl_signal_compatibility_id: Some(compatibility_id),
+            rpu_present_flag: Some(1),
+            bl_present_flag: Some(1),
+            el_present_flag: Some(i32::from(profile == 7)),
+            color_space: space.map(str::to_owned),
+            color_transfer: transfer.map(str::to_owned),
+            color_primaries: primaries.map(str::to_owned),
+            hdr10_plus_present_flag: Some(hdr10_plus),
+            ..MediaStream::default()
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(7, 6, "smpte2084", false, VideoRangeType::DoviWithEl)]
+    #[case(7, 6, "smpte2084", true, VideoRangeType::DoviWithElhdr10Plus)]
+    #[case(8, 1, "smpte2084", false, VideoRangeType::DoviWithHdr10)]
+    #[case(8, 1, "smpte2084", true, VideoRangeType::DoviWithHdr10Plus)]
+    #[case(8, 4, "arib-std-b67", false, VideoRangeType::DoviWithHlg)]
+    #[case(10, 1, "smpte2084", false, VideoRangeType::DoviWithHdr10)]
+    #[case(10, 1, "smpte2084", true, VideoRangeType::DoviWithHdr10Plus)]
+    #[case(10, 4, "arib-std-b67", false, VideoRangeType::DoviWithHlg)]
+    #[case(8, 1, "SMPTE2084", false, VideoRangeType::DoviWithHdr10)]
+    #[case(8, 4, "ARIB-STD-B67", false, VideoRangeType::DoviWithHlg)]
+    fn get_video_color_range_valid_dovi_preserves_range_type(
+        #[case] profile: i32,
+        #[case] compatibility_id: i32,
+        #[case] transfer: &str,
+        #[case] hdr10_plus: bool,
+        #[case] expected: VideoRangeType,
+    ) {
+        let stream = create_dovi(
+            profile,
+            compatibility_id,
+            (Some("BT2020NC"), Some(transfer), Some("BT2020")),
+            hdr10_plus,
+        );
+        assert_eq!(stream.get_video_color_range(), (VideoRange::Hdr, expected));
+    }
+
+    #[rstest::rstest]
+    #[case(Some("bt709"), Some("bt709"), Some("bt709"), VideoRange::Sdr)]
+    #[case(Some("bt2020nc"), Some("bt709"), Some("bt2020"), VideoRange::Sdr)]
+    #[case(Some("bt2020nc"), None, Some("bt2020"), VideoRange::Sdr)]
+    #[case(Some("bt2020nc"), Some(""), Some("bt2020"), VideoRange::Sdr)]
+    #[case(Some("bt2020nc"), Some("unknown"), Some("bt2020"), VideoRange::Sdr)]
+    #[case(Some("bt2020nc"), Some("bt2020-10"), Some("bt2020"), VideoRange::Sdr)]
+    #[case(None, None, None, VideoRange::Sdr)]
+    #[case(Some("bt709"), Some("smpte2084"), Some("bt2020"), VideoRange::Hdr)]
+    #[case(Some("bt2020nc"), Some("smpte2084"), Some("bt709"), VideoRange::Hdr)]
+    #[case(None, Some("smpte2084"), Some("bt2020"), VideoRange::Hdr)]
+    #[case(Some("bt2020nc"), Some("smpte2084"), None, VideoRange::Hdr)]
+    #[case(Some("bt709"), Some("arib-std-b67"), Some("bt2020"), VideoRange::Hdr)]
+    #[case(Some("bt2020nc"), Some("arib-std-b67"), Some("bt709"), VideoRange::Hdr)]
+    #[case(None, Some("arib-std-b67"), Some("bt2020"), VideoRange::Hdr)]
+    #[case(Some("bt2020nc"), Some("arib-std-b67"), None, VideoRange::Hdr)]
+    fn get_video_color_range_invalid_dovi_colors_uses_base_layer_range(
+        #[case] space: Option<&str>,
+        #[case] transfer: Option<&str>,
+        #[case] primaries: Option<&str>,
+        #[case] expected: VideoRange,
+    ) {
+        // Every HDR-compatible DV profile, including the HDR10+ variants.
+        for (profile, compatibility_id) in [(7, 6), (8, 1), (8, 4), (10, 1), (10, 4)] {
+            for hdr10_plus in [false, true] {
+                let stream = create_dovi(
+                    profile,
+                    compatibility_id,
+                    (space, transfer, primaries),
+                    hdr10_plus,
+                );
+                let at = format!("{profile}.{compatibility_id}, HDR10+ {hdr10_plus}");
+                assert_eq!(stream.video_range(), expected, "{at}");
+                assert_eq!(
+                    stream.video_range_type(),
+                    VideoRangeType::DoviInvalid,
+                    "{at}"
+                );
+            }
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(7, 6, "arib-std-b67")]
+    #[case(8, 1, "arib-std-b67")]
+    #[case(8, 4, "smpte2084")]
+    #[case(10, 1, "arib-std-b67")]
+    #[case(10, 4, "smpte2084")]
+    fn get_video_color_range_wrong_hdr_transfer_invalid_but_still_hdr(
+        #[case] profile: i32,
+        #[case] compatibility_id: i32,
+        #[case] transfer: &str,
+    ) {
+        let stream = create_dovi(
+            profile,
+            compatibility_id,
+            (Some("bt2020nc"), Some(transfer), Some("bt2020")),
+            true,
+        );
+        assert_eq!(
+            stream.get_video_color_range(),
+            (VideoRange::Hdr, VideoRangeType::DoviInvalid)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(5, 0, None, VideoRange::Hdr, VideoRangeType::Dovi)]
+    #[case(10, 0, None, VideoRange::Hdr, VideoRangeType::Dovi)]
+    #[case(8, 2, Some("bt709"), VideoRange::Sdr, VideoRangeType::DoviWithSdr)]
+    #[case(10, 2, Some("bt709"), VideoRange::Sdr, VideoRangeType::DoviWithSdr)]
+    fn get_video_color_range_other_dovi_profiles_preserves_classification(
+        #[case] profile: i32,
+        #[case] compatibility_id: i32,
+        #[case] transfer: Option<&str>,
+        #[case] range: VideoRange,
+        #[case] range_type: VideoRangeType,
+    ) {
+        let stream = create_dovi(
+            profile,
+            compatibility_id,
+            (Some("bt709"), transfer, Some("bt709")),
+            false,
+        );
+        assert_eq!(stream.get_video_color_range(), (range, range_type));
+    }
+
+    #[rstest::rstest]
+    #[case(8, None, VideoRange::Sdr)]
+    #[case(8, Some("bt709"), VideoRange::Sdr)]
+    #[case(8, Some("smpte2084"), VideoRange::Hdr)]
+    #[case(10, None, VideoRange::Sdr)]
+    #[case(10, Some("arib-std-b67"), VideoRange::Hdr)]
+    fn get_video_color_range_invalid_compatibility_id_uses_base_layer_range(
+        #[case] profile: i32,
+        #[case] transfer: Option<&str>,
+        #[case] expected: VideoRange,
+    ) {
+        let stream = create_dovi(
+            profile,
+            6,
+            (Some("bt2020nc"), transfer, Some("bt2020")),
+            false,
+        );
+        assert_eq!(
+            stream.get_video_color_range(),
+            (expected, VideoRangeType::DoviInvalid)
+        );
+    }
+
+    #[rstest::rstest]
+    #[case(Some("bt709"), false, VideoRange::Sdr, VideoRangeType::Sdr)]
+    #[case(None, false, VideoRange::Sdr, VideoRangeType::Sdr)]
+    #[case(Some("smpte2084"), false, VideoRange::Hdr, VideoRangeType::Hdr10)]
+    #[case(Some("smpte2084"), true, VideoRange::Hdr, VideoRangeType::Hdr10Plus)]
+    #[case(Some("arib-std-b67"), false, VideoRange::Hdr, VideoRangeType::Hlg)]
+    fn get_video_color_range_without_dovi_preserves_classification(
+        #[case] transfer: Option<&str>,
+        #[case] hdr10_plus: bool,
+        #[case] range: VideoRange,
+        #[case] range_type: VideoRangeType,
+    ) {
+        let mut stream = MediaStream {
+            stream_type: MediaStreamType::Video,
+            color_transfer: transfer.map(str::to_owned),
+            hdr10_plus_present_flag: Some(hdr10_plus),
+            ..MediaStream::default()
+        };
+        assert_eq!(stream.get_video_color_range(), (range, range_type));
+        stream.stream_type = MediaStreamType::Audio;
+        assert_eq!(
+            stream.get_video_color_range(),
+            (VideoRange::Unknown, VideoRangeType::Unknown)
+        );
     }
 
     #[test]

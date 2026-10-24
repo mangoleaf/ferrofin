@@ -45,10 +45,6 @@
 //!   the upstream `OwnerId`/`LocalAlternateVersions`/`LinkedAlternateVersions`
 //!   columns and the linked-child reroute are Jellyfin-internal representation
 //!   with no Ferrofin equivalent.
-//! - No `VideoType`/`Video3DFormat` columns exist, so primary selection cannot
-//!   demote 3D/non-file videos — the widest wins.
-//! - No `IndexNumberEnd` column exists, so that merge-key component is always
-//!   empty (only multi-episode files could tell the difference).
 //! - The upstream movie loops run their async merges inside `Parallel.ForEach`
 //!   fire-and-forget lambdas (dropping errors); Ferrofin awaits sequentially.
 
@@ -464,7 +460,7 @@ impl MergeVersionsService {
         // Primary selection: the first supplied item (id order) that already
         // owns alternates and is not itself an alternate — the C#
         // `MediaSourceCount > 1 && !PrimaryVersionId.HasValue` probe — else
-        // the widest (`Video3DFormat`/`VideoType` demotion is not modeled).
+        // plain files before 3D and disc videos, then the widest.
         let owns_alternates = |item: &BaseItemEntity| {
             local.contains(&item.id)
                 || group
@@ -475,13 +471,7 @@ impl MergeVersionsService {
             .iter()
             .find(|i| i.primary_version_id.is_none() && owns_alternates(i))
             .unwrap_or_else(|| {
-                let mut best = &items[0];
-                for item in &items[1..] {
-                    if item.width.unwrap_or(0) > best.width.unwrap_or(0) {
-                        best = item;
-                    }
-                }
-                best
+                &items[ferrofin_core::video_versions::preferred_primary_version(&items)]
             });
         let primary_id = primary.id.clone();
 
@@ -830,9 +820,15 @@ fn episode_merge_key(ep: &BaseItemEntity, provider_id: impl Fn(&str) -> Option<S
         }
     }
     if let (Some(parent), Some(index)) = (ep.parent_index_number, ep.index_number) {
-        // No `IndexNumberEnd` column exists in Ferrofin's schema; the trailing
-        // component is empty, exactly as the C# renders a null.
-        return format!("{series}|number:{parent}:{index}:");
+        // `IndexNumberEnd` lives in the `Data` blob; a null renders as
+        // nothing, as in the C# interpolation.
+        let end = ferrofin_core::item_data::read_data_i32(
+            &ferrofin_core::item_data::parse_data(ep.data.as_deref()),
+            "IndexNumberEnd",
+        )
+        .map(|end| end.to_string())
+        .unwrap_or_default();
+        return format!("{series}|number:{parent}:{index}:{end}");
     }
     format!(
         "{series}|title:{}:{}:{}",
@@ -995,7 +991,7 @@ mod tests {
             _name: &str,
             _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
             _options: &ferrofin_model::configuration::LibraryOptions,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
             unimplemented!()
         }
         async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
@@ -1226,6 +1222,14 @@ mod tests {
     fn episode_merge_key_falls_back_to_numbers_then_title() {
         let ep = episode("Show", "Season 1", "Pilot", Some((1, 2)));
         assert_eq!(episode_merge_key(&ep, |_| None), "Show|number:1:2:");
+        // A multi-episode file's range end is the last component, as the C#
+        // renders `IndexNumberEnd`: a double episode is not a version of
+        // its first half.
+        let double = BaseItemEntity {
+            data: Some(r#"{"IndexNumberEnd":3,"Container":"mkv"}"#.to_owned()),
+            ..ep.clone()
+        };
+        assert_eq!(episode_merge_key(&double, |_| None), "Show|number:1:2:3");
         let ep = episode("Show", "Season 1", "Pilot", None);
         assert_eq!(
             episode_merge_key(&ep, |_| None),
@@ -1302,6 +1306,45 @@ mod tests {
         );
         assert_eq!(primary_of(&db, &svc, lonely).await, None);
         assert_eq!(primary_of(&db, &svc, no_id).await, None);
+    }
+
+    /// The plugin puts 3D and disc (non-`VideoFile`) videos after plain
+    /// files before it compares widths (`MergeVersionsManager.cs:199-202`).
+    #[tokio::test]
+    async fn merge_movies_demotes_3d_and_disc_copies_below_a_plain_file() {
+        let db = test_db().await;
+        let three_d = Uuid::from_u128(0x411);
+        let disc = Uuid::from_u128(0x412);
+        let plain = Uuid::from_u128(0x413);
+        for (id, width, data) in [
+            (three_d, 3840, r#"{"Video3DFormat":"HalfSideBySide"}"#),
+            (disc, 1920, r#"{"VideoType":"BluRay"}"#),
+            (plain, 1280, "{}"),
+        ] {
+            FerrofinItemPersistenceService::new(db.clone())
+                .save_items(&[BaseItemEntity {
+                    id: id.to_string(),
+                    type_: stored_type(BaseItemKind::Movie).to_owned(),
+                    width: Some(width),
+                    data: Some(data.to_owned()),
+                    ..BaseItemEntity::default()
+                }])
+                .await
+                .expect("seed item");
+            set_provider_id(&db, id, "Tmdb", "603").await;
+        }
+        let svc = service_over(&db, FakePlugins::enabled(), Vec::new());
+
+        svc.merge_movies(None).await.expect("merge movies");
+
+        assert_eq!(primary_of(&db, &svc, plain).await, None);
+        for id in [three_d, disc] {
+            assert_eq!(
+                primary_of(&db, &svc, id).await.as_deref(),
+                Some(plain.to_string().as_str()),
+                "the wider 3D or disc copy is an alternate of the plain file"
+            );
+        }
     }
 
     /// Seeds a movie owned by `library` (`TopParentId`). Unlike [`seed`],

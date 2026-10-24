@@ -260,7 +260,10 @@ impl FerrofinUserManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
-        self.auth_cache.clear();
+        // Only this user's row changed (a lockout cleared everything above);
+        // a wholesale clear here would let a stream of wrong passwords for one
+        // account keep every other user's cached auth cold.
+        self.auth_cache.invalidate_user(&user.id);
         tracing::warn!(
             username = %user.username,
             user_id = %user.id,
@@ -628,20 +631,26 @@ fn provider_id(name: &str) -> &str {
     }
 }
 
-/// Validates a username against the C# `ValidUsernameRegex`
-/// (`^(?!\s)[\w \-'._@+]+(?<!\s)$`) plus the `.`/`..` exclusions, without a
-/// regex engine: allowed characters are word characters (Unicode alphanumerics
-/// or `_`), space, and any of `- ' . _ @ +`; it must be non-empty, must not
-/// start or end with whitespace, and must not be `.` or `..`.
+/// The C# `ValidUsernameRegex` (`^(?!\s)[\w\ \-'._@+]+(?<!\s)$`,
+/// `UserManager.cs:119`) without its lookarounds, which [`valid_username`]
+/// checks itself. .NET's `\w` is `[\p{L}\p{Mn}\p{Nd}\p{Pc}]`, narrower than
+/// Rust's: it has no other numerics (`²`, `½`, `Ⅻ`) and no spacing marks.
+static VALID_USERNAME: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[\p{L}\p{Mn}\p{Nd}\p{Pc} \-'._@+]+$")
+        .expect("ValidUsernameRegex pattern is valid")
+});
+
+/// Validates a username against the C# `ValidUsernameRegex` plus the
+/// `.`/`..` exclusions (`ThrowIfInvalidUsername`, `UserManager.cs:965`): word
+/// characters, space and any of `- ' . _ @ +`, not starting or ending with a
+/// space. One divergence: .NET's `$` also matches before a final newline, so
+/// upstream admits `"alice\n"`; Ferrofin does not.
 fn valid_username(name: &str) -> bool {
-    if name.is_empty() || name == "." || name == ".." {
-        return false;
-    }
-    if name.starts_with(char::is_whitespace) || name.ends_with(char::is_whitespace) {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '_' | ' ' | '-' | '\'' | '.' | '@' | '+'))
+    VALID_USERNAME.is_match(name)
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && name != "."
+        && name != ".."
 }
 
 /// Validates a username or returns [`ServiceError::InvalidInput`] (C#
@@ -794,7 +803,10 @@ impl UserManager for FerrofinUserManager {
     async fn update_user(&self, user: &UserEntity) -> Result<(), ServiceError> {
         // Ensure the row exists (C# ResourceNotFound). The sibling
         // permission/preference/schedule collections are managed through their
-        // own helpers; this persists the flat `Users` columns.
+        // own helpers; this persists the flat `Users` columns. Session activity
+        // stamps `LastActivityDate` on its own (`record_user_activity`), so a
+        // save from an entity read before that stamp never moves it back, nor
+        // clears it.
         let id = Uuid::parse_str(&user.id)
             .map_err(|_| ServiceError::invalid_input("user id is not a valid guid"))?;
         self.require_user(id).await?;
@@ -817,7 +829,10 @@ impl UserManager for FerrofinUserManager {
                 "EnableLocalPassword" = ?8, "EnableNextEpisodeAutoPlay" = ?9,
                 "EnableUserPreferenceAccess" = ?10, "HidePlayedInLatest" = ?11,
                 "InternalId" = ?12, "InvalidLoginAttemptCount" = ?13,
-                "LastActivityDate" = ?14, "LastLoginDate" = ?15,
+                "LastActivityDate" = CASE
+                    WHEN ?14 IS NULL OR "LastActivityDate" > ?14 THEN "LastActivityDate"
+                    ELSE ?14 END,
+                "LastLoginDate" = ?15,
                 "LoginAttemptsBeforeLockout" = ?16, "MaxActiveSessions" = ?17,
                 "MaxParentalRatingScore" = ?18, "MaxParentalRatingSubScore" = ?19,
                 "MustUpdatePassword" = ?20,
@@ -866,6 +881,14 @@ impl UserManager for FerrofinUserManager {
         tx.commit().await.map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
+    }
+
+    async fn record_user_activity(
+        &self,
+        user: &UserEntity,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ServiceError> {
+        crate::user_activity_repository::stamp_last_activity(&self.db, &user.id, at).await
     }
 
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError> {
@@ -962,16 +985,13 @@ impl UserManager for FerrofinUserManager {
         }
         // The built-in provider supplies the hash while this manager owns its
         // database write. External providers own their credential store.
-        let hash = self.default_provider.format_password_hash(new_password)?;
-        sqlx::query(
-            r#"UPDATE "Users" SET "Password" = ?2, "RowVersion" = "RowVersion" + 1
-               WHERE "Id" = ?1"#,
-        )
-        .bind(guid_to_db(user_id))
-        .bind(hash)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
+        let hash = self
+            .default_provider
+            .format_password_hash(new_password)
+            .await?;
+        user_repository::set_password(self.db.writer(), &guid_to_db(user_id), hash.as_deref())
+            .await
+            .map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
     }
@@ -1036,6 +1056,25 @@ impl UserManager for FerrofinUserManager {
             return Ok(None);
         }
 
+        // Upstream's default provider migrates a legacy hash once the password
+        // verified ("Migrate old hashes to the new default"); the entity it
+        // changed is saved with the successful login.
+        if user
+            .authentication_provider_id
+            .eq_ignore_ascii_case(DEFAULT_AUTH_PROVIDER_ID)
+            && let Some(stored) = user.password.as_deref()
+            && let Some(hash) = self
+                .default_provider
+                .upgraded_hash(stored, password)
+                .await?
+        {
+            user_repository::set_password(self.db.writer(), &user.id, Some(&hash))
+                .await
+                .map_err(db_err)?;
+            tracing::info!(user_id = %user.id, "migrated password hash to the current default");
+            user.password = Some(hash);
+        }
+
         // Success: reset the failure counter and, for a real user session, stamp
         // the login/activity dates.
         let now = chrono::Utc::now();
@@ -1062,7 +1101,8 @@ impl UserManager for FerrofinUserManager {
         }
 
         tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
-        self.auth_cache.clear();
+        // The writes above touch this user's row only.
+        self.auth_cache.invalidate_user(&user.id);
         Ok(Some(user))
     }
 
@@ -1707,6 +1747,47 @@ fn parse_unrated_item(value: &str) -> Option<UnratedItem> {
 mod tests {
     use super::*;
     use crate::test_support::test_db;
+    use ferrofin_common::cryptography::PasswordHash;
+
+    /// Session activity's stamp never moves `LastActivityDate` back (an
+    /// earlier stamp writes nothing, `RowVersion` included), and a full save
+    /// from an entity read before the stamp, older or never set, keeps it.
+    #[tokio::test]
+    async fn the_activity_stamp_never_moves_back_or_is_undone_by_a_save() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let read = mgr.create_user("synthetic-activity").await.unwrap();
+        let id = Uuid::parse_str(&read.id).unwrap();
+        let stored = || async { mgr.get_user_by_id(id).await.unwrap().unwrap() };
+        let now = chrono::Utc::now();
+        mgr.record_user_activity(&read, now).await.unwrap();
+        let stamped = stored().await;
+        assert_eq!(
+            stamped.last_activity_date.map(|d| d.timestamp_micros()),
+            Some(now.timestamp_micros())
+        );
+
+        mgr.record_user_activity(&read, now - chrono::Duration::minutes(5))
+            .await
+            .unwrap();
+        let after = stored().await;
+        assert_eq!(after.last_activity_date, stamped.last_activity_date);
+        assert_eq!(after.row_version, stamped.row_version, "nothing written");
+
+        for before in [Some(now - chrono::Duration::days(30)), None] {
+            mgr.update_user(&UserEntity {
+                last_activity_date: before,
+                ..stored().await
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                stored().await.last_activity_date,
+                stamped.last_activity_date,
+                "a save from {before:?} keeps the stamp"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn profile_image_tags_follow_upload_replacement_and_removal() {
@@ -1862,17 +1943,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn valid_username_accepts_and_rejects() {
-        assert!(valid_username("alice"));
-        assert!(valid_username("a-b_c.d@e+f 1"));
-        assert!(!valid_username(""));
-        assert!(!valid_username("."));
-        assert!(!valid_username(".."));
-        assert!(!valid_username(" leading"));
-        assert!(!valid_username("trailing "));
-        assert!(!valid_username("has\ttab"));
-        assert!(!valid_username("bad/slash"));
+    /// `UserManagerTests.ThrowIfInvalidUsername_*` (`[InlineData]` verbatim),
+    /// then the word class .NET `\w` is: letters, nonspacing marks (a
+    /// Devanagari virama, a decomposed acute), decimal digits and connector
+    /// punctuation — not spacing marks, nor other numerics such as `²`, `½`
+    /// or `Ⅻ`.
+    #[rstest::rstest]
+    #[case::upstream_valid_1("this_is_valid", true)]
+    #[case::upstream_valid_2("this is also valid", true)]
+    #[case::upstream_valid_3("0@_-' .", true)]
+    #[case::upstream_valid_4("Aa0@_-' .+", true)]
+    #[case::upstream_valid_5("thisisa+testemail@test.foo", true)]
+    #[case::upstream_valid_6(
+        "------@@@--+++----@@--abcdefghijklmn---------@----_-_-___-_ .9foo+",
+        true
+    )]
+    #[case::upstream_invalid_1(" ", false)]
+    #[case::upstream_invalid_2("", false)]
+    #[case::upstream_invalid_3("special characters like & $ ? are not allowed", false)]
+    #[case::upstream_invalid_4("thishasaspaceontheend ", false)]
+    #[case::upstream_invalid_5(" thishasaspaceatthestart", false)]
+    #[case::upstream_invalid_6(" thishasaspaceatbothends ", false)]
+    #[case::upstream_invalid_7(" this has a space at both ends and inbetween ", false)]
+    #[case::upstream_invalid_8(".", false)]
+    #[case::upstream_invalid_9("..", false)]
+    #[case::devanagari_virama("कृष्ण", true)]
+    // ज़ुबैर: a nukta and two vowel signs, all nonspacing (`Mn`).
+    #[case::devanagari_nukta("\u{91c}\u{93c}\u{941}\u{92c}\u{948}\u{930}", true)]
+    // जो: the vowel sign O is a spacing mark (`Mc`), outside .NET's `\w`.
+    #[case::devanagari_spacing_mark("\u{91c}\u{94b}", false)]
+    #[case::decomposed_latin("Jose\u{301}", true)]
+    #[case::connector_punctuation("a\u{203f}b", true)]
+    #[case::superscript_digit("user²", false)]
+    #[case::vulgar_fraction("half½", false)]
+    #[case::roman_numeral("Louis Ⅻ", false)]
+    #[case::tab("has\ttab", false)]
+    #[case::trailing_no_break_space("a\u{a0}", false)]
+    #[case::slash("bad/slash", false)]
+    // .NET's `$` also matches before a final newline, so upstream admits
+    // "alice\n"; Ferrofin does not port that.
+    #[case::trailing_newline("alice\n", false)]
+    fn valid_username_matches_the_upstream_regex(#[case] name: &str, #[case] valid: bool) {
+        assert_eq!(valid_username(name), valid, "{name:?}");
     }
 
     // jellyfin-web refuses to initialize the Cast SDK when CastReceiverId is
@@ -2408,6 +2520,55 @@ mod tests {
         ));
     }
 
+    /// A successful login re-hashes a legacy hash with the current default, as
+    /// upstream `DefaultAuthenticationProvider.Authenticate` does ("Migrate old
+    /// hashes to the new default"); a failed one leaves it alone.
+    #[tokio::test]
+    async fn login_upgrades_a_legacy_password_hash() {
+        // PBKDF2-HMAC-SHA1, 1000 iterations, 32-byte key, of "legacy-pw".
+        const LEGACY: &str = "$PBKDF2$iterations=1000$69F420AABBCCDDEEFF00112233445566$\
+            28A5D139D2C7C66286E60F053FD55AFE9DAA7A94D4A45B84B8E08479F4D3122E";
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let user = mgr.create_user("erin").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        user_repository::set_password(db.writer(), &user.id, Some(LEGACY))
+            .await
+            .expect("seed legacy hash");
+        let stored = || async {
+            mgr.get_user_by_id(id)
+                .await
+                .expect("read")
+                .and_then(|user| user.password)
+                .expect("password")
+        };
+
+        let bad = mgr
+            .authenticate_user("erin", "wrong", "127.0.0.1", true)
+            .await
+            .expect("auth call");
+        assert!(bad.is_none());
+        assert_eq!(stored().await, LEGACY, "a failed login keeps the hash");
+
+        let ok = mgr
+            .authenticate_user("erin", "legacy-pw", "127.0.0.1", true)
+            .await
+            .expect("auth ok");
+        assert!(ok.is_some());
+        let upgraded = PasswordHash::parse(&stored().await).expect("parse");
+        assert!(
+            DefaultAuthenticationProvider::new().hash_is_current(&upgraded),
+            "upgraded to the current default: {upgraded}"
+        );
+        assert!(
+            mgr.authenticate_user("erin", "legacy-pw", "127.0.0.1", true)
+                .await
+                .expect("auth again")
+                .is_some(),
+            "the upgraded hash still verifies"
+        );
+    }
+
     #[tokio::test]
     async fn admin_password_may_not_be_emptied() {
         let db = test_db().await;
@@ -2419,6 +2580,96 @@ mod tests {
             mgr.change_password(id, "   ").await,
             Err(ServiceError::InvalidInput(_))
         ));
+    }
+
+    /// A login attempt that does not lock the account changes only that user's
+    /// own row, so it drops only that user's cached auth: a failed or a
+    /// successful login for one user leaves every other user's cached token
+    /// and DTO in place, and a failed password stream cannot keep the whole
+    /// cache cold.
+    #[tokio::test]
+    async fn a_login_attempt_invalidates_only_that_users_cached_auth() {
+        let db = test_db().await;
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let mgr = FerrofinUserManager::new(db).with_auth_cache(Arc::clone(&cache));
+        let tried = mgr.create_user("tried").await.unwrap();
+        let other = mgr.create_user("other").await.unwrap();
+        mgr.change_password(Uuid::parse_str(&tried.id).unwrap(), "secret")
+            .await
+            .unwrap();
+        let tried = mgr
+            .get_user_by_id(Uuid::parse_str(&tried.id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let cache_both = || {
+            let generation = cache.generation();
+            for (token, user) in [("tried-token", &tried), ("other-token", &other)] {
+                let device = ferrofin_db::entities::security::DeviceEntity {
+                    id: 1,
+                    access_token: token.to_owned(),
+                    app_name: "app".into(),
+                    app_version: "1.0".into(),
+                    date_created: chrono::Utc::now(),
+                    date_last_activity: chrono::Utc::now(),
+                    date_modified: chrono::Utc::now(),
+                    device_id: token.to_owned(),
+                    device_name: "Device".into(),
+                    is_active: true,
+                    user_id: user.id.clone(),
+                };
+                cache.put(generation, token, device, Some(user.clone()), None);
+                cache.put_user_dto(generation, user, UserDto::default());
+            }
+        };
+
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "wrong", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.get("other-token").is_some(), "another user's token");
+        assert!(cache.get_user_dto(&other).is_some(), "another user's DTO");
+        assert!(cache.get("tried-token").is_none(), "the tried user's token");
+        assert!(cache.get_user_dto(&tried).is_none(), "the tried user's DTO");
+
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "secret", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(cache.get("other-token").is_some(), "another user's token");
+        assert!(cache.get_user_dto(&other).is_some(), "another user's DTO");
+        assert!(cache.get("tried-token").is_none(), "the tried user's token");
+        assert!(cache.get_user_dto(&tried).is_none(), "the tried user's DTO");
+
+        // A failure that locks the account out still clears everyone: the
+        // lock must not wait for any cached resolution to expire.
+        let tried_id = Uuid::parse_str(&tried.id).unwrap();
+        mgr.update_policy(
+            tried_id,
+            &UserPolicy {
+                login_attempts_before_lockout: 1,
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "wrong", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache.get("other-token").is_none(),
+            "a lockout clears everyone"
+        );
     }
 
     #[rstest::rstest]

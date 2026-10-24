@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttp="http://www.w3.org/ns/ttml#parameter" ttp:timeBase="media" xmlns:tts="http://www.w3.org/ns/ttml#styling" xml:lang="en" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">
+  <head>
+    <metadata>
+      <ttm:title></ttm:title>
+    </metadata>
+    <styling>
+      <style xml:id="s0" tts:backgroundColor="black" tts:fontStyle="normal" tts:fontSize="16px" tts:fontFamily="sansSerif" tts:color="white" />
+    </styling>
+    <layout>
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="start" xml:id="topLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="start" xml:id="centerLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="start" xml:id="bottomLeft" />
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="center" xml:id="topCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="center" xml:id="centerCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="center" xml:id="bottomCenter" />
+      <region tts:extent="80% 40%" tts:origin="10% 10%" tts:displayAlign="before" tts:textAlign="end" xml:id="topRight" />
+      <region tts:extent="80% 40%" tts:origin="10% 30%" tts:displayAlign="center" tts:textAlign="end" xml:id="centerRight" />
+      <region tts:extent="80% 40%" tts:origin="10% 50%" tts:displayAlign="after" tts:textAlign="end" xml:id="bottomRight" />
+    </layout>
+  </head>
+  <body style="s0">
+    <div>
+      <p begin="1.0s" xml:id="p0" end="1.9s">AB: ½<span tts:fontStyle="italic">x</span><br /><span tts:fontStyle="italic">y</span></p>
+      <p begin="2.0s" xml:id="p1" end="2.9s">AB: ²<span tts:fontStyle="italic">x</span><br /><span tts:fontStyle="italic">y</span></p>
+      <p begin="3.0s" xml:id="p2" end="3.9s">AB:٣<span tts:fontStyle="italic">x</span><br /><span tts:fontStyle="italic">y</span></p>
+      <p begin="4.0s" xml:id="p3" end="4.9s">²</p>
+      <p begin="5.0s" xml:id="p4" end="5.9s">ⅷ</p>
+      <p begin="6.0s" xml:id="p5" end="6.9s">
+        <span tts:fontStyle="italic">é</span>
+      </p>
+      <p begin="7.0s" xml:id="p6" end="7.9s">&amp;ⅷⅷ; and &amp;éé; and &amp;ab;</p>
+    </div>
+  </body>
+</tt>

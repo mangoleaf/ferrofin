@@ -129,6 +129,82 @@ down). The live result above is therefore recorded as **pending**: the `Adoption
 exercises this row on the next push to `release/v1.4.0`, and `release-gate` blocks the tag until
 it is green. Update the table row and this note once that run lands.
 
+### 2026-10-20 messy rows, first slice (gl-629)
+
+Fixtures built fresh by `build-fixtures.sh` into a new directory (the build had stopped at the
+fresh-install fixture on every run until gl-701, so this is also the first complete build at that
+recipe: eleven fixtures, three oracle smoke files, the schema pin), then `messy.py build` for
+the two messy copies. The oracle was Jellyfin 12.2 image id `sha256:357724bf0ae2…` (pulled by the
+build and recorded in each `messy-oracle.json`); its all-shapes run matched its single-shape runs
+on both lineages. Ferrofin image `ferrofin:adopt-gl663b` (built 2026-10-19 21:00 MDT from the
+gl-663 branch, which includes migration 0044; it was not rebuilt from the current
+`release/v1.4.0` head, so the release run must use its own candidate image). `run.sh --only
+jellyfin-10.11.11-messy`: **PASS** (the shapes end as the oracle and the written divergences
+say, the table digests hold, the second boot is quiet). `run.sh --only jellyfin-12.2-messy`:
+**FAIL, as expected**: Ferrofin refuses the database (`database has 1 foreign-key violation(s)
+after migrating (BaseItems → BaseItems: 1)`) because of the dangling-owner extra, which Jellyfin
+12.2 boots; gl-707 tracks it, and the row passes only once that is fixed. The run ends at once
+with every reason named, not after the readiness deadlines. The other two shapes on that lineage
+were checked on a scratch copy without the extra (`messy.py check` exit 0). The eleven clean rows
+and `synthetic.py run` were not re-run for this change, which touches none of them.
+
+### 2026-10-20 scale row (gl-631)
+
+Every fixture rebuilt by `build-fixtures.sh` into a new directory, so the populated tables of
+gl-628 are in. It was built before the missing-count and duplicate-page guards went into
+`preservation.py`, so `synthetic.py run` on it would ask for a rebuild; the scale row does not read
+the recipe. The build also ran
+`scale.py build`: `jellyfin-10.11.11-scale`, a 253 MiB database of 39,933 cloned items on top of the
+fixture's own 67 (the clones carry 139,770 chapter rows, 97,837 stream rows, 55,908 people links,
+27,954 trickplay rows, 27,954 keyframe rows and 7,986 UserData rows). Ferrofin image
+`ferrofin:adopt-gl631`, built from this change on top of `release/v1.4.0` (migration 0044, not
+0045); the release run needs its own candidate image. `run.sh --only jellyfin-10.11.11-scale`
+**PASSED** three times and recorded the numbers each time. Runs 1 and 2 predate the review fixes
+to the harness (run 1 also the anonymous-memory figure); run 3 is on the final harness:
+
+| Number | Run 1 | Run 2 | Run 3 (final harness) |
+|---|---|---|---|
+| migration time (server start to migrations applied) | 2.9 s | 2.9 s | 5.4 s |
+| peak memory (container cgroup, page cache included; the whole first boot including the boot repairs) | 1.4 GiB | 1.5 GiB | 1.3 GiB |
+| anonymous memory (largest seen by the sampler) | not yet recorded | 243.5 MiB | 245.7 MiB |
+| disk high-water (data directory, WAL and snapshots included) | 1,454 MiB, 5.7x the database | 1,454 MiB | 1,454 MiB |
+| largest WAL seen | 140 MiB | 140.1 MiB | 161.8 MiB |
+| `foreign_key_check` on the adopted file | 0.2 s | 0.2 s | 0.2 s |
+
+Most of the cgroup peak is page cache (about 245 MiB of 1.3 to 1.5 GiB is anonymous), so the cgroup
+figure is not a measure of resident memory and should not become a memory threshold. Three runs on
+a shared, loaded host with the database on a local NVMe disk: an indication, not a baseline. Disk
+is the same to the MiB every time and the `foreign_key_check` steady; memory and the WAL peak move
+a little; the migration time doubled on the third run, which was not investigated (other builds
+were running on the host throughout). The measured high-water of the whole data directory (5.7x the database)
+is only about 0.3 of the database below the free-disk floor (`FREE_MULTIPLE` = 6 times the
+database, plus the rest of the fixture); raise the multiple when a threshold is proposed.
+The two messy rows were run again with the same image because `wait_up` now takes a deadline:
+`jellyfin-10.11.11-messy` **PASS**, `jellyfin-12.2-messy` fails at once for the reason in the
+messy record above (this image has no 0045). The eleven clean rows and `synthetic.py run` were not
+re-run: they wait with `wait_ready`, which did not change (`wait_up`, which the messy and scale
+rows use, now takes a deadline whose default equals the old 300 polls of 2 s), and the one thing
+they share with this change is `preservation.py`'s snapshot, which pages through every item and is
+covered by its unit tests.
+
+### 2026-10-21 the report (gl-633)
+
+`report.html` written by both entry points, on synthetic fixtures with Ferrofin image
+`ferrofin:adopt-gl630` (built from `release/v1.4.0`, migration 0045; the release run needs its own
+candidate image). `run.sh` ran against existing synthetic fixtures (it does not compare them to the
+recipe): `--only 12.2.0` adopted the five 12.2.0 rows (`from-10`, `from-12`, `from-121`, `fresh`
+and the `messy` copy with its three original shapes), all **PASS**, 78 checks recorded, the page
+written in 99 s with the messy shapes table and every stage's checks; `--only
+jellyfin-10.11.11-scale` **PASSED** and its page carries the same measurements as the PASS line
+(migration 4.7 s, peak memory 950.1 MiB, anonymous 234.1 MiB, disk high-water 1.4 GiB, WAL 161.8
+MiB, `foreign_key_check` 0.3 s). The pages open from disk and the viewer's Adoption tab lists them
+(`bench/report.py --serve --adoption-dir DIR/work`). `preservation.py` is part of the synthetic
+recipe, so the report change needs the fixtures built again for `synthetic.py run`: the five
+fixtures it needs (`jellyfin-10.11.8`, `12.0`, `12.1-from-12`, `12.2-from-121`, `12.2-from-10`) were
+built into a new directory and `synthetic.py run --only jellyfin-12.2-from-10` **PASSED** all four
+stages, its page listing 35 checks under the same stage names as `run.sh`'s. The other paths of the
+matrix, and the messy shapes added to the messy fixtures later, were not run again for this change.
+
 ## What the live suite checks
 
 1. The boot log names the expected generation, reports completed database migrations and
@@ -156,6 +232,12 @@ it is green. Update the table row and this note once that run lands.
    database and movie/episode API responses, including watched flags and progress.
 7. Every row of the Jellyfin-owned tables no other check covers survives each stage, bar
    the rewrites listed under the table digests below.
+8. After the eleven paths, two **messy** fixtures are adopted (see [Messy rows](#messy-rows)):
+   each shape of rows real databases carry ends as Jellyfin 12.2 left it, or as a divergence
+   written down.
+9. Last, a **scale** fixture of 40,000 items is adopted (see [Scale fixture](#scale-fixture)):
+   every cloned item and the rows that hang off it survive, and the run records the migration
+   time, peak memory, disk high-water mark and the cost of the `foreign_key_check`.
 
 The table digests (`table_digests.py`) hash every row of those tables whole, keyed by its
 primary key, and take the baseline from each fixture copy before Ferrofin starts. A row that
@@ -169,8 +251,9 @@ stops seeing, so add one only with a migration or server behaviour to point at:
 |---|---|
 | GUIDs compare as 32 lowercase hex digits | casing and dashes: 0007, 0032 |
 | `ItemId` is the item's path when the item has an owner and no other item shares the path | the rehome repair re-keys a local alternate version (an owned item) to the id its primary's type derives, as Jellyfin 12.2 does; an unowned item re-keyed still fails |
+| that item's id in its metadata folder (`/<2>/<id>/`) in `Chapters.ImagePath` | the same repair moves the item's metadata folder, chapter images included, to the new id, as Jellyfin 12.2 does; any other path change still fails |
 | the listed timestamps compare as instants | 0007 rewrites ISO `T` dates to the space form |
-| `ItemValues.CleanValue` is not compared | 0031 re-derives keys that matched the previous derivation |
+| `ItemValues.CleanValue` is checked on its own: it must stay what it was or become what `Value` derives to | 0031 and the boot repair `repair_clean_values` (12.0's `RefreshCleanNamesAsync`) re-derive it with `get_clean_value`, ported in `clean_value.py` (needs PyICU) and proven against the Rust oracle; a value NULLed or corrupted by adoption still fails |
 | a `Devices` row's `AppName`, `AppVersion`, `DeviceName`, `DateModified` and `DateLastActivity` are not compared, as is `ApiKeys.DateLastActivity` | every authenticated request re-announces them |
 | a `Devices` row's `Id`, `AccessToken`, `IsActive` and `DateCreated` (as an instant, since 0007 rewrites it) are compared, except on the `DeviceId`s the harness logs in from (`synthetic-login-*`, `account-login-*`) | authenticating again from a device replaces its row with a new id, token, activation and creation date, as Jellyfin does; the harness does this only from its own `DeviceId`s, so on every other device a reset token or a deactivated device fails. `run.sh` logs in from none and compares them all |
 | rows that share a key are a multiset, not one row | `(UserId, DeviceId)` is not unique, so losing or changing one of two devices for the same user and device must still fail |
@@ -238,6 +321,146 @@ library. Run it before
 any change to `crates/ferrofin-db/migrations/`, the adoption gate in
 `database.rs`, or the boot repairs in `adoption_repairs.rs`, and before a release.
 
+## The report
+
+`adoption/run.sh` and `python3 adoption/synthetic.py run` each write a self-contained
+`report.html` in their work directory (`DIR/work/run/` for `run.sh`, `DIR/work/` for the
+preservation matrix; `ADOPTION_WORK_DIR` moves the first). It opens from disk, has no external
+asset, and shows:
+
+- the run: image, Jellyfin oracle, duration, how many fixtures passed, failed or were skipped;
+- per fixture, per stage (**after adoption**, **after restart**, **after scan**), **every check's
+  verdict** and, for a failed one, why: boot log, answers against Jellyfin, `integrity_check` and
+  `foreign_key_check`, second-boot repairs, metadata, watch history, table digests (and, for the
+  matrix, user accounts, seeded states and artwork);
+- the **table-digest differences** of a stage that lost or changed a row;
+- for a messy fixture, **each shape's end state next to the one it must reach** and where that
+  expectation comes from (Jellyfin 12.2's record, or the divergence written for it);
+- for the scale fixture, the **measurements** (migration time, peak and anonymous memory, disk
+  high-water, WAL peak, the `foreign_key_check` time) and which of them could not be taken.
+
+Failed fixtures are open and passing ones collapsed. The checks are recorded one JSON line each in
+`work/results.jsonl` as the run goes (`adoption/adoption_report.py` is the recorder and the renderer), and the
+page is built from that when the run ends, **however it ends**: a run that is terminated, or stops
+on an error, still leaves its page, with the fixture it was on listed as unfinished (`INCOMPLETE`,
+which fails the run) and, for the matrix, the error that stopped it as a failed check. A run
+refused before it starts (a missing fixture directory, no docker) leaves nothing, and a matrix
+refused before its first fixture starts (no oracle, a recipe change, a previous run's copy still in
+`work/`) leaves the last report alone. The matrix has no messy or scale sections: those fixtures
+are `run.sh`'s. A page embeds the first 500 table-digest differences of a stage and counts the rest
+(the matrix also caps the reasons of a check and of a row at 500 each); `run.sh` keeps every difference in
+`<fixture>.tables-*.log` beside the page, and `synthetic.py run` prints them in the error that ends
+the run. Recording never changes a run's verdict or its exit status: an I/O or rendering problem
+leaves the run going without a page, and `run.sh` says on stderr that none was written (the
+recorder's own messages go to `/dev/null` there, so they never change what a run prints). When
+stdout is a terminal, `run.sh` also prints the page's path at the end: the one line of stdout
+recording adds, and only on a terminal.
+
+The shared viewer lists it in its Adoption tab and compares two runs side by side:
+
+```bash
+python3 bench/report.py --serve --adoption-dir DIR/work      # `run`, and the matrix as `work`
+```
+
+The `Adoption` workflow uploads the two pages as the `adoption-report` (`run.sh`) and
+`adoption-matrix-report` artifacts on every run, pass or fail (the whole work directory is still
+uploaded as `adoption-work` on a failure).
+
+## Messy rows
+
+Long-lived databases carry rows no API produces, and the clean fixtures never hold them.
+`messy.py` writes the shapes of this first slice by SQL into a stopped copy of a finished
+fixture, one function and one manifest entry (`messy.json`) per shape:
+
+| Shape | What is written |
+|---|---|
+| `deleted_user` | UserData, Permissions, Preferences, Devices and DisplayPreferences rows of a user that does not exist |
+| `dangling_owner_extra` | a copy of an extra whose `OwnerId` names no item, at a path no file has |
+| `duplicate_paths` | two `BaseItems` rows with one `Path`, the copy being the older |
+
+They go into `jellyfin-10.11.11-messy` and `jellyfin-12.2-messy`, copies of the latest 10.11.x and
+the latest 12.x fixture (`jellyfin-12.2-from-121`), one per lineage: the 10.11 lineage runs 0032
+and `FixIncorrectOwnerIdRelationships` on adoption, a 12.x database already has. The copies leave
+the eleven clean paths and their smoke oracle as the control; `build-fixtures.sh` builds them last.
+
+The expectation per shape is what **Jellyfin 12.2 itself did**, not an assumption:
+`messy.py build` pulls `jellyfin/jellyfin:12.2` (a stale local tag would record another release;
+the image id goes into the record), boots it on a clean copy of the source carrying only that
+shape, waits for its tasks to settle, and records the outcome and the end state read from the
+database (`messy-oracle.json`). It then boots it once on a copy carrying all three, because
+Ferrofin adopts the combined fixture, and fails the build if that differs from the single runs.
+A boot that neither answers nor exits within the deadline is an error, never a recorded
+refusal; a failed build removes its own derived copy, leaving the clean fixtures as they were.
+Each oracle boot's server log stays in `work/` as `messy-oracle-<fixture>-<shape>.server.log`,
+the evidence behind a recorded outcome.
+`run.sh` then adopts a fresh copy of each messy fixture with the image under test and fails when
+a shape ends differently, when the boot log has an `ERROR`, when the file fails its integrity or
+foreign-key check, when a second boot repairs again, or when the table digests (check 7, baseline
+taken before Ferrofin starts) show a row lost beside the messy ones. A container that exits (a
+refused database) ends the wait at once. Where Ferrofin is meant to end differently,
+`DIVERGENCES` in `messy.py` names the state it must reach and why; a difference that is not
+written there fails, a shape Jellyfin refuses needs a written expectation, and a fixture built
+with a different list of shapes is refused rather than partly checked. What Jellyfin 12.2 did:
+
+| Shape | 10.11 lineage (upgraded by 12.2) | 12.x lineage (booted as is) |
+|---|---|---|
+| `deleted_user` | deletes Permissions and Preferences; keeps UserData, Devices, DisplayPreferences | keeps every row |
+| `dangling_owner_extra` | deletes the extra | keeps it, dangling |
+| `duplicate_paths` | deletes the copy | keeps both |
+
+And what Ferrofin is expected to reach where it differs: every row of the missing user deleted
+on both lineages (migration 0044); on 12.x the dangling extra removed as on 10.11 (today
+Ferrofin refuses that database instead: gl-707) and the duplicate path collapsed by the ported
+routine. The next slice of shapes (GUID casing, case duplicates, orphaned ancestors, virtual
+seasons) goes into the same module.
+
+## Scale fixture
+
+The clean fixtures hold a few dozen items; a real library holds tens of thousands, and the
+migration chain rebuilds `BaseItems` and its neighbours (0007, 0032) and the boot runs a
+`foreign_key_check` over all of it. `scale.py build` derives `jellyfin-10.11.11-scale` from the
+clean `jellyfin-10.11.11` (the 10.11 lineage runs the heavy migrations) and clones its media
+items by SQL until `BaseItems` holds 40,000 rows (`ITEMS`); `build-fixtures.sh` builds it last.
+Nothing is scanned and no file is written: scan cost at scale belongs to the benchmark corpus.
+
+A clone is a movie, episode or song (one with no owner and no primary version, not an extra)
+with a new id, a name carrying its number, and a path in a directory of its own that no file
+has (`…/scale-00042/name.mkv`: a duplicate path would be collapsed by the very repair under
+test). Every row that hangs off its template is copied with it: streams, attachments, chapters,
+keyframes, trickplay, segments, images, providers, metadata fields, trailer types, ancestors,
+item values and people; the values and people themselves are shared, as in a real library. One
+clone in ten (`USERDATA_EVERY`) also carries the play state of every user the fixture holds any for
+(two of its seven accounts), copied from its template's own row or, when the template has none, from
+the fixture's first row for that user.
+A table that gains a foreign key to `BaseItems` fails the build until `CHILDREN` names it, so
+nothing goes uncloned unnoticed, and the clones must add no foreign-key violation.
+
+`run.sh` adopts a fresh copy with the image under test, after checking that the disk can hold it
+(`FREE_MULTIPLE` = 6 times the database, which covers the working copy, the `.pre-ferrofin` and
+`.pre-00NN` snapshots, the WAL and the room a table rebuild takes, plus the rest of the fixture; the
+row **fails** naming the shortfall rather than starting). The boot may take
+`ADOPTION_SCALE_TIMEOUT` seconds to answer (default 1800), twice. It is held to the boot log
+(generation, migrations, no `ERROR`), the file's integrity, a quiet second boot, the table
+digests, and the survival of every cloned item and the rows hanging off it (`scale.py counts` and
+`check`: a table that loses rows of a clone fails and is named). What it costs is **recorded, not
+gated**, on the PASS line and in `scale-measurements-<fixture>.json` in the run's work
+directory, which the cleanup of a passing row leaves alone:
+
+| Number | How it is taken |
+|---|---|
+| migration wall time | the boot log: from `ferrofin-server starting` to `database migrations applied`. That window also holds the `.pre-ferrofin` copy, the rebuild snapshots, the dangling-row cleanup and the first `foreign_key_check`, because the database opens before the line is logged |
+| peak memory | the container's cgroup `memory.peak` (cgroup v2, Linux 5.19+), read once a second. It counts the **page cache** of the database, its snapshots and its WAL, so it is not resident memory and moves with the host's cache pressure; beside it, the largest `anon` of the cgroup's `memory.stat` seen by the sampler is recorded as the closer match for resident memory |
+| disk high-water | the allocated size of the whole data directory, sampled every `SAMPLE_S` = 1 s from the container's start until the first boot has settled, with the WAL's own largest size beside it; it includes `.pre-ferrofin` and the `.pre-00NN` snapshots |
+| `foreign_key_check` cost | the time of `PRAGMA foreign_key_check` on the adopted file, taken once the boot has settled with the file warm in the page cache, which is what every later boot adds |
+
+Disk, the WAL and the anonymous memory are sampled, so a short peak between two samples is missed
+and each is a lower bound (the cgroup's own peak is not); a migration that finishes in a few seconds
+gives only a few samples. A number that cannot
+be taken (no cgroup v2, a log without the migration lines, a sampler that never ran, a WAL none of
+the samples saw) fails the row naming it; it is never filled in, and a previous run's numbers are
+deleted before the row starts so they cannot stand in. Nothing here is gated. `scale.py` needs
+Python 3.11 or newer.
+
 ## The fixtures are synthetic
 
 Every fixture is built from **synthetic data only**: no real library, personal media
@@ -280,7 +503,8 @@ The probes run as the synthetic administrator, which has a **Jellyfin Web** sess
 `Devices` and an **API key** in `ApiKeys`; `oracle/user.txt` records it, and `--user NAME`
 or `ADOPTION_USER` overrides. Credentials are read from the copy at run time and never
 written. The builder and runner need Docker, Python 3, Pillow (`python3-pil` on
-Debian/Ubuntu), `sqlite3`, `jq` and `curl`. Media encoding uses the Jellyfin image's FFmpeg.
+Debian/Ubuntu), PyICU (`python3-icu`, for the `CleanValue` derivation), `sqlite3`, `jq` and
+`curl`. Media encoding uses the Jellyfin image's FFmpeg.
 
 ```bash
 adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once; pulls 10.11.8–12.2
@@ -339,8 +563,21 @@ date/GUID normalization, private baselines, fixtures missing watched/resume data
 failure reporting. Its fixtures contain only invented IDs and playback data.
 `tests/test_table_digests.py` checks a lost row in each listed table, a changed column, a
 lost and an added column, and a case per normaliser rule (each with the unrewritten change
-next to it that must still fail).
-CI runs the Bats tests with `bats adoption/tests`
+next to it that must still fail). `tests/test_messy.py` checks each shape's seeder and end-state
+reader on a scratch SQLite database, the comparison with Jellyfin 12.2's record, and that every
+written divergence names a seeded shape, a derived lineage and a whole state.
+`tests/test_scale.py` checks the cloning on a small library with the same table shapes
+(round-robin templates, ids and paths of their own, every hanging row copied, the play-state
+density, determinism, an unknown foreign key refused, a failed build cleaned up), the survival
+check, the disk requirement, the sampler's high-water marks and the cgroup lookup with
+substituted files, the boot-log timing and the record that names what it could not measure.
+`tests/test_adoption_report.py` checks the recorder (a new run forgets the last, bad verdicts refused, a
+line cut off by a killed run ignored), the verdict rules (a row that passed with a failed check is
+failed; a fixture that began and never finished is `INCOMPLETE`; a run that ran nothing says so),
+every section of the page, that run text cannot inject markup, that the page is self-contained,
+the command line, and that the viewer's Adoption tab lists it. `adoption.bats` runs `run.sh` with a
+fake docker to see the checks recorded in the page of a failing row, of a skipped one and of a
+terminated run. CI runs the Bats tests with `bats adoption/tests`
 next to `scripts/tests`; locally `mise exec bats@latest -- bats adoption/tests` or
 a system `bats` works.
 
@@ -436,10 +673,22 @@ own setup, library, user, metadata, and playlist APIs. It uses invented accounts
 titles, tags, provider IDs, solid-color images, silent video, and generated tones.
 It neither reads nor modifies a personal media server.
 
-The fixture has five movie titles (one with two versions), one extra, one series
-with two seasons and six episodes, and six music tracks across two artists and
-two albums. One album spans two discs. English subtitle files accompany every
-movie and episode. Seven users provide an administrator, an adult with access to
+The fixture has eight movie titles (one with two versions, one HDR10, one with two
+audio languages and an attached font, one under a non-ASCII path), one extra, one
+series with two seasons and six episodes, six music tracks across two artists and
+two albums, a book and two photos. One album spans two discs. English subtitle files
+accompany every movie and episode, every video has chapters, and every movie and
+episode NFO credits two actors. Chapter-image and trickplay extraction run during
+the scan, and the builder runs the keyframe-extraction task, saves display
+preferences and a device name, and writes two media segments under the Intro
+Skipper plugin's provider id (no API creates one). So every table the
+[table digests](#2026-10-19-table-digests-check-7) compare holds rows on every
+fixture (bar media segments on the fresh install, which skips `seed_database`), and the
+builder fails when one of them is empty. Measured on 2026-10-20 on an idle host,
+before the fresh-install row existed, this made a full `build-fixtures.sh` take 420 s instead
+of 396 s (+6 %), and the fixture directory 29 MB instead of 18 MB.
+
+Seven users provide an administrator, an adult with access to
 every library, a child with library/parental restrictions, an administratively
 disabled account, an account locked by failed logins, a passwordless account, and
 a dedicated account with populated policy and configuration settings. Downloads
@@ -511,7 +760,7 @@ verify that unlisted future policy/configuration fields are compared.
 
 ### Running the synthetic matrix
 
-Requires Docker, Python 3, Pillow, Bash, and jq. Media encoding uses
+Requires Docker, Python 3, Pillow, PyICU (`python3-icu`), Bash, and jq. Media encoding uses
 `/usr/lib/jellyfin-ffmpeg/ffmpeg` from the official Jellyfin container; no host
 FFmpeg installation is needed. Docker must be available to the invoking user.
 Use a fresh fixture directory on a local disk, outside the checkout.
@@ -547,7 +796,8 @@ Adoption remains one-way: Jellyfin is never started against an adopted copy.
 The synthetic harness regression tests run through `bats adoption/tests`, along
 with the original metadata and watch-history tests. The PR CI does not encode or scan these
 fixtures. The live matrix runs in the `Adoption` workflow (`.github/workflows/adoption.yml`)
-on every push to a `release/**` branch, or by hand on any branch: it builds the image from
+on every push to a `release/**` branch, or by hand on any branch (one run per branch at a time:
+a newer push replaces the run still waiting, never the one running): it builds the image from
 the commit, restores the fixtures from a cache keyed on the recipe, `smoke.sh`,
 `build-fixtures.sh` and the Jellyfin image digests (building them on a miss; GitHub scopes
 the cache to the branch, so each new release branch builds once), and runs

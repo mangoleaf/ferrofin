@@ -27,6 +27,7 @@ use ferrofin_model::tasks::{TaskTriggerInfo, TaskTriggerInfoType};
 use ferrofin_traits::activity::ActivityManager;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::library::LibraryManager;
 use ferrofin_traits::session::SessionManager;
 use ferrofin_traits::system::ServerApplicationPaths;
 use uuid::Uuid;
@@ -84,6 +85,35 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+/// Port of `TranscodeManager.DeleteEncodedMediaCache`
+/// (`TranscodeManager.cs:718-736`), which the upstream constructor runs at
+/// startup: deletes every file under the transcode directory, whatever its
+/// age, so the segments and outputs a crash left behind do not outlive the
+/// restart. Directories stay. The `.jellyfin-transcode` marker goes with the
+/// rest, as upstream, and the next `prepare_transcode_path` recreates it. A
+/// directory that cannot be prepared (a conflicting marker says it is not
+/// ours) is left alone. Per-file failures are logged and skipped.
+///
+/// Run it before any transcode job can start. Returns how many files were
+/// deleted.
+pub fn delete_encoded_media_cache(paths: &dyn ServerApplicationPaths) -> u64 {
+    let dir = match paths.prepare_transcode_path() {
+        Ok(dir) => PathBuf::from(dir),
+        Err(error) => {
+            tracing::error!(%error, "cannot clear the transcode cache");
+            return 0;
+        }
+    };
+    let mut deleted = 0;
+    for file in files_under(&dir) {
+        match std::fs::remove_file(&file) {
+            Ok(()) => deleted += 1,
+            Err(e) => tracing::warn!(path = %file.display(), error = %e, "failed to delete file"),
+        }
+    }
+    deleted
 }
 
 /// Deletes every file under `dir` last modified before `cutoff`, then prunes
@@ -220,7 +250,8 @@ impl ScheduledTask for CleanActivityLogTask {
 
 /// "Clean Cache Directory" — deletes cache files no longer needed by the
 /// system. Port of `DeleteCacheFileTask`: cache files older than 30 days, temp
-/// files (`{cache}/temp`) older than 1 day, then empty-folder pruning.
+/// files ([`ServerApplicationPaths::temp_path`], `{cache}/temp`) older than 1
+/// day, then empty-folder pruning.
 pub struct DeleteCacheFileTask {
     paths: Arc<dyn ServerApplicationPaths>,
 }
@@ -259,7 +290,7 @@ impl ScheduledTask for DeleteCacheFileTask {
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         let cache = PathBuf::from(self.paths.cache_path());
-        let temp = cache.join("temp");
+        let temp = PathBuf::from(self.paths.temp_path());
         let progress = progress.clone();
         let deleted = run_sweep(move || {
             let now = SystemTime::now();
@@ -405,7 +436,10 @@ impl ScheduledTask for DeleteTranscodeFileTask {
             tracing::info!("skipping transcode-directory sweep: playback is active");
             return Ok(());
         }
-        let dir = PathBuf::from(self.paths.prepare_transcode_path()?);
+        let dir = PathBuf::from(
+            ferrofin_traits::system::prepare_transcode_path_off_runtime(Arc::clone(&self.paths))
+                .await?,
+        );
         let progress = progress.clone();
         let deleted = run_sweep(move || {
             let cutoff = SystemTime::now() - std::time::Duration::from_hours(24);
@@ -427,16 +461,27 @@ impl ScheduledTask for DeleteTranscodeFileTask {
 pub struct OptimizeDatabaseTask {
     db: Database,
     sessions: Arc<dyn SessionManager>,
+    library: Arc<dyn LibraryManager>,
 }
 
 impl OptimizeDatabaseTask {
-    /// Builds the task over the database handle and the session manager (the
+    /// Builds the task over the database handle (skipped while a backup
+    /// snapshot holds its maintenance turn), the session manager (the
     /// vacuum is skipped while anything is playing — `VACUUM` and the
     /// truncating checkpoint take exclusive locks that fail live requests; a
-    /// real mid-playback black-screen traced to exactly this window).
+    /// real mid-playback black-screen traced to exactly this window) and the
+    /// library manager (skipped, as upstream, while a library scan runs).
     #[must_use]
-    pub fn new(db: Database, sessions: Arc<dyn SessionManager>) -> Self {
-        Self { db, sessions }
+    pub fn new(
+        db: Database,
+        sessions: Arc<dyn SessionManager>,
+        library: Arc<dyn LibraryManager>,
+    ) -> Self {
+        Self {
+            db,
+            sessions,
+            library,
+        }
     }
 }
 
@@ -467,6 +512,13 @@ impl ScheduledTask for OptimizeDatabaseTask {
         vec![interval_hours(6)]
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+        // `OptimizeDatabaseTask.ExecuteAsync`: the vacuum and the truncating
+        // checkpoint hold the only writer a library scan writes through, and
+        // can stall it, so the run waits for the next trigger.
+        if self.library.is_scan_running() {
+            tracing::info!("skipping database optimization: a library scan is running");
+            return Ok(());
+        }
         // Playback guard: VACUUM + wal_checkpoint(TRUNCATE) take exclusive
         // locks; concurrent requests (HLS auth, playstate) hard-fail once the
         // reader busy-timeout elapses. Skip while anything is playing — the
@@ -475,6 +527,15 @@ impl ScheduledTask for OptimizeDatabaseTask {
             tracing::info!("skipping database optimize/vacuum: playback is active");
             return Ok(());
         }
+        // A backup snapshot holds a read for its whole copy: the truncating
+        // checkpoint would wait on it through the busy timeout holding the
+        // one writer, and the vacuum would grow the WAL by the database's
+        // size. Skipped like the guards above. A snapshot asked for while
+        // this pass runs waits for it.
+        let Some(_turn) = self.db.try_maintenance_turn() else {
+            tracing::info!("skipping database optimization: a database snapshot is running");
+            return Ok(());
+        };
         tracing::info!("optimizing and vacuuming the database");
         for (statement, pct) in [
             ("PRAGMA optimize", 25.0),
@@ -672,7 +733,7 @@ mod tests {
             device_id: &str,
             device_name: &str,
             remote_endpoint: &str,
-            user: &UserEntity,
+            user: Option<&UserEntity>,
         ) -> Result<SessionInfoDto, ServiceError> {
             unreachable!("not used by maintenance tasks")
         }
@@ -1080,12 +1141,39 @@ mod tests {
         assert!(fresh.exists(), "in-flight transcode file should remain");
     }
 
+    /// The boot purge deletes every file whatever its age and keeps the
+    /// directories; a transcode directory carrying another directory's marker
+    /// is not ours, so nothing in it is touched.
+    #[test]
+    fn delete_encoded_media_cache_clears_only_its_own_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = FakeConfig::over(dir.path(), |_| {});
+        let paths = config.application_paths();
+        let transcodes = std::path::PathBuf::from(paths.transcode_path());
+        let fresh = touch(&transcodes, "abc/segment0.ts");
+        let playlist = touch(&transcodes, "abc.m3u8");
+
+        // The two files and the `.jellyfin-transcode` marker, as upstream.
+        assert_eq!(delete_encoded_media_cache(&*paths), 3);
+        assert!(!fresh.exists() && !playlist.exists());
+        assert!(transcodes.join("abc").is_dir(), "directories stay");
+
+        let kept = touch(&transcodes, "abc/segment1.ts");
+        let foreign = touch(&transcodes, "media/.jellyfin-data");
+        assert_eq!(delete_encoded_media_cache(&*paths), 0);
+        assert!(kept.exists() && foreign.exists());
+    }
+
     // -- Optimize database -------------------------------------------------
 
     #[tokio::test]
     async fn optimize_database_runs_pragmas_and_vacuum() {
         let db = test_db().await;
-        let task = OptimizeDatabaseTask::new(db, idle_sessions());
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db),
+        );
         assert_eq!(task.key(), "OptimizeDatabaseTask");
         assert_eq!(
             task.default_triggers()[0].interval_ticks,
@@ -1099,13 +1187,60 @@ mod tests {
     #[tokio::test]
     async fn optimize_database_skips_while_playback_is_active() {
         let db = test_db().await;
-        let task = OptimizeDatabaseTask::new(db, playing_sessions());
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            playing_sessions(),
+            crate::test_support::library_manager_over(db),
+        );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
         assert!(
             progress.current().abs() < f64::EPSILON,
             "guarded run must not have executed the vacuum steps"
         );
+    }
+
+    /// `OptimizeDatabaseTask.ExecuteAsync` returns at once while a library
+    /// scan runs (`IsScanRunning`): the vacuum and the truncating checkpoint
+    /// would hold the only writer the scan writes through. The skipped run
+    /// still succeeds, so the task records `Completed`.
+    #[tokio::test]
+    async fn optimize_database_skips_while_a_library_scan_runs() {
+        let db = test_db().await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_mid_scan(db).await,
+        );
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("skip is Ok");
+        assert!(
+            progress.current().abs() < f64::EPSILON,
+            "a run during a library scan must not have executed the vacuum steps"
+        );
+    }
+
+    /// While a backup snapshot holds the database's maintenance turn, the
+    /// optimize run is skipped: its truncating checkpoint would wait on the
+    /// snapshot's read through the busy timeout, holding the one writer.
+    #[tokio::test]
+    async fn optimize_database_skips_while_a_snapshot_runs() {
+        let db = test_db().await;
+        let task = OptimizeDatabaseTask::new(
+            db.clone(),
+            idle_sessions(),
+            crate::test_support::library_manager_over(db.clone()),
+        );
+        let snapshot = db.try_maintenance_turn().expect("free");
+        let progress = TaskProgress::default();
+        task.execute(&progress).await.expect("skip is Ok");
+        assert!(
+            progress.current().abs() < f64::EPSILON,
+            "a run during a snapshot must not have executed the vacuum steps"
+        );
+        drop(snapshot);
+        task.execute(&progress).await.expect("run");
+        assert!((progress.current() - 100.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

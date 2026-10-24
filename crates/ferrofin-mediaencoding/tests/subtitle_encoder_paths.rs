@@ -7,6 +7,8 @@
 //! All process/network I/O is captured by an in-memory `SubtitleIo` fake, so the
 //! real ffmpeg subprocess is never spawned — only the arg-building/decision code
 //! is exercised.
+// libse keeps times as `double`s, and `filter_events` must reproduce them exactly.
+#![allow(clippy::float_cmp)]
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,6 +31,12 @@ struct RecordingIo {
     files: Mutex<HashMap<String, Vec<u8>>>,
     extract_calls: Mutex<Vec<(String, Vec<String>)>>,
     cache_id_is_empty_none: bool,
+    /// When set, a path exists exactly when it is in `files` (the cache
+    /// freshness tests); otherwise the real filesystem answers, as before.
+    files_exist: bool,
+    /// The `(size, .NET ticks)` stamp of each source path; a path not here
+    /// does not exist as a source.
+    stamps: Mutex<HashMap<String, (u64, i64)>>,
 }
 
 impl RecordingIo {
@@ -105,6 +113,18 @@ impl SubtitleIo for RecordingIo {
             .unwrap()
             .insert(path.to_owned(), content.to_vec());
         Ok(())
+    }
+
+    fn file_exists(&self, path: &str) -> bool {
+        if self.files_exist {
+            self.files.lock().unwrap().contains_key(path)
+        } else {
+            std::path::Path::new(path).is_file()
+        }
+    }
+
+    fn file_stamp(&self, path: &str) -> Option<(u64, i64)> {
+        self.stamps.lock().unwrap().get(path).copied()
     }
 }
 
@@ -223,6 +243,55 @@ async fn readable_file_unsupported_external_text_converts_to_srt() {
     assert!(info.is_external);
 }
 
+// -- get_readable_file: external WebVTT is parsed, not converted ----------
+
+/// Jellyfin 12 (PR 16998) reads an external sidecar by its extension, and libse
+/// parses WebVTT: a `.vtt` (codec `webvtt`) is served as itself, never sent
+/// through the ffmpeg SRT conversion that drops its cue settings.
+#[tokio::test]
+async fn readable_file_external_vtt_is_parsed_not_converted() {
+    let stream = sub_stream(4, "webvtt", Some("/media/movie.en.vtt"), true);
+    let source = source_with("guid9", "/media/movie.mkv", vec![stream.clone()]);
+    let raw = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000 line:10%\nTop\n";
+    let io = RecordingIo::default();
+    io.files
+        .lock()
+        .unwrap()
+        .insert("/media/movie.en.vtt".to_owned(), raw.as_bytes().to_vec());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), io);
+
+    let info = encoder.get_readable_file(&source, &stream).await.unwrap();
+    assert_eq!(info.path, "/media/movie.en.vtt");
+    assert_eq!(info.format, "vtt");
+
+    // `Stream.vtt` returns the file unchanged, cue settings included.
+    let same = encoder
+        .get_subtitles(&source, &stream, "vtt", 0, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(String::from_utf8(same).unwrap(), raw);
+
+    // Another format is converted from the parsed cues, which keep their
+    // position as libse's `{\an8}` tag.
+    let srt = encoder
+        .get_subtitles(&source, &stream, "srt", 0, 0, false)
+        .await
+        .unwrap();
+    assert!(String::from_utf8(srt).unwrap().contains("{\\an8}Top"));
+
+    // Only a request for the source's own format is served verbatim: `webvtt` is
+    // converted (`TryGetWriter` takes it as a WebVTT alias), so the cue gets libse's
+    // settings for `{\an8}`.
+    let webvtt = encoder
+        .get_subtitles(&source, &stream, "webvtt", 0, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(webvtt).unwrap(),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000 line:20%\nTop"
+    );
+}
+
 // -- extract_all_extractable_subtitles: arg building -----------------------
 
 #[tokio::test]
@@ -266,6 +335,42 @@ async fn extract_all_records_ffmpeg_args() {
     assert_eq!(outputs.len(), 2);
     assert!(outputs.iter().any(|o| o.ends_with("/0.ass")));
     assert!(outputs.iter().any(|o| o.ends_with("/1.srt")));
+}
+
+/// `ExtractAllExtractableSubtitlesMKS`: an external `.mks` is its own ffmpeg
+/// input, each of its tracks mapped by its position inside that file, and a
+/// VobSub track re-muxed as Matroska (no `.idx`/`.sub` muxer). The embedded
+/// pass keeps reading the video file.
+#[tokio::test]
+async fn extract_all_extracts_external_mks_tracks_from_their_own_file() {
+    let ass = sub_stream(0, "ass", None, false);
+    let srt = sub_stream(2, "subrip", Some("/media/subs.mks"), true);
+    let vob = sub_stream(3, "dvdsub", Some("/media/subs.mks"), true);
+    let source = source_with("guid9", "/media/movie.mkv", vec![ass, srt, vob]);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 2, "the video file, then the .mks: {calls:?}");
+    let (embedded, outputs) = &calls[0];
+    assert!(
+        embedded.starts_with("-y -i file:\"/media/movie.mkv\""),
+        "{embedded}"
+    );
+    assert_eq!(outputs, &["/cache/guid9/0.ass"]);
+    let (mks, outputs) = &calls[1];
+    assert!(mks.starts_with("-y -i file:\"/media/subs.mks\""), "{mks}");
+    assert!(
+        mks.contains("-map 0:0 -an -vn -c:s copy -flush_packets 1"),
+        "{mks}"
+    );
+    assert!(
+        mks.contains("-map 0:1 -an -vn -c:s copy -f matroska -flush_packets 1"),
+        "{mks}"
+    );
+    assert_eq!(outputs, &["/cache/guid9/2.srt", "/cache/guid9/3.mks"]);
 }
 
 /// File names come from the library. One built to close the quote must reach
@@ -365,6 +470,12 @@ impl SubtitleIo for ArcIo {
     fn write_file(&self, path: &str, content: &[u8]) -> Result<(), String> {
         self.0.write_file(path, content)
     }
+    fn file_exists(&self, path: &str) -> bool {
+        self.0.file_exists(path)
+    }
+    fn file_stamp(&self, path: &str) -> Option<(u64, i64)> {
+        self.0.file_stamp(path)
+    }
 }
 
 // -- convert_subtitles: writer selection + windowing -----------------------
@@ -430,7 +541,7 @@ async fn convert_subtitles_windows_and_rebases_timestamps() {
 
 // -- filter_events directly ------------------------------------------------
 
-fn cue(text: &str, start_ms: i64, end_ms: i64) -> Paragraph {
+fn cue(text: &str, start_ms: f64, end_ms: f64) -> Paragraph {
     Paragraph::new(
         text.to_owned(),
         TimeCode::from_milliseconds(start_ms),
@@ -442,11 +553,12 @@ fn cue(text: &str, start_ms: i64, end_ms: i64) -> Paragraph {
 fn filter_events_drops_fully_elapsed_and_after_end() {
     let mut s = Subtitle {
         paragraphs: vec![
-            cue("before", 0, 500),   // fully before start=1000 -> dropped
-            cue("spans", 800, 1500), // ends after start -> kept
-            cue("mid", 2000, 3000),  // kept
-            cue("late", 9000, 9500), // starts after end=5000 -> dropped
+            cue("before", 0.0, 500.0),   // fully before start=1000 -> dropped
+            cue("spans", 800.0, 1500.0), // ends after start -> kept
+            cue("mid", 2000.0, 3000.0),  // kept
+            cue("late", 9000.0, 9500.0), // starts after end=5000 -> dropped
         ],
+        ..Subtitle::default()
     };
     let start_ticks = 1_000 * 10_000;
     let end_ticks = 5_000 * 10_000;
@@ -454,19 +566,45 @@ fn filter_events_drops_fully_elapsed_and_after_end() {
     let texts: Vec<_> = s.paragraphs.iter().map(|p| p.text.as_str()).collect();
     assert_eq!(texts, vec!["spans", "mid"]);
     // preserve_timestamps=true -> timestamps unchanged.
-    assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 800);
+    assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 800.0);
 }
 
 #[test]
 fn filter_events_rebase_clamps_to_zero() {
     let mut s = Subtitle {
-        paragraphs: vec![cue("spans", 800, 1500)],
+        paragraphs: vec![cue("spans", 800.0, 1500.0)],
+        ..Subtitle::default()
     };
     let start_ticks = 1_000 * 10_000;
     filter_events(&mut s, start_ticks, 0, false);
     // start 800ms - 1000ms clamps to 0; end 1500-1000 = 500ms.
-    assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 0);
-    assert_eq!(s.paragraphs[0].end_time.total_milliseconds(), 500);
+    assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 0.0);
+    assert_eq!(s.paragraphs[0].end_time.total_milliseconds(), 500.0);
+}
+
+#[test]
+fn filter_events_wraps_an_extreme_offset_as_unchecked_csharp_arithmetic_does() {
+    // The offset comes from the request (`routeStartPositionTicks`). C#'s `long`
+    // arithmetic wraps: `ticks - long.MinValue` goes negative, so every cue elapsed.
+    let mut s = Subtitle {
+        paragraphs: vec![cue("cue", 1000.0, 2000.0)],
+        ..Subtitle::default()
+    };
+    filter_events(&mut s, i64::MIN, 0, false);
+    assert!(s.paragraphs.is_empty());
+}
+
+#[test]
+fn filter_events_rebase_keeps_the_sub_millisecond_part_of_the_offset() {
+    // `new TimeCode(TimeSpan.FromTicks(...))`: a 1.2345 ms offset leaves 998.7655 ms,
+    // which the JSON writer reads back as 9 987 655 ticks.
+    let mut s = Subtitle {
+        paragraphs: vec![cue("cue", 1000.0, 2000.0)],
+        ..Subtitle::default()
+    };
+    filter_events(&mut s, 12_345, 0, false);
+    assert_eq!(s.paragraphs[0].start_time.total_milliseconds(), 998.7655);
+    assert_eq!(s.paragraphs[0].start_time.ticks(), 9_987_655);
 }
 
 // -- extract_all_extractable_subtitles: failure handling --------------------
@@ -748,4 +886,224 @@ async fn extract_all_no_fixup_when_no_arial_reference() {
     // No rewrite should have occurred — original content preserved.
     assert!(text.contains("Noto Sans"));
     assert!(!text.contains("Arial Unicode MS"));
+}
+
+// -- cache freshness: `IsCachedSubtitleFresh` / `WriteCacheMeta` (v12.2) ---
+
+/// A recorder whose files exist only in memory, with `source` stamped.
+fn stamped(source: &str, stamp: (u64, i64)) -> std::sync::Arc<RecordingIo> {
+    let recorder = std::sync::Arc::new(RecordingIo {
+        files_exist: true,
+        ..RecordingIo::default()
+    });
+    recorder
+        .stamps
+        .lock()
+        .unwrap()
+        .insert(source.to_owned(), stamp);
+    recorder
+}
+
+fn meta(recorder: &RecordingIo, cache: &str) -> Option<String> {
+    recorder
+        .files
+        .lock()
+        .unwrap()
+        .get(&format!("{cache}.meta"))
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// An embedded extraction records the media file's `{size}:{ticks}` beside
+/// the cache, is reused while the file is unchanged, and is redone once the
+/// file is replaced in place (same path, so same item and stream indexes).
+#[tokio::test]
+async fn an_embedded_extraction_is_redone_when_the_media_file_changes() {
+    let recorder = stamped("/media/movie.mkv", (1000, 638_000_000_000_000_000));
+    let source = source_with(
+        "guid10",
+        "/media/movie.mkv",
+        vec![sub_stream(0, "ass", None, false)],
+    );
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+    assert_eq!(recorder.calls().len(), 1);
+    assert_eq!(
+        meta(&recorder, "/cache/guid10/0.ass").as_deref(),
+        Some("1000:638000000000000000")
+    );
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+    assert_eq!(
+        recorder.calls().len(),
+        1,
+        "unchanged media file: the cache is fresh"
+    );
+
+    recorder.stamps.lock().unwrap().insert(
+        "/media/movie.mkv".to_owned(),
+        (2000, 638_000_000_100_000_000),
+    );
+    encoder.extract_all_extractable_subtitles(&source).await;
+    assert_eq!(
+        recorder.calls().len(),
+        2,
+        "replaced media file: extracted again"
+    );
+    assert_eq!(
+        meta(&recorder, "/cache/guid10/0.ass").as_deref(),
+        Some("2000:638000000100000000")
+    );
+}
+
+/// A cache from before the sidecar existed is rebuilt once, then reused.
+#[tokio::test]
+async fn a_cache_without_a_sidecar_is_rebuilt_once() {
+    let recorder = stamped("/media/movie.mkv", (1000, 638_000_000_000_000_000));
+    recorder
+        .files
+        .lock()
+        .unwrap()
+        .insert("/cache/guid11/0.ass".to_owned(), b"old".to_vec());
+    let source = source_with(
+        "guid11",
+        "/media/movie.mkv",
+        vec![sub_stream(0, "ass", None, false)],
+    );
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+    encoder.extract_all_extractable_subtitles(&source).await;
+    assert_eq!(recorder.calls().len(), 1);
+}
+
+/// A cache whose source is gone (or unreachable) is kept.
+#[tokio::test]
+async fn a_cache_whose_source_is_missing_is_kept() {
+    let recorder = std::sync::Arc::new(RecordingIo {
+        files_exist: true,
+        ..RecordingIo::default()
+    });
+    recorder
+        .files
+        .lock()
+        .unwrap()
+        .insert("/cache/guid12/0.ass".to_owned(), b"kept".to_vec());
+    let source = source_with(
+        "guid12",
+        "/media/gone.mkv",
+        vec![sub_stream(0, "ass", None, false)],
+    );
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+    assert!(recorder.calls().is_empty());
+}
+
+/// `ConvertTextSubtitleToSrt`: a sidecar the parser cannot read is converted
+/// once per revision, not on every request.
+#[tokio::test]
+async fn a_text_conversion_is_reused_until_its_sidecar_changes() {
+    let recorder = stamped("/media/movie.sub", (12, 638_000_000_000_000_000));
+    recorder
+        .files
+        .lock()
+        .unwrap()
+        .insert("/media/movie.sub".to_owned(), b"{1}{50}Hello".to_vec());
+    let stream = sub_stream(3, "microdvd", Some("/media/movie.sub"), true);
+    let source = source_with("guid13", "/media/movie.mkv", vec![stream.clone()]);
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    for _ in 0..2 {
+        let info = encoder.get_readable_file(&source, &stream).await.unwrap();
+        assert_eq!(info.path, "/cache/guid13/3.srt");
+    }
+    assert_eq!(recorder.calls().len(), 1, "converted once");
+    assert_eq!(
+        meta(&recorder, "/cache/guid13/3.srt").as_deref(),
+        Some("12:638000000000000000")
+    );
+
+    recorder
+        .stamps
+        .lock()
+        .unwrap()
+        .insert("/media/movie.sub".to_owned(), (20, 638_000_000_000_000_001));
+    encoder.get_readable_file(&source, &stream).await.unwrap();
+    assert_eq!(recorder.calls().len(), 2, "edited sidecar: converted again");
+}
+
+/// The default seam stamps a file with `FileInfo.LastWriteTimeUtc.Ticks`:
+/// 100 ns intervals since 0001-01-01 UTC, so a Jellyfin 12 sidecar matches.
+#[test]
+fn the_file_stamp_is_the_size_and_dotnet_ticks_of_the_last_write() {
+    use ferrofin_mediaencoding::subtitles::encoder::NoopSubtitleIo;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("movie.srt");
+    std::fs::write(&path, b"12345").unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123_456_789))
+        .unwrap();
+    drop(file);
+    assert_eq!(
+        NoopSubtitleIo.file_stamp(&path.to_string_lossy()),
+        Some((5, 638_355_968_001_234_567))
+    );
+    assert_eq!(NoopSubtitleIo.file_stamp("/no/such/file"), None);
+}
+
+// -- ffmpeg stream index: `GetSubtitleStreamIndexForFfmpeg` (v12.2) -------
+
+/// An embedded track is mapped by its position among the video file's own
+/// streams (`EncodingHelper.FindIndex`), so a subtitle sidecar listed first
+/// does not shift it past the end of the file.
+#[tokio::test]
+async fn an_embedded_track_is_mapped_past_a_subtitle_sidecar() {
+    let sidecar = sub_stream(0, "subrip", Some("/media/movie.en.srt"), true);
+    let video = MediaStream {
+        index: 1,
+        codec: Some("h264".to_owned()),
+        stream_type: MediaStreamType::Video,
+        ..MediaStream::default()
+    };
+    let embedded = sub_stream(2, "subrip", None, false);
+    let source = source_with("guid14", "/media/movie.mkv", vec![sidecar, video, embedded]);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].0.contains("-map 0:1 -an -vn"), "{}", calls[0].0);
+    assert_eq!(calls[0].1, ["/cache/guid14/2.srt"]);
+}
+
+/// On a Blu-ray source, the TrueHD and Atmos audio streams before the track,
+/// which ffprobe hides but ffmpeg counts, shift its index.
+#[tokio::test]
+async fn a_blu_ray_track_counts_the_hidden_truehd_streams_before_it() {
+    let video = MediaStream {
+        index: 0,
+        codec: Some("h264".to_owned()),
+        stream_type: MediaStreamType::Video,
+        ..MediaStream::default()
+    };
+    let truehd = MediaStream {
+        index: 1,
+        codec: Some("truehd".to_owned()),
+        stream_type: MediaStreamType::Audio,
+        ..MediaStream::default()
+    };
+    let subtitle = sub_stream(2, "subrip", None, false);
+    let mut source = source_with("guid15", "/media/disc", vec![video, truehd, subtitle]);
+    source.video_type = Some(ferrofin_model::entities::VideoType::BluRay);
+    let recorder = std::sync::Arc::new(RecordingIo::default());
+    let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
+
+    encoder.extract_all_extractable_subtitles(&source).await;
+
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].0.contains("-map 0:3 -an -vn"), "{}", calls[0].0);
 }

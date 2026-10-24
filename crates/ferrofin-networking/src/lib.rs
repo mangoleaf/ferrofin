@@ -36,6 +36,6 @@ pub mod remote_access_policy_result;
 
 pub use error::NetworkingError;
 pub use logger::{Logger, NullLogger};
-pub use manager::{NetworkManager, StartupConfig};
+pub use manager::{HostLookup, NetworkManager, StartupConfig, published_urls_missing_base_url};
 pub use network_configuration::{NetworkConfiguration, normalize_base_url};
 pub use remote_access_policy_result::RemoteAccessPolicyResult;

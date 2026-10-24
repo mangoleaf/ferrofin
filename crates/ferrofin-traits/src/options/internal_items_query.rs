@@ -283,7 +283,9 @@ pub struct InternalItemsQuery {
     /// When set, a non-recursive `parent_id` browse matches only PHYSICAL children
     /// (`bi.ParentId = parent_id`) and does NOT merge the parent's `LinkedChildren`
     /// members. Used by delete-cascade so removing a box-set/playlist never deletes
-    /// the referenced items (linked children are references, not owned children).
+    /// the referenced items (linked children are references, not owned children),
+    /// and by the `/Items/Filters2` facets, whose `Parent` upstream matches as a
+    /// strict `ParentId` equality (`TranslateQuery.cs:320-322`).
     pub physical_children_only: bool,
     /// The physical folders [`Self::parent_id`] stands for, when it names a
     /// Jellyfin `CollectionFolder`.
@@ -395,7 +397,9 @@ pub struct InternalItemsQuery {
     pub force_direct: bool,
     /// Provider ids to exclude (name → value).
     pub exclude_provider_ids: Option<HashMap<String, String>>,
-    /// Whether results are grouped by metadata key.
+    /// Whether the caller de-duplicates the rows by metadata key itself: the
+    /// list queries then read 4 rows past `limit` for it to drop
+    /// (`BaseItemRepository.PrepareFilterQuery`).
     pub enable_group_by_metadata_key: bool,
     /// Restrict to items with chapter images.
     pub has_chapter_images: Option<bool>,
@@ -707,7 +711,6 @@ impl InternalItemsQuery {
             || self.has_imdb_id.is_some()
             || self.has_tmdb_id.is_some()
             || self.has_tvdb_id.is_some()
-            || !self.any_provider_id_equals.is_empty()
             || self.has_overview.is_some()
             || self.has_official_rating.is_some()
             || self.has_parental_rating.is_some()
@@ -910,6 +913,14 @@ mod tests {
             ..Default::default()
         };
         assert!(!q3.has_filters());
+
+        // Nor is a provider-id lookup: C# `HasFilters` leaves out
+        // `HasAnyProviderId`.
+        let q4 = InternalItemsQuery {
+            any_provider_id_equals: vec![("Tmdb".into(), "603".into())],
+            ..Default::default()
+        };
+        assert!(!q4.has_filters());
     }
 
     #[test]

@@ -381,6 +381,22 @@ pub fn application_paths(config: &Config) -> ferrofin_core::FerrofinServerApplic
     )
 }
 
+/// Port of `ServerApplicationPaths.MakeSanityCheckOrThrow`, which
+/// `Program.StartApp` runs before anything else touches the paths (Ferrofin runs
+/// it once logging has started): every
+/// server directory exists and carries its `.jellyfin-<kind>` marker.
+///
+/// # Errors
+///
+/// Returns the first directory that cannot be created or marked, or the
+/// conflict when a directory carries another kind's marker (two server paths
+/// point at one directory).
+pub fn check_application_paths(config: &Config) -> anyhow::Result<()> {
+    application_paths(config)
+        .make_sanity_check()
+        .context("the server's directories failed their startup check")
+}
+
 /// Opens the SQLite database at `{data_dir}/ferrofin.db` and applies migrations.
 ///
 /// Creates the data directory (and the DB file) if missing, then runs all
@@ -564,6 +580,7 @@ pub async fn discover_ffmpeg(
         filter_options,
         bsf_options,
         low_priority_hwaccel_flag,
+        prober_first_video_frame,
         os_version,
     ) = Box::pin(probe_round(&ffmpeg, &ffprobe)).await;
     let ffmpeg_version = ffmpeg_version
@@ -589,6 +606,7 @@ pub async fn discover_ffmpeg(
         // VideoToolbox decode branches read it.
         .arm64(std::env::consts::ARCH == "aarch64")
         .low_priority_hwaccel_flag(low_priority_hwaccel_flag)
+        .prober_first_video_frame(prober_first_video_frame)
         .validated(true);
     if let Some(version) = ffmpeg_version {
         builder = builder.ffmpeg_version(version);
@@ -729,6 +747,7 @@ async fn probe_round(
     [bool; FilterOption::ALL.len()],
     [bool; BsfOption::ALL.len()],
     bool,
+    bool,
     Option<FfmpegVersion>,
 ) {
     tokio::join!(
@@ -742,6 +761,7 @@ async fn probe_round(
         probe_filter_options(ffmpeg),
         probe_bsf_options(ffmpeg),
         probe_hwaccel_flag(ffmpeg, "low_priority"),
+        probe_prober_option(ffprobe, "only_first_vframe"),
         read_os_version(),
     )
 }
@@ -840,6 +860,34 @@ async fn probe_help_pages(
         }
     }
     pages
+}
+
+/// Whether `ffprobe` accepts `-<option>`, decided by its exit status on a 1x1
+/// one-second null source. Port of `EncoderValidator.CheckSupportedProberOption`
+/// (`-loglevel quiet -f lavfi -i nullsrc=s=1x1:d=1 -{option}`).
+async fn probe_prober_option(ffprobe: &Path, option: &str) -> bool {
+    let status = tokio::process::Command::new(ffprobe)
+        .args([
+            "-loglevel",
+            "quiet",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=1x1:d=1",
+            &format!("-{option}"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    match status {
+        Ok(status) => status.success(),
+        Err(e) => {
+            tracing::debug!(error = %e, option, "error probing ffprobe option");
+            false
+        }
+    }
 }
 
 /// Whether ffmpeg accepts `-hwaccel_flags +<flag>`, decided by exit status on a
@@ -1119,6 +1167,69 @@ async fn validate_binary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_logs::CapturedLogs;
+
+    /// Startup runs `MakeSanityCheckOrThrow` (`Program.StartApp`): every
+    /// server directory exists and carries its `.jellyfin-<kind>` marker, and
+    /// the cache its `CACHEDIR.TAG`.
+    #[test]
+    fn the_startup_check_creates_and_marks_the_server_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        check_application_paths(&Config::test_stub(tmp.path())).expect("checked");
+
+        // `test_stub`'s data directory is `data/`, beside `config/` and `cache/`.
+        for (dir, marker) in [
+            ("config", "config"),
+            ("data/log", "log"),
+            ("data/plugins", "plugin"),
+            ("data", "data"),
+            ("cache", "cache"),
+            ("data/data", "data"),
+            ("data/root", "root"),
+        ] {
+            let path = tmp.path().join(dir).join(format!(".jellyfin-{marker}"));
+            assert!(path.is_file(), "missing {}", path.display());
+        }
+        assert!(tmp.path().join("cache/CACHEDIR.TAG").is_file());
+    }
+
+    /// A server directory carrying another kind's marker means two server
+    /// paths point at one directory: startup refuses it, as upstream's
+    /// `CheckOrCreateMarker` throws.
+    #[test]
+    fn the_startup_check_refuses_a_directory_marked_for_another_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("data/root")).unwrap();
+        std::fs::write(tmp.path().join("data/root/.jellyfin-config"), "").unwrap();
+
+        let error = check_application_paths(&Config::test_stub(tmp.path()))
+            .expect_err("startup refuses the directory");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Expected to find only .jellyfin-root but found marker for")
+                && message.contains(".jellyfin-config"),
+            "{message}"
+        );
+    }
+
+    /// The likeliest clash: the cache directory set to the data directory.
+    #[test]
+    fn the_startup_check_refuses_a_cache_in_the_data_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::test_stub(tmp.path());
+        config.cache_dir = config.data_dir.clone();
+
+        let error = check_application_paths(&config).expect_err("startup refuses the layout");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Expected to find only .jellyfin-cache but found marker for")
+                && message.contains(".jellyfin-data"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn derive_ffprobe_replaces_basename_in_dir() {
@@ -1338,25 +1449,6 @@ mod tests {
         );
     }
 
-    /// An in-memory `MakeWriter` capturing fmt-layer output for assertions.
-    #[derive(Clone, Default)]
-    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for BufWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[test]
     fn json_stdout_line_carries_trace_id_for_in_span_events() {
         // The headline correlation requirement: with the OTel layer active and the
@@ -1368,7 +1460,7 @@ mod tests {
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let buf = BufWriter::default();
+        let buf = CapturedLogs::default();
         let provider = SdkTracerProvider::builder()
             .with_sampler(Sampler::AlwaysOn)
             .with_simple_exporter(InMemorySpanExporter::default())
@@ -1388,7 +1480,7 @@ mod tests {
             tracing::info!("inside the request");
         });
 
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = buf.text();
         let line = out
             .lines()
             .find(|l| l.contains("inside the request"))
@@ -1516,7 +1608,7 @@ mod tests {
         // sink). catch_unwind still fires the hook on this thread, where the scoped
         // subscriber captures it.
         use tracing_subscriber::layer::SubscriberExt as _;
-        let buf = BufWriter::default();
+        let buf = CapturedLogs::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -1526,7 +1618,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let _ = std::panic::catch_unwind(|| panic!("kaboom"));
         });
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = buf.text();
         assert!(
             out.contains("panicked"),
             "hook emitted the error line: {out}"
@@ -1658,6 +1750,9 @@ mod tests {
         // a mistyped flag, or a probe that stopped running (and so fell through
         // to the version banner's exit 0) all report true and fail this.
         assert!(!caps.low_priority_hwaccel_flag());
+        // `CheckSupportedProberOption("only_first_vframe")`, by exit status too:
+        // the fake accepts it, so an unwired or inverted probe reads false.
+        assert!(caps.prober_supports_first_video_frame());
         // Populated from the host rather than left at the "nothing probed"
         // default; on Linux the OS version is read too.
         assert_eq!(caps.platform(), Platform::current());

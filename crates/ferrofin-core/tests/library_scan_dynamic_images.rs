@@ -306,6 +306,12 @@ async fn an_uploaded_genre_primary_survives_rescans(#[case] adopted: bool) {
 const RED: [u8; 3] = [180, 30, 30];
 const BLUE: [u8; 3] = [30, 30, 180];
 
+/// `colour` under the black rectangle at alpha `0x78` a library tile (a thumb
+/// collage) draws over its backdrop, as `StripCollageBuilder` does.
+fn dimmed(colour: [u8; 3]) -> [u8; 3] {
+    colour.map(|c| u8::try_from((u16::from(c) * (255 - 0x78) + 127) / 255).unwrap_or(u8::MAX))
+}
+
 /// A solid `colour` photo at `{dir}/a.png`.
 fn write_photo(dir: &Path, colour: [u8; 3]) {
     image::RgbImage::from_pixel(40, 60, image::Rgb(colour))
@@ -334,7 +340,7 @@ impl PhotoLibrary {
         db.run_migrations().await.expect("migrate");
         let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
-            FerrofinVirtualFolderManager::new(tmp.path().join("views"))
+            FerrofinVirtualFolderManager::new(tmp.path().join("root").join("default"))
                 .with_item_store(persistence.clone()),
         );
         vf.add_virtual_folder(
@@ -496,21 +502,51 @@ async fn an_uploaded_photo_album_primary_survives_a_default_rescan() {
 
 const MUSIC_GENRE: &str = "MediaBrowser.Controller.Entities.Audio.MusicGenre";
 const PLAYLIST: &str = "MediaBrowser.Controller.Playlists.Playlist";
+const PERSON: &str = "MediaBrowser.Controller.Entities.Person";
+const STUDIO: &str = "MediaBrowser.Controller.Entities.Studio";
+const YEAR: &str = "MediaBrowser.Controller.Entities.Year";
+const MUSIC_ARTIST: &str = "MediaBrowser.Controller.Entities.Audio.MusicArtist";
+const BOX_SET: &str = "MediaBrowser.Controller.Entities.Movies.BoxSet";
+const COLLECTION_FOLDER: &str = "MediaBrowser.Controller.Entities.CollectionFolder";
 
-/// gl-590: a music genre's and a playlist folder's upload is saved beside the
-/// item's own path whatever the library says, as `IsSaveLocalMetadataEnabled`
-/// is overridden to true for both (`MusicGenre.cs:63`, `Playlist.cs:126`) —
-/// while that path is in the server's own directories. A playlist file inside
-/// a media library whose "Save artwork into media folders" is off keeps its
-/// upload in the internal metadata folder: nothing is written into the media.
+/// gl-590, gl-598: an upload is saved beside the item's own path whatever the
+/// library says for the kinds whose `IsSaveLocalMetadataEnabled` is
+/// overridden to true — a music genre and a playlist (`MusicGenre.cs:63`,
+/// `Playlist.cs:126`), a person, a studio, a year and a by-name artist (each
+/// also `ContainingFolderPath => Path`), a box set and a library
+/// (`CollectionFolder.cs:196`) — while that path is in the server's own
+/// directories: data, metadata, and the libraries' root folder. A playlist
+/// file or a box-set folder inside a media library whose "Save artwork into
+/// media folders" is off keeps its upload in the internal metadata folder:
+/// nothing is written into the media.
 #[rstest::rstest]
-#[case::music_genre(MUSIC_GENRE, "metadata/MusicGenre/Mix", false, Some("folder.png"))]
-#[case::playlist(PLAYLIST, "data/playlists/Mix", false, Some("folder.png"))]
-#[case::playlist_file_in_a_library(PLAYLIST, "photos/Mix.m3u", true, None)]
+#[case::music_genre(
+    MUSIC_GENRE,
+    "metadata/MusicGenre/Mix",
+    false,
+    false,
+    Some("folder.png")
+)]
+#[case::playlist(PLAYLIST, "data/playlists/Mix", true, false, Some("folder.png"))]
+#[case::playlist_file_in_a_library(PLAYLIST, "photos/Mix.m3u", true, true, None)]
+#[case::person(PERSON, "metadata/People/M/Mix", false, false, Some("folder.png"))]
+#[case::studio(STUDIO, "metadata/Studio/Mix", false, false, Some("folder.png"))]
+#[case::year(YEAR, "metadata/Year/2020", false, false, Some("folder.png"))]
+#[case::by_name_artist(MUSIC_ARTIST, "metadata/artists/Mix", false, false, Some("folder.png"))]
+#[case::box_set(
+    BOX_SET,
+    "data/collections/Mix [boxset]",
+    true,
+    false,
+    Some("folder.png")
+)]
+#[case::box_set_in_a_library(BOX_SET, "photos/Mix [boxset]", true, false, None)]
+#[case::library(COLLECTION_FOLDER, "root/default/Mix", true, false, Some("folder.png"))]
 #[tokio::test(flavor = "multi_thread")]
-async fn uploads_to_music_genres_and_playlists_save_beside_their_path(
+async fn uploads_save_beside_their_path_for_the_overriding_kinds(
     #[case] type_: &str,
     #[case] path: &str,
+    #[case] is_folder: bool,
     #[case] is_file: bool,
     #[case] beside: Option<&str>,
 ) {
@@ -523,7 +559,7 @@ async fn uploads_to_music_genres_and_playlists_save_beside_their_path(
             type_: type_.to_owned(),
             name: Some("Mix".to_owned()),
             path: Some(path.to_string_lossy().into_owned()),
-            is_folder: type_ == PLAYLIST,
+            is_folder,
             is_in_mixed_folder: is_file,
             ..BaseItemEntity::default()
         }])
@@ -557,6 +593,47 @@ async fn uploads_to_music_genres_and_playlists_save_beside_their_path(
     );
 }
 
+/// A library tile is recorded as any saved image is: its size and blurhash
+/// read from the file (`LibraryManager.UpdateImagesAsync`), and the file's own
+/// modification time, so `/UserViews` carries `ImageBlurHashes.Primary`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_tile_is_recorded_with_its_blurhash_and_file_time() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let id = uuid::Uuid::parse_str(&lib.row(BaseItemKind::CollectionFolder, "Photos").await.id)
+        .expect("id");
+    let images = lib.items.get_image_infos(id).await.expect("images");
+    let tile = images
+        .iter()
+        .find(|i| i.image_type == ImageType::Primary)
+        .expect("a drawn tile");
+    let (width, height) = image::image_dimensions(&tile.path).expect("decodable");
+    assert_eq!(
+        (tile.width, tile.height),
+        (
+            i32::try_from(width).expect("width"),
+            i32::try_from(height).expect("height")
+        )
+    );
+    assert!(
+        tile.blur_hash.as_deref().is_some_and(|h| !h.is_empty()),
+        "the tile has a blurhash: {tile:?}"
+    );
+    let modified = std::fs::metadata(&tile.path)
+        .and_then(|m| m.modified())
+        .map(chrono::DateTime::<chrono::Utc>::from)
+        .expect("mtime");
+    assert_eq!(
+        db_ticks(tile.date_modified),
+        db_ticks(modified),
+        "the row's date is the file's"
+    );
+}
+
+/// A date at the database's 100 ns precision.
+fn db_ticks(date: chrono::DateTime<chrono::Utc>) -> i64 {
+    date.timestamp_nanos_opt().expect("in range") / 100
+}
+
 /// gl-576: a library validation whose options run every provider redraws the
 /// albums it walked and the library tile past their date gates, where the
 /// default validation leaves both current images alone.
@@ -566,7 +643,7 @@ async fn a_full_refresh_validation_redraws_albums_and_the_library_tile() {
     assert_eq!(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
-        RED
+        dimmed(RED)
     );
     write_photo(&lib.album_dir, BLUE);
 
@@ -578,7 +655,7 @@ async fn a_full_refresh_validation_redraws_albums_and_the_library_tile() {
     assert_eq!(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
-        RED
+        dimmed(RED)
     );
 
     let full = MetadataRefreshOptions {
@@ -597,7 +674,7 @@ async fn a_full_refresh_validation_redraws_albums_and_the_library_tile() {
     assert_eq!(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
-        BLUE
+        dimmed(BLUE)
     );
 }
 
@@ -644,6 +721,378 @@ async fn a_library_refresh_redraws_its_tile_unless_locked(
         )
         .await
         .expect("refresh");
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        dimmed(want)
+    );
+}
+
+/// The row's Primary image row.
+async fn primary_of(
+    items: &Arc<dyn ItemRepository>,
+    id: uuid::Uuid,
+) -> ferrofin_traits::options::ItemImageInfo {
+    items
+        .get_image_infos(id)
+        .await
+        .expect("images")
+        .into_iter()
+        .find(|i| i.image_type == ImageType::Primary)
+        .expect("a Primary")
+}
+
+/// Replaces the row's Primary with one at `path`, dated `date_modified`.
+async fn set_primary_of(
+    items: &Arc<dyn ItemRepository>,
+    persistence: &FerrofinItemPersistenceService,
+    id: uuid::Uuid,
+    path: &str,
+    date_modified: chrono::DateTime<chrono::Utc>,
+) {
+    let mut images = items.get_image_infos(id).await.expect("images");
+    images.retain(|i| i.image_type != ImageType::Primary);
+    images.insert(
+        0,
+        ferrofin_traits::options::ItemImageInfo {
+            path: path.to_owned(),
+            image_type: ImageType::Primary,
+            date_modified,
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        },
+    );
+    persistence
+        .save_item_images(id, &images)
+        .await
+        .expect("save images");
+}
+
+/// Jellyfin's art folder for `id` under the test's data root
+/// (`GetInternalMetadataPath`): `{metadata}/library/{xx}/{id:N}`.
+fn jellyfin_art_dir(root: &Path, id: uuid::Uuid) -> std::path::PathBuf {
+    let simple = id.simple().to_string();
+    root.join("metadata")
+        .join("library")
+        .join(&simple[..2])
+        .join(&simple)
+}
+
+/// A movie library whose NFO declares the genre "Crime", scanned once: the
+/// genre's collage is drawn from the poster's colour.
+struct GenreLibrary {
+    tmp: tempfile::TempDir,
+    poster: std::path::PathBuf,
+    scanner: LibraryScanner,
+    items: Arc<dyn ItemRepository>,
+    persistence: Arc<FerrofinItemPersistenceService>,
+}
+
+impl GenreLibrary {
+    async fn scanned() -> Self {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let media = tmp.path().join("movies");
+        write_movie_library(&media);
+        let db = Database::connect_in_memory().await.expect("connect");
+        db.run_migrations().await.expect("migrate");
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("views"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .expect("add library");
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
+            ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache")),
+        );
+        let scanner = LibraryScanner::new(
+            vf,
+            Arc::new(ferrofin_core::file_system::FerrofinFileSystem::new()),
+            persistence.clone(),
+        )
+        .with_items(Arc::clone(&items))
+        .with_image_processor(processor)
+        .with_metadata_dir(tmp.path().join("metadata").join("library"));
+        scanner.scan_all().await.expect("scan");
+        Self {
+            poster: media.join("Heat (1995)").join("poster.png"),
+            tmp,
+            scanner,
+            items,
+            persistence,
+        }
+    }
+
+    async fn genre(&self) -> uuid::Uuid {
+        let row = self
+            .items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::Genre],
+                name: Some("Crime".to_owned()),
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("query")
+            .into_iter()
+            .next()
+            .expect("the genre");
+        uuid::Uuid::parse_str(&row.id).expect("id")
+    }
+
+    async fn primary_colour(&self, id: uuid::Uuid) -> [u8; 3] {
+        image::open(primary_of(&self.items, id).await.path)
+            .expect("decodable")
+            .to_rgb8()
+            .get_pixel(10, 10)
+            .0
+    }
+}
+
+/// gl-591: an image Jellyfin drew lives in its own sharded folder
+/// (`{metadata}/library/{xx}/{id:N}`, `GetInternalMetadataPath`); on an adopted
+/// database it is still the genre's own, so a full refresh redraws it as it
+/// would one Ferrofin drew (`FetchAsync`), from the poster's new colour.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_genre_image_jellyfin_drew_is_redrawn_as_its_own() {
+    let lib = GenreLibrary::scanned().await;
+    let genre = lib.genre().await;
+    let drawn = primary_of(&lib.items, genre).await;
+    let dir = jellyfin_art_dir(lib.tmp.path(), genre);
+    std::fs::create_dir_all(&dir).expect("jellyfin art dir");
+    let adopted = dir.join("primary.png");
+    std::fs::copy(&drawn.path, &adopted).expect("copy");
+    set_primary_of(
+        &lib.items,
+        &lib.persistence,
+        genre,
+        &adopted.to_string_lossy(),
+        drawn.date_modified,
+    )
+    .await;
+    image::RgbImage::from_pixel(40, 60, image::Rgb(BLUE))
+        .save(&lib.poster)
+        .expect("poster");
+
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    lib.scanner
+        .scan_with(None, &full)
+        .await
+        .expect("full rescan");
+
+    assert_eq!(lib.primary_colour(genre).await, BLUE);
+}
+
+/// gl-591: `ValidateImages` drops an image row whose file is gone (an adopted
+/// database moved to a new host without its metadata folder), so the genre
+/// has no Primary and the next scan draws one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_genre_whose_image_file_is_gone_is_drawn_again() {
+    let lib = GenreLibrary::scanned().await;
+    let genre = lib.genre().await;
+    let gone = jellyfin_art_dir(lib.tmp.path(), genre).join("primary.png");
+    set_primary_of(
+        &lib.items,
+        &lib.persistence,
+        genre,
+        &gone.to_string_lossy(),
+        chrono::Utc::now(),
+    )
+    .await;
+
+    lib.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(lib.primary_colour(genre).await, RED);
+}
+
+/// gl-591: the library tile is never drawn over a Primary that is not the
+/// library's own (`HasChanged` / `FetchAsync`), here a remote one, even when
+/// the tile file it would have drawn is missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_tile_is_never_drawn_over_a_remote_primary() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let library =
+        uuid::Uuid::parse_str(&lib.row(BaseItemKind::CollectionFolder, "Photos").await.id)
+            .expect("id");
+    let tile = primary_of(&lib.items, library).await;
+    std::fs::remove_file(&tile.path).expect("remove the drawn tile");
+    let remote = "https://images.example.test/photos.jpg";
+    set_primary_of(
+        &lib.items,
+        &lib.persistence,
+        library,
+        remote,
+        chrono::Utc::now(),
+    )
+    .await;
+
+    lib.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(primary_of(&lib.items, library).await.path, remote);
+}
+
+/// gl-591: a library tile Jellyfin drew into its own sharded folder is the
+/// library's own: a Default rescan leaves it while it is current, as it would
+/// one Ferrofin drew, and a forced one redraws it.
+#[rstest::rstest]
+#[case::default_keeps_a_current_tile(MetadataRefreshMode::Default, RED)]
+#[case::forced_redraws(MetadataRefreshMode::FullRefresh, BLUE)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_tile_jellyfin_drew_is_its_own(
+    #[case] mode: MetadataRefreshMode,
+    #[case] want: [u8; 3],
+) {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let library =
+        uuid::Uuid::parse_str(&lib.row(BaseItemKind::CollectionFolder, "Photos").await.id)
+            .expect("id");
+    let drawn = primary_of(&lib.items, library).await;
+    let dir = jellyfin_art_dir(lib.tmp.path(), library);
+    std::fs::create_dir_all(&dir).expect("jellyfin art dir");
+    let adopted = dir.join("folder.png");
+    std::fs::copy(&drawn.path, &adopted).expect("copy");
+    std::fs::remove_file(&drawn.path).expect("remove Ferrofin's copy");
+    set_primary_of(
+        &lib.items,
+        &lib.persistence,
+        library,
+        &adopted.to_string_lossy(),
+        drawn.date_modified,
+    )
+    .await;
+    write_photo(&lib.album_dir, BLUE);
+
+    let options = MetadataRefreshOptions {
+        metadata_refresh_mode: mode,
+        image_refresh_mode: mode,
+        ..MetadataRefreshOptions::default()
+    };
+    lib.scanner.scan_with(None, &options).await.expect("rescan");
+
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        dimmed(want)
+    );
+}
+
+/// gl-591: a library whose tile file is gone loses the row (`ValidateImages`)
+/// and is drawn again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_whose_tile_file_is_gone_is_drawn_again() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let library =
+        uuid::Uuid::parse_str(&lib.row(BaseItemKind::CollectionFolder, "Photos").await.id)
+            .expect("id");
+    let gone = jellyfin_art_dir(lib.tmp.path(), library).join("folder.png");
+    set_primary_of(
+        &lib.items,
+        &lib.persistence,
+        library,
+        &gone.to_string_lossy(),
+        chrono::Utc::now(),
+    )
+    .await;
+
+    lib.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        dimmed(RED)
+    );
+}
+
+/// gl-598: a library's uploaded image is saved in the library's own folder
+/// (`CollectionFolder.IsSaveLocalMetadataEnabled`), so it moves with a rename,
+/// and the renamed library reads it back from there (`LocalImageProvider` on
+/// its `ContainingFolderPath`, then `MergeImages`). It is not the library's
+/// own drawing, so even a forced refresh never draws the collage over it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_upload_survives_a_rename_and_a_forced_refresh() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let library =
+        uuid::Uuid::parse_str(&lib.row(BaseItemKind::CollectionFolder, "Photos").await.id)
+            .expect("id");
+    lib.uploader()
+        .await
+        .save_image(library, &png(BLUE), "image/png", ImageType::Primary, None)
+        .await
+        .expect("upload");
+    assert_eq!(
+        primary_of(&lib.items, library).await.path,
+        lib.tmp
+            .path()
+            .join("root/default/Photos/folder.png")
+            .to_string_lossy()
+    );
+
+    lib.vf
+        .rename_virtual_folder("Photos", "Pictures")
+        .await
+        .expect("rename");
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    lib.scanner.scan_with(None, &full).await.expect("rescan");
+
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Pictures")
+            .await,
+        BLUE
+    );
+}
+
+/// gl-598: an image already in a library's own folder (`root/default/<name>`,
+/// where Jellyfin keeps an adopted library's `folder.jpg`) becomes the
+/// library's image on the next pass — unless the library is locked, which runs
+/// no image provider and keeps the tile its first scan drew (a thumb collage,
+/// so under the collage's shadow).
+#[rstest::rstest]
+#[case::unlocked(false, BLUE)]
+#[case::locked(true, dimmed(RED))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_librarys_own_folder_image_is_read_unless_it_is_locked(
+    #[case] locked: bool,
+    #[case] want: [u8; 3],
+) {
+    let lib = PhotoLibrary::scanned(RED).await;
+    if locked {
+        let mut row = lib.row(BaseItemKind::CollectionFolder, "Photos").await;
+        row.is_locked = true;
+        lib.persistence
+            .save_items(std::slice::from_ref(&row))
+            .await
+            .expect("lock");
+    }
+    std::fs::write(
+        lib.tmp.path().join("root/default/Photos/folder.png"),
+        png(BLUE),
+    )
+    .expect("folder image");
+
+    lib.scanner.scan_all().await.expect("rescan");
+
     assert_eq!(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,

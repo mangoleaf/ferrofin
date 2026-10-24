@@ -6,7 +6,7 @@
 //! - The C# `Video` / `BaseItem` receivers become [`uuid::Uuid`] identity
 //!   arguments; callers supply the resolved `LibraryOptions` for refreshes.
 //! - Stored trickplay metadata is a persistence concern, so it surfaces as the
-//!   [`TrickplayInfoEntity`](ferrofin_db::entities::playback::TrickplayInfoEntity)
+//!   [`TrickplayInfoEntity`]
 //!   row (the C# `TrickplayInfo` EF entity). Maps keyed by width use `i32`
 //!   keys; the manifest keys by media-source id.
 //! - `IReadOnlyList`/`Dictionary` become `Vec`/`HashMap`.

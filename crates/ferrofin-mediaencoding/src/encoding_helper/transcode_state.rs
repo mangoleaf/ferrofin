@@ -38,6 +38,29 @@ pub trait EncoderCapabilities: Send + Sync {
     /// Returns whether `encoder` (an ffmpeg encoder name, e.g. `"aac_at"`) is
     /// available. Port of `IMediaEncoder.SupportsEncoder`.
     fn supports_encoder(&self, encoder: &str) -> bool;
+
+    /// The probed ffmpeg version, which gates version-dependent arguments.
+    /// Port of `IMediaEncoder.EncoderVersion`.
+    ///
+    /// `None` (the default) when unprobed. That passes no `>=` gate, as C#'s
+    /// null `Version` compares below every minimum.
+    fn ffmpeg_version(&self) -> Option<crate::encoder::FfmpegVersion> {
+        None
+    }
+
+    /// Whether the probed ffmpeg is at least `min`: the shape every
+    /// `_minFFmpeg*` gate in C# takes. False when the version is unknown.
+    fn ffmpeg_at_least(&self, min: crate::encoder::FfmpegVersion) -> bool {
+        self.ffmpeg_version().is_some_and(|version| version >= min)
+    }
+
+    /// Whether the VAAPI device runs Intel's iHD driver, the one VAAPI driver
+    /// whose `-compression_level` upstream trusts. Port of
+    /// `IMediaEncoder.IsVaapiDeviceInteliHD`; `false` (the default) when
+    /// nothing was probed.
+    fn is_vaapi_device_intel_ihd(&self) -> bool {
+        false
+    }
 }
 
 /// [`EncoderCapabilities`] that reports no optional encoders available.
@@ -68,6 +91,10 @@ pub struct BaseEncodingJobOptions {
     pub allow_video_stream_copy: bool,
     /// Whether audio stream copy is allowed (`AllowAudioStreamCopy`).
     pub allow_audio_stream_copy: bool,
+    /// Whether the audio may be encoded VBR when the encoding options enable
+    /// it (`EnableAudioVbrEncoding`). The stream request sets it, true unless
+    /// the client says otherwise.
+    pub enable_audio_vbr_encoding: bool,
     /// The requested audio codec (`AudioCodec`).
     pub audio_codec: Option<String>,
     /// The requested audio sample rate (`AudioSampleRate`).
@@ -145,6 +172,9 @@ impl Default for BaseEncodingJobOptions {
             allow_video_stream_copy: true,
             allow_audio_stream_copy: true,
             context: EncodingContext::Streaming,
+            // Not a constructor initializer: the stream controllers' query
+            // default (`enableAudioVbrEncoding = true`) sets it per request.
+            enable_audio_vbr_encoding: false,
             audio_codec: None,
             audio_sample_rate: None,
             max_audio_bit_depth: None,
@@ -289,6 +319,11 @@ pub struct EncodingJobInfo {
     pub supported_video_codecs: Vec<String>,
     /// The audio codecs the target supports (`SupportedAudioCodecs`).
     pub supported_audio_codecs: Vec<String>,
+    /// The subtitle codecs an `Embed` delivery may write
+    /// (`SupportedSubtitleCodecs`): the request's `subtitleCodec`, split on
+    /// commas with empty entries dropped. The first names the embedded
+    /// track's codec ([`crate::encoding_helper::helper::subtitle_embed_arguments`]).
+    pub supported_subtitle_codecs: Vec<String>,
     /// The segment cut length, in seconds (`StreamState.SegmentLength`).
     ///
     /// Drives the segment cache filenames and the forward-gap heuristic. `0`
@@ -434,6 +469,17 @@ impl EncodingJobInfo {
         }
 
         force_if_interlaced
+    }
+
+    /// Whether the video filter chain deinterlaces: `doDeintH264 ||
+    /// doDeintHevc`, the source deinterlaced under either spelling of each
+    /// codec with an interlaced source forcing it. Port of
+    /// `EncodingHelper.IsDeinterlaceAvailable`.
+    #[must_use]
+    pub fn is_deinterlace_available(&self) -> bool {
+        ["h264", "avc", "h265", "hevc"]
+            .iter()
+            .any(|codec| self.deinterlace(Some(codec), true))
     }
 
     /// The client-requested video profiles for `codec`. Port of
@@ -636,6 +682,7 @@ mod derived_state_tests {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 3,
             wait_for_path: None,
             segment_container: None,

@@ -1,0 +1,20 @@
+[Script Info]
+; This is an Advanced Sub Station Alpha v4+ script.
+Title: untitled
+ScriptType: v4.00+
+PlayDepth: 0
+ScaledBorderAndShadow: Yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H0000FFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,1,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,{\i1}Italic line{\i0}\N{\b1}bold{\b0} and {\u1}under{\u0}
+Dialogue: 0,0:00:04.00,0:00:06.00,Default,,0,0,0,,{\c&H0000ff&}red hex{\c} {\c&H0000ff&}red name{\c}\N{\c&H0000ff&}Red name{\c} {\c&H00ff00&}eight
+Dialogue: 0,0:00:06.50,0:00:08.25,Default,,0,0,0,,{\an8}Top centred sign
+Dialogue: 0,0:00:09.00,0:00:10.00,Default,,0,0,0,,{\pos(100,200)}Positioned & "quoted" <odd> a<b
+Dialogue: 0,0:00:10.00,0:00:10.00,Default,,0,0,0,,Zero length
+Dialogue: 0,0:00:11.12,0:00:12.99,Default,,0,0,0,,First paragraph\N\Nsecond after a blank line
+Dialogue: 0,25:01:02.35,25:01:04.01,Default,,0,0,0,,{\fs20\fnArial}Face and size{\fn\fs} &amp; done

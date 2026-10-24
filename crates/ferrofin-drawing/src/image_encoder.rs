@@ -10,11 +10,11 @@
 //! file when options are default" short-circuit.
 //!
 //! Port rules applied:
-//! - The Skia-only input formats (`dng`, `astc`, `ktx`, raw camera formats, `svg`)
-//!   are dropped: this encoder advertises only the decodable subset the `image`
-//!   crate is compiled with (`jpeg`/`jpg`/`png`/`webp`), plus the container names
-//!   Skia lists that map onto those decoders. Requesting an unsupported input
-//!   returns the input path untouched (mirrors `EncodeImage`).
+//! - This encoder advertises the subset of Skia's input formats the `image`
+//!   crate is compiled to decode (`jpeg`/`jpg`/`png`/`webp`/`gif`/`bmp`/`ico`).
+//!   The rest of Skia's list (raw `dng`/`cr2`/`nef`/`arw`, `wbmp`,
+//!   `astc`/`ktx`/`pkm`, `svg`) has no decoder yet (gl-802). Requesting an
+//!   unsupported input returns the input path untouched (mirrors `EncodeImage`).
 //! - The C# `throw` sites (`FileNotFoundException`, `InvalidDataException`,
 //!   `ArgumentException`, `InvalidOperationException`) become
 //!   [`ServiceError`] variants: [`ServiceError::NotFound`] for a missing input,
@@ -22,13 +22,14 @@
 //!   [`ServiceError::Backend`] for an I/O/encode failure.
 //! - `GetImageSize` returns [`ImageDimensions::default`] (`0×0`) on a zero-byte or
 //!   undecodable file, exactly like the Skia `return default;` fallbacks.
-//! - `CreateSplashscreen` is a deferred feature returning [`ServiceError::Backend`].
-//!   `GetImageBlurHash` is implemented (decode → 128x128 downscale → BlurHash-encode);
+//! - `CreateSplashscreen` builds `{DataPath}/splashscreen.png` (see
+//!   [`crate::splashscreen`]). `GetImageBlurHash` is implemented (decode → 128x128 downscale → BlurHash-encode);
 //!   its output is valid but not byte-identical to Skia's (see the method doc).
 //! - The overlay work Skia does inside `EncodeImage` (background colour, blur,
-//!   foreground layer, unplayed/percent-played indicators) is **not** ported —
-//!   this encoder does resize + format-convert only, so `has_default_options`
-//!   already decides whether re-encoding is needed.
+//!   foreground layer: gl-805; unplayed/percent-played indicators: gl-806) is
+//!   **not** ported yet — this encoder does auto-orientation, resize and
+//!   format-convert only, so `has_default_options` and `auto_orient` already
+//!   decide whether re-encoding is needed.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -76,18 +77,25 @@ fn encode_permits() -> &'static Semaphore {
 /// delegated to the shared
 /// `ferrofin-model` `drawing_utils`, so it matches the C# `DrawingUtils` /
 /// `ImageHelper.GetNewImageSize` exactly.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ImageCrateEncoder;
+#[derive(Debug, Clone, Default)]
+pub struct ImageCrateEncoder {
+    /// The server's data directory, where [`ImageEncoder::create_splashscreen`]
+    /// writes `splashscreen.png` (upstream's `IApplicationPaths.DataPath`).
+    data_path: Option<std::path::PathBuf>,
+}
 
 impl ImageCrateEncoder {
-    /// The message on the [`ServiceError::Backend`] returned by the deferred
-    /// blurhash/splashscreen features.
-    const DEFERRED: &'static str = "ImageCrateEncoder: feature not implemented (deferred)";
-
     /// Constructs a new [`ImageCrateEncoder`].
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The encoder writing the generated splashscreen into `data_path`.
+    #[must_use]
+    pub fn with_data_path(mut self, data_path: impl Into<std::path::PathBuf>) -> Self {
+        self.data_path = Some(data_path.into());
+        self
     }
 
     /// The lowercase file extension of `path` without its leading dot, or an
@@ -112,7 +120,7 @@ impl ImageCrateEncoder {
     /// [`ServiceError`]. A missing file is [`ServiceError::NotFound`]; an
     /// undecodable one is [`ServiceError::InvalidInput`] (the port of Skia's
     /// `InvalidDataException`/`return null` fallbacks).
-    fn decode(path: &str) -> Result<DynamicImage, ServiceError> {
+    pub(crate) fn decode(path: &str) -> Result<DynamicImage, ServiceError> {
         if !Path::new(path).exists() {
             return Err(ServiceError::not_found(format!(
                 "image file not found: {path}"
@@ -125,6 +133,32 @@ impl ImageCrateEncoder {
         reader
             .decode()
             .map_err(|e| ServiceError::invalid_input(format!("decode {path}: {e}")))
+    }
+
+    /// `SkiaEncoder.GetBitmap(path, autoOrient: true, …)`: decodes `path` and
+    /// applies its own EXIF origin (`codec.EncodedOrigin` → `OrientImage`), so
+    /// the pixels stand as the photo was taken. A file whose orientation
+    /// cannot be read is taken as stored.
+    fn decode_oriented(path: &str) -> Result<DynamicImage, ServiceError> {
+        use image::ImageDecoder as _;
+        if !Path::new(path).exists() {
+            return Err(ServiceError::not_found(format!(
+                "image file not found: {path}"
+            )));
+        }
+        let mut decoder = ImageReader::open(path)
+            .map_err(|e| DrawingError::io(format!("open {path}"), e))?
+            .with_guessed_format()
+            .map_err(|e| DrawingError::io(format!("probe {path}"), e))?
+            .into_decoder()
+            .map_err(|e| ServiceError::invalid_input(format!("decode {path}: {e}")))?;
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+        let mut image = DynamicImage::from_decoder(decoder)
+            .map_err(|e| ServiceError::invalid_input(format!("decode {path}: {e}")))?;
+        image.apply_orientation(orientation);
+        Ok(image)
     }
 
     /// Maps an output [`ImageFormat`] onto the `image` crate's writer format.
@@ -140,8 +174,8 @@ impl ImageCrateEncoder {
 
     /// Chooses the writer format from an output *path* extension. Port of
     /// `StripCollageBuilder.GetEncodedFormat` (jpg/jpeg → JPEG, webp → WebP,
-    /// default → PNG); gif/bmp are not writable by this build, so they too fall
-    /// back to PNG.
+    /// default → PNG); gif/bmp fall back to PNG as upstream's do, although
+    /// this build could write them.
     fn format_for_path(path: &str) -> CrateFormat {
         match Self::input_format(path).as_str() {
             "jpg" | "jpeg" => CrateFormat::Jpeg,
@@ -151,10 +185,9 @@ impl ImageCrateEncoder {
     }
 
     /// Writes `image` to `output_path` in `format` at `quality` (0–100),
-    /// creating the parent directory first. JPEG honours `quality`; PNG/WebP are
-    /// lossless here, so `quality` is ignored (the `image` crate's default WebP
-    /// writer is lossless). Port of the `SKFileWStream`/`Encode(..., quality)`
-    /// tail of `EncodeImage`.
+    /// creating the parent directory first. JPEG and WebP (lossy, via libwebp)
+    /// honour `quality`; PNG is lossless, so it ignores `quality`. Port of the
+    /// `SKFileWStream`/`Encode(..., quality)` tail of `EncodeImage`.
     fn write(
         image: &DynamicImage,
         output_path: &str,
@@ -176,12 +209,27 @@ impl ImageCrateEncoder {
             // WebP encoder is lossless-only and ignores `quality`, which made
             // every poster several times larger than Jellyfin's — so this branch
             // routes around it.
+            //
+            // libwebp cannot write a side over 16383 px. Refused before the RGBA
+            // copy, and as invalid input like the JPEG limit: it is decided by the
+            // input alone and recurs on every request (nothing is cached).
+            if image.width() > WEBP_MAX_DIMENSION || image.height() > WEBP_MAX_DIMENSION {
+                return Err(ServiceError::InvalidInput(format!(
+                    "cannot write {output_path}: {}x{} exceeds WebP's \
+                     {WEBP_MAX_DIMENSION}x{WEBP_MAX_DIMENSION} limit",
+                    image.width(),
+                    image.height()
+                )));
+            }
             let rgba = image.to_rgba8();
             // Precision loss is irrelevant: quality is clamped to 0..=100.
             #[allow(clippy::cast_precision_loss)]
             let quality = quality.clamp(0, 100) as f32;
+            // `encode_simple`, not `encode`: the latter unwraps libwebp's error
+            // and panics on any other encode failure.
             let bytes = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
-                .encode(quality);
+                .encode_simple(false, quality)
+                .map_err(|code| DrawingError::webp_encode(format!("encode {output_path}"), code))?;
             std::fs::write(output_path, &*bytes)
                 .map_err(|e| DrawingError::io(format!("write {output_path}"), e).into())
         } else {
@@ -344,7 +392,11 @@ impl ImageCrateEncoder {
             return Ok(input_path.to_owned());
         }
 
-        let image = Self::decode(input_path)?;
+        let image = if auto_orient {
+            Self::decode_oriented(input_path)?
+        } else {
+            Self::decode(input_path)?
+        };
         let original = ImageDimensions::new(
             i32::try_from(image.width()).unwrap_or(i32::MAX),
             i32::try_from(image.height()).unwrap_or(i32::MAX),
@@ -366,106 +418,11 @@ impl ImageCrateEncoder {
         )?;
         Ok(output_path.to_owned())
     }
-}
 
-/// Port of `ImageHelper.GetNewImageSize`: `DrawingUtils.Resize`, then
-/// `DrawingUtils.ResizeFill`, then `DrawingUtils.ScaleDownToFit` against the
-/// source, so a caller-supplied `width`/`height` never encodes (or allocates)
-/// larger than the original image.
-fn get_new_image_size(
-    options: &ImageProcessingOptions,
-    original: ImageDimensions,
-) -> ImageDimensions {
-    let new_size = resize(
-        original,
-        options.width.unwrap_or(0),
-        options.height.unwrap_or(0),
-        options.max_width.unwrap_or(0),
-        options.max_height.unwrap_or(0),
-    );
-    let new_size = resize_fill(new_size, options.fill_width, options.fill_height);
-
-    // Never encode larger than the source.
-    scale_down_to_fit(new_size, original)
-}
-
-/// The decodable input extensions this encoder advertises.
-///
-/// The subset of `SkiaEncoder.SupportedInputFormats` the `image` crate is
-/// compiled to decode (`jpeg`/`png`/`webp`), with the alias `jpg` for `jpeg`.
-/// The Skia-only formats (`dng`/`astc`/`ktx`/raw/`svg`/`gif`/`bmp`/`ico`) are
-/// dropped because this build cannot decode them.
-const SUPPORTED_INPUT_FORMATS: [&str; 4] = ["jpeg", "jpg", "png", "webp"];
-
-#[async_trait]
-impl ImageEncoder for ImageCrateEncoder {
-    /// Port of `SupportedInputFormats` — the decodable subset
-    /// (`jpeg`/`jpg`/`png`/`webp`).
-    fn supported_input_formats(&self) -> Vec<String> {
-        SUPPORTED_INPUT_FORMATS
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect()
-    }
-
-    /// Port of `SupportedOutputFormats` — [`ImageFormat::Webp`],
-    /// [`ImageFormat::Jpg`], [`ImageFormat::Png`] (Skia also lists `Svg`, which
-    /// this raster encoder cannot produce). WebP output is real *lossy* WebP via
-    /// libwebp — the same encoder Skia links — so the prefer-WebP negotiation
-    /// yields Jellyfin-sized files, not the `image` crate's lossless-only blobs.
-    fn supported_output_formats(&self) -> Vec<ImageFormat> {
-        vec![ImageFormat::Webp, ImageFormat::Jpg, ImageFormat::Png]
-    }
-
-    /// Port of `Name` — the constant `"Image Crate"`.
-    fn name(&self) -> String {
-        "Image Crate".to_owned()
-    }
-
-    /// Port of `SupportsImageCollageCreation` — always `true`.
-    fn supports_image_collage_creation(&self) -> bool {
-        true
-    }
-
-    /// Port of `SupportsImageEncoding` — always `true`.
-    fn supports_image_encoding(&self) -> bool {
-        true
-    }
-
-    /// Port of `GetImageSize`. Returns [`ImageDimensions::default`] (`0×0`) for a
-    /// zero-byte or undecodable file (Skia's `return default;`), and the header
-    /// dimensions otherwise. A missing file is [`ServiceError::NotFound`].
-    ///
-    /// Every step is synchronous filesystem work — two stats plus an open and a
-    /// header read — so it runs on the blocking pool, never inline on the async
-    /// worker. It is not a background-only call: `DtoService` reaches it once per
-    /// item whose stored image dimensions are `0` while building
-    /// `PrimaryImageAspectRatio`, i.e. up to a full page of probes per request,
-    /// and on network-backed media (NFS/SMB) a cold probe parks the calling
-    /// thread for seconds.
-    async fn get_image_size(&self, path: &str) -> Result<ImageDimensions, ServiceError> {
-        let path = path.to_owned();
-        tokio::task::spawn_blocking(move || Self::image_size_blocking(&path))
-            .await
-            .map_err(|e| ServiceError::backend(format!("image probe task failed: {e}")))?
-    }
-
-    /// Port of `SkiaEncoder.GetImageBlurHash`: decode, downscale to fit 128x128
-    /// ("larger is too slow, no visible difference"), then BlurHash-encode with the
-    /// caller's component counts.
-    ///
-    /// The hash is functionally valid but **not byte-identical** to Jellyfin's — its
-    /// pixels come from Skia's decode+resample, which the `image` crate can't reproduce
-    /// exactly (documented divergence; `ImageBlurHashes` is denylisted in the parity test).
-    async fn get_image_blur_hash(
-        &self,
-        x_comp: i32,
-        y_comp: i32,
-        path: &str,
-    ) -> Result<String, ServiceError> {
-        if path.is_empty() {
-            return Err(ServiceError::invalid_input("path is empty"));
-        }
+    /// The synchronous body of [`ImageEncoder::get_image_blur_hash`]: decode,
+    /// downscale to fit 128×128, then BlurHash-encode. CPU-bound (plus the
+    /// decode's file read), so it runs on the blocking pool, never inline.
+    fn blur_hash_blocking(x_comp: i32, y_comp: i32, path: &str) -> Result<String, ServiceError> {
         let decoded = Self::decode(path)?;
         let small = decoded
             .resize(128, 128, image::imageops::FilterType::Triangle)
@@ -476,76 +433,10 @@ impl ImageEncoder for ImageCrateEncoder {
             .map_err(|e| ServiceError::backend(e.to_string()))
     }
 
-    /// Port of `EncodeImage`. Rejects unsupported inputs (returns `input_path`
-    /// untouched), decodes, short-circuits to the original file when
-    /// [`ImageProcessingOptions::has_default_options`] holds and no
-    /// auto-orientation is requested, otherwise resizes to
-    /// `ImageHelper.GetNewImageSize` and writes `output_format` at `quality`.
-    ///
-    /// The `auto_orient`/`orientation` overlay work Skia performs is not ported;
-    /// this encoder does resize + format-convert only.
-    async fn encode_image(
-        &self,
-        input_path: &str,
-        _date_modified: DateTime<Utc>,
-        output_path: &str,
-        auto_orient: bool,
-        _orientation: Option<ImageOrientation>,
-        quality: i32,
-        options: &ImageProcessingOptions,
-        output_format: ImageFormat,
-    ) -> Result<String, ServiceError> {
-        if input_path.is_empty() {
-            return Err(ServiceError::invalid_input("input_path is empty"));
-        }
-        if output_path.is_empty() {
-            return Err(ServiceError::invalid_input("output_path is empty"));
-        }
-
-        // Decode + Lanczos3 resize + re-encode is CPU-bound synchronous work.
-        // Running it directly on the async worker freezes that thread for the
-        // whole encode (tens of ms per poster), starving every other request
-        // sharing the worker — a cheap 3 ms endpoint's p99 balloons behind an
-        // image derivation. Offload to the blocking pool so the reactor stays
-        // free (Jellyfin's Skia path runs off the request thread likewise). The
-        // permit bounds concurrent encodes to core count so a cold-cache storm
-        // can't oversubscribe the CPUs; it is held across the whole encode.
-        let _permit = encode_permits()
-            .acquire()
-            .await
-            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
-        let input_path = input_path.to_owned();
-        let output_path = output_path.to_owned();
-        let options = options.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::encode_image_blocking(
-                &input_path,
-                &output_path,
-                auto_orient,
-                quality,
-                &options,
-                output_format,
-            )
-        })
-        .await
-        .map_err(|e| ServiceError::backend(format!("image encode task failed: {e}")))?
-    }
-
-    /// Port of `CreateImageCollage`. Dispatches on the width/height ratio: a
-    /// `>= 1.4` ratio builds a horizontal thumb strip, anything else a `2×2`
-    /// square collage. The text/gradient extras Skia draws are omitted — this is
-    /// a plain tile composite.
-    async fn create_image_collage(
-        &self,
-        options: &ImageCollageOptions,
-        _library_name: Option<&str>,
-    ) -> Result<(), ServiceError> {
-        if options.width <= 0 || options.height <= 0 {
-            return Err(ServiceError::invalid_input(
-                "collage width/height must be positive",
-            ));
-        }
-
+    /// The build + write body of [`ImageEncoder::create_image_collage`]: several
+    /// decodes, Lanczos3 resizes and an encode. CPU-bound, so it runs on the
+    /// blocking pool. Assumes the caller has validated `width`/`height`.
+    fn create_image_collage_blocking(options: &ImageCollageOptions) -> Result<(), ServiceError> {
         let ratio = f64::from(options.width) / f64::from(options.height);
         let canvas = if ratio >= COLLAGE_THUMB_RATIO {
             build_thumb_collage(&options.input_paths, options.width, options.height)
@@ -563,27 +454,14 @@ impl ImageEncoder for ImageCrateEncoder {
         )
     }
 
-    /// Deferred feature — always [`ServiceError::Backend`]. Port of
-    /// `CreateSplashscreen`, whose builder is out of scope for this unit.
-    async fn create_splashscreen(
-        &self,
-        _posters: &[String],
-        _backdrops: &[String],
-    ) -> Result<(), ServiceError> {
-        Err(ServiceError::backend(Self::DEFERRED))
-    }
-
-    /// Port of `CreateTrickplayTile`. Packs `input_paths` into an
-    /// `img_width*tile_width × img_height*tile_height` grid (row-major), encodes
-    /// it as JPEG at `quality`, and returns the single-thumbnail height.
-    ///
-    /// Validation mirrors the C# exactly: empty inputs and an over-full grid are
-    /// [`ServiceError::InvalidInput`]; every tile's width must equal `img_width`
-    /// and its height the first tile's height, else [`ServiceError::InvalidInput`]
-    /// (the ports of `ArgumentException`/`InvalidOperationException`). A missing
-    /// `img_height` is taken from the first image.
-    async fn create_trickplay_tile(
-        &self,
+    /// The decode + overlay + JPEG-encode body of
+    /// [`ImageEncoder::create_trickplay_tile`]: up to `tile_width`×`tile_height`
+    /// (default 100) JPEG decodes packed into one large grid. CPU- and
+    /// file-I/O-bound with no yield points, so it runs on the blocking pool.
+    /// Assumes the caller has validated the O(1) arguments (non-empty inputs,
+    /// positive tile dimensions and `img_width`, and that the inputs fit the
+    /// grid); the per-image dimension checks stay here with the decode.
+    fn create_trickplay_tile_blocking(
         options: &ImageCollageOptions,
         quality: i32,
         img_width: i32,
@@ -592,26 +470,6 @@ impl ImageEncoder for ImageCrateEncoder {
         let paths = &options.input_paths;
         let tile_width = options.width;
         let tile_height = options.height;
-
-        if paths.is_empty() {
-            return Err(ServiceError::invalid_input("InputPaths cannot be empty."));
-        }
-        if tile_width <= 0 || tile_height <= 0 {
-            return Err(ServiceError::invalid_input(
-                "tile width/height must be positive",
-            ));
-        }
-        // i64 product avoids overflow before the comparison.
-        if i64::try_from(paths.len()).unwrap_or(i64::MAX)
-            > i64::from(tile_width) * i64::from(tile_height)
-        {
-            return Err(ServiceError::invalid_input(format!(
-                "InputPaths contains more images than would fit on {tile_width}x{tile_height} grid.",
-            )));
-        }
-        if img_width <= 0 {
-            return Err(ServiceError::invalid_input("img_width must be positive"));
-        }
 
         // If no height provided, use the first image's height (after validating
         // its width matches img_width), matching the Skia default path.
@@ -684,6 +542,327 @@ impl ImageEncoder for ImageCrateEncoder {
     }
 }
 
+/// Port of `ImageHelper.GetNewImageSize`: `DrawingUtils.Resize`, then
+/// `DrawingUtils.ResizeFill`, then `DrawingUtils.ScaleDownToFit` against the
+/// source, so a caller-supplied `width`/`height` never encodes (or allocates)
+/// larger than the original image.
+fn get_new_image_size(
+    options: &ImageProcessingOptions,
+    original: ImageDimensions,
+) -> ImageDimensions {
+    let new_size = resize(
+        original,
+        options.width.unwrap_or(0),
+        options.height.unwrap_or(0),
+        options.max_width.unwrap_or(0),
+        options.max_height.unwrap_or(0),
+    );
+    let new_size = resize_fill(new_size, options.fill_width, options.fill_height);
+
+    // Never encode larger than the source.
+    scale_down_to_fit(new_size, original)
+}
+
+/// The decodable input extensions this encoder advertises.
+///
+/// The subset of `SkiaEncoder.SupportedInputFormats` the `image` crate is
+/// compiled to decode (`jpeg`/`png`/`webp`/`gif`/`bmp`/`ico`), with the alias
+/// `jpg` for `jpeg`. A GIF decodes to its first frame, as Skia's does.
+///
+/// TODO(gl-802): the rest of Skia's list (`dng`/`cr2`/`nef`/`arw`, `wbmp`,
+/// `astc`/`ktx`/`pkm`, `svg`) has no decoder in the `image` crate; each needs
+/// its own decoder dependency before it can join this list.
+const SUPPORTED_INPUT_FORMATS: [&str; 7] = ["jpeg", "jpg", "png", "webp", "gif", "bmp", "ico"];
+
+/// The widest or tallest image libwebp can write, its `WEBP_MAX_DIMENSION`
+/// (the bitstream's 14-bit size fields), which the `webp` crate does not
+/// re-export.
+const WEBP_MAX_DIMENSION: u32 = 16_383;
+
+#[async_trait]
+impl ImageEncoder for ImageCrateEncoder {
+    /// Port of `SupportedInputFormats` — the decodable subset
+    /// (`jpeg`/`jpg`/`png`/`webp`/`gif`/`bmp`/`ico`).
+    fn supported_input_formats(&self) -> Vec<String> {
+        SUPPORTED_INPUT_FORMATS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    }
+
+    /// Port of `SupportedOutputFormats` — [`ImageFormat::Webp`],
+    /// [`ImageFormat::Jpg`], [`ImageFormat::Png`] (Skia also lists `Svg`, which
+    /// this raster encoder cannot produce). WebP output is real *lossy* WebP via
+    /// libwebp — the same encoder Skia links — so the prefer-WebP negotiation
+    /// yields Jellyfin-sized files, not the `image` crate's lossless-only blobs.
+    fn supported_output_formats(&self) -> Vec<ImageFormat> {
+        vec![ImageFormat::Webp, ImageFormat::Jpg, ImageFormat::Png]
+    }
+
+    /// Port of `Name` — the constant `"Image Crate"`.
+    fn name(&self) -> String {
+        "Image Crate".to_owned()
+    }
+
+    /// Port of `SupportsImageCollageCreation` — always `true`.
+    fn supports_image_collage_creation(&self) -> bool {
+        true
+    }
+
+    /// Port of `SupportsImageEncoding` — always `true`.
+    fn supports_image_encoding(&self) -> bool {
+        true
+    }
+
+    /// Port of `GetImageSize`. Returns [`ImageDimensions::default`] (`0×0`) for a
+    /// zero-byte or undecodable file (Skia's `return default;`), and the header
+    /// dimensions otherwise. A missing file is [`ServiceError::NotFound`].
+    ///
+    /// Every step is synchronous filesystem work — two stats plus an open and a
+    /// header read — so it runs on the blocking pool, never inline on the async
+    /// worker. It is not a background-only call: `DtoService` reaches it once per
+    /// item whose stored image dimensions are `0` while building
+    /// `PrimaryImageAspectRatio`, i.e. up to a full page of probes per request,
+    /// and on network-backed media (NFS/SMB) a cold probe parks the calling
+    /// thread for seconds.
+    async fn get_image_size(&self, path: &str) -> Result<ImageDimensions, ServiceError> {
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || Self::image_size_blocking(&path))
+            .await
+            .map_err(|e| ServiceError::backend(format!("image probe task failed: {e}")))?
+    }
+
+    /// Port of `SkiaEncoder.GetImageBlurHash`: decode, downscale to fit 128x128
+    /// ("larger is too slow, no visible difference"), then BlurHash-encode with the
+    /// caller's component counts.
+    ///
+    /// The hash is functionally valid but **not byte-identical** to Jellyfin's — its
+    /// pixels come from Skia's decode+resample, which the `image` crate can't reproduce
+    /// exactly (documented divergence; `ImageBlurHashes` is denylisted in the parity test).
+    async fn get_image_blur_hash(
+        &self,
+        x_comp: i32,
+        y_comp: i32,
+        path: &str,
+    ) -> Result<String, ServiceError> {
+        if path.is_empty() {
+            return Err(ServiceError::invalid_input("path is empty"));
+        }
+        // A full decode (4K backdrops included) plus a Triangle resize is
+        // CPU-bound synchronous work, and the decode's file read can be a cold
+        // NFS/SMB read; offload it to the blocking pool under the shared encode
+        // permit so it never pins an async worker (see `encode_image`).
+        let _permit = encode_permits()
+            .acquire()
+            .await
+            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || Self::blur_hash_blocking(x_comp, y_comp, &path))
+            .await
+            .map_err(|e| ServiceError::backend(format!("blur hash task failed: {e}")))?
+    }
+
+    /// Port of `EncodeImage`. Rejects unsupported inputs (returns `input_path`
+    /// untouched), decodes, short-circuits to the original file when
+    /// [`ImageProcessingOptions::has_default_options`] holds and no
+    /// auto-orientation is requested, otherwise resizes to
+    /// `ImageHelper.GetNewImageSize` and writes `output_format` at `quality`.
+    ///
+    /// With `auto_orient` the file's own EXIF origin is applied first
+    /// (`SkiaEncoder.GetBitmap` → `OrientImage`), so the resize sees the
+    /// upright size. `orientation` is unused: Skia falls back to it only when
+    /// the codec cannot open the file, and then has no bitmap to draw either.
+    /// The played/unplayed/blur overlays are not drawn.
+    async fn encode_image(
+        &self,
+        input_path: &str,
+        _date_modified: DateTime<Utc>,
+        output_path: &str,
+        auto_orient: bool,
+        _orientation: Option<ImageOrientation>,
+        quality: i32,
+        options: &ImageProcessingOptions,
+        output_format: ImageFormat,
+    ) -> Result<String, ServiceError> {
+        if input_path.is_empty() {
+            return Err(ServiceError::invalid_input("input_path is empty"));
+        }
+        if output_path.is_empty() {
+            return Err(ServiceError::invalid_input("output_path is empty"));
+        }
+
+        // Decode + Lanczos3 resize + re-encode is CPU-bound synchronous work.
+        // Running it directly on the async worker freezes that thread for the
+        // whole encode (tens of ms per poster), starving every other request
+        // sharing the worker — a cheap 3 ms endpoint's p99 balloons behind an
+        // image derivation. Offload to the blocking pool so the reactor stays
+        // free (Jellyfin's Skia path runs off the request thread likewise). The
+        // permit bounds concurrent encodes to core count so a cold-cache storm
+        // can't oversubscribe the CPUs; it is held across the whole encode.
+        let _permit = encode_permits()
+            .acquire()
+            .await
+            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
+        let input_path = input_path.to_owned();
+        let output_path = output_path.to_owned();
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::encode_image_blocking(
+                &input_path,
+                &output_path,
+                auto_orient,
+                quality,
+                &options,
+                output_format,
+            )
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("image encode task failed: {e}")))?
+    }
+
+    /// Port of `CreateImageCollage`. Dispatches on the width/height ratio: a
+    /// `>= 1.4` ratio builds a horizontal thumb strip, anything else a `2×2`
+    /// square collage. The thumb strip's library-name text is not drawn yet
+    /// (see [`build_thumb_collage`]).
+    async fn create_image_collage(
+        &self,
+        options: &ImageCollageOptions,
+        _library_name: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        if options.width <= 0 || options.height <= 0 {
+            return Err(ServiceError::invalid_input(
+                "collage width/height must be positive",
+            ));
+        }
+
+        // Several poster decodes, Lanczos3 resizes and a final encode are
+        // CPU-bound synchronous work; offload under the shared encode permit so
+        // it never pins an async worker (see `encode_image`).
+        let _permit = encode_permits()
+            .acquire()
+            .await
+            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || Self::create_image_collage_blocking(&options))
+            .await
+            .map_err(|e| ServiceError::backend(format!("image collage task failed: {e}")))?
+    }
+
+    /// Port of `CreateSplashscreen`: builds `{DataPath}/splashscreen.png`
+    /// ([`crate::splashscreen`]) when there is at least one poster and one
+    /// backdrop, and does nothing otherwise. The file is written beside the
+    /// final name and renamed over it, so a reader never sees half a PNG.
+    async fn create_splashscreen(
+        &self,
+        posters: &[String],
+        backdrops: &[String],
+    ) -> Result<(), ServiceError> {
+        // Only generate the splash screen if we have at least one poster and at
+        // least one backdrop/thumbnail.
+        if posters.is_empty() || backdrops.is_empty() {
+            return Ok(());
+        }
+        let Some(data_path) = self.data_path.clone() else {
+            return Err(ServiceError::backend(
+                "ImageCrateEncoder has no data path to write the splashscreen to",
+            ));
+        };
+        // Dozens of decodes, a 5760x2160 wall and a projection: CPU-bound, so
+        // under the shared encode permit on the blocking pool.
+        let _permit = encode_permits()
+            .acquire()
+            .await
+            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
+        let (posters, backdrops) = (posters.to_vec(), backdrops.to_vec());
+        tokio::task::spawn_blocking(move || {
+            // A scratch name per call: two validations finishing together must
+            // not write, or rename away, each other's file.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let splash = crate::splashscreen::generate_splash(&posters, &backdrops)?;
+            let output = data_path.join("splashscreen.png");
+            let partial = data_path.join(format!(
+                "splashscreen.png.{}.partial",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let written = Self::write(
+                &DynamicImage::ImageRgba8(splash),
+                &partial.to_string_lossy(),
+                CrateFormat::Png,
+                COLLAGE_QUALITY,
+            )
+            .and_then(|()| {
+                std::fs::rename(&partial, &output).map_err(|e| {
+                    DrawingError::io(format!("rename {}", partial.display()), e).into()
+                })
+            });
+            if written.is_err() {
+                // Best effort: the scratch file may not exist at all.
+                let _ = std::fs::remove_file(&partial);
+            }
+            written
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("splashscreen task failed: {e}")))?
+    }
+
+    /// Port of `CreateTrickplayTile`. Packs `input_paths` into an
+    /// `img_width*tile_width × img_height*tile_height` grid (row-major), encodes
+    /// it as JPEG at `quality`, and returns the single-thumbnail height.
+    ///
+    /// Validation mirrors the C# exactly: empty inputs and an over-full grid are
+    /// [`ServiceError::InvalidInput`]; every tile's width must equal `img_width`
+    /// and its height the first tile's height, else [`ServiceError::InvalidInput`]
+    /// (the ports of `ArgumentException`/`InvalidOperationException`). A missing
+    /// `img_height` is taken from the first image.
+    async fn create_trickplay_tile(
+        &self,
+        options: &ImageCollageOptions,
+        quality: i32,
+        img_width: i32,
+        img_height: Option<i32>,
+    ) -> Result<i32, ServiceError> {
+        let paths = &options.input_paths;
+        let tile_width = options.width;
+        let tile_height = options.height;
+
+        if paths.is_empty() {
+            return Err(ServiceError::invalid_input("InputPaths cannot be empty."));
+        }
+        if tile_width <= 0 || tile_height <= 0 {
+            return Err(ServiceError::invalid_input(
+                "tile width/height must be positive",
+            ));
+        }
+        // i64 product avoids overflow before the comparison.
+        if i64::try_from(paths.len()).unwrap_or(i64::MAX)
+            > i64::from(tile_width) * i64::from(tile_height)
+        {
+            return Err(ServiceError::invalid_input(format!(
+                "InputPaths contains more images than would fit on {tile_width}x{tile_height} grid.",
+            )));
+        }
+        if img_width <= 0 {
+            return Err(ServiceError::invalid_input("img_width must be positive"));
+        }
+
+        // Up to tile_width×tile_height (default 100) JPEG decodes, overlaid onto
+        // one large grid and JPEG-encoded — CPU- and file-I/O-bound with no yield
+        // points. Offload to the blocking pool under the shared encode permit
+        // (one per tile, not per film, so tiling cannot starve request-path
+        // poster encodes that share the same core-count semaphore).
+        let _permit = encode_permits()
+            .acquire()
+            .await
+            .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
+        let options = options.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::create_trickplay_tile_blocking(&options, quality, img_width, img_height)
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("trickplay tile task failed: {e}")))?
+    }
+}
+
 /// The width/height ratio at or above which a collage is laid out as a
 /// horizontal thumb strip rather than a `2×2` square. Port of the C# `>= 1.4`
 /// dispatch in `CreateImageCollage`.
@@ -695,7 +874,8 @@ const COLLAGE_QUALITY: i32 = 90;
 
 /// Decodes the first path that loads, tiling the rest into a `2×2` square,
 /// each cell `width/2 × height/2`. Port of
-/// `StripCollageBuilder.BuildSquareCollageBitmap` (no text/shadow extras).
+/// `StripCollageBuilder.BuildSquareCollageBitmap`; [`next_valid`] wraps, so
+/// fewer than four images repeat.
 fn build_square_collage(paths: &[String], width: i32, height: i32) -> RgbaImage {
     let cell_w = (width / 2).max(1);
     let cell_h = (height / 2).max(1);
@@ -728,9 +908,10 @@ fn build_square_collage(paths: &[String], width: i32, height: i32) -> RgbaImage 
 }
 
 /// Builds a thumb-strip collage: the first valid image scaled to the collage
-/// width (aspect-preserved) and drawn at the top on a black canvas. Port of the
-/// backdrop-fill portion of `StripCollageBuilder.BuildThumbCollageBitmap`; the
-/// shadow rectangle and library-name text are omitted.
+/// width (aspect-preserved) and drawn at the top on a black canvas, under a
+/// black rectangle at alpha `0x78`. Port of
+/// `StripCollageBuilder.BuildThumbCollageBitmap` without its library-name text
+/// (TODO(gl-804): the text needs a font rasterizer and a bundled font).
 fn build_thumb_collage(paths: &[String], width: i32, height: i32) -> RgbaImage {
     let mut canvas = RgbaImage::from_pixel(
         u32::try_from(width).unwrap_or(1),
@@ -749,23 +930,43 @@ fn build_thumb_collage(paths: &[String], width: i32, height: i32) -> RgbaImage {
             imageops::FilterType::Lanczos3,
         );
         imageops::overlay(&mut canvas, &resized.to_rgba8(), 0, 0);
+        // The shadow rectangle: black at alpha 0x78 over every pixel.
+        for pixel in canvas.pixels_mut() {
+            for channel in &mut pixel.0[..3] {
+                let dimmed = (u16::from(*channel) * (255 - THUMB_SHADOW_ALPHA) + 127) / 255;
+                *channel = u8::try_from(dimmed).unwrap_or(u8::MAX);
+            }
+        }
     }
 
     canvas
 }
 
-/// Returns the first decodable image at or after `start`, plus the index one
-/// past it. Port of `SkiaHelper.GetNextValidImage` — undecodable paths are
-/// skipped rather than fatal.
+/// The alpha of the black rectangle `BuildThumbCollageBitmap` draws over the
+/// backdrop (`SKColors.Black.WithAlpha(0x78)`).
+const THUMB_SHADOW_ALPHA: u16 = 0x78;
+
+/// Returns the first decodable image from `start` on, plus the index one past
+/// it. See [`next_valid`].
 fn next_valid_image(paths: &[String], start: usize) -> Option<(DynamicImage, usize)> {
-    let mut index = start;
-    while index < paths.len() {
-        if let Ok(image) = ImageCrateEncoder::decode(&paths[index]) {
-            return Some((image, index + 1));
-        }
-        index += 1;
-    }
-    None
+    next_valid(paths, start, &mut |path| {
+        ImageCrateEncoder::decode(path).ok()
+    })
+}
+
+/// Port of `SkiaHelper.GetNextValidImage`: the first path from `start` that
+/// `load` accepts, wrapping to the start of the list, plus the index one past
+/// it. Each path is tried at most once; undecodable ones are skipped, and
+/// `None` means no path loads.
+pub(crate) fn next_valid<T>(
+    paths: &[String],
+    start: usize,
+    load: &mut impl FnMut(&str) -> Option<T>,
+) -> Option<(T, usize)> {
+    (0..paths.len()).find_map(|offset| {
+        let index = (start + offset) % paths.len();
+        load(&paths[index]).map(|value| (value, index + 1))
+    })
 }
 
 #[cfg(test)]
@@ -826,12 +1027,7 @@ mod tests {
         let enc = ImageCrateEncoder::new();
         assert_eq!(
             enc.supported_input_formats(),
-            vec![
-                "jpeg".to_owned(),
-                "jpg".to_owned(),
-                "png".to_owned(),
-                "webp".to_owned()
-            ]
+            ["jpeg", "jpg", "png", "webp", "gif", "bmp", "ico"].map(str::to_owned)
         );
         assert_eq!(
             enc.supported_output_formats(),
@@ -909,6 +1105,121 @@ mod tests {
 
         let dims = enc.get_image_size(&output).await.expect("probe out");
         assert_eq!(dims, ImageDimensions::new(960, 540));
+    }
+
+    /// The formats Skia decodes beyond jpeg/png/webp (`SkiaEncoder.
+    /// SupportedInputFormats`) that the `image` crate can: their size and
+    /// blurhash are read and a resize is encoded, not served as the original.
+    #[rstest]
+    #[case::bmp("poster.bmp")]
+    #[case::ico("poster.ico")]
+    #[case::gif("poster.gif")]
+    #[tokio::test]
+    async fn bmp_ico_and_gif_inputs_are_decoded_and_resized(#[case] name: &str) {
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, name, 200, 100);
+        let output = out_path(&dir, "small.png");
+        let enc = ImageCrateEncoder::new();
+        assert_eq!(
+            enc.get_image_size(&input).await.expect("probe in"),
+            ImageDimensions::new(200, 100)
+        );
+        assert!(
+            !enc.get_image_blur_hash(4, 3, &input)
+                .await
+                .expect("blurhash")
+                .is_empty()
+        );
+        let options = ImageProcessingOptions {
+            max_width: Some(100),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let written = enc
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                false,
+                None,
+                90,
+                &options,
+                ImageFormat::Png,
+            )
+            .await
+            .expect("encode");
+        assert_eq!(written, output);
+        assert_eq!(
+            enc.get_image_size(&output).await.expect("probe out"),
+            ImageDimensions::new(100, 50)
+        );
+    }
+
+    /// An EXIF block holding only `Orientation = 6` (rotate 90° clockwise),
+    /// as a phone writes a portrait shot stored landscape: a little-endian
+    /// TIFF header and one IFD entry.
+    const ORIENTATION_6_EXIF: [u8; 26] = [
+        0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, // "II*", IFD at 8
+        0x01, 0x00, // one entry
+        0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00,
+        0x00, // Orientation = 6
+        0x00, 0x00, 0x00, 0x00, // no next IFD
+    ];
+
+    /// `SkiaEncoder.GetBitmap(path, autoOrient: true, …)`: the file's EXIF
+    /// origin is applied before the resize, so a 40×20 JPEG tagged with
+    /// orientation 6 comes out 20×40; without auto-orientation it is left as
+    /// stored.
+    #[tokio::test]
+    async fn auto_orient_applies_the_exif_orientation() {
+        use image::ImageEncoder as _;
+        let dir = TempDir::new().expect("tempdir");
+        let input = out_path(&dir, "phone.jpg");
+        {
+            let pixels = image::RgbImage::from_pixel(40, 20, image::Rgb([200, 30, 30]));
+            let file = std::fs::File::create(&input).expect("fixture");
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 90);
+            encoder
+                .set_exif_metadata(ORIENTATION_6_EXIF.to_vec())
+                .expect("exif");
+            encoder
+                .write_image(&pixels, 40, 20, image::ExtendedColorType::Rgb8)
+                .expect("write fixture");
+        }
+        let enc = ImageCrateEncoder::new();
+        // The resize measures the upright image: a 10-pixel height bound
+        // halves the rotated 20×40 to 5×10.
+        for (auto_orient, max_height, expected) in [
+            (true, 100, (20, 40)),
+            (false, 100, (40, 20)),
+            (true, 10, (5, 10)),
+        ] {
+            let output = out_path(&dir, &format!("out-{auto_orient}-{max_height}.jpg"));
+            let options = ImageProcessingOptions {
+                max_height: Some(max_height),
+                supported_output_formats: vec![ImageFormat::Jpg],
+                ..Default::default()
+            };
+            let written = enc
+                .encode_image(
+                    &input,
+                    Utc::now(),
+                    &output,
+                    auto_orient,
+                    None,
+                    90,
+                    &options,
+                    ImageFormat::Jpg,
+                )
+                .await
+                .expect("encode");
+            let dims = enc.get_image_size(&written).await.expect("probe out");
+            assert_eq!(
+                (dims.width, dims.height),
+                expected,
+                "auto_orient {auto_orient}"
+            );
+        }
     }
 
     /// Transliterated from upstream `ImageHelperTests` (jellyfin#17056): an
@@ -1030,7 +1341,7 @@ mod tests {
 
         let mut handles = Vec::new();
         for i in 0..32 {
-            let (e, inp, op) = (enc, input.clone(), options.clone());
+            let (e, inp, op) = (enc.clone(), input.clone(), options.clone());
             let out = out_path(&dir, &format!("o{i}.png"));
             handles.push(tokio::spawn(async move {
                 let written = e
@@ -1052,6 +1363,61 @@ mod tests {
         for h in handles {
             h.await.expect("task");
         }
+    }
+
+    /// libwebp cannot write a side over 16383 px, and its `encode` panicked on
+    /// one (`VP8_ENC_ERROR_BAD_DIMENSION`). Such an output is now refused as
+    /// invalid input before encoding, like the JPEG limit, so `process_image`
+    /// logs it at debug and serves the original; a side of exactly 16383 px
+    /// still encodes.
+    #[rstest]
+    #[case(16_384, 1)]
+    #[case(1, 16_384)]
+    fn a_webp_output_over_libwebps_limit_is_invalid_input_not_a_panic(
+        #[case] width: u32,
+        #[case] height: u32,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let out = out_path(&dir, "huge.webp");
+
+        let err = ImageCrateEncoder::write(
+            &DynamicImage::new_rgba8(width, height),
+            &out,
+            CrateFormat::WebP,
+            90,
+        )
+        .expect_err("libwebp's dimension limit");
+
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+        assert!(err.to_string().contains("16383x16383 limit"), "{err}");
+        assert!(!Path::new(&out).exists(), "nothing is written");
+
+        let edge = out_path(&dir, "edge.webp");
+        ImageCrateEncoder::write(
+            &DynamicImage::new_rgba8(width.min(16_383), height.min(16_383)),
+            &edge,
+            CrateFormat::WebP,
+            90,
+        )
+        .expect("16383 px is within the limit");
+        assert!(Path::new(&edge).exists());
+    }
+
+    /// Any other libwebp failure is an ordinary encode error too, not the
+    /// `unwrap` panic of `Encoder::encode`: a zero-width image, which libwebp
+    /// rejects itself.
+    #[test]
+    fn a_libwebp_failure_is_an_encode_error_not_a_panic() {
+        let dir = TempDir::new().expect("tempdir");
+        let out = out_path(&dir, "empty.webp");
+
+        let err =
+            ImageCrateEncoder::write(&DynamicImage::new_rgba8(0, 1), &out, CrateFormat::WebP, 90)
+                .expect_err("libwebp refuses an empty picture");
+
+        assert!(matches!(err, ServiceError::BackendSource(_)), "{err:?}");
+        assert!(err.to_string().contains("libwebp VP8_ENC_ERROR"), "{err}");
+        assert!(!Path::new(&out).exists(), "nothing is written");
     }
 
     #[tokio::test]
@@ -1477,13 +1843,133 @@ mod tests {
         assert_eq!(dims, ImageDimensions::new(960, 540));
     }
 
+    /// Port of `SkiaEncoder.CreateSplashscreen` + `SplashscreenBuilder`: a
+    /// 1920x1080 PNG at `{DataPath}/splashscreen.png`, built from however few
+    /// posters and backdrops there are (they repeat, `GetNextValidImage` wraps).
     #[tokio::test]
-    async fn splashscreen_is_deferred() {
-        let enc = ImageCrateEncoder::new();
+    async fn the_splashscreen_is_written_to_the_data_dir() {
+        let dir = TempDir::new().expect("tempdir");
+        let posters = vec![fixture(&dir, "poster.png", 200, 300)];
+        let backdrops = vec![fixture(&dir, "thumb.png", 320, 180)];
+        let enc = ImageCrateEncoder::new().with_data_path(dir.path());
+        enc.create_splashscreen(&posters, &backdrops)
+            .await
+            .expect("splashscreen");
+        let output = dir.path().join("splashscreen.png");
+        let image = image::open(&output).expect("a PNG");
+        assert_eq!((image.width(), image.height()), (1920, 1080));
+        // The tilted wall fills the middle of the frame with tiles; only the
+        // 20 px gaps between them are black.
+        let image = image.to_rgba8();
+        let middle: Vec<_> = (760..1160)
+            .flat_map(|x| (340..740).map(move |y| (x, y)))
+            .map(|(x, y)| image.get_pixel(x, y).0)
+            .collect();
+        let tiled = middle
+            .iter()
+            .filter(|p| **p == [0x30, 0x60, 0x90, 0xFF])
+            .count();
+        assert!(
+            tiled * 2 > middle.len(),
+            "{tiled} of {} tile pixels",
+            middle.len()
+        );
+    }
+
+    /// Upstream generates nothing unless both lists have an entry.
+    #[rstest]
+    #[case::no_posters(false, true)]
+    #[case::no_backdrops(true, false)]
+    #[tokio::test]
+    async fn the_splashscreen_needs_a_poster_and_a_backdrop(
+        #[case] with_poster: bool,
+        #[case] with_backdrop: bool,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let posters: Vec<String> = with_poster
+            .then(|| fixture(&dir, "poster.png", 200, 300))
+            .into_iter()
+            .collect();
+        let backdrops: Vec<String> = with_backdrop
+            .then(|| fixture(&dir, "thumb.png", 320, 180))
+            .into_iter()
+            .collect();
+        let enc = ImageCrateEncoder::new().with_data_path(dir.path());
+        enc.create_splashscreen(&posters, &backdrops)
+            .await
+            .expect("no-op");
+        assert!(!dir.path().join("splashscreen.png").exists());
+    }
+
+    /// `GenerateCollage` throws when a list has no decodable image left.
+    #[tokio::test]
+    async fn a_splashscreen_with_no_decodable_poster_is_an_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let broken = dir.path().join("broken.png");
+        std::fs::write(&broken, b"not an image").expect("write");
+        let backdrops = vec![fixture(&dir, "thumb.png", 320, 180)];
+        let enc = ImageCrateEncoder::new().with_data_path(dir.path());
         assert!(matches!(
-            enc.create_splashscreen(&[], &[]).await,
-            Err(ServiceError::Backend(_))
+            enc.create_splashscreen(&[broken.to_string_lossy().into_owned()], &backdrops)
+                .await,
+            Err(ServiceError::InvalidInput(_))
         ));
+        assert!(!dir.path().join("splashscreen.png").exists());
+    }
+
+    /// `GetNextValidImage` wraps to the start of the list, so a square collage
+    /// of two images repeats them instead of leaving cells empty.
+    #[tokio::test]
+    async fn a_square_collage_of_two_images_fills_every_cell() {
+        let dir = TempDir::new().expect("tempdir");
+        let inputs: Vec<String> = (0..2)
+            .map(|i| fixture(&dir, &format!("c{i}.png"), 200, 200))
+            .collect();
+        let output = out_path(&dir, "collage.png");
+        let options = ImageCollageOptions {
+            input_paths: inputs,
+            output_path: output.clone(),
+            width: 400,
+            height: 400,
+        };
+        ImageCrateEncoder::new()
+            .create_image_collage(&options, None)
+            .await
+            .expect("collage");
+        let collage = image::open(&output).expect("png").to_rgba8();
+        for (x, y) in [(100, 100), (300, 100), (100, 300), (300, 300)] {
+            assert_eq!(
+                collage.get_pixel(x, y).0,
+                [0x30, 0x60, 0x90, 0xFF],
+                "cell at {x},{y}"
+            );
+        }
+    }
+
+    /// `BuildThumbCollageBitmap` draws a black rectangle at alpha `0x78` over
+    /// the backdrop.
+    #[tokio::test]
+    async fn a_thumb_collage_is_dimmed() {
+        let dir = TempDir::new().expect("tempdir");
+        let inputs = vec![fixture(&dir, "b.png", 1920, 1080)];
+        let output = out_path(&dir, "thumb.png");
+        let options = ImageCollageOptions {
+            input_paths: inputs,
+            output_path: output.clone(),
+            width: 960,
+            height: 540,
+        };
+        ImageCrateEncoder::new()
+            .create_image_collage(&options, Some("Movies"))
+            .await
+            .expect("thumb collage");
+        let pixel = image::open(&output)
+            .expect("png")
+            .to_rgba8()
+            .get_pixel(480, 270)
+            .0;
+        // 0x30/0x60/0x90 under black at 0x78/0xFF: c * (255 - 120) / 255.
+        assert_eq!(pixel, [25, 51, 76, 0xFF]);
     }
 
     #[tokio::test]
@@ -1562,7 +2048,7 @@ mod tests {
             .expect("runtime");
 
         runtime.block_on(async {
-            let encoder = ImageCrateEncoder;
+            let encoder = ImageCrateEncoder::new();
 
             // Occupy the single blocking thread, and wait until it is provably
             // busy so the probe below cannot win the race for it.
@@ -1586,6 +2072,83 @@ mod tests {
             hog.await.expect("hog joined");
             let dims = encoder.get_image_size(&path).await.expect("probe");
             assert_eq!((dims.width, dims.height), (64, 32));
+        });
+    }
+
+    #[test]
+    fn blur_hash_collage_and_trickplay_go_through_the_blocking_pool() {
+        // Like the probe test above: the three CPU/decode methods must offload
+        // to the blocking pool, not run inline on the async worker. With the one
+        // blocking thread hogged, each call must fail to complete in the window.
+        // Inputs are valid so the O(1) validation passes and execution reaches
+        // the offloaded work; the decode never runs because the pool is starved.
+        const STARVED_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+        let dir = TempDir::new().expect("tempdir");
+        let img = fixture(&dir, "work.png", 100, 100);
+        let collage_inputs: Vec<String> = (0..4)
+            .map(|i| fixture(&dir, &format!("w{i}.png"), 200, 200))
+            .collect();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let encoder = ImageCrateEncoder::new();
+
+            // Occupy the single blocking thread, provably, before the calls.
+            let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let hog = tokio::task::spawn_blocking(move || {
+                busy_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            busy_rx.await.expect("hog started");
+
+            let blur =
+                tokio::time::timeout(STARVED_WAIT, encoder.get_image_blur_hash(4, 3, &img)).await;
+            assert!(
+                blur.is_err(),
+                "get_image_blur_hash completed with the blocking pool starved, so it ran inline"
+            );
+
+            let collage_options = ImageCollageOptions {
+                input_paths: collage_inputs.clone(),
+                output_path: out_path(&dir, "work-collage.png"),
+                width: 400,
+                height: 400,
+            };
+            let collage = tokio::time::timeout(
+                STARVED_WAIT,
+                encoder.create_image_collage(&collage_options, None),
+            )
+            .await;
+            assert!(
+                collage.is_err(),
+                "create_image_collage completed with the blocking pool starved, so it ran inline"
+            );
+
+            let tile_options = ImageCollageOptions {
+                input_paths: vec![img.clone()],
+                output_path: out_path(&dir, "work-tile.jpg"),
+                width: 1,
+                height: 1,
+            };
+            let tile = tokio::time::timeout(
+                STARVED_WAIT,
+                encoder.create_trickplay_tile(&tile_options, 90, 100, Some(100)),
+            )
+            .await;
+            assert!(
+                tile.is_err(),
+                "create_trickplay_tile completed with the blocking pool starved, so it ran inline"
+            );
+
+            release_tx.send(()).expect("release hog");
+            hog.await.expect("hog joined");
         });
     }
 }

@@ -67,6 +67,11 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   - **Accepted divergence (a fix, not a gap):** renaming a user moves their profile image
     to the new name's folder. Jellyfin leaves it, so a new user who takes the old name
     overwrites the renamed user's image on upload and deletes it on removal.
+  - **Accepted divergence (a fix, not a gap):** an item's images of one type (its
+    backdrops) list in the order they were added, and keep that order when the item is
+    saved again; a new one goes last. Jellyfin lists them by a random id it draws again on
+    every save, so its backdrop order reshuffles. An item adopted from Jellyfin can show
+    its backdrops in a different order once.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
@@ -91,8 +96,16 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   NVENC's) but **have not yet been run on an Intel or AMD GPU**.
   **AMF, VideoToolbox, RKMPP and V4L2M2M are not supported** — see the note in
   `CLAUDE.md`; selecting one falls back to a software transcode and logs a warning.
-- **Live TV** — M3U **and HDHomeRun** tuners + XMLTV guide, channels/programs, DB-backed
-  DVR timers & recordings. The HDHomeRun backend is a port of Jellyfin's `HdHomerunHost`:
+  - **Accepted divergence (a fix, not a gap):** Jellyfin puts the configured VAAPI device
+    path into the `-init_hw_device` string unquoted, so a path with a space or quote breaks
+    the command line. Ferrofin quotes such a path; an ordinary one (`/dev/dri/renderD128`)
+    is passed exactly as Jellyfin passes it.
+- **Live TV** — M3U **and HDHomeRun** tuners + XMLTV **and Schedules Direct** guides,
+  channels/programs, DB-backed DVR timers & recordings. The Schedules Direct provider is a
+  port of Jellyfin 12.2's `SchedulesDirect` (login, lineups, the station map, schedules,
+  program details and artwork, SD's error codes and daily limits); it is verified against
+  Jellyfin's own JSON fixtures and a fake SD API, and **has not been run against a real
+  Schedules Direct account**. The HDHomeRun backend is a port of Jellyfin's `HdHomerunHost`:
   `discover.json`/`lineup.json`, UDP device discovery, the per-channel HTTP stream with
   its transcode profiles, and the legacy binary control protocol. **No physical HDHomeRun
   has been run against it** — it is verified against Jellyfin's own JSON fixtures, against
@@ -103,10 +116,16 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   exercised end-to-end with a real tuner/guide by a human**; treat as less battle-tested
   than the rest of this list.
 - **SyncPlay** — groups, playback-command relay, time sync.
-- **Scheduled tasks** — 19 of Jellyfin's scheduled tasks (including the Live TV guide
+- **Scheduled tasks** — 20 of Jellyfin's scheduled tasks (including the Live TV guide
   refresh and the hidden channel refresh) plus the trigger scheduler. "Clean up
-  collections and playlists" is gone, as in Jellyfin 12; Jellyfin 12's "Refresh upcoming
-  and missing episodes (TheMovieDb)" task is not ported yet.
+  collections and playlists" is gone, as in Jellyfin 12, and Jellyfin 12's "Refresh
+  upcoming and missing episodes (TheMovieDb)" is there.
+- **Missing and unaired episodes** — the TMDb settings page's options from Jellyfin 12:
+  for the TV libraries opted in, a series refresh adds a virtual entry for each episode
+  TheMovieDb lists that has not aired yet and/or each aired one the library lacks (and a
+  virtual season when the library has nothing of a season), keeps them in step with
+  TheMovieDb, and removes them once a file arrives, they age out, or the option is turned
+  off. Off by default, as in Jellyfin.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
   - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half
@@ -114,10 +133,14 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     ffmpeg's expression parser rejects outright — so chapter and thumbnail images cannot
     be extracted for that layout there at all. Ferrofin emits the balanced form, the same
     shape Jellyfin's own half-side-by-side case already has.
+  - **Accepted divergence (a fix, not a gap):** Jellyfin passes every 3D scaler unquoted
+    (`-vf {3}`), and those graphs contain spaces, so the command line is split apart and
+    no 3D layout gets chapter or thumbnail images. Ferrofin quotes the filter graph.
 - **Photos & books** — a home-videos library resolves its images into `Photo` items with
   their EXIF read off the file (camera, exposure, GPS, orientation, date taken); a books
   library resolves `.epub`/`.cbz`/… into `Book` items with `ComicInfo`/`ComicBookInfo`/OPF
-  metadata and the cover extracted from the archive.
+  metadata and the cover extracted from the archive: a comic's from a ZIP, 7z or tar archive
+  whatever its extension (a RAR `.cbr` gets none yet).
 - **Item links & id fields** — the "Links" row (IMDb/TMDB/MusicBrainz/…) and the per-kind
   external-id fields the Identify dialog offers.
 - **Backup & restore.**
@@ -129,7 +152,7 @@ Wired and working, with a documented limitation or lighter verification:
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
-  providers (TMDB similar titles, ListenBrainz similar artists) run only for a library
+  providers (TMDB recommendations, ListenBrainz similar artists) run only for a library
   that ticked them under "Similarity providers", and resolve against items already in the
   library. The local scorer is a single query rather than upstream's six per-kind
   providers, which are identical in behaviour.
@@ -182,8 +205,9 @@ Wired and working, with a documented limitation or lighter verification:
   saves XML metadata into the library (a library whose metadata savers are unset), the
   `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
   playlist stays empty; Ferrofin always reads the entries and never that sidecar.
-  `collection.xml` is still not read or written: Ferrofin's collections are pathless database
-  rows, with membership in the `LinkedChildren` table, as Jellyfin 12 keeps it.
+  `collection.xml` is still not read or written. A collection made in Ferrofin gets
+  Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before that stay
+  folderless), and its membership lives in the `LinkedChildren` table, as Jellyfin 12 keeps it.
 
 ## Not implemented (by design)
 
@@ -281,6 +305,13 @@ and Episode downloader off: a new episode appears about `LibraryMonitorDelay` se
 its file lands (5.1 s with a 5 s delay), and the scan itself takes about 50 ms. Provider
 requests come on top: the new episode's first refresh asks every checked downloader, and
 the season's folder change asks the season providers.
+
+### Accepted divergences (fixes, not gaps)
+
+- **An episode's season and episode numbers are read only from its path below the library
+  folder.** Jellyfin reads the whole path, so a folder above the library named like
+  `media-v12-2` or `disk1-2` puts an episode whose own name has no numbers (a bonus video,
+  say) into season 12 or 1. In Ferrofin that episode stays in the unnumbered season.
 
 ### Known limits
 

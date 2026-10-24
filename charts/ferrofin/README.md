@@ -63,8 +63,10 @@ ingress:
       hosts: [ferrofin.example.com]
 ```
 
-Health probes target Ferrofin's real endpoints (`GET /health/live`, `GET /health/ready`);
-there is no Jellyfin-style `/health`.
+Health probes target Ferrofin's real endpoints: `GET /health/live` is process-only, and
+`GET /health/ready` checks that the database answers. Jellyfin's own `/health` (plain-text
+`Healthy`, or `Unhealthy` with a 503) runs the same check, so healthchecks written for
+Jellyfin keep working.
 
 ## Grafana dashboards
 

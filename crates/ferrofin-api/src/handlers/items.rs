@@ -18,6 +18,9 @@
 //! the persistence layer where portable and otherwise left to later waves; the
 //! handler maps the request faithfully onto the query struct.
 
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, PoisonError};
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -27,8 +30,10 @@ use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, ItemCounts};
+use ferrofin_model::entities::ImageType;
 use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::options::{AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -105,8 +110,9 @@ pub(crate) async fn effective_user_id(
 ///
 /// The id itself comes from [`effective_user_id`] (the full
 /// `RequestHelpers.GetUserId` port, nil-fallback *and* the administrator gate).
-/// A `user_id` that resolves to no account is a `400`; a caller with neither an
-/// explicit id nor an authenticated user is likewise rejected.
+/// A caller with neither an explicit id nor an authenticated user (a nil
+/// effective id) is a `400`, as `GetUserById(Guid.Empty)` throws
+/// `ArgumentException`; an id that resolves to no account is a `404`.
 pub(crate) async fn resolve_user(
     state: &AppState,
     auth: &AuthorizationInfo,
@@ -472,8 +478,10 @@ where
 /// Port of `ItemsController.GetItems` (v12 ItemsController.cs:83-350). The
 /// wide query is mapped onto [`InternalItemsQuery`] and every persistable
 /// filter is honoured by `translate_query`; the controller-side branches
-/// live here: the `UserRootFolder` children answer for a non-recursive,
-/// id-less request (`user_root_children`), the BoxSet/Playlist re-rooting
+/// live here: the `UserRootFolder` children answer for an unfiltered,
+/// non-recursive, id-less request (`user_root_children`) while a filtered one
+/// runs recursively (Jellyfin 12's `HasFilters` dispatch), the library browse
+/// defaults ([`apply_library_browse_defaults`]), the BoxSet/Playlist re-rooting
 /// (`redirect_container_browse`), `ApplyFilters`, `LocationTypes` →
 /// `IsVirtualItem`, the `AllowedTags` ⇒ `Tags` field rule, and
 /// `AddAdditionalDtoOptions`. A non-recursive `parentId` browse of a box-set
@@ -512,6 +520,7 @@ async fn get_items(
     {
         internal.collapse_box_set_items = Some(false);
     }
+    order_search_by_sort_name(&mut internal);
     apply_media_stream_filter_rules(&mut internal);
     // `IsVirtualItem` is driven ONLY by these two parameters on this route
     // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
@@ -535,16 +544,30 @@ async fn get_items(
     // linked-child-ancestor constraint instead (C# ItemsController's
     // `linkedChildAncestorIds` redirect). Without this, the library's
     // Collections tab can never list anything.
+    let mut library = None;
     let (parent_type, folder_policy) =
-        check_parent_visibility(&state, &auth, &mut internal).await?;
+        check_parent_visibility(&state, &auth, &mut internal, &mut library).await?;
     internal.parent_type = parent_type;
     // Reuse the already-loaded parent for SourceType and UserView dispatch;
     // only source consumers that call Folder's policy inherit global flags.
     internal.apply_folder_display_options = folder_policy;
     redirect_container_browse(&state, &mut internal).await;
     // After the re-root, as upstream: it decides on the requested types and
-    // this rewrite on the folder that results.
+    // these rewrites on the folder that results.
     list_playlists_folder_as_playlists(&mut internal);
+    apply_library_browse_defaults(&mut internal, library, query.recursive);
+    // `|| query.HasFilters` (v12.2 ItemsController.cs:592) with
+    // `UserRootFolder.GetItemsInternal` (UserRootFolder.cs:77): at the user
+    // root only an unfiltered request is the plain listing of the user's
+    // libraries; a filtered one runs recursively.
+    if internal.item_ids.is_empty()
+        && (internal.parent_id.is_nil()
+            || internal.parent_type == Some(BaseItemKind::UserRootFolder))
+        && internal.has_filters()
+    {
+        internal.recursive = true;
+        internal.user_root_children = false;
+    }
     if !internal.item_ids.is_empty() {
         // ItemsController clears query.Parent immediately before GetItems.
         // Keep any linked-child ancestor constraint established by the
@@ -575,10 +598,27 @@ async fn get_items(
             options.fields.push(ItemFields::Tags);
         }
     }
-    let dtos = state
-        .dto
-        .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
-        .await?;
+    // A playlist's or box set's own listing is its linked children
+    // (`Folder.GetItemsInternal` → `GetChildren` → `GetLinkedChildren(user)`),
+    // which upstream resolves with every field loaded; a recursive listing is
+    // the repository query, loaded with the client's fields.
+    let linked_children = !internal.recursive
+        && internal.item_ids.is_empty()
+        && matches!(
+            internal.parent_type,
+            Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+        );
+    let dtos = if linked_children {
+        state
+            .dto
+            .get_linked_children_dtos(&result.items, &options, internal.user.as_ref())
+            .await?
+    } else {
+        state
+            .dto
+            .get_base_item_dtos(&result.items, &options, internal.user.as_ref(), None, true)
+            .await?
+    };
     Ok(Json(QueryResult::new(
         Some(result.start_index),
         Some(result.total_record_count),
@@ -611,6 +651,59 @@ fn list_playlists_folder_as_playlists(internal: &mut InternalItemsQuery) {
         if internal.user.is_some() {
             reroot_to_user_root(internal);
         }
+    }
+}
+
+/// A library (`ICollectionFolder`) parent's defaults (v12.2
+/// ItemsController.cs:326-340): a `boxsets` library browsed with no item
+/// types lists box sets, and an item-typed browse that did not choose
+/// `recursive` lists the library's contents recursively rather than just its
+/// immediate children. `library` is `Some(is_boxsets)` only when the requested
+/// parent is itself a library ([`library_is_boxsets`]); a view that delegates
+/// to one is not, and a re-rooted browse no longer has a library parent.
+fn apply_library_browse_defaults(
+    internal: &mut InternalItemsQuery,
+    library: Option<bool>,
+    requested_recursive: Option<bool>,
+) {
+    let Some(is_boxsets) = library else {
+        return;
+    };
+    if internal.parent_id.is_nil() {
+        return;
+    }
+    if internal.include_item_types.is_empty() && is_boxsets {
+        internal.include_item_types = vec![BaseItemKind::BoxSet];
+    }
+    if !internal.include_item_types.is_empty() && requested_recursive.is_none() {
+        internal.recursive = true;
+        internal.user_root_children = false;
+    }
+}
+
+/// Leads a searched query's sort keys with `SortName` ascending.
+///
+/// v12.2 `ItemsController.GetItems` (ItemsController.cs:596-600) orders a
+/// searched page by the search providers' score, then `SortName`, with a
+/// stable in-memory sort of what `folder.GetItems` returned in the caller's
+/// order — so the caller's `sortBy` only orders rows tied on both. The
+/// repository's search branch (v12.2 `ApplyOrder`) emits the relevance rank,
+/// then these keys (the leading `SortName` earning its `Name` tiebreaker), so
+/// this reproduces that order with the relevance rank standing in for the
+/// provider score until those providers are ported (gl-450). The extra `Name`
+/// term only reorders rows tied on `SortName`. Upstream falls back to `ApplyOrder` alone when no provider
+/// returns a candidate; that fallback belongs to the same port.
+pub(crate) fn order_search_by_sort_name(internal: &mut InternalItemsQuery) {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    if internal
+        .search_term
+        .as_deref()
+        .is_some_and(|term| !term.trim().is_empty())
+    {
+        internal
+            .order_by
+            .insert(0, (ItemSortBy::SortName, SortOrder::Ascending));
     }
 }
 
@@ -755,7 +848,15 @@ async fn get_item(
             .await?
             .ok_or_else(|| ApiError::NotFound("user root folder".into()))?
     } else {
-        require_visible_item(&state, item_id, Some(&user)).await?
+        let item = require_visible_item(&state, item_id, Some(&user)).await?;
+        // A refresh that finished rewrote the row: answer with what it found.
+        // Upstream refreshes the object it already checked and builds the DTO
+        // from it, so the access check is not asked again.
+        if refresh_on_demand_if_needed(&state, item_id, &item).await? {
+            state.library.get_item_by_id(item_id).await?.unwrap_or(item)
+        } else {
+            item
+        }
     };
     // A single-item fetch backs a detail page, so return the full DTO (overview,
     // genres, people, studios, tags, …) — the field-gated data jellyfin-web's
@@ -767,6 +868,137 @@ async fn get_item(
         .get_base_item_dto(&item, &options, Some(&user), None)
         .await?;
     Ok(Json(dto))
+}
+
+/// `UserLibraryController.RefreshOnDemandTimeout`: how long a page view waits
+/// for a person's on-demand refresh.
+const REFRESH_ON_DEMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long ago a person must have been refreshed for its page view to
+/// refresh it again (C# `(DateTime.UtcNow - item.DateLastRefreshed).TotalDays
+/// < 3` skips it).
+const REFRESH_ON_DEMAND_AFTER: chrono::TimeDelta = chrono::TimeDelta::days(3);
+
+/// The persons whose on-demand refresh is running. A page view of one of
+/// them starts no second refresh; upstream's would run its own beside it.
+static PERSON_REFRESHES: Mutex<BTreeSet<Uuid>> = Mutex::new(BTreeSet::new());
+
+/// A person's place in [`PERSON_REFRESHES`], given up when its refresh ends.
+struct PersonRefresh(Uuid);
+
+impl PersonRefresh {
+    /// Claims `item_id`, or `None` while a refresh of it is running.
+    fn claim(item_id: Uuid) -> Option<Self> {
+        let mut running = PERSON_REFRESHES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // `then`, not `then_some`: a claim built and dropped here, as an
+        // eager one is when the person is taken, would lock the set again.
+        running.insert(item_id).then(|| Self(item_id))
+    }
+}
+
+impl Drop for PersonRefresh {
+    fn drop(&mut self) {
+        PERSON_REFRESHES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Port of `UserLibraryController.RefreshOnDemandIfNeeded`: a person shown
+/// without an overview or a primary image, and not refreshed for three days,
+/// is refreshed in full (metadata and images, saved) before its page is
+/// answered, for at most [`REFRESH_ON_DEMAND_TIMEOUT`].
+///
+/// The refresh runs on a task of its own, which the page only waits for.
+/// Upstream cancels the refresh when the timeout fires or the client hangs
+/// up, and on the timeout queues a new one at high priority. Dropping the
+/// refresh part way here could leave its image files written without their
+/// rows, or its row saved without its provider ids, so a page that stops
+/// waiting leaves the refresh to finish instead, with no second one queued.
+/// While it runs, another view of the person is answered at once, without
+/// starting another ([`PERSON_REFRESHES`]). The task logs a failure itself
+/// only when no page is left to report it.
+///
+/// Returns whether the refresh finished in time, so the caller re-reads the
+/// row it rewrote.
+async fn refresh_on_demand_if_needed(
+    state: &AppState,
+    item_id: Uuid,
+    item: &BaseItemEntity,
+) -> Result<bool, ApiError> {
+    if BaseItemKind::from_stored_type_name(&item.type_) != Some(BaseItemKind::Person) {
+        return Ok(false);
+    }
+    let refreshed_lately = item
+        .date_last_refreshed
+        .is_some_and(|at| Utc::now() - at < REFRESH_ON_DEMAND_AFTER);
+    if refreshed_lately {
+        return Ok(false);
+    }
+    let has_overview = item
+        .overview
+        .as_deref()
+        .is_some_and(|overview| !overview.trim().is_empty());
+    let has_metadata = has_overview
+        && state
+            .library
+            .get_item_images(item_id)
+            .await?
+            .iter()
+            .any(|image| image.image_type == ImageType::Primary);
+    if has_metadata {
+        return Ok(false);
+    }
+    let Some(claim) = PersonRefresh::claim(item_id) else {
+        return Ok(false);
+    };
+    let options = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        image_refresh_mode: MetadataRefreshMode::FullRefresh,
+        force_save: true,
+        ..MetadataRefreshOptions::default()
+    };
+    let providers = Arc::clone(&state.providers);
+    let (outcome, waiting) = tokio::sync::oneshot::channel();
+    // Background work starts its own trace (LOGGING.md §4).
+    let span = tracing::info_span!(
+        parent: None,
+        "person_refresh",
+        item_id = %item_id,
+        trigger = "item_page"
+    );
+    tokio::spawn(tracing::Instrument::instrument(
+        async move {
+            let _claim = claim;
+            let refreshed = providers.refresh_single_item(item_id, &options).await;
+            // A provider's failure is counted inside the refresh, not
+            // returned, so an error here is the store's: the queued
+            // refresh's `warn!` ("queued metadata refresh failed").
+            if let Err(Err(error)) = outcome.send(refreshed) {
+                tracing::warn!(%error, "on-demand person refresh failed");
+            }
+        },
+        span,
+    ));
+    match tokio::time::timeout(REFRESH_ON_DEMAND_TIMEOUT, waiting).await {
+        Ok(Ok(refreshed)) => {
+            refreshed?;
+            Ok(true)
+        }
+        Ok(Err(_ended)) => Err(ApiError::Service(
+            ferrofin_traits::error::ServiceError::Backend("person refresh task panicked".into()),
+        )),
+        Err(_elapsed) => {
+            tracing::debug!(
+                %item_id,
+                "person refresh still running; answering the page without it"
+            );
+            Ok(false)
+        }
+    }
 }
 
 /// `LibraryController.DeleteItem`'s gate (`LibraryController.cs:386-389` at
@@ -1050,7 +1282,7 @@ async fn translate_parent_item(
         return Ok(Some(item.clone()));
     }
     // Candidate group 1: the `CollectionFolder` views.
-    let folders = state.virtual_folders.get_virtual_folders().await?;
+    let folders = state.virtual_folders.library_folders().await?;
     let Some(view_id) = folders
         .iter()
         .find(|vf| vf.locations.iter().any(|loc| loc == path))
@@ -1456,10 +1688,13 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
 /// ItemsController uses IsVisible on its explicit parent, not standalone
 /// lookup. It returns 401 for a hidden parent, and API keys bypass this gate.
 /// Container-only browses re-root to UserRootFolder before the upstream check.
+/// Whether the parent is itself a library, and a `boxsets` one, is left in
+/// `library` for the library browse defaults ([`apply_library_browse_defaults`]).
 async fn check_parent_visibility(
     state: &AppState,
     auth: &AuthorizationInfo,
     query: &mut InternalItemsQuery,
+    library: &mut Option<bool>,
 ) -> Result<(Option<BaseItemKind>, bool), ApiError> {
     use ferrofin_model::data::CollectionType;
 
@@ -1510,6 +1745,7 @@ async fn check_parent_visibility(
                 .is_some_and(|id| !id.is_nil())
     };
     if kind != "UserView" {
+        *library = library_is_boxsets(&parent);
         return Ok((kind_from(&parent), !is_channel(&parent)));
     }
 
@@ -1520,15 +1756,17 @@ async fn check_parent_visibility(
     let (view_type, parent_id) = user_view_browse_context(&parent);
     let direct = user_view_uses_direct_items(view_type);
     if direct {
-        // These simple direct builders set their kind and recursive mode
-        // regardless of the request, then forward explicit collapse to SQL.
-        // Their automatic global grouping policy is intentionally absent.
-        if let Some(kind) = match view_type {
-            Some(CollectionType::Moviemovies) => Some(BaseItemKind::Movie),
-            Some(CollectionType::Tvshowseries) => Some(BaseItemKind::Series),
+        // These simple direct builders (`GetMovieMovies`, `GetTvSeries`,
+        // `GetBooks`) set their kinds and recursive mode regardless of the
+        // request, then forward explicit collapse to SQL. Their automatic
+        // global grouping policy is intentionally absent.
+        if let Some(kinds) = match view_type {
+            Some(CollectionType::Moviemovies) => Some(vec![BaseItemKind::Movie]),
+            Some(CollectionType::Tvshowseries) => Some(vec![BaseItemKind::Series]),
+            Some(CollectionType::books) => Some(vec![BaseItemKind::Book, BaseItemKind::AudioBook]),
             _ => None,
         } {
-            query.include_item_types = vec![kind];
+            query.include_item_types = kinds;
             query.recursive = true;
             query.user_root_children = false;
         }
@@ -1604,6 +1842,24 @@ fn user_view_browse_context(
                 .filter(|id| !id.is_nil())
         });
     (view_type, parent_id)
+}
+
+/// When the requested parent is itself a library (`ICollectionFolder`),
+/// whether it is a `boxsets` one, from its `Data.CollectionType` read
+/// case-insensitively as the other readers do; `None` for any other row.
+fn library_is_boxsets(parent: &BaseItemEntity) -> Option<bool> {
+    (parent.type_.rsplit('.').next() == Some("CollectionFolder")).then(|| {
+        parent
+            .data
+            .as_deref()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+            .and_then(|data| {
+                data.get("CollectionType")?
+                    .as_str()
+                    .map(|kind| kind.eq_ignore_ascii_case("boxsets"))
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// These UserView builders use direct item selection rather than Folder policy.
@@ -1687,21 +1943,22 @@ async fn redirect_container_browse(
     }
     // A browse of the boxsets/playlists library itself keeps plain parent
     // scoping (C# `itemCollectionType != targetCollectionType`).
-    let parent_collection_type = state
-        .virtual_folders
-        .get_virtual_folders()
-        .await
-        .ok()
-        .and_then(|folders| {
-            folders
-                .into_iter()
-                .find(|vf| {
-                    vf.item_id
-                        .as_deref()
-                        .is_some_and(|id| id.eq_ignore_ascii_case(&parent.id))
-                })
-                .and_then(|vf| vf.collection_type)
-        });
+    let parent_collection_type =
+        state
+            .virtual_folders
+            .library_folders()
+            .await
+            .ok()
+            .and_then(|folders| {
+                folders
+                    .iter()
+                    .find(|vf| {
+                        vf.item_id
+                            .as_deref()
+                            .is_some_and(|id| id.eq_ignore_ascii_case(&parent.id))
+                    })
+                    .and_then(|vf| vf.collection_type)
+            });
     if target_collection_type.is_some() && parent_collection_type == target_collection_type {
         return;
     }

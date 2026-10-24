@@ -191,8 +191,11 @@ PCM, or ≤ 16 sampled stills ≤ 320 px per call. Fingerprinting, loudness, sil
 black-frame detection — and analyses nobody has written yet — are all guest code over
 these windows; extraction runs under a global decode budget (`FERROFIN_WASM_ANALYSIS_CONCURRENCY`,
 default a quarter of the cores) so plugin analysis never starves transcodes. Plugins that declare `scan-targets` are
-offered each new matching item exactly once by the "Plugin media analysis" dashboard
-task. Why a host-driven pass instead of each plugin polling `query-items` with its own
+offered each new matching item once by the "Plugin media analysis" dashboard
+task. When the plugin's circuit breaker stops a pass, the items it did not reach are
+offered after the restart, and an item sharing the cut-off item's creation time (or, on
+a first pass, an undated one) can be offered again, so analysis must be idempotent.
+Why a host-driven pass instead of each plugin polling `query-items` with its own
 cursor (which the 0.3 surface already allowed): the offer-once watermark lives under a
 `host:`-reserved state key a guest can neither read nor rewind (a self-managed cursor
 could be rewound to re-burn the shared decode budget), disabled plugins are centrally
@@ -213,6 +216,10 @@ plugins like Home Screen Sections possible):
   controllers); the caller's resolved identity (`user-id`, `is-admin`,
   `is-authenticated`) is forwarded — never a token — and the plugin gates its own
   sensitive paths. Inbound bodies are capped at 1 MiB; a disabled plugin's URL space 404s.
+  Requests never wait for the plugin: together they may hold at most half of its queue
+  (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`), queued or running, and past that, or when the
+  queue is full, the server answers `503` at once. So a flood of anonymous requests cannot
+  starve the scans, tasks and events that share the queue.
 - **`web-transforms`** — declared literal search/replace patches the server applies to
   matching `/web` files while the plugin is enabled (capped: 16 per plugin, 256 KiB per
   text). This is how a plugin injects its client-side hooks into jellyfin-web.
@@ -384,7 +391,10 @@ removes the server-as-network-pivot risk; grant a specific trusted plugin privat
 access with `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` (comma-separated plugin UUIDs, or `*`).
 The private-address check also **pins the vetted address on the connection
 itself** (the request resolves to the address that was checked, not a second
-DNS answer), closing the classic DNS-rebinding TOCTOU. (Referencing plugins by
+DNS answer), closing the classic DNS-rebinding TOCTOU. When the server's
+environment sets an HTTP proxy (`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`), the proxy
+resolves the destination itself: the check then runs on the server's own DNS answer before
+the request is sent, and the pin covers the hosts the proxy settings exclude. (Referencing plugins by
 UUID in the allowlist is acknowledged UX debt — accepting plugin names is a
 planned improvement.)
 
@@ -392,8 +402,8 @@ planned improvement.)
 plugin's declared `web-transforms` rewrite served jellyfin-web files for all
 users — a strictly larger grant than settings pages (admin-only) or plugin
 routes (opt-in fetches). It is the single strongest reason to install only
-plugins you trust; a disabled plugin's transforms are not applied
-(restart-required, like everything decided at boot).
+plugins you trust; a disabled or uninstalled plugin's transforms stop
+applying at once, and enabling a plugin starts them, with no restart.
 
 **Settings pages are outside the sandbox.** A plugin's `config-pages` HTML/JS
 executes in the **admin's browser with the admin's session** — the same trust
@@ -478,9 +488,8 @@ Two things to know:
 - **The opt-out is per plugin, by disabling it** (or removing the repository). Upstream
   honours an `AutoUpdate` flag in each installed plugin's manifest; Ferrofin's WASM
   artifacts carry no such manifest, so a disabled plugin is what the task skips. Disabling
-  takes effect live for tasks, providers and analysis, and keeps the plugin installed and
-  inert; a plugin's **web transforms** are wired at boot, so disarming those needs a
-  restart.
+  takes effect live for tasks, providers, analysis and the plugin's **web transforms**,
+  and keeps the plugin installed and inert.
 
 ## Roadmap
 

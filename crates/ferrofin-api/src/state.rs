@@ -57,6 +57,9 @@ pub fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
 /// may be bracketed; both spellings are read. An entry that is neither is
 /// dropped rather than ending the walk, since a proxy that writes an obfuscated
 /// identifier should not silently pin the client to the hop before it.
+///
+/// TODO(gl-184): end the walk at such an entry, as ASP.NET's `ApplyForwarders`
+/// and [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers) do.
 #[must_use]
 pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
     headers
@@ -70,7 +73,7 @@ pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
 
 /// One `X-Forwarded-For` entry as an address.
 #[must_use]
-fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
+pub(crate) fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
     if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
         return Some(normalize_ip(ip));
     }
@@ -97,6 +100,10 @@ pub struct Inner {
         String,
         Arc<dyn ferrofin_common::configuration::ValidatingConfiguration + Send + Sync>,
     >,
+    /// Checks run after every committed named save, registered by the
+    /// composition root (Jellyfin's `NamedConfigurationUpdated` handlers).
+    pub committed_configuration_checks:
+        Vec<Arc<dyn ferrofin_common::configuration::CommittedConfigurationCheck>>,
     /// The network policy — which peers count as local, and which remote ones
     /// may reach the server at all (`RemoteIPFilter`).
     ///
@@ -106,6 +113,14 @@ pub struct Inner {
     /// `NetworkManager::update_settings` rewrites its caches when an admin
     /// saves the network configuration.
     pub network: Option<Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>>,
+    /// Floor for a dashboard WebSocket stream's push period (Sessions /
+    /// ScheduledTasksInfo / ActivityLogEntry). The client names the period in
+    /// its `*Start` subscription and it is clamped up to this value, because
+    /// Ferrofin drives these streams on a timer rather than off events. Set by
+    /// the composition root from `FERROFIN_WS_MIN_STREAM_PERIOD_MS` via
+    /// [`AppState::with_websocket_min_stream_period`]; defaults to
+    /// [`crate::handlers::websocket::DEFAULT_WS_MIN_STREAM_PERIOD`].
+    pub websocket_min_stream_period: std::time::Duration,
     /// Library catalogue queries and item resolution.
     pub library: Arc<dyn LibraryManager>,
     /// User accounts, authentication policy, and profiles.
@@ -187,6 +202,11 @@ pub struct Inner {
     /// Defaults to the disabled stub; the composition root injects the
     /// ffmpeg-backed `SubtitleEncoderImpl`.
     pub subtitle_encoder: Arc<dyn SubtitleEncoder>,
+    /// The encoders the probed ffmpeg has, which the playback negotiation
+    /// asks before offering an audio transcode (`ITranscoderSupport`).
+    /// Defaults to none, a server without ffmpeg; the composition root
+    /// injects the probed set.
+    pub encoder_support: Arc<dyn ferrofin_traits::media_encoding::EncoderSupport>,
     /// The on-disk virtual-folder (library-structure) admin surface backing
     /// `/Library/VirtualFolders*` and `/Library/PhysicalPaths`. Defaults to the
     /// disabled stub (empty reads, rejected writes); the composition root injects
@@ -201,6 +221,10 @@ pub struct Inner {
     /// composition root injects the watcher-backed `FerrofinLibraryMonitor` via
     /// [`AppState::with_library_monitor`].
     pub library_monitor: Arc<dyn LibraryMonitor>,
+    /// The dependency checks behind `/health` and `/health/ready`. Empty by
+    /// default (both always healthy); the composition root injects the
+    /// database check via [`AppState::with_health_checkers`].
+    pub health_checkers: Vec<Arc<dyn ferrofin_health::HealthChecker>>,
     /// The Intro Skipper's per-season analyzer actions
     /// (`/Intros/AnalyzerActions/*`). Defaults to a process-local store; the
     /// composition root injects the database-backed one via
@@ -311,6 +335,22 @@ impl AppState {
         Arc::clone(&self.request_culture)
     }
 
+    /// Sets the floor for dashboard WebSocket stream periods (see
+    /// [`Inner::websocket_min_stream_period`]). The composition root resolves it
+    /// from `FERROFIN_WS_MIN_STREAM_PERIOD_MS`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned), as the other
+    /// `with_*` builders do — it must run before the state is handed out.
+    #[must_use]
+    pub fn with_websocket_min_stream_period(mut self, period: std::time::Duration) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_websocket_min_stream_period must be called before the state is shared");
+        inner.websocket_min_stream_period = period;
+        self
+    }
+
     /// Builds an [`AppState`] from each manager trait object.
     ///
     /// The composition root passes the concrete `ferrofin-core` impls (as
@@ -356,8 +396,13 @@ impl AppState {
             configuration_write_lock: tokio::sync::Mutex::new(()),
             password_reset_lock: tokio::sync::Mutex::new(()),
             configuration_validators: std::collections::HashMap::new(),
+            committed_configuration_checks: Vec::new(),
             // Wired by the composition root via `with_network`.
             network: None,
+            // Overridden by the composition root via
+            // `with_websocket_min_stream_period`; this fallback floors
+            // client-chosen stream periods even on a bare state.
+            websocket_min_stream_period: crate::handlers::websocket::DEFAULT_WS_MIN_STREAM_PERIOD,
             library,
             users,
             user_views,
@@ -403,12 +448,14 @@ impl AppState {
             hls: Arc::new(DisabledHlsStreamManager),
             attachments: Arc::new(ferrofin_traits::stubs::DisabledAttachmentExtractor),
             subtitle_encoder: Arc::new(DisabledSubtitleEncoder),
+            encoder_support: Arc::new(ferrofin_traits::media_encoding::NoEncoders),
             // Default to the disabled virtual-folder store; the composition root
             // overrides it via `with_virtual_folders`.
             virtual_folders: Arc::new(DisabledVirtualFolderManager),
             // Default to the no-op library monitor; the composition root overrides
             // it via `with_library_monitor` once the filesystem watcher is wired.
             library_monitor: Arc::new(NoopLibraryMonitor),
+            health_checkers: Vec::new(),
             intro_skipper: Arc::new(
                 ferrofin_traits::intro_skipper::InMemoryIntroSkipperStore::default(),
             ),
@@ -463,6 +510,24 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_subtitle_encoder must be called before the state is shared");
         inner.subtitle_encoder = subtitle_encoder;
+        self
+    }
+
+    /// Replaces the encoder set the playback negotiation reads with the
+    /// probed ffmpeg's ([`new`](Self::new) installs none).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_encoder_support(
+        mut self,
+        encoder_support: Arc<dyn ferrofin_traits::media_encoding::EncoderSupport>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_encoder_support must be called before the state is shared");
+        inner.encoder_support = encoder_support;
         self
     }
 
@@ -538,6 +603,23 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_library_monitor must be called before the state is shared");
         inner.library_monitor = library_monitor;
+        self
+    }
+
+    /// Replaces the dependency checks run by `/health` and `/health/ready`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_health_checkers(
+        mut self,
+        checkers: Vec<Arc<dyn ferrofin_health::HealthChecker>>,
+    ) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_health_checkers must be called before the state is shared");
+        inner.health_checkers = checkers;
         self
     }
 
@@ -633,6 +715,23 @@ impl AppState {
         self
     }
 
+    /// Adds a check run after every committed named save.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state has already been cloned.
+    #[must_use]
+    pub fn with_committed_configuration_check(
+        mut self,
+        check: Arc<dyn ferrofin_common::configuration::CommittedConfigurationCheck>,
+    ) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("with_committed_configuration_check must precede sharing")
+            .committed_configuration_checks
+            .push(check);
+        self
+    }
+
     /// Wires the network policy so the local-network test and the remote-IP
     /// filter are the CONFIGURED ones rather than a private-range guess.
     ///
@@ -671,6 +770,43 @@ impl AppState {
         self.client_address_for(peer, &forwarded_for(&parts.headers))
     }
 
+    /// [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers)
+    /// under the configured known proxies. Nothing is forwarded without a
+    /// network policy, as Jellyfin forwards nothing without known proxies.
+    #[must_use]
+    pub fn forwarded_request(
+        &self,
+        peer: std::net::IpAddr,
+        headers: &axum::http::HeaderMap,
+    ) -> crate::forwarded_headers::ForwardedRequest {
+        use crate::forwarded_headers::{ForwardedRequest, forwarded_through};
+        self.inner
+            .network
+            .as_deref()
+            .map_or_else(ForwardedRequest::default, |network| {
+                forwarded_through(network, peer, headers)
+            })
+    }
+
+    /// The scheme `parts`' request has (`HttpRequest.Scheme`), lowercased as
+    /// `UriBuilder` writes it: the one known proxies forwarded, else its
+    /// listener's ([`Transport`](crate::forwarded_headers::Transport)), else
+    /// `http`.
+    #[must_use]
+    pub fn request_scheme(&self, parts: &axum::http::request::Parts) -> String {
+        use crate::forwarded_headers::{Transport, effective_scheme};
+        let forwarded = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .and_then(|axum::extract::ConnectInfo(peer)| {
+                self.forwarded_request(peer.ip(), &parts.headers).scheme
+            });
+        effective_scheme(
+            forwarded.as_deref(),
+            parts.extensions.get::<Transport>().copied(),
+        )
+    }
+
     /// [`Self::client_address`] over an already-extracted peer and chain, so the
     /// middleware (which holds a `Request`, not `Parts`) shares the one rule.
     #[must_use]
@@ -679,15 +815,11 @@ impl AppState {
         peer: std::net::IpAddr,
         forwarded_for: &[std::net::IpAddr],
     ) -> std::net::IpAddr {
-        match self.inner.network.as_ref() {
-            Some(network) => network.read().map_or_else(
-                |e| e.into_inner().client_address(peer, forwarded_for),
-                |n| n.client_address(peer, forwarded_for),
-            ),
-            // No policy wired means no known proxies, and upstream ignores the
-            // header entirely in that case.
-            None => peer,
-        }
+        crate::forwarded_headers::client_address_through(
+            self.inner.network.as_deref(),
+            peer,
+            forwarded_for,
+        )
     }
 
     /// Whether `ip` is on the local network.

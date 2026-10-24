@@ -17,7 +17,8 @@
 //! The row's `HomeSection` children round-trip through the same `CustomPrefs`
 //! map as `homesection{n}` keys: the GET emits one per stored section, and the
 //! POST parses them back, substituting the C# per-order default when a value
-//! does not name a `HomeSectionType`. They are loaded and rewritten through the
+//! does not parse as a `HomeSectionType` (`Enum.TryParse`: a name list or an
+//! integer). They are loaded and rewritten through the
 //! display-preferences seam's `list_home_sections`/`set_home_sections`, which
 //! stand in for EF's `.Include(HomeSections)` eager-load.
 
@@ -295,18 +296,17 @@ async fn update_display_preferences(
     prefs.tv_home = take_nullable_pref(&mut dto.custom_prefs, "tvhome");
 
     // Home sections: every `homesection{order}` key is consumed off CustomPrefs
-    // and turned into a `HomeSection` row. A value that does not name a
-    // `HomeSectionType` falls back to the per-order default, and an order at or
-    // beyond that table falls back to `None` — C#
+    // and turned into a `HomeSection` row. A value that does not parse as a
+    // `HomeSectionType` (`enum_try_parse`) falls back to the per-order default,
+    // and an order at or beyond that table falls back to `None` — C#
     // `type = order < 8 ? defaults[order] : HomeSectionType.None;`.
     let mut home_sections: Vec<(i32, i32)> = Vec::new();
     let home_section_keys: Vec<String> = dto
         .custom_prefs
         .keys()
-        .filter(|k| {
-            k.len() > "homesection".len()
-                && k[.."homesection".len()].eq_ignore_ascii_case("homesection")
-        })
+        // A bare `homesection` is left alone: C# matches it too and then
+        // throws on `int.Parse("")`, a 500 not worth porting.
+        .filter(|k| k.len() > "homesection".len() && has_prefix_ignore_case(k, "homesection"))
         .cloned()
         .collect();
     for key in home_section_keys {
@@ -319,7 +319,7 @@ async fn update_display_preferences(
         };
         let type_ = value
             .as_deref()
-            .and_then(home_section_from_name)
+            .and_then(|value| enum_try_parse(value, HomeSectionType::ALL))
             .unwrap_or_else(|| {
                 usize::try_from(order)
                     .ok()
@@ -329,17 +329,21 @@ async fn update_display_preferences(
         home_sections.push((order, type_));
     }
 
-    // `landing-*` keys naming something that is not a `ViewType` are dropped
-    // rather than persisted (C# logs and removes them).
+    // `landing-*` keys: an empty value (jellyfin-web's "default screen") is
+    // dropped silently, one naming something that is not a `ViewType` is
+    // logged and dropped (C#).
     dto.custom_prefs.retain(|key, value| {
-        if key.len() <= "landing-".len()
-            || !key[.."landing-".len()].eq_ignore_ascii_case("landing-")
-        {
+        if !has_prefix_ignore_case(key, "landing-") {
             return true;
         }
-        let valid = value.as_deref().is_some_and(is_view_type_name);
+        let Some(value) = value.as_deref().filter(|v| !v.is_empty()) else {
+            return false;
+        };
+        let valid = is_view_type_name(value);
         if !valid {
-            tracing::error!(landing_screen_option = ?value, "Invalid ViewType");
+            // C# logs this at error; it is bad client input, a warning by
+            // docs/conventions/LOGGING.md.
+            tracing::warn!(landing_screen_option = value, "Invalid ViewType");
         }
         valid
     });
@@ -420,73 +424,49 @@ const HOME_SECTION_DEFAULTS: [i32; 8] = [
 ];
 
 /// The `HomeSectionType` name for a stored discriminant — C#
-/// `homeSection.Type.ToString().ToLowerInvariant()`.
+/// `homeSection.Type.ToString().ToLowerInvariant()`, which writes an unnamed
+/// value (one `Enum.TryParse` stored from an integer) as the number itself.
 fn home_section_name(value: i32) -> String {
     HomeSectionType::try_from(value)
-        .map_or_else(|_| "none".to_owned(), |t| format!("{t:?}").to_lowercase())
+        .map_or_else(|_| value.to_string(), |t| format!("{t:?}").to_lowercase())
 }
 
-/// Parses a `HomeSectionType` name back to its stored discriminant, case
-/// insensitively (C# `Enum.TryParse<HomeSectionType>(value, true, out _)`).
-fn home_section_from_name(name: &str) -> Option<i32> {
-    HOME_SECTION_TYPES
-        .iter()
-        .find(|t| format!("{t:?}").eq_ignore_ascii_case(name))
-        .map(|t| i32::from(*t))
+/// C# `Enum.TryParse<TEnum>(value, ignoreCase: true, out var result)` for an
+/// `int`-backed enum with the members `all`: a value starting with a digit or a
+/// sign is an integer of the underlying type, named or not; anything else is a
+/// comma-separated list of member names, case insensitive, whose values are
+/// OR'd. Surrounding whitespace is ignored; anything else is `None`.
+fn enum_try_parse<T>(value: &str, all: &[T]) -> Option<i32>
+where
+    T: Copy + std::fmt::Debug,
+    i32: From<T>,
+{
+    let value = value.trim();
+    if value.starts_with(|c: char| c.is_ascii_digit() || c == '-' || c == '+') {
+        return value.parse::<i32>().ok();
+    }
+    if value.is_empty() {
+        return None;
+    }
+    value.split(',').try_fold(0, |acc, name| {
+        all.iter()
+            .find(|member| format!("{member:?}").eq_ignore_ascii_case(name.trim()))
+            .map(|member| acc | i32::from(*member))
+    })
 }
 
-/// Every `HomeSectionType` variant, so a name lookup can enumerate them (the
-/// `db_enum!` macro generates only the numeric conversions).
-const HOME_SECTION_TYPES: [HomeSectionType; 10] = [
-    HomeSectionType::None,
-    HomeSectionType::SmallLibraryTiles,
-    HomeSectionType::LibraryButtons,
-    HomeSectionType::ActiveRecordings,
-    HomeSectionType::Resume,
-    HomeSectionType::ResumeAudio,
-    HomeSectionType::LatestMedia,
-    HomeSectionType::NextUp,
-    HomeSectionType::LiveTv,
-    HomeSectionType::ResumeBook,
-];
-
-/// Whether `name` parses as a `ViewType`, case insensitively (C#
-/// `Enum.TryParse<ViewType>(value, true, out _)`).
-fn is_view_type_name(name: &str) -> bool {
-    VIEW_TYPES
-        .iter()
-        .any(|v| format!("{v:?}").eq_ignore_ascii_case(name))
+/// Whether `value` parses as a `ViewType` ([`enum_try_parse`]).
+fn is_view_type_name(value: &str) -> bool {
+    enum_try_parse(value, ViewType::ALL).is_some()
 }
 
-/// Every `ViewType` variant, for the `landing-*` validity check.
-const VIEW_TYPES: [ViewType; 26] = [
-    ViewType::Albums,
-    ViewType::AlbumArtists,
-    ViewType::Artists,
-    ViewType::Channels,
-    ViewType::Collections,
-    ViewType::Episodes,
-    ViewType::Favorites,
-    ViewType::Genres,
-    ViewType::Guide,
-    ViewType::Movies,
-    ViewType::Networks,
-    ViewType::Playlists,
-    ViewType::Programs,
-    ViewType::Recordings,
-    ViewType::Schedule,
-    ViewType::Series,
-    ViewType::Shows,
-    ViewType::Songs,
-    ViewType::Suggestions,
-    ViewType::Trailers,
-    ViewType::Upcoming,
-    ViewType::Authors,
-    ViewType::Books,
-    ViewType::Folders,
-    ViewType::Mixed,
-    ViewType::Photos,
-];
+/// Whether `key` starts with the ASCII `prefix`, ignoring case (C#
+/// `StartsWith(prefix, StringComparison.OrdinalIgnoreCase)`). Never slices
+/// inside a multi-byte character.
+fn has_prefix_ignore_case(key: &str, prefix: &str) -> bool {
+    key.get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+}
 
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {

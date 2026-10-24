@@ -58,6 +58,7 @@ serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 utoipa.workspace = true
 uuid.workspace = true
+url.workspace = true
 tracing.workspace = true
 # Read the OTel trace_id off the request span for log↔trace correlation. No
 # exporter here — that lives in ferrofin-server; these are API-only helpers.
@@ -72,7 +73,7 @@ ferrofin-api = { path = ".", features = ["test-util"] }
 async-trait.workspace = true
 serde_json.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # The /socket tests drive a real WebSocket against a real listener — the
 # push path cannot be exercised through `tower::oneshot`.
 tokio-tungstenite.workspace = true

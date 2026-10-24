@@ -246,6 +246,8 @@ fn ok_auth_info() -> AuthorizationInfo {
             enable_video_playback_transcoding: false,
             enable_audio_playback_transcoding: false,
             enable_playback_remuxing: false,
+            // Upstream's default, so a remote peer reaches the route.
+            enable_remote_access: true,
             ..ferrofin_model::users::UserPolicy::default()
         })),
         is_authenticated: true,
@@ -843,6 +845,65 @@ async fn video_master_playlist_returns_m3u8() {
     assert_eq!(resp.headers().get("expires").unwrap(), "0");
     let body = body_string(resp).await;
     assert!(body.contains("#MASTER"));
+}
+
+/// `DynamicHlsHelper` decides locality from `GetNormalizedRemoteIP()` (the
+/// client behind a known proxy) with `INetworkManager.IsInLocalNetwork` (the
+/// configured LAN subnets), not from the raw TCP peer and a fixed private
+/// range: a client behind the proxy is remote, a private address outside the
+/// configured subnets is remote, and a connection with no peer address is
+/// not local.
+#[tokio::test]
+async fn master_playlist_locality_follows_the_network_policy() {
+    let config = ferrofin_networking::NetworkConfiguration {
+        known_proxies: vec!["10.0.0.1".to_owned()],
+        local_network_subnets: vec!["192.168.50.0/24".to_owned()],
+        ..ferrofin_networking::NetworkConfiguration::default()
+    };
+    let rec = Arc::new(Recorded::default());
+    let state = build_state(
+        ok_hls("/nonexistent", rec.clone()),
+        Arc::new(FakeAttachments {
+            mime: None,
+            data: vec![],
+        }),
+        Arc::new(ItemLibrary { present: true }),
+    )
+    .with_network(Arc::new(std::sync::RwLock::new(
+        ferrofin_networking::NetworkManager::with_defaults(config, ""),
+    )));
+    let router = create_router(state);
+    for (peer, forwarded, local) in [
+        (Some("10.0.0.1:5000"), Some("203.0.113.9"), false),
+        (Some("192.168.1.5:5000"), None, false),
+        (Some("192.168.50.7:5000"), None, true),
+        (Some("10.0.0.1:5000"), Some("192.168.50.7"), true),
+        (None, None, false),
+    ] {
+        let mut request = authed(
+            "GET",
+            &format!(
+                "/Videos/{ITEM_ID}/master.m3u8?deviceId=dev1&playSessionId=s1&mediaSourceId=src9"
+            ),
+        );
+        if let Some(peer) = peer {
+            request.extensions_mut().insert(axum::extract::ConnectInfo(
+                peer.parse::<std::net::SocketAddr>().expect("peer"),
+            ));
+        }
+        if let Some(forwarded) = forwarded {
+            request
+                .headers_mut()
+                .insert("X-Forwarded-For", forwarded.parse().expect("header value"));
+        }
+        let resp = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let last = rec.last.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            last.is_in_local_network, local,
+            "peer {peer:?} forwarded {forwarded:?}"
+        );
+    }
 }
 
 /// The contract spells the caps `videoBitRate`/`audioBitRate` and the manifest
@@ -1454,6 +1515,49 @@ async fn invalid_progressive_containers_are_rejected_before_dispatch() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
     }
     assert!(rec.last.lock().unwrap().is_none());
+}
+
+/// `subtitleCodec` is bound with `[RegularExpression(ContainerValidationRegexStr)]`
+/// on the stream routes (`VideosController.cs:363`), like the container and
+/// the other codecs: its first entry is written into the ffmpeg command line,
+/// so a value outside the pattern is a 400 before anything runs.
+#[tokio::test]
+async fn invalid_subtitle_codecs_are_rejected_before_dispatch() {
+    let rec = Arc::new(Recorded::default());
+    let app = router_no_static(ok_hls("/unused", Arc::clone(&rec)));
+    for path in [
+        format!("/Videos/{ITEM_ID}/stream?SubtitleCodec=ass%20-f%20null%20-"),
+        format!("/Videos/{ITEM_ID}/stream.mkv?subtitleCodec=a%3Bb"),
+        format!("/Videos/{ITEM_ID}/stream.mkv?SubtitleCodec=..%2Fout"),
+    ] {
+        let response = app.clone().oneshot(authed("HEAD", &path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+    }
+    assert!(rec.last.lock().unwrap().is_none());
+}
+
+/// The subtitle codec list reaches the request whatever the key's case
+/// (`StreamInfo` writes `SubtitleCodec`; the binding ignores case).
+#[tokio::test]
+async fn the_subtitle_codec_list_binds_in_any_key_case() {
+    for key in ["SubtitleCodec", "subtitleCodec"] {
+        let rec = Arc::new(Recorded::default());
+        let app = router_no_static(ok_hls("/unused", Arc::clone(&rec)));
+        let path = format!("/Videos/{ITEM_ID}/stream.mkv?{key}=ass,srt");
+        let response = app.oneshot(authed("HEAD", &path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{key}");
+        assert_eq!(
+            rec.last
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .subtitle_codec
+                .as_deref(),
+            Some("ass,srt"),
+            "{key}"
+        );
+    }
 }
 
 #[tokio::test]
