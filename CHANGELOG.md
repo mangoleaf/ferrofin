@@ -239,6 +239,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   An SSA script's italic, bold, underline and colour tags reach every format as HTML tags.
   Unlike Jellyfin, a script's `Comment:` events never show up as subtitle lines. A WebVTT
   file converted to ASS does not get Jellyfin's style conversion yet
+- `/System/Configuration/{key}` knows Jellyfin's named configurations only: `branding`,
+  `encoding`, `network`, `metadata`, `xbmcmetadata`, `livetv` and `database`. Reading any other
+  key is a 404, as in Jellyfin (it was a 501, or a file a save had left behind), and saving one
+  fails as Jellyfin's does instead of writing a file. `database` reads as the SQLite provider
+  Ferrofin runs on, and saving it is refused (400), since no other provider can be used
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

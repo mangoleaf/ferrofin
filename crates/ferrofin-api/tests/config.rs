@@ -618,8 +618,10 @@ async fn named_configuration_branding_and_unknown() {
     // Branding serializes as an object.
     assert!(json(&b1).is_object());
 
+    // `GetConfiguration` throws `ResourceNotFoundException` for a key no store
+    // is registered under, which Jellyfin's exception middleware answers 404.
     let (s2, _) = get(full_state(), "/System/Configuration/unknownkey").await;
-    assert_eq!(s2, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(s2, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -973,22 +975,61 @@ async fn invalid_core_configurations_return_defaults_and_report_the_section() {
     }
 }
 
+/// Only Jellyfin's registered stores are named configurations. A key none is
+/// registered under is not found on read (`ResourceNotFoundException`), even
+/// when a file of that name was left behind, and a save fails in
+/// `GetConfigurationType`'s `First()` (`InvalidOperationException`, `500`)
+/// without writing anything.
 #[tokio::test]
-async fn plugin_named_configuration_keeps_its_own_shape() {
+async fn an_unregistered_named_configuration_is_neither_served_nor_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    write_named_config(dir.path(), "plugin-owned", br#"{"CustomSetting":1}"#);
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+    for uri in [
+        "/System/Configuration/plugin-owned",
+        "/System/Configuration/never-saved",
+        "/System/Configuration/not.a.key",
+    ] {
+        let (status, _) = get(app.clone(), uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+
+    let document = serde_json::json!({"CustomSetting":{"NestedValue":[1,"two",false]}});
+    assert_eq!(
+        post(app, "/System/Configuration/never-saved", &document).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(!dir.path().join("named/never-saved.json").exists());
+}
+
+/// Jellyfin's `database` store selects its database provider; Ferrofin runs on
+/// SQLite only. A read answers what Jellyfin writes on its first start, and a
+/// save is refused, because no other provider could be honoured.
+#[tokio::test]
+async fn the_database_configuration_is_sqlite_and_cannot_be_changed() {
     let dir = tempfile::tempdir().unwrap();
     let app = admin_state_with_paths(StubPaths {
         log_dir: String::new(),
         config_dir: dir.path().to_string_lossy().into_owned(),
     });
-    let uri = "/System/Configuration/plugin-owned";
-    let document = serde_json::json!({"CustomSetting":{"NestedValue":[1,"two",false]}});
-    assert_eq!(
-        post(app.clone(), uri, &document).await,
-        StatusCode::NO_CONTENT
-    );
-    let (status, body) = get(app, uri).await;
+
+    let (status, body) = get(app.clone(), "/System/Configuration/Database").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json(&body), document);
+    assert_eq!(
+        json(&body),
+        serde_json::json!({"DatabaseType": "Jellyfin-SQLite", "LockingBehavior": "NoLock"})
+    );
+
+    let document =
+        serde_json::json!({"DatabaseType": "Jellyfin-PgSql", "LockingBehavior": "Optimistic"});
+    assert_eq!(
+        post(app, "/System/Configuration/database", &document).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(!dir.path().join("named/database.json").exists());
 }
 
 /// A Live TV manager whose two configuration reads fail (backend down).

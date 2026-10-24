@@ -6,11 +6,15 @@
 //! - `POST /System/Configuration/Branding` — update the branding config.
 //! - `GET`/`POST /System/Configuration/{key}` — a *named* configuration.
 //!
-//! Named configurations are Jellyfin's pluggable per-key config store. `branding`
-//! has a dedicated typed store; other keys use per-key files at
-//! `{config}/users/named/{key}.json`. Core sections bind through typed
-//! JsonDefaults converters before persistence and return typed documents on
-//! reads. Plugin-owned documents keep their raw shape.
+//! Named configurations are Jellyfin's pluggable per-key config store, and a
+//! key is one only while a store is registered under it: `branding`,
+//! `encoding`, `network`, `metadata`, `xbmcmetadata`, `livetv` and `database`.
+//! Any other key is not found on read (`404`) and fails on save (`500`), as
+//! upstream. `branding`
+//! has a dedicated typed store; the others use per-key files at
+//! `{config}/users/named/{key}.json`, except `database`, which is SQLite and
+//! read-only. They bind through typed JsonDefaults converters before
+//! persistence and return typed documents on reads.
 //!
 //! Every route is `[Authorize]` (writes additionally `RequiresElevation`), which
 //! collapses to authentication at this layer via [`RequireAuth`].
@@ -196,8 +200,9 @@ fn load_named_configuration<T: serde::de::DeserializeOwned + Default>(
 /// Port of `ConfigurationController.GetNamedConfiguration`. `branding` keeps its
 /// dedicated typed store; other core keys load their DTO from the per-key
 /// store (`{config}/users/named/{key}.json`). Omitted members receive defaults,
-/// and invalid documents fall back with a warning. Plugin-owned keys retain
-/// their raw shape; an unknown, never-saved key is still `501`.
+/// and invalid documents fall back with a warning. `database` is the SQLite
+/// document Jellyfin writes on its first start. A key no store is registered
+/// under is `404`, as `GetConfiguration`'s `ResourceNotFoundException` is.
 #[utoipa::path(
     get,
     path = "/System/Configuration/{key}",
@@ -291,7 +296,14 @@ async fn get_named_configuration(
         "xbmcmetadata" => to_value(serde_json::to_value(load_named_configuration::<
             XbmcMetadataOptions,
         >(&key, saved)))?,
-        _ => saved.ok_or(ApiError::NotImplemented)?,
+        "database" => to_value(serde_json::to_value(
+            ferrofin_model::configuration::DatabaseConfigurationOptions::default(),
+        ))?,
+        _ => {
+            return Err(ApiError::NotFound(format!(
+                "Configuration with key {key} not found."
+            )));
+        }
     };
     Ok(Json(value))
 }
@@ -346,17 +358,30 @@ fn normalize_named_configuration(key: &str, raw: &str) -> Result<Value, ApiError
         "metadata" => typed::<MetadataConfiguration>(raw),
         "xbmcmetadata" => typed::<XbmcMetadataOptions>(raw),
         "livetv" => typed::<ferrofin_model::live_tv::LiveTvOptions>(raw),
-        // Plugin-owned documents have no core DTO: retain their existing store.
-        _ => serde_json::from_str(raw).map_err(|error| configuration_error(&error)),
+        // Jellyfin's `database` store picks the database provider for the next
+        // start. Ferrofin runs on SQLite only, so a saved choice could never be
+        // honoured; refuse it rather than keep a setting that does nothing.
+        "database" => Err(ApiError::BadRequest(
+            "Ferrofin runs on SQLite only, so the database configuration cannot be changed."
+                .to_owned(),
+        )),
+        // `GetConfigurationType` looks the store up with `First()`, which throws
+        // `InvalidOperationException` for a key none is registered under; the
+        // exception middleware answers that 500.
+        _ => Err(ferrofin_traits::error::ServiceError::backend(format!(
+            "no configuration store is registered under the key {key}"
+        ))
+        .into()),
     }
 }
 
 /// `POST /System/Configuration/{key}` — update a named configuration.
 ///
 /// Port of `ConfigurationController.UpdateNamedConfiguration` (elevation-gated).
-/// Known keys bind through their configuration DTO with exact member names
-/// and JsonDefaults value conversion before being saved. Plugin-owned keys
-/// retain their generic JSON store.
+/// Registered keys bind through their configuration DTO with exact member
+/// names and JsonDefaults value conversion before being saved. `database` is
+/// refused (`400`), and a key no store is registered under fails (`500`), as
+/// upstream's store lookup does.
 #[utoipa::path(
     post,
     path = "/System/Configuration/{key}",
