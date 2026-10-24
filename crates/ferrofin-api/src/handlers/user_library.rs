@@ -23,11 +23,10 @@
 //!
 //! The `UserData` reads and writes check `AssertCanUpdateUser` with the
 //! user-preference restriction, as `ItemsController` does
-//! ([`super::users::assert_can_update_user`]). TODO(parity, open work item
-//! gl-174): the person on-demand metadata refresh
-//! (`RefreshItemOnDemandIfNeeded`) is not ported. `GET /Items/Latest` is the
-//! full `GetLatestMedia` port (the grouping lives in the
-//! [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
+//! ([`super::users::assert_can_update_user`]). The person on-demand metadata
+//! refresh (`RefreshOnDemandIfNeeded`) runs in `items::get_item`, which both
+//! item routes reach. `GET /Items/Latest` is the full `GetLatestMedia` port (the
+//! grouping lives in the [`UserViewManager`](ferrofin_traits::library::UserViewManager)).
 
 use axum::extract::{Path, State};
 use axum::routing::{get, post};

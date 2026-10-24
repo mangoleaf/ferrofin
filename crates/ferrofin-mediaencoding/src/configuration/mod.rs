@@ -10,8 +10,10 @@
 //! `TranscodingTempPath` to exist — is ported with the un-mockable directory
 //! check behind the [`DirChecker`] seam so tests inject a fake.
 
+pub mod reader;
 pub mod store;
 
+pub use reader::EncodingOptionsReader;
 pub use store::{
     DirChecker, EncodingConfigurationFactory, EncodingConfigurationStore, RealDirChecker,
 };

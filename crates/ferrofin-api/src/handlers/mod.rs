@@ -1268,6 +1268,49 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "post",
+        path: "/LiveTv/ListingProviders",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "AddListingProvider",
+        ferrofin: "handlers/live_tv.rs add_listing_provider → ferrofin-livetv manager.rs \
+               save_listing_provider (ListingsBackend::of, validate_xmltv, \
+               store_listing_provider) → schedules_direct/mod.rs SchedulesDirect::validate \
+               (ListingsManager.SaveListingProvider, XmlTvListingsProvider.Validate, \
+               SchedulesDirect.Validate)",
+        date: "2026-10-21",
+        divergences: &[
+            "An XMLTV provider without a Path is a 400; upstream's Validate dereferences \
+         the null path and answers a NullReferenceException 500. Jellyfin bug not ported.",
+            "Schedules Direct's /token body is serialized, so a username with a quote or a \
+         backslash stays valid JSON; upstream concatenates it into the body raw. Jellyfin \
+         bug not ported.",
+            "SchedulesDirect.GetTokenInternal logs the session token at info; Ferrofin never \
+         logs the password, its hash or the token. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/LiveTv/ListingProviders/Lineups",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "GetLineups",
+        ferrofin: "handlers/live_tv.rs get_lineups → ferrofin-livetv manager.rs get_lineups \
+               (ListingsBackend::of, provider_channels) → schedules_direct/mod.rs \
+               SchedulesDirect::get_lineups (ListingsManager.GetLineups, \
+               XmlTvListingsProvider.GetLineups, SchedulesDirect.GetHeadends)",
+        date: "2026-10-21",
+        divergences: &[
+            "A blank id is a 404 whatever the type; upstream calls \
+         GetProvider(type).GetLineups(null, …), which is a 404 for an unknown type but \
+         dereferences the null provider (500) for xmltv and SchedulesDirect. Jellyfin bug \
+         not ported.",
+            "The country and postal code are percent-encoded into Schedules Direct's \
+         headends query; upstream concatenates them raw, so a value holding `&` or `#` \
+         changes the query. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
         path: "/Items/{itemId}/ContentType",
         upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",
         upstream_method: "UpdateItemContentType",
@@ -1279,6 +1322,41 @@ pub const VERIFIED: &[Verified] = &[
         divergences: &[
             "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/System/Configuration/{key}",
+        upstream_file: "Jellyfin.Api/Controllers/ConfigurationController.cs",
+        upstream_method: "GetNamedConfiguration",
+        ferrofin: "handlers/config.rs get_named_configuration → ferrofin-core \
+               configuration_manager.rs get_named_configuration and get_encoding_options \
+               (read_named; BaseConfigurationManager.GetConfiguration and \
+               LoadConfiguration, the seven ConfigurationStore registrations) → \
+               encoding_response for encoding, the Live TV manager's tuner and provider rows \
+               for livetv",
+        date: "2026-10-23",
+        divergences: &[
+            "The stored document is reread on every call instead of cached from the first load \
+         until a save, so a hand-edited file applies without a restart, and a document that \
+         does not parse is logged at warn once per change of the file where upstream logs it \
+         at error once.",
+            "A stored document that exists but cannot be read is a 500, and so is a save of \
+         encoding (the one store with a validator) over it. LoadConfiguration catches every \
+         exception but IOException, so upstream serves the defaults for a permission-denied \
+         read (UnauthorizedAccessException, logged at error) and for a directory in the \
+         file's place (File.Exists is false), and only other I/O errors fail. Jellyfin quirk \
+         not ported: serving the defaults lets the next save replace a document nobody saw.",
+            "database always reads as Jellyfin-SQLite without locking, the document Jellyfin \
+         writes on its first start: Ferrofin has no other database provider and refuses to \
+         save another (owner decision 2026-10-23).",
+            "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
+         the database rather than in the document; when they cannot be read the lists are \
+         empty and the failure is logged.",
+            "For a caller who is not an administrator, livetv's TunerHosts[].Url and \
+         ListingProviders[].Password are blanked; upstream's plain [Authorize] serves those \
+         credentials to every signed-in user (owner decision 2026-10-23).",
         ],
         refs: &[],
     },

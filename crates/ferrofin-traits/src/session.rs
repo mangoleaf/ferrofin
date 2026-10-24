@@ -134,6 +134,14 @@ pub trait SessionManager: Send + Sync {
     /// Reports that a session has ended.
     async fn report_session_ended(&self, session_id: &str) -> Result<(), ServiceError>;
 
+    /// Ends a session whose last WebSocket closed (C#
+    /// `SessionManager.CloseIfNeededAsync`): the live stream it was playing is
+    /// released first, which [`report_session_ended`](Self::report_session_ended)
+    /// (a logout) does not do. The default only ends the session.
+    async fn close_if_needed(&self, session_id: &str) -> Result<(), ServiceError> {
+        self.report_session_ended(session_id).await
+    }
+
     /// Sends a general command to a controlled session.
     async fn send_general_command(
         &self,

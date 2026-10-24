@@ -100,6 +100,16 @@ pub fn parse_data(data: Option<&str>) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
+/// The `CollectionType` a row's `Data` stores, lower-cased: how a library's
+/// type (`CollectionFolder.CollectionType`) is read case-insensitively.
+/// `mixed` comes back as stored; callers that read it as no type filter it.
+pub(crate) fn stored_collection_type(data: Option<&str>) -> Option<String> {
+    parse_data(data)
+        .get("CollectionType")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+}
+
 /// The `LinkedChildren` array from a parsed `Data` object, or empty.
 #[must_use]
 pub fn read_linked_children(data: &Map<String, Value>) -> Vec<LinkedChildJson> {
@@ -421,6 +431,15 @@ pub struct VideoFormat {
     pub iso_type: Option<ferrofin_model::entities::IsoType>,
     /// `Video.Video3DFormat`, for a 3D video.
     pub video3d_format: Option<ferrofin_model::entities::Video3DFormat>,
+}
+
+/// `BaseItem.Container`: the container a probe stored in `data`
+/// (`FFProbeVideoInfo`/`AudioFileProber`), if any. The text is read first: a
+/// blob with no `"Container"` key is not parsed.
+#[must_use]
+pub fn stored_container(data: Option<&str>) -> Option<String> {
+    let text = data.filter(|text| text.contains("\"Container\""))?;
+    read_data_string(&parse_data(Some(text)), "Container").filter(|c| !c.is_empty())
 }
 
 /// The [`VideoFormat`] `data` stores. The text is read first: a blob naming

@@ -424,7 +424,7 @@ async fn seasons_are_named_by_the_library_and_the_server_culture() {
                 "Flat S00E01.mkv",
                 "Flat S01E01.mkv",
                 "Season 3/Flat S03E01.mkv",
-                "Bonus/Making of.mkv",
+                "Making of.mkv",
             ],
             season_zero: Some("Extras"),
             culture: Some("de"),
@@ -478,7 +478,7 @@ async fn digits_above_the_library_are_no_season() {
     let fx = Fixture::scanned_with(
         &tmp.path().join("media-v12-2"),
         Setup {
-            files: &["Flat S01E01.mkv", "Bonus/Making of.mkv"],
+            files: &["Flat S01E01.mkv", "Making of.mkv"],
             culture: Some("de"),
             ..Setup::default()
         },

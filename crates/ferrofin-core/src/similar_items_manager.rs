@@ -425,10 +425,11 @@ impl LocalFilter {
 }
 
 /// Recently-played movies sampled to seed the "similar to recently played"
-/// categories (C# `GetMovieRecommendationsAsync`: `Limit = 7`).
+/// categories (C# `GetMovieRecommendationsAsync`: `Limit = 7`). The query is
+/// grouped by metadata key, so the repository reads 4 more rows.
 const RECENTLY_PLAYED_LIMIT: i32 = 7;
 /// Liked/favorited movies sampled for the "similar to liked" categories
-/// (C#: `Limit = 10`).
+/// (C#: `Limit = 10`), also read with 4 more rows.
 const LIKED_LIMIT: i32 = 10;
 /// How many of the most-recently-played movies contribute director/actor names
 /// (C#: `Take(Math.Min(count, 6))`).
@@ -1197,9 +1198,10 @@ impl FerrofinSimilarItemsManager {
     /// when the round-robin needs another category of this type. A category is
     /// the person's unplayed movies (`Person = name`, `IsMovie`,
     /// `IsPlayed = false`, directors restricted to the `Director` credit type).
-    /// Each query over-fetches by two, drops later movies sharing an IMDb id,
-    /// then keeps `item_limit`. The category id is `md5(name)`, as C#'s
-    /// `name.GetMD5()`.
+    /// Each query asks for `item_limit + 2` grouped by metadata key, and the
+    /// repository adds 4 more rows (`PrepareFilterQuery`). The category then
+    /// drops later movies sharing an IMDb id and keeps `item_limit`. The
+    /// category id is `md5(name)`, as C#'s `name.GetMD5()`.
     async fn next_person_category(
         &self,
         cursor: &mut PersonCursor<'_>,
@@ -1226,6 +1228,7 @@ impl FerrofinSimilarItemsManager {
                 person_types: person_types.clone(),
                 is_played: Some(false),
                 limit: Some(item_limit.saturating_add(2)),
+                enable_group_by_metadata_key: true,
                 ..Default::default()
             };
             query.set_user(user.clone());
@@ -1455,35 +1458,18 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             return Ok(Vec::new());
         }
 
-        // Recently-played movies (C#: IsPlayed, OrderBy DatePlayed desc, Limit 7).
-        let mut recent_played_q = InternalItemsQuery {
-            parent_id,
-            include_item_types: vec![BaseItemKind::Movie],
-            recursive: true,
-            is_played: Some(true),
-            limit: Some(RECENTLY_PLAYED_LIMIT),
-            order_by: vec![(ItemSortBy::DatePlayed, SortOrder::Descending)],
-            ..Default::default()
-        };
+        let mut recent_played_q = recently_played_query(parent_id);
         recent_played_q.set_user(user.clone());
         let recently_played = self.items.get_item_list(&recent_played_q).await?;
 
-        // Liked/favorited movies (C#: IsFavoriteOrLiked, Limit 10, minus the above).
+        // Liked/favorited movies (C#: IsFavoriteOrLiked, Limit 10,
+        // EnableGroupByMetadataKey, so 4 more, minus the above).
         let played_ids: Vec<Uuid> = recently_played
             .iter()
             .filter_map(|m| Uuid::parse_str(&m.id).ok())
             .collect();
         let movie_kinds = self.movie_candidate_kinds().await;
-        let mut liked_q = InternalItemsQuery {
-            parent_id,
-            include_item_types: movie_kinds.clone(),
-            is_movie: Some(true),
-            recursive: true,
-            is_favorite_or_liked: Some(true),
-            limit: Some(LIKED_LIMIT),
-            exclude_item_ids: played_ids.clone(),
-            ..Default::default()
-        };
+        let mut liked_q = liked_query(parent_id, movie_kinds.clone(), played_ids.clone());
         liked_q.set_user(user.clone());
         let liked = self.items.get_item_list(&liked_q).await?;
 
@@ -1538,6 +1524,50 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             },
         )
         .await
+    }
+}
+
+/// The recently-played baseline of `GetMovieRecommendationsAsync`
+/// (`SimilarItemsManager.cs:316-325`): played movies, most recently played
+/// first and ties shuffled, up to [`RECENTLY_PLAYED_LIMIT`]. It is grouped by
+/// metadata key (`EnableGroupByMetadataKey`), so `PrepareFilterQuery` reads 4
+/// more.
+fn recently_played_query(parent_id: Uuid) -> InternalItemsQuery {
+    InternalItemsQuery {
+        parent_id,
+        include_item_types: vec![BaseItemKind::Movie],
+        recursive: true,
+        is_played: Some(true),
+        limit: Some(RECENTLY_PLAYED_LIMIT),
+        order_by: vec![
+            (ItemSortBy::DatePlayed, SortOrder::Descending),
+            (ItemSortBy::Random, SortOrder::Descending),
+        ],
+        enable_group_by_metadata_key: true,
+        ..Default::default()
+    }
+}
+
+/// The liked baseline of `GetMovieRecommendationsAsync`
+/// (`SimilarItemsManager.cs:335-347`): favourite or liked movies of `kinds`,
+/// a random [`LIKED_LIMIT`] of them, without the recently played ones.
+/// Grouped by metadata key too, so 4 more are read.
+fn liked_query(
+    parent_id: Uuid,
+    kinds: Vec<BaseItemKind>,
+    played_ids: Vec<Uuid>,
+) -> InternalItemsQuery {
+    InternalItemsQuery {
+        parent_id,
+        include_item_types: kinds,
+        is_movie: Some(true),
+        recursive: true,
+        is_favorite_or_liked: Some(true),
+        limit: Some(LIKED_LIMIT),
+        exclude_item_ids: played_ids,
+        order_by: vec![(ItemSortBy::Random, SortOrder::Descending)],
+        enable_group_by_metadata_key: true,
+        ..Default::default()
     }
 }
 
@@ -2877,6 +2907,25 @@ mod tests {
         assert!(similar.is_none());
     }
 
+    /// `GetMovieRecommendationsAsync`'s baseline orders: recently played by
+    /// `DatePlayed` descending then `Random` (`:319`), liked by `Random` alone
+    /// (`:339`), so a user with more than ten favourites gets a different
+    /// liked set on each load.
+    #[test]
+    fn the_recommendation_baselines_order_as_upstream() {
+        assert_eq!(
+            super::recently_played_query(Uuid::nil()).order_by,
+            vec![
+                (ItemSortBy::DatePlayed, SortOrder::Descending),
+                (ItemSortBy::Random, SortOrder::Descending),
+            ]
+        );
+        assert_eq!(
+            super::liked_query(Uuid::nil(), vec![BaseItemKind::Movie], Vec::new()).order_by,
+            vec![(ItemSortBy::Random, SortOrder::Descending)]
+        );
+    }
+
     #[tokio::test]
     async fn recommendations_are_empty_without_watch_history() {
         // The parity fix: recommendations are built from watch state, so a user
@@ -3920,8 +3969,9 @@ mod tests {
     #[tokio::test]
     async fn a_director_category_lists_only_films_the_person_directed() {
         // C# `GetPersonRecommendations` sets `PersonTypes = [Director]`, and
-        // TranslateQuery restricts the credit to it; it also over-fetches by two
-        // and drops a second film with the same IMDb id.
+        // TranslateQuery restricts the credit to it; it also over-fetches (by
+        // two, plus `PrepareFilterQuery`'s four) and drops a second film with
+        // the same IMDb id.
         let db = test_db().await;
         let user = seed_user(&db, Uuid::from_u128(0x711)).await;
         grant_all_folders(&db, &user).await;
@@ -3948,7 +3998,9 @@ mod tests {
         seed_user_data(&db, user_id, played, true, None).await;
 
         // `itemLimit` 2: the two editions of one film take the first two rows,
-        // so only the `+ 2` over-fetch leaves room for the second film.
+        // so only the over-fetch leaves room for the second film.
+        // `a_person_category_reads_four_rows_more_for_its_imdb_de_duplication`
+        // pins the `+ 4` on its own.
         let recs = manager(&db)
             .get_movie_recommendations(Some(user_id), Uuid::nil(), 6, 2, &DtoOptions::default())
             .await
@@ -3969,6 +4021,142 @@ mod tests {
             "one edition per IMDb id, then the next film: {films:?}"
         );
         assert!(films.contains(&"Zulu Directed".to_owned()), "{films:?}");
+    }
+
+    #[tokio::test]
+    async fn a_person_category_reads_four_rows_more_for_its_imdb_de_duplication() {
+        // C# `GetPersonRecommendations` asks for `itemLimit + 2` with
+        // `EnableGroupByMetadataKey`, and `PrepareFilterQuery` adds 4 more:
+        // `itemLimit + 6` rows reach `DistinctBy(Imdb).Take(itemLimit)`.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x7a1)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let played = Uuid::from_u128(0x7a2);
+        seed_movie(&db, played, "Played", "Drama").await;
+        credit_person(&db, played, "Chris Maker", "Director").await;
+        // Four editions of one film take the first four rows: `itemLimit + 2`
+        // reads only them, so the second film needs the `+ 4`.
+        let editions: Vec<Uuid> = (0..4).map(|i| Uuid::from_u128(0x7a3 + i)).collect();
+        for (i, &edition) in editions.iter().enumerate() {
+            seed_movie(&db, edition, &format!("Directed (Edition {i})"), "Western").await;
+            credit_person(&db, edition, "Chris Maker", "Director").await;
+            crate::test_support::seed_provider_id(&db, edition, "Imdb", "tt0000001").await;
+        }
+        let another = Uuid::from_u128(0x7a8);
+        seed_movie(&db, another, "Zulu Directed", "Western").await;
+        credit_person(&db, another, "Chris Maker", "Director").await;
+        let mut library = editions.clone();
+        library.extend([played, another]);
+        crate::test_support::seed_library_over(&db, &library).await;
+        seed_user_data(&db, user_id, played, true, None).await;
+
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 6, 2, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        let directed_by = recs
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::HasDirectorFromRecentlyPlayed)
+            .expect("a directed-by category");
+        let films = names(&directed_by.items);
+        assert_eq!(films.len(), 2, "one edition, then the next film: {films:?}");
+        assert!(films.contains(&"Zulu Directed".to_owned()), "{films:?}");
+    }
+
+    /// Seeds `count` movies named `<prefix> <i>`, each in a genre of its own
+    /// that one unplayed candidate shares, so each makes one "similar to"
+    /// category. Returns the baselines and every seeded id.
+    async fn baselines_with_candidates(
+        db: &Database,
+        prefix: &str,
+        first_id: u128,
+        count: u128,
+    ) -> (Vec<Uuid>, Vec<Uuid>) {
+        let mut baselines = Vec::new();
+        let mut all = Vec::new();
+        for i in 0..count {
+            let baseline = Uuid::from_u128(first_id + 2 * i);
+            let candidate = Uuid::from_u128(first_id + 2 * i + 1);
+            let genre = format!("{prefix} Genre {i}");
+            seed_movie(db, baseline, &format!("{prefix} {i}"), &genre).await;
+            seed_movie(db, candidate, &format!("{prefix} Candidate {i}"), &genre).await;
+            baselines.push(baseline);
+            all.extend([baseline, candidate]);
+        }
+        (baselines, all)
+    }
+
+    /// How many categories of `kind` the recommendations hold.
+    fn categories_of(recs: &[SimilarItemsRecommendation], kind: RecommendationType) -> usize {
+        recs.iter()
+            .filter(|r| r.recommendation_type == kind)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn the_recently_played_baselines_read_four_rows_past_their_limit() {
+        // C# `GetMovieRecommendationsAsync`: `Limit = 7` with
+        // `EnableGroupByMetadataKey`, which `PrepareFilterQuery` makes 11.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x7b0)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let (played, all) = baselines_with_candidates(&db, "Played", 0x7c00, 9).await;
+        crate::test_support::seed_library_over(&db, &all).await;
+        for &movie in &played {
+            seed_user_data(&db, user_id, movie, true, Some(chrono::Utc::now())).await;
+        }
+
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 20, 1, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        assert_eq!(
+            categories_of(&recs, RecommendationType::SimilarToRecentlyPlayed),
+            9,
+            "all nine played movies fit in 7 + 4 rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_liked_baselines_read_four_rows_past_their_limit() {
+        // C# `GetMovieRecommendationsAsync`: `Limit = 10` with
+        // `EnableGroupByMetadataKey`, which `PrepareFilterQuery` makes 14.
+        use ferrofin_traits::library::UserDataManager as _;
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x7d0)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let (liked, all) = baselines_with_candidates(&db, "Liked", 0x7e00, 12).await;
+        crate::test_support::seed_library_over(&db, &all).await;
+        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig {
+            external: std::sync::atomic::AtomicBool::new(false),
+        });
+        let user_data = crate::user_data_manager::FerrofinUserDataManager::new(db.clone(), config);
+        for &movie in &liked {
+            user_data
+                .save_user_data(
+                    user_id,
+                    movie,
+                    &ferrofin_model::dto::UpdateUserItemDataDto {
+                        is_favorite: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("favourite");
+        }
+
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 20, 1, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        assert_eq!(
+            categories_of(&recs, RecommendationType::SimilarToLikedItem),
+            12,
+            "all twelve liked movies fit in 10 + 4 rows"
+        );
     }
 
     #[tokio::test]

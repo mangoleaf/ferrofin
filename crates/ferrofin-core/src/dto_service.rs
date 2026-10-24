@@ -86,6 +86,22 @@ use ferrofin_traits::trickplay::TrickplayManager;
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
 
+/// How the projected rows were read, which decides what upstream had loaded
+/// on them before projecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowRead {
+    /// `RetrieveItem`: one row by id, provider ids always included
+    /// (`BaseItemRepository.cs:825-829`); projected as `GetBaseItemDto`.
+    ById,
+    /// A list query: provider ids only for `ItemFields.ProviderIds`
+    /// (`ApplyNavigations`, :442-445); projected as `GetBaseItemDtos`.
+    List,
+    /// A playlist's or box set's members: `Folder.ResolveLinkedChildren` with
+    /// every field (v12.2 Folder.cs:1819-1873), or a box set's per-member
+    /// `GetLinkedChild` by id; projected as `GetBaseItemDtos`.
+    LinkedChildren,
+}
+
 /// Relation rows bulk-loaded for a whole page of items, so `build_dto` needs
 /// no per-item queries for them (list endpoints); absent entries mean "no rows"
 /// for that item, not "not prefetched".
@@ -668,12 +684,13 @@ pub(crate) fn fill_folder_played(
     }
 }
 
-/// `100 × position ÷ runtime` as the C# double division (both counts are tick
-/// magnitudes well inside `f64`'s 2^53 integer range, so the casts are exact
-/// enough for a display percentage).
+/// `100 × (position ÷ runtime)` in C#'s order — divide, then scale
+/// (`pct = PlaybackPositionTicks / (double)RunTimeTicks; 100 * pct`) — so the
+/// double is the one Jellyfin reports to the last digit (both counts are tick
+/// magnitudes well inside `f64`'s 2^53 integer range, so the casts are exact).
 #[allow(clippy::cast_precision_loss)]
 fn percent_of_ticks(position: i64, runtime: i64) -> f64 {
-    100.0 * position as f64 / runtime as f64
+    100.0 * (position as f64 / runtime as f64)
 }
 
 /// An empty (never-played) [`UserItemDataDto`] for `item_id` — the shape
@@ -1847,36 +1864,47 @@ impl FerrofinDtoService {
 
         let mut list = Vec::with_capacity(people.len());
         for person in people {
-            // The by-name item id (one per name, what favorites key on);
-            // pre-unification rows fall back to the credit id.
-            //
-            // A credit that resolves to neither has no id a client could follow.
-            // C# `AttachPeople` only ever adds a `BaseItemPerson` once the name
+            // The by-name `Person` item id (one per name, what favorites key
+            // on). C# `AttachPeople` adds a `BaseItemPerson` only once the name
             // resolved to a `Person` item (`list.Add` sits inside the
-            // `dictionary.TryGetValue` branch), so dropping the credit is the
-            // upstream behaviour — emitting one carrying the nil GUID would give
-            // the client a `People[].Id` that 404s on every follow-up request.
+            // `dictionary.TryGetValue` branch): a credit without one has no id a
+            // client could follow, its `Peoples` row id being no item id.
             let Some(person_id) = prefetched
                 .person_ids_by_name
                 .get(person.name.as_str())
                 .copied()
-                .or_else(|| Uuid::parse_str(&person.id).ok())
             else {
-                tracing::warn!(
-                    person = %person.name,
-                    "skipping credit: stored person id is not a guid"
-                );
                 continue;
             };
-            // Resolve the person's primary image tag (from the materialized Person
-            // item's image rows) so the client renders cast/crew artwork.
+            // `GetTagAndFillBlurhash(dto, entity, ImageType.Primary)`: the
+            // person's primary image tag, its blurhash recorded on the item.
             let primary_image_tag = match images_by_person
                 .get(&person_id)
                 .and_then(|images| images.iter().find(|i| i.image_type == ImageType::Primary))
             {
-                Some(primary) => self.image_tag(person_id, primary).await,
+                Some(primary) => self.tag_and_fill_blur_hash(dto, person_id, primary).await,
                 None => None,
             };
+            // Only the blurhash of the person's own image, under every image
+            // type the item's map has (C# copies the map, keeping the entries
+            // whose tag is the person's).
+            let image_blur_hashes = dto.image_blur_hashes.as_ref().map(|hashes| {
+                hashes
+                    .iter()
+                    .map(|(image_type, by_tag)| {
+                        let own: HashMap<String, String> = by_tag
+                            .iter()
+                            .filter(|(tag, _)| {
+                                primary_image_tag
+                                    .as_deref()
+                                    .is_some_and(|own| own.eq_ignore_ascii_case(tag))
+                            })
+                            .map(|(tag, hash)| (tag.clone(), hash.clone()))
+                            .collect();
+                        (*image_type, own)
+                    })
+                    .collect()
+            });
             list.push(BaseItemPerson {
                 name: Some(person.name.clone()),
                 id: person_id,
@@ -1888,7 +1916,7 @@ impl FerrofinDtoService {
                         ferrofin_model::data::PersonKind::from_stored(t)
                     }),
                 primary_image_tag,
-                image_blur_hashes: None,
+                image_blur_hashes,
             });
         }
         dto.people = Some(list); // Jellyfin emits [] when People is requested but there are none
@@ -2658,14 +2686,23 @@ impl FerrofinDtoService {
 
         dto.end_date = item.end_date;
 
-        // Container is always set from the file extension (C# `dto.Container = item.Container`,
-        // which resolution fills from the extension) — folders have none, so it stays absent.
-        dto.container = item
-            .path
-            .as_deref()
-            .and_then(|p| std::path::Path::new(p).extension())
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase);
+        // `dto.Container = item.Container` (`DtoService.cs:1125`): the container
+        // the probe stored (`FFProbeVideoInfo`/`AudioFileProber` are its only
+        // writers), so folders, by-name items, photos and books have none. A
+        // video or audio file not probed yet answers its extension where
+        // upstream answers null, so it keeps a label: one scanned before audio
+        // probes stored their container, or on a server without ffprobe.
+        dto.container = crate::item_data::stored_container(item.data.as_deref()).or_else(|| {
+            // A disc rip's path is its folder (`/m/Movie.2010`), which has
+            // no extension to give.
+            let media = matches!(item.media_type.as_deref(), Some("Video" | "Audio"));
+            (media && !item.is_folder && !crate::item_data::path_is_directory(item))
+                .then_some(item.path.as_deref())
+                .flatten()
+                .and_then(|p| std::path::Path::new(p).extension())
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+        });
 
         // Gated scalar defaults Jellyfin emits when the field is requested (item_detail, not lists).
         if options.contains_field(ItemFields::EnableMediaSourceDisplay) {
@@ -3791,10 +3828,16 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         // list query only does so for `ItemFields.ProviderIds` (:442-445). That
         // difference is observable: it decides whether a movie's `UserData.Key`
         // is its IMDb id or its guid.
-        self.project(std::slice::from_ref(item), options, user, owner_id, true)
-            .await?
-            .pop()
-            .ok_or_else(|| ServiceError::Backend("projection returned no DTO".to_owned()))
+        self.project(
+            std::slice::from_ref(item),
+            options,
+            user,
+            owner_id,
+            RowRead::ById,
+        )
+        .await?
+        .pop()
+        .ok_or_else(|| ServiceError::Backend("projection returned no DTO".to_owned()))
     }
 
     async fn get_base_item_dtos(
@@ -3805,7 +3848,18 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        self.project(items, options, user, owner_id, false).await
+        self.project(items, options, user, owner_id, RowRead::List)
+            .await
+    }
+
+    async fn get_linked_children_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.project(items, options, user, None, RowRead::LinkedChildren)
+            .await
     }
 
     async fn get_item_by_name_dto(
@@ -4023,16 +4077,15 @@ impl FerrofinDtoService {
     /// The shared projection body behind [`DtoService::get_base_item_dto`] and
     /// [`DtoService::get_base_item_dtos`].
     ///
-    /// `retrieved_by_id` says the rows came from the by-id read
-    /// (`RetrieveItem`), which upstream always hydrates provider ids for; a list
-    /// query hydrates them only when `ItemFields.ProviderIds` was requested.
+    /// `read` says how the rows were read, and so what upstream had loaded
+    /// on them (see [`RowRead`]).
     async fn project(
         &self,
         items: &[BaseItemEntity],
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
-        retrieved_by_id: bool,
+        read: RowRead,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
         // Visibility filtering needs the domain tree (`IsVisible`), which is not
         // ported at this layer; the caller is expected to have filtered the set,
@@ -4045,8 +4098,8 @@ impl FerrofinDtoService {
                 options,
                 user,
                 owner_id,
-                retrieved_by_id,
-                !retrieved_by_id,
+                read != RowRead::List,
+                read != RowRead::ById,
             )
             .await?;
         // Ids the page lists more than once (a playlist may repeat a track).
@@ -4135,7 +4188,7 @@ impl FerrofinDtoService {
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
-        retrieved_by_id: bool,
+        providers_loaded: bool,
         list_page: bool,
     ) -> Result<Prefetched, ServiceError> {
         let ids: Vec<Uuid> = items.iter().map(row_id).collect();
@@ -4189,7 +4242,7 @@ impl FerrofinDtoService {
                 // 10.11.8: the same movie's key is its guid in a plain list and
                 // `tt0111161` with `Fields=ProviderIds` or by id.
                 let hydrate_providers =
-                    retrieved_by_id || options.contains_field(ItemFields::ProviderIds);
+                    providers_loaded || options.contains_field(ItemFields::ProviderIds);
                 self.user_data
                     .get_user_data_dtos_for_rows(items, user_id, hydrate_providers)
                     .await
@@ -4582,11 +4635,19 @@ impl FerrofinDtoService {
             // id — not the row. Materializing a full `BaseItemEntity` per
             // credited name was the single most expensive statement on an
             // all-fields page (hundreds of 72-column rows decoded and dropped).
-            let resolved = self
+            let resolved = match self
                 .library
                 .get_named_item_ids(ferrofin_model::data::BaseItemKind::Person, &names)
                 .await
-                .unwrap_or_default();
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    // C# `AttachPeople` logs each failed `GetPerson` and
+                    // leaves its credits out.
+                    tracing::error!(%error, "person lookup failed; leaving the page's credits out");
+                    Vec::new()
+                }
+            };
             let mut id_by_slot: Vec<Option<Uuid>> = vec![None; names.len()];
             let mut person_ids: Vec<Uuid> = Vec::new();
             for (slot, resolved_id) in resolved.into_iter().enumerate() {
@@ -4597,20 +4658,38 @@ impl FerrofinDtoService {
                     person_ids.push(id);
                 }
             }
-            let by_name: HashMap<String, Uuid> = slot_by_name
+            let mut by_name: HashMap<String, Uuid> = slot_by_name
                 .into_iter()
                 .filter_map(|(name, slot)| {
                     id_by_slot.get(slot).copied().flatten().map(|id| (name, id))
                 })
                 .collect();
-            // Pre-unification rows keyed images on the credit id; keep
-            // loading those too so old databases still render cast art.
-            person_ids.extend(
-                people
-                    .values()
-                    .flatten()
-                    .filter_map(|p| Uuid::parse_str(&p.id).ok()),
-            );
+            // C# `.Where(i => user is null || i!.IsVisible(user))`: a person the
+            // user may not see leaves the credits. `Person.IsVisible` is the
+            // parental check with the allowed tags skipped.
+            if let Some(user) = user
+                && !person_ids.is_empty()
+            {
+                // A failed check leaves the credits out, as a failed lookup
+                // does above: failing open would show persons the user may
+                // not see.
+                let allowed: std::collections::HashSet<Uuid> = match self
+                    .library
+                    .get_parentally_allowed_item_ids(&person_ids, user, true)
+                    .await
+                {
+                    Ok(allowed) => allowed.into_iter().collect(),
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "person visibility check failed; leaving the page's credits out"
+                        );
+                        std::collections::HashSet::new()
+                    }
+                };
+                person_ids.retain(|id| allowed.contains(id));
+                by_name.retain(|_, id| allowed.contains(id));
+            }
             (person_ids, by_name)
         } else {
             (Vec::new(), HashMap::new())
@@ -5251,10 +5330,49 @@ mod tests {
         named_items: Vec<BaseItemEntity>,
     }
 
+    /// The by-name `Person` item of each name, as the scan materializes one
+    /// for every credit it saves (`update_people`), for `named_items`.
+    async fn person_rows(db: &Database, names: &[&str]) -> Vec<BaseItemEntity> {
+        let mut rows = Vec::new();
+        for name in names {
+            let id = Uuid::new_v4();
+            seed_named_item(db, id, BaseItemKind::Person, name).await;
+            rows.push(fetch_item(db, id).await);
+        }
+        rows
+    }
+
     #[async_trait]
     impl LibraryManager for FakeLibrary {
         async fn get_item_by_id(&self, _id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
             Ok(None)
+        }
+        /// A named item tagged `Hidden` fails the parental check; one tagged
+        /// `Fail` makes the check itself fail.
+        async fn get_parentally_allowed_item_ids(
+            &self,
+            ids: &[Uuid],
+            _user: &UserEntity,
+            _skip_allowed_tags: bool,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            if self
+                .named_items
+                .iter()
+                .any(|row| row.tags.as_deref() == Some("Fail"))
+            {
+                return Err(ServiceError::backend("visibility unavailable"));
+            }
+            let hidden: Vec<Uuid> = self
+                .named_items
+                .iter()
+                .filter(|row| row.tags.as_deref() == Some("Hidden"))
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect();
+            Ok(ids
+                .iter()
+                .copied()
+                .filter(|id| !hidden.contains(id))
+                .collect())
         }
         async fn get_item_images(
             &self,
@@ -5514,10 +5632,31 @@ mod tests {
 
     #[test]
     fn percent_of_ticks_is_the_played_percentage_division() {
-        // 50% of a 2 h runtime — the C# `100 * position / runtime` double math.
+        // 50% of a 2 h runtime.
         assert!((percent_of_ticks(36_000_000_000, 72_000_000_000) - 50.0).abs() < 1e-9);
         // Tiny fractions stay positive and precise enough for display.
         assert!(percent_of_ticks(1, 72_000_000_000) > 0.0);
+    }
+
+    /// Byte-equal to Jellyfin 12.2's doubles for the same ticks, measured on
+    /// `GET /UserItems/Resume`: upstream divides first, then scales
+    /// (`pct = PlaybackPositionTicks / (double)RunTimeTicks; 100 * pct`), and
+    /// the other order rounds differently in the last digits.
+    #[rstest::rstest]
+    #[case(13_206_045, 50_210_000, 26.301_623_182_632_945)]
+    #[case(30_347_999, 50_210_000, 60.442_141_007_767_38)]
+    #[case(31_000_576, 50_210_000, 61.741_836_287_592_11)]
+    fn percent_of_ticks_matches_jellyfin_bit_for_bit(
+        #[case] position: i64,
+        #[case] runtime: i64,
+        #[case] jellyfin: f64,
+    ) {
+        assert_eq!(
+            percent_of_ticks(position, runtime).to_bits(),
+            jellyfin.to_bits(),
+            "{} != {jellyfin}",
+            percent_of_ticks(position, runtime)
+        );
     }
 
     /// A folder's `RecursiveItemCount` and its played numbers come from the SAME
@@ -6215,6 +6354,73 @@ mod tests {
         );
     }
 
+    /// `dto.Container = item.Container` (`DtoService.cs:1125`): the container
+    /// the probe stored (`FFProbeVideoInfo`/`AudioFileProber`), and nothing for
+    /// a folder, whatever dots its name has. A video or audio file not probed
+    /// yet falls back to its extension, unless it is a disc rip's folder; a
+    /// photo has no container.
+    #[tokio::test]
+    async fn the_dto_container_is_the_probed_one_and_folders_have_none() {
+        let db = test_db().await;
+        let mut rows = Vec::new();
+        for (kind, data, path, is_folder, media_type) in [
+            (BaseItemKind::Series, "{}", "/tv/Mr. Robot", true, None),
+            (
+                BaseItemKind::Movie,
+                r#"{"Container":"mkv"}"#,
+                "/m/Film.mp4",
+                false,
+                Some("Video"),
+            ),
+            (
+                BaseItemKind::Audio,
+                "{}",
+                "/music/Song.FLAC",
+                false,
+                Some("Audio"),
+            ),
+            (
+                BaseItemKind::Photo,
+                "{}",
+                "/photos/Shot.jpg",
+                false,
+                Some("Photo"),
+            ),
+            (
+                BaseItemKind::Audio,
+                r#"{"Container":"mp3"}"#,
+                "/music/Song.mp3",
+                false,
+                Some("Audio"),
+            ),
+            (
+                BaseItemKind::Movie,
+                r#"{"VideoType":"BluRay"}"#,
+                "/m/Movie.2010",
+                false,
+                Some("Video"),
+            ),
+        ] {
+            let id = Uuid::new_v4();
+            crate::test_support::seed_item_with_data(&db, id, kind, "X", data).await;
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            row.is_folder = is_folder;
+            row.media_type = media_type.map(str::to_owned);
+            rows.push(row);
+        }
+        let dtos = service(db.clone())
+            .get_base_item_dtos(&rows, &DtoOptions::default(), None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            dtos.iter()
+                .map(|d| d.container.as_deref())
+                .collect::<Vec<_>>(),
+            [None, Some("mkv"), Some("flac"), None, Some("mp3"), None]
+        );
+    }
+
     /// `MediaSources` lists every version of a video, the queried one first
     /// and each named by what sets it apart (`Video.GetMediaSources`): from a
     /// local alternate as much as from its primary, both on one page.
@@ -6277,6 +6483,56 @@ mod tests {
             ]
         );
         assert_eq!(listed(1), [(p, "Movie".to_owned()), (a, "4K".to_owned())]);
+    }
+
+    /// A playlist's or box set's members are resolved with every field
+    /// (`Folder.ResolveLinkedChildren` with a parameterless `DtoOptions`), so a
+    /// never-written member keys its user data by its provider id, as on its
+    /// own page — where the same row in a plain list without `Fields=ProviderIds`
+    /// keys it by its guid (measured on Jellyfin 12.2: `"101765"` in the
+    /// playlist, the guid in a library list).
+    #[tokio::test]
+    async fn linked_children_key_unwritten_user_data_by_provider_id() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Movie").await;
+        seed_provider_id(&db, movie, "Tmdb", "101765").await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            Arc::new(crate::user_data_manager::FerrofinUserDataManager::new(
+                db.clone(),
+                crate::test_support::configuration_with_path_substitution(
+                    tmp.path(),
+                    "/unused",
+                    "/unused",
+                )
+                .await,
+            )),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources::default()),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let rows = [fetch_item(&db, movie).await];
+        let options = DtoOptions::with_all_fields(false);
+        let key =
+            |dtos: Vec<BaseItemDto>| dtos[0].user_data.as_ref().expect("user data").key.clone();
+
+        let listed = svc
+            .get_base_item_dtos(&rows, &options, Some(&user), None, true)
+            .await
+            .unwrap();
+        assert_eq!(key(listed), movie.to_string());
+        let members = svc
+            .get_linked_children_dtos(&rows, &options, Some(&user))
+            .await
+            .unwrap();
+        assert_eq!(key(members), "101765");
     }
 
     /// A movie watched to the end on another version shows watched, with that
@@ -10432,7 +10688,7 @@ mod tests {
                 person_type: Some("Actor".into()),
                 ..Default::default()
             }],
-            ..Default::default()
+            named_items: person_rows(&db, &["Leonardo DiCaprio"]).await,
         });
         let svc = service_with(db, library);
         let dto = svc
@@ -10927,7 +11183,11 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
-            named_items: Vec::new(),
+            named_items: person_rows(
+                &db,
+                &credits.iter().map(|(name, _, _)| *name).collect::<Vec<_>>(),
+            )
+            .await,
         });
         let svc = service_with(db, library);
         let dto = svc
@@ -10960,6 +11220,9 @@ mod tests {
             .map(|(name, _)| (*name, *name))
             .collect();
         stored.extend([("actor", "Unknown"), ("Colorer", "Unknown")]);
+        let names: Vec<String> = (0..stored.len())
+            .map(|order| format!("Person {order}"))
+            .collect();
         let library = Arc::new(FakeLibrary {
             people: (0_i64..)
                 .zip(&stored)
@@ -10971,7 +11234,8 @@ mod tests {
                     ..Default::default()
                 })
                 .collect(),
-            named_items: Vec::new(),
+            named_items: person_rows(&db, &names.iter().map(String::as_str).collect::<Vec<_>>())
+                .await,
         });
         let svc = service_with(db, library);
         let dto = svc
@@ -11125,9 +11389,8 @@ mod tests {
     /// about the key for every one of [`AWKWARD_CREDITS`].
     ///
     /// If they ever disagree (one side lowercasing, trimming or cleaning while
-    /// the other does not) every cast member silently falls back to its
-    /// per-credit `Peoples` row id — which is NOT what favorites are written
-    /// against — and nothing else in the suite would notice, because tidy ASCII
+    /// the other does not) every such cast member silently drops out of the
+    /// credits, and nothing else in the suite would notice, because tidy ASCII
     /// names key the same under either convention.
     #[tokio::test]
     async fn person_ids_resolve_for_awkwardly_spelled_credits() {
@@ -11136,20 +11399,17 @@ mod tests {
         seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
 
         // One by-name Person item per credit, plus one per-credit Peoples row
-        // with a DIFFERENT id, so a fallback to the credit id is visible.
+        // with a DIFFERENT id, so the credit's id is never mistaken for it.
         let mut person_rows = Vec::new();
         let mut expected = Vec::new();
         let mut credits = Vec::new();
-        let mut credit_ids = Vec::new();
         for (i, (credited_as, item_name)) in AWKWARD_CREDITS.iter().enumerate() {
             let person_id = Uuid::from_u128(0xB_9100 + idx(i));
             seed_named_item(&db, person_id, BaseItemKind::Person, item_name).await;
             person_rows.push(fetch_item(&db, person_id).await);
             expected.push(person_id);
-            let credit_id = Uuid::from_u128(0xB_9200 + idx(i));
-            credit_ids.push(credit_id);
             credits.push(PeopleEntity {
-                id: credit_id.to_string(),
+                id: Uuid::from_u128(0xB_9200 + idx(i)).to_string(),
                 name: (*credited_as).into(),
                 person_type: Some("Actor".into()),
                 ..Default::default()
@@ -11177,11 +11437,6 @@ mod tests {
                 "credit name for {credited_as:?}"
             );
             // …and resolves to the by-name Person item, not the credit row.
-            assert_ne!(
-                people[i].id, credit_ids[i],
-                "{credited_as:?} fell back to its per-credit row id — the build \
-                 and lookup sides of person_ids_by_name disagree about the key"
-            );
             assert_eq!(
                 people[i].id, expected[i],
                 "by-name Person id for {credited_as:?}"
@@ -11191,8 +11446,10 @@ mod tests {
 
     /// The lookup half of the same convention, pinned in isolation: the map is
     /// keyed by the credit row's name EXACTLY as stored (the contract its doc
-    /// comment states), and a name the prefetch never resolved falls back to the
-    /// per-credit row id — or is dropped when that is not a GUID.
+    /// comment states), and a credit whose name the prefetch never resolved to a
+    /// `Person` item is dropped, as C# `AttachPeople` adds a `BaseItemPerson`
+    /// only inside `dictionary.TryGetValue` (its `Peoples` row id is no item id
+    /// a client could follow).
     #[tokio::test]
     async fn attach_people_looks_up_the_raw_stored_credit_name() {
         let db = test_db().await;
@@ -11216,7 +11473,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        // An unresolved credit keeps its own row id…
+        // An unresolved credit is dropped, whatever its row id…
         let unresolved = Uuid::from_u128(0xB_95FF);
         credits.push(PeopleEntity {
             id: unresolved.to_string(),
@@ -11224,9 +11481,7 @@ mod tests {
             person_type: Some("Actor".into()),
             ..Default::default()
         });
-        // …and a credit whose stored id is not a GUID is dropped entirely
-        // rather than emitted with the nil GUID (C# `AttachPeople` only adds a
-        // `BaseItemPerson` for a credit it could resolve).
+        // …a GUID or not.
         credits.push(PeopleEntity {
             id: "not-a-guid".into(),
             name: "Also Nobody".into(),
@@ -11245,29 +11500,196 @@ mod tests {
             .unwrap();
 
         let people = dto.people.as_ref().expect("people");
-        // The non-GUID credit is dropped, so only the resolvable ones survive.
-        assert_eq!(people.len(), AWKWARD_CREDITS.len() + 1);
+        // Only the resolved credits survive.
+        assert_eq!(people.len(), AWKWARD_CREDITS.len());
         for (i, (credited_as, _)) in AWKWARD_CREDITS.iter().enumerate() {
             assert_eq!(
                 people[i].id, expected[i],
                 "{credited_as:?} must be looked up under its raw stored spelling"
             );
         }
-        assert_eq!(
-            people[AWKWARD_CREDITS.len()].id,
-            unresolved,
-            "unresolved credit keeps its per-credit row id"
-        );
         assert!(
-            people.iter().all(|p| !p.id.is_nil()),
-            "no credit is emitted with the nil GUID"
+            people.iter().all(|p| p.id != unresolved),
+            "an unresolved credit is not emitted with its `Peoples` row id"
         );
         assert!(
             people
                 .iter()
-                .all(|p| p.name.as_deref() != Some("Also Nobody")),
-            "a credit whose stored id is not a GUID is dropped, not emitted as nil"
+                .all(|p| !matches!(p.name.as_deref(), Some("Nobody At All" | "Also Nobody"))),
+            "unresolved credits are dropped"
         );
+    }
+
+    /// C# `AttachPeople` keeps only the persons the user may see
+    /// (`.Where(i => user is null || i!.IsVisible(user))`): with a user, a
+    /// person the parental check rejects leaves the credits; with none, every
+    /// resolved credit stays.
+    #[tokio::test]
+    async fn a_person_the_user_may_not_see_leaves_the_credits() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, movie).await;
+        let user = crate::test_support::seed_user(&db, Uuid::new_v4()).await;
+        let mut named = person_rows(&db, &["Seen", "Unseen"]).await;
+        named[1].tags = Some("Hidden".into());
+        let credit = |name: &str| PeopleEntity {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            person_type: Some("Actor".into()),
+            ..Default::default()
+        };
+        let library = Arc::new(FakeLibrary {
+            people: vec![credit("Seen"), credit("Unseen")],
+            named_items: named,
+        });
+        let svc = service_with(db, library);
+        let credited = |dto: BaseItemDto| -> Vec<String> {
+            dto.people
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| p.name)
+                .collect()
+        };
+
+        let for_user = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(credited(for_user), ["Seen"]);
+        let for_nobody = svc
+            .get_base_item_dto(&item, &DtoOptions::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(credited(for_nobody), ["Seen", "Unseen"]);
+    }
+
+    /// A visibility check that fails leaves the page's credits out rather
+    /// than showing persons the user may not see.
+    #[tokio::test]
+    async fn a_failed_visibility_check_leaves_the_credits_out() {
+        let db = test_db().await;
+        let movie = Uuid::new_v4();
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, movie).await;
+        let user = crate::test_support::seed_user(&db, Uuid::new_v4()).await;
+        let mut named = person_rows(&db, &["Anyone"]).await;
+        named[0].tags = Some("Fail".into());
+        let library = Arc::new(FakeLibrary {
+            people: vec![PeopleEntity {
+                id: Uuid::new_v4().to_string(),
+                name: "Anyone".into(),
+                person_type: Some("Actor".into()),
+                ..Default::default()
+            }],
+            named_items: named,
+        });
+        let dto = service_with(db, library)
+            .get_base_item_dto(&item, &DtoOptions::default(), Some(&user), None)
+            .await
+            .unwrap();
+        assert_eq!(dto.people, Some(Vec::new()));
+    }
+
+    /// C# `AttachPeople` tags a person's primary image with
+    /// `GetTagAndFillBlurhash`: its blurhash lands on the item's
+    /// `ImageBlurHashes`, and the person's own `ImageBlurHashes` is the item's
+    /// map filtered to the person's tag — every image type the item has, empty
+    /// but for that one entry.
+    #[tokio::test]
+    async fn a_person_carries_the_blurhash_of_its_primary_image() {
+        let db = test_db().await;
+        let movie = Uuid::from_u128(0xB_9701);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "M").await;
+        let item = fetch_item(&db, movie).await;
+        let svc = service(db);
+        let person = Uuid::from_u128(0xB_9702);
+        let image = ItemImageInfo {
+            path: "/people/someone/folder.jpg".into(),
+            image_type: ImageType::Primary,
+            date_modified: Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap(),
+            width: 10,
+            height: 10,
+            blur_hash: Some("LKO2?U%2Tw=w".into()),
+        };
+        let prefetched = Prefetched {
+            people: [(
+                movie,
+                vec![PeopleEntity {
+                    id: Uuid::from_u128(0xB_9703).to_string(),
+                    name: "Someone".into(),
+                    person_type: Some("Actor".into()),
+                    ..Default::default()
+                }],
+            )]
+            .into_iter()
+            .collect(),
+            person_ids_by_name: [("Someone".to_owned(), person)].into_iter().collect(),
+            person_images: [(person, vec![image.clone()])].into_iter().collect(),
+            ..Prefetched::default()
+        };
+        // Whatever the map already holds when the people are attached (in C#
+        // and here the item's own images are attached afterwards, onto a fresh
+        // map, so in a page this is the hashes of the persons before): the
+        // person's copy keeps every image type, empty but for its own entry.
+        let mut dto = BaseItemDto {
+            image_blur_hashes: Some(
+                [(
+                    ImageType::Backdrop,
+                    [("backdrop-tag".to_owned(), "backdrop-hash".to_owned())]
+                        .into_iter()
+                        .collect(),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+            ..BaseItemDto::default()
+        };
+        svc.attach_people(&mut dto, &item, &prefetched)
+            .await
+            .unwrap();
+
+        let tag = svc.image_tag(person, &image).await.expect("tag");
+        let people = dto.people.as_ref().expect("people");
+        assert_eq!(people[0].primary_image_tag.as_deref(), Some(tag.as_str()));
+        let person_hash: HashMap<String, String> = [(tag.clone(), "LKO2?U%2Tw=w".to_owned())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            people[0].image_blur_hashes,
+            Some(
+                [
+                    (ImageType::Backdrop, HashMap::new()),
+                    (ImageType::Primary, person_hash.clone()),
+                ]
+                .into_iter()
+                .collect()
+            )
+        );
+        let item_hashes = dto.image_blur_hashes.as_ref().expect("item blurhashes");
+        assert_eq!(item_hashes.get(&ImageType::Primary), Some(&person_hash));
+        assert_eq!(
+            item_hashes[&ImageType::Backdrop]["backdrop-tag"],
+            "backdrop-hash"
+        );
+
+        // With no map yet and no blurhash on the person's image, the person
+        // has no map either (C# `dto.ImageBlurHashes is not null` is false).
+        let unhashed = ItemImageInfo {
+            blur_hash: None,
+            ..image
+        };
+        let prefetched = Prefetched {
+            person_images: [(person, vec![unhashed])].into_iter().collect(),
+            ..prefetched
+        };
+        let mut dto = BaseItemDto::default();
+        svc.attach_people(&mut dto, &item, &prefetched)
+            .await
+            .unwrap();
+        let people = dto.people.as_ref().expect("people");
+        assert!(people[0].primary_image_tag.is_some());
+        assert_eq!(people[0].image_blur_hashes, None);
     }
 
     /// The clean lookup key the projection uses must be byte-identical to

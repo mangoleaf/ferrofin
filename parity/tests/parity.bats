@@ -44,7 +44,7 @@ sanitise() { echo "\${1//[^A-Za-z0-9]/-}"; }
 start_server() { # start_server NAME: (re)start the fake server recorded for it
   local name=\$1 port behaviour
   port=\$(cat "\$state/\$name.port"); behaviour=\$(cat "\$state/\$name.behaviour")
-  setsid python3 "$PARITY/tests/fake_server.py" "\$port" "\$behaviour" >/dev/null 2>&1 &
+  setsid python3 "$PARITY/tests/fake_server.py" "\$port" "\$behaviour" "\$(cat "\$state/\$name.config")" >/dev/null 2>&1 &
   echo \$! > "\$state/\$name.pid"
 }
 stop_server() { [ ! -f "\$state/\$1.pid" ] || { kill "\$(cat "\$state/\$1.pid")" 2>/dev/null || true; rm -f "\$state/\$1.pid"; }; }
@@ -55,18 +55,22 @@ case "\$1" in
     exit 0;;
   ps) ls "\$state" 2>/dev/null | sed -n 's/\.name\$//p'; exit 0;;
   run)
-    args=("\$@"); image=\${args[-1]}; name=""; port=""; cid=""
+    args=("\$@"); image=\${args[-1]}; name=""; port=""; cid=""; config=""
     for ((i = 0; i < \${#args[@]}; i++)); do
-      case "\${args[i]}" in --name) name=\${args[i+1]};; --cidfile) cid=\${args[i+1]};; -p) port=\${args[i+1]#127.0.0.1:}; port=\${port%%:*};; esac
+      case "\${args[i]}" in --name) name=\${args[i+1]};; --cidfile) cid=\${args[i+1]};; -p) port=\${args[i+1]#127.0.0.1:}; port=\${port%%:*};;
+        -v) case "\${args[i+1]}" in *:/config) config=\${args[i+1]%:/config};; esac;; esac
     done
     case "\$image" in *wontstart*) echo "fake docker: cannot start" >&2; exit 125;; esac
     sleep "\${FAKE_RUN_DELAY:-0}"   # a slow create: the container exists only once this returns
     behaviour=same
     case "\$image" in *nulled*) behaviour=nulled;; *slow*) behaviour=slow;; *quiet*) behaviour=quiet;; *leaky*) behaviour=leaky;; esac
     echo "\$name" > "\$state/\$name.name"; echo "\$port" > "\$state/\$name.port"; echo "\$behaviour" > "\$state/\$name.behaviour"
+    echo "\$config" > "\$state/\$name.config"; echo "\$image" > "\$state/\$name.image"
     echo "\$name" > "\$cid"; start_server "\$name"; echo "\$name"; exit 0;;
   stop) stop_server "\${@: -1}"; exit 0;;
-  start) start_server "\$2"; exit 0;;
+  start)   # a *brittle* image starts once more (the isolation restart), never again (a reset)
+    if grep -q brittle "\$state/\$2.image" && [ -f "\$state/\$2.started" ]; then echo "fake docker: cannot start" >&2; exit 1; fi
+    touch "\$state/\$2.started"; start_server "\$2"; exit 0;;
   inspect) [ -f "\$state/\${@: -1}.name" ] && exit 0; exit 1;;
   logs) echo "fake server log"; exit 0;;
   rm) name=\${@: -1}; stop_server "\$name"; rm -f "\$state/\$name".*; exit 0;;
@@ -97,7 +101,7 @@ case "\$*" in
       crash) echo "Traceback: the comparison blew up" >&2; exit 2;;
     esac;;
 esac
-exec $(command -v python3) "\$@"
+exec $(type -ap python3 | grep -v /shims/ | head -n1) "\$@"   # skip a version-manager shim, which would find this one again
 EOS
   chmod +x bin/docker bin/git bin/python3 bin/jq
   PATH="$TMP/bin:$PATH"
@@ -165,6 +169,11 @@ containers_gone() { # no container left in the fake docker, no server process le
   [[ "$output" == *"PARITY_CAP_S must be a positive integer"* ]]
   PARITY_PIN=2 run parity
   [ "$status" -eq 2 ]
+  for bad in 0 9; do
+    PARITY_CONCURRENCY=$bad run parity
+    [ "$status" -eq 2 ]
+  done
+  [[ "$output" == *"PARITY_CONCURRENCY is 1 to 8"* ]]
   [ ! -e out ]
 }
 
@@ -330,12 +339,74 @@ containers_gone() { # no container left in the fake docker, no server process le
   containers_gone
 }
 
+@test "run.sh: a request directory is every *.jsonl in it, read PARITY_CONCURRENCY at a time, and run.json records both" {
+  mkdir set
+  echo '{"id": "a", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' > set/1.jsonl
+  echo '{"id": "b", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' > set/2.jsonl
+  echo 'not requests' > set/notes.txt
+  PARITY_CONCURRENCY=2 run parity --requests set
+  [ "$status" -eq 0 ]
+  [ "$(jq -c '[.requests[].id]' out/results.json)" = '["a","b"]' ]
+  [ "$(jq -r .concurrency out/run.json)" = 2 ]
+  [ "$(jq -r .timing.reads.concurrency out/results.json)" = 2 ]
+  [ "$(jq -r .requests_sha256 out/run.json)" = "$(cat set/1.jsonl set/2.jsonl | sha256sum | cut -d' ' -f1)" ]
+  containers_gone
+}
+
+@test "run.sh: several request sets given with --requests are sent as one, in the order given" {
+  mkdir set
+  echo '{"id": "a", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' > set/1.jsonl
+  echo '{"id": "e", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' > edge.jsonl
+  run parity --requests edge.jsonl --requests set
+  [ "$status" -eq 0 ]
+  [ "$(jq -c '[.requests[].id]' out/results.json)" = '["e","a"]' ]
+  [ "$(jq -r .requests_sha256 out/run.json)" = "$(cat edge.jsonl set/1.jsonl | sha256sum | cut -d' ' -f1)" ]
+  containers_gone
+}
+
+# ── writes ────────────────────────────────────────────────────────────────────────────────────
+@test "run.sh: each write runs after every read, on a fresh copy of the isolated configuration, followed by its read-backs" {
+  printf '%s\n' '{"id": "fav-a", "method": "POST", "path": "/UserFavoriteItems/a", "readbacks": [{"id": "list", "path": "/favourites"}]}' \
+                '{"id": "read", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' \
+                '{"id": "fav-b", "method": "POST", "path": "/UserFavoriteItems/b", "readbacks": [{"id": "list", "path": "/favourites"}]}' > writes.jsonl
+  run parity --requests writes.jsonl
+  [ "$status" -eq 0 ]
+  [ "$(jq -c '[.requests[] | [.id, .state]]' out/results.json)" = '[["read","match"],["fav-a","match"],["fav-a/list","match"],["fav-b","match"],["fav-b/list","match"]]' ]
+  [ "$(jq -r .resets out/results.json)" = 2 ]
+  # b was written on a fresh copy: a's write did not survive the reset, and the snapshot holds neither
+  [ "$(cat out/oracle/config/favourites.json)" = '["b"]' ]
+  [ "$(cat out/ferrofin/config/favourites.json)" = '["b"]' ]
+  [ ! -e out/oracle/pristine/config/favourites.json ]
+  # the boot's isolation restart and one reset per write, on both servers
+  [ "$(grep -c '^stop .*parity-oracle$' "$FAKE_STATE/calls")" = 3 ]
+  [ "$(grep -c '^start parity-ferrofin$' "$FAKE_STATE/calls")" = 3 ]
+  # the read was answered before any write was sent
+  read_at=$(grep -n "$PARITY_ORACLE_PORT GET /Users/u1/Items/m1" "$FAKE_STATE/requests.log" | cut -d: -f1)
+  write_at=$(grep -n "$PARITY_ORACLE_PORT POST /UserFavoriteItems/" "$FAKE_STATE/requests.log" | head -n1 | cut -d: -f1)
+  [ "$read_at" -lt "$write_at" ]
+  grep -q "Writes (2)" out/report.html
+  grep -q "2 resets" out/report.html
+  containers_gone
+}
+
+@test "run.sh: a server that does not come back from a reset fails the run, naming it, and both containers are removed" {
+  echo '{"id": "fav-a", "method": "POST", "path": "/UserFavoriteItems/a", "readbacks": [{"id": "list", "path": "/favourites"}]}' > writes.jsonl
+  FERROFIN_IMAGE=ferrofin:brittle run parity --requests writes.jsonl
+  [ "$status" -eq 1 ]
+  [ "$(jq -r .verdict out/results.json)" = "run failed" ]
+  grep -q "resetting the servers before .fav-a. failed: " out/report.html
+  grep -q "ferrofin: docker could not start it again" out/report.html
+  grep -q "ferrofin: fake docker: cannot start" out/report.html   # what docker said, from reset.log
+  containers_gone
+}
+
 # ── the cap ───────────────────────────────────────────────────────────────────────────────────
 @test "run.sh: past the cap the run stops, fails with a named reason, writes a partial report and removes both containers" {
   printf '%s\n' '{"id": "a", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' \
                 '{"id": "b", "method": "GET", "path": "/Users/{user}/Items/{movie}"}' > two.jsonl
   start=$SECONDS
-  PARITY_CAP_S=20 PARITY_REQUEST_TIMEOUT=10 FERROFIN_IMAGE=ferrofin:slow run parity --requests two.jsonl
+  # one read at a time, so the second starts with less than its timeout left (in parallel both finish in time)
+  PARITY_CAP_S=20 PARITY_REQUEST_TIMEOUT=10 PARITY_CONCURRENCY=1 FERROFIN_IMAGE=ferrofin:slow run parity --requests two.jsonl
   [ "$status" -eq 1 ]
   [ "$(jq -r .verdict out/results.json)" = "run failed" ]
   grep -q "before every request was sent" out/report.html   # the comparison hit the cap, not the boot

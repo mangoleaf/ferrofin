@@ -28,7 +28,8 @@ use serde::Deserialize;
 /// candidate setting is already exposed as [`Config::port`].
 pub const DEFAULT_HTTP_PORT: u16 = 8096;
 
-/// Default TCP port for the HTTPS endpoint (TLS termination is deferred).
+/// Default TCP port for the HTTPS endpoint, served when the network
+/// configuration enables HTTPS and its certificate loads.
 ///
 /// `8920` is the Jellyfin parity value (`ServerConfiguration.HttpsServerPortNumber`).
 /// FLAGGED as a magic number, same rationale as [`DEFAULT_HTTP_PORT`].
@@ -303,7 +304,9 @@ pub struct Config {
     /// HTTP port to listen on. Default [`DEFAULT_HTTP_PORT`].
     pub port: u16,
 
-    /// HTTPS port (TLS deferred). Default [`DEFAULT_HTTPS_PORT`].
+    /// HTTPS port, listened on beside the HTTP port when the network
+    /// configuration's `EnableHttps` is on and its certificate loads. Default
+    /// [`DEFAULT_HTTPS_PORT`].
     pub https_port: u16,
 
     /// Publicly reachable server URL advertised to clients

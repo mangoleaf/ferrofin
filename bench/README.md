@@ -135,11 +135,16 @@ tmdb/imdb ids), locally drawn posters/fanart/logos, and five ffmpeg-generated te
 clips cloned under every name (real streams, no disk cost). It includes 40 multi-version
 movies, 50 HDR10 4K files, 300 multi-track files and one 3-minute 8 Mbps movie for the
 streaming numbers. **Jellyfin 10.11.8 itself scans it** with every remote fetcher off and
-is seeded over its own API (two users; 30 % of movies and 60 % of forty series played,
-5 % favorites, 60 resume positions, 200 ratings), then drained and stopped. The resulting
+is seeded over its own API (two users; 30 % of movies and 60 % of forty series played, 5 %
+favorites, 60 resume positions, 200 ratings), then drained and stopped. The resulting
 config directory is what Ferrofin boots a fresh copy of. Jellyfin boots a copy of the
-separately prepared config described below. Ferrofin adoption stays inside the run;
-media is mounted read-only for every server.
+separately prepared config described below. Ferrofin adoption stays inside the run: after
+its isolation restart, each run asks Ferrofin for one full library scan, waits for it to
+complete (`scan.json`) and restarts the server, outside every measured phase. That is the
+equivalent of the scan the Jellyfin preparation gave its config, so album-artist people
+and library view images exist on both sides, and no scan heap is left in the memory
+numbers. `scan_policy: 1` in `run.json` keeps these runs from pooling with earlier ones.
+Media is mounted read-only for every server.
 
 ## Shared picks and bounded validation
 
@@ -218,7 +223,8 @@ it is not all-endpoint coverage or a deep-parity score.
 - Before each drain, the runner verifies that triggers remain empty, library monitoring/
   fetchers remain off, and plugin states still satisfy the policy. Tasks drain to idle
   plus a 30 s settle before measurements. Fixture creation and the explicit Jellyfin 12
-  preparation scan remain enabled outside benchmark runs.
+  preparation scan remain enabled outside benchmark runs, and Ferrofin's one explicit
+  library scan runs during provisioning, followed by a restart, before every measured phase.
 - Ferrofin runs as **core Ferrofin**, with every plugin/compiled-in extension disabled;
   WASM files in the disposable config are rejected. Installed Jellyfin plugins are also
   disabled. Jellyfin's non-uninstallable bundled providers (AudioDB, MusicBrainz, OMDb,
@@ -269,7 +275,8 @@ These settings are recorded and checked before aggregation. Client process group
 TERM, then KILL if needed; container cleanup uses the ID created by this run. k6 retains
 its bounded default HTTP request timeout, with the outer client limit above. A drain can
 finish its last bounded HTTP call before reporting timeout. Fixture task drain/export
-uses `PREPARE_TIMEOUT_S` (1800 by default). No global cleanup or host changes occur.
+uses `PREPARE_TIMEOUT_S` (1800 by default), and so does Ferrofin's in-run library
+scan. No global cleanup or host changes occur.
 
 The sampler saves `cpu_usec` beside its interval utilization fields. Sample timestamps
 retain sub-millisecond precision so catch-up observations do not collide through rounding.

@@ -18,6 +18,7 @@ use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 use uuid::Uuid;
 
 struct Fixture {
@@ -992,11 +993,14 @@ async fn series_and_season_extras_are_owned_and_legacy_episodes_are_repaired() {
         );
         assert!(f.row("Show/Extras/bonus.mkv").await.is_in_mixed_folder);
         assert!(!f.row(extra_path).await.is_in_mixed_folder);
+        // `IsGeneratedExtraName` (v12.2) counts a type's numbers up to the
+        // candidates it has now: with one trailer left, "Trailer 2" is no
+        // name this scan could give, so it reads as the user's and stands.
         std::fs::remove_file(f.media.join("Show/Show-trailer.mkv")).unwrap();
         f.scanner.scan_all().await.unwrap();
         assert_eq!(
             f.row("Show/trailer.mkv").await.name.as_deref(),
-            Some("Trailer")
+            Some("Trailer 2")
         );
         let episode = f.row("Show/Season 01/Show S01E01.mkv").await;
         assert_eq!(episode.parent_id.as_ref(), Some(&season.id));
@@ -2582,4 +2586,237 @@ async fn a_loose_episodes_own_folder_extras_are_its_own() {
     assert_eq!(owned.len(), 1, "{owned:?}");
     assert!(owned[0].1.is_some());
     assert_eq!(owned[0].2.as_deref(), Some(primary.as_str()));
+}
+
+const BR: &str = "Blade Runner (1982)/Blade Runner (1982).mkv";
+const BR_TRAILER: &str = "Blade Runner (1982)/trailers/trailer.mkv";
+const BR_FEATURETTE: &str = "Blade Runner (1982)/featurettes/Making of.mkv";
+
+/// Writes the Blade Runner folder's `movie.nfo` with `plot` and `year`.
+fn write_movie_nfo(f: &Fixture, plot: &str, year: i32) {
+    std::fs::write(
+        f.media.join("Blade Runner (1982)/movie.nfo"),
+        format!(
+            "<movie><title>Blade Runner</title><plot>{plot}</plot><genre>Sci-Fi</genre>\
+             <studio>Warner</studio><country>US</country><mpaa>R</mpaa>\
+             <rating>8.1</rating><year>{year}</year>\
+             <premiered>{year}-06-25</premiered></movie>"
+        ),
+    )
+    .unwrap();
+}
+
+/// The genres linked to `id` in `ItemValues`, which genre filters read.
+async fn genre_links(f: &Fixture, id: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        r#"SELECT v."Value" FROM "ItemValuesMap" m
+           JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+           WHERE m."ItemId" = ?1 AND v."Type" = 2"#,
+    )
+    .bind(id)
+    .fetch_all(f.db.pool())
+    .await
+    .unwrap()
+}
+
+/// Upstream `BaseItem.RefreshExtras`: an owner's refresh that finds its
+/// extras new gives them its title metadata (`RefreshMetadataForOwnedItem`'s
+/// `copyTitleMetadata`) and its dates (`InheritDatesFromOwner`), so a
+/// trailer and a featurette are dated, rated and described like their movie.
+#[tokio::test]
+async fn new_extras_take_their_owners_title_metadata_and_dates() {
+    let f = Fixture::new(&[BR, BR_TRAILER, BR_FEATURETTE]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    let movie = f.row(BR).await;
+    assert_eq!(movie.overview.as_deref(), Some("First plot"));
+    for extra in [BR_TRAILER, BR_FEATURETTE] {
+        let row = f.row(extra).await;
+        assert_eq!(row.genres, movie.genres, "{extra}");
+        assert_eq!(row.studios, movie.studios, "{extra}");
+        assert_eq!(
+            row.production_locations, movie.production_locations,
+            "{extra}"
+        );
+        assert_eq!(row.overview, movie.overview, "{extra}");
+        assert_eq!(row.official_rating.as_deref(), Some("R"), "{extra}");
+        assert_eq!(row.community_rating, movie.community_rating, "{extra}");
+        assert_eq!(row.production_year, Some(1982), "{extra}");
+        assert_eq!(row.premiere_date, movie.premiere_date, "{extra}");
+        assert_eq!(genre_links(&f, &row.id).await, ["Sci-Fi"], "{extra}");
+    }
+}
+
+/// Upstream `RefreshExtras` on a refresh that finds the extras as they were
+/// gives them only the owner's dates; a full refresh, or one that finds an
+/// extra gone, gives them its title metadata again.
+#[tokio::test]
+async fn later_refreshes_copy_the_dates_and_only_a_full_one_or_a_removal_the_rest() {
+    let f = Fixture::new(&[BR, BR_TRAILER, BR_FEATURETTE]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+
+    write_movie_nfo(&f, "Second plot", 1983);
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(BR).await.overview.as_deref(), Some("Second plot"));
+    let trailer = f.row(BR_TRAILER).await;
+    assert_eq!(trailer.overview.as_deref(), Some("First plot"));
+    assert_eq!(trailer.production_year, Some(1983));
+    assert_eq!(trailer.premiere_date, f.row(BR).await.premiere_date);
+
+    let full = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    f.scanner.scan_with(None, &full).await.unwrap();
+    assert_eq!(
+        f.row(BR_TRAILER).await.overview.as_deref(),
+        Some("Second plot")
+    );
+
+    write_movie_nfo(&f, "Third plot", 1983);
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row(BR_TRAILER).await.overview.as_deref(),
+        Some("Second plot")
+    );
+    std::fs::remove_file(f.media.join(BR_FEATURETTE)).unwrap();
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(
+        f.row(BR_TRAILER).await.overview.as_deref(),
+        Some("Third plot")
+    );
+}
+
+/// Upstream `RefreshExtras` counts an extra `FindExtras` renames
+/// (`renamedExtraIds`): the refresh gives every extra the owner's title
+/// metadata again, as a full one does. Here the stored name is the raw file
+/// stem an older Ferrofin scan gave the trailer, which the rescan renews.
+#[tokio::test]
+async fn an_extra_find_extras_renames_takes_the_title_metadata_again() {
+    const TRAILER: &str = "Blade Runner (1982)/Blade Runner (1982)-trailer.mkv";
+    let f = Fixture::new(&[BR, TRAILER]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(TRAILER).await.name.as_deref(), Some("Trailer"));
+
+    write_movie_nfo(&f, "Second plot", 1982);
+    sqlx::query(r#"UPDATE "BaseItems" SET "Name" = ? WHERE "Path" = ?"#)
+        .bind("Blade Runner (1982)-trailer")
+        .bind(f.media.join(TRAILER).to_string_lossy().as_ref())
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    let trailer = f.row(TRAILER).await;
+    assert_eq!(trailer.name.as_deref(), Some("Trailer"));
+    assert_eq!(trailer.overview.as_deref(), Some("Second plot"));
+}
+
+/// A name an extra's own NFO changes is no `FindExtras` rename: the extra
+/// takes the new title, and the refresh gives it only the owner's dates.
+#[tokio::test]
+async fn an_extras_nfo_title_change_is_no_rename() {
+    let f = Fixture::new(&[BR, BR_FEATURETTE]).await;
+    let nfo = f
+        .media
+        .join("Blade Runner (1982)/featurettes/Making of.nfo");
+    std::fs::write(&nfo, "<movie><title>Old cut</title></movie>").unwrap();
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.row(BR_FEATURETTE).await.name.as_deref(), Some("Old cut"));
+
+    write_movie_nfo(&f, "Second plot", 1982);
+    std::fs::write(&nfo, "<movie><title>New cut</title></movie>").unwrap();
+    f.scanner.scan_all().await.unwrap();
+    let featurette = f.row(BR_FEATURETTE).await;
+    assert_eq!(featurette.name.as_deref(), Some("New cut"));
+    assert_eq!(featurette.overview.as_deref(), Some("First plot"));
+}
+
+/// A rescan that finds the owner and its extras as they were writes no
+/// extra: the copy writes only rows that differ, so the dates it gives are
+/// already theirs.
+#[tokio::test]
+async fn a_quiet_rescan_writes_no_extra() {
+    let f = Fixture::new(&[BR, BR_TRAILER, BR_FEATURETTE]).await;
+    write_movie_nfo(&f, "First plot", 1982);
+    f.scanner.scan_all().await.unwrap();
+    let before = [
+        f.row(BR_TRAILER).await.date_last_saved,
+        f.row(BR_FEATURETTE).await.date_last_saved,
+    ];
+    f.scanner.scan_all().await.unwrap();
+    let after = [
+        f.row(BR_TRAILER).await.date_last_saved,
+        f.row(BR_FEATURETTE).await.date_last_saved,
+    ];
+    assert_eq!(after, before);
+    assert_eq!(
+        f.row(BR_TRAILER).await.overview.as_deref(),
+        Some("First plot")
+    );
+}
+
+/// An extra named after an alternate version is owned by that version
+/// (`Video.GetOwnerIdForExtra`) and maintained by its primary
+/// (`GetOwnedVersionIds`), whose metadata it takes.
+#[tokio::test]
+async fn an_extra_of_an_alternate_version_takes_its_primarys_metadata() {
+    let f = Fixture::new(&[
+        "Film (2001)/Film (2001).mkv",
+        "Film (2001)/Film (2001) - 4K.mkv",
+        "Film (2001)/Film (2001) - 4K-trailer.mkv",
+    ])
+    .await;
+    std::fs::write(
+        f.media.join("Film (2001)/movie.nfo"),
+        "<movie><title>Film</title><plot>A plot</plot><genre>Drama</genre></movie>",
+    )
+    .unwrap();
+    f.scanner.scan_all().await.unwrap();
+    let trailer = f.row("Film (2001)/Film (2001) - 4K-trailer.mkv").await;
+    assert_eq!(
+        trailer.owner_id,
+        Some(f.row("Film (2001)/Film (2001) - 4K.mkv").await.id)
+    );
+    assert_eq!(trailer.overview.as_deref(), Some("A plot"));
+    assert_eq!(trailer.genres.as_deref(), Some("Drama"));
+    assert_eq!(trailer.production_year, Some(2001));
+}
+
+/// Upstream `FindExtras_TrailerWithYearInFilename_SetsProductionYearFromFilename`:
+/// a video extra is resolved with its name parsed, so the year in its file
+/// name is its own while its owner has none to give it — for a movie's
+/// trailer and featurette, and for a series' trailer.
+#[tokio::test]
+async fn a_video_extra_takes_the_year_in_its_file_name() {
+    let f = Fixture::new(&[
+        "Up/Up.mkv",
+        "Up/trailers/Trailer 1 (2013).mkv",
+        "Up/featurettes/Making of (2009).mkv",
+    ])
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let trailer = f.row("Up/trailers/Trailer 1 (2013).mkv").await;
+    assert_eq!(
+        trailer.extra_type,
+        Some(ferrofin_model::entities::ExtraType::Trailer.json_value())
+    );
+    assert_eq!(trailer.production_year, Some(2013));
+    let featurette = f.row("Up/featurettes/Making of (2009).mkv").await;
+    assert_eq!(featurette.production_year, Some(2009));
+
+    let f = Fixture::with_type(
+        &[
+            "Show/Season 1/Show S01E01.mkv",
+            "Show/trailers/Trailer 1 (2013).mkv",
+        ],
+        CollectionTypeOptions::tvshows,
+    )
+    .await;
+    f.scanner.scan_all().await.unwrap();
+    let trailer = f.row("Show/trailers/Trailer 1 (2013).mkv").await;
+    assert!(trailer.owner_id.is_some());
+    assert_eq!(trailer.production_year, Some(2013));
 }

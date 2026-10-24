@@ -296,13 +296,20 @@ fn pages_movie_keys(filter: &InternalItemsQuery) -> bool {
 /// group represented by a row it excluded, and the outer query carries no
 /// predicates of its own.
 ///
-/// The representative is the group's *primary* version where there is one.
-/// SQLite reports the bare `"Id"` from whichever row produced the `MIN`, so the
-/// aggregate is what picks it; without that a merged movie could be listed
-/// under an alternate cut's title.
+/// The representative is upstream's `g.Where(e => e.PrimaryVersionId ==
+/// null).Min(e => (Guid?)e.Id) ?? g.Min(e => (Guid?)e.Id)`: the smallest id
+/// among the group's *primary* versions, so a merged movie is never listed
+/// under an alternate cut's title, else the smallest id in the group (when
+/// none of the rows the query matched is a primary). Ids are stored as uppercase
+/// hyphenated GUID text, so `MIN` is the text comparison EF's translation makes.
+/// Before the `Id` tie-break, a group whose rows tie on primary-ness (two
+/// seasons of one series with the same number, the keyless group described on
+/// [`push_group_tail`], alternates whose primary is gone) was represented by
+/// whichever row SQLite scanned first.
 fn push_group_head(qb: &mut QueryBuilder<Sqlite>) {
-    qb.push(r#"bi."Id" IN (SELECT "rep" FROM (SELECT bi."Id" AS "rep", MIN("#)
-        .push(r#"CASE WHEN bi."PrimaryVersionId" IS NULL THEN 0 ELSE 1 END) FROM "BaseItems" AS bi WHERE bi."Id" <> "#)
+    qb.push(r#"bi."Id" IN (SELECT "rep" FROM (SELECT COALESCE(MIN(CASE WHEN "#)
+        .push(r#"bi."PrimaryVersionId" IS NULL THEN bi."Id" END), MIN(bi."Id")) AS "rep" "#)
+        .push(r#"FROM "BaseItems" AS bi WHERE bi."Id" <> "#)
         .push_bind(PLACEHOLDER_ID);
 }
 
@@ -3126,9 +3133,11 @@ mod tests {
         let user =
             crate::test_support::seed_user_with_defaults(&db, uuid::Uuid::from_u128(0x5501)).await;
         for kind in [BaseItemKind::Playlist, BaseItemKind::BoxSet] {
-            let mut filter = crate::user_view_manager::visible_item_query(kind, &user);
-            filter.top_parent_ids =
-                vec![uuid::Uuid::from_u128(0x5502), uuid::Uuid::from_u128(0x5503)];
+            let filter = crate::user_view_manager::visible_item_query(
+                kind,
+                &user,
+                vec![uuid::Uuid::from_u128(0x5502), uuid::Uuid::from_u128(0x5503)],
+            );
             let mut builder = build_query(&filter, QueryShape::IdsOnly);
             let mut query = builder.build();
             let args = query.take_arguments().expect("arguments").expect("binds");

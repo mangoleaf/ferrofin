@@ -1,0 +1,94 @@
+# Names the corpus's ids.json does not record, read from the oracle once it is up and filled into
+# `{found.<name>}` templates (both servers serve the same library, so one answer serves both).
+#
+# [found.<name>]
+# path  = the GET that lists it
+# query = its query (templates allowed)
+# pick  = the field of the answer that holds the name: object keys and list indices joined by dots
+
+version = 1
+
+[found.genre]
+path = "/Genres"
+query = { userId = "{user}", parentId = "{views.movies}", sortBy = "SortName", limit = 1 }
+pick = "Items.0.Name"
+
+[found.music_genre]
+path = "/MusicGenres"
+query = { userId = "{user}", sortBy = "SortName", limit = 1 }
+pick = "Items.0.Name"
+
+[found.music_genre_id]
+path = "/MusicGenres"
+query = { userId = "{user}", sortBy = "SortName", limit = 1 }
+pick = "Items.0.Id"
+
+[found.person]
+path = "/Persons"
+query = { userId = "{user}", limit = 1 }
+pick = "Items.0.Name"
+
+[found.studio]
+path = "/Studios"
+query = { userId = "{user}", sortBy = "SortName", limit = 1 }
+pick = "Items.0.Name"
+
+[found.artist]
+path = "/Artists"
+query = { userId = "{user}", sortBy = "SortName", limit = 1 }
+pick = "Items.0.Name"
+
+[found.artist_id]
+path = "/Artists"
+query = { userId = "{user}", sortBy = "SortName", limit = 1 }
+pick = "Items.0.Id"
+
+[found.album]
+path = "/Items"
+query = { userId = "{user}", includeItemTypes = "MusicAlbum", recursive = true, sortBy = "SortName", limit = 1 }
+pick = "Items.0.Id"
+
+[found.track]
+path = "/Items"
+query = { userId = "{user}", includeItemTypes = "Audio", recursive = true, sortBy = "SortName", limit = 1 }
+pick = "Items.0.Id"
+
+# a word of the first movie's name, for the search requests
+[found.term]
+path = "/Items"
+query = { userId = "{user}", includeItemTypes = "Movie", recursive = true, sortBy = "SortName", limit = 1 }
+pick = "Items.0.Name"
+
+[found.task]
+path = "/ScheduledTasks"
+pick = "0.Id"
+
+[found.log]
+path = "/System/Logs"
+pick = "0.Name"
+
+[found.library]
+path = "/Library/VirtualFolders"
+pick = "0.Name"
+
+[found.library_path]
+path = "/Library/VirtualFolders"
+pick = "0.Locations.0"
+
+# a tag the first movie carries, for the blocked-tags edge case
+[found.tag]
+path = "/Items"
+query = { userId = "{user}", includeItemTypes = "Movie", recursive = true, sortBy = "SortName", limit = 1, fields = "Tags" }
+pick = "Items.0.Tags.0"
+
+# the first movie, which carries {found.tag}: the blocked-tags user must not see it
+[found.tagged_movie]
+path = "/Items"
+query = { userId = "{user}", includeItemTypes = "Movie", recursive = true, sortBy = "SortName", limit = 1 }
+pick = "Items.0.Id"
+
+# an R-rated movie: the PG-13 user must not see it
+[found.r_movie]
+path = "/Items"
+query = { userId = "{user}", includeItemTypes = "Movie", recursive = true, officialRatings = "R", sortBy = "SortName", limit = 1 }
+pick = "Items.0.Id"
