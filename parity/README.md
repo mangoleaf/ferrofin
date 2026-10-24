@@ -53,8 +53,11 @@ instead of warned about. The oracle is the same pinned image and the same stale-
 2. **Boot.** Both servers boot at once, each on its own disposable copy of the **same** configuration (the one the
    pinned Jellyfin upgraded and scanned, `jellyfin/config`; the benchmark boots Ferrofin on the 10.11.8 source
    instead, and a replay on that would compare two different scans, not two servers), media read-only, each on
-   half of `SERVER_CPUS`. Plugins and automatic tasks are switched off and the servers restarted, as in the benchmark,
-   so the answers come from the core servers and nothing rewrites the copy. While each server is stopped for
+   half of `SERVER_CPUS`, with the same container hostname (an unnamed server's name). Plugins that can be
+   uninstalled and automatic tasks are switched off and the servers restarted, so the answers come from the core
+   servers and nothing rewrites the copy; the in-tree plugins (TMDb, OMDb, …), which Jellyfin cannot disable, stay
+   as they are on both, and Ferrofin's compiled-in extensions, which Jellyfin does not have, are off
+   (`FERROFIN_DISABLE_EXTENSIONS=1`). While each server is stopped for
    that restart, its isolated configuration and cache are copied to `<server>/pristine/`: the snapshot every
    write starts from. Readiness is `/System/Ping` and idle `/ScheduledTasks`, never a fixed sleep.
 3. **Compare.** `diff.py run` signs in as the corpus's browse user on both, sends each read to both, and
@@ -123,6 +126,12 @@ the playlist it created; a server whose answer lacks the field is not asked, and
 `oracle_trap` never excuses it). When the oracle fails on a write with an `oracle_trap`, its read-backs are not
 sent and count as oracle failures too.
 
+A read-back may name a `settle` field (`"settle": "ProductionYear"`): a field the server fills in a background
+refresh the write only queues (both servers queue a new collection's first refresh). A server whose answer lacks
+it, or has it null or an empty list, is asked again every second (lib.sh's `POLL_S`) until it is there or the request
+timeout has passed; then its last answer is compared. Each server settles on its own, so a slow refresh is
+compared once it is done and a refresh that never fills the field is still a difference.
+
 A write may also carry `setup`: writes (with a request's fields, without read-backs) sent on the fresh copy
 before it, to build the state it acts on. An unfavourite first favourites the movie, so it clears something
 rather than nothing. Setup steps are compared like everything else and reported as `<write id>/<step id>`; ids
@@ -146,7 +155,12 @@ Bodies are compared as JSON, after the normalisation rules:
 | `missing` / `extra` | a field only Jellyfin / only Ferrofin has: an extra field on Ferrofin is a difference too |
 | `length` | arrays of different length |
 
-Arrays are compared in order unless a rule says otherwise. A body that is not JSON must be byte-equal.
+Arrays are compared in order unless a rule says otherwise. Two elements in the same place that are objects with
+different `Id`s are different items: the order or the selection differs, and that is reported once, as a `value`
+difference at `<array>[].Id`, without comparing the two items field by field, and the rules under them are not
+counted as used by that pair. Ids that differ only in dashes or case are the same item (the format is reported at
+`.Id` and the fields are compared), and a rule on the element itself or one making its `Id` opaque turns the
+collapse off. A body that is not JSON must be byte-equal.
 
 ### Normalisation (`normalise.toml`)
 
@@ -163,6 +177,14 @@ or a playlist was created, without making the same path opaque everywhere. A new
 both servers derive it from the same path, so it must agree. A path belongs to one rule for every
 request, or to rules limited to requests that never share one (checked before anything boots).
 
+The path `$` is the whole body, for the requests a rule names (it must name them): `unordered` over a root array
+(`/Library/VirtualFolders`), or `opaque` over a body that can never agree. For a body that is not JSON (an
+encoder's output: a re-encoded image, a remuxed stream) both sides must still answer one; a JSON body is then
+compared only for its type and nullness, nothing inside it.
+
+Each server's own harness token is replaced by `<token>` in its answers before they are compared or stored: the
+servers write the token their session holds into the URLs they return (a subtitle playlist's `ApiKey=`).
+
 A rule that matches nothing in a run is listed in the report. Rules change only through a reviewed PR.
 
 ### Ledger (`ledger.toml`)
@@ -172,8 +194,9 @@ entry written for a harmless value difference must not also swallow a null or a 
 and exactly one link:
 `verified = "<METHOD> <path>"` (a row of `handlers::VERIFIED`, checked to exist) or `issue = <iid>` (the GitLab
 issue that tracks it). An entry with no link, two, or a `verified` that is not a row of the record fails the run
-before anything boots. The report groups ledgered differences by their link and lists the entries (not links) that
-matched nothing.
+before anything boots. A path with `<tag>` matches every image-tag key of that map
+(`Items[].ImageBlurHashes.Primary.<tag>`), as in `filed.toml`. The report groups ledgered differences by their link
+and lists the entries (not links) that matched nothing.
 
 ### Filing new differences (`new-differences.json`, `filed.toml`)
 
