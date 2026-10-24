@@ -1420,8 +1420,10 @@ fn presentation_key_groups_sql() -> &'static str {
 /// physical library folders (20,457 closure rows between them) measure 4.63 ms
 /// unpinned against 19.18 ms pinned. Those folders DO reach here: the page's
 /// folder list (`dto_service.rs`, the `get_played_and_total_count_batch` call
-/// site) drops `CollectionFolder`, `UserView` and the by-name kinds, but a plain
-/// `Folder` passes. What bounds the loss is the `total` arm: it is this
+/// site) keeps only the folders whose `UserData` reads the counts (v12.2
+/// `DtoService.cs:207-209`), which drops `CollectionFolder`, `UserView`, the
+/// by-name kinds, and an album or artist page without `RecursiveItemCount`, but
+/// a plain `Folder` passes. What bounds the loss is the `total` arm: it is this
 /// same statement WITHOUT the `UserData` join, it always drives from the
 /// page's branches, and on that page it cost 20.36 ms — already the same order.
 /// So the pinned played arm took such a page from ~25 ms to ~40 ms, never from
