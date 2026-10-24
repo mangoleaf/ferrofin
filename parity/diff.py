@@ -36,9 +36,11 @@ Normalisation file (normalise.toml) and ledger (ledger.toml) are described in pa
 """
 
 import argparse
+import concurrent.futures
 import contextlib
 import dataclasses
 import fnmatch
+import hashlib
 import html
 import http.client
 import json
@@ -67,10 +69,11 @@ KINDS = ("status", "value", "type", "null", "missing", "extra", "length")
 RULE_KINDS = ("opaque", "opaque-keys", "unordered")
 #: The methods the harness sends; a write runs on a fresh database copy, after every read.
 WRITES = ("POST", "DELETE")
-METHODS = ("GET", *WRITES)
-PLACEHOLDER = re.compile(r"\{([A-Za-z_][\w.]*)\}")
-#: A read-back's templates under this prefix are read from the write's answer on the same server.
-CAPTURE = "write."
+METHODS = ("GET", "HEAD", *WRITES)
+PLACEHOLDER = re.compile(r"\{([A-Za-z_][\w.]*)([+-]\d+)?\}")
+#: Templates under these prefixes are read from an answer on the same server: `{write.Id}` (in a
+#: read-back) from the write's, `{setup.<step>.Id}` (in a later step, the write or a read-back) from a setup step's.
+CAPTURES = ("write.", "setup.")
 
 
 class ParityError(Exception):
@@ -102,38 +105,67 @@ class Request:
     expect_status: int
     readbacks: tuple = ()    # a write's read-backs (Requests whose id is `<write>/<read-back>`)
     of: str = ""             # a read-back's or setup step's write
-    setup: tuple = ()        # writes sent on the fresh copy before this write (ids `<write>/<step>`)
+    setup: tuple = ()        # requests sent on the fresh copy before this write (ids `<write>/<step>`)
+    file: str = ""           # the request file it came from (the report's time by request file)
 
     @property
     def is_write(self):
         return self.method in WRITES
 
 
-#: `capture` for templates outside a read-back: `{write.…}` is an error there.
-NO_CAPTURE = object()
-#: `capture` for checking a read-back's templates before anything is sent: any `{write.…}` resolves.
-ANY_CAPTURE = object()
+#: `capture` for templates outside a write test: `{write.…}` and `{setup.…}` are errors there.
+NO_CAPTURE = None
+
+
+class Available(frozenset):
+    """`capture` for checking templates before anything is sent: the answers (`write`, `setup.<step>`)
+    that will exist when the request is sent; any field of those resolves."""
 
 
 def scalar(value):
     return not isinstance(value, bool) and isinstance(value, (str, int))
 
 
-def lookup(ids, name, capture=NO_CAPTURE):
-    """`name` ("user", "views.movies") read from the ids file, or a read-back's `write.Id` read from the
-    write's answer on this server (`capture`, its JSON); a string or integer."""
-    if name.startswith(CAPTURE):
-        if capture is NO_CAPTURE:
-            raise ParityError(f"`{{{name}}}` reads the write's answer: it is allowed only in a write's read-backs")
-        if capture is ANY_CAPTURE:
-            return "x"
-        value = capture
-        for part in name[len(CAPTURE):].split("."):
-            if not isinstance(value, dict) or part not in value:
-                raise CaptureMissing(f"the write's answer has no `{name}`")
+def capture_key(name):
+    """`("setup.pl", "Id")` for `setup.pl.Id`, `("write", "A.B")` for `write.A.B`."""
+    root, _, rest = name.partition(".")
+    if root == "setup":
+        step, _, rest = rest.partition(".")
+        return f"setup.{step}", rest
+    return root, rest
+
+
+def walk(value, field):
+    """`field` ("A.0.B": object keys and list indices) read from a JSON value; KeyError when absent."""
+    for part in field.split(".") if field else ():
+        if isinstance(value, dict) and part in value:
             value = value[part]
+        elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+            value = value[int(part)]
+        else:
+            raise KeyError(part)
+    return value
+
+
+def lookup(ids, name, capture=NO_CAPTURE):
+    """`name` ("user", "views.movies") read from the ids file, or `write.Id` / `setup.<step>.Id` read from
+    an answer this server gave earlier in the same write test (`capture`: those answers' JSON by key); a
+    string or integer."""
+    if name.startswith(CAPTURES):
+        if capture is NO_CAPTURE:
+            raise ParityError(f"`{{{name}}}` reads an earlier answer: it is allowed only in a write's setup steps and read-backs")
+        key, field = capture_key(name)
+        if isinstance(capture, Available):
+            if key not in capture:
+                raise ParityError(f"`{{{name}}}` names no step sent before it")
+            return "x"
+        whose = "the write's answer" if key == "write" else f"setup step `{key.split('.', 1)[1]}`'s answer"
+        try:
+            value = walk(capture[key], field)
+        except (KeyError, TypeError):
+            raise CaptureMissing(f"{whose} has no `{name}`") from None
         if not scalar(value):
-            raise CaptureMissing(f"the write's answer has no `{name}` (it is not a string or an integer)")
+            raise CaptureMissing(f"{whose} has no `{name}` (it is not a string or an integer)")
         return str(value)
     value = ids
     for part in name.split("."):
@@ -146,7 +178,15 @@ def lookup(ids, name, capture=NO_CAPTURE):
 
 
 def fill(text, ids, capture=NO_CAPTURE):
-    return PLACEHOLDER.sub(lambda found: lookup(ids, found.group(1), capture), text)
+    """`text` with each `{name}` filled; `{name-1}` (or `+2`) offsets an integer value (the last page's index)."""
+    def one(found):
+        value = lookup(ids, found.group(1), capture)
+        if not found.group(2):
+            return value
+        if not value.lstrip("-").isdigit():
+            raise ParityError(f"`{found.group(1)}` is not an integer: it cannot be offset")
+        return str(int(value) + int(found.group(2)))
+    return PLACEHOLDER.sub(one, text)
 
 
 SETUP_FIELDS = {"id", "method", "path", "query", "body", "source", "oracle_trap", "expect_status"}
@@ -169,13 +209,14 @@ def parse_request(row, where, of=None, kind=""):
     method = "GET" if kind == "read-back" else row["method"]
     if method not in METHODS:
         raise ParityError(f"{where}: `{method}` is not a method the harness sends ({', '.join(METHODS)})")
-    if kind == "setup" and method not in WRITES:
-        raise ParityError(f"{where}: a setup step is a write ({', '.join(WRITES)})")
+    if kind == "setup" and method not in WRITES and row.get("body") is not None:
+        raise ParityError(f"{where}: a setup step has no body unless it is a write")
     if not row["path"].startswith("/"):
         raise ParityError(f"{where}: `path` starts with a slash")
     query = row.get("query") or {}
-    if not isinstance(query, dict):
-        raise ParityError(f"{where}: `query` is an object")
+    pairs = isinstance(query, list) and all(isinstance(pair, list) and len(pair) == 2 and isinstance(pair[0], str) for pair in query)
+    if not isinstance(query, dict) and not pairs:
+        raise ParityError(f"{where}: `query` is an object or a list of [name, value] pairs (a parameter sent more than once)")
     body = row.get("body")
     if body is not None and method == "GET":
         raise ParityError(f"{where}: a GET carries no body")
@@ -203,37 +244,118 @@ def parse_request(row, where, of=None, kind=""):
                    tuple(children["setup"]))
 
 
+def request_lines(paths):
+    """`(file name, where, line)` for every line of each request set in `paths` (one or a list, in order):
+    a request file, or every `*.jsonl` file of a directory in name order (a request set split into files)."""
+    for path in [paths] if isinstance(paths, (str, Path)) else paths:
+        path = Path(path)
+        for file in sorted(path.glob("*.jsonl")) if path.is_dir() else [path]:
+            for number, line in enumerate(file.read_text().splitlines(), 1):
+                yield f"{file.parent.name}/{file.name}", f"{file}:{number}", line
+
+
 def load_requests(path, ids=None):
-    """The requests in `path`; with `ids`, every template must also resolve against it (a read-back's
-    `{write.…}` is only known once the write is answered)."""
+    """The requests in `path` (a file or a directory of them, or a list of those sent as one set); with
+    `ids`, every template must also resolve against it (`{write.…}` and `{setup.…}` are only known once
+    those are answered)."""
     requests, seen = [], set()
-    for number, line in enumerate(Path(path).read_text().splitlines(), 1):
+    for file, where, line in request_lines(path):
         if not line.strip():
             continue
-        where = f"{path}:{number}"
         try:
             row = json.loads(line)
         except json.JSONDecodeError as err:
             raise ParityError(f"{where}: not JSON ({err})") from err
         request = parse_request(row, where)
+        request = dataclasses.replace(request, file=file, setup=tuple(dataclasses.replace(s, file=file) for s in request.setup),
+                                      readbacks=tuple(dataclasses.replace(r, file=file) for r in request.readbacks))
         if request.id in seen:
             raise ParityError(f"{where}: request id `{request.id}` is used twice")
         seen.add(request.id)
         requests.append(request)
     if not requests:
-        raise ParityError(f"{path}: no requests")
+        raise ParityError(f"{', '.join(map(str, [path] if isinstance(path, (str, Path)) else path))}: no requests")
     for request in requests if ids is not None else ():
-        for step in (request, *request.setup):
-            target(step, ids)
-            body_of(step, ids)
-        for readback in request.readbacks:
-            target(readback, ids, ANY_CAPTURE)
+        for step, available in scopes(request):
+            target(step, ids, available)
+            body_of(step, ids, available)
     return requests
+
+
+def scopes(request):
+    """`(request, Available)` for a request and each of its setup steps and read-backs, in the order they
+    are sent: what each may read with `{setup.…}` and `{write.…}`."""
+    if not request.is_write:
+        yield request, NO_CAPTURE
+        return
+    seen = []
+    for step in request.setup:
+        yield step, Available(seen)
+        seen.append("setup." + step.id.split("/", 1)[1])
+    yield request, Available(seen)
+    for readback in request.readbacks:
+        yield readback, Available([*seen, "write"])
 
 
 def every_id(requests):
     """The ids of the requests, their setup steps and read-backs, as results report them."""
     return [r.id for request in requests for r in (request, *request.setup, *request.readbacks)]
+
+
+# ── names discovered from the oracle ────────────────────────────────────────
+def load_discover(path):
+    """`{name: Request-like spec}` from a discovery file: names the corpus does not record (a person, an
+    artist), read from the oracle once it is up and filled into `{found.<name>}` templates."""
+    data = tomllib.loads(Path(path).read_text())
+    unknown = set(data) - {"version", "found"}
+    if unknown:
+        raise ParityError(f"{path}: unknown key(s) {', '.join(sorted(unknown))}")
+    spec = {}
+    for name, row in data.get("found", {}).items():
+        where = f"{path}: found.{name}"
+        if not isinstance(row, dict) or set(row) - {"path", "query", "pick"}:
+            raise ParityError(f"{where}: unknown key(s); a name has `path`, `query` and `pick`")
+        if not isinstance(row.get("path"), str) or not row["path"].startswith("/"):
+            raise ParityError(f"{where}: `path` starts with a slash")
+        if not isinstance(row.get("query", {}), dict):
+            raise ParityError(f"{where}: `query` is a table")
+        if not isinstance(row.get("pick"), str) or not row["pick"]:
+            raise ParityError(f"{where}: `pick` is the field of the answer that holds the name (`Items.0.Name`)")
+        spec[name] = (Request(f"found-{name}", "GET", row["path"], row.get("query", {}), None, "", "", 200), row["pick"])
+    return spec
+
+
+def used_names(requests):
+    """The `{found.<name>}` names the requests (with their setup steps and read-backs) use."""
+    names = set()
+    for request in requests:
+        for one in (request, *request.setup, *request.readbacks):
+            text = json.dumps([one.path, one.query, one.body])
+            names |= {name.split(".", 1)[1] for name, _ in PLACEHOLDER.findall(text) if name.startswith("found.")}
+    return names
+
+
+def placeholder_ids(ids, spec):
+    """The ids with a stand-in for every discovered name, to check templates before anything boots."""
+    return {**ids, "found": {name: "x" for name in spec}}
+
+
+def discover(base, token, spec, ids, timeout, send=None):
+    """`{name: value}` read from the oracle for each discovered name; ParityError when one is missing."""
+    send = send or fetch
+    found = {}
+    for name, (request, pick) in spec.items():
+        reply = send(base, "GET", target(request, ids), auth_header(token), timeout)
+        value, why = None, f"it answered {reply.status or reply.error}"
+        if reply.status == 200:
+            try:
+                value = walk(json.loads(reply.body), pick)
+            except (ValueError, KeyError, TypeError):
+                why = f"its answer has no `{pick}`"
+        if not scalar(value):
+            raise ParityError(f"cannot discover `{name}` from the oracle ({request.path}): {why}")
+        found[name] = str(value)
+    return found
 
 
 def query_value(value, ids, capture=NO_CAPTURE):
@@ -249,24 +371,25 @@ def target(request, ids, capture=NO_CAPTURE):
     from `capture`, the JSON this server answered to the write)."""
     path = urllib.parse.quote(fill(request.path, ids, capture), safe="/%")
     if request.query:
-        pairs = [(key, query_value(value, ids, capture)) for key, value in request.query.items()]
+        items = request.query.items() if isinstance(request.query, dict) else request.query
+        pairs = [(key, query_value(value, ids, capture)) for key, value in items]
         path += "?" + urllib.parse.urlencode(pairs, quote_via=urllib.parse.quote, safe=",")
     return path
 
 
-def filled(value, ids):
+def filled(value, ids, capture=NO_CAPTURE):
     if isinstance(value, str):
-        return fill(value, ids)
+        return fill(value, ids, capture)
     if isinstance(value, list):
-        return [filled(item, ids) for item in value]
+        return [filled(item, ids, capture) for item in value]
     if isinstance(value, dict):
-        return {key: filled(item, ids) for key, item in value.items()}
+        return {key: filled(item, ids, capture) for key, item in value.items()}
     return value
 
 
-def body_of(request, ids):
+def body_of(request, ids, capture=NO_CAPTURE):
     """A write's JSON body, its templates filled, as bytes; None for a request without one."""
-    return None if request.body is None else json.dumps(filled(request.body, ids)).encode()
+    return None if request.body is None else json.dumps(filled(request.body, ids, capture)).encode()
 
 
 # ── talking to a server ─────────────────────────────────────────────────────
@@ -505,6 +628,18 @@ def compare_bodies(oracle_body, ferrofin_body, rules, used):
     return comparison.differences
 
 
+#: How much of a differing body results.json keeps: a video stream is compared whole, never stored whole.
+STORED_BODY_BYTES = 256 * 1024
+
+
+def stored(body):
+    """A body as results.json keeps it: whole when small, else its start, its size and its digest."""
+    if len(body) <= STORED_BODY_BYTES:
+        return body.decode("utf-8", "replace")
+    head = body[:STORED_BODY_BYTES].decode("utf-8", "replace")
+    return f"{head}\n… {len(body)} bytes in all, sha256 {hashlib.sha256(body).hexdigest()}"
+
+
 def decode(response):
     """The JSON of a response, or (None, reason) when it has none."""
     if not response.body:
@@ -612,16 +747,24 @@ class Outcome(NamedTuple):
     used: set
     cap_exceeded: bool
     failure: str
+    timing: dict   # per phase: {"reads": {requests, seconds, concurrency}, "writes": {requests, seconds, resets_s}}
 
 
 ROLES = ("oracle", "ferrofin")
+#: Reads in flight per server at once (PARITY_CONCURRENCY): default 4, 1 to 8 (run.sh holds the same range).
+CONCURRENCY_DEFAULT = 4
+CONCURRENCY_RANGE = (1, 8)
 
 
 def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries, request_timeout, deadline,
-                 now=time.monotonic, wall=time.time, send=fetch, reset=None):
-    """Send every read to both servers, then each write, each on a fresh database copy (`reset(timeout)`
-    gives both servers one and returns new tokens), after its setup steps and followed by its read-backs, until `deadline`
-    (epoch seconds, None for none). Writes never run beside reads: every read is answered first."""
+                 now=time.monotonic, wall=time.time, send=fetch, reset=None, concurrency=1):
+    """Send every read to both servers, `concurrency` pairs at a time (so each server has at most that many
+    in flight), then each write one at a time, each on a fresh database copy (`reset(timeout)` gives both
+    servers one and returns new tokens), after its setup steps and followed by its read-backs, until
+    `deadline` (epoch seconds, None for none). Writes never run beside reads: every read is answered first."""
+    low, high = CONCURRENCY_RANGE
+    if not low <= concurrency <= high:
+        raise ParityError(f"the read concurrency is {low} to {high}")
     reads = [r for r in requests if not r.is_write]
     writes = [r for r in requests if r.is_write]
     if writes and reset is None:
@@ -637,9 +780,9 @@ def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries
             return 0, True
         return (request_timeout if remaining is None else min(request_timeout, remaining)), False
 
-    def exchange(request, paths, body=None, unsent=None):
+    def exchange(request, paths, bodies=None, unsent=None):
         """Both servers' answers, or None when the cap cut the pair short. A side in `unsent` is not
-        asked: its answer is the given stand-in (a read-back the write gave nothing to ask about)."""
+        asked: its answer is the given stand-in (a step an earlier answer gave nothing to ask about)."""
         replies = []
         for role in ROLES:   # each call gets what is left, not the pair's first share
             if unsent and role in unsent:
@@ -649,6 +792,7 @@ def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries
             if spent:
                 return None
             headers = auth_header(tokens[role])
+            body = (bodies or {}).get(role)
             if body is not None:
                 headers["Content-Type"] = "application/json"
             reply = send(urls[role], request.method, paths[role], headers, timeout, now, body=body)
@@ -657,7 +801,7 @@ def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries
             replies.append(reply)
         return replies
 
-    def record(request, paths, a, b, state=None, **extra):
+    def record(request, paths, a, b, state=None, keep=True, **extra):
         differences = []
         if state is None:
             state, differences = examine(request, a, b, rules_for(rules, request.id), used)
@@ -671,30 +815,58 @@ def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries
             state = "ledgered"
         result = {"id": request.id, "method": request.method, "target": paths["oracle"], "source": request.source,
                   "state": state, "oracle": a.brief(), "ferrofin": b.brief(), "differences": rows,
-                  "bodies": {"oracle": a.body.decode("utf-8", "replace"),
-                             "ferrofin": b.body.decode("utf-8", "replace")} if state == "differences" else None, **extra}
+                  "bodies": {"oracle": stored(a.body), "ferrofin": stored(b.body)} if state == "differences" else None, **extra}
         if paths["ferrofin"] != paths["oracle"]:
             result["ferrofin_target"] = paths["ferrofin"]
         if request.of:
             result["of"] = request.of
-        results.append(result)
+        if request.file:
+            result["file"] = request.file
+        if state == "oracle failed" and request.oracle_trap:
+            result["oracle_trap"] = request.oracle_trap
+        if keep:
+            results.append(result)
         return result
 
     def past_deadline():
         return deadline is not None and wall() >= deadline
 
-    def finish(cap_exceeded=False, failure=""):
-        return Outcome(results, used, cap_exceeded, failure)
+    timing = {"reads": {"requests": 0, "seconds": 0.0, "concurrency": concurrency},
+              "writes": {"requests": 0, "seconds": 0.0, "resets_s": 0.0}}
+    phase = {"name": "reads", "started": now()}
 
-    for request in reads:
+    def finish(cap_exceeded=False, failure=""):
+        timing[phase["name"]]["seconds"] = round(now() - phase["started"], 3)
+        timing["reads"]["requests"] = sum(1 for r in results if r["method"] in ("GET", "HEAD") and "of" not in r)
+        timing["writes"]["requests"] = len(results) - timing["reads"]["requests"]
+        timing["writes"]["resets_s"] = round(sum(r.get("reset_s", 0.0) for r in results), 3)
+        return Outcome(results, used, cap_exceeded, failure, timing)
+
+    def read(request):
+        """One read sent to both servers: its result, or None when the cap cut it short."""
         path = target(request, ids)
         replies = exchange(request, {"oracle": path, "ferrofin": path})
-        if replies is None:
-            return finish(cap_exceeded=True)
-        record(request, {"oracle": path, "ferrofin": path}, *replies)
-        if past_deadline():
-            return finish(cap_exceeded=len(results) < planned)
+        return None if replies is None else record(request, {"oracle": path, "ferrofin": path}, *replies, keep=False)
 
+    if concurrency == 1:
+        for request in reads:
+            result = read(request)
+            if result is None:
+                return finish(cap_exceeded=True)
+            results.append(result)
+            if past_deadline():
+                return finish(cap_exceeded=len(results) < planned)
+    elif reads:
+        # Each worker sends one read to the oracle, then to Ferrofin: neither server has more than
+        # `concurrency` in flight. Results keep the request file's order.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+            done = list(pool.map(read, reads))
+        results.extend(result for result in done if result is not None)
+        if None in done or (past_deadline() and len(results) < planned):
+            return finish(cap_exceeded=True)
+
+    timing["reads"]["seconds"] = round(now() - phase["started"], 3)
+    phase.update(name="writes", started=now())
     for write in writes:
         remaining = None if deadline is None else deadline - wall()
         if remaining is not None and remaining <= 0:
@@ -707,44 +879,35 @@ def run_requests(requests, ids, oracle_url, ferrofin_url, tokens, rules, entries
                 return finish(cap_exceeded=True)
             return finish(failure=f"resetting the servers before `{write.id}` failed: {err}")
         reset_s = round(now() - started, 3)
-        setup_failed = False
-        for step in write.setup:   # the state the write acts on, built on the fresh copy and compared like the rest
-            path = target(step, ids)
-            paths = {"oracle": path, "ferrofin": path}
-            replies = exchange(step, paths, body_of(step, ids))
-            if replies is None:
-                return finish(cap_exceeded=True)
-            setup_failed |= record(step, paths, *replies)["state"] == "oracle failed"
-        if setup_failed:   # the oracle never built the state the write acts on: nothing after it compares
-            skipped = Response(None, b"", 0.0, "not sent: a setup step failed on the oracle")
-            for request in (write, *write.readbacks):
-                record(request, {"oracle": request.path, "ferrofin": request.path}, skipped, skipped,
-                       state="oracle failed", **({"reset_s": reset_s} if request is write else {}))
-            continue
-        path = target(write, ids)
-        paths = {"oracle": path, "ferrofin": path}
-        replies = exchange(write, paths, body_of(write, ids))
-        if replies is None:
-            return finish(cap_exceeded=True)
-        written = record(write, paths, *replies, reset_s=reset_s)
-        captures = {role: decode(reply)[0] for role, reply in zip(ROLES, replies)}
-        for readback in write.readbacks:
-            if written["state"] == "oracle failed":   # the oracle never did the write: there is nothing to read back
-                skipped = Response(None, b"", 0.0, "not sent: the write failed on the oracle")
-                record(readback, {"oracle": readback.path, "ferrofin": readback.path}, skipped, skipped, state="oracle failed")
+        # Each server's answers so far in this write test, for the `{setup.…}` and `{write.…}` templates.
+        captures = {role: {} for role in ROLES}
+        steps = [(step, "setup." + step.id.split("/", 1)[1]) for step in write.setup] + [(write, "write")]
+        steps += [(readback, None) for readback in write.readbacks]
+        skipped = None   # why the rest of the test is not sent: the oracle failed a step the rest builds on
+        for request, key in steps:
+            extra = {"reset_s": reset_s} if request is write else {}
+            if skipped:
+                stand_in = Response(None, b"", 0.0, f"not sent: {skipped}")
+                record(request, {"oracle": request.path, "ferrofin": request.path}, stand_in, stand_in, state="oracle failed", **extra)
                 continue
-            paths, unsent = {}, {}
+            paths, bodies, unsent = {}, {}, {}
             for role in ROLES:
                 try:
-                    paths[role] = target(readback, ids, captures[role])
-                except CaptureMissing as err:
-                    paths[role] = readback.path
+                    paths[role] = target(request, ids, captures[role])
+                    bodies[role] = body_of(request, ids, captures[role])
+                except CaptureMissing as err:   # what an earlier answer on this server lacked: this server is not asked
+                    paths[role], bodies[role] = request.path, None
                     unsent[role] = Response(None, b"", 0.0, f"not sent: {err}")
-            replies = exchange(readback, paths, unsent=unsent)
+            replies = exchange(request, paths, bodies, unsent=unsent)
             if replies is None:
                 return finish(cap_exceeded=True)
             # A trap excuses an oracle that stalled or failed, never a server that was not asked at all.
-            record(dataclasses.replace(readback, oracle_trap="") if unsent else readback, paths, *replies)
+            result = record(dataclasses.replace(request, oracle_trap="") if unsent else request, paths, *replies, **extra)
+            if key:
+                for role, reply in zip(ROLES, replies):
+                    captures[role][key] = decode(reply)[0]
+                if result["state"] == "oracle failed":
+                    skipped = "a setup step failed on the oracle" if key != "write" else "the write failed on the oracle"
         if past_deadline():
             return finish(cap_exceeded=len(results) < planned)
     return finish()
@@ -811,6 +974,7 @@ def render(summary):
                                  if run.get(side, {}).get("boot_s") is not None)),
              ("Elapsed", f"{summary['elapsed_s']:.1f} s of the {summary['cap_s']} s cap, boot included" if summary.get("cap_s") else f"{summary['elapsed_s']:.1f} s"),
              ("Request timeout", f"{summary['request_timeout_s']} s" if summary.get("request_timeout_s") else ""),
+             ("Reads", reads_fact(summary.get("timing"))), ("Writes", writes_fact(summary.get("timing"))),
              ("Resets before writes", resets_fact(results))]
     out.append(table(["", ""], [[esc(k), esc(v)] for k, v in facts if v != ""]))
     new = [r for r in results if r["state"] == "differences"]
@@ -841,8 +1005,9 @@ def render(summary):
         out.append("<p class='mut'>None.</p>")
     failed = [r for r in results if r["state"] == "oracle failed"]
     out.append(f"<h2>Oracle failures ({len(failed)})</h2>")
-    out.append(table(["Request", "Jellyfin answered"], [[f"<code>{esc(r['id'])}</code>", esc(r['oracle']['error'] or r['oracle']['status'])]
-                                                     for r in failed]) if failed else "<p class='mut'>None.</p>")
+    out.append(table(["Request", "Jellyfin answered", "Why the oracle is excused", "Ferrofin answered"],
+                     [[f"<code>{esc(r['id'])}</code>", esc(r['oracle']['error'] or r['oracle']['status']), esc(r.get("oracle_trap", "")),
+                       esc(r['ferrofin']['error'] or r['ferrofin']['status'])] for r in failed]) if failed else "<p class='mut'>None.</p>")
     out.append("<h2>Normalisation rules that matched nothing</h2>")
     unused = summary["unused_rules"]
     out.append("<ul>" + "".join(f"<li><code>{esc(', '.join(u['paths']))}</code> <span class='mut'>{esc(u['reason'])}</span></li>"
@@ -851,6 +1016,14 @@ def render(summary):
     out.append("<h2>Ledger entries that matched nothing</h2>")
     out.append("<ul>" + "".join(f"<li><code>{esc(u['request'])} {esc(u['path'])}</code> <span class='mut'>{esc(u['link'])}</span></li>"
                                  for u in stale) + "</ul>" if stale else "<p class='mut'>None.</p>")
+    files = time_by_file(results)
+    if files:
+        out.append("<h2>By request file</h2><p class='mut'>Each request file is a group of its own. Server time is the two servers' "
+                   "answer times added up; reads overlap PARITY_CONCURRENCY at a time, so it is more than the time the reads took.</p>")
+        out.append(table(["File", "Requests", "Identical", "Ledgered", "New differences", "Oracle failed", "Jellyfin s", "Ferrofin s", "Resets s"],
+                         [[f"<code>{esc(name)}</code>", str(row["requests"])]
+                          + [str(row["states"].get(state, 0)) for state in ("match", "ledgered", "differences", "oracle failed")]
+                          + [f"{row['oracle_s']:.1f}", f"{row['ferrofin_s']:.1f}", f"{row['resets_s']:.1f}"] for name, row in files.items()]))
     writes = [r for r in results if "reset_s" in r]
     if writes:   # each write on its fresh copy, with what its read-backs found
         out.append(f"<h2>Writes ({len(writes)})</h2>")
@@ -865,6 +1038,36 @@ def render(summary):
                       for r in clean]) if clean else "<p class='mut'>None.</p>")
     return ("<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
             f"<title>Parity run {esc(run.get('name', ''))}</title><style>{CSS}</style></head><body><main>{''.join(out)}</main></body></html>")
+
+
+def time_by_file(results):
+    """`{file: {requests, oracle_s, ferrofin_s, resets_s, states}}` in the order the files were first sent;
+    `states` counts the results by state (`match`, `differences`, …), so each request set is its own group."""
+    files = {}
+    for r in results:
+        if "file" not in r:
+            continue
+        row = files.setdefault(r["file"], {"requests": 0, "oracle_s": 0.0, "ferrofin_s": 0.0, "resets_s": 0.0, "states": {}})
+        row["requests"] += 1
+        row["states"][r["state"]] = row["states"].get(r["state"], 0) + 1
+        row["oracle_s"] += r["oracle"]["seconds"]
+        row["ferrofin_s"] += r["ferrofin"]["seconds"]
+        row["resets_s"] += r.get("reset_s", 0.0)
+    return files
+
+
+def reads_fact(timing):
+    reads = (timing or {}).get("reads")
+    if not reads or not reads["requests"]:
+        return ""
+    return f"{reads['requests']} reads in {reads['seconds']:.1f} s, {reads['concurrency']} at a time per server"
+
+
+def writes_fact(timing):
+    writes = (timing or {}).get("writes")
+    if not writes or not writes["requests"]:
+        return ""
+    return f"{writes['requests']} write requests in {writes['seconds']:.1f} s, {writes['resets_s']:.1f} s of it resets"
 
 
 def resets_fact(results):
@@ -902,7 +1105,8 @@ def read_run(out):
 
 # ── commands ────────────────────────────────────────────────────────────────
 def check_inputs(args, ids=None):
-    requests = load_requests(args.requests, ids)
+    spec = load_discover(args.discover)
+    requests = load_requests(args.requests, None if ids is None else placeholder_ids(ids, spec))
     rules = load_rules(args.normalise)
     check_rule_scopes(rules, every_id(requests))
     entries = load_ledger(args.ledger, args.source)
@@ -949,11 +1153,18 @@ def command_run(args):
         raise ParityError(f"--request-timeout is {low} to {high} seconds")
     ids = json.loads(Path(args.ids).read_text())
     requests, rules, entries = check_inputs(args, ids)   # every template resolves before the first request
+    low, high = CONCURRENCY_RANGE
+    if not low <= args.concurrency <= high:
+        raise ParityError(f"--concurrency is {low} to {high}")
     if any(r.is_write for r in requests) and not args.reset_command:
         raise ParityError("the request file has writes: they need --reset-command, which gives both servers a fresh database copy")
     started = time.monotonic()
     urls = dict(zip(ROLES, (args.oracle_url, args.ferrofin_url)))
     tokens = {role: login(url, ids, args.request_timeout) for role, url in urls.items()}
+    # Names the corpus does not record are read from the oracle; both servers serve the same library.
+    spec = load_discover(args.discover)
+    found = discover(args.oracle_url, tokens["oracle"], {name: spec[name] for name in sorted(used_names(requests))}, ids, args.request_timeout)
+    ids = {**ids, "found": found}
     resetter = ResetCommand(args.reset_command) if args.reset_command else None
 
     def reset(timeout):
@@ -974,7 +1185,8 @@ def command_run(args):
     handlers = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)} if resetter else {}
     try:
         outcome = run_requests(requests, ids, args.oracle_url, args.ferrofin_url, tokens, rules, entries,
-                               args.request_timeout, args.deadline, reset=reset if resetter else None)
+                               args.request_timeout, args.deadline, reset=reset if resetter else None,
+                               concurrency=args.concurrency)
     finally:
         for sig, handler in handlers.items():
             signal.signal(sig, handler)
@@ -984,8 +1196,10 @@ def command_run(args):
     run = read_run(args.out)
     # the cap counts from the start of the whole run (run.json), boot included
     elapsed = time.time() - run["started"] if "started" in run else time.monotonic() - started
+    outcome.timing["files"] = time_by_file(results)
     summary = {"verdict": verdict, "reason": reason, "cap_exceeded": outcome.cap_exceeded, "planned": len(every_id(requests)),
                "requests": results, "elapsed_s": elapsed, "run": run, "resets": sum(1 for r in results if "reset_s" in r),
+               "timing": outcome.timing, "found": found,
                "request_timeout_s": args.request_timeout, "cap_s": run.get("cap_s"),
                "unused_rules": [{"paths": list(r.paths), "reason": r.reason} for r in rules if r not in outcome.used],
                "unused_ledger": [{"request": e.request, "path": e.path, "link": e.link()} for index, e in enumerate(entries)
@@ -1010,10 +1224,12 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", required=True)
 
     def inputs(p):
-        p.add_argument("--requests", default=str(HERE / "requests" / "tracer.jsonl"))
+        p.add_argument("--requests", action="append", default=None,
+                       help="a request file or directory; repeat it to send several as one set (default: requests/tracer.jsonl)")
         p.add_argument("--normalise", default=str(HERE / "normalise.toml"))
         p.add_argument("--ledger", default=str(HERE / "ledger.toml"))
         p.add_argument("--source", default=None, help="the Rust file holding handlers::VERIFIED (tests)")
+        p.add_argument("--discover", default=str(HERE / "discover.toml"), help="names read from the oracle for {found.*}")
 
     run = sub.add_parser("run")
     inputs(run)
@@ -1023,6 +1239,7 @@ def build_parser():
     run.add_argument("--out", required=True)
     run.add_argument("--request-timeout", type=int, default=REQUEST_TIMEOUT_DEFAULT_S)
     run.add_argument("--deadline", type=float, default=None, help="epoch seconds at which the run must stop")
+    run.add_argument("--concurrency", type=int, default=CONCURRENCY_DEFAULT, help="reads in flight per server, 1 to 8")
     run.add_argument("--reset-command", default=None,
                      help="resets both servers to a fresh database copy before each write (the runner passes parity/reset.sh RUN_DIR)")
     check = sub.add_parser("check")
@@ -1041,6 +1258,8 @@ def build_parser():
 
 def main(argv):
     args = build_parser().parse_args(argv)
+    if hasattr(args, "requests"):
+        args.requests = args.requests or [str(HERE / "requests" / "tracer.jsonl")]
     try:
         if args.command == "run":
             return command_run(args)

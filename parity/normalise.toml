@@ -45,5 +45,19 @@ reason = "Marking an item played stamps the time each server handled the request
 [[rule]]
 paths = ["DateCreated", "DateLastMediaAdded", "Etag"]
 kind = "opaque"
-requests = ["playlist-create/detail", "collection-create/detail"]
+requests = ["playlist-create/detail", "collection-create/detail", "edge-non-null-collection/detail"]
 reason = "A playlist or collection created by the write carries the time each server created it, and an Etag derived from that time."
+
+# An error answer in RFC 9110 problem-details form carries the id of the request's trace, new on every request.
+[[rule]]
+paths = ["traceId"]
+kind = "opaque"
+reason = "The trace id of an error answer is new for every request on every server."
+
+# A user created by an edge-case test gets a new id on each server (both are asked about it by their own
+# id through {setup.user.Id}); everything else about the user is compared.
+[[rule]]
+paths = ["Id"]
+kind = "opaque"
+requests = ["edge-parental-rating/user", "edge-blocked-tags/user"]
+reason = "A user created by the test gets a new random id on each server."

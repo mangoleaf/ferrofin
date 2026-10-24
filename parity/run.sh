@@ -8,8 +8,11 @@
 #   --oracle     the Jellyfin image (the pinned release image in bench/testdata/jellyfin-image.txt)
 #   --ferrofin   the Ferrofin image under test
 #   --testdata   the benchmark corpus (config/, media/, ids.json, jellyfin/): default bench/testdata
-#   --requests   the request file: default parity/requests/tracer.jsonl. Its writes each run on a
-#                fresh database copy: parity/reset.sh restores both servers to the snapshot taken at boot
+#   --requests   a request file, or a directory of them (every *.jsonl in it); repeat it to send several
+#                sets as one (the sweep and the edge cases: --requests parity/requests/sweep
+#                --requests parity/requests/edge): default
+#                parity/requests/tracer.jsonl; the full sweep is parity/requests/sweep. Its writes each run
+#                on a fresh database copy: parity/reset.sh restores both servers to the snapshot taken at boot
 #   --out        the run directory: default parity/runs/<name>; never reused
 #   --gate       a release-gate run: a stale oracle pin, or an --oracle other than the pin, is refused
 #                (an ad-hoc run only warns)
@@ -18,7 +21,8 @@
 # passed, a reset failed); 2 the arguments or inputs were refused before anything started.
 #
 # Settings (environment): PARITY_CAP_S (the whole run's limit, default 7200 = 2 hours),
-# PARITY_REQUEST_TIMEOUT (seconds per request, 10 to 120, default 30), PARITY_ORACLE_PORT /
+# PARITY_REQUEST_TIMEOUT (seconds per request, 10 to 120, default 30), PARITY_CONCURRENCY (reads in
+# flight per server, 1 to 8, default 4; writes always run one at a time), PARITY_ORACLE_PORT /
 # PARITY_FERROFIN_PORT, PARITY_PIN (0: no cpusets and no idle-core check, for hosts without the
 # benchmark's core layout and for the harness's own tests), SERVER_CPUS, CLIENT_CPUS, MEMORY,
 # CORE_IDLE_MIN, READY_TIMEOUT_S, DRAIN_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S.
@@ -35,6 +39,7 @@ source parity/lib.sh   # READY_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S, KIL
 
 PARITY_CAP_S=${PARITY_CAP_S:-7200}
 PARITY_REQUEST_TIMEOUT=${PARITY_REQUEST_TIMEOUT:-30}
+PARITY_CONCURRENCY=${PARITY_CONCURRENCY:-4}   # reads in flight per server; writes are serial (decision D4)
 DRAIN_TIMEOUT_S=${DRAIN_TIMEOUT_S:-300}   # this and the settings below are bench/run.sh's
 CORE_IDLE_MIN=${CORE_IDLE_MIN:-0.90}   # the server and client cores must be this idle before a run starts
 SERVER_CPUS=${SERVER_CPUS:-8-15}       # the benchmark's server cpuset: each server gets half of it
@@ -45,7 +50,7 @@ ORACLE_PORT=${PARITY_ORACLE_PORT:-18111}    # beside the benchmark's 18101 and 1
 FERROFIN_PORT=${PARITY_FERROFIN_PORT:-18113}
 
 ORACLE_IMAGE=""; FERROFIN_IMAGE=""; GATE=false
-TESTDATA=$PWD/bench/testdata; REQUESTS=$PWD/parity/requests/tracer.jsonl; OUT=""
+TESTDATA=$PWD/bench/testdata; REQUESTS=(); OUT=""
 die() { echo "parity: $*" >&2; exit 2; }
 while [ $# -gt 0 ]; do
   case "$1" in --oracle|--ferrofin|--testdata|--requests|--out) [ $# -ge 2 ] || die "$1 needs a value";; esac
@@ -53,7 +58,7 @@ while [ $# -gt 0 ]; do
     --oracle) ORACLE_IMAGE=$2; shift 2;;
     --ferrofin) FERROFIN_IMAGE=$2; shift 2;;
     --testdata) TESTDATA=$2; shift 2;;
-    --requests) REQUESTS=$2; shift 2;;
+    --requests) REQUESTS+=("$2"); shift 2;;
     --out) OUT=$2; shift 2;;
     --gate) GATE=true; shift;;
     *) die "unknown $1";;
@@ -61,15 +66,19 @@ while [ $# -gt 0 ]; do
 done
 abs() { case "$1" in /*) echo "$1";; *) echo "$CALLER/$1";; esac; }   # user paths are relative to the caller's shell
 if [ -z "$ORACLE_IMAGE" ] || [ -z "$FERROFIN_IMAGE" ]; then die "--oracle IMAGE and --ferrofin IMAGE are required"; fi
-for setting in PARITY_CAP_S PARITY_REQUEST_TIMEOUT READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S CLEANUP_TIMEOUT_S ORACLE_PORT FERROFIN_PORT; do
+for setting in PARITY_CAP_S PARITY_REQUEST_TIMEOUT PARITY_CONCURRENCY READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S CLEANUP_TIMEOUT_S ORACLE_PORT FERROFIN_PORT; do
   [[ "${!setting}" =~ ^[1-9][0-9]*$ ]] || die "$setting must be a positive integer"
 done
 (( PARITY_REQUEST_TIMEOUT >= 10 && PARITY_REQUEST_TIMEOUT <= 120 )) || die "PARITY_REQUEST_TIMEOUT is 10 to 120 seconds"   # diff.py holds the same range
+(( PARITY_CONCURRENCY <= 8 )) || die "PARITY_CONCURRENCY is 1 to 8"   # diff.py holds the same range
 (( PARITY_CAP_S <= 7200 )) || die "PARITY_CAP_S is at most 7200: a run is capped at two hours"
 (( ORACLE_PORT <= 65535 && FERROFIN_PORT <= 65535 && ORACLE_PORT != FERROFIN_PORT )) || die "the two ports are different and at most 65535"
 [[ "$PIN" =~ ^[01]$ ]] || die "PARITY_PIN is 0 or 1"
 ! $GATE || [ "$PIN" = 1 ] || die "a release-gate run is pinned: PARITY_PIN=0 is for ad-hoc runs and the harness's own tests"
-TESTDATA=$(realpath -m "$(abs "$TESTDATA")"); REQUESTS=$(realpath -m "$(abs "$REQUESTS")")
+TESTDATA=$(realpath -m "$(abs "$TESTDATA")")
+(( ${#REQUESTS[@]} )) || REQUESTS=("$PWD/parity/requests/tracer.jsonl")
+request_args=()   # --requests once per set, in the order given: they are sent as one set
+for i in "${!REQUESTS[@]}"; do REQUESTS[i]=$(realpath -m "$(abs "${REQUESTS[i]}")"); request_args+=(--requests "${REQUESTS[i]}"); done
 export READY_TIMEOUT_S HTTP_TIMEOUT_S CLEANUP_TIMEOUT_S   # parity/reset.sh waits as the boot does
 DEADLINE=$((START_EPOCH + PARITY_CAP_S))
 
@@ -105,7 +114,7 @@ for t in docker python3 jq curl timeout; do command -v "$t" >/dev/null || die "$
 IDS=$TESTDATA/ids.json
 [ -f "$IDS" ] || die "no $IDS: build the test data first (bench/testdata/build.sh)"
 jq -e '.user and .user_name and .password' "$IDS" >/dev/null || die "$IDS lacks the browse user (user, user_name, password)"
-python3 parity/diff.py check --requests "$REQUESTS" --ids "$IDS" >/dev/null || exit 2   # its message is on stderr
+python3 parity/diff.py check "${request_args[@]}" --ids "$IDS" >/dev/null || exit 2   # its message is on stderr
 for d in config media jellyfin/config; do [ -d "$TESTDATA/$d" ] || die "no $TESTDATA/$d: build and prepare the test data (bench/testdata/build.sh --prepare-jellyfin)"; done
 PREP=$TESTDATA/jellyfin/preparation.json
 [ -f "$PREP" ] || die "prepare Jellyfin first: bench/testdata/build.sh --prepare-jellyfin '$TESTDATA'"
@@ -184,13 +193,19 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP   # a closed terminal or a dropped ssh session
 DIRTY=$([ -z "$(git status --porcelain 2>/dev/null)" ] && echo false || echo true)
+requests_digest() {   # one digest over every request set in the order given (a directory: its *.jsonl in name order)
+  local set
+  for set in "${REQUESTS[@]}"; do
+    if [ -d "$set" ]; then find "$set" -maxdepth 1 -name '*.jsonl' -print0 | LC_ALL=C sort -z | xargs -0 cat; else cat "$set"; fi
+  done | sha256sum | cut -d' ' -f1
+}
 jq -n --arg name "$(basename "$OUT")" --arg sha "$SHA" --argjson dirty "$DIRTY" --argjson cap "$PARITY_CAP_S" --argjson timeout "$PARITY_REQUEST_TIMEOUT" \
-  --argjson started "$START_EPOCH" --argjson oracle "$ORACLE_PIN" --arg oracle_image "$ORACLE_IMAGE" --arg oracle_id "$expected_image" \
+  --argjson started "$START_EPOCH" --argjson concurrency "$PARITY_CONCURRENCY" --argjson oracle "$ORACLE_PIN" --arg oracle_image "$ORACLE_IMAGE" --arg oracle_id "$expected_image" \
   --arg ferrofin_image "$FERROFIN_IMAGE" --arg ferrofin_id "$(docker_cmd image inspect -f '{{.Id}}' "$FERROFIN_IMAGE")" \
   --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | xargs || true)" \
-  --arg ids_sha "$expected_ids" --arg requests_sha "$(sha256sum "$REQUESTS" | cut -d' ' -f1)" --argjson gate "$GATE" --arg pin "$PIN" \
+  --arg ids_sha "$expected_ids" --arg requests_sha "$(requests_digest)" --argjson gate "$GATE" --arg pin "$PIN" \
   --arg server_cpus "${ORACLE_CPUS:-} ${FERROFIN_CPUS:-}" \
-  '{name:$name, sha:$sha, dirty:$dirty, started:$started, cap_s:$cap, request_timeout_s:$timeout, gate:$gate, pinned:($pin == "1"),
+  '{name:$name, sha:$sha, dirty:$dirty, started:$started, cap_s:$cap, request_timeout_s:$timeout, concurrency:$concurrency, gate:$gate, pinned:($pin == "1"),
     oracle:($oracle + {image:$oracle_image, image_id:$oracle_id}), ferrofin:{image:$ferrofin_image, image_id:$ferrofin_id},
     host:$host, cpu:$cpu, ids_sha256:$ids_sha, requests_sha256:$requests_sha, server_cpus:$server_cpus}' > "$OUT/run.json"
 echo "parity: oracle $ORACLE_IMAGE, ferrofin $FERROFIN_IMAGE; cap ${PARITY_CAP_S}s; output $OUT"
@@ -309,8 +324,8 @@ pin_prefix=(); [ "$PIN" = 0 ] || pin_prefix=(taskset -c "$CLIENT_CPUS")
 # group, which a signal to ours does not reach) and cleanup stops it.
 rc=0
 timeout --kill-after="${CLEANUP_TIMEOUT_S}s" "$((remaining + CLEANUP_TIMEOUT_S))s" "${pin_prefix[@]}" python3 parity/diff.py run \
-  --oracle-url "http://127.0.0.1:$ORACLE_PORT" --ferrofin-url "http://127.0.0.1:$FERROFIN_PORT" --ids "$IDS" --requests "$REQUESTS" \
-  --out "$OUT" --request-timeout "$PARITY_REQUEST_TIMEOUT" --deadline "$DEADLINE" \
+  --oracle-url "http://127.0.0.1:$ORACLE_PORT" --ferrofin-url "http://127.0.0.1:$FERROFIN_PORT" --ids "$IDS" "${request_args[@]}" \
+  --out "$OUT" --request-timeout "$PARITY_REQUEST_TIMEOUT" --deadline "$DEADLINE" --concurrency "$PARITY_CONCURRENCY" \
   --reset-command "$(printf '%q ' bash parity/reset.sh "$OUT")" 2> "$OUT/diff.err" &
 wait "$!" || rc=$?
 cat "$OUT/diff.err" >&2

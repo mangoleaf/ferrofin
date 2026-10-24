@@ -9,11 +9,25 @@ and writes `report.html`. A new difference makes the run exit non-zero.
 This is supporting evidence. **"Deep verified" stays code against upstream C#**: the replay never
 adds to, redefines or shrinks the `handlers::VERIFIED` count.
 
-It sends reads, the item-details call of `bench/screens.js` (`GET /Users/{user}/Items/{movie}`,
-`requests/tracer.jsonl`), and writes, each on a fresh copy of the database and followed by read-backs
-(`requests/writes.jsonl`: played and unplayed, favourite and unfavourite, a resume position, a new playlist
-and a new collection). The full sweep of the contract, the edge cases, the seeded ledger and the filing of
-new differences as issues extend this same path in later steps.
+The request sets:
+- `requests/sweep/`, **the sweep**: at least one request for every one of the 412 operations of the vendored
+  10.11.8 contract (`contract.jsonl`); one request per documented value of each enumerated or boolean
+  parameter of the query-heavy operations (`combos.jsonl`: `/Items`, the by-name lists, `/Shows/*`, Latest,
+  Resume); and jellyfin-web's request shapes from `bench/screens.js` (`screens.jsonl`).
+- `requests/edge/`, **the edge cases** (B7): two users with restrictions, each made on a fresh copy and asked
+  about by id in its read-backs (a user allowed up to PG-13, a user with a blocked tag), each also asked for the
+  one movie it must not see, which the oracle must refuse, so a restriction both servers ignored fails the run; paging at the first page,
+  the last, exactly at the end and past it; SortBy/SortOrder combinations; `Fields` with every documented
+  field; `EnableUserData=false`; `ImageTypeLimit` 0, 1 and many; and the item kinds that carry the fields the
+  TV clients require non-null (`ChildCount`, `ImageTags`, `ImageBlurHashes`): views, series, seasons, albums,
+  artists, episodes, a new box set, the root and the libraries. A template may offset an integer:
+  `{counts.movies-1}` is the last page's index on any corpus size.
+- `requests/writes.jsonl`: a starter set of writes with read-backs (played and unplayed, favourite and
+  unfavourite, a resume position, a new playlist and a new collection).
+- `requests/tracer.jsonl`: the item-details call of `bench/screens.js` alone.
+
+A release run sends the sweep and the edge cases as one set; a new difference in either fails it. The seeded
+ledger and the filing of new differences as issues extend this same path in later steps.
 
 ```bash
 # needs docker, python3 (3.11+), jq, curl, timeout, taskset; the benchmark corpus, prepared for Jellyfin
@@ -22,6 +36,8 @@ bench/testdata/build.sh --prepare-jellyfin    # once: the corpus upgraded and sc
 docker build -t ferrofin:parity .             # the commit under test: REBUILD IT
 parity/run.sh --oracle "$(cat bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity
 parity/run.sh --oracle "$(cat bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity --requests parity/requests/writes.jsonl
+parity/run.sh --oracle "$(cat bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity \
+  --requests parity/requests/sweep --requests parity/requests/edge                                  # the release run
 python3 bench/report.py --serve --parity-dir parity/runs      # list and compare runs
 ```
 
@@ -32,7 +48,7 @@ instead of warned about. The oracle is the same pinned image and the same stale-
 ## What a run does
 
 1. **Preflight.** Nothing is booted and no run directory is made if an input is refused (exit 2): the
-   request file, `normalise.toml` and `ledger.toml` must be valid, the corpus must be prepared for this
+   request sets, `normalise.toml` and `ledger.toml` must be valid, the corpus must be prepared for this
    oracle image, the oracle pin must be current (`--gate`), and the cores must be idle.
 2. **Boot.** Both servers boot at once, each on its own disposable copy of the **same** configuration (the one the
    pinned Jellyfin upgraded and scanned, `jellyfin/config`; the benchmark boots Ferrofin on the 10.11.8 source
@@ -79,14 +95,16 @@ isolation snapshots): remove the directory when you are done with the run.
 | `reset.sh` | puts both servers back on the boot snapshot before a write (`diff.py` runs it) |
 | `lib.sh` | what `run.sh` and `reset.sh` share: the wait bounds and the readiness check |
 | `diff.py` | the requests, the comparison, the ledger, the report (`diff.py --help`) |
-| `requests/*.jsonl` | the request sets |
+| `requests/*.jsonl`, `requests/sweep/`, `requests/edge/` | the request sets; `--requests` takes a file or a directory (every `*.jsonl` in it, in name order), and repeats to send several as one set |
+| `generate.py`, `sweep.toml` | build `requests/sweep/contract.jsonl` and `combos.jsonl` from the vendored contract (see below) |
+| `discover.toml` | names the corpus does not record, read from the oracle at run start (`{found.<name>}`) |
 | `normalise.toml` | what the comparison treats as equal although two servers cannot agree |
 | `ledger.toml` | the accepted divergences |
-| `tests/` | `test_diff.py` (the comparison, over fixture pairs and local servers) and `parity.bats` (the runner, over a fake docker) |
+| `tests/` | `test_diff.py` (the comparison, over fixture pairs and local servers), `test_generate.py` (the sweep covers every operation and is current), `test_edge.py` (every edge category has requests) and `parity.bats` (the runner, over a fake docker) |
 
 ### Requests
 
-JSON lines. Each object has `id` (unique, without `/`), `method` (`GET`, or a write: `POST`, `DELETE`), `path`
+JSON lines. Each object has `id` (unique, without `/`), `method` (`GET`, `HEAD`, or a write: `POST`, `DELETE`), `path`
 and optionally `query`, `source` (where jellyfin-web issues it) and `oracle_trap` (why the oracle is known to
 stall or fail on it: a timeout there is recorded as `oracle failed` and is no difference; on any other
 request, or on Ferrofin, a timeout is a difference).
@@ -162,6 +180,7 @@ matched nothing.
 |---|---|---|
 | `PARITY_CAP_S` | 7200 | the whole run's limit, at most 7200 |
 | `PARITY_REQUEST_TIMEOUT` | 30 | seconds per request, 10 to 120 |
+| `PARITY_CONCURRENCY` | 4 | reads in flight per server, 1 to 8; writes always run one at a time |
 | `PARITY_ORACLE_PORT`, `PARITY_FERROFIN_PORT` | 18111, 18113 | loopback ports |
 | `PARITY_PIN` | 1 | `0`: no cpusets and no idle-core check, for a host without the benchmark's core layout and for the runner's own tests; a `--gate` run refuses it |
 | `SERVER_CPUS`, `CLIENT_CPUS` | 8-15, 16-19 | the benchmark's cpusets; each server gets half of `SERVER_CPUS` |
@@ -169,12 +188,56 @@ matched nothing.
 | `MEMORY` | 8g | per server, swap disabled |
 | `READY_TIMEOUT_S`, `DRAIN_TIMEOUT_S`, `HTTP_TIMEOUT_S`, `CLEANUP_TIMEOUT_S` | 300, 300, 10, 30 | boot and teardown bounds |
 
+### The sweep (`generate.py`, `sweep.toml`)
+
+`python3 parity/generate.py` writes `requests/sweep/contract.jsonl` and `combos.jsonl` from
+`contracts/jellyfin-openapi-10.11.8.json` and `sweep.toml`; the files are checked in, so a change to the request
+set is a diff to review, and a self-test fails when they are stale or an operation has no request.
+`screens.jsonl` is written by hand from `bench/screens.js`: a change to a screen there is copied here by hand.
+- A path parameter takes its value from `[path]` by name, or from `[path_by_prefix]` where the same name means
+  something else (`name` is a genre under `/Genres/`, a person under `/Persons/`). A required query
+  parameter takes its value from `[query]`. The expected status is the lowest success status the contract
+  documents.
+- `[op.<operationId>]` overrides one operation: a body, query values, setup steps, an `oracle_trap`, the status
+  it answers on this corpus with the reason (both servers are asked about something the corpus lacks: a Live TV
+  timer, an artist's image), or `readback_of`: a read that needs something a write creates (a playlist's items)
+  is sent as a read-back of that write, with `{write.Id}`.
+- An `oracle_trap` excuses **any** answer from the oracle other than the expected status (a stall, a 404, a 500),
+  never Ferrofin's; when the oracle answers as expected the pair is compared as usual. The sweep marks, each with
+  its reason: the three known traps of `POST /Backup/Create`, `/Years` and `/Items/Filters` (which this corpus
+  happens not to trip); the routes of the plugins the vendored contract carries (the oracle runs with its plugins
+  disabled); the routes Jellyfin 12 removed; remote lookups that need the internet; Live TV writes without a
+  tuner; and requests the oracle fails on this corpus (a read-only media mount, no trailers, a slow
+  `/Items/Suggestions`). The report lists every oracle failure with its reason and what Ferrofin answered, so
+  what a trap leaves unchecked stays visible.
+- A write that reads `{setup.<name>.…}` gets the `[setups.<name>]` sequence in front of it (a playlist to add
+  to, the session to send a command to). A setup step may be a read; its answer on each server is what
+  `{setup.<step>.Field}` reads there (list indices allowed: `{setup.session.0.Id}`).
+- `[combos]` lists the query-heavy operations; each gets its base query plus one parameter at a time, once per
+  enum value, true and false, or the values `[combos.values]` names.
+
+### Discovered names (`discover.toml`)
+
+Names the corpus's `ids.json` does not record (a person, an artist, a log file, a task) are read from the
+oracle once it is up: `[found.<name>]` names the GET, its query and the field of the answer (`Items.0.Name`).
+Only the names the request set uses are asked for, and a name the oracle does not give fails the run.
+Both servers serve the same library, so the oracle's answer serves both. A run's `results.json` records them.
+
+### Timing
+
+Reads run `PARITY_CONCURRENCY` at a time per server (a worker sends one read to the oracle, then to Ferrofin);
+writes run one at a time after every read. The report shows the time of each phase against the cap: the
+boot, the reads and their concurrency, the writes and how much of that went to resets. Each request file is a
+shard of the set and a group of its own: the report's "By request file" table gives each file's requests by
+state (identical, ledgered, new differences, oracle failed), both servers' answer times added up, and its
+resets (`results.json`: `timing.files`), so the edge cases read apart from the sweep.
+
 ## Tests
 
 ```bash
-python3 -m unittest discover -s parity/tests     # the comparison, the ledger, the cap, the report
+python3 -m unittest discover -s parity/tests     # the comparison, the ledger, the cap, the report, the sweep's coverage
 bats parity/tests                                # the runner: refusals, the cap and its backstop, teardown, failure reports
-shellcheck -x parity/run.sh && shellcheck -x -s bash parity/tests/parity.bats
+shellcheck -x parity/lib.sh parity/run.sh parity/reset.sh && shellcheck -x -s bash parity/tests/parity.bats
 ```
 
 CI runs all three. The runner's pinned-cpuset path needs the benchmark's core layout, so only a live run covers it.
