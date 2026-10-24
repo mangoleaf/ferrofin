@@ -1004,16 +1004,9 @@ where
         return Ok(());
     }
     let imported = adopt_xml(xml_path, default, root_name, deny).await?;
-    if let Some(parent) = json_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| io_err("create the named configuration directory", parent, &e))?;
-    }
     let json = serde_json::to_vec_pretty(&imported)
         .map_err(|e| ServiceError::Backend(format!("serialize the adopted configuration: {e}")))?;
-    tokio::fs::write(json_path, json)
-        .await
-        .map_err(|e| io_err("write the adopted configuration", json_path, &e))
+    write_atomically(json_path, json, "write the adopted configuration").await
 }
 
 /// Restores `IsStartupWizardCompleted` on an install adopted before the XML
@@ -1143,16 +1136,31 @@ async fn write_config(
     path: &std::path::Path,
     configuration: &ServerConfiguration,
 ) -> Result<(), ServiceError> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| io_err("create configuration directory", parent, &e))?;
-    }
     let json = serde_json::to_vec_pretty(configuration)
         .map_err(|e| ServiceError::Backend(format!("serialize configuration: {e}")))?;
-    tokio::fs::write(path, json)
-        .await
-        .map_err(|e| io_err("write configuration", path, &e))
+    write_atomically(path, json, "write configuration").await
+}
+
+/// Writes a boot-time configuration file the way every runtime configuration
+/// save does.
+///
+/// [`ferrofin_util::file_helper::atomic_write`] creates the parent directory,
+/// replaces the file only once the new contents are complete, and leaves it
+/// private (`0600` on Unix). A boot killed mid-write therefore keeps the
+/// previous file, or none, instead of a truncated `system.json` that stops the
+/// next boot or a truncated named document that is never seeded again.
+async fn write_atomically(
+    path: &std::path::Path,
+    contents: Vec<u8>,
+    action: &'static str,
+) -> Result<(), ServiceError> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        ferrofin_util::file_helper::atomic_write(&path, &contents)
+            .map_err(|e| io_err(action, &path, &e))
+    })
+    .await
+    .map_err(|e| ServiceError::backend(format!("boot configuration writer: {e}")))?
 }
 
 /// Wraps a filesystem error touching `path` as a [`ServiceError`].
@@ -2252,6 +2260,32 @@ mod tests {
             ferrofin_model::entities::HardwareAccelerationType::none,
             "the operator turned it off; adoption must not turn it back on"
         );
+    }
+
+    /// The boot writes go through the same atomic, private write as every
+    /// runtime save, so a crash mid-write cannot leave a truncated
+    /// `system.json` or named document behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn boot_writes_are_private_like_every_other_configuration_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_jellyfin_config(tmp.path(), COMPLETED_SYSTEM_XML);
+        let mgr = FerrofinServerConfigurationManager::load(test_paths(tmp.path()))
+            .await
+            .expect("load");
+        let named = mgr.encoding_file.parent().expect("named dir");
+        for file in [
+            mgr.config_file.clone(),
+            mgr.encoding_file.clone(),
+            named.join("network.json"),
+        ] {
+            let mode = std::fs::metadata(&file)
+                .unwrap_or_else(|e| panic!("{}: {e}", file.display()))
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{}", file.display());
+        }
     }
 
     /// `GetMetadataConfiguration()`: the default until the dashboard saves

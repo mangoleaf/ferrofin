@@ -335,6 +335,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   directory, and saved now. Before, it had no modified or saved date. A one-off startup
   repair fills the dates missing from the Playlists folder and the Collections library
   that earlier versions created, and leaves every other library alone
+- The configuration files written at startup (`system.json` on a first or adopting start,
+  when the port is authorized and by the setup-completed repair, and the named documents
+  seeded from Jellyfin's XML) are replaced atomically and readable by the server's user only
+  (`0600`), like every other configuration save. A server stopped mid-write could leave a
+  truncated `system.json` that kept the next start from booting
 
 ## [1.0.0] - 2026-09-05
 
