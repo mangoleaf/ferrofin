@@ -1066,10 +1066,11 @@ async fn a_library_upload_survives_a_rename_and_a_forced_refresh() {
 /// gl-598: an image already in a library's own folder (`root/default/<name>`,
 /// where Jellyfin keeps an adopted library's `folder.jpg`) becomes the
 /// library's image on the next pass — unless the library is locked, which runs
-/// no image provider and keeps its tile.
+/// no image provider and keeps the tile its first scan drew (a thumb collage,
+/// so under the collage's shadow).
 #[rstest::rstest]
 #[case::unlocked(false, BLUE)]
-#[case::locked(true, RED)]
+#[case::locked(true, dimmed(RED))]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_librarys_own_folder_image_is_read_unless_it_is_locked(
     #[case] locked: bool,

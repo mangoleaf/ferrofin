@@ -1,0 +1,19 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: untitled
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Arial,20,-14478847,-65536,-16777216,-16777216,0,0,1,1,1,2,10,10,10,0,1
+Style: Tiny,Arial,0,-1,-65536,-16777216,-16777216,0,0,1,1.0000000000000000000000000000,1,2,10,10,10,0,1
+Style: Big,Arial,10,-1,-65536,-16777216,-16777216,0,0,1,0.0000000000000000000000000002,1,2,10,10,10,0,1
+
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: Marked=0,0:00:01.00,0:00:02.00,*Default,NTP,0000,0000,0000,,multibyte colour style
+Dialogue: Marked=0,0:00:02.00,0:00:03.00,Tiny,NTP,0000,0000,0000,,forty-five fraction digits
+Dialogue: Marked=0,0:00:03.00,0:00:04.00,Big,NTP,0000,0000,0000,,twenty-nine significant digits

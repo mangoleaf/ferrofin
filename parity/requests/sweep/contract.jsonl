@@ -1,0 +1,407 @@
+{"id": "GetLogEntries", "method": "GET", "path": "/System/ActivityLog/Entries", "source": "contract: GET /System/ActivityLog/Entries"}
+{"id": "GetKeys", "method": "GET", "path": "/Auth/Keys", "source": "contract: GET /Auth/Keys"}
+{"id": "CreateKey", "method": "POST", "path": "/Auth/Keys", "source": "contract: POST /Auth/Keys", "query": {"app": "parity"}, "expect_status": 204}
+{"id": "RevokeKey", "method": "DELETE", "path": "/Auth/Keys/{setup.key.Items.0.AccessToken}", "source": "contract: DELETE /Auth/Keys/{key}", "expect_status": 204, "setup": [{"id": "key-create", "method": "POST", "path": "/Auth/Keys", "query": {"app": "parity"}, "expect_status": 204}, {"id": "key", "method": "GET", "path": "/Auth/Keys"}]}
+{"id": "GetArtists", "method": "GET", "path": "/Artists", "source": "contract: GET /Artists"}
+{"id": "GetArtistByName", "method": "GET", "path": "/Artists/{found.artist}", "source": "contract: GET /Artists/{name}"}
+{"id": "GetAlbumArtists", "method": "GET", "path": "/Artists/AlbumArtists", "source": "contract: GET /Artists/AlbumArtists"}
+{"id": "GetAudioStream", "method": "GET", "path": "/Audio/{found.track}/stream", "source": "contract: GET /Audio/{itemId}/stream"}
+{"id": "HeadAudioStream", "method": "HEAD", "path": "/Audio/{found.track}/stream", "source": "contract: HEAD /Audio/{itemId}/stream", "oracle_trap": "Jellyfin 12.2 answers HEAD on a static audio stream with 500"}
+{"id": "GetAudioStreamByContainer", "method": "GET", "path": "/Audio/{found.track}/stream.mp3", "source": "contract: GET /Audio/{itemId}/stream.{container}"}
+{"id": "HeadAudioStreamByContainer", "method": "HEAD", "path": "/Audio/{found.track}/stream.mp3", "source": "contract: HEAD /Audio/{itemId}/stream.{container}"}
+{"id": "ListBackups", "method": "GET", "path": "/Backup", "source": "contract: GET /Backup"}
+{"id": "CreateBackup", "method": "POST", "path": "/Backup/Create", "source": "contract: POST /Backup/Create", "body": {}, "oracle_trap": "Jellyfin's backup holds its exclusive database lock and can outlast the request timeout"}
+{"id": "GetBackup", "method": "GET", "path": "/Backup/Manifest", "source": "contract: GET /Backup/Manifest", "query": {"path": "/media"}, "expect_status": 404}
+{"id": "StartRestoreBackup", "method": "POST", "path": "/Backup/Restore", "source": "contract: POST /Backup/Restore", "body": {"ArchiveFileName": "parity.zip"}, "expect_status": 404}
+{"id": "GetBrandingOptions", "method": "GET", "path": "/Branding/Configuration", "source": "contract: GET /Branding/Configuration"}
+{"id": "GetBrandingCss", "method": "GET", "path": "/Branding/Css", "source": "contract: GET /Branding/Css"}
+{"id": "GetBrandingCss_2", "method": "GET", "path": "/Branding/Css.css", "source": "contract: GET /Branding/Css.css"}
+{"id": "GetChannels", "method": "GET", "path": "/Channels", "source": "contract: GET /Channels"}
+{"id": "GetChannelFeatures", "method": "GET", "path": "/Channels/00000000000000000000000000000001/Features", "source": "contract: GET /Channels/{channelId}/Features", "expect_status": 400}
+{"id": "GetChannelItems", "method": "GET", "path": "/Channels/00000000000000000000000000000001/Items", "source": "contract: GET /Channels/{channelId}/Items", "expect_status": 400}
+{"id": "GetAllChannelFeatures", "method": "GET", "path": "/Channels/Features", "source": "contract: GET /Channels/Features"}
+{"id": "GetLatestChannelItems", "method": "GET", "path": "/Channels/Items/Latest", "source": "contract: GET /Channels/Items/Latest"}
+{"id": "LogFile", "method": "POST", "path": "/ClientLog/Document", "source": "contract: POST /ClientLog/Document"}
+{"id": "CreateCollection", "method": "POST", "path": "/Collections", "source": "contract: POST /Collections", "query": {"name": "Parity sweep", "ids": "{movie}"}}
+{"id": "AddToCollection", "method": "POST", "path": "/Collections/{setup.collection.Id}/Items", "source": "contract: POST /Collections/{collectionId}/Items", "query": {"ids": "{hdr_movie}"}, "expect_status": 204, "setup": [{"id": "collection", "method": "POST", "path": "/Collections", "query": {"name": "Parity sweep", "ids": "{movie}"}}]}
+{"id": "RemoveFromCollection", "method": "DELETE", "path": "/Collections/{setup.collection.Id}/Items", "source": "contract: DELETE /Collections/{collectionId}/Items", "query": {"ids": "{movie}"}, "expect_status": 204, "setup": [{"id": "collection", "method": "POST", "path": "/Collections", "query": {"name": "Parity sweep", "ids": "{movie}"}}]}
+{"id": "GetConfiguration", "method": "GET", "path": "/System/Configuration", "source": "contract: GET /System/Configuration"}
+{"id": "UpdateConfiguration", "method": "POST", "path": "/System/Configuration", "source": "contract: POST /System/Configuration", "body": {}, "expect_status": 204}
+{"id": "GetNamedConfiguration", "method": "GET", "path": "/System/Configuration/network", "source": "contract: GET /System/Configuration/{key}"}
+{"id": "UpdateNamedConfiguration", "method": "POST", "path": "/System/Configuration/network", "source": "contract: POST /System/Configuration/{key}", "body": {}, "expect_status": 204}
+{"id": "UpdateBrandingConfiguration", "method": "POST", "path": "/System/Configuration/Branding", "source": "contract: POST /System/Configuration/Branding", "body": {}, "expect_status": 204}
+{"id": "GetDefaultMetadataOptions", "method": "GET", "path": "/System/Configuration/MetadataOptions/Default", "source": "contract: GET /System/Configuration/MetadataOptions/Default"}
+{"id": "GetDashboardConfigurationPage", "method": "GET", "path": "/web/ConfigurationPage", "source": "contract: GET /web/ConfigurationPage", "expect_status": 404}
+{"id": "GetConfigurationPages", "method": "GET", "path": "/web/ConfigurationPages", "source": "contract: GET /web/ConfigurationPages"}
+{"id": "GetDevices", "method": "GET", "path": "/Devices", "source": "contract: GET /Devices"}
+{"id": "DeleteDevice", "method": "DELETE", "path": "/Devices", "source": "contract: DELETE /Devices", "query": {"id": "parity"}, "expect_status": 204}
+{"id": "GetDeviceInfo", "method": "GET", "path": "/Devices/Info", "source": "contract: GET /Devices/Info", "query": {"id": "parity"}}
+{"id": "GetDeviceOptions", "method": "GET", "path": "/Devices/Options", "source": "contract: GET /Devices/Options", "query": {"id": "parity"}, "expect_status": 404}
+{"id": "UpdateDeviceOptions", "method": "POST", "path": "/Devices/Options", "source": "contract: POST /Devices/Options", "query": {"id": "parity"}, "body": {"CustomName": "Parity device"}, "expect_status": 204}
+{"id": "GetDisplayPreferences", "method": "GET", "path": "/DisplayPreferences/usersettings", "source": "contract: GET /DisplayPreferences/{displayPreferencesId}", "query": {"client": "emby"}}
+{"id": "UpdateDisplayPreferences", "method": "POST", "path": "/DisplayPreferences/usersettings", "source": "contract: POST /DisplayPreferences/{displayPreferencesId}", "query": {"client": "emby"}, "body": {"Client": "emby", "SortBy": "SortName", "CustomPrefs": {"homesection0": "resume"}}, "expect_status": 204}
+{"id": "GetHlsAudioSegment", "method": "GET", "path": "/Audio/{found.track}/hls1/main/0.mp3", "source": "contract: GET /Audio/{itemId}/hls1/{playlistId}/{segmentId}.{container}", "query": {"runtimeTicks": 0, "actualSegmentLengthTicks": 0}, "oracle_trap": "a segment of a transcode that was never started: Jellyfin 12.2 answers 500"}
+{"id": "GetVariantHlsAudioPlaylist", "method": "GET", "path": "/Audio/{found.track}/main.m3u8", "source": "contract: GET /Audio/{itemId}/main.m3u8"}
+{"id": "GetMasterHlsAudioPlaylist", "method": "GET", "path": "/Audio/{found.track}/master.m3u8", "source": "contract: GET /Audio/{itemId}/master.m3u8", "query": {"mediaSourceId": "{found.track}"}}
+{"id": "HeadMasterHlsAudioPlaylist", "method": "HEAD", "path": "/Audio/{found.track}/master.m3u8", "source": "contract: HEAD /Audio/{itemId}/master.m3u8", "query": {"mediaSourceId": "{found.track}"}}
+{"id": "GetHlsVideoSegment", "method": "GET", "path": "/Videos/{movie}/hls1/main/0.mkv", "source": "contract: GET /Videos/{itemId}/hls1/{playlistId}/{segmentId}.{container}", "query": {"runtimeTicks": 0, "actualSegmentLengthTicks": 0}}
+{"id": "GetLiveHlsStream", "method": "GET", "path": "/Videos/{movie}/live.m3u8", "source": "contract: GET /Videos/{itemId}/live.m3u8"}
+{"id": "GetVariantHlsVideoPlaylist", "method": "GET", "path": "/Videos/{movie}/main.m3u8", "source": "contract: GET /Videos/{itemId}/main.m3u8"}
+{"id": "GetMasterHlsVideoPlaylist", "method": "GET", "path": "/Videos/{movie}/master.m3u8", "source": "contract: GET /Videos/{itemId}/master.m3u8", "query": {"mediaSourceId": "{movie}"}}
+{"id": "HeadMasterHlsVideoPlaylist", "method": "HEAD", "path": "/Videos/{movie}/master.m3u8", "source": "contract: HEAD /Videos/{itemId}/master.m3u8", "query": {"mediaSourceId": "{movie}"}}
+{"id": "GetDefaultDirectoryBrowser", "method": "GET", "path": "/Environment/DefaultDirectoryBrowser", "source": "contract: GET /Environment/DefaultDirectoryBrowser"}
+{"id": "GetDirectoryContents", "method": "GET", "path": "/Environment/DirectoryContents", "source": "contract: GET /Environment/DirectoryContents", "query": {"path": "/media"}}
+{"id": "GetDrives", "method": "GET", "path": "/Environment/Drives", "source": "contract: GET /Environment/Drives"}
+{"id": "GetNetworkShares", "method": "GET", "path": "/Environment/NetworkShares", "source": "contract: GET /Environment/NetworkShares", "oracle_trap": "Jellyfin 12 removed it; the 10.11.8 contract still has it"}
+{"id": "GetParentPath", "method": "GET", "path": "/Environment/ParentPath", "source": "contract: GET /Environment/ParentPath", "query": {"path": "/media"}}
+{"id": "ValidatePath", "method": "POST", "path": "/Environment/ValidatePath", "source": "contract: POST /Environment/ValidatePath", "body": {"ValidateWritable": false, "Path": "/media", "IsFile": false}, "expect_status": 204}
+{"id": "RegisterTransformation", "method": "POST", "path": "/FileTransformation/RegisterTransformation", "source": "contract: POST /FileTransformation/RegisterTransformation", "body": {}, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetQueryFiltersLegacy", "method": "GET", "path": "/Items/Filters", "source": "contract: GET /Items/Filters", "oracle_trap": "Jellyfin's /Items/Filters fails or stalls on large libraries"}
+{"id": "GetQueryFilters", "method": "GET", "path": "/Items/Filters2", "source": "contract: GET /Items/Filters2"}
+{"id": "GetGenres", "method": "GET", "path": "/Genres", "source": "contract: GET /Genres"}
+{"id": "GetGenre", "method": "GET", "path": "/Genres/{found.genre}", "source": "contract: GET /Genres/{genreName}"}
+{"id": "GetHlsAudioSegmentLegacyAac", "method": "GET", "path": "/Audio/{found.track}/hls/0/stream.aac", "source": "contract: GET /Audio/{itemId}/hls/{segmentId}/stream.aac", "oracle_trap": "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"}
+{"id": "GetHlsAudioSegmentLegacyMp3", "method": "GET", "path": "/Audio/{found.track}/hls/0/stream.mp3", "source": "contract: GET /Audio/{itemId}/hls/{segmentId}/stream.mp3", "oracle_trap": "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"}
+{"id": "GetHlsVideoSegmentLegacy", "method": "GET", "path": "/Videos/{movie}/hls/main/0.ts", "source": "contract: GET /Videos/{itemId}/hls/{playlistId}/{segmentId}.{segmentContainer}", "oracle_trap": "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"}
+{"id": "GetHlsPlaylistLegacy", "method": "GET", "path": "/Videos/{movie}/hls/main/stream.m3u8", "source": "contract: GET /Videos/{itemId}/hls/{playlistId}/stream.m3u8", "oracle_trap": "Jellyfin 12 removed the legacy HLS routes; the 10.11.8 contract still has them"}
+{"id": "StopEncodingProcess", "method": "DELETE", "path": "/Videos/ActiveEncodings", "source": "contract: DELETE /Videos/ActiveEncodings", "query": {"deviceId": "parity", "playSessionId": "parity"}, "expect_status": 204}
+{"id": "GetArtistImage", "method": "GET", "path": "/Artists/{found.artist}/Images/Primary/0", "source": "contract: GET /Artists/{name}/Images/{imageType}/{imageIndex}", "expect_status": 404}
+{"id": "HeadArtistImage", "method": "HEAD", "path": "/Artists/{found.artist}/Images/Primary/0", "source": "contract: HEAD /Artists/{name}/Images/{imageType}/{imageIndex}", "expect_status": 404}
+{"id": "GetSplashscreen", "method": "GET", "path": "/Branding/Splashscreen", "source": "contract: GET /Branding/Splashscreen"}
+{"id": "UploadCustomSplashscreen", "method": "POST", "path": "/Branding/Splashscreen", "source": "contract: POST /Branding/Splashscreen", "expect_status": 400}
+{"id": "DeleteCustomSplashscreen", "method": "DELETE", "path": "/Branding/Splashscreen", "source": "contract: DELETE /Branding/Splashscreen", "expect_status": 204}
+{"id": "GetGenreImage", "method": "GET", "path": "/Genres/{found.genre}/Images/Primary", "source": "contract: GET /Genres/{name}/Images/{imageType}"}
+{"id": "HeadGenreImage", "method": "HEAD", "path": "/Genres/{found.genre}/Images/Primary", "source": "contract: HEAD /Genres/{name}/Images/{imageType}"}
+{"id": "GetGenreImageByIndex", "method": "GET", "path": "/Genres/{found.genre}/Images/Primary/0", "source": "contract: GET /Genres/{name}/Images/{imageType}/{imageIndex}"}
+{"id": "HeadGenreImageByIndex", "method": "HEAD", "path": "/Genres/{found.genre}/Images/Primary/0", "source": "contract: HEAD /Genres/{name}/Images/{imageType}/{imageIndex}"}
+{"id": "GetItemImageInfos", "method": "GET", "path": "/Items/{movie}/Images", "source": "contract: GET /Items/{itemId}/Images"}
+{"id": "DeleteItemImage", "method": "DELETE", "path": "/Items/{movie}/Images/Primary", "source": "contract: DELETE /Items/{itemId}/Images/{imageType}", "expect_status": 204, "oracle_trap": "the image is in the read-only media folder: Jellyfin 12.2's delete fails with 500"}
+{"id": "SetItemImage", "method": "POST", "path": "/Items/{movie}/Images/Primary", "source": "contract: POST /Items/{itemId}/Images/{imageType}", "expect_status": 400}
+{"id": "GetItemImage", "method": "GET", "path": "/Items/{movie}/Images/Primary", "source": "contract: GET /Items/{itemId}/Images/{imageType}"}
+{"id": "HeadItemImage", "method": "HEAD", "path": "/Items/{movie}/Images/Primary", "source": "contract: HEAD /Items/{itemId}/Images/{imageType}"}
+{"id": "DeleteItemImageByIndex", "method": "DELETE", "path": "/Items/{movie}/Images/Primary/0", "source": "contract: DELETE /Items/{itemId}/Images/{imageType}/{imageIndex}", "expect_status": 204, "oracle_trap": "the image is in the read-only media folder: Jellyfin 12.2's delete fails with 500"}
+{"id": "SetItemImageByIndex", "method": "POST", "path": "/Items/{movie}/Images/Primary/0", "source": "contract: POST /Items/{itemId}/Images/{imageType}/{imageIndex}", "expect_status": 400}
+{"id": "GetItemImageByIndex", "method": "GET", "path": "/Items/{movie}/Images/Primary/0", "source": "contract: GET /Items/{itemId}/Images/{imageType}/{imageIndex}"}
+{"id": "HeadItemImageByIndex", "method": "HEAD", "path": "/Items/{movie}/Images/Primary/0", "source": "contract: HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}"}
+{"id": "GetItemImage2", "method": "GET", "path": "/Items/{movie}/Images/Primary/0/parity/jpg/200/300/0/0", "source": "contract: GET /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}"}
+{"id": "HeadItemImage2", "method": "HEAD", "path": "/Items/{movie}/Images/Primary/0/parity/jpg/200/300/0/0", "source": "contract: HEAD /Items/{itemId}/Images/{imageType}/{imageIndex}/{tag}/{format}/{maxWidth}/{maxHeight}/{percentPlayed}/{unplayedCount}"}
+{"id": "UpdateItemImageIndex", "method": "POST", "path": "/Items/{movie}/Images/Primary/0/Index", "source": "contract: POST /Items/{itemId}/Images/{imageType}/{imageIndex}/Index", "query": {"newIndex": 0}, "expect_status": 400}
+{"id": "GetMusicGenreImage", "method": "GET", "path": "/MusicGenres/{found.music_genre}/Images/Primary", "source": "contract: GET /MusicGenres/{name}/Images/{imageType}"}
+{"id": "HeadMusicGenreImage", "method": "HEAD", "path": "/MusicGenres/{found.music_genre}/Images/Primary", "source": "contract: HEAD /MusicGenres/{name}/Images/{imageType}"}
+{"id": "GetMusicGenreImageByIndex", "method": "GET", "path": "/MusicGenres/{found.music_genre}/Images/Primary/0", "source": "contract: GET /MusicGenres/{name}/Images/{imageType}/{imageIndex}"}
+{"id": "HeadMusicGenreImageByIndex", "method": "HEAD", "path": "/MusicGenres/{found.music_genre}/Images/Primary/0", "source": "contract: HEAD /MusicGenres/{name}/Images/{imageType}/{imageIndex}"}
+{"id": "GetPersonImage", "method": "GET", "path": "/Persons/{found.person}/Images/Primary", "source": "contract: GET /Persons/{name}/Images/{imageType}", "expect_status": 404}
+{"id": "HeadPersonImage", "method": "HEAD", "path": "/Persons/{found.person}/Images/Primary", "source": "contract: HEAD /Persons/{name}/Images/{imageType}", "expect_status": 404}
+{"id": "GetPersonImageByIndex", "method": "GET", "path": "/Persons/{found.person}/Images/Primary/0", "source": "contract: GET /Persons/{name}/Images/{imageType}/{imageIndex}", "expect_status": 404}
+{"id": "HeadPersonImageByIndex", "method": "HEAD", "path": "/Persons/{found.person}/Images/Primary/0", "source": "contract: HEAD /Persons/{name}/Images/{imageType}/{imageIndex}", "expect_status": 404}
+{"id": "GetStudioImage", "method": "GET", "path": "/Studios/{found.studio}/Images/Primary", "source": "contract: GET /Studios/{name}/Images/{imageType}", "expect_status": 404}
+{"id": "HeadStudioImage", "method": "HEAD", "path": "/Studios/{found.studio}/Images/Primary", "source": "contract: HEAD /Studios/{name}/Images/{imageType}", "expect_status": 404}
+{"id": "GetStudioImageByIndex", "method": "GET", "path": "/Studios/{found.studio}/Images/Primary/0", "source": "contract: GET /Studios/{name}/Images/{imageType}/{imageIndex}", "expect_status": 404}
+{"id": "HeadStudioImageByIndex", "method": "HEAD", "path": "/Studios/{found.studio}/Images/Primary/0", "source": "contract: HEAD /Studios/{name}/Images/{imageType}/{imageIndex}", "expect_status": 404}
+{"id": "PostUserImage", "method": "POST", "path": "/UserImage", "source": "contract: POST /UserImage", "expect_status": 400}
+{"id": "DeleteUserImage", "method": "DELETE", "path": "/UserImage", "source": "contract: DELETE /UserImage", "expect_status": 204}
+{"id": "GetUserImage", "method": "GET", "path": "/UserImage", "source": "contract: GET /UserImage", "expect_status": 404}
+{"id": "HeadUserImage", "method": "HEAD", "path": "/UserImage", "source": "contract: HEAD /UserImage", "expect_status": 404}
+{"id": "GetInstantMixFromAlbum", "method": "GET", "path": "/Albums/{found.album}/InstantMix", "source": "contract: GET /Albums/{itemId}/InstantMix"}
+{"id": "GetInstantMixFromArtists", "method": "GET", "path": "/Artists/{found.artist_id}/InstantMix", "source": "contract: GET /Artists/{itemId}/InstantMix"}
+{"id": "GetInstantMixFromArtists2", "method": "GET", "path": "/Artists/InstantMix", "source": "contract: GET /Artists/InstantMix", "query": {"id": "{found.artist_id}"}}
+{"id": "GetInstantMixFromItem", "method": "GET", "path": "/Items/{movie}/InstantMix", "source": "contract: GET /Items/{itemId}/InstantMix"}
+{"id": "GetInstantMixFromMusicGenreByName", "method": "GET", "path": "/MusicGenres/{found.music_genre}/InstantMix", "source": "contract: GET /MusicGenres/{name}/InstantMix"}
+{"id": "GetInstantMixFromMusicGenreById", "method": "GET", "path": "/MusicGenres/InstantMix", "source": "contract: GET /MusicGenres/InstantMix", "query": {"id": "{found.music_genre_id}"}}
+{"id": "GetInstantMixFromSong", "method": "GET", "path": "/Songs/{found.track}/InstantMix", "source": "contract: GET /Songs/{itemId}/InstantMix"}
+{"id": "GetExternalIdInfos", "method": "GET", "path": "/Items/{movie}/ExternalIdInfos", "source": "contract: GET /Items/{itemId}/ExternalIdInfos"}
+{"id": "ApplySearchCriteria", "method": "POST", "path": "/Items/RemoteSearch/Apply/{movie}", "source": "contract: POST /Items/RemoteSearch/Apply/{itemId}", "body": {}, "expect_status": 204}
+{"id": "GetBookRemoteSearchResults", "method": "POST", "path": "/Items/RemoteSearch/Book", "source": "contract: POST /Items/RemoteSearch/Book", "body": {"SearchInfo": {"Name": "Parity"}, "IncludeDisabledProviders": false}, "oracle_trap": "a remote metadata search: needs the internet"}
+{"id": "GetBoxSetRemoteSearchResults", "method": "POST", "path": "/Items/RemoteSearch/BoxSet", "source": "contract: POST /Items/RemoteSearch/BoxSet", "body": {"SearchInfo": {"Name": "Parity"}, "IncludeDisabledProviders": false}, "oracle_trap": "a remote metadata search: needs the internet"}
+{"id": "GetMovieRemoteSearchResults", "method": "POST", "path": "/Items/RemoteSearch/Movie", "source": "contract: POST /Items/RemoteSearch/Movie", "body": {"SearchInfo": {"Name": "Parity"}, "IncludeDisabledProviders": false}, "oracle_trap": "a remote metadata search: needs the internet"}
+{"id": "GetMusicAlbumRemoteSearchResults", "method": "POST", "path": "/Items/RemoteSearch/MusicAlbum", "source": "contract: POST /Items/RemoteSearch/MusicAlbum", "body": {"SearchInfo": {"Name": "Parity"}, "IncludeDisabledProviders": false}, "oracle_trap": "a remote metadata search: needs the internet"}
+{"id": "GetMusicArtistRemoteSearchResults", "method": "POST", "path": "/Items/RemoteSearch/MusicArtist", "source": "contract: POST /Items/RemoteSearch/MusicArtist", "body": {"SearchInfo": {"Name": "Parity"}, "IncludeDisabledProviders": false}, "oracle_trap": "a remote metadata search: needs the internet"}
+{"id": "GetMusicVideoRemoteSearchResults", "method": "POST", "path": "/Items/RemoteSearch/MusicVideo", "source": "contract: POST /Items/RemoteSearch/MusicVideo", "body": {"SearchInfo": {"Name": "Parity"}, "IncludeDisabledProviders": false}, "oracle_trap": "a remote metadata search: needs the internet"}
+{"id": "GetPersonRemoteSearchResults", "method": "POST", "path": "/Items/RemoteSearch/Person", "source": "contract: POST /Items/RemoteSearch/Person", "body": {"SearchInfo": {"Name": "Parity"}, "IncludeDisabledProviders": false}, "oracle_trap": "a remote metadata search: needs the internet"}
+{"id": "GetSeriesRemoteSearchResults", "method": "POST", "path": "/Items/RemoteSearch/Series", "source": "contract: POST /Items/RemoteSearch/Series", "body": {"SearchInfo": {"Name": "Parity"}, "IncludeDisabledProviders": false}, "oracle_trap": "a remote metadata search: needs the internet"}
+{"id": "GetTrailerRemoteSearchResults", "method": "POST", "path": "/Items/RemoteSearch/Trailer", "source": "contract: POST /Items/RemoteSearch/Trailer", "body": {"SearchInfo": {"Name": "Parity"}, "IncludeDisabledProviders": false}, "oracle_trap": "a remote metadata search: needs the internet"}
+{"id": "RefreshItem", "method": "POST", "path": "/Items/{movie}/Refresh", "source": "contract: POST /Items/{itemId}/Refresh", "expect_status": 204}
+{"id": "GetItems", "method": "GET", "path": "/Items", "source": "contract: GET /Items"}
+{"id": "DeleteItems", "method": "DELETE", "path": "/Items", "source": "contract: DELETE /Items", "expect_status": 204}
+{"id": "GetItemUserData", "method": "GET", "path": "/UserItems/{movie}/UserData", "source": "contract: GET /UserItems/{itemId}/UserData"}
+{"id": "UpdateItemUserData", "method": "POST", "path": "/UserItems/{movie}/UserData", "source": "contract: POST /UserItems/{itemId}/UserData", "body": {"PlaybackPositionTicks": 100000000, "Played": false}}
+{"id": "GetResumeItems", "method": "GET", "path": "/UserItems/Resume", "source": "contract: GET /UserItems/Resume"}
+{"id": "UpdateItem", "method": "POST", "path": "/Items/{movie}", "source": "contract: POST /Items/{itemId}", "body": {}, "expect_status": 204}
+{"id": "DeleteItem", "method": "DELETE", "path": "/Items/{movie}", "source": "contract: DELETE /Items/{itemId}", "expect_status": 204, "oracle_trap": "the media is mounted read-only; Jellyfin 12.2's delete fails with 500"}
+{"id": "GetItem", "method": "GET", "path": "/Items/{movie}", "source": "contract: GET /Items/{itemId}"}
+{"id": "UpdateItemContentType", "method": "POST", "path": "/Items/{movie}/ContentType", "source": "contract: POST /Items/{itemId}/ContentType", "expect_status": 204}
+{"id": "GetMetadataEditorInfo", "method": "GET", "path": "/Items/{movie}/MetadataEditor", "source": "contract: GET /Items/{itemId}/MetadataEditor"}
+{"id": "GetSimilarAlbums", "method": "GET", "path": "/Albums/{found.album}/Similar", "source": "contract: GET /Albums/{itemId}/Similar"}
+{"id": "GetSimilarArtists", "method": "GET", "path": "/Artists/{found.artist_id}/Similar", "source": "contract: GET /Artists/{itemId}/Similar"}
+{"id": "GetAncestors", "method": "GET", "path": "/Items/{movie}/Ancestors", "source": "contract: GET /Items/{itemId}/Ancestors"}
+{"id": "GetCriticReviews", "method": "GET", "path": "/Items/{movie}/CriticReviews", "source": "contract: GET /Items/{itemId}/CriticReviews", "oracle_trap": "Jellyfin 12 removed it; the 10.11.8 contract still has it"}
+{"id": "GetDownload", "method": "GET", "path": "/Items/{movie}/Download", "source": "contract: GET /Items/{itemId}/Download"}
+{"id": "GetFile", "method": "GET", "path": "/Items/{movie}/File", "source": "contract: GET /Items/{itemId}/File"}
+{"id": "GetSimilarItems", "method": "GET", "path": "/Items/{movie}/Similar", "source": "contract: GET /Items/{itemId}/Similar"}
+{"id": "GetThemeMedia", "method": "GET", "path": "/Items/{movie}/ThemeMedia", "source": "contract: GET /Items/{itemId}/ThemeMedia"}
+{"id": "GetThemeSongs", "method": "GET", "path": "/Items/{movie}/ThemeSongs", "source": "contract: GET /Items/{itemId}/ThemeSongs"}
+{"id": "GetThemeVideos", "method": "GET", "path": "/Items/{movie}/ThemeVideos", "source": "contract: GET /Items/{itemId}/ThemeVideos"}
+{"id": "GetItemCounts", "method": "GET", "path": "/Items/Counts", "source": "contract: GET /Items/Counts"}
+{"id": "GetLibraryOptionsInfo", "method": "GET", "path": "/Libraries/AvailableOptions", "source": "contract: GET /Libraries/AvailableOptions"}
+{"id": "PostUpdatedMedia", "method": "POST", "path": "/Library/Media/Updated", "source": "contract: POST /Library/Media/Updated", "body": {}, "expect_status": 204}
+{"id": "GetMediaFolders", "method": "GET", "path": "/Library/MediaFolders", "source": "contract: GET /Library/MediaFolders"}
+{"id": "PostAddedMovies", "method": "POST", "path": "/Library/Movies/Added", "source": "contract: POST /Library/Movies/Added", "expect_status": 204}
+{"id": "PostUpdatedMovies", "method": "POST", "path": "/Library/Movies/Updated", "source": "contract: POST /Library/Movies/Updated", "expect_status": 204}
+{"id": "GetPhysicalPaths", "method": "GET", "path": "/Library/PhysicalPaths", "source": "contract: GET /Library/PhysicalPaths"}
+{"id": "RefreshLibrary", "method": "POST", "path": "/Library/Refresh", "source": "contract: POST /Library/Refresh", "expect_status": 204}
+{"id": "PostAddedSeries", "method": "POST", "path": "/Library/Series/Added", "source": "contract: POST /Library/Series/Added", "expect_status": 204}
+{"id": "PostUpdatedSeries", "method": "POST", "path": "/Library/Series/Updated", "source": "contract: POST /Library/Series/Updated", "expect_status": 204}
+{"id": "GetSimilarMovies", "method": "GET", "path": "/Movies/{movie}/Similar", "source": "contract: GET /Movies/{itemId}/Similar"}
+{"id": "GetSimilarShows", "method": "GET", "path": "/Shows/{series}/Similar", "source": "contract: GET /Shows/{itemId}/Similar"}
+{"id": "GetSimilarTrailers", "method": "GET", "path": "/Trailers/{movie}/Similar", "source": "contract: GET /Trailers/{itemId}/Similar"}
+{"id": "GetVirtualFolders", "method": "GET", "path": "/Library/VirtualFolders", "source": "contract: GET /Library/VirtualFolders"}
+{"id": "AddVirtualFolder", "method": "POST", "path": "/Library/VirtualFolders", "source": "contract: POST /Library/VirtualFolders", "body": {"LibraryOptions": {}}, "expect_status": 204, "query": {"name": "Parity", "collectionType": "movies", "refreshLibrary": false}}
+{"id": "RemoveVirtualFolder", "method": "DELETE", "path": "/Library/VirtualFolders", "source": "contract: DELETE /Library/VirtualFolders", "expect_status": 204, "query": {"name": "{found.library}", "refreshLibrary": false}}
+{"id": "UpdateLibraryOptions", "method": "POST", "path": "/Library/VirtualFolders/LibraryOptions", "source": "contract: POST /Library/VirtualFolders/LibraryOptions", "body": {"Id": "{views.movies}", "LibraryOptions": {}}, "expect_status": 204}
+{"id": "RenameVirtualFolder", "method": "POST", "path": "/Library/VirtualFolders/Name", "source": "contract: POST /Library/VirtualFolders/Name", "expect_status": 204, "query": {"name": "{found.library}", "newName": "Parity renamed", "refreshLibrary": false}}
+{"id": "AddMediaPath", "method": "POST", "path": "/Library/VirtualFolders/Paths", "source": "contract: POST /Library/VirtualFolders/Paths", "body": {"Name": "{found.library}", "Path": "/media", "PathInfo": {"Path": "/media"}}, "expect_status": 204, "query": {"refreshLibrary": false}}
+{"id": "RemoveMediaPath", "method": "DELETE", "path": "/Library/VirtualFolders/Paths", "source": "contract: DELETE /Library/VirtualFolders/Paths", "expect_status": 204, "query": {"name": "{found.library}", "path": "{found.library_path}", "refreshLibrary": false}}
+{"id": "UpdateMediaPath", "method": "POST", "path": "/Library/VirtualFolders/Paths/Update", "source": "contract: POST /Library/VirtualFolders/Paths/Update", "body": {"Name": "{found.library}", "PathInfo": {"Path": "{found.library_path}"}}, "expect_status": 204}
+{"id": "GetChannelMappingOptions", "method": "GET", "path": "/LiveTv/ChannelMappingOptions", "source": "contract: GET /LiveTv/ChannelMappingOptions", "oracle_trap": "Jellyfin 12.2 answers 500 without a tuner or a listings provider"}
+{"id": "SetChannelMapping", "method": "POST", "path": "/LiveTv/ChannelMappings", "source": "contract: POST /LiveTv/ChannelMappings", "body": {"ProviderId": "parity", "TunerChannelId": "parity", "ProviderChannelId": "parity"}, "oracle_trap": "no Live TV in the corpus: Jellyfin 12.2 answers 500"}
+{"id": "GetLiveTvChannels", "method": "GET", "path": "/LiveTv/Channels", "source": "contract: GET /LiveTv/Channels"}
+{"id": "GetChannel", "method": "GET", "path": "/LiveTv/Channels/00000000000000000000000000000001", "source": "contract: GET /LiveTv/Channels/{channelId}", "expect_status": 404}
+{"id": "GetGuideInfo", "method": "GET", "path": "/LiveTv/GuideInfo", "source": "contract: GET /LiveTv/GuideInfo"}
+{"id": "GetLiveTvInfo", "method": "GET", "path": "/LiveTv/Info", "source": "contract: GET /LiveTv/Info"}
+{"id": "AddListingProvider", "method": "POST", "path": "/LiveTv/ListingProviders", "source": "contract: POST /LiveTv/ListingProviders", "body": {}, "expect_status": 404}
+{"id": "DeleteListingProvider", "method": "DELETE", "path": "/LiveTv/ListingProviders", "source": "contract: DELETE /LiveTv/ListingProviders", "expect_status": 204}
+{"id": "GetDefaultListingProvider", "method": "GET", "path": "/LiveTv/ListingProviders/Default", "source": "contract: GET /LiveTv/ListingProviders/Default"}
+{"id": "GetLineups", "method": "GET", "path": "/LiveTv/ListingProviders/Lineups", "source": "contract: GET /LiveTv/ListingProviders/Lineups", "expect_status": 404}
+{"id": "GetSchedulesDirectCountries", "method": "GET", "path": "/LiveTv/ListingProviders/SchedulesDirect/Countries", "source": "contract: GET /LiveTv/ListingProviders/SchedulesDirect/Countries"}
+{"id": "GetLiveRecordingFile", "method": "GET", "path": "/LiveTv/LiveRecordings/00000000000000000000000000000001/stream", "source": "contract: GET /LiveTv/LiveRecordings/{recordingId}/stream", "expect_status": 404}
+{"id": "GetLiveStreamFile", "method": "GET", "path": "/LiveTv/LiveStreamFiles/00000000000000000000000000000001/stream.mkv", "source": "contract: GET /LiveTv/LiveStreamFiles/{streamId}/stream.{container}", "expect_status": 404}
+{"id": "GetLiveTvPrograms", "method": "GET", "path": "/LiveTv/Programs", "source": "contract: GET /LiveTv/Programs"}
+{"id": "GetPrograms", "method": "POST", "path": "/LiveTv/Programs", "source": "contract: POST /LiveTv/Programs", "body": {}}
+{"id": "GetProgram", "method": "GET", "path": "/LiveTv/Programs/00000000000000000000000000000001", "source": "contract: GET /LiveTv/Programs/{programId}", "expect_status": 404}
+{"id": "GetRecommendedPrograms", "method": "GET", "path": "/LiveTv/Programs/Recommended", "source": "contract: GET /LiveTv/Programs/Recommended"}
+{"id": "GetRecordings", "method": "GET", "path": "/LiveTv/Recordings", "source": "contract: GET /LiveTv/Recordings"}
+{"id": "GetRecording", "method": "GET", "path": "/LiveTv/Recordings/00000000000000000000000000000001", "source": "contract: GET /LiveTv/Recordings/{recordingId}", "expect_status": 404}
+{"id": "DeleteRecording", "method": "DELETE", "path": "/LiveTv/Recordings/00000000000000000000000000000001", "source": "contract: DELETE /LiveTv/Recordings/{recordingId}", "expect_status": 404}
+{"id": "GetRecordingFolders", "method": "GET", "path": "/LiveTv/Recordings/Folders", "source": "contract: GET /LiveTv/Recordings/Folders"}
+{"id": "GetRecordingGroups", "method": "GET", "path": "/LiveTv/Recordings/Groups", "source": "contract: GET /LiveTv/Recordings/Groups"}
+{"id": "GetRecordingGroup", "method": "GET", "path": "/LiveTv/Recordings/Groups/00000000000000000000000000000001", "source": "contract: GET /LiveTv/Recordings/Groups/{groupId}", "expect_status": 404}
+{"id": "GetRecordingsSeries", "method": "GET", "path": "/LiveTv/Recordings/Series", "source": "contract: GET /LiveTv/Recordings/Series"}
+{"id": "GetSeriesTimers", "method": "GET", "path": "/LiveTv/SeriesTimers", "source": "contract: GET /LiveTv/SeriesTimers"}
+{"id": "CreateSeriesTimer", "method": "POST", "path": "/LiveTv/SeriesTimers", "source": "contract: POST /LiveTv/SeriesTimers", "body": {}, "expect_status": 204, "oracle_trap": "no Live TV in the corpus: Jellyfin 12.2 answers 500"}
+{"id": "GetSeriesTimer", "method": "GET", "path": "/LiveTv/SeriesTimers/00000000000000000000000000000001", "source": "contract: GET /LiveTv/SeriesTimers/{timerId}", "expect_status": 404}
+{"id": "CancelSeriesTimer", "method": "DELETE", "path": "/LiveTv/SeriesTimers/00000000000000000000000000000001", "source": "contract: DELETE /LiveTv/SeriesTimers/{timerId}", "expect_status": 404}
+{"id": "UpdateSeriesTimer", "method": "POST", "path": "/LiveTv/SeriesTimers/00000000000000000000000000000001", "source": "contract: POST /LiveTv/SeriesTimers/{timerId}", "body": {}, "expect_status": 204, "oracle_trap": "no Live TV in the corpus: Jellyfin 12.2 answers 500"}
+{"id": "GetTimers", "method": "GET", "path": "/LiveTv/Timers", "source": "contract: GET /LiveTv/Timers"}
+{"id": "CreateTimer", "method": "POST", "path": "/LiveTv/Timers", "source": "contract: POST /LiveTv/Timers", "body": {}, "expect_status": 204, "oracle_trap": "no Live TV in the corpus: Jellyfin 12.2 answers 500"}
+{"id": "GetTimer", "method": "GET", "path": "/LiveTv/Timers/00000000000000000000000000000001", "source": "contract: GET /LiveTv/Timers/{timerId}"}
+{"id": "CancelTimer", "method": "DELETE", "path": "/LiveTv/Timers/00000000000000000000000000000001", "source": "contract: DELETE /LiveTv/Timers/{timerId}", "expect_status": 404}
+{"id": "UpdateTimer", "method": "POST", "path": "/LiveTv/Timers/00000000000000000000000000000001", "source": "contract: POST /LiveTv/Timers/{timerId}", "body": {}, "expect_status": 204, "oracle_trap": "no Live TV in the corpus: Jellyfin 12.2 answers 500"}
+{"id": "GetDefaultTimer", "method": "GET", "path": "/LiveTv/Timers/Defaults", "source": "contract: GET /LiveTv/Timers/Defaults"}
+{"id": "AddTunerHost", "method": "POST", "path": "/LiveTv/TunerHosts", "source": "contract: POST /LiveTv/TunerHosts", "body": {}, "expect_status": 404}
+{"id": "DeleteTunerHost", "method": "DELETE", "path": "/LiveTv/TunerHosts", "source": "contract: DELETE /LiveTv/TunerHosts", "expect_status": 204}
+{"id": "GetTunerHostTypes", "method": "GET", "path": "/LiveTv/TunerHosts/Types", "source": "contract: GET /LiveTv/TunerHosts/Types"}
+{"id": "ResetTuner", "method": "POST", "path": "/LiveTv/Tuners/00000000000000000000000000000001/Reset", "source": "contract: POST /LiveTv/Tuners/{tunerId}/Reset", "expect_status": 400}
+{"id": "DiscoverTuners", "method": "GET", "path": "/LiveTv/Tuners/Discover", "source": "contract: GET /LiveTv/Tuners/Discover"}
+{"id": "DiscvoverTuners", "method": "GET", "path": "/LiveTv/Tuners/Discvover", "source": "contract: GET /LiveTv/Tuners/Discvover"}
+{"id": "GetCountries", "method": "GET", "path": "/Localization/Countries", "source": "contract: GET /Localization/Countries"}
+{"id": "GetCultures", "method": "GET", "path": "/Localization/Cultures", "source": "contract: GET /Localization/Cultures"}
+{"id": "GetLocalizationOptions", "method": "GET", "path": "/Localization/Options", "source": "contract: GET /Localization/Options"}
+{"id": "GetParentalRatings", "method": "GET", "path": "/Localization/ParentalRatings", "source": "contract: GET /Localization/ParentalRatings"}
+{"id": "GetLyrics", "method": "GET", "path": "/Audio/{found.track}/Lyrics", "source": "contract: GET /Audio/{itemId}/Lyrics", "expect_status": 404}
+{"id": "UploadLyrics", "method": "POST", "path": "/Audio/{found.track}/Lyrics", "source": "contract: POST /Audio/{itemId}/Lyrics", "query": {"fileName": "parity.lrc"}, "expect_status": 400}
+{"id": "DeleteLyrics", "method": "DELETE", "path": "/Audio/{found.track}/Lyrics", "source": "contract: DELETE /Audio/{itemId}/Lyrics", "expect_status": 204}
+{"id": "SearchRemoteLyrics", "method": "GET", "path": "/Audio/{found.track}/RemoteSearch/Lyrics", "source": "contract: GET /Audio/{itemId}/RemoteSearch/Lyrics"}
+{"id": "DownloadRemoteLyrics", "method": "POST", "path": "/Audio/{found.track}/RemoteSearch/Lyrics/parity", "source": "contract: POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}", "expect_status": 404}
+{"id": "GetRemoteLyrics", "method": "GET", "path": "/Providers/Lyrics/parity", "source": "contract: GET /Providers/Lyrics/{lyricId}", "expect_status": 404}
+{"id": "GetPlaybackInfo", "method": "GET", "path": "/Items/{movie}/PlaybackInfo", "source": "contract: GET /Items/{itemId}/PlaybackInfo"}
+{"id": "GetPostedPlaybackInfo", "method": "POST", "path": "/Items/{movie}/PlaybackInfo", "source": "contract: POST /Items/{itemId}/PlaybackInfo", "body": {"UserId": "{user}", "MaxStreamingBitrate": 120000000}, "query": {"userId": "{user}"}}
+{"id": "CloseLiveStream", "method": "POST", "path": "/LiveStreams/Close", "source": "contract: POST /LiveStreams/Close", "query": {"liveStreamId": "parity"}, "expect_status": 204}
+{"id": "OpenLiveStream", "method": "POST", "path": "/LiveStreams/Open", "source": "contract: POST /LiveStreams/Open", "body": {}, "expect_status": 400}
+{"id": "GetBitrateTestBytes", "method": "GET", "path": "/Playback/BitrateTest", "source": "contract: GET /Playback/BitrateTest"}
+{"id": "GetItemSegments", "method": "GET", "path": "/MediaSegments/{movie}", "source": "contract: GET /MediaSegments/{itemId}"}
+{"id": "MergeEpisodesRequestAsync", "method": "POST", "path": "/MergeVersions/MergeEpisodes", "source": "contract: POST /MergeVersions/MergeEpisodes", "expect_status": 204, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "MergeMoviesRequest", "method": "POST", "path": "/MergeVersions/MergeMovies", "source": "contract: POST /MergeVersions/MergeMovies", "expect_status": 204, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "SplitEpisodesRequestAsync", "method": "POST", "path": "/MergeVersions/SplitEpisodes", "source": "contract: POST /MergeVersions/SplitEpisodes", "expect_status": 204, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "SplitMoviesRequest", "method": "POST", "path": "/MergeVersions/SplitMovies", "source": "contract: POST /MergeVersions/SplitMovies", "expect_status": 204, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetMovieRecommendations", "method": "GET", "path": "/Movies/Recommendations", "source": "contract: GET /Movies/Recommendations"}
+{"id": "GetMusicGenres", "method": "GET", "path": "/MusicGenres", "source": "contract: GET /MusicGenres"}
+{"id": "GetMusicGenre", "method": "GET", "path": "/MusicGenres/{found.music_genre}", "source": "contract: GET /MusicGenres/{genreName}"}
+{"id": "ValidateLoginInfo", "method": "POST", "path": "/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo", "source": "contract: POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo", "body": {}, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetPackages", "method": "GET", "path": "/Packages", "source": "contract: GET /Packages"}
+{"id": "GetPackageInfo", "method": "GET", "path": "/Packages/Intro Skipper", "source": "contract: GET /Packages/{name}", "expect_status": 404}
+{"id": "InstallPackage", "method": "POST", "path": "/Packages/Installed/Intro Skipper", "source": "contract: POST /Packages/Installed/{name}", "expect_status": 404}
+{"id": "CancelPackageInstallation", "method": "DELETE", "path": "/Packages/Installing/00000000000000000000000000000001", "source": "contract: DELETE /Packages/Installing/{packageId}", "expect_status": 204}
+{"id": "GetRepositories", "method": "GET", "path": "/Repositories", "source": "contract: GET /Repositories"}
+{"id": "SetRepositories", "method": "POST", "path": "/Repositories", "source": "contract: POST /Repositories", "body": [], "expect_status": 204}
+{"id": "GetPersons", "method": "GET", "path": "/Persons", "source": "contract: GET /Persons"}
+{"id": "GetPerson", "method": "GET", "path": "/Persons/{found.person}", "source": "contract: GET /Persons/{name}"}
+{"id": "CreatePlaylist", "method": "POST", "path": "/Playlists", "source": "contract: POST /Playlists", "body": {"Name": "Parity sweep", "Ids": ["{movie}", "{hdr_movie}"], "UserId": "{user}", "MediaType": "Video"}, "readbacks": [{"id": "GetInstantMixFromPlaylist", "path": "/Playlists/{write.Id}/InstantMix", "query": {"userId": "{user}", "limit": 20}, "source": "contract: GET /Playlists/{itemId}/InstantMix"}, {"id": "GetPlaylist", "path": "/Playlists/{write.Id}", "source": "contract: GET /Playlists/{playlistId}"}, {"id": "GetPlaylistItems", "path": "/Playlists/{write.Id}/Items", "query": {"userId": "{user}"}, "source": "contract: GET /Playlists/{playlistId}/Items"}, {"id": "GetPlaylistUsers", "path": "/Playlists/{write.Id}/Users", "source": "contract: GET /Playlists/{playlistId}/Users"}, {"id": "GetPlaylistUser", "path": "/Playlists/{write.Id}/Users/{user}", "source": "contract: GET /Playlists/{playlistId}/Users/{userId}"}]}
+{"id": "UpdatePlaylist", "method": "POST", "path": "/Playlists/{setup.playlist.Id}", "source": "contract: POST /Playlists/{playlistId}", "body": {"Name": "Parity sweep renamed"}, "expect_status": 204, "setup": [{"id": "playlist", "method": "POST", "path": "/Playlists", "body": {"Name": "Parity sweep", "Ids": ["{movie}", "{hdr_movie}"], "UserId": "{user}", "MediaType": "Video"}}]}
+{"id": "AddItemToPlaylist", "method": "POST", "path": "/Playlists/{setup.playlist.Id}/Items", "source": "contract: POST /Playlists/{playlistId}/Items", "expect_status": 204, "query": {"ids": "{hdr_movie}", "userId": "{user}"}, "setup": [{"id": "playlist", "method": "POST", "path": "/Playlists", "body": {"Name": "Parity sweep", "Ids": ["{movie}", "{hdr_movie}"], "UserId": "{user}", "MediaType": "Video"}}]}
+{"id": "RemoveItemFromPlaylist", "method": "DELETE", "path": "/Playlists/{setup.playlist.Id}/Items", "source": "contract: DELETE /Playlists/{playlistId}/Items", "expect_status": 204, "query": {"entryIds": "{movie}"}, "setup": [{"id": "playlist", "method": "POST", "path": "/Playlists", "body": {"Name": "Parity sweep", "Ids": ["{movie}", "{hdr_movie}"], "UserId": "{user}", "MediaType": "Video"}}]}
+{"id": "MoveItem", "method": "POST", "path": "/Playlists/{setup.playlist.Id}/Items/{movie}/Move/1", "source": "contract: POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}", "expect_status": 204, "setup": [{"id": "playlist", "method": "POST", "path": "/Playlists", "body": {"Name": "Parity sweep", "Ids": ["{movie}", "{hdr_movie}"], "UserId": "{user}", "MediaType": "Video"}}]}
+{"id": "UpdatePlaylistUser", "method": "POST", "path": "/Playlists/{setup.playlist.Id}/Users/{viewer}", "source": "contract: POST /Playlists/{playlistId}/Users/{userId}", "body": {"CanEdit": true}, "expect_status": 204, "setup": [{"id": "playlist", "method": "POST", "path": "/Playlists", "body": {"Name": "Parity sweep", "Ids": ["{movie}", "{hdr_movie}"], "UserId": "{user}", "MediaType": "Video"}}]}
+{"id": "RemoveUserFromPlaylist", "method": "DELETE", "path": "/Playlists/{setup.playlist.Id}/Users/{viewer}", "source": "contract: DELETE /Playlists/{playlistId}/Users/{userId}", "expect_status": 204, "setup": [{"id": "playlist", "method": "POST", "path": "/Playlists", "body": {"Name": "Parity sweep", "Ids": ["{movie}", "{hdr_movie}"], "UserId": "{user}", "MediaType": "Video"}}, {"id": "share", "method": "POST", "path": "/Playlists/{setup.playlist.Id}/Users/{viewer}", "body": {"CanEdit": false}, "expect_status": 204}]}
+{"id": "OnPlaybackStart", "method": "POST", "path": "/PlayingItems/{movie}", "source": "contract: POST /PlayingItems/{itemId}", "expect_status": 204}
+{"id": "OnPlaybackStopped", "method": "DELETE", "path": "/PlayingItems/{movie}", "source": "contract: DELETE /PlayingItems/{itemId}", "expect_status": 204}
+{"id": "OnPlaybackProgress", "method": "POST", "path": "/PlayingItems/{movie}/Progress", "source": "contract: POST /PlayingItems/{itemId}/Progress", "expect_status": 204}
+{"id": "ReportPlaybackStart", "method": "POST", "path": "/Sessions/Playing", "source": "contract: POST /Sessions/Playing", "body": {"ItemId": "{movie}", "PlaySessionId": "parity", "PositionTicks": 0, "CanSeek": true, "PlayMethod": "DirectPlay"}, "expect_status": 204}
+{"id": "PingPlaybackSession", "method": "POST", "path": "/Sessions/Playing/Ping", "source": "contract: POST /Sessions/Playing/Ping", "query": {"playSessionId": "parity"}, "expect_status": 204}
+{"id": "ReportPlaybackProgress", "method": "POST", "path": "/Sessions/Playing/Progress", "source": "contract: POST /Sessions/Playing/Progress", "body": {"ItemId": "{movie}", "PlaySessionId": "parity", "PositionTicks": 100000000, "CanSeek": true, "PlayMethod": "DirectPlay"}, "expect_status": 204}
+{"id": "ReportPlaybackStopped", "method": "POST", "path": "/Sessions/Playing/Stopped", "source": "contract: POST /Sessions/Playing/Stopped", "body": {"ItemId": "{movie}", "PlaySessionId": "parity", "PositionTicks": 100000000}, "expect_status": 204}
+{"id": "MarkPlayedItem", "method": "POST", "path": "/UserPlayedItems/{movie}", "source": "contract: POST /UserPlayedItems/{itemId}"}
+{"id": "MarkUnplayedItem", "method": "DELETE", "path": "/UserPlayedItems/{movie}", "source": "contract: DELETE /UserPlayedItems/{itemId}"}
+{"id": "GetPlugins", "method": "GET", "path": "/Plugins", "source": "contract: GET /Plugins"}
+{"id": "UninstallPlugin", "method": "DELETE", "path": "/Plugins/00000000000000000000000000000001", "source": "contract: DELETE /Plugins/{pluginId}", "expect_status": 404}
+{"id": "UninstallPluginByVersion", "method": "DELETE", "path": "/Plugins/00000000000000000000000000000001/1.0.0.0", "source": "contract: DELETE /Plugins/{pluginId}/{version}", "expect_status": 404}
+{"id": "DisablePlugin", "method": "POST", "path": "/Plugins/00000000000000000000000000000001/1.0.0.0/Disable", "source": "contract: POST /Plugins/{pluginId}/{version}/Disable", "expect_status": 404}
+{"id": "EnablePlugin", "method": "POST", "path": "/Plugins/00000000000000000000000000000001/1.0.0.0/Enable", "source": "contract: POST /Plugins/{pluginId}/{version}/Enable", "expect_status": 404}
+{"id": "GetPluginImage", "method": "GET", "path": "/Plugins/00000000000000000000000000000001/1.0.0.0/Image", "source": "contract: GET /Plugins/{pluginId}/{version}/Image", "expect_status": 404}
+{"id": "GetPluginConfiguration", "method": "GET", "path": "/Plugins/00000000000000000000000000000001/Configuration", "source": "contract: GET /Plugins/{pluginId}/Configuration", "expect_status": 404}
+{"id": "UpdatePluginConfiguration", "method": "POST", "path": "/Plugins/00000000000000000000000000000001/Configuration", "source": "contract: POST /Plugins/{pluginId}/Configuration", "expect_status": 404}
+{"id": "GetPluginManifest", "method": "POST", "path": "/Plugins/00000000000000000000000000000001/Manifest", "source": "contract: POST /Plugins/{pluginId}/Manifest", "expect_status": 404}
+{"id": "AuthorizeQuickConnect", "method": "POST", "path": "/QuickConnect/Authorize", "source": "contract: POST /QuickConnect/Authorize", "query": {"code": "000000"}, "expect_status": 404}
+{"id": "GetQuickConnectState", "method": "GET", "path": "/QuickConnect/Connect", "source": "contract: GET /QuickConnect/Connect", "query": {"secret": "parity"}, "expect_status": 404}
+{"id": "GetQuickConnectEnabled", "method": "GET", "path": "/QuickConnect/Enabled", "source": "contract: GET /QuickConnect/Enabled"}
+{"id": "InitiateQuickConnect", "method": "POST", "path": "/QuickConnect/Initiate", "source": "contract: POST /QuickConnect/Initiate"}
+{"id": "GetRemoteImages", "method": "GET", "path": "/Items/{movie}/RemoteImages", "source": "contract: GET /Items/{itemId}/RemoteImages"}
+{"id": "DownloadRemoteImage", "method": "POST", "path": "/Items/{movie}/RemoteImages/Download", "source": "contract: POST /Items/{itemId}/RemoteImages/Download", "query": {"type": "Primary"}, "expect_status": 400}
+{"id": "GetRemoteImageProviders", "method": "GET", "path": "/Items/{movie}/RemoteImages/Providers", "source": "contract: GET /Items/{itemId}/RemoteImages/Providers"}
+{"id": "GetTasks", "method": "GET", "path": "/ScheduledTasks", "source": "contract: GET /ScheduledTasks"}
+{"id": "GetTask", "method": "GET", "path": "/ScheduledTasks/{found.task}", "source": "contract: GET /ScheduledTasks/{taskId}"}
+{"id": "UpdateTask", "method": "POST", "path": "/ScheduledTasks/{found.task}/Triggers", "source": "contract: POST /ScheduledTasks/{taskId}/Triggers", "body": [], "expect_status": 204}
+{"id": "StartTask", "method": "POST", "path": "/ScheduledTasks/Running/{found.task}", "source": "contract: POST /ScheduledTasks/Running/{taskId}", "expect_status": 204}
+{"id": "StopTask", "method": "DELETE", "path": "/ScheduledTasks/Running/{found.task}", "source": "contract: DELETE /ScheduledTasks/Running/{taskId}", "expect_status": 204, "setup": [{"id": "start", "method": "POST", "path": "/ScheduledTasks/Running/{found.task}", "expect_status": 204}], "oracle_trap": "Jellyfin 12.2 answers 500 when the task has already finished by the time it is stopped"}
+{"id": "GetSearchHints", "method": "GET", "path": "/Search/Hints", "source": "contract: GET /Search/Hints", "query": {"searchTerm": "{found.term}"}}
+{"id": "GetPluginMetadata", "method": "GET", "path": "/MediaSegmentsApi", "source": "contract: GET /MediaSegmentsApi", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "CreateSegmentAsync", "method": "POST", "path": "/MediaSegmentsApi/{movie}", "source": "contract: POST /MediaSegmentsApi/{itemId}", "query": {"providerId": "parity"}, "body": {}, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "DeleteSegmentAsync", "method": "DELETE", "path": "/MediaSegmentsApi/0", "source": "contract: DELETE /MediaSegmentsApi/{segmentId}", "query": {"itemId": "{movie}", "type": "Primary"}, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetPasswordResetProviders", "method": "GET", "path": "/Auth/PasswordResetProviders", "source": "contract: GET /Auth/PasswordResetProviders"}
+{"id": "GetAuthProviders", "method": "GET", "path": "/Auth/Providers", "source": "contract: GET /Auth/Providers"}
+{"id": "GetSessions", "method": "GET", "path": "/Sessions", "source": "contract: GET /Sessions"}
+{"id": "SendFullGeneralCommand", "method": "POST", "path": "/Sessions/{setup.session.0.Id}/Command", "source": "contract: POST /Sessions/{sessionId}/Command", "body": {"Name": "DisplayMessage", "Arguments": {"Header": "Parity", "Text": "sweep"}}, "expect_status": 204, "setup": [{"id": "session", "method": "GET", "path": "/Sessions", "query": {"deviceId": "parity"}}]}
+{"id": "SendGeneralCommand", "method": "POST", "path": "/Sessions/{setup.session.0.Id}/Command/DisplayMessage", "source": "contract: POST /Sessions/{sessionId}/Command/{command}", "expect_status": 204, "setup": [{"id": "session", "method": "GET", "path": "/Sessions", "query": {"deviceId": "parity"}}]}
+{"id": "SendMessageCommand", "method": "POST", "path": "/Sessions/{setup.session.0.Id}/Message", "source": "contract: POST /Sessions/{sessionId}/Message", "body": {"Header": "Parity", "Text": "sweep", "TimeoutMs": 1000}, "expect_status": 204, "setup": [{"id": "session", "method": "GET", "path": "/Sessions", "query": {"deviceId": "parity"}}]}
+{"id": "Play", "method": "POST", "path": "/Sessions/{setup.session.0.Id}/Playing", "source": "contract: POST /Sessions/{sessionId}/Playing", "query": {"playCommand": "PlayNow", "itemIds": "{movie}"}, "expect_status": 204, "setup": [{"id": "session", "method": "GET", "path": "/Sessions", "query": {"deviceId": "parity"}}]}
+{"id": "SendPlaystateCommand", "method": "POST", "path": "/Sessions/{setup.session.0.Id}/Playing/Pause", "source": "contract: POST /Sessions/{sessionId}/Playing/{command}", "expect_status": 204, "setup": [{"id": "session", "method": "GET", "path": "/Sessions", "query": {"deviceId": "parity"}}]}
+{"id": "SendSystemCommand", "method": "POST", "path": "/Sessions/{setup.session.0.Id}/System/GoHome", "source": "contract: POST /Sessions/{sessionId}/System/{command}", "expect_status": 204, "setup": [{"id": "session", "method": "GET", "path": "/Sessions", "query": {"deviceId": "parity"}}]}
+{"id": "AddUserToSession", "method": "POST", "path": "/Sessions/{setup.session.0.Id}/User/{viewer}", "source": "contract: POST /Sessions/{sessionId}/User/{userId}", "expect_status": 204, "setup": [{"id": "session", "method": "GET", "path": "/Sessions", "query": {"deviceId": "parity"}}]}
+{"id": "RemoveUserFromSession", "method": "DELETE", "path": "/Sessions/{setup.session.0.Id}/User/{viewer}", "source": "contract: DELETE /Sessions/{sessionId}/User/{userId}", "expect_status": 204, "setup": [{"id": "session", "method": "GET", "path": "/Sessions", "query": {"deviceId": "parity"}}]}
+{"id": "DisplayContent", "method": "POST", "path": "/Sessions/{setup.session.0.Id}/Viewing", "source": "contract: POST /Sessions/{sessionId}/Viewing", "query": {"itemType": "Movie", "itemId": "{movie}", "itemName": "parity"}, "expect_status": 204, "setup": [{"id": "session", "method": "GET", "path": "/Sessions", "query": {"deviceId": "parity"}}]}
+{"id": "PostCapabilities", "method": "POST", "path": "/Sessions/Capabilities", "source": "contract: POST /Sessions/Capabilities", "expect_status": 204}
+{"id": "PostFullCapabilities", "method": "POST", "path": "/Sessions/Capabilities/Full", "source": "contract: POST /Sessions/Capabilities/Full", "body": {"PlayableMediaTypes": ["Video", "Audio"], "SupportedCommands": ["DisplayMessage"], "SupportsMediaControl": true}, "expect_status": 204}
+{"id": "ReportSessionEnded", "method": "POST", "path": "/Sessions/Logout", "source": "contract: POST /Sessions/Logout", "expect_status": 204}
+{"id": "ReportViewing", "method": "POST", "path": "/Sessions/Viewing", "source": "contract: POST /Sessions/Viewing", "query": {"itemId": "{movie}"}, "expect_status": 204}
+{"id": "InjectCss", "method": "POST", "path": "/SkipButtonCss/InjectCss", "source": "contract: POST /SkipButtonCss/InjectCss", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "UpdateSkipDuration", "method": "POST", "path": "/SkipButtonCss/UpdateSkipDuration", "source": "contract: POST /SkipButtonCss/UpdateSkipDuration", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetSkippableSegments", "method": "GET", "path": "/Episode/{episode}/IntroSkipperSegments", "source": "contract: GET /Episode/{id}/IntroSkipperSegments", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "UpdateTimestampsAsync", "method": "POST", "path": "/Episode/{episode}/Timestamps", "source": "contract: POST /Episode/{Id}/Timestamps", "body": {}, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetTimestamps", "method": "GET", "path": "/Episode/{episode}/Timestamps", "source": "contract: GET /Episode/{Id}/Timestamps", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "ResetIntroTimestamps", "method": "POST", "path": "/Intros/EraseTimestamps", "source": "contract: POST /Intros/EraseTimestamps", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "RebuildDatabase", "method": "POST", "path": "/Intros/RebuildDatabase", "source": "contract: POST /Intros/RebuildDatabase", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "CompleteWizard", "method": "POST", "path": "/Startup/Complete", "source": "contract: POST /Startup/Complete", "expect_status": 204}
+{"id": "GetStartupConfiguration", "method": "GET", "path": "/Startup/Configuration", "source": "contract: GET /Startup/Configuration"}
+{"id": "UpdateInitialConfiguration", "method": "POST", "path": "/Startup/Configuration", "source": "contract: POST /Startup/Configuration", "body": {}, "expect_status": 204}
+{"id": "GetFirstUser_2", "method": "GET", "path": "/Startup/FirstUser", "source": "contract: GET /Startup/FirstUser"}
+{"id": "SetRemoteAccess", "method": "POST", "path": "/Startup/RemoteAccess", "source": "contract: POST /Startup/RemoteAccess", "body": {}, "expect_status": 204}
+{"id": "GetFirstUser", "method": "GET", "path": "/Startup/User", "source": "contract: GET /Startup/User"}
+{"id": "UpdateStartupUser", "method": "POST", "path": "/Startup/User", "source": "contract: POST /Startup/User", "body": {}, "expect_status": 403}
+{"id": "GetStudios", "method": "GET", "path": "/Studios", "source": "contract: GET /Studios"}
+{"id": "GetStudio", "method": "GET", "path": "/Studios/{found.studio}", "source": "contract: GET /Studios/{name}"}
+{"id": "GetFallbackFontList", "method": "GET", "path": "/FallbackFont/Fonts", "source": "contract: GET /FallbackFont/Fonts"}
+{"id": "GetFallbackFont", "method": "GET", "path": "/FallbackFont/Fonts/parity.ttf", "source": "contract: GET /FallbackFont/Fonts/{name}"}
+{"id": "SearchRemoteSubtitles", "method": "GET", "path": "/Items/{movie}/RemoteSearch/Subtitles/eng", "source": "contract: GET /Items/{itemId}/RemoteSearch/Subtitles/{language}"}
+{"id": "DownloadRemoteSubtitles", "method": "POST", "path": "/Items/{movie}/RemoteSearch/Subtitles/parity", "source": "contract: POST /Items/{itemId}/RemoteSearch/Subtitles/{subtitleId}", "expect_status": 204}
+{"id": "GetRemoteSubtitles", "method": "GET", "path": "/Providers/Subtitles/Subtitles/parity", "source": "contract: GET /Providers/Subtitles/Subtitles/{subtitleId}", "oracle_trap": "a remote subtitle provider: needs an OpenSubtitles account and the internet"}
+{"id": "GetSubtitlePlaylist", "method": "GET", "path": "/Videos/{movie}/{movie}/Subtitles/0/subtitles.m3u8", "source": "contract: GET /Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/subtitles.m3u8", "query": {"segmentLength": 3}}
+{"id": "UploadSubtitle", "method": "POST", "path": "/Videos/{movie}/Subtitles", "source": "contract: POST /Videos/{itemId}/Subtitles", "body": {"Language": "eng", "Format": "srt", "IsForced": false, "IsHearingImpaired": false, "Data": "MQ0KMDA6MDA6MDEsMDAwIC0tPiAwMDowMDowMiwwMDANClBhcml0eQ0K"}, "expect_status": 500}
+{"id": "DeleteSubtitle", "method": "DELETE", "path": "/Videos/{movie}/Subtitles/0", "source": "contract: DELETE /Videos/{itemId}/Subtitles/{index}", "expect_status": 204}
+{"id": "GetSubtitleWithTicks", "method": "GET", "path": "/Videos/{movie}/{movie}/Subtitles/0/0/Stream.vtt", "source": "contract: GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/{routeStartPositionTicks}/Stream.{routeFormat}", "oracle_trap": "the corpus movie's stream 0 is not a subtitle; Jellyfin 12.2 answers 500"}
+{"id": "GetSubtitle", "method": "GET", "path": "/Videos/{movie}/{movie}/Subtitles/0/Stream.vtt", "source": "contract: GET /Videos/{routeItemId}/{routeMediaSourceId}/Subtitles/{routeIndex}/Stream.{routeFormat}", "oracle_trap": "the corpus movie's stream 0 is not a subtitle; Jellyfin 12.2 answers 500"}
+{"id": "GetSuggestions", "method": "GET", "path": "/Items/Suggestions", "source": "contract: GET /Items/Suggestions", "oracle_trap": "Jellyfin 12.2's /Items/Suggestions outlasts the request timeout on this corpus"}
+{"id": "SyncPlayGetGroup", "method": "GET", "path": "/SyncPlay/{episode}", "source": "contract: GET /SyncPlay/{id}", "expect_status": 404}
+{"id": "SyncPlayBuffering", "method": "POST", "path": "/SyncPlay/Buffering", "source": "contract: POST /SyncPlay/Buffering", "body": {}, "expect_status": 204}
+{"id": "SyncPlayJoinGroup", "method": "POST", "path": "/SyncPlay/Join", "source": "contract: POST /SyncPlay/Join", "body": {}, "expect_status": 204}
+{"id": "SyncPlayLeaveGroup", "method": "POST", "path": "/SyncPlay/Leave", "source": "contract: POST /SyncPlay/Leave", "expect_status": 204}
+{"id": "SyncPlayGetGroups", "method": "GET", "path": "/SyncPlay/List", "source": "contract: GET /SyncPlay/List"}
+{"id": "SyncPlayMovePlaylistItem", "method": "POST", "path": "/SyncPlay/MovePlaylistItem", "source": "contract: POST /SyncPlay/MovePlaylistItem", "body": {}, "expect_status": 204}
+{"id": "SyncPlayCreateGroup", "method": "POST", "path": "/SyncPlay/New", "source": "contract: POST /SyncPlay/New", "body": {}}
+{"id": "SyncPlayNextItem", "method": "POST", "path": "/SyncPlay/NextItem", "source": "contract: POST /SyncPlay/NextItem", "body": {}, "expect_status": 204}
+{"id": "SyncPlayPause", "method": "POST", "path": "/SyncPlay/Pause", "source": "contract: POST /SyncPlay/Pause", "expect_status": 204}
+{"id": "SyncPlayPing", "method": "POST", "path": "/SyncPlay/Ping", "source": "contract: POST /SyncPlay/Ping", "body": {}, "expect_status": 204}
+{"id": "SyncPlayPreviousItem", "method": "POST", "path": "/SyncPlay/PreviousItem", "source": "contract: POST /SyncPlay/PreviousItem", "body": {}, "expect_status": 204}
+{"id": "SyncPlayQueue", "method": "POST", "path": "/SyncPlay/Queue", "source": "contract: POST /SyncPlay/Queue", "body": {}, "expect_status": 204}
+{"id": "SyncPlayReady", "method": "POST", "path": "/SyncPlay/Ready", "source": "contract: POST /SyncPlay/Ready", "body": {}, "expect_status": 204}
+{"id": "SyncPlayRemoveFromPlaylist", "method": "POST", "path": "/SyncPlay/RemoveFromPlaylist", "source": "contract: POST /SyncPlay/RemoveFromPlaylist", "body": {}, "expect_status": 204}
+{"id": "SyncPlaySeek", "method": "POST", "path": "/SyncPlay/Seek", "source": "contract: POST /SyncPlay/Seek", "body": {}, "expect_status": 204}
+{"id": "SyncPlaySetIgnoreWait", "method": "POST", "path": "/SyncPlay/SetIgnoreWait", "source": "contract: POST /SyncPlay/SetIgnoreWait", "body": {}, "expect_status": 204}
+{"id": "SyncPlaySetNewQueue", "method": "POST", "path": "/SyncPlay/SetNewQueue", "source": "contract: POST /SyncPlay/SetNewQueue", "body": {}, "expect_status": 204}
+{"id": "SyncPlaySetPlaylistItem", "method": "POST", "path": "/SyncPlay/SetPlaylistItem", "source": "contract: POST /SyncPlay/SetPlaylistItem", "body": {}, "expect_status": 204}
+{"id": "SyncPlaySetRepeatMode", "method": "POST", "path": "/SyncPlay/SetRepeatMode", "source": "contract: POST /SyncPlay/SetRepeatMode", "body": {}, "expect_status": 204}
+{"id": "SyncPlaySetShuffleMode", "method": "POST", "path": "/SyncPlay/SetShuffleMode", "source": "contract: POST /SyncPlay/SetShuffleMode", "body": {}, "expect_status": 204}
+{"id": "SyncPlayStop", "method": "POST", "path": "/SyncPlay/Stop", "source": "contract: POST /SyncPlay/Stop", "expect_status": 204}
+{"id": "SyncPlayUnpause", "method": "POST", "path": "/SyncPlay/Unpause", "source": "contract: POST /SyncPlay/Unpause", "expect_status": 204}
+{"id": "GetEndpointInfo", "method": "GET", "path": "/System/Endpoint", "source": "contract: GET /System/Endpoint"}
+{"id": "GetSystemInfo", "method": "GET", "path": "/System/Info", "source": "contract: GET /System/Info"}
+{"id": "GetPublicSystemInfo", "method": "GET", "path": "/System/Info/Public", "source": "contract: GET /System/Info/Public"}
+{"id": "GetSystemStorage", "method": "GET", "path": "/System/Info/Storage", "source": "contract: GET /System/Info/Storage"}
+{"id": "GetServerLogs", "method": "GET", "path": "/System/Logs", "source": "contract: GET /System/Logs"}
+{"id": "GetLogFile", "method": "GET", "path": "/System/Logs/Log", "source": "contract: GET /System/Logs/Log", "query": {"name": "{found.log}"}}
+{"id": "GetPingSystem", "method": "GET", "path": "/System/Ping", "source": "contract: GET /System/Ping"}
+{"id": "PostPingSystem", "method": "POST", "path": "/System/Ping", "source": "contract: POST /System/Ping"}
+{"id": "RestartApplication", "method": "POST", "path": "/System/Restart", "source": "contract: POST /System/Restart", "expect_status": 204}
+{"id": "ShutdownApplication", "method": "POST", "path": "/System/Shutdown", "source": "contract: POST /System/Shutdown", "expect_status": 204}
+{"id": "GetUtcTime", "method": "GET", "path": "/GetUtcTime", "source": "contract: GET /GetUtcTime"}
+{"id": "TmdbClientConfiguration", "method": "GET", "path": "/Tmdb/ClientConfiguration", "source": "contract: GET /Tmdb/ClientConfiguration"}
+{"id": "GetTrailers", "method": "GET", "path": "/Trailers", "source": "contract: GET /Trailers", "oracle_trap": "Jellyfin 12.2 answers /Trailers with 500 on this corpus, which has no trailers"}
+{"id": "GetTrickplayTileImage", "method": "GET", "path": "/Videos/{movie}/Trickplay/320/0.jpg", "source": "contract: GET /Videos/{itemId}/Trickplay/{width}/{index}.jpg", "expect_status": 404}
+{"id": "GetTrickplayHlsPlaylist", "method": "GET", "path": "/Videos/{movie}/Trickplay/320/tiles.m3u8", "source": "contract: GET /Videos/{itemId}/Trickplay/{width}/tiles.m3u8", "expect_status": 404}
+{"id": "GetPluginMetadata_Introskipper", "method": "GET", "path": "/IntroSkipper", "source": "contract: GET /IntroSkipper", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetSupportBundle", "method": "GET", "path": "/IntroSkipper/SupportBundle", "source": "contract: GET /IntroSkipper/SupportBundle", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetEpisodes", "method": "GET", "path": "/Shows/{series}/Episodes", "source": "contract: GET /Shows/{seriesId}/Episodes"}
+{"id": "GetSeasons", "method": "GET", "path": "/Shows/{series}/Seasons", "source": "contract: GET /Shows/{seriesId}/Seasons"}
+{"id": "GetNextUp", "method": "GET", "path": "/Shows/NextUp", "source": "contract: GET /Shows/NextUp"}
+{"id": "GetUpcomingEpisodes", "method": "GET", "path": "/Shows/Upcoming", "source": "contract: GET /Shows/Upcoming"}
+{"id": "GetUniversalAudioStream", "method": "GET", "path": "/Audio/{found.track}/universal", "source": "contract: GET /Audio/{itemId}/universal", "oracle_trap": "Jellyfin 12.2 answers 500 to the universal audio stream without a device profile's parameters"}
+{"id": "HeadUniversalAudioStream", "method": "HEAD", "path": "/Audio/{found.track}/universal", "source": "contract: HEAD /Audio/{itemId}/universal"}
+{"id": "GetUsers", "method": "GET", "path": "/Users", "source": "contract: GET /Users"}
+{"id": "UpdateUser", "method": "POST", "path": "/Users", "source": "contract: POST /Users", "body": {"Id": "{viewer}", "Name": "viewer", "Policy": {"AuthenticationProviderId": "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider", "PasswordResetProviderId": "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider"}}, "expect_status": 204, "query": {"userId": "{viewer}"}}
+{"id": "GetUserById", "method": "GET", "path": "/Users/{user}", "source": "contract: GET /Users/{userId}"}
+{"id": "DeleteUser", "method": "DELETE", "path": "/Users/{viewer}", "source": "contract: DELETE /Users/{userId}", "expect_status": 204}
+{"id": "UpdateUserPolicy", "method": "POST", "path": "/Users/{viewer}/Policy", "source": "contract: POST /Users/{userId}/Policy", "body": {"AuthenticationProviderId": "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider", "PasswordResetProviderId": "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider", "IsAdministrator": false, "EnableAllFolders": true}, "expect_status": 204}
+{"id": "AuthenticateUserByName", "method": "POST", "path": "/Users/AuthenticateByName", "source": "contract: POST /Users/AuthenticateByName", "body": {"Username": "{user_name}", "Pw": "{password}"}}
+{"id": "AuthenticateWithQuickConnect", "method": "POST", "path": "/Users/AuthenticateWithQuickConnect", "source": "contract: POST /Users/AuthenticateWithQuickConnect", "body": {"Secret": "parity"}, "expect_status": 404}
+{"id": "UpdateUserConfiguration", "method": "POST", "path": "/Users/Configuration", "source": "contract: POST /Users/Configuration", "body": {"PlayDefaultAudioTrack": true, "SubtitleMode": "Default", "OrderedViews": [], "LatestItemsExcludes": [], "MyMediaExcludes": []}, "expect_status": 204, "query": {"userId": "{user}"}}
+{"id": "ForgotPassword", "method": "POST", "path": "/Users/ForgotPassword", "source": "contract: POST /Users/ForgotPassword", "body": {"EnteredUsername": "nobody"}}
+{"id": "ForgotPasswordPin", "method": "POST", "path": "/Users/ForgotPassword/Pin", "source": "contract: POST /Users/ForgotPassword/Pin", "body": {"Pin": "0000"}, "expect_status": 404}
+{"id": "GetCurrentUser", "method": "GET", "path": "/Users/Me", "source": "contract: GET /Users/Me"}
+{"id": "CreateUserByName", "method": "POST", "path": "/Users/New", "source": "contract: POST /Users/New", "body": {"Name": "parity-user", "Password": "parity"}}
+{"id": "UpdateUserPassword", "method": "POST", "path": "/Users/Password", "source": "contract: POST /Users/Password", "body": {"CurrentPw": "", "NewPw": "parity"}, "expect_status": 204, "query": {"userId": "{viewer}"}}
+{"id": "GetPublicUsers", "method": "GET", "path": "/Users/Public", "source": "contract: GET /Users/Public"}
+{"id": "GetIntros", "method": "GET", "path": "/Items/{movie}/Intros", "source": "contract: GET /Items/{itemId}/Intros"}
+{"id": "GetLocalTrailers", "method": "GET", "path": "/Items/{movie}/LocalTrailers", "source": "contract: GET /Items/{itemId}/LocalTrailers"}
+{"id": "GetSpecialFeatures", "method": "GET", "path": "/Items/{movie}/SpecialFeatures", "source": "contract: GET /Items/{itemId}/SpecialFeatures"}
+{"id": "GetLatestMedia", "method": "GET", "path": "/Items/Latest", "source": "contract: GET /Items/Latest"}
+{"id": "GetRootFolder", "method": "GET", "path": "/Items/Root", "source": "contract: GET /Items/Root"}
+{"id": "MarkFavoriteItem", "method": "POST", "path": "/UserFavoriteItems/{movie}", "source": "contract: POST /UserFavoriteItems/{itemId}"}
+{"id": "UnmarkFavoriteItem", "method": "DELETE", "path": "/UserFavoriteItems/{movie}", "source": "contract: DELETE /UserFavoriteItems/{itemId}"}
+{"id": "DeleteUserItemRating", "method": "DELETE", "path": "/UserItems/{movie}/Rating", "source": "contract: DELETE /UserItems/{itemId}/Rating"}
+{"id": "UpdateUserItemRating", "method": "POST", "path": "/UserItems/{movie}/Rating", "source": "contract: POST /UserItems/{itemId}/Rating", "query": {"likes": true}}
+{"id": "GetUserViews", "method": "GET", "path": "/UserViews", "source": "contract: GET /UserViews"}
+{"id": "GetGroupingOptions", "method": "GET", "path": "/UserViews/GroupingOptions", "source": "contract: GET /UserViews/GroupingOptions"}
+{"id": "GetAttachment", "method": "GET", "path": "/Videos/{movie}/{movie}/Attachments/0", "source": "contract: GET /Videos/{videoId}/{mediaSourceId}/Attachments/{index}", "expect_status": 404}
+{"id": "GetAdditionalPart", "method": "GET", "path": "/Videos/{movie}/AdditionalParts", "source": "contract: GET /Videos/{itemId}/AdditionalParts"}
+{"id": "DeleteAlternateSources", "method": "DELETE", "path": "/Videos/{movie}/AlternateSources", "source": "contract: DELETE /Videos/{itemId}/AlternateSources", "expect_status": 204}
+{"id": "GetVideoStream", "method": "GET", "path": "/Videos/{movie}/stream", "source": "contract: GET /Videos/{itemId}/stream"}
+{"id": "HeadVideoStream", "method": "HEAD", "path": "/Videos/{movie}/stream", "source": "contract: HEAD /Videos/{itemId}/stream"}
+{"id": "GetVideoStreamByContainer", "method": "GET", "path": "/Videos/{movie}/stream.mkv", "source": "contract: GET /Videos/{itemId}/stream.{container}"}
+{"id": "HeadVideoStreamByContainer", "method": "HEAD", "path": "/Videos/{movie}/stream.mkv", "source": "contract: HEAD /Videos/{itemId}/stream.{container}"}
+{"id": "MergeVersions", "method": "POST", "path": "/Videos/MergeVersions", "source": "contract: POST /Videos/MergeVersions", "query": {"ids": "{movie},{hdr_movie}"}, "expect_status": 204}
+{"id": "GetAnalyzerAction", "method": "GET", "path": "/Intros/AnalyzerActions/{season}", "source": "contract: GET /Intros/AnalyzerActions/{SeasonId}", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "UpdateAnalyzerActions", "method": "POST", "path": "/Intros/AnalyzerActions/UpdateSeason", "source": "contract: POST /Intros/AnalyzerActions/UpdateSeason", "body": {}, "expect_status": 204, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "ScanSeason", "method": "POST", "path": "/Intros/ScanSeason/{series}/{season}", "source": "contract: POST /Intros/ScanSeason/{SeriesId}/{SeasonId}", "expect_status": 202, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetScanStatus", "method": "GET", "path": "/Intros/ScanStatus", "source": "contract: GET /Intros/ScanStatus", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetSeasonEpisodes", "method": "GET", "path": "/Intros/Show/{series}/{season}", "source": "contract: GET /Intros/Show/{SeriesId}/{SeasonId}", "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "EraseSeasonAsync", "method": "DELETE", "path": "/Intros/Show/{series}/{season}", "source": "contract: DELETE /Intros/Show/{SeriesId}/{SeasonId}", "expect_status": 204, "oracle_trap": "a plugin's route: the oracle runs with its plugins disabled"}
+{"id": "GetYears", "method": "GET", "path": "/Years", "source": "contract: GET /Years", "oracle_trap": "Jellyfin's /Years fails or stalls on large libraries"}
+{"id": "GetYear", "method": "GET", "path": "/Years/2003", "source": "contract: GET /Years/{year}"}

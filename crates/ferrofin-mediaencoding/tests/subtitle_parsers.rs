@@ -1,6 +1,8 @@
 //! Transliteration of `Jellyfin.MediaEncoding.Subtitles.Tests`
 //! `SrtParserTests` / `SsaParserTests` / `AssParserTests`. Expected values are
 //! the C# oracle verbatim (ticks are `TimeSpan.Parse(...).Ticks`).
+// libse keeps times as `double`s; the WebVTT cases below are exact in one.
+#![allow(clippy::float_cmp)]
 
 use ferrofin_mediaencoding::subtitles::{SubtitleEditParser, SubtitleParser};
 
@@ -210,14 +212,42 @@ fn vtt_x_timestamp_map_shifts_every_cue() {
         "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n00:00:16.360 --> 00:00:20.840\nLine1\n\n00:00:30.000 --> 00:00:35.000\nLine2",
     );
     assert_eq!(parsed.paragraphs[0].text, "Line1");
-    assert_eq!(parsed.paragraphs[0].start_time.total_milliseconds(), 26_360);
-    assert_eq!(parsed.paragraphs[0].end_time.total_milliseconds(), 30_840);
-    assert_eq!(parsed.paragraphs[1].start_time.total_milliseconds(), 40_000);
+    assert_eq!(
+        parsed.paragraphs[0].start_time.total_milliseconds(),
+        26_360.0
+    );
+    assert_eq!(parsed.paragraphs[0].end_time.total_milliseconds(), 30_840.0);
+    assert_eq!(
+        parsed.paragraphs[1].start_time.total_milliseconds(),
+        40_000.0
+    );
     let parsed = vtt(
         "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:10.000\n\n00:00:16.360 --> 00:00:20.840\nLine1\n\n00:00:30.000 --> 00:00:35.000\nLine2",
     );
-    assert_eq!(parsed.paragraphs[0].start_time.total_milliseconds(), 16_360);
-    assert_eq!(parsed.paragraphs[1].start_time.total_milliseconds(), 30_000);
+    assert_eq!(
+        parsed.paragraphs[0].start_time.total_milliseconds(),
+        16_360.0
+    );
+    assert_eq!(
+        parsed.paragraphs[1].start_time.total_milliseconds(),
+        30_000.0
+    );
+}
+
+/// libse adds the `X-TIMESTAMP-MAP` shift to its `double` milliseconds
+/// (`TotalMilliseconds += addSeconds * 1000`), so a shift that is not a whole
+/// number of milliseconds is kept, and the writers read it back through
+/// `TimeSpan.FromMilliseconds`, which truncates.
+#[test]
+fn vtt_x_timestamp_map_keeps_a_sub_millisecond_shift() {
+    let parsed = vtt(
+        "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900009,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:02.000\nA",
+    );
+    let shift = 900_009.0 / 90_000.0 * 1000.0;
+    let cue = &parsed.paragraphs[0];
+    assert_eq!(cue.start_time.total_milliseconds(), 1_000.0 + shift);
+    assert_eq!(cue.end_time.total_milliseconds(), 2_000.0 + shift);
+    assert_eq!(cue.start_time.ticks(), 110_001_000);
 }
 
 /// The cue settings survive the load: `GetPositionInfo` turns `line`/`position`
@@ -232,22 +262,23 @@ fn vtt_keeps_cue_settings_regions_and_header() {
     assert_eq!(parsed.paragraphs.len(), 3);
     let first = &parsed.paragraphs[0];
     assert_eq!(first.text, "{\\an7}Top left");
-    assert_eq!(first.start_time.total_milliseconds(), 1_000);
-    assert_eq!(first.end_time.total_milliseconds(), 2_500);
-    assert_eq!(first.style, "line:10% align:start position:10%");
+    assert_eq!(first.start_time.total_milliseconds(), 1_000.0);
+    assert_eq!(first.end_time.total_milliseconds(), 2_500.0);
+    assert_eq!(
+        first.style.as_deref(),
+        Some("line:10% align:start position:10%")
+    );
     assert_eq!(first.region.as_deref(), Some("top"));
     assert_eq!(parsed.paragraphs[1].text, "{\\an3}Bottom right");
     assert_eq!(parsed.paragraphs[2].text, "Plain");
-    assert_eq!(parsed.paragraphs[2].style, "");
+    assert_eq!(parsed.paragraphs[2].style.as_deref(), Some(""));
     assert_eq!(parsed.paragraphs[2].region, None);
     assert_eq!(
-        parsed.header.as_deref(),
+        parsed.header,
         // `header.Replace(NewLine + NewLine, NewLine).Trim()`, one pass: the
         // blocks were joined by three or four line breaks, so one blank line
         // stays between them.
-        Some(
-            "WEBVTT - film\n\nSTYLE\n::cue { color: yellow }\n\nREGION\nid:top width:40%\n\nNOTE a comment"
-        )
+        "WEBVTT - film\n\nSTYLE\n::cue { color: yellow }\n\nREGION\nid:top width:40%\n\nNOTE a comment"
     );
 }
 
@@ -287,12 +318,12 @@ fn vtt_x_timestamp_map_edges() {
     let later = vtt(
         "WEBVTT\n\nX-TIMESTAMP-MAP=MPEGTS:180000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:02.000\nShifted",
     );
-    assert_eq!(later.paragraphs[0].start_time.total_milliseconds(), 3_000);
+    assert_eq!(later.paragraphs[0].start_time.total_milliseconds(), 3_000.0);
     let no_local =
         vtt("WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000\n\n00:00:01.000 --> 00:00:02.000\nShifted");
     assert_eq!(
         no_local.paragraphs[0].start_time.total_milliseconds(),
-        11_000
+        11_000.0
     );
     let bad = SubtitleEditParser::new().parse(
         b"WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00::00.000\n\n00:00:01.000 --> 00:00:02.000\nA",
@@ -311,5 +342,5 @@ fn vtt_crlf_and_a_style_block_leaked_into_a_cue() {
     );
     let texts: Vec<&str> = parsed.paragraphs.iter().map(|p| p.text.as_str()).collect();
     assert_eq!(texts, ["Hello there", "B"]);
-    assert_eq!(parsed.header.as_deref(), Some("WEBVTT"));
+    assert_eq!(parsed.header, "WEBVTT");
 }

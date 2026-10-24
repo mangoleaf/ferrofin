@@ -145,14 +145,17 @@ async fn update_initial_configuration(
 /// Port of `StartupController.SetRemoteAccess`: persists `EnableRemoteAccess`
 /// onto the `NetworkConfiguration` — and only that, as upstream does. Ferrofin
 /// keeps the config in the named-config store (`{config}/named/network.json`,
-/// the same file `GET/POST /System/Configuration/network` reads), so the wizard
-/// toggle actually takes effect rather than being dropped.
+/// the same file `GET/POST /System/Configuration/network` reads) and saves it
+/// through that route's save, so the toggle reaches the live network policy at
+/// once, as it does upstream.
 ///
 /// Note the shape: this reads the whole document, changes one field, and writes
 /// the whole document back. Every field therefore has to survive
 /// deserialization, or this handler quietly resets it — which is why
 /// `NetworkConfiguration` carries `#[serde(default)]` and aliases for the names
-/// older versions wrote.
+/// older versions wrote. The read happens before the save takes the
+/// configuration write lock, as upstream reads its cached configuration
+/// without one: a dashboard save landing in between can be undone by this one.
 #[utoipa::path(
     post,
     path = "/Startup/RemoteAccess",
@@ -202,22 +205,27 @@ async fn set_remote_access(
     };
     config.enable_remote_access = body.enable_remote_access;
     // Accepted and dropped, exactly as upstream does it: `SetRemoteAccess`
-    // (`Jellyfin.Api/Controllers/StartupController.cs:94`) assigns
+    // (`Jellyfin.Api/Controllers/StartupController.cs:99`) assigns
     // `EnableRemoteAccess` and nothing else, so the wizard's port-mapping
     // checkbox never reaches `EnableUPnP` there either.
     let _ = body.enable_automatic_port_mapping;
 
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| {
-            ApiError::from(ferrofin_traits::error::ServiceError::backend(e.to_string()))
-        })?;
-    }
-    let json = serde_json::to_vec_pretty(&config).map_err(|e| {
+    // `SaveConfiguration(NetworkConfigurationStore.StoreKey, settings)`: the
+    // dashboard's own save, so the live network policy takes the change at
+    // once (`NetworkManager.UpdateSettings` on `NamedConfigurationUpdated`).
+    // Like that save, it finishes even if the client disconnects.
+    let document = serde_json::to_value(&config).map_err(|e| {
         ApiError::from(ferrofin_traits::error::ServiceError::backend(e.to_string()))
     })?;
-    tokio::fs::write(&path, json).await.map_err(|e| {
-        ApiError::from(ferrofin_traits::error::ServiceError::backend(e.to_string()))
-    })?;
+    tokio::spawn(crate::handlers::config::save_named_configuration(
+        state,
+        "network".to_owned(),
+        document,
+    ))
+    .await
+    .map_err(|error| {
+        ferrofin_traits::error::ServiceError::backend(format!("configuration worker: {error}"))
+    })??;
     Ok(StatusCode::NO_CONTENT)
 }
 

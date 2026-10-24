@@ -284,14 +284,17 @@ impl WebFileTransformationService {
     ///
     /// A relative endpoint is a path on this server. The plugin sends it to
     /// `http://localhost:{HttpPort}`; Ferrofin resolves it against the local
-    /// access URL instead, which carries the base URL (without it the request
-    /// is redirected to the web client) and reaches a listener pinned to one
-    /// address.
+    /// access URL over HTTP instead, which carries the base URL (without it
+    /// the request is redirected to the web client) and reaches a listener
+    /// pinned to one address. Plain HTTP, like the plugin's, because the
+    /// server's own certificate need not be one this client trusts. With
+    /// Require HTTPS on, the callback is redirected to HTTPS like any request,
+    /// as the plugin's is.
     async fn call_endpoint(&self, endpoint: &str, contents: &str) -> Option<String> {
         let url = if endpoint.starts_with("http") {
             endpoint.to_owned()
         } else {
-            match self.local_api.get_api_url_for_local_access().await {
+            match self.local_api.get_http_api_url_for_local_access().await {
                 Ok(base) => format!("{base}/{}", endpoint.trim_start_matches('/')),
                 Err(e) => {
                     tracing::warn!(endpoint, error = %e, "transformation endpoint has no local api url");
@@ -678,7 +681,13 @@ mod tests {
 
     #[async_trait]
     impl LocalApiAccess for LocalApi {
+        /// The HTTPS address a server listening with HTTPS gives; nothing
+        /// listens there, so a callback sent to it fails.
         async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+            Ok("https://127.0.0.1:1".to_owned())
+        }
+
+        async fn get_http_api_url_for_local_access(&self) -> Result<String, ServiceError> {
             Ok(self.0.clone())
         }
     }

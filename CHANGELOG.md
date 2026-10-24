@@ -35,6 +35,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Keep the playlists folder out of a user's library-wide queries until they can see a
+  playlist, and a box-set library until they can see a box set, as Jellyfin's
+  `GetUserViews` does. An unscoped recursive `/Items` (or `/Items/Counts`) from a user with
+  no playlist no longer lists the folder, which put its counts one above Jellyfin's
 - Take a comic's cover from `.cb7` (7z) and `.cbt` (tar) archives as well as `.cbz`, and open
   every comic archive as what its content is, as Jellyfin 12 does, so a `.cbr` that is
   really a ZIP gets its cover too. The fallback page is the first in .NET's key order
@@ -124,6 +128,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   for a folder's `playlist.xml` (#56)
 - Create the internal playlists folder at startup, as `CreateRootFolder` does: a server
   whose only playlists come from the library scan now lists the Playlists view
+- Check the server directories at startup, as Jellyfin does. Before a scheduled restore is
+  applied or the database is opened, Ferrofin creates its configuration, log, plugins,
+  data, cache, `<data>/data` and `<data>/root` directories, and leaves Jellyfin's
+  `.jellyfin-<kind>` marker in each (the cache also gets `CACHEDIR.TAG`). A layout that
+  used to start now stops the boot with a clear error when a directory holds another
+  kind's marker (two of its paths point at one directory) or cannot be created or written
+  to. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - The Playlists view lists every playlist the user may open, wherever it is, as Jellyfin
   12.2 does — not only the ones made in the app
 - Port Jellyfin 12.2's `HasVisibleItem` for the Playlists and Collections views in
@@ -208,6 +220,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `{base}/health`, so healthchecks written for Jellyfin keep working. `/health/ready` runs
   the same database check, so the chart's readiness probe now fails while the database is
   unreachable (it was always ready before)
+- The startup wizard's "Allow remote connections" choice applies at once, as in Jellyfin:
+  `POST /Startup/RemoteAccess` now saves the network configuration the way the dashboard
+  does, so the live remote-access policy takes it without a restart
+- Serve HTTPS from the dashboard's Networking settings, as Jellyfin does: with **Enable
+  HTTPS** and a PKCS#12 certificate that loads, the server also listens on
+  `FERROFIN_HTTPS_PORT` (8920) and publishes `https://` addresses; **Require HTTPS**
+  redirects plain HTTP there with a `307`; a new certificate path flags a restart, and a
+  missing one is answered `404`. `X-Forwarded-Proto` now counts only from known proxies,
+  also for addresses published from each request; see [docs/UPGRADING.md](docs/UPGRADING.md)
 - Music libraries keep their folder tree: a folder that is neither artist nor album (a
   grouping folder such as `Rock/`, an artist's `albums/` or `live/`, a folder of playlists)
   is a folder item, as in Jellyfin, and what it holds sits under it in folder browsing
@@ -221,6 +242,20 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   settings page's "Create unaired episodes", "Create missing episodes" and "Include
   specials" options, its library list, refresh interval and grace period, and the "Refresh
   upcoming and missing episodes (TheMovieDb)" scheduled task. Off by default
+- Convert subtitles with Jellyfin 12's writers (SubtitleEdit's libse 4.0.12), byte for byte:
+  converted WebVTT, SubRip, SSA and ASS lose the byte-order mark, and WebVTT loses the fixed
+  region block and `line:90%` on every cue. An `{\anN}` sign is placed where it asks to be
+  (`{\an8}` at the top), other SSA/ASS override tags are removed instead of shown as text,
+  and `<font color>` becomes a WebVTT colour class. An ASS script converted to SSA keeps its
+  styles and comments. `Stream.ttml` now serves TTML (`application/ttml+xml`; it was a 500).
+  An SSA script's italic, bold, underline and colour tags reach every format as HTML tags.
+  Unlike Jellyfin, a script's `Comment:` events never show up as subtitle lines. A WebVTT
+  file converted to ASS does not get Jellyfin's style conversion yet
+- `/System/Configuration/{key}` knows Jellyfin's named configurations only: `branding`,
+  `encoding`, `network`, `metadata`, `xbmcmetadata`, `livetv` and `database`. Reading any other
+  key is a 404, as in Jellyfin (it was a 501, or a file a save had left behind), and saving one
+  fails as Jellyfin's does instead of writing a file. `database` reads as the SQLite provider
+  Ferrofin runs on, and saving it is refused (400), since no other provider can be used
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -230,6 +265,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   wrong data directory or a deleted file was enough). The refusal names three ways out: restore
   the database, set `IsStartupWizardCompleted` to false in `system.json` to start over, or
   start with empty configuration and data directories. See [docs/UPGRADING.md](docs/UPGRADING.md)
+- `GET /System/Configuration/livetv` no longer hands Live TV credentials to users who are not
+  administrators: each tuner's URL (an IPTV playlist's usually carries the account's user name
+  and password) and each guide provider's password (the Schedules Direct password hash) come
+  back blank for them. Jellyfin serves both to every signed-in user; only the dashboard's admin
+  pages read them, so jellyfin-web is unaffected
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for
@@ -317,6 +357,24 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   directory, and saved now. Before, it had no modified or saved date. A one-off startup
   repair fills the dates missing from the Playlists folder and the Collections library
   that earlier versions created, and leaves every other library alone
+- The configuration files written at startup (`system.json` on a first or adopting start,
+  when the port is authorized and by the setup-completed repair, and the named documents
+  seeded from Jellyfin's XML) are replaced atomically and readable by the server's user only
+  (`0600`), like every other configuration save. A server stopped mid-write could leave a
+  truncated `system.json` that kept the next start from booting
+- A Jellyfin configuration file that cannot be imported no longer stops the ones after it. A
+  corrupt `encoding.xml` or `branding.xml` kept `network.xml` (the remote-IP filter, local
+  subnets and known proxies), `metadata.xml`, `xbmcmetadata.xml` and `livetv.xml` from being
+  imported on every start, and only the broken file was named. Each file is now imported on its
+  own, and each one that fails is logged with its path
+- An `encoding.json` the server cannot read (after an ownership change, say) is logged once as
+  a warning while transcodes run, as the transcode planner already did, instead of an error
+  every five seconds for each running transcode
+- `GET /System/Configuration/{key}` reads through the configuration manager like the rest of
+  the server. A saved document that does not parse is logged once per change of the file
+  instead of on every request. One that exists but cannot be read answers 500 instead of
+  reading as the defaults, and so does saving the encoding settings over it, so a save cannot
+  replace a document nobody could see (Jellyfin serves the defaults when it lacks permission)
 
 ## [1.0.0] - 2026-09-05
 
