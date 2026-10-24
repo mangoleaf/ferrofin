@@ -406,6 +406,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   other end accepts the connection and never answers. Before, it waited for ever, stalling
   the guide refresh, tuner discovery or the client's request. The M3U, HDHomeRun and relay
   limits stop at the response headers, so a long body or stream is never cut off
+- A scheduled task that panics is recorded as failed, with an alert on the dashboard, and can
+  run again, as in Jellyfin. Before, it stayed "Running" until someone pressed Stop, the
+  server restarted or a trigger's time limit ran out, and its triggers and the Run button did
+  nothing
 
 ## [1.0.0] - 2026-09-05
 

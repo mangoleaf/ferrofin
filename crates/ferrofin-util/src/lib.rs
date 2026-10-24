@@ -4,8 +4,10 @@
 //! translated to idiomatic Rust while preserving observable behavior (the
 //! upstream xUnit tests are ported verbatim as the oracle). [`process_priority`]
 //! is the OS process priority Jellyfin sets through .NET's
-//! `Process.PriorityClass`, and [`http_client`] holds the .NET `HttpClient`
-//! defaults Jellyfin's outbound requests inherit.
+//! `Process.PriorityClass`, [`http_client`] holds the .NET `HttpClient`
+//! defaults Jellyfin's outbound requests inherit, and [`panic`](mod@panic)
+//! reads a caught panic's message where upstream's `catch` reads
+//! `Exception.Message`.
 
 pub mod copy_to_extensions;
 pub mod current_culture;
@@ -17,6 +19,7 @@ pub mod file_helper;
 pub mod formatting_stream_writer;
 pub mod guid_extensions;
 pub mod http_client;
+pub mod panic;
 pub mod path_extensions;
 pub mod path_helper;
 pub mod process_priority;
