@@ -204,7 +204,9 @@ pub trait ScheduledTask: Send + Sync {
     ///
     /// Errors surface as a [`TaskCompletionStatus::Failed`] result recorded by
     /// the registry; the returned `Result` also propagates to the caller of
-    /// [`FerrofinTaskManager::run_now`].
+    /// [`FerrofinTaskManager::run_now`]. A panic in the body is recorded the
+    /// same way, as a failure whose error names the panic's message (upstream
+    /// catches every exception the body throws as `Failed`).
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError>;
 }
 
@@ -880,18 +882,19 @@ impl FerrofinTaskManager {
     ///
     /// This is the foreground `Execute` path. A failing task body is recorded
     /// as a [`TaskCompletionStatus::Failed`] result *and* propagated to the
-    /// caller.
+    /// caller; so is a body that panics, whose panic does not reach the caller.
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError::NotFound`] if no task has that key,
     /// [`ServiceError::InvalidInput`] if it is already running (mirroring the C#
-    /// guard that only queues an `Idle` task), or whatever error the task body
-    /// itself returns.
+    /// guard that only queues an `Idle` task), whatever error the task body
+    /// itself returns, or [`ServiceError::Backend`] naming the panic when the
+    /// body panics.
     pub async fn run_now(&self, key: &str) -> Result<(), ServiceError> {
         let (task, progress) = self.claim(key, None)?;
         let start = Utc::now();
-        let outcome = task.execute(&progress).await;
+        let outcome = execute_contained(task.as_ref(), &progress).await;
         self.finish(key, &task, start, &outcome, &progress);
         outcome
     }
@@ -948,7 +951,7 @@ impl FerrofinTaskManager {
             async move {
                 let started = std::time::Instant::now();
                 tracing::info!("scheduled task started");
-                let outcome = task.execute(&progress).await;
+                let outcome = execute_contained(task.as_ref(), &progress).await;
                 let elapsed_ms = started.elapsed().as_millis();
                 let result = match &outcome {
                     Ok(()) if progress.was_stopped() => "cancelled",
@@ -1222,6 +1225,28 @@ impl FerrofinTaskManager {
             }
         }
     }
+}
+
+/// Runs a claimed task's body, turning a panic in it into a failure.
+///
+/// `ScheduledTaskWorker.ExecuteInternal` catches every exception the body
+/// throws as `Failed`, so a body that panics ends like one that returns an
+/// error: [`finish`](FerrofinTaskManager::finish) records the failure, returns
+/// the task to [`Idle`](TaskState::Idle) and starts its queued triggers. The
+/// catch sits inside the run, so stopping it still aborts the spawned task.
+/// The panic hook has already logged the panic itself.
+async fn execute_contained(
+    task: &dyn ScheduledTask,
+    progress: &TaskProgress,
+) -> Result<(), ServiceError> {
+    futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(task.execute(progress)))
+        .await
+        .unwrap_or_else(|panic| {
+            Err(ServiceError::backend(format!(
+                "scheduled task panicked: {}",
+                ferrofin_util::panic::message(panic.as_ref())
+            )))
+        })
 }
 
 /// Converts trigger ticks (100 ns) to a chrono duration.
@@ -1566,7 +1591,7 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use ferrofin_model::tasks::{
-        TaskCompletionStatus, TaskState, TaskTriggerInfo, TaskTriggerInfoType,
+        TaskCompletionStatus, TaskResult, TaskState, TaskTriggerInfo, TaskTriggerInfoType,
     };
 
     use ferrofin_traits::error::ServiceError;
@@ -1885,37 +1910,39 @@ mod tests {
         assert_eq!(result["Status"], "Completed");
     }
 
+    /// An activity log that records the entries written to it.
+    #[derive(Default)]
+    struct RecordingActivity {
+        entries: std::sync::Mutex<Vec<ferrofin_traits::activity::ActivityLogCreate>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::activity::ActivityManager for RecordingActivity {
+        async fn get_paged_result(
+            &self,
+            _query: &ferrofin_traits::activity::ActivityLogQuery,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_model::activity::ActivityLogEntry>,
+            ServiceError,
+        > {
+            unimplemented!()
+        }
+        async fn create_entry(
+            &self,
+            entry: ferrofin_traits::activity::ActivityLogCreate,
+        ) -> Result<(), ServiceError> {
+            crate::scheduled_tasks::lock(&self.entries).push(entry);
+            Ok(())
+        }
+        async fn clean(&self, _before: chrono::DateTime<Utc>) -> Result<u64, ServiceError> {
+            Ok(0)
+        }
+    }
+
     /// A failed run must land a `TaskFailed` entry in the activity log (the
     /// dashboard's Alerts feed); a successful run must not.
     #[tokio::test(flavor = "multi_thread")]
     async fn failed_run_writes_a_task_failed_activity_entry() {
-        #[derive(Default)]
-        struct RecordingActivity {
-            entries: std::sync::Mutex<Vec<ferrofin_traits::activity::ActivityLogCreate>>,
-        }
-        #[async_trait::async_trait]
-        impl ferrofin_traits::activity::ActivityManager for RecordingActivity {
-            async fn get_paged_result(
-                &self,
-                _query: &ferrofin_traits::activity::ActivityLogQuery,
-            ) -> Result<
-                ferrofin_model::querying::QueryResult<ferrofin_model::activity::ActivityLogEntry>,
-                ServiceError,
-            > {
-                unimplemented!()
-            }
-            async fn create_entry(
-                &self,
-                entry: ferrofin_traits::activity::ActivityLogCreate,
-            ) -> Result<(), ServiceError> {
-                crate::scheduled_tasks::lock(&self.entries).push(entry);
-                Ok(())
-            }
-            async fn clean(&self, _before: chrono::DateTime<Utc>) -> Result<u64, ServiceError> {
-                Ok(0)
-            }
-        }
-
         let mgr = FerrofinTaskManager::new();
         let activity = Arc::new(RecordingActivity::default());
         mgr.set_activity_manager(activity.clone());
@@ -1955,6 +1982,202 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    /// A task whose body panics, after waiting for its gate when it has one.
+    struct PanickingTask {
+        runs: Arc<AtomicU32>,
+        gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    #[async_trait]
+    impl ScheduledTask for PanickingTask {
+        fn key(&self) -> &str {
+            "panicking"
+        }
+        fn name(&self) -> &str {
+            "Panicking Task"
+        }
+        fn description(&self) -> &str {
+            "panics"
+        }
+        fn category(&self) -> &str {
+            "Test"
+        }
+        async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
+            progress.report(10.0);
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
+            panic!("kaboom");
+        }
+    }
+
+    /// How long a panicking-task test may take: a run left `Running` fails the
+    /// test instead of hanging it.
+    const PANIC_TEST_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// What a run that panicked with `kaboom` records as its error.
+    const KABOOM: &str = "backend error: scheduled task panicked: kaboom";
+
+    fn panicking(gate: Option<Arc<tokio::sync::Notify>>) -> (FerrofinTaskManager, Arc<AtomicU32>) {
+        let mgr = FerrofinTaskManager::new();
+        let runs = Arc::new(AtomicU32::new(0));
+        mgr.register(Arc::new(PanickingTask {
+            runs: runs.clone(),
+            gate,
+        }));
+        (mgr, runs)
+    }
+
+    /// Waits for the task to be idle again and returns its last result.
+    async fn idle_result(mgr: &FerrofinTaskManager, key: &str) -> TaskResult {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let info = mgr.get(key).expect("info");
+            if info.state == TaskState::Idle
+                && let Some(result) = info.last_execution_result
+            {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run never returned to Idle"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// `ScheduledTaskWorker.ExecuteInternal` catches every exception as
+    /// `Failed`: a queued run whose body panics is recorded Failed, naming the
+    /// panic, and leaves the task idle so it runs again.
+    #[tokio::test]
+    async fn a_panicking_queued_run_records_failed_and_runs_again() {
+        tokio::time::timeout(PANIC_TEST_LIMIT, async {
+            let (mgr, runs) = panicking(None);
+            mgr.queue("panicking").expect("queued");
+            let result = idle_result(&mgr, "panicking").await;
+            assert_eq!(result.status, TaskCompletionStatus::Failed);
+            assert_eq!(result.error_message.as_deref(), Some(KABOOM));
+            assert_eq!(
+                mgr.get("panicking")
+                    .expect("info")
+                    .current_progress_percentage,
+                None
+            );
+
+            mgr.queue("panicking").expect("idle again: starts");
+            wait_for_runs(&runs, 2).await;
+            let result = idle_result(&mgr, "panicking").await;
+            assert_eq!(result.status, TaskCompletionStatus::Failed);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// `ExecuteQueuedTasks` follows every outcome, a panic included: a trigger
+    /// parked behind a run that panics starts once that run is recorded.
+    #[tokio::test]
+    async fn a_trigger_queued_behind_a_panicking_run_still_starts() {
+        tokio::time::timeout(PANIC_TEST_LIMIT, async {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let (mgr, runs) = panicking(Some(gate.clone()));
+            mgr.queue_scheduled("panicking", "schedule", None)
+                .expect("idle: starts");
+            wait_for_runs(&runs, 1).await;
+            mgr.queue_scheduled("panicking", "schedule", None)
+                .expect("queued");
+            assert_eq!(runs.load(Ordering::SeqCst), 1, "nothing starts while busy");
+
+            gate.notify_one();
+            wait_for_runs(&runs, 2).await;
+            assert_eq!(
+                mgr.get("panicking").expect("info").state,
+                TaskState::Running
+            );
+            gate.notify_one();
+            let result = idle_result(&mgr, "panicking").await;
+            assert_eq!(result.status, TaskCompletionStatus::Failed);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// The foreground path too: a panic is `run_now`'s error and a Failed
+    /// result, and the task is idle again.
+    #[tokio::test]
+    async fn run_now_turns_a_panic_into_a_failed_result() {
+        tokio::time::timeout(PANIC_TEST_LIMIT, async {
+            let (mgr, runs) = panicking(None);
+            let err = mgr
+                .run_now("panicking")
+                .await
+                .expect_err("a panic fails the run");
+            assert!(
+                matches!(&err, ServiceError::Backend(why) if why == "scheduled task panicked: kaboom"),
+                "{err}"
+            );
+            let info = mgr.get("panicking").expect("info");
+            assert_eq!(info.state, TaskState::Idle);
+            let result = info.last_execution_result.expect("result");
+            assert_eq!(result.status, TaskCompletionStatus::Failed);
+            assert_eq!(result.error_message.as_deref(), Some(KABOOM));
+
+            mgr.run_now("panicking")
+                .await
+                .expect_err("runs again and fails again");
+            assert_eq!(runs.load(Ordering::SeqCst), 2);
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// A panicked run reaches the dashboard like any failure: a `TaskCompleted`
+    /// with `Status: Failed` (the `ScheduledTaskEnded` push) and one
+    /// `TaskFailed` activity entry naming the panic.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panicked_run_publishes_task_completed_and_writes_task_failed() {
+        tokio::time::timeout(PANIC_TEST_LIMIT, async {
+            let (mgr, _runs) = panicking(None);
+            let events = crate::event_manager::FerrofinEventManager::new();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            events.subscribe(
+                "TaskCompleted",
+                Arc::new(move |payload: &str| {
+                    let _ = tx.send(payload.to_owned());
+                    crate::event_manager::consumer_done()
+                }),
+            );
+            mgr.set_event_manager(Arc::new(events));
+            let activity = Arc::new(RecordingActivity::default());
+            mgr.set_activity_manager(activity.clone());
+
+            mgr.queue("panicking").expect("queued");
+            let payload = rx.recv().await.expect("TaskCompleted published");
+            let result: serde_json::Value = serde_json::from_str(&payload).expect("json");
+            assert_eq!(result["Key"], "panicking");
+            assert_eq!(result["Status"], "Failed");
+            assert_eq!(result["ErrorMessage"], KABOOM);
+
+            // The entry write is spawned; poll for it.
+            loop {
+                {
+                    let entries = crate::scheduled_tasks::lock(&activity.entries);
+                    if !entries.is_empty() {
+                        assert_eq!(entries.len(), 1);
+                        assert_eq!(entries[0].type_, "TaskFailed");
+                        assert_eq!(entries[0].name, "Panicking Task failed");
+                        assert_eq!(entries[0].overview.as_deref(), Some(KABOOM));
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test timed out");
     }
 
     /// A task that stays running until its gate is released.

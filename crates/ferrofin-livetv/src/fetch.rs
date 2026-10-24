@@ -4,9 +4,12 @@
 //! I/O sits behind [`SourceFetcher`] so the manager's channel/guide-population
 //! logic can be unit-tested with an in-memory fake instead of a live server.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 
 use ferrofin_traits::error::ServiceError;
+use ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT;
 
 use crate::error::LiveTvError;
 
@@ -121,6 +124,11 @@ pub struct SourceRequest {
     /// A JSON body, sent as `application/json; charset=utf-8`
     /// (`JsonContent.Create` upstream).
     pub json: Option<Vec<u8>>,
+    /// Whether the request ends at the response headers
+    /// (`HttpCompletionOption.ResponseHeadersRead`): the real fetcher then
+    /// answers a success with an empty body, unread, and reads only a
+    /// failure's body.
+    pub headers_only: bool,
 }
 
 impl std::fmt::Debug for SourceRequest {
@@ -137,6 +145,7 @@ impl std::fmt::Debug for SourceRequest {
                     .collect::<Vec<_>>(),
             )
             .field("json_bytes", &self.json.as_ref().map(Vec::len))
+            .field("headers_only", &self.headers_only)
             .finish()
     }
 }
@@ -150,6 +159,7 @@ impl SourceRequest {
             url: url.into(),
             headers: Vec::new(),
             json: None,
+            headers_only: false,
         }
     }
 
@@ -164,6 +174,13 @@ impl SourceRequest {
     #[must_use]
     pub fn json(mut self, body: Vec<u8>) -> Self {
         self.json = Some(body);
+        self
+    }
+
+    /// Ends the request at the response headers: sets `headers_only`.
+    #[must_use]
+    pub fn headers_only(mut self) -> Self {
+        self.headers_only = true;
         self
     }
 }
@@ -192,9 +209,47 @@ impl SourceResponse {
 const USER_AGENT: &str = concat!("Ferrofin/", env!("CARGO_PKG_VERSION"));
 
 /// The real fetcher: `reqwest` for `http(s)://`, a filesystem read otherwise.
+///
+/// Upstream sends these requests through `NamedClient.Default`, so each one
+/// gives up after its `HttpClient.Timeout` ([`HTTP_CLIENT_DEFAULT_TIMEOUT`]).
+/// The M3U and HDHomeRun requests are `ResponseHeadersRead`, so the timeout
+/// stops at their headers; the Schedules Direct ones read the whole response,
+/// so it covers their bodies, except a `headers_only` one (adding a lineup),
+/// which ends at a success's headers. An XMLTV download is bounded by its
+/// caller (`XmlTvCache`'s `DOWNLOAD_TIMEOUT`, upstream's `_downloadTimeout`)
+/// instead.
 #[derive(Debug, Clone)]
 pub struct ReqwestFetcher {
     client: reqwest::Client,
+    /// The `HttpClient.Timeout` (a test shortens it).
+    timeout: Duration,
+}
+
+/// How far the fetcher's timeout reaches into one request.
+#[derive(Debug, Clone, Copy)]
+enum Deadline {
+    /// Up to the response headers; the body is read with no limit
+    /// (`HttpCompletionOption.ResponseHeadersRead`).
+    Headers,
+    /// The whole exchange, body included (`ResponseContentRead`, the default).
+    Total,
+    /// None: the caller bounds the request (the XMLTV download).
+    Caller,
+}
+
+/// The error a request to `url` that ran out of time answers.
+fn timed_out(url: &str) -> ServiceError {
+    ServiceError::Backend(format!("Timed out fetching {url}"))
+}
+
+/// Maps a `reqwest` failure of `operation` on `url`: a timeout reads as one,
+/// anything else keeps its cause.
+fn http_failure(operation: &str, url: &str, error: reqwest::Error) -> ServiceError {
+    if error.is_timeout() {
+        timed_out(url)
+    } else {
+        LiveTvError::http(format!("{operation} {url}"), error).into()
+    }
 }
 
 impl Default for ReqwestFetcher {
@@ -215,20 +270,38 @@ impl ReqwestFetcher {
             // initialise; the plain client surfaces the same condition on
             // first use, where it is reported per fetch rather than at wiring.
             .unwrap_or_default();
-        Self { client }
+        Self {
+            client,
+            timeout: HTTP_CLIENT_DEFAULT_TIMEOUT,
+        }
     }
 
-    /// Performs the `GET`, failing on transport errors and non-success statuses.
-    async fn get(&self, url: &str) -> Result<reqwest::Response, ServiceError> {
-        self.get_as(url, None).await
+    /// Sends `request` to `url` within `deadline`.
+    async fn send_within(
+        &self,
+        request: reqwest::RequestBuilder,
+        url: &str,
+        deadline: Deadline,
+    ) -> Result<reqwest::Response, ServiceError> {
+        let sent = match deadline {
+            Deadline::Headers => tokio::time::timeout(self.timeout, request.send())
+                .await
+                .map_err(|_| timed_out(url))?,
+            Deadline::Total => request.timeout(self.timeout).send().await,
+            Deadline::Caller => request.send().await,
+        };
+        sent.map_err(|e| http_failure("fetch", url, e))
     }
 
-    /// [`get`](Self::get) with a per-request `User-Agent`, when it is a valid
-    /// header value; an invalid one is dropped, as `TryParseAdd` drops it.
-    async fn get_as(
+    /// Performs the `GET` within `deadline`, with a per-request `User-Agent`
+    /// when it is a valid header value (an invalid one is dropped, as
+    /// `TryParseAdd` drops it), failing on transport errors and non-success
+    /// statuses.
+    async fn get(
         &self,
         url: &str,
         user_agent: Option<&str>,
+        deadline: Deadline,
     ) -> Result<reqwest::Response, ServiceError> {
         let mut request = self.client.get(url);
         if let Some(agent) = user_agent.map(str::trim).filter(|agent| !agent.is_empty())
@@ -236,10 +309,7 @@ impl ReqwestFetcher {
         {
             request = request.header(reqwest::header::USER_AGENT, value);
         }
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| LiveTvError::http(format!("fetch {url}"), e))?;
+        let resp = self.send_within(request, url, deadline).await?;
         Ok(resp
             .error_for_status()
             .map_err(|e| LiveTvError::http(format!("fetch {url}"), e))?)
@@ -292,7 +362,7 @@ where
 impl SourceFetcher for ReqwestFetcher {
     async fn fetch(&self, url: &str) -> Result<String, ServiceError> {
         if is_http(url) {
-            self.get(url)
+            self.get(url, None, Deadline::Headers)
                 .await?
                 .text()
                 .await
@@ -307,7 +377,7 @@ impl SourceFetcher for ReqwestFetcher {
 
     async fn fetch_as(&self, url: &str, user_agent: Option<&str>) -> Result<String, ServiceError> {
         if is_http(url) {
-            self.get_as(url, user_agent)
+            self.get(url, user_agent, Deadline::Headers)
                 .await?
                 .text()
                 .await
@@ -320,11 +390,8 @@ impl SourceFetcher for ReqwestFetcher {
     async fn fetch_with_status(&self, url: &str) -> Result<(u16, String), ServiceError> {
         if is_http(url) {
             let resp = self
-                .client
-                .get(url)
-                .send()
-                .await
-                .map_err(|e| LiveTvError::http(format!("fetch {url}"), e))?;
+                .send_within(self.client.get(url), url, Deadline::Headers)
+                .await?;
             let status = resp.status().as_u16();
             let body = resp
                 .text()
@@ -350,7 +417,7 @@ impl SourceFetcher for ReqwestFetcher {
 
     async fn fetch_listings(&self, url: &str) -> Result<String, ServiceError> {
         if is_http(url) {
-            let resp = self.get(url).await?;
+            let resp = self.get(url, None, Deadline::Caller).await?;
             let final_url = resp.url().to_string();
             if !is_gzip_name(&final_url) {
                 return resp
@@ -377,12 +444,12 @@ impl SourceFetcher for ReqwestFetcher {
 
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, ServiceError> {
         if is_http(url) {
-            self.get(url)
+            self.get(url, None, Deadline::Total)
                 .await?
                 .bytes()
                 .await
                 .map(|b| b.to_vec())
-                .map_err(|e| LiveTvError::http(format!("read {url}"), e).into())
+                .map_err(|e| http_failure("read", url, e))
         } else {
             let path = url.strip_prefix("file://").unwrap_or(url);
             tokio::fs::read(path)
@@ -410,15 +477,20 @@ impl SourceFetcher for ReqwestFetcher {
                 .body(json);
         }
         let url = &request.url;
-        let resp = builder
-            .send()
-            .await
-            .map_err(|e| LiveTvError::http(format!("fetch {url}"), e))?;
+        // Bounded in full: a headers-only request still waits for its headers
+        // within the timeout, and for a refusal's body within what is left.
+        let resp = self.send_within(builder, url, Deadline::Total).await?;
         let status = resp.status().as_u16();
+        if request.headers_only && resp.status().is_success() {
+            return Ok(SourceResponse {
+                status,
+                body: Vec::new(),
+            });
+        }
         let body = resp
             .bytes()
             .await
-            .map_err(|e| LiveTvError::http(format!("read {url}"), e))?;
+            .map_err(|e| http_failure("read", url, e))?;
         Ok(SourceResponse {
             status,
             body: body.to_vec(),
@@ -429,6 +501,7 @@ impl SourceFetcher for ReqwestFetcher {
 #[cfg(test)]
 mod tests {
     use super::{ReqwestFetcher, SourceFetcher};
+    use ferrofin_traits::error::ServiceError;
 
     #[tokio::test]
     async fn reads_a_local_file_path() {
@@ -831,5 +904,247 @@ mod tests {
             err.to_string()
                 .contains("fetch http://127.0.0.1:0/countries")
         );
+    }
+
+    /// The deadline these tests give the fetcher in place of the 100 s.
+    const SHORT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+    /// Long enough for every fetch below to finish, short enough that a fetch
+    /// with no deadline fails here instead of hanging the run.
+    const GUARD: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn short_timeout_fetcher() -> ReqwestFetcher {
+        ReqwestFetcher {
+            timeout: SHORT_TIMEOUT,
+            ..ReqwestFetcher::new()
+        }
+    }
+
+    /// A peer that accepts every connection and never answers, holding each
+    /// one open.
+    async fn silent_peer() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        base
+    }
+
+    /// A peer that reads each request, waits `head_delay`, sends `status`
+    /// headers announcing `chunks` in full, then sends each chunk `gap` after
+    /// the last. A `None` chunk stops sending there and holds the connection
+    /// open.
+    async fn trickling_peer(
+        status: &'static str,
+        head_delay: std::time::Duration,
+        chunks: &'static [Option<&'static str>],
+        gap: std::time::Duration,
+    ) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 4096];
+                    let _ = stream.read(&mut buffer).await;
+                    tokio::time::sleep(head_delay).await;
+                    let length: usize = chunks.iter().flatten().map(|chunk| chunk.len()).sum();
+                    let head = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                    );
+                    if stream.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    for chunk in chunks {
+                        tokio::time::sleep(gap).await;
+                        let Some(chunk) = chunk else {
+                            // Stall: keep the connection open, send nothing more.
+                            std::future::pending::<()>().await;
+                            return;
+                        };
+                        if stream.write_all(chunk.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        base
+    }
+
+    fn assert_timed_out(result: Result<impl std::fmt::Debug, ServiceError>, url: &str) {
+        let err = result.expect_err("a silent source must fail");
+        assert!(
+            matches!(&err, ServiceError::Backend(why) if *why == format!("Timed out fetching {url}")),
+            "{err:?}"
+        );
+    }
+
+    /// `M3uParser.GetListingsStream`, `HdHomerunHost` and `SchedulesDirect`
+    /// send through `NamedClient.Default`, whose `HttpClient.Timeout` gives up
+    /// on a source that accepts the connection and never answers.
+    #[tokio::test]
+    async fn a_silent_source_times_out_on_every_bounded_path() {
+        let base = silent_peer().await;
+        let fetcher = short_timeout_fetcher();
+        let url = format!("{base}/list.m3u");
+        let outcome = tokio::time::timeout(GUARD, async {
+            assert_timed_out(fetcher.fetch_as(&url, None).await, &url);
+            assert_timed_out(fetcher.fetch(&url).await, &url);
+            assert_timed_out(fetcher.fetch_with_status(&url).await, &url);
+            assert_timed_out(fetcher.fetch_bytes(&url).await, &url);
+            assert_timed_out(
+                fetcher
+                    .send(super::SourceRequest::new(
+                        super::RequestMethod::Post,
+                        url.clone(),
+                    ))
+                    .await,
+                &url,
+            );
+        })
+        .await;
+        assert!(outcome.is_ok(), "a fetch to a silent source never gave up");
+    }
+
+    /// The M3U and HDHomeRun requests are `ResponseHeadersRead`: the timeout
+    /// stops at the headers, so a body slower than it still arrives whole.
+    #[tokio::test]
+    async fn a_slow_body_after_prompt_headers_is_read_whole() {
+        let base = trickling_peer(
+            "200 OK",
+            std::time::Duration::ZERO,
+            &[
+                Some("#EXT"),
+                Some("M3U\n"),
+                Some("#EXTINF:-1,A\n"),
+                Some("http://a\n"),
+            ],
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let fetcher = short_timeout_fetcher();
+        let url = format!("{base}/list.m3u");
+        let outcome = tokio::time::timeout(GUARD, async {
+            assert_eq!(
+                fetcher.fetch_as(&url, None).await.expect("m3u"),
+                "#EXTM3U\n#EXTINF:-1,A\nhttp://a\n"
+            );
+            assert_eq!(
+                fetcher.fetch_with_status(&url).await.expect("hdhomerun"),
+                (200, "#EXTM3U\n#EXTINF:-1,A\nhttp://a\n".to_owned())
+            );
+        })
+        .await;
+        assert!(outcome.is_ok(), "the slow body was never read");
+    }
+
+    /// XMLTV sets its own `HttpClient.Timeout` (`_downloadTimeout`, which
+    /// `XmlTvCache` applies), so the fetcher's timeout bounds neither its
+    /// headers nor its body.
+    #[tokio::test]
+    async fn a_listings_download_is_not_bounded_by_the_fetcher_timeout() {
+        let base = trickling_peer(
+            "200 OK",
+            std::time::Duration::from_millis(300),
+            &[Some("<tv>"), Some("</tv>")],
+            std::time::Duration::from_millis(150),
+        )
+        .await;
+        let fetcher = short_timeout_fetcher();
+        let text =
+            tokio::time::timeout(GUARD, fetcher.fetch_listings(&format!("{base}/guide.xml")))
+                .await
+                .expect("the listings download finished");
+        assert_eq!(text.expect("listings"), "<tv></tv>");
+    }
+
+    /// Schedules Direct reads its responses whole (`ResponseContentRead`, the
+    /// default), so its timeout covers the body: one that stalls after the
+    /// headers fails instead of pinning the request.
+    #[tokio::test]
+    async fn a_schedules_direct_body_that_stalls_times_out() {
+        let base = trickling_peer(
+            "200 OK",
+            std::time::Duration::ZERO,
+            &[Some("[{"), None, Some("}]")],
+            std::time::Duration::from_millis(50),
+        )
+        .await;
+        let fetcher = short_timeout_fetcher();
+        let url = format!("{base}/available/countries");
+        let outcome = tokio::time::timeout(GUARD, async {
+            assert_timed_out(fetcher.fetch_bytes(&url).await, &url);
+            assert_timed_out(
+                fetcher
+                    .send(super::SourceRequest::new(
+                        super::RequestMethod::Get,
+                        url.clone(),
+                    ))
+                    .await,
+                &url,
+            );
+        })
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "a stalled Schedules Direct body never gave up"
+        );
+    }
+
+    /// `AddLineupToAccount` sends `ResponseHeadersRead` and reads the body only
+    /// of a refusal, to log it: a success whose body stalls answers at its
+    /// headers, and a refusal's body is read, within the timeout.
+    #[tokio::test]
+    async fn a_headers_only_request_reads_only_a_refusals_body() {
+        let fetcher = short_timeout_fetcher();
+        let put = |base: &str| {
+            super::SourceRequest::new(super::RequestMethod::Put, format!("{base}/lineups/X"))
+                .headers_only()
+        };
+        let gap = std::time::Duration::from_millis(50);
+        let stalled_success = trickling_peer(
+            "200 OK",
+            std::time::Duration::ZERO,
+            &[Some("{"), None, Some("}")],
+            gap,
+        )
+        .await;
+        let refusal = trickling_peer(
+            "400 Bad Request",
+            std::time::Duration::ZERO,
+            &[Some("{\"code\":2100}")],
+            gap,
+        )
+        .await;
+        let stalled_refusal = trickling_peer(
+            "400 Bad Request",
+            std::time::Duration::ZERO,
+            &[Some("{"), None, Some("}")],
+            gap,
+        )
+        .await;
+        let outcome = tokio::time::timeout(GUARD, async {
+            let added = fetcher.send(put(&stalled_success)).await.expect("added");
+            assert_eq!((added.status, added.body), (200, Vec::new()));
+            let refused = fetcher.send(put(&refusal)).await.expect("refused");
+            assert_eq!(
+                (refused.status, refused.body),
+                (400, br#"{"code":2100}"#.to_vec())
+            );
+            let url = format!("{stalled_refusal}/lineups/X");
+            assert_timed_out(fetcher.send(put(&stalled_refusal)).await, &url);
+        })
+        .await;
+        assert!(outcome.is_ok(), "a headers-only request never answered");
     }
 }

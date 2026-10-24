@@ -2994,16 +2994,6 @@ fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
         ItemSortBy::VideoBitRate => r#"bi."TotalBitrate""#,
         ItemSortBy::ParentIndexNumber => r#"bi."ParentIndexNumber""#,
         ItemSortBy::IndexNumber => r#"bi."IndexNumber""#,
-        // Aired order: (season, episode). Specials (`ParentIndexNumber = 0`) have
-        // no air-date positioning here, so they sort *after* the regular seasons
-        // (rather than at the very front, where `SortName`/filename order put
-        // them and made "Play"/"Play All" start on a special). Port of
-        // `AiredEpisodeOrderComparer` with the metadata-less special placed last.
-        ItemSortBy::AiredEpisodeOrder => {
-            r#"(CASE WHEN bi."ParentIndexNumber" = 0 THEN 1000000
-                     ELSE COALESCE(bi."ParentIndexNumber", 0) END) * 100000
-               + COALESCE(bi."IndexNumber", 0)"#
-        }
         ItemSortBy::IsFolder => r#"bi."IsFolder""#,
         ItemSortBy::OfficialRating => r#"bi."InheritedParentalRatingValue""#,
         ItemSortBy::SeriesSortName => r#"bi."SeriesName""#,
@@ -3012,6 +3002,9 @@ fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
         ItemSortBy::Name => r#"bi."CleanName""#,
         // Everything else falls back to SortName (the join-backed keys
         // `Artist`, `AlbumArtist` and `Studio` are expressions of their own).
+        // That includes `AiredEpisodeOrder`: `OrderMapper` has no arm for it,
+        // and `AiredEpisodeOrderComparer` only runs in upstream's in-memory
+        // sorts (a folder's children, a season's episodes, Next Up).
         _ => r#"bi."SortName""#,
     }
 }
@@ -3730,6 +3723,23 @@ mod tests {
         assert_eq!(
             order_by(&sorted_by(&[(ItemSortBy::AirTime, SortOrder::Ascending)])),
             r#"ORDER BY +bi."SortName" ASC, bi."SortName" ASC"#
+        );
+        // `AiredEpisodeOrder` is one of those keys: `OrderMapper` has no arm
+        // for it, so the query sorts by SortName (the comparer is only for
+        // in-memory sorts), in either direction.
+        assert_eq!(
+            order_by(&sorted_by(&[(
+                ItemSortBy::AiredEpisodeOrder,
+                SortOrder::Ascending
+            )])),
+            r#"ORDER BY +bi."SortName" ASC, bi."SortName" ASC"#
+        );
+        assert_eq!(
+            order_by(&sorted_by(&[(
+                ItemSortBy::AiredEpisodeOrder,
+                SortOrder::Descending
+            )])),
+            r#"ORDER BY +bi."SortName" DESC, bi."SortName" ASC"#
         );
         // A leading key on another column can never be served by the index, so
         // it is left unpinned — and takes no Name tiebreaker.

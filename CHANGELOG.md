@@ -398,6 +398,30 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `Retry-After` and a "starting" page. Before, the port stayed closed until boot finished,
   so a long adoption could outlast the chart's startup probe and be restarted in a loop.
   Boot stages are now logged at `info`
+- A recursive `/Items` request sorted by `AiredEpisodeOrder` orders by sort name, as Jellyfin
+  does, and a folder's children sorted by it use the aired-episode comparer
+- `/Items?ids=` and `/Trailers?ids=` without a `sortBy` return the items in the order their
+  ids were requested, as Jellyfin does, instead of in sort-name order
+- A Live TV stream that a client's start and progress reports never named is closed by its stop
+  report or by the teardown of its abandoned transcode, as Jellyfin does, instead of holding the
+  tuner until a restart
+- The playlists folder is made only at startup, as Jellyfin does, instead of being looked for
+  again, with a rule of its own, on every `GET /Library/MediaFolders` and Folders view request
+- A DVR timer whose row cannot be read when it fires is retried every minute, up to ten
+  times, and logged, instead of the recording being missed with no trace. A stored timer or
+  series timer that no longer parses is logged when it is first read and when it misses its
+  recording, instead of vanishing silently
+- An M3U playlist, HDHomeRun or Schedules Direct request, a File Transformation callback or
+  the relay of a remote static stream gives up after 100 seconds, as Jellyfin's do, when the
+  other end accepts the connection and never answers. Before, it waited for ever, stalling
+  the guide refresh, tuner discovery or the client's request. The M3U, HDHomeRun and relay
+  limits stop at the response headers, so a long body or stream is never cut off
+- A scheduled task that panics is recorded as failed, with an alert on the dashboard, and can
+  run again, as in Jellyfin. Before, it stayed "Running" until someone pressed Stop, the
+  server restarted or a trigger's time limit ran out, and its triggers and the Run button did
+  nothing
+- A request whose handler panics is answered `500` "Error processing request." and logged,
+  as in Jellyfin. Before, its connection was dropped, over HTTP/2 with every other request on it
 
 ## [1.0.0] - 2026-09-05
 
