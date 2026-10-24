@@ -35,6 +35,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Refuse a `POST /Playlists` body without a `Name`, or with a null or blank one, and an
+  `"IsPublic": null`, with `400` as Jellyfin does, instead of creating the playlist; a
+  query-string `name` does not rescue such a body. A request with neither a body nor a
+  `name` is a `400` too (Jellyfin fails it with a `500`), where Ferrofin created a
+  nameless playlist
 - Accept a partial body on `POST /DisplayPreferences/{id}`, as Jellyfin does: each member
   left out takes the default of Jellyfin's `DisplayPreferencesDto` (`ShowBackdrop` true,
   250 px images, the rest off or empty) instead of failing with `400 missing field`
