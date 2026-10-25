@@ -1431,6 +1431,36 @@ mod tests {
         );
     }
 
+    /// The config file is TOML: a file named for another format is refused,
+    /// not read in a format the docs never describe, and so is one with no
+    /// extension, as before.
+    #[test]
+    fn config_file_in_another_format_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("config.json", "{\"port\": 5000}"),
+            ("config.json5", "{port: 5000}"),
+            ("config.yaml", "port: 5000\n"),
+            ("config.yml", "port: 5000\n"),
+            ("config.ini", "port=5000\n"),
+            ("config.ron", "(port: 5000)"),
+            ("config", "port = 5000\n"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            let cli = Cli {
+                config_file: Some(path),
+                ..Cli::default()
+            };
+            let err = Config::load_from(cli, &FakeEnv::new()).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("is not of a supported file format"),
+                "{name}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn db_pool_defaults_to_auto() {
         let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();

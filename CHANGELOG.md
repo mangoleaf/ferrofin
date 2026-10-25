@@ -829,6 +829,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - File Transformation: a callback endpoint that fails (an error status, a timeout, a refused
   connection) logs one warning, then logs at debug level until it works again. It logged two
   warnings on every matching `/web` request for as long as it stayed down
+- The config file is read as TOML only: a `--config`/`FERROFIN_CONFIG_FILE` path named
+  `.json`, `.json5`, `.yaml`, `.yml`, `.ini` or `.ron` is refused instead of parsed in that format
+  (see [docs/UPGRADING.md](docs/UPGRADING.md)), and the server no longer builds those
+  parsers
 
 ## [1.0.0] - 2026-09-05
 

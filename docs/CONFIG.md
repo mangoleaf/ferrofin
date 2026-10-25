@@ -7,7 +7,7 @@ Ferrofin is configured three ways, **highest precedence first**:
 3. **`config.toml`** — an optional file at `{data_dir}/config.toml` (or `--config`/
    `FERROFIN_CONFIG_FILE`). Keys are the env-var stems, lower-cased and prefix-stripped
    (`FERROFIN_BIND_ADDR` → `bind_addr`). The whole file is optional; a missing one is not an
-   error.
+   error. It is TOML and must be named `*.toml`: any other name (`config.json`, `config.yaml`, …) is refused.
 
 Everything below has a working default except where noted; a bare `cargo run -p ferrofin-server`
 boots.
