@@ -761,6 +761,33 @@ impl FerrofinVirtualFolderManager {
         persistence.merge_data_fields(id, &fields).await
     }
 
+    /// Points the row a rename keeps at the renamed directory `folder_path`:
+    /// its `Path`, `Name` and `SortName` follow the new spelling and its
+    /// locations are recorded again. Without it the row keeps the old
+    /// spelling's `Path`, which the orphan prune deletes on a case-sensitive
+    /// filesystem. No-op without an item reader and store wired.
+    async fn repath_collection_folder(
+        &self,
+        id: uuid::Uuid,
+        folder_path: &Path,
+    ) -> Result<(), ServiceError> {
+        let (Some(items), Some(persistence)) = (&self.items, &self.persistence) else {
+            return Ok(());
+        };
+        let Some(mut row) = items.retrieve_item(id).await? else {
+            return Ok(());
+        };
+        let name = folder_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        row.sort_name = Some(ferrofin_util::sort_name::create_sort_name(&name));
+        row.name = Some(name);
+        row.path = Some(folder_path.to_string_lossy().into_owned());
+        persistence.save_items(std::slice::from_ref(&row)).await?;
+        self.sync_physical_folders(folder_path, id).await
+    }
+
     /// Forgets that the library at `folder_path` was set up this boot, so the
     /// next [`ensure_collection_folder`](Self::ensure_collection_folder)
     /// records its changed locations.
@@ -1674,20 +1701,28 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // case-only hop reassigns `current` to a temporary uuid directory, whose
         // id is not the one to delete.
         let vacated = self.collection_folder_id(&current);
+        // A rename onto the library's own id (the same name, or a case-only
+        // rename under case-insensitive ids) keeps its row, as upstream's
+        // `ValidateTopLibraryFolders` keeps a row whose `Path` still exists.
+        let kept = vacated.filter(|id| self.collection_folder_id(&target) == Some(*id));
         let preferences = self.library_rename(&current, &target).await?;
-        if let Some(id) = vacated {
+        if let Some(id) = vacated.filter(|_| kept.is_none()) {
             self.preserve_legacy_children(id).await?;
         }
 
         // A case-only rename hops through a temporary directory so a
         // case-insensitive filesystem does not treat it as a no-op (C# path).
-        if same_case_insensitive {
-            let temp = self.root.join(uuid::Uuid::new_v4().simple().to_string());
-            Self::case_hop(&current, &temp, &target).await?;
-        } else {
-            tokio::fs::rename(&current, &target)
-                .await
-                .map_err(|e| Self::io_err("rename virtual folder", &e))?;
+        // The same name moves nothing: upstream's hop there changes nothing
+        // visible, and skipping it cannot fail half-way.
+        if current != target {
+            if same_case_insensitive {
+                let temp = self.root.join(uuid::Uuid::new_v4().simple().to_string());
+                Self::case_hop(&current, &temp, &target).await?;
+            } else {
+                tokio::fs::rename(&current, &target)
+                    .await
+                    .map_err(|e| Self::io_err("rename virtual folder", &e))?;
+            }
         }
         // Jellyfin 12.2: once the directory has moved, the library's users
         // follow it to its new id. A failure is returned after the row cleanup
@@ -1705,9 +1740,12 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // for upstream after a rename; do it eagerly here so a caller that passed
         // `refreshLibrary=false` still converges. Legacy children were moved
         // transactionally before the directory rename; the physical hierarchy
-        // survives deletion of the old collection folder.
+        // survives deletion of the old collection folder. A row the new path
+        // keeps (`kept`) is not an orphan: it follows the directory instead.
         let cleaned = async {
-            if let (Some(persistence), Some(id)) = (&self.persistence, vacated) {
+            if let Some(id) = kept {
+                self.repath_collection_folder(id, &target).await?;
+            } else if let (Some(persistence), Some(id)) = (&self.persistence, vacated) {
                 persistence.delete_items(std::slice::from_ref(&id)).await?;
                 if let Ok(mut set) = self.parented.lock() {
                     set.remove(&id);
@@ -1993,6 +2031,73 @@ mod tests {
         let rows = root_libraries(&mgr).await;
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].0, "MOVIES");
+    }
+
+    /// A rename onto the library's own id keeps its row, as upstream's
+    /// `ValidateTopLibraryFolders` does for a row whose `Path` still exists:
+    /// the same name (any id mode), or a case-only rename under the
+    /// case-insensitive ids `new()` defaults to. The row keeps its id, its
+    /// `DateCreated` and its images, and follows the new spelling.
+    #[rstest::rstest]
+    #[case::same_name("Movies", "Movies")]
+    #[case::case_only("Movies", "MOVIES")]
+    #[tokio::test]
+    async fn a_rename_onto_the_same_id_keeps_the_library_row(
+        #[case] name: &str,
+        #[case] new_name: &str,
+    ) {
+        use ferrofin_traits::persistence::ItemPersistenceService as _;
+        let (tmp, db, mgr) = manager_with_store().await;
+        let media = media_dir(&tmp, "movies");
+        mgr.add_virtual_folder(name, None, &opts_with_paths(&[media]))
+            .await
+            .expect("add");
+        let before = mgr.get_virtual_folders().await.expect("get");
+        let id = uuid::Uuid::parse_str(before[0].item_id.as_deref().expect("ItemId")).expect("id");
+        let image = ferrofin_traits::options::ItemImageInfo {
+            path: "/meta/library/primary.jpg".to_owned(),
+            image_type: ferrofin_model::entities::ImageType::Primary,
+            date_modified: chrono::Utc::now(),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        };
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_item_images(id, std::slice::from_ref(&image))
+            .await
+            .expect("image");
+        let items = mgr.items.clone().expect("items");
+        let created = items
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("row")
+            .date_created;
+
+        mgr.rename_virtual_folder(name, new_name)
+            .await
+            .expect("rename");
+        let after = mgr.get_virtual_folders().await.expect("get");
+        assert_eq!(after[0].item_id, before[0].item_id);
+        let row = items
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("row kept");
+        assert_eq!(row.date_created, created);
+        assert_eq!(row.name.as_deref(), Some(new_name));
+        assert_eq!(
+            row.sort_name,
+            Some(ferrofin_util::sort_name::create_sort_name(new_name))
+        );
+        assert!(
+            row.path.as_deref().is_some_and(|p| p.ends_with(new_name)),
+            "{:?}",
+            row.path
+        );
+        let images = items.get_image_infos(id).await.expect("images");
+        assert_eq!(images.len(), 1, "{images:?}");
+        assert_eq!(root_libraries(&mgr).await.len(), 1);
     }
 
     /// A user's stored preferences, by kind.
