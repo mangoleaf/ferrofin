@@ -1,19 +1,22 @@
-//! [`FerrofinPluginManager`] — the registry-backed [`PluginManager`] for Tier-1
-//! (compile-time) plugins.
+//! [`FerrofinPluginManager`] — the registry-backed [`PluginManager`] for the
+//! compiled-in (Tier 1a) plugins and the WASM (Tier 1b) plugins the host
+//! loaded at boot.
 //!
-//! Plugins are Rust crates compiled into the server and handed to this manager as
-//! [`RegisteredPlugin`] entries at the composition root. The manager owns the
-//! immutable registry plus the mutable, on-disk state (per-plugin enabled flag,
-//! package repositories, per-plugin configuration JSON) rooted at a `plugins/`
-//! directory under the server config dir.
+//! Both are handed to this manager as [`RegisteredPlugin`] entries at the
+//! composition root. The manager owns the registry plus the mutable, on-disk
+//! state (per-plugin enabled flag, package repositories, per-plugin
+//! configuration JSON, the install ledger) rooted at a `plugins/` directory
+//! under the server config dir.
 //!
-//! Runtime installation / removal (a dynamic plugin host — WASM or `libloading`)
-//! is **Tier 2** and out of scope: [`remove_plugin`](PluginManager::remove_plugin)
-//! rejects a compiled-in extension (and, like upstream, silently ignores a
-//! plugin that reports `CanUninstall: false`), and
-//! [`list_packages`](PluginManager::list_packages)
-//! returns `[]` (no repository fetch yet). See `docs/PLUGINS_UPSTREAM.md` for
-//! the compiled-in plugin design.
+//! It is also the WASM plugin installer, Jellyfin's flow:
+//! [`list_packages`](PluginManager::list_packages) reads the configured
+//! repositories, [`install_package`](PluginManager::install_package)
+//! downloads, verifies and stages an artifact the host loads at the next
+//! start, and [`remove_plugin`](PluginManager::remove_plugin) uninstalls a
+//! WASM plugin. `remove_plugin` rejects a compiled-in extension, and, like
+//! upstream, silently ignores a plugin that reports `CanUninstall: false`.
+//! See `docs/EXTENSIONS.md` for the two tiers and `docs/PLUGINS_UPSTREAM.md`
+//! for the compiled-in plugin design.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -1330,7 +1333,8 @@ impl PluginManager for FerrofinPluginManager {
         let mut packages: Vec<PackageInfo> = Vec::new();
         // Manifests are small JSON documents: a total deadline plus a
         // streamed size cap, so a hostile/hung repository can neither OOM
-        // the server nor pin the task (GET /Packages is plain-auth).
+        // the server nor pin the task (GET /Packages is admin-only, but the
+        // repository is remote and untrusted).
         let client = reqwest::Client::builder()
             .timeout(REPO_FETCH_TIMEOUT)
             .build()

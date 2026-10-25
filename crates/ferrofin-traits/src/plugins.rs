@@ -1,14 +1,14 @@
-//! The plugin-manager seam — **Tier 1** (compile-time plugins).
+//! The plugin-manager seam — compiled-in (Tier 1a) and WASM (Tier 1b) plugins.
 //!
 //! Port of the object-safe slice of `MediaBrowser.Common.Plugins.IPluginManager`
 //! that the `PluginsController` / `PackageController` API surface needs, reduced
-//! to Ferrofin's Tier-1 model: plugins are Rust crates compiled into the server and
-//! registered at the composition root. There is no runtime assembly loading
-//! (that is Tier 2 — a WASM/`libloading` boundary, see `docs/EXTENSIONS.md`),
-//! `remove_plugin` and package installation ARE supported for runtime-installed
-//! WASM (Tier-1b) plugins: `install_package` downloads a repository package,
-//! verifies + validates it, and stages it for the next restart; compiled-in
-//! plugins still reject both.
+//! to Ferrofin's model: every plugin is registered at the composition root,
+//! either a Rust crate compiled into the server or a sandboxed WASM component
+//! the host loaded from `{data_dir}/plugins/`. There is no .NET assembly
+//! loading (see `docs/EXTENSIONS.md`). `remove_plugin` and package
+//! installation are supported for WASM plugins: `install_package` downloads a
+//! repository package, verifies + validates it, and stages it for the next
+//! restart; compiled-in plugins reject both.
 //!
 //! The trait traffics only in plain data ([`PluginDescriptor`], [`PluginImage`],
 //! and the `ferrofin-model` `RepositoryInfo`/`PackageInfo` wire DTOs) so it stays

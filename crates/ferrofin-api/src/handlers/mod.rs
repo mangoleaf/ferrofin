@@ -672,11 +672,12 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Branding/Splashscreen"),
     ("post", "/Branding/Splashscreen"),
     ("delete", "/Branding/Splashscreen"),
-    // Plugins Tier 1 — the plugin-manager surface (`PluginsController` +
-    // `PackageController`) over the compile-time plugin registry. Reads,
-    // enable/disable, config, and the repository list are real; install and
-    // uninstall are honest rejections (they need the Tier-2 dynamic host, not a
-    // faked success). See `handlers::plugins`.
+    // Plugins — the plugin-manager surface (`PluginsController` +
+    // `PackageController`) over the plugin registry: compiled-in (Tier 1a)
+    // plugins and the WASM (Tier 1b) plugins the host loaded. Reads,
+    // enable/disable, config, the repository list, and WASM install and
+    // uninstall are real; a compiled-in plugin refuses both. See
+    // `handlers::plugins`.
     ("get", "/Plugins"),
     ("get", "/Plugins/{pluginId}/Configuration"),
     ("post", "/Plugins/{pluginId}/Configuration"),
