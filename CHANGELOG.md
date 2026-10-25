@@ -469,6 +469,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   no longer forge a line in the log file behind `/System/Logs`: the file continues the entry
   on an indented line instead (a carriage return is written as `\r`), and a plugin's text is
   logged escaped, under `guest_message`, cut at 8 KiB
+- WASM plugins: an `http-fetch` to an IPv6 address that carries a private IPv4 one is refused
+  like the IPv4 address itself, unless the plugin is granted private-network access. A NAT64
+  (`64:ff9b::/96`), 6to4 (`2002::/16`) or IPv4-compatible (`::a.b.c.d`) address reached, say,
+  the cloud metadata service or the server's own loopback through a gateway, where only the
+  IPv4-mapped form was unwrapped. The local-use NAT64 prefix `64:ff9b:1::/48` is refused
+  outright
 
 ### Bug Fixes
 - A backup no longer reports success with something left out:

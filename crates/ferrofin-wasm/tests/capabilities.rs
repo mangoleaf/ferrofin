@@ -327,6 +327,16 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
         "ff02::1",           // v6 multicast
         "::ffff:10.0.0.1",   // v4-mapped RFC1918
         "::ffff:100.64.0.1", // v4-mapped CGNAT
+        // IPv6 forms that carry a private IPv4 reach it through a NAT64
+        // gateway, a 6to4 relay or IPv4-compatible routing.
+        "64:ff9b::a9fe:a9fe", // NAT64 → cloud metadata
+        "64:ff9b::7f00:1",    // NAT64 → loopback
+        "64:ff9b:1::1",       // local-use NAT64 prefix (not globally reachable)
+        "2002:7f00:1::",      // 6to4 → loopback
+        "2002:c0a8:101::1",   // 6to4 → 192.168.1.1
+        "2002:a00:1::",       // 6to4 → 10.0.0.1
+        "::127.0.0.1",        // IPv4-compatible loopback
+        "::10.0.0.1",         // IPv4-compatible RFC1918
     ] {
         assert!(
             is_private_address(private.parse().unwrap()),
@@ -340,6 +350,11 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
         "100.63.255.255", // just below CGNAT
         "100.128.0.0",    // just above CGNAT
         "2606:4700:4700::1111",
+        "64:ff9b::808:808", // NAT64 → 8.8.8.8
+        "2002:808:808::1",  // 6to4 → 8.8.8.8
+        "::8.8.8.8",        // IPv4-compatible public
+        "64:ff9b:2::1",     // just past the local-use NAT64 prefix
+        "64:ff9b:0:0:1::1", // not the NAT64 /96: a non-zero middle
     ] {
         assert!(
             !is_private_address(public.parse().unwrap()),
