@@ -883,7 +883,8 @@ impl CollectionManager for FerrofinCollectionManager {
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
         // Port of `CollectionManager.EnsureLibraryFolder`
         // (v10.11.8 Emby.Server.Implementations/Collections/CollectionManager.cs
-        // :81-109): look the library up BY PATH, and provision it — directory,
+        // :81-109): look the library up BY PATH (then by its derived id, for a
+        // data directory that moved), and provision it — directory,
         // row, boxsets collection type and all — only when the caller asked for
         // it. This used to answer `Ok(None)` unconditionally under a "documented
         // deferral" comment; the tree it was said to need is the same
@@ -891,8 +892,20 @@ impl CollectionManager for FerrofinCollectionManager {
         let path = format!("{}/collections", self.paths.data_path());
         let id = if create_if_needed {
             collections_folder(&self.db, &self.paths).await?
-        } else {
+        } else if let Some(id) =
             crate::item_persistence_service::container_at(&self.db, &path).await?
+        {
+            Some(id)
+        } else {
+            // A data directory that moved left the row at its old path (gl-922).
+            let (mode, _) = container_identity(&self.db, &self.paths).await?;
+            crate::item_persistence_service::moved_container(
+                &self.db,
+                BaseItemKind::CollectionFolder,
+                &path,
+                &mode,
+            )
+            .await?
         };
         let Some(id) = id else {
             return Ok(None);
@@ -2129,6 +2142,98 @@ mod tests {
             .expect("lookup")
             .expect("a row");
         assert_eq!(found.id, made.id, "the same row, found by path");
+    }
+
+    /// gl-922: the Collections library's id comes from its program-data-relative
+    /// path, its stored `Path` from the absolute one, so a data directory that
+    /// moved leaves the row at its old path under the same id. Both lookups
+    /// find it there and move it to the new path: box-set grouping keeps
+    /// finding its collections, and a create no longer fails on the primary key.
+    #[tokio::test]
+    async fn a_moved_data_directory_keeps_its_collections_library() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager_in = |dir: &str| {
+            FerrofinCollectionManager::new(
+                db.clone(),
+                library_manager_over(db.clone()),
+                Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+                test_paths_in(&tmp.path().join(dir)),
+            )
+        };
+        let made = manager_in("old")
+            .get_collections_folder(true)
+            .await
+            .expect("provision")
+            .expect("a row");
+
+        let moved = manager_in("new");
+        let found = moved
+            .get_collections_folder(false)
+            .await
+            .expect("lookup")
+            .expect("the row under its derived id");
+        assert_eq!(found.id, made.id);
+        let new_path = format!("{}/new/data/collections", tmp.path().display());
+        assert_eq!(found.path.as_deref(), Some(new_path.as_str()));
+
+        moved
+            .create_collection(&CollectionCreationOptions {
+                name: "Heist".to_owned(),
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("a create after the move");
+    }
+
+    /// gl-922: only a `CollectionFolder` under the derived id moves. A row of
+    /// another kind there, or an adopted Collections library under its own
+    /// id, keeps its path.
+    #[tokio::test]
+    async fn only_the_derived_collections_row_moves() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths_in(tmp.path());
+        let path = format!("{}/collections", paths.data_path());
+        let mode =
+            crate::item_type_lookup::IdDerivation::from_meta(None, Some(paths.program_data_path()));
+        let derived = crate::item_type_lookup::derive_item_id_with(
+            &mode,
+            BaseItemKind::CollectionFolder,
+            &path,
+        )
+        .expect("an id");
+        let adopted = Uuid::new_v4();
+        for (id, kind, old) in [
+            (derived, BaseItemKind::Folder, "/old/data/collections"),
+            (
+                adopted,
+                BaseItemKind::CollectionFolder,
+                "/old/root/default/Collections",
+            ),
+        ] {
+            crate::test_support::seed_named_item(&db, id, kind, "Collections").await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.path = Some(old.to_owned());
+            crate::test_support::save_item(&db, &row).await;
+        }
+
+        let found = crate::item_persistence_service::moved_container(
+            &db,
+            BaseItemKind::CollectionFolder,
+            &path,
+            &mode,
+        )
+        .await
+        .expect("lookup");
+        assert_eq!(found, None);
+        for (id, old) in [
+            (derived, "/old/data/collections"),
+            (adopted, "/old/root/default/Collections"),
+        ] {
+            let row = crate::test_support::fetch_item(&db, id).await;
+            assert_eq!(row.path.as_deref(), Some(old));
+        }
     }
 
     /// The auto-provisioned Collections library carries
