@@ -258,6 +258,36 @@ impl M3uTunerHost {
             None => !crate::stream::is_in_local_network(host),
         }
     }
+
+    /// `M3uParser.GetListingsStream` (v12.2 M3uParser.cs:48-70): the playlist,
+    /// opened and unread. A local path is opened as a file, and one that does
+    /// not exist is a `404`, upstream's `FileNotFoundException`. A URL is
+    /// requested with the tuner's user agent, and a non-success status fails
+    /// (`EnsureSuccessStatusCode`).
+    async fn open_playlist(
+        &self,
+        tuner: &TunerHostInfo,
+    ) -> Result<crate::fetch::SourceBody, ServiceError> {
+        let url = tuner.url.as_deref().unwrap_or_default();
+        let opened = self
+            .fetcher
+            .open(url, tuner.user_agent.as_deref())
+            .await
+            .map_err(|e| {
+                if crate::fetch::is_http(url) {
+                    e
+                } else {
+                    crate::fetch::missing_file_is_not_found(e)
+                }
+            })?;
+        if !opened.is_success() {
+            return Err(ServiceError::backend(format!(
+                "fetch {url} answered {}",
+                opened.status
+            )));
+        }
+        Ok(opened)
+    }
 }
 
 #[async_trait]
@@ -274,19 +304,11 @@ impl TunerHost for M3uTunerHost {
 
     async fn get_channels(&self, tuner: &TunerHostInfo) -> Result<Vec<TunerChannel>, ServiceError> {
         let url = tuner.url.as_deref().unwrap_or_default();
-        // `M3uParser.GetListingsStream` presents the tuner's user agent and
-        // fails on a non-success status (`EnsureSuccessStatusCode`); `Parse`
-        // then reads the playlist line by line as it arrives (v12.2
-        // M3uParser.cs:39-70), never holding it whole. Like upstream, an
+        // `Parse` reads the playlist line by line as it arrives (v12.2
+        // M3uParser.cs:39-45), never holding it whole. Like upstream, an
         // endless body is read for ever, and one that never ends a line
         // grows that line.
-        let mut opened = self.fetcher.open(url, tuner.user_agent.as_deref()).await?;
-        if !opened.is_success() {
-            return Err(ServiceError::backend(format!(
-                "fetch {url} answered {}",
-                opened.status
-            )));
-        }
+        let mut opened = self.open_playlist(tuner).await?;
         let mut parser = M3uParser::new();
         while let Some(chunk) = opened.body.next_chunk().await? {
             parser.push(&chunk);
@@ -310,6 +332,13 @@ impl TunerHost for M3uTunerHost {
                 audio_codec: None,
             })
             .collect())
+    }
+
+    /// `M3UTunerHost.Validate` (v12.2 M3UTunerHost.cs:133-138): the playlist
+    /// must open before the tuner is saved. The body is dropped unread, as
+    /// upstream disposes the stream.
+    async fn validate(&self, info: &mut TunerHostInfo) -> Result<(), ServiceError> {
+        self.open_playlist(info).await.map(drop)
     }
 
     async fn channel_media_sources(
