@@ -3591,13 +3591,10 @@ impl LocalProviderManager {
         if let Some(folders) = &self.virtual_folders
             && let Some(path) = entity.path.as_deref()
             && let Ok(list) = folders.get_virtual_folders().await
-            && let Some(lang) = list
-                .iter()
-                .find(|f| {
-                    f.locations
-                        .iter()
-                        .any(|loc| !loc.is_empty() && path.starts_with(loc.as_str()))
-                })
+            // The library owning the path (innermost location, then first by
+            // sort name), not whichever the listing names first: the listing
+            // comes in the file system's order.
+            && let Some(lang) = ferrofin_model::entities_media::owning_library(&list, None, Some(path))
                 .and_then(|f| f.library_options.as_ref())
                 .and_then(|o| usable(o.preferred_metadata_language.as_deref()))
         {
@@ -3634,13 +3631,10 @@ impl LocalProviderManager {
         if let Some(folders) = &self.virtual_folders
             && let Some(path) = entity.path.as_deref()
             && let Ok(list) = folders.get_virtual_folders().await
-            && let Some(lang) = list
-                .iter()
-                .find(|f| {
-                    f.locations
-                        .iter()
-                        .any(|loc| !loc.is_empty() && path.starts_with(loc.as_str()))
-                })
+            // The library owning the path (innermost location, then first by
+            // sort name), not whichever the listing names first: the listing
+            // comes in the file system's order.
+            && let Some(lang) = ferrofin_model::entities_media::owning_library(&list, None, Some(path))
                 .and_then(|f| f.library_options.as_ref())
                 .and_then(|o| usable(o.metadata_country_code.as_deref()))
         {
