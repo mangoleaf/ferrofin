@@ -132,14 +132,15 @@ struct LibraryRename {
 /// C# `LibraryStructureController.ReplaceIds`: maps each GUID in `values`
 /// through `map` (a later pair wins, as a later dictionary write does), keeping
 /// the value's spelling (`D` when it has a dash, `N` otherwise) and dropping a
-/// repeat of an id already kept. A value that is not a GUID is left alone.
-/// `None` when nothing changed.
+/// repeat of an id already kept. Values are parsed as `Guid.TryParse` parses
+/// them ([`parse_dotnet_guid`](ferrofin_util::guid_extensions::parse_dotnet_guid));
+/// a value that is not a GUID is left alone. `None` when nothing changed.
 fn replace_ids(values: &[String], map: &[(uuid::Uuid, uuid::Uuid)]) -> Option<Vec<String>> {
     let mut rewritten = Vec::with_capacity(values.len());
     let mut seen = std::collections::HashSet::new();
     let mut touched = false;
     for value in values {
-        let Ok(parsed) = uuid::Uuid::parse_str(value) else {
+        let Some(parsed) = ferrofin_util::guid_extensions::parse_dotnet_guid(value) else {
             rewritten.push(value.clone());
             continue;
         };
@@ -2295,6 +2296,31 @@ mod tests {
         assert_eq!(
             super::replace_ids(&[new.hyphenated().to_string()], &map),
             None
+        );
+    }
+
+    /// `ReplaceIds` parses with `Guid.TryParse`: padding is trimmed and the
+    /// `(…)` form is a GUID (rewritten as `D`, as it holds a dash);
+    /// `urn:uuid:` is not one, so it stays. (The `{0x…}` form holds commas,
+    /// so it never survives the list's `,` split.)
+    #[rstest::rstest]
+    #[case::padded(
+        " 00000000-0000-0000-0000-000000000001 ",
+        Some("00000000-0000-0000-0000-000000000002")
+    )]
+    #[case::parenthesized(
+        "(00000000-0000-0000-0000-000000000001)",
+        Some("00000000-0000-0000-0000-000000000002")
+    )]
+    #[case::urn_is_not_a_guid("urn:uuid:00000000-0000-0000-0000-000000000001", None)]
+    fn replace_ids_parses_values_as_dotnet_does(
+        #[case] value: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        let map = [(uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2))];
+        assert_eq!(
+            super::replace_ids(&[value.to_owned()], &map),
+            expected.map(|v| vec![v.to_owned()])
         );
     }
 
