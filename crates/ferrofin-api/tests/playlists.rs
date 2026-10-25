@@ -374,6 +374,7 @@ struct RecordingPlaylists {
     added: Mutex<Option<AddCall>>,
     removed: Mutex<Option<RemoveCall>>,
     moved: Mutex<Option<MoveCall>>,
+    updated: Mutex<Option<ferrofin_model::playlists::PlaylistUpdateRequest>>,
     access: PlaylistAccess,
     shares: Vec<ferrofin_model::entities_media::PlaylistUserPermissions>,
 }
@@ -385,6 +386,7 @@ impl Default for RecordingPlaylists {
             added: Mutex::default(),
             removed: Mutex::default(),
             moved: Mutex::default(),
+            updated: Mutex::default(),
             access: PlaylistAccess {
                 level: PlaylistAccessLevel::Owner,
                 open_access: false,
@@ -429,8 +431,9 @@ impl PlaylistManager for RecordingPlaylists {
     }
     async fn update_playlist(
         &self,
-        _request: &ferrofin_model::playlists::PlaylistUpdateRequest,
+        request: &ferrofin_model::playlists::PlaylistUpdateRequest,
     ) -> Result<(), ServiceError> {
+        *self.updated.lock().unwrap() = Some(request.clone());
         Ok(())
     }
     async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
@@ -730,6 +733,57 @@ async fn create_playlist_rejects_bodies_upstream_binding_refuses() {
         let (status, _) = send(app, "POST", uri, Body::from(body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
         assert!(pl.created.lock().unwrap().is_none(), "{uri} {body}");
+    }
+}
+
+/// A `Users` entry binds through upstream's `PlaylistUserPermissions(Guid
+/// userId, bool canEdit = false)` constructor on create and update alike: a
+/// missing `CanEdit` is `false`, a missing or null `UserId` the empty GUID,
+/// and a null `CanEdit` is a 400. Measured on a live Jellyfin 12.2.
+#[tokio::test]
+async fn playlist_users_entries_bind_through_the_constructor_defaults() {
+    use ferrofin_model::entities_media::PlaylistUserPermissions as Share;
+    let users = format!(
+        r#"[{{"UserId":"{}"}},{{"CanEdit":true}},{{}},{{"UserId":null,"CanEdit":true}}]"#,
+        USER_ID.simple()
+    );
+    let expected = vec![
+        Share::new(USER_ID, false),
+        Share::new(Uuid::nil(), true),
+        Share::new(Uuid::nil(), false),
+        Share::new(Uuid::nil(), true),
+    ];
+
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let body = format!(r#"{{"Name":"Roadtrip","Users":{users}}}"#);
+    let (status, _) = send(app, "POST", "/Playlists", Body::from(body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let created = pl.created.lock().unwrap().clone().expect("recorded");
+    assert_eq!(created.users, expected);
+
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let uri = format!("/Playlists/{PLAYLIST_ID}");
+    let body = format!(r#"{{"Users":{users}}}"#);
+    let (status, _) = send(app, "POST", &uri, Body::from(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let updated = pl.updated.lock().unwrap().clone().expect("recorded");
+    assert_eq!(updated.users, Some(expected));
+
+    for (uri, body) in [
+        (
+            "/Playlists".to_owned(),
+            r#"{"Name":"Roadtrip","Users":[{"CanEdit":null}]}"#,
+        ),
+        (uri, r#"{"Users":[{"CanEdit":null}]}"#),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", &uri, Body::from(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+        assert!(pl.created.lock().unwrap().is_none(), "{uri} {body}");
+        assert!(pl.updated.lock().unwrap().is_none(), "{uri} {body}");
     }
 }
 

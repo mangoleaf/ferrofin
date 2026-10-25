@@ -1257,6 +1257,17 @@ pub(crate) async fn seed_playlist_owner(db: &Database, playlist: Uuid, owner: Uu
     .expect("seed playlist owner");
 }
 
+/// Test-only: drops `playlist`'s share rows (not its `Data`), so a test can
+/// prove the boot re-import brings them back from `Data`.
+#[cfg(test)]
+pub(crate) async fn clear_playlist_shares(db: &Database, playlist: Uuid) {
+    sqlx::query(r#"DELETE FROM "FerrofinPlaylistShares" WHERE "PlaylistId" = ?1"#)
+        .bind(guid_to_db(playlist))
+        .execute(db.writer())
+        .await
+        .expect("clear playlist shares");
+}
+
 /// Test-only: makes every write of `item`'s `Data` abort (a `BEFORE UPDATE OF
 /// "Data"` trigger), to prove an edit that changes no `Data` key never writes
 /// it, or to fail an edit at its `Data` sync.

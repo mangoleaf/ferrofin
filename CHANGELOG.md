@@ -63,6 +63,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Accept a playlist `Users` entry without `CanEdit` or `UserId` on `POST /Playlists` and
+  `POST /Playlists/{id}`, as Jellyfin does: a missing `CanEdit` shares read-only, a missing
+  or null `UserId` is the empty GUID; a `null` `CanEdit` is still a `400`
 - Pin the order a display-preferences row's home sections are read in to `Order`, then `Id`:
   on a database adopted from Jellyfin, which keeps every save's rows, `GET /DisplayPreferences`
   answers the newest section of each order, as Jellyfin does. SQLite already returned them in

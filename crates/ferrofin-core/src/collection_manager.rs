@@ -4508,6 +4508,60 @@ mod tests {
         assert!(stranger.open_access);
     }
 
+    /// A `Users` entry without a user id binds as the empty GUID (upstream's
+    /// `PlaylistUserPermissions` constructor default), and upstream stores and
+    /// lists that share as given. It is kept here too: listed, written into
+    /// `Data`, and brought back by the boot re-import.
+    #[tokio::test]
+    async fn an_empty_guid_share_is_stored_listed_and_survives_a_restart() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+
+        let db = test_db().await;
+        let (mgr, _root) = playlist_manager(&db).await;
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Shared".to_owned()),
+                user_id: Uuid::new_v4(),
+                users: vec![PlaylistUserPermissions::new(Uuid::nil(), true)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        let expected = vec![PlaylistUserPermissions::new(Uuid::nil(), true)];
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            expected
+        );
+        let data = crate::test_support::fetch_item(&db, playlist_id)
+            .await
+            .data
+            .expect("Data");
+        let data: serde_json::Value = serde_json::from_str(&data).expect("json");
+        assert_eq!(
+            data["Shares"],
+            serde_json::json!([{"UserId": "00000000000000000000000000000000", "CanEdit": true}])
+        );
+
+        // Only `Data` holds the share now: the re-import must bring it back.
+        crate::item_data::clear_playlist_shares(&db, playlist_id).await;
+        assert!(
+            mgr.get_playlist_shares(playlist_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        crate::item_data::reconcile_playlist_permissions(&db)
+            .await
+            .expect("boot re-import");
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            expected
+        );
+    }
+
     /// The stored `SortName` of row `id` (the raw row, no read-time derivation).
     async fn stored_sort_name(db: &ferrofin_db::Database, id: Uuid) -> Option<String> {
         crate::test_support::fetch_item(db, id).await.sort_name

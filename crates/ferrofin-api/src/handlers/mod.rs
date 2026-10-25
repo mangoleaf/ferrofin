@@ -1584,7 +1584,7 @@ pub const VERIFIED: &[Verified] = &[
                new_playlist_folder_and_id, then report_item_added for AddChild's \
                ItemAdded; playlist_items for AddToPlaylistInternal and \
                Playlist.GetPlaylistItems)",
-        date: "2026-10-24",
+        date: "2026-10-25",
         divergences: &[
             "A request with neither a body nor a name query is a 400; upstream's \
          GetValidFilename(null) throws a NullReferenceException (500). Jellyfin bug not \
@@ -1613,9 +1613,6 @@ pub const VERIFIED: &[Verified] = &[
             "A malformed id in the ids query is a 400; upstream's \
          CommaDelimitedCollectionModelBinder drops it, so an all-malformed list falls back \
          to the body's Ids. Fix path: gl-884.",
-            "A Users entry without CanEdit or UserId is a 400; upstream binds \
-         PlaylistUserPermissions through its constructor, defaulting them to false and the \
-         empty GUID. Fix path: gl-885.",
             "A user named twice in Users keeps one share, with the last entry's CanEdit; \
          upstream stores and lists both, and grants edit if either has CanEdit. Fix path: \
          gl-886.",
@@ -1623,6 +1620,44 @@ pub const VERIFIED: &[Verified] = &[
          inferred, an API key that names no user) and 403 (another user's id without the \
          administrator role) bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Playlists/{itemId}",
+        upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
+        upstream_method: "UpdatePlaylist",
+        ferrofin: "handlers/playlists.rs update_playlist (get_playlist_access + require_edit: \
+               GetPlaylistForUser and the owner-or-editing-share check) → ferrofin-model \
+               playlists.rs UpdatePlaylistDto, entities_media.rs PlaylistUserPermissions \
+               (constructor defaults) → ferrofin-core collection_manager.rs \
+               FerrofinPlaylistManager::update_playlist (PlaylistManager.UpdatePlaylist: \
+               playlist_items for the Ids' AddToPlaylistInternal, rename_named_item_in, \
+               OpenAccess, share_playlist_in, sync_container_data_in, queue_refresh)",
+        date: "2026-10-25",
+        divergences: &[
+            "Ids, Name, Users and IsPublic are saved in one transaction with the Data sync; \
+         upstream saves the cleared entries before it adds the new ones and then saves the \
+         rest, so a failure part way leaves a partial update. Jellyfin bug not ported.",
+            "An Ids entry naming a container that holds this playlist expands that container \
+         with this playlist's entries from before the update; upstream clears them first, so \
+         it expands without them. The playlist's own id expands to nothing on both.",
+            "When the entries change, the members are re-rated before the refresh is queued; \
+         upstream re-rates them in that refresh (MetadataService's UpdateRatingToItems). The \
+         ratings end the same.",
+            "SavePlaylistFile has no caller: a playlist file the scan found has no owner and \
+         no editing share, so an update of it is a 403 here as upstream, and no update \
+         reaches a file.",
+            "A user named twice in Users keeps one share, with the last entry's CanEdit; \
+         upstream stores and lists both, and grants edit if either has CanEdit. Fix path: \
+         gl-886.",
+            "A body Ids sent as a comma-delimited string is a 400; upstream's \
+         JsonCommaDelimitedCollectionConverterFactory splits it and drops entries that do \
+         not parse (so \"abc\" clears the playlist). Fix path: gl-883.",
+            "The 404 (no playlist the caller can see) and 403 (no editing share) bodies are \
+         Ferrofin's error shape, not upstream's (a \"Playlist not found\" string and an \
+         empty Forbid). Fix path: gl-666.",
         ],
         refs: &[],
     },
