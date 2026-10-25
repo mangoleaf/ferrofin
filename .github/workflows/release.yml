@@ -29,6 +29,29 @@ on:
 permissions: {} # each job grants only what it needs
 
 jobs:
+  # The CI run create-release requires may be days old: an advisory published since then
+  # blocks the release too. A job of its own, so the tools it installs never run beside
+  # create-release's RELEASE_TOKEN.
+  release-advisories:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        # Same master-commit pin as binaries (see the note there).
+        with:
+          toolchain: 1.98.1 # = rust-toolchain.toml
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked check advisories
+
   # ── the manual gate: derive next version, tag, push (mirrors create-release) ──
   create-release:
     # main (patch releases of the released line) or the current release/vX.Y.Z branch
@@ -36,6 +59,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' &&
       (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/'))
+    needs: release-advisories
     runs-on: ubuntu-latest
     permissions:
       contents: read # the tag push uses RELEASE_TOKEN, not GITHUB_TOKEN

@@ -68,7 +68,7 @@ zip = { workspace = true, features = ["time"] }   # backup archives; `time` stam
 [dev-dependencies]
 # Self dev-dependency so unit + integration tests build with the `test-util`
 # fakes (the composition-root deps are unavailable at this layer by design).
-ferrofin-api = { path = ".", features = ["test-util"] }
+ferrofin-api = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true
 serde_json.workspace = true
 serde.workspace = true

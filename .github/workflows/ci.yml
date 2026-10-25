@@ -166,6 +166,38 @@ jobs:
           df -h /
           du -sh target || true # absent when the job failed before building
 
+  # The supply chain, without a build: cargo-deny checks the crates the workspace builds
+  # against the RustSec advisory database and deny.toml's license, ban and source rules,
+  # cargo-machete looks for declared but unused dependencies, and check-workspace-deps.py for
+  # a dependency a crate declares itself instead of taking the workspace's. Outside `lint`, so
+  # an advisory published today turns every branch red without blocking merges; it does block
+  # a release, which needs this whole run green and re-checks the advisories before tagging
+  # (release.yml).
+  dependencies:
+    if: *not-release-pr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      # cargo-deny reads the crate graph through `cargo metadata`. Same master-commit pin
+      # as clippy (see the note there).
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: 1.98.1 # = rust-toolchain.toml
+      # Same release-tag pin as lint-tests (see the note there): never a per-tool tag.
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.20.2,cargo-machete@0.9.2
+      # Each check runs whatever the one before found, so an advisory never hides the rest.
+      - run: cargo deny --locked check
+      - if: ${{ !cancelled() }}
+        run: cargo machete apps crates # vendor/ holds upstream code as published
+      - if: ${{ !cancelled() }}
+        run: scripts/check-workspace-deps.py
+
   lint:
     # Renamed as well as skipped in the release PR's run (see benchmark-report): a skipped
     # check named `lint` on the commit could pass for the push run's failed one.

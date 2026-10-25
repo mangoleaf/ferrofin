@@ -84,7 +84,7 @@ tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compressio
 # Decoders for the response-compression tests only (the server never decodes a
 # response it just encoded). Streaming readers validate the wire response.
 flate2 = "1.1.10"
-zip = { version = "8", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-api, which adds `time`)
+zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-api, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
 sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
 brotli = "9.0.0"
@@ -165,7 +165,7 @@ prometheus = { version = "0.14", default-features = false }
 # so the list is the sandbox's grant (`threads`, `gc` with exceptions,
 # `component-model-async` and `stack-switching` stay off, and so do the
 # profiling, cache, coredump and pooling extras). Only WASIp2 is linked.
-wasmtime = { version = "49.0.0", default-features = false, features = [
+wasmtime = { version = "49.0.4", default-features = false, features = [
     "addr2line",
     "anyhow",
     "backtrace",
@@ -177,7 +177,7 @@ wasmtime = { version = "49.0.0", default-features = false, features = [
     "std",
 ] }
 # Locked-down empty WASI ctx (no preopens/sockets) so std guests link.
-wasmtime-wasi = { version = "49.0.0", default-features = false, features = ["p2"] }
+wasmtime-wasi = { version = "49.0.4", default-features = false, features = ["p2"] }
 wat = "1.259.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────
