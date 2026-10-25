@@ -55,16 +55,25 @@ pub trait SourceFetcher: Send + Sync {
         self.fetch(url).await.map(String::into_bytes)
     }
 
-    /// Fetches an XMLTV listings document: [`fetch`](Self::fetch), except that
-    /// a gzipped source is decompressed. Port of
-    /// `XmlTvListingsProvider.UnzipIfNeededAndCopy`, which decides on the URL
-    /// after redirects, or the path, with any query stripped: `.gz` or
-    /// `.gzip`.
+    /// Opens an XMLTV listings document and answers its bytes as they arrive,
+    /// decompressed when the source is gzipped. Port of `GetXml`'s download
+    /// and `UnzipIfNeededAndCopy` (v12.2 XmlTvListingsProvider.cs:100-123,
+    /// 175-202), which stream the response or the file into the cache; a
+    /// source is gzipped when the URL after redirects, or the path, with any
+    /// query stripped ends in `.gz` or `.gzip`. A failure status is an error
+    /// (`EnsureSuccessStatusCode`).
     ///
-    /// The default is plain [`fetch`](Self::fetch), so a text-only fake keeps
-    /// working; the real fetcher decompresses.
-    async fn fetch_listings(&self, url: &str) -> Result<String, ServiceError> {
-        self.fetch(url).await
+    /// The default is [`open`](Self::open) with that status check, so a
+    /// text-only fake keeps working; the real fetcher decompresses.
+    async fn fetch_listings(&self, url: &str) -> Result<Box<dyn BodyChunks>, ServiceError> {
+        let opened = self.open(url, None).await?;
+        if !opened.is_success() {
+            return Err(ServiceError::backend(format!(
+                "fetch {url} answered {}",
+                opened.status
+            )));
+        }
+        Ok(opened.body)
     }
 
     /// Sends `request` and answers its status and body, whatever the status.
@@ -546,9 +555,31 @@ impl ReqwestFetcher {
     }
 }
 
-/// Whether `url` names a remote `http(s)://` source (vs. a local path).
-fn is_http(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
+/// Whether `url` names a remote source rather than a local path, by upstream's
+/// rule everywhere it makes that choice: it starts with `http`, ignoring ASCII
+/// case (`StartsWith("http", StringComparison.OrdinalIgnoreCase)`, v12.2
+/// M3uParser.cs:52, XmlTvListingsProvider.cs:76,343).
+pub(crate) fn is_http(url: &str) -> bool {
+    url.get(..4)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
+}
+
+/// `error` as a `404` when it is a local file that does not exist, the way
+/// upstream's middleware answers the `FileNotFoundException` or
+/// `DirectoryNotFoundException` that `AsyncFile.OpenRead` throws
+/// (`ExceptionMiddleware.GetStatusCode`); any other error is returned as it is.
+pub(crate) fn missing_file_is_not_found(error: ServiceError) -> ServiceError {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(current) = cause {
+        if current
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        {
+            return ServiceError::not_found(error.to_string());
+        }
+        cause = current.source();
+    }
+    error
 }
 
 /// Whether a listings source is gzipped, as `UnzipIfNeededAndCopy` decides:
@@ -564,28 +595,74 @@ fn is_gzip_name(name: &str) -> bool {
         })
 }
 
-/// Decompresses a gzipped listings document and decodes it as UTF-8 (lossily,
-/// like `.text()` on a response that names no charset). Every gzip member is
-/// read, as .NET's `GZipStream` reads concatenated members. It runs on the
-/// blocking pool, because an EPG can run to tens of megabytes.
-async fn gunzip<B>(name: &str, bytes: B) -> Result<String, ServiceError>
-where
-    B: AsRef<[u8]> + Send + 'static,
-{
-    let context = format!("extract gz {name}");
-    let text = tokio::task::spawn_blocking(move || {
-        let mut text = Vec::new();
-        std::io::Read::read_to_end(
-            &mut flate2::read::MultiGzDecoder::new(bytes.as_ref()),
-            &mut text,
-        )
-        .map(|_| text)
-    })
-    .await
-    .map_err(|e| LiveTvError::io(context.clone(), std::io::Error::other(e)))?
-    .map_err(|e| LiveTvError::io(context, e))?;
-    Ok(String::from_utf8(text)
-        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+/// How much compressed input [`GunzipBody`] hands its decoder at once. Deflate
+/// expands at most about 1032 to 1, so the text one call answers stays near a
+/// megabyte however the transport chunks the body.
+const GUNZIP_SLICE: usize = 1024;
+
+/// A gzipped body, decompressed as it arrives. Every gzip member is read, as
+/// .NET's `GZipStream` reads concatenated members.
+struct GunzipBody {
+    /// The compressed body.
+    compressed: Box<dyn BodyChunks>,
+    /// The compressed chunk being decompressed; `pending[at..]` is not fed yet.
+    pending: Vec<u8>,
+    /// How much of `pending` the decoder has had.
+    at: usize,
+    /// The decoder, writing what it extracts into its `Vec`; `None` once the
+    /// body has ended.
+    decoder: Option<flate2::write::MultiGzDecoder<Vec<u8>>>,
+    /// The URL after redirects, or the path, for errors.
+    name: String,
+}
+
+impl GunzipBody {
+    fn new(compressed: Box<dyn BodyChunks>, name: String) -> Self {
+        Self {
+            compressed,
+            pending: Vec::new(),
+            at: 0,
+            decoder: Some(flate2::write::MultiGzDecoder::new(Vec::new())),
+            name,
+        }
+    }
+}
+
+#[async_trait]
+impl BodyChunks for GunzipBody {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ServiceError> {
+        use std::io::Write as _;
+        loop {
+            let Some(decoder) = self.decoder.as_mut() else {
+                return Ok(None);
+            };
+            let ended = if self.at < self.pending.len() {
+                let end = self.pending.len().min(self.at + GUNZIP_SLICE);
+                decoder
+                    .write_all(&self.pending[self.at..end])
+                    .and_then(|()| decoder.flush())
+                    .map_err(|e| LiveTvError::io(format!("extract gz {}", self.name), e))?;
+                self.at = end;
+                false
+            } else if let Some(chunk) = self.compressed.next_chunk().await? {
+                self.pending = chunk;
+                self.at = 0;
+                continue;
+            } else {
+                decoder
+                    .try_finish()
+                    .map_err(|e| LiveTvError::io(format!("extract gz {}", self.name), e))?;
+                true
+            };
+            let out = std::mem::take(decoder.get_mut());
+            if ended {
+                self.decoder = None;
+            }
+            if !out.is_empty() {
+                return Ok(Some(out));
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -624,6 +701,15 @@ impl SourceFetcher for ReqwestFetcher {
             let file = tokio::fs::File::open(path)
                 .await
                 .map_err(|e| LiveTvError::io(format!("read {path}"), e))?;
+            // `AsyncFile.OpenRead` refuses a directory (`UnauthorizedAccessException`),
+            // where a Unix `open` succeeds and only the first read fails.
+            if file.metadata().await.is_ok_and(|meta| meta.is_dir()) {
+                return Err(LiveTvError::io(
+                    format!("read {path}"),
+                    std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory"),
+                )
+                .into());
+            }
             Ok(SourceBody {
                 status: 200,
                 body: Box::new(FileBody {
@@ -634,31 +720,24 @@ impl SourceFetcher for ReqwestFetcher {
         }
     }
 
-    async fn fetch_listings(&self, url: &str) -> Result<String, ServiceError> {
-        if is_http(url) {
-            let resp = self.get(url, Deadline::Caller).await?;
-            let final_url = resp.url().to_string();
-            if !is_gzip_name(&final_url) {
-                return resp
-                    .text()
-                    .await
-                    .map_err(|e| LiveTvError::http(format!("read {url}"), e).into());
-            }
-            let bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| LiveTvError::http(format!("read {url}"), e))?;
-            gunzip(&final_url, bytes).await
+    async fn fetch_listings(&self, url: &str) -> Result<Box<dyn BodyChunks>, ServiceError> {
+        let (name, body): (String, Box<dyn BodyChunks>) = if is_http(url) {
+            let response = self.get(url, Deadline::Caller).await?;
+            let final_url = response.url().to_string();
+            let body = Box::new(HttpBody {
+                response,
+                url: url.to_owned(),
+            });
+            (final_url, body)
         } else {
-            let path = url.strip_prefix("file://").unwrap_or(url);
-            if !is_gzip_name(path) {
-                return self.fetch(url).await;
-            }
-            let bytes = tokio::fs::read(path)
-                .await
-                .map_err(|e| LiveTvError::io(format!("read {path}"), e))?;
-            gunzip(path, bytes).await
-        }
+            let path = url.strip_prefix("file://").unwrap_or(url).to_owned();
+            (path, self.open(url, None).await?.body)
+        };
+        Ok(if is_gzip_name(&name) {
+            Box::new(GunzipBody::new(body, name))
+        } else {
+            body
+        })
     }
 
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, ServiceError> {
@@ -733,6 +812,23 @@ mod tests {
             .expect("fetch");
         assert_eq!(body, "#EXTM3U\n");
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// `StartsWith("http", StringComparison.OrdinalIgnoreCase)`: the scheme in
+    /// any case is remote; a path, `file://` and anything shorter are not.
+    #[rstest::rstest]
+    #[case("http://guide/x.xml", true)]
+    #[case("HTTP://guide/x.xml", true)]
+    #[case("Http://guide/x.xml", true)]
+    #[case("https://guide/x.xml", true)]
+    #[case("/srv/guide.xml", false)]
+    #[case("file:///srv/guide.xml", false)]
+    #[case("C:\\guide.xml", false)]
+    #[case("htt", false)]
+    #[case("", false)]
+    #[case("htté://x", false)]
+    fn a_source_is_remote_when_it_starts_with_http(#[case] url: &str, #[case] remote: bool) {
+        assert_eq!(super::is_http(url), remote, "{url}");
     }
 
     #[tokio::test]
@@ -1055,6 +1151,92 @@ mod tests {
         encoder.finish().expect("finish")
     }
 
+    /// A listings document read whole, for the assertions.
+    async fn listings_text(fetcher: &dyn SourceFetcher, url: &str) -> Result<String, ServiceError> {
+        let mut body = fetcher.fetch_listings(url).await?;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next_chunk().await? {
+            bytes.extend(chunk);
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A body served a few bytes at a time.
+    struct GzPieces(std::collections::VecDeque<Vec<u8>>);
+
+    #[async_trait::async_trait]
+    impl super::BodyChunks for GzPieces {
+        async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>, ServiceError> {
+            Ok(self.0.pop_front())
+        }
+    }
+
+    /// `UnzipIfNeededAndCopy` gunzips the stream as it is copied: a gzipped
+    /// body that arrives in pieces cut anywhere, members included, becomes
+    /// the same document, and nothing is held but the piece in hand.
+    #[tokio::test]
+    async fn a_gzipped_body_is_decompressed_as_it_arrives() {
+        let mut members = gzipped("<tv><channel id=\"a\"/>");
+        members.extend(gzipped("</tv>"));
+        let pieces = members.chunks(3).map(<[u8]>::to_vec).collect();
+        let mut body =
+            super::GunzipBody::new(Box::new(GzPieces(pieces)), "guide.xml.gz".to_owned());
+        let mut text = Vec::new();
+        while let Some(chunk) = super::BodyChunks::next_chunk(&mut body)
+            .await
+            .expect("gunzip")
+        {
+            assert!(!chunk.is_empty());
+            text.extend(chunk);
+        }
+        assert_eq!(text, b"<tv><channel id=\"a\"/></tv>");
+        assert!(
+            super::BodyChunks::next_chunk(&mut body)
+                .await
+                .expect("ended")
+                .is_none()
+        );
+    }
+
+    /// A gzip stream cut short is an extraction error, not a shorter guide.
+    #[tokio::test]
+    async fn a_truncated_gzipped_body_fails() {
+        let mut gz = gzipped("<tv><channel id=\"a\"/></tv>");
+        gz.truncate(gz.len() - 6);
+        let mut body =
+            super::GunzipBody::new(Box::new(GzPieces([gz].into())), "guide.xml.gz".to_owned());
+        let mut outcome = Ok(Some(Vec::new()));
+        while matches!(outcome, Ok(Some(_))) {
+            outcome = super::BodyChunks::next_chunk(&mut body).await;
+        }
+        assert!(outcome.is_err(), "{outcome:?}");
+    }
+
+    /// One compressed chunk that expands a thousandfold is handed out a slice
+    /// of input at a time, never whole.
+    #[tokio::test]
+    async fn a_highly_compressed_chunk_is_extracted_in_bounded_pieces() {
+        use std::io::Write as _;
+        const TEXT_BYTES: usize = 16 * 1024 * 1024;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![b' '; TEXT_BYTES])
+            .expect("compress");
+        let gz = encoder.finish().expect("finish");
+        let mut body =
+            super::GunzipBody::new(Box::new(GzPieces([gz].into())), "guide.xml.gz".to_owned());
+        let (mut total, mut largest) = (0, 0);
+        while let Some(chunk) = super::BodyChunks::next_chunk(&mut body)
+            .await
+            .expect("gunzip")
+        {
+            total += chunk.len();
+            largest = largest.max(chunk.len());
+        }
+        assert_eq!(total, TEXT_BYTES);
+        assert!(largest <= 2 * 1024 * 1024, "one piece was {largest} bytes");
+    }
+
     /// A guide gzipped as several concatenated members (as some EPG builders
     /// write them) is read in full, as `GZipStream` reads it.
     #[tokio::test]
@@ -1065,8 +1247,7 @@ mod tests {
         members.extend(gzipped("</tv>"));
         tokio::fs::write(&gz, members).await.expect("write");
         assert_eq!(
-            ReqwestFetcher::new()
-                .fetch_listings(gz.to_str().unwrap())
+            listings_text(&ReqwestFetcher::new(), gz.to_str().unwrap())
                 .await
                 .expect("gz"),
             "<tv></tv>"
@@ -1083,8 +1264,7 @@ mod tests {
             .expect("write");
         let fetcher = ReqwestFetcher::new();
         assert_eq!(
-            fetcher
-                .fetch_listings(gz.to_str().unwrap())
+            listings_text(&fetcher, gz.to_str().unwrap())
                 .await
                 .expect("gz"),
             "<tv></tv>"
@@ -1092,8 +1272,7 @@ mod tests {
         let plain = dir.path().join("guide.xml");
         tokio::fs::write(&plain, "<tv/>").await.expect("write");
         assert_eq!(
-            fetcher
-                .fetch_listings(plain.to_str().unwrap())
+            listings_text(&fetcher, plain.to_str().unwrap())
                 .await
                 .expect("plain"),
             "<tv/>"
@@ -1102,8 +1281,7 @@ mod tests {
         let fake = dir.path().join("fake.xml.gz");
         tokio::fs::write(&fake, "<tv/>").await.expect("write");
         assert!(
-            fetcher
-                .fetch_listings(fake.to_str().unwrap())
+            listings_text(&fetcher, fake.to_str().unwrap())
                 .await
                 .is_err()
         );
@@ -1141,8 +1319,7 @@ mod tests {
             b"HTTP/1.1 302 Found\r\nLocation: /guide.xml.gz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
             ok,
         ]);
-        let text = ReqwestFetcher::new()
-            .fetch_listings(&format!("{base}/epg?id=1"))
+        let text = listings_text(&ReqwestFetcher::new(), &format!("{base}/epg?id=1"))
             .await
             .expect("fetch");
         assert_eq!(text, "<tv><channel id=\"a\"/></tv>");
@@ -1161,7 +1338,7 @@ mod tests {
             }
         }
         assert_eq!(
-            TextOnly.fetch_listings("x.gz").await.expect("fetch"),
+            listings_text(&TextOnly, "x.gz").await.expect("fetch"),
             "body of x.gz"
         );
     }
@@ -1461,7 +1638,7 @@ mod tests {
         .await;
         let fetcher = short_timeout_fetcher();
         let text =
-            tokio::time::timeout(GUARD, fetcher.fetch_listings(&format!("{base}/guide.xml")))
+            tokio::time::timeout(GUARD, listings_text(&fetcher, &format!("{base}/guide.xml")))
                 .await
                 .expect("the listings download finished");
         assert_eq!(text.expect("listings"), "<tv></tv>");

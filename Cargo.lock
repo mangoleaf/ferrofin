@@ -1640,6 +1640,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "crc32fast",
+ "encoding_rs",
  "ferrofin-common",
  "ferrofin-core",
  "ferrofin-db",

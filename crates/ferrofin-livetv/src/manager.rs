@@ -62,7 +62,8 @@ use crate::projection::{
 };
 use crate::schedules_direct::{SchedulesDirect, SdChannel, SdProgram};
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
-use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, parse_xmltv_where};
+use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_where};
+use crate::xmltv_cache::XmlTvDocument;
 
 /// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
 /// is 999 before 3.32, 32766 after); multi-row inserts chunk to stay under it.
@@ -446,6 +447,9 @@ pub struct FerrofinLiveTvManager {
     /// apart from the capture retries in `retry_counts` — see
     /// [`FerrofinLiveTvManager::retry_unread_timer`].
     read_retry_counts: Arc<Mutex<HashMap<String, u32>>>,
+    /// The timers whose fire is checking for, or starting, their capture —
+    /// see [`FiringClaim`].
+    firing: Arc<Mutex<HashSet<String>>>,
     /// The stored rows already reported as unparseable, by table — see
     /// [`FerrofinLiveTvManager::parse_stored_row`].
     unparseable_rows: Arc<Mutex<HashMap<&'static str, HashSet<String>>>>,
@@ -459,6 +463,9 @@ pub struct FerrofinLiveTvManager {
     /// The NFO options' `ReleaseDateFormat`, for a recording's sidecar NFO
     /// ([`with_release_date_format`](Self::with_release_date_format)).
     release_date_format: crate::recording_metadata::ReleaseDateFormat,
+    /// The server's `PreferredMetadataLanguage`, read live
+    /// ([`with_metadata_language`](Self::with_metadata_language)).
+    metadata_language: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     /// Serializes "join or open", so two clients tuning the same channel at
     /// once cannot both miss the join and both dial the tuner.
     ///
@@ -631,7 +638,7 @@ enum GuideSource {
     /// An XMLTV document and its `<channel>` list; the airings are read in the
     /// write half (`insert_programs`).
     XmlTv {
-        body: String,
+        document: XmlTvDocument,
         channels: Vec<XmltvChannel>,
     },
     /// Schedules Direct: the lineup's stations and the airings of each station
@@ -875,19 +882,61 @@ impl CategoryClasses {
     }
 }
 
-/// Parses an XMLTV document on the blocking pool, keeping the programmes
-/// `keep` accepts, and hands the document back with the result.
+/// A fired timer's claim on its capture, held from the in-progress check
+/// until `record_stream` returns, which is after the whole capture (hours,
+/// for a long showing) or its failure. A second fire of the same timer
+/// meanwhile finds the claim taken and stands down. Dropping the claim, a
+/// panic's unwind included, releases the timer.
+struct FiringClaim {
+    firing: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl FiringClaim {
+    /// Claims timer `id`, unless a fire of it already holds the claim.
+    fn take(firing: &Arc<Mutex<HashSet<String>>>, id: &str) -> Option<Self> {
+        firing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_owned())
+            .then(|| Self {
+                firing: Arc::clone(firing),
+                id: id.to_owned(),
+            })
+    }
+}
+
+impl Drop for FiringClaim {
+    fn drop(&mut self) {
+        self.firing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
+/// Reads an XMLTV document from its file on the blocking pool, keeping the
+/// programmes `keep` accepts, and hands the document back with the result.
 ///
 /// A large IPTV guide is hundreds of megabytes and takes seconds to parse, and
 /// a guide refresh reads each document twice (channels, then the bound
-/// channels' airings), so neither read runs on a runtime worker.
+/// channels' airings), so neither read runs on a runtime worker. The file is
+/// read as a stream, as `XmlTvReader` reads it (Jellyfin.XmlTv
+/// `XmlTvReader.GetChannels`/`GetProgrammes`), so neither read holds it whole.
 async fn parse_guide(
-    body: String,
+    document: XmlTvDocument,
+    language: Option<String>,
     keep: impl FnMut(&XmltvProgramme) -> bool + Send + 'static,
-) -> Result<(String, Xmltv), ServiceError> {
+) -> Result<(XmlTvDocument, Xmltv), ServiceError> {
     tokio::task::spawn_blocking(move || {
-        let guide = parse_xmltv_where(&body, keep);
-        (body, guide)
+        let guide = match document.reader() {
+            Ok(reader) => read_xmltv_where(reader, language.as_deref(), keep),
+            Err(e) => Xmltv {
+                error: Some(format!("the XMLTV document could not be read: {e}")),
+                ..Xmltv::default()
+            },
+        };
+        (document, guide)
     })
     .await
     .map_err(|e| ServiceError::Backend(format!("XMLTV parse task failed: {e}")))
@@ -956,10 +1005,12 @@ impl FerrofinLiveTvManager {
             armed_timers: Arc::new(Mutex::new(HashMap::new())),
             retry_counts: Arc::new(Mutex::new(HashMap::new())),
             read_retry_counts: Arc::new(Mutex::new(HashMap::new())),
+            firing: Arc::new(Mutex::new(HashSet::new())),
             unparseable_rows: Arc::new(Mutex::new(HashMap::new())),
             encoder: None,
             self_writes: None,
             release_date_format: crate::recording_metadata::default_release_date_format(),
+            metadata_language: None,
             open_lock: Arc::new(tokio::sync::Mutex::new(())),
             guide_lock: Arc::new(tokio::sync::Mutex::new(())),
             refresh_generation: Arc::new(AtomicU64::new(0)),
@@ -1008,6 +1059,31 @@ impl FerrofinLiveTvManager {
     ) -> Self {
         self.release_date_format = format;
         self
+    }
+
+    /// Reads the server's `PreferredMetadataLanguage` through `language`, each
+    /// time a guide is read, so a changed setting applies to the next read.
+    /// It is the language an XMLTV guide is read in when its provider names
+    /// none ([`guide_language`](Self::guide_language)). Without one (tests) a
+    /// guide is read with no language.
+    #[must_use]
+    pub fn with_metadata_language(
+        mut self,
+        language: Arc<dyn Fn() -> String + Send + Sync>,
+    ) -> Self {
+        self.metadata_language = Some(language);
+        self
+    }
+
+    /// The language an XMLTV guide is read in: `XmlTvListingsProvider.GetLanguage`
+    /// (v12.2 :53-60), the provider's `PreferredLanguage` unless it is blank,
+    /// else the server's `PreferredMetadataLanguage`.
+    fn guide_language(&self, provider: &ListingsProviderInfo) -> Option<String> {
+        provider
+            .preferred_language
+            .clone()
+            .filter(|language| !language.trim().is_empty())
+            .or_else(|| self.metadata_language.as_ref().map(|language| language()))
     }
 
     /// Sets the on-disk locations the live-stream buffer and DVR recordings use.
@@ -1647,8 +1723,18 @@ impl FerrofinLiveTvManager {
         };
         let before = timer.clone();
         copy_program_into_timer(&program, &mut timer);
-        if timer != before {
+        let changed = timer != before;
+        if changed {
             self.persist_timer(&timer).await?;
+        }
+        // `_timerManager.Update(timer)` → `AddOrUpdateSystemTimer`, for every
+        // live timer whether or not the guide changed it: re-arming is the
+        // backstop for an arm that was lost, and a timer whose showing is under
+        // way fires again at once, which `on_timer_fired` turns away when it is
+        // already recording. An unchanged timer that still has an arm keeps
+        // it: re-arming would aim at the same moment, and it keeps a read
+        // retry's backoff (`retry_unread_timer`) instead of firing at once.
+        if changed || !self.armed_timers_lock().contains_key(id) {
             self.arm_timer(&timer);
         }
         Ok(())
@@ -1775,9 +1861,9 @@ impl FerrofinLiveTvManager {
                 .map(sd_epg_channel)
                 .collect());
         }
-        let body = self.xmltv.get_xml(info).await?;
+        let document = self.xmltv.get_xml(info).await?;
         // The channels only: every airing is dropped as soon as it is read.
-        let (_, guide) = parse_guide(body, |_| false).await?;
+        let (_, guide) = parse_guide(document, self.guide_language(info), |_| false).await?;
         // Upstream's `GetChannels` throws on a bad document, so the mapping
         // dialog shows an error instead of "no channels".
         if let Some(e) = guide.error {
@@ -1806,11 +1892,8 @@ impl FerrofinLiveTvManager {
             ));
         }
         self.xmltv.forget_failure(path);
-        let remote = path
-            .get(..4)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"));
         // `File.Exists`: false for a directory, and for anything unreadable.
-        if !remote
+        if !crate::fetch::is_http(path)
             && !tokio::fs::metadata(path)
                 .await
                 .is_ok_and(|meta| meta.is_file())
@@ -2042,10 +2125,10 @@ impl FerrofinLiveTvManager {
     /// airings inside the window are kept. A large IPTV guide carries
     /// thousands of channels nobody mapped, and parsing them all (upstream
     /// streams its cached file one channel at a time instead) held the whole
-    /// guide in memory. `body` is dropped once its rows are built.
+    /// guide in memory. `document` is dropped once its rows are built.
     async fn insert_programs(
         &self,
-        body: String,
+        document: XmlTvDocument,
         channels: &[XmltvChannel],
         provider: &ListingsProviderInfo,
         window: (DateTime<Utc>, DateTime<Utc>),
@@ -2072,12 +2155,12 @@ impl FerrofinLiveTvManager {
         // `clean_programs` replace the bound channels' airings with a partial
         // set, so the refresh stops before any prune instead.
         let bound: HashSet<String> = by_epg_channel.keys().cloned().collect();
-        let (body, guide) = parse_guide(body, move |prog| {
+        let (document, guide) = parse_guide(document, self.guide_language(provider), move |prog| {
             bound.contains(&prog.channel_id)
                 && Self::in_guide_window(prog, window_start, window_end)
         })
         .await?;
-        drop(body);
+        drop(document);
         if let Some(e) = guide.error {
             return Err(ServiceError::Backend(format!(
                 "the guide document became unreadable on its second read: {e}"
@@ -2261,17 +2344,18 @@ impl FerrofinLiveTvManager {
             // an empty download never gets here: `get_xml` treats it as a failed
             // download and answers with the cached copy, if there is one, or the
             // `Err` below.
-            Ok(body) => {
+            Ok(document) => {
                 // The channels and whether the document is readable; every
                 // airing is dropped as it is read.
-                let (body, probe) = parse_guide(body, |_| false).await?;
+                let (document, probe) =
+                    parse_guide(document, self.guide_language(provider), |_| false).await?;
                 if let Some(e) = &probe.error {
                     tracing::warn!(%path, error = %e, "live tv: guide document unreadable; keeping the stored guide");
                     Ok((None, false))
                 } else {
                     Ok((
                         Some(GuideSource::XmlTv {
-                            body,
+                            document,
                             channels: probe.channels,
                         }),
                         true,
@@ -3215,8 +3299,8 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // rather than living through the item mirror below.
         for (provider, source) in guides {
             kept_programs.extend(match source {
-                GuideSource::XmlTv { body, channels } => {
-                    self.insert_programs(body, &channels, &provider, window)
+                GuideSource::XmlTv { document, channels } => {
+                    self.insert_programs(document, &channels, &provider, window)
                         .await?
                 }
                 GuideSource::SchedulesDirect { channels, programs } => {
@@ -4978,6 +5062,16 @@ impl FerrofinLiveTvManager {
             }
             return;
         }
+        // `Skipping RecordStream because it's already in progress.` A timer
+        // re-armed while its capture is starting fires again (each guide
+        // refresh re-arms every live timer, `RefreshTimers`), and the capture
+        // registers itself only after several awaits; the claim, held until
+        // `record_stream` returns, makes the check and that registration one
+        // step, so a showing is never captured twice.
+        let Some(_firing) = FiringClaim::take(&self.firing, &timer_id) else {
+            tracing::info!(timer_id, "live tv: that recording is already in progress");
+            return;
+        };
         if self.active_recordings_lock().contains_key(&timer_id) {
             tracing::info!(timer_id, "live tv: that recording is already in progress");
             return;
@@ -6821,7 +6915,11 @@ mod tests {
     async fn info_always_has_emby_service_and_is_enabled() {
         // No tuner host configured: the built-in "Emby" service is still
         // present and IsEnabled is true, mirroring DefaultLiveTvService.
-        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let mgr = manager_with(FakeFetcher(HashMap::from([(
+            "http://tuner/playlist.m3u".to_owned(),
+            M3U.to_owned(),
+        )])))
+        .await;
         let info = mgr.get_live_tv_info().await.expect("info");
         assert!(info.is_enabled);
         assert_eq!(info.services.len(), 1);
@@ -6877,7 +6975,11 @@ mod tests {
 
         let mgr = FerrofinLiveTvManager::new(
             db,
-            Arc::new(FakeFetcher(HashMap::new())),
+            // `M3UTunerHost.Validate` opens the playlist before the save.
+            Arc::new(FakeFetcher(HashMap::from([(
+                "http://tuner/playlist.m3u".to_owned(),
+                M3U.to_owned(),
+            )]))),
             "srv".to_owned(),
             std::env::temp_dir().join("ferrofin-livetv-manager-tests"),
         )
@@ -6906,7 +7008,11 @@ mod tests {
 
     #[tokio::test]
     async fn tuner_host_crud_roundtrips() {
-        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let mgr = manager_with(FakeFetcher(HashMap::from([(
+            "http://tuner/playlist.m3u".to_owned(),
+            M3U.to_owned(),
+        )])))
+        .await;
         // The synchronous flag the "Refresh Guide" task's hidden rule polls
         // tracks the store through every mutation.
         assert!(!mgr.has_tuner_hosts(), "no host configured yet");
@@ -7243,6 +7349,97 @@ mod tests {
         assert_eq!(mgr.get_listing_providers().await.expect("list").len(), 1);
         mgr.delete_listing_provider(&id).await.expect("delete");
         assert!(mgr.get_listing_providers().await.expect("list2").is_empty());
+    }
+
+    /// `XmlTvListingsProvider.Validate` (v12.2 :333-349): a local guide path
+    /// that is not a file is `FileNotFoundException` (`404`) and nothing is
+    /// saved; an existing file and a URL whose scheme is in any case save.
+    #[tokio::test]
+    async fn an_xmltv_provider_must_name_an_existing_file_or_a_url() {
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = |path: &str| {
+            as_xmltv(ListingsProviderInfo {
+                path: Some(path.to_owned()),
+                ..ListingsProviderInfo::default()
+            })
+        };
+
+        let missing = dir.path().join("missing.xml");
+        let err = mgr
+            .save_listing_provider(provider(missing.to_str().expect("utf-8")), false, false)
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+        assert!(mgr.get_listing_providers().await.expect("list").is_empty());
+
+        let guide = dir.path().join("guide.xml");
+        std::fs::write(&guide, XMLTV).expect("write");
+        mgr.save_listing_provider(provider(guide.to_str().expect("utf-8")), false, false)
+            .await
+            .expect("an existing file");
+        mgr.save_listing_provider(provider("HTTP://guide/xmltv.xml"), false, false)
+            .await
+            .expect("a URL");
+        assert_eq!(mgr.get_listing_providers().await.expect("list").len(), 2);
+    }
+
+    /// `XmlTvListingsProvider.GetLanguage`: a guide is read in its provider's
+    /// `PreferredLanguage`, else in the server's `PreferredMetadataLanguage`,
+    /// read as it is when the guide is read.
+    #[tokio::test]
+    async fn a_guide_is_read_in_the_provider_or_the_server_language() {
+        let guide = "<tv><channel id=\"a\">\
+            <display-name lang=\"de\">Erstes</display-name>\
+            <display-name lang=\"en\">First</display-name></channel></tv>";
+        let server = Arc::new(std::sync::Mutex::new("de".to_owned()));
+        let mgr = manager_with(FakeFetcher(HashMap::from([(
+            "http://guide/xmltv.xml".to_owned(),
+            guide.to_owned(),
+        )])))
+        .await
+        .with_metadata_language({
+            let server = Arc::clone(&server);
+            Arc::new(move || server.lock().expect("lock").clone())
+        });
+        let name = |language: Option<&str>| {
+            let mgr = mgr.clone();
+            let provider = as_xmltv(ListingsProviderInfo {
+                path: Some("http://guide/xmltv.xml".to_owned()),
+                preferred_language: language.map(str::to_owned),
+                ..ListingsProviderInfo::default()
+            });
+            async move {
+                mgr.provider_channels(&provider).await.expect("channels")[0]
+                    .name
+                    .clone()
+            }
+        };
+
+        assert_eq!(name(Some("en")).await, "First");
+        assert_eq!(name(None).await, "Erstes");
+        assert_eq!(name(Some("  ")).await, "Erstes", "a blank one is none");
+        *server.lock().expect("lock") = "en".to_owned();
+        assert_eq!(name(None).await, "First", "the setting is read live");
+    }
+
+    /// `TunerHostManager.SaveTunerHost` runs `M3UTunerHost.Validate` first, so
+    /// a tuner whose playlist does not open is refused and never stored.
+    #[tokio::test]
+    async fn an_m3u_tuner_whose_playlist_does_not_open_is_not_saved() {
+        let mgr = manager_with_fetcher(Arc::new(crate::fetch::ReqwestFetcher::new())).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.m3u");
+        let err = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                url: Some(missing.to_str().expect("utf-8").to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+        assert!(mgr.get_tuner_hosts().await.expect("list").is_empty());
     }
 
     /// `ListingsManager.SaveListingProvider`'s id rule: a posted id matching a
@@ -7995,6 +8192,31 @@ mod tests {
         );
     }
 
+    /// `TunerHostManager.DeleteTunerHost` queues a guide refresh, and that
+    /// refresh's `CleanDatabase` passes remove the host's channel and programme
+    /// items, the last host's included: the refresh has no early return for an
+    /// empty tuner list. The programme items are what this adds to
+    /// `an_empty_lineup_cleans_every_channel_item`: they belong to a listings
+    /// provider that is still configured.
+    #[tokio::test]
+    async fn a_refresh_after_the_last_tuner_is_deleted_removes_its_items() {
+        let lab = item_lab(M3U, Some(dated(XMLTV))).await;
+        let mgr = &lab.mgr;
+        mgr.refresh_guide().await.expect("refresh");
+        assert_eq!(stored_channel_items(mgr).await.len(), 2);
+        assert!(!stored_program_items(mgr).await.is_empty());
+
+        mgr.delete_tuner_host(lab.tuner.id.as_deref().expect("tuner id"))
+            .await
+            .expect("delete");
+        // The delete leaves the items to the refresh, as upstream's does.
+        assert_eq!(stored_channel_items(mgr).await.len(), 2);
+        assert!(!stored_program_items(mgr).await.is_empty());
+        mgr.refresh_guide().await.expect("refresh after the delete");
+        assert!(stored_channel_items(mgr).await.is_empty());
+        assert!(stored_program_items(mgr).await.is_empty());
+    }
+
     /// A channel that left the lineup and comes back gets its users' data
     /// back. `CleanDatabase` deleted its item, which parked the rows on the
     /// deletion placeholder. Upstream's first refresh of the recreated item
@@ -8675,7 +8897,7 @@ mod tests {
             lineups[0].2[0].image_url.clone()
         };
         let xmltv = |channel: XmltvChannel| GuideSource::XmlTv {
-            body: String::new(),
+            document: crate::xmltv_cache::XmlTvDocument::empty_for_test(),
             channels: vec![channel],
         };
         // A provider for another tuner, and one whose channel has no logo.
@@ -10274,6 +10496,45 @@ mod tests {
         );
     }
 
+    /// `RefreshTimers` calls `_timerManager.Update` for every live timer, not
+    /// only one the guide changed, so a timer whose arm was lost is armed again
+    /// by the next guide refresh even when its programme is as it was.
+    #[tokio::test]
+    async fn a_guide_refresh_rearms_a_timer_the_guide_left_unchanged() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let future = Utc::now() + chrono::Duration::hours(3);
+        let (id, dto) = refresh_test_timer(
+            &airing,
+            "lost arm",
+            RecordingStatus::New,
+            Some(airing.id.clone()),
+            future,
+        );
+        mgr.persist_timer(&dto).await.expect("seed timer");
+        mgr.refresh_guide().await.expect("refresh");
+        let refreshed = timers_by_id(&mgr).await[&id].clone();
+        let arm = Arc::clone(&mgr.armed_timers_lock()[&id]);
+
+        // Unchanged and still armed: the arm stays as it is.
+        mgr.refresh_guide().await.expect("refresh again");
+        assert!(Arc::ptr_eq(&arm, &mgr.armed_timers_lock()[&id]));
+
+        // The arm is lost; the next refresh finds the programme as it was.
+        mgr.disarm_timer(&id);
+        assert!(!mgr.armed_timers_lock().contains_key(&id));
+        mgr.refresh_guide().await.expect("second refresh");
+        assert_eq!(
+            timers_by_id(&mgr).await[&id],
+            refreshed,
+            "the guide changed nothing"
+        );
+        assert!(
+            mgr.armed_timers_lock().contains_key(&id),
+            "the unchanged timer is armed again"
+        );
+    }
+
     /// What `RefreshTimers` must leave alone: `Completed` rows (recordings
     /// reference them; `GetTimersAsync` excludes them), an ended timer whose
     /// capture is still running (`GetActiveRecordingPath`), and a showing
@@ -11651,6 +11912,8 @@ mod tests {
     async fn mapping_manager() -> (FerrofinLiveTvManager, String, String) {
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        // A second playlist, for the tests that save another tuner.
+        sources.insert("http://tuner/other.m3u".to_owned(), M3U.to_owned());
         // `dated`, not the literal fixture: the refresh ingests only
         // `[now - 1h, now - 1h + GuideDays)`, so a fixture pinned to a calendar
         // date silently empties itself once that date rolls past.
@@ -12059,8 +12322,22 @@ mod tests {
             .expect("age");
         *fetcher.body.lock().unwrap() = None;
 
-        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("fallback"), XMLTV);
-        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("backoff"), XMLTV);
+        assert_eq!(
+            mgr.xmltv
+                .get_xml(&provider)
+                .await
+                .expect("fallback")
+                .text_for_test(),
+            XMLTV
+        );
+        assert_eq!(
+            mgr.xmltv
+                .get_xml(&provider)
+                .await
+                .expect("backoff")
+                .text_for_test(),
+            XMLTV
+        );
         assert_eq!(fetcher.fetches(), 2, "the failed path is not retried");
 
         // With no cached copy the recent failure is an error, still unfetched.
@@ -12077,7 +12354,14 @@ mod tests {
             .save_listing_provider(as_xmltv(provider), false, false)
             .await
             .expect("resave");
-        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("retried"), XMLTV);
+        assert_eq!(
+            mgr.xmltv
+                .get_xml(&provider)
+                .await
+                .expect("retried")
+                .text_for_test(),
+            XMLTV
+        );
         assert_eq!(fetcher.fetches(), 3);
     }
 
@@ -12100,7 +12384,14 @@ mod tests {
             .expect("age");
 
         *fetcher.body.lock().unwrap() = Some(String::new());
-        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("fallback"), XMLTV);
+        assert_eq!(
+            mgr.xmltv
+                .get_xml(&provider)
+                .await
+                .expect("fallback")
+                .text_for_test(),
+            XMLTV
+        );
         assert_eq!(std::fs::read_to_string(&cache_file).expect("kept"), XMLTV);
         mgr.xmltv.get_xml(&provider).await.expect("backoff");
         assert_eq!(
@@ -12147,16 +12438,23 @@ mod tests {
         // fetch, even though neither can ever finish.
         let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mgr = manager_with_fetcher(std::sync::Arc::new(HangingFetcher(entered.clone()))).await;
-        mgr.save_tuner_host(TunerHostInfo {
-            // `SaveTunerHost` resolves the host by `Type` first and 404s when nothing
-            // claims it (v10.11.8 TunerHostManager.cs:60-69), so the fixture names the
-            // M3U host this playlist belongs to.
+        // Stored directly: `save_tuner_host` opens the playlist first
+        // (`M3UTunerHost.Validate`), and this source never answers.
+        let tuner = TunerHostInfo {
+            id: Some("wedged".to_owned()),
             type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
-        })
-        .await
-        .expect("tuner");
+        };
+        mgr.db
+            .upsert_live_tv_tuner_host(
+                "wedged",
+                "http://tuner/playlist.m3u",
+                "m3u",
+                &serde_json::to_string(&tuner).expect("json"),
+            )
+            .await
+            .expect("tuner");
 
         let both = async { tokio::join!(mgr.refresh_guide(), mgr.refresh_guide()) };
         assert!(
@@ -12565,6 +12863,48 @@ mod tests {
             mgr.on_timer_fired(id.clone()).await;
             assert_eq!(read_retries_of(&mgr, &id), None, "a good read clears it");
             assert_eq!(capture_retries_of(&mgr, &id), Some(1));
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// A fire of a timer whose capture another fire is still starting (a guide
+    /// refresh re-arms every live timer, so one under way fires again) stands
+    /// down before it opens anything, as upstream's "already in progress" skip
+    /// does; once that fire is done, the timer captures again.
+    #[tokio::test]
+    async fn a_second_fire_while_the_capture_starts_stands_down() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+            let (id, _) = stored_fire_test_timer(&mgr).await;
+            let starting = super::FiringClaim::take(&mgr.firing, &id).expect("first claim");
+            assert!(
+                super::FiringClaim::take(&mgr.firing, &id).is_none(),
+                "one claim per timer"
+            );
+            let logs = CapturedLogs::default();
+            let guard = logs.install();
+
+            mgr.on_timer_fired(id.clone()).await;
+            drop(guard);
+            assert_eq!(
+                logs.lines_at("INFO", &id)
+                    .iter()
+                    .filter(|line| line.contains("already in progress"))
+                    .count(),
+                1
+            );
+            assert_eq!(capture_retries_of(&mgr, &id), None, "nothing was opened");
+
+            // The first fire is done: the next one tries the capture (which
+            // fails here, the channel being in no lineup).
+            drop(starting);
+            mgr.on_timer_fired(id.clone()).await;
+            assert_eq!(capture_retries_of(&mgr, &id), Some(1));
+            assert!(
+                super::FiringClaim::take(&mgr.firing, &id).is_some(),
+                "a finished fire releases its claim"
+            );
         })
         .await
         .expect("test timed out");

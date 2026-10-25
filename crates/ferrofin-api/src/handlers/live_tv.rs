@@ -877,13 +877,19 @@ async fn add_tuner_host(
 
 /// `DELETE /LiveTv/TunerHosts?id=` — remove a tuner host (and its channels).
 ///
-/// Port of `LiveTvController.DeleteTunerHost`.
+/// Port of `LiveTvController.DeleteTunerHost` → `TunerHostManager.DeleteTunerHost`
+/// (v12.2 TunerHostManager.cs:104-128), which ends with
+/// `CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`: the queued
+/// refresh's `CleanDatabase` pass removes the host's channel and programme
+/// items. Its `{cache}/{id}_channels` file has no counterpart here.
 async fn delete_tuner_host(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Query(q): Query<IdQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    live_tv(&state)?.delete_tuner_host(&q.id).await?;
+    let m = live_tv(&state)?;
+    m.delete_tuner_host(&q.id).await?;
+    queue_guide_refresh(m);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -941,10 +947,6 @@ async fn delete_listing_provider(
     // `RefreshGuideScheduledTask`, whose `CleanDatabase` pass is what actually
     // drains the listings the removed provider supplied — queued, so the DELETE
     // answers 204 before the guide has drained, on both servers.
-    // (`DeleteTunerHost` deliberately queues NOTHING — upstream leaves its
-    // channels until the next refresh; here they cascade away with the host row.
-    // Recorded as an accepted divergence in `suite/parity/classifications.json`
-    // under `DELETE /LiveTv/TunerHosts`.)
     queue_guide_refresh(m);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -2744,7 +2746,7 @@ mod tests {
             &self,
             _id: &str,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
-            unimplemented!()
+            Ok(())
         }
         async fn delete_listing_provider(
             &self,
@@ -2966,6 +2968,43 @@ mod tests {
             fake.refreshes.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "exactly one refresh per configuration write"
+        );
+    }
+
+    /// `TunerHostManager.DeleteTunerHost` queues the guide refresh whose
+    /// `CleanDatabase` removes the host's channel and programme items, and the
+    /// DELETE answers `204` without waiting for it.
+    #[tokio::test]
+    async fn deleting_a_tuner_host_queues_the_guide_refresh() {
+        let fake = std::sync::Arc::new(FakeLiveTv {
+            hang_refresh: true,
+            ..FakeLiveTv::default()
+        });
+        let state = fake_state().with_live_tv(fake.clone());
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            delete_tuner_host(
+                State(state),
+                admin_auth(),
+                Query(IdQuery {
+                    id: "tuner1".to_owned(),
+                }),
+            ),
+        )
+        .await
+        .expect("the handler must not block on the guide refresh")
+        .expect("delete");
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fake.refresh_started.notified(),
+        )
+        .await
+        .expect("the delete must queue a guide refresh");
+        assert_eq!(
+            fake.refreshes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one refresh per delete"
         );
     }
 
