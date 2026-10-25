@@ -78,6 +78,17 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `+00:00` offset instead of `Z` (`POST /Backup/Create`, `GET /Backup`,
   `GET /Backup/Manifest` and the archive's `manifest.json`). Archives written with the `Z`
   form still list and restore
+- Answer the backup routes as Jellyfin 12.2 does:
+  - `POST /Backup/Create` needs its body. With no content type it is a `415`, an empty or
+    `null` body is a `400`, and `{}` still takes the defaults. A create during a library
+    scan is a `500`, not a `503`.
+  - `GET /Backup/Manifest` answers `204` for a file that is not a readable backup.
+  - `GET /Backup/Manifest` and `POST /Backup/Restore` reduce the requested name as
+    Jellyfin's `SanitizePath` does, so `x.zip/` and `..` are `404`. `POST /Backup/Restore`
+    with no content type is a `415`.
+  - `GET /Backup` lists the archives in directory order and matches `.zip`
+    case-sensitively.
+  - Each manifest starts with `ServerVersion`, as Jellyfin's do.
 - Report an API key's `DateLastActivity` as `0001-01-01T00:00:00.0000000Z` (.NET's unset
   date) in `GET /Auth/Keys`, as Jellyfin does, instead of the Unix epoch
 - Answer a grouped `/Items/Latest` whose first typed library is a movies library as
@@ -434,6 +445,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   be enabled, disabled and uninstalled from the dashboard; those buttons answered `400`
 
 ### Bug Fixes
+- A backup no longer reports success with something left out:
+  - a file it cannot read, or whose name is not UTF-8, fails the create with a `500`,
+    and the server log names the file;
+  - with the metadata on a custom path, the default metadata folder goes into the archive
+    too (`metadata-default`, as in Jellyfin) and is restored there;
+  - a backups folder that cannot be read fails `GET /Backup` instead of listing nothing;
+  - the database is taken only from its consistent snapshot.
+- Two backups created in the same second no longer replace each other: the second one's
+  archive takes a `-1` suffix
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for
   while it runs waits for it to finish. Its vacuum and truncating checkpoint stalled every
   database write for up to 30 seconds when the two overlapped

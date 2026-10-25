@@ -16,9 +16,11 @@
 //!   would overwrite an open SQLite file.
 
 use std::io::{Read as _, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -48,8 +50,10 @@ const RESTORE_PENDING_FILE: &str = "restore-pending";
 /// the box-set and playlist folders are always included, as upstream's
 /// `CreateBackupAsync` always copies `Root`, `Data/collections`,
 /// `Data/playlists` and `Data/ScheduledTasks`; the others follow
-/// `BackupOptions`. Built from the live application paths (so a configured
-/// `FERROFIN_CONFIG_DIR` / `MetadataPath` is honoured, as Jellyfin archives
+/// `BackupOptions`, the default metadata folder going with the metadata when
+/// it is a folder of its own (upstream's `metadata-default`). Built from the
+/// live application paths (so a configured `FERROFIN_CONFIG_DIR` /
+/// `MetadataPath` is honoured, as Jellyfin archives
 /// `ConfigurationDirectoryPath` / `InternalMetadataPath`), or from the default
 /// layout at boot, before any configuration is loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +67,10 @@ pub struct TreeRoots {
     pub config: PathBuf,
     /// The internal metadata directory (`metadata/`).
     pub metadata: PathBuf,
+    /// The default internal metadata directory (`metadata-default/`),
+    /// archived beside [`metadata`](Self::metadata) only when that is
+    /// configured elsewhere: the default location may still hold data.
+    pub metadata_default: PathBuf,
     /// The trickplay directory (`trickplay/`).
     pub trickplay: PathBuf,
     /// The subtitle cache directory (`subtitles/`).
@@ -88,6 +96,7 @@ impl TreeRoots {
             database: PathBuf::from(paths.database_path()),
             config: PathBuf::from(paths.configuration_directory_path()),
             metadata: PathBuf::from(paths.internal_metadata_path()),
+            metadata_default: PathBuf::from(paths.default_internal_metadata_path()),
             trickplay: data.join("trickplay"),
             subtitles: data.join("subtitles"),
             root: PathBuf::from(paths.root_folder_path()),
@@ -107,6 +116,7 @@ impl TreeRoots {
             database: database.to_path_buf(),
             config: config_dir.to_path_buf(),
             metadata: program_data.join("metadata"),
+            metadata_default: program_data.join("metadata"),
             trickplay: program_data.join("data").join("trickplay"),
             subtitles: program_data.join("data").join("subtitles"),
             root: program_data.join("root"),
@@ -116,27 +126,36 @@ impl TreeRoots {
         }
     }
 
-    /// (archive prefix, on-disk root) for each tree.
-    fn trees(&self) -> [(&'static str, &Path); 7] {
-        [
+    /// (archive prefix, on-disk root) for each tree. `metadata-default` is
+    /// one only while the default metadata folder is not the configured one:
+    /// upstream compares the two full paths ignoring case, and writes and
+    /// restores it only when they differ.
+    fn trees(&self) -> impl Iterator<Item = (&'static str, &Path)> {
+        let separate_default = Path::new(&self.metadata.to_string_lossy().to_lowercase())
+            != Path::new(&self.metadata_default.to_string_lossy().to_lowercase());
+        let trees: [(&'static str, &Path); 8] = [
             ("config", &self.config),
             ("metadata", &self.metadata),
+            ("metadata-default", &self.metadata_default),
             ("trickplay", &self.trickplay),
             ("subtitles", &self.subtitles),
             ("root", &self.root),
             ("data/collections", &self.collections),
             ("data/playlists", &self.playlists),
-        ]
+        ];
+        trees
+            .into_iter()
+            .filter(move |(prefix, _)| *prefix != "metadata-default" || separate_default)
     }
 }
 
 /// Serializes `POST /Backup/Create`.
 ///
-/// Two reasons, either sufficient. The archive name is second-granular
-/// (`ferrofin-backup-%Y%m%d-%H%M%S.zip`), so two creates in the same second
-/// write the *same* path and one silently destroys the other. And each create
-/// writes a database-sized snapshot beside its archive, so N concurrent creates
-/// need N x database-size of free disk on top of the archives.
+/// Two reasons, either sufficient. A create picks its archive name by looking
+/// for a free one ([`write_backup`]), which only holds while no other create
+/// is picking at the same time. And each create writes a database-sized
+/// snapshot beside its archive, so N concurrent creates need N x database-size
+/// of free disk on top of the archives.
 ///
 /// Before this handler moved onto the blocking pool the runtime's worker count
 /// bounded that implicitly; dispatching to a 512-thread pool removed the bound,
@@ -179,9 +198,22 @@ const TASK_RESULTS_ENTRY: &str = "data/task_results.json";
 
 /// The manifest entry stored inside each archive (as `manifest.json`) and returned
 /// by the list/create/inspect routes. Port of `BackupManifestDto`.
+///
+/// The fields keep `BackupManifestDto`'s declaration order, which is the order
+/// System.Text.Json writes them in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct BackupManifest {
+    /// The server version that wrote it.
+    server_version: String,
+    /// The archive-layout version ([`BACKUP_ENGINE_VERSION`]). Defaulted on read
+    /// so archives written before the field existed (same layout) still list.
+    #[serde(default)]
+    backup_engine_version: String,
+    /// When the backup was created: a `DateTimeOffset` upstream, so written
+    /// with an explicit offset ([`date_time_offset`]).
+    #[serde(with = "date_time_offset")]
+    date_created: DateTime<Utc>,
     /// The archive's absolute path (Jellyfin reports the full path; its file
     /// name is the handle Restore / Manifest accept). Always re-derived from the
     /// on-disk location on read — and defaulted, because a Jellyfin manifest
@@ -189,16 +221,6 @@ struct BackupManifest {
     /// it (and the listing can show it, as Jellyfin lists foreign archives).
     #[serde(default)]
     path: String,
-    /// When the backup was created: a `DateTimeOffset` upstream, so written
-    /// with an explicit offset ([`date_time_offset`]).
-    #[serde(with = "date_time_offset")]
-    date_created: DateTime<Utc>,
-    /// The server version that wrote it.
-    server_version: String,
-    /// The archive-layout version ([`BACKUP_ENGINE_VERSION`]). Defaulted on read
-    /// so archives written before the field existed (same layout) still list.
-    #[serde(default)]
-    backup_engine_version: String,
     /// The options the backup was created with (echoed back).
     options: BackupOptions,
 }
@@ -257,7 +279,7 @@ impl BackupOptions {
     fn includes(&self, prefix: &str) -> bool {
         match prefix {
             "config" | "root" | "data/collections" | "data/playlists" => true,
-            "metadata" => self.metadata,
+            "metadata" | "metadata-default" => self.metadata,
             "trickplay" => self.trickplay,
             "subtitles" => self.subtitles,
             _ => false,
@@ -305,7 +327,7 @@ fn restore_refusal(archive: &Path) -> Option<String> {
         || archive.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
-    if !read_manifest(archive).is_some_and(|m| restorable(&m)) {
+    if !read_manifest(archive).is_ok_and(|m| m.is_some_and(|m| restorable(&m))) {
         return Some(format!(
             "backup {name} is not a Ferrofin {BACKUP_ENGINE_VERSION} archive"
         ));
@@ -340,20 +362,40 @@ fn read_schema_head(archive: &Path) -> Result<Option<i64>, String> {
     text.trim().parse().map(Some).map_err(|e| unreadable(&e))
 }
 
-/// Reads the `manifest.json` embedded in one archive, if it parses.
-fn read_manifest(archive_path: &Path) -> Option<BackupManifest> {
-    let file = std::fs::File::open(archive_path).ok()?;
-    let mut zip = zip::ZipArchive::new(file).ok()?;
-    let mut entry = zip.by_name("manifest.json").ok()?;
+/// Reads the `manifest.json` embedded in one archive: `Ok(None)` when it has
+/// none (upstream's `GetManifest` returns null), `Err` when the archive or its
+/// manifest cannot be read (where upstream throws).
+fn read_manifest(archive_path: &Path) -> Result<Option<BackupManifest>, String> {
+    let file = std::fs::File::open(archive_path).map_err(|e| e.to_string())?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
+    let mut entry = match zip.by_name("manifest.json") {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
     let mut buf = String::new();
-    entry.read_to_string(&mut buf).ok()?;
-    let mut manifest: BackupManifest = serde_json::from_str(&buf).ok()?;
+    entry.read_to_string(&mut buf).map_err(|e| e.to_string())?;
+    let mut manifest: BackupManifest = serde_json::from_str(&buf).map_err(|e| e.to_string())?;
     // Trust the on-disk location over whatever the manifest recorded.
     manifest.path = archive_path.to_string_lossy().into_owned();
-    Some(manifest)
+    Ok(Some(manifest))
 }
 
-/// `GET /Backup` — the available backups, newest first.
+/// [`read_manifest`], with an archive that cannot be read logged and treated
+/// as one without a manifest, as `GetBackupManifest` and `EnumerateBackups`
+/// do ("Tried to load manifest from archive … but failed").
+fn manifest_or_warn(archive: &Path) -> Option<BackupManifest> {
+    read_manifest(archive).unwrap_or_else(|error| {
+        tracing::warn!(
+            path = %archive.display(),
+            %error,
+            "could not read a backup archive's manifest"
+        );
+        None
+    })
+}
+
+/// `GET /Backup` — the available backups.
 ///
 /// Port of `BackupController.ListBackups`: reads every `.zip` under the backups
 /// directory and returns its manifest. A missing directory is an empty list.
@@ -366,35 +408,63 @@ fn read_manifest(archive_path: &Path) -> Option<BackupManifest> {
 async fn list_backups(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-) -> Json<Vec<BackupManifest>> {
+) -> Result<Json<Vec<BackupManifest>>, ApiError> {
     // Opening every retained archive and inflating its manifest is blocking file
     // I/O, unbounded in the number of backups kept and on possibly-network
     // storage — the same reason `create_backup` does not run inline.
     let dir = backups_dir(&state);
-    Json(
-        blocking(move || Ok(list_backups_in(&dir)))
-            .await
-            .unwrap_or_default(),
-    )
+    blocking(move || list_backups_in(&dir))
+        .await
+        .map(Json)
+        .map_err(|e| io_err("list backups", &e))
 }
 
-/// Reads every `.zip` in `dir` and returns its manifest, newest first. A missing
-/// directory (or a `.zip` with no readable manifest) contributes nothing. Pure over
+/// The manifest of every `.zip` in `dir`, in the order the directory lists
+/// them: `EnumerateBackups` over `Directory.EnumerateFiles(path, "*.zip")`,
+/// so files only, the extension matched case-sensitively, and unsorted. A
+/// missing directory is empty, one that cannot be read an error (upstream
+/// throws), and an archive without a readable manifest is left out. Pure over
 /// the path so it is unit-testable and shared by the handler.
-fn list_backups_in(dir: &Path) -> Vec<BackupManifest> {
-    let mut manifests: Vec<BackupManifest> = std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| {
-            e.path()
-                .extension()
-                .is_some_and(|x| x.eq_ignore_ascii_case("zip"))
-        })
-        .filter_map(|e| read_manifest(&e.path()))
-        .collect();
-    manifests.sort_by_key(|m| std::cmp::Reverse(m.date_created));
-    manifests
+fn list_backups_in(dir: &Path) -> std::io::Result<Vec<BackupManifest>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let unreadable =
+        |e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display()));
+    let mut manifests = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(unreadable)? {
+        let path = entry.map_err(unreadable)?.path();
+        if path.as_os_str().as_encoded_bytes().ends_with(b".zip") && path.is_file() {
+            manifests.extend(manifest_or_warn(&path));
+        }
+    }
+    Ok(manifests)
+}
+
+/// The file name `BackupController.SanitizePath` keeps of a requested archive:
+/// `Path.GetFileName(Path.GetFullPath(path))`. The value is resolved lexically
+/// against the working directory, as .NET does on Unix, and its last component
+/// kept: empty when it ends in a separator, a directory's own name for `.` or
+/// `..`. It never holds a separator or `..`, so joining it to the backups
+/// directory stays inside it.
+fn sanitized_file_name(path: &str) -> String {
+    if path.ends_with('/') {
+        return String::new();
+    }
+    let mut full = std::env::current_dir().unwrap_or_default();
+    for part in Path::new(path).components() {
+        match part {
+            Component::RootDir => full = PathBuf::from("/"),
+            Component::ParentDir => {
+                full.pop();
+            }
+            Component::Normal(name) => full.push(name),
+            Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    full.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// Query for `GET /Backup/Manifest`.
@@ -408,14 +478,16 @@ struct ManifestQuery {
 
 /// `GET /Backup/Manifest?path=` — one backup's manifest.
 ///
-/// Port of `BackupController.GetBackup`. `404` when the named archive is missing or
-/// carries no readable manifest.
+/// Port of `BackupController.GetBackup`: `path` is reduced to a file name in
+/// the backups directory ([`sanitized_file_name`]), `404` when that is not a
+/// file and `204` when the file carries no readable manifest.
 #[utoipa::path(
     get,
     path = "/Backup/Manifest",
     params(("path" = String, Query, description = "The archive file name")),
     responses(
         (status = 200, description = "Backup manifest returned"),
+        (status = 204, description = "Not a valid backup archive"),
         (status = 404, description = "Backup not found")
     ),
     tag = "ferrofin"
@@ -424,36 +496,50 @@ async fn get_backup_manifest(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<ManifestQuery>,
-) -> Result<Json<BackupManifest>, ApiError> {
-    let name = query
+) -> Result<Response, ApiError> {
+    let path = query
         .path
-        .as_deref()
-        .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
-        .filter(|n| !n.is_empty())
         .ok_or_else(|| ApiError::BadRequest("missing 'path'".to_owned()))?;
-    let archive = backups_dir(&state).join(name);
-    read_manifest(&archive)
-        .map(Json)
-        .ok_or_else(|| ApiError::NotFound(format!("backup {name}")))
+    let archive = backups_dir(&state).join(sanitized_file_name(&path));
+    // Opening the archive and inflating its manifest is blocking file I/O, as
+    // in `list_backups`.
+    let found = blocking(move || Ok(archive.is_file().then(|| manifest_or_warn(&archive))))
+        .await
+        .map_err(|e| io_err("read backup manifest", &e))?;
+    match found {
+        None => Err(ApiError::NotFound(format!("backup {path}"))),
+        Some(None) => Ok(StatusCode::NO_CONTENT.into_response()),
+        Some(Some(manifest)) => Ok(Json(manifest).into_response()),
+    }
 }
 
-/// Recursively adds a directory's files to the zip under `prefix/…`.
+/// Recursively adds a directory's files to the zip under `prefix/…`. A file
+/// that cannot be read, or whose name is not UTF-8, fails the whole archive
+/// with its path in the error: upstream's `CreateEntryFromFile` throws, and a
+/// backup must never be reported complete with a file left out.
 fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
     zip: &mut zip::ZipWriter<W>,
     dir: &Path,
     prefix: &str,
     options: zip::write::SimpleFileOptions,
 ) -> std::io::Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
+    let at = |path: &Path, e: std::io::Error| {
+        std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+    };
+    for entry in std::fs::read_dir(dir).map_err(|e| at(dir, e))? {
+        let path = entry.map_err(|e| at(dir, e))?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            let not_utf8 = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the file name is not UTF-8",
+            );
+            at(&path, not_utf8)
+        })?;
         let zip_path = format!("{prefix}/{name}");
         if path.is_dir() {
             add_dir_to_zip(zip, &path, &zip_path, options)?;
-        } else if let Ok(bytes) = std::fs::read(&path) {
+        } else {
+            let bytes = std::fs::read(&path).map_err(|e| at(&path, e))?;
             zip.start_file(zip_path, options)?;
             zip.write_all(&bytes)?;
         }
@@ -465,9 +551,11 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
 ///
 /// Port of `BackupController.CreateBackup` + `BackupService.CreateBackupAsync`:
 /// zips the SQLite database file and the configuration directory (plus a
-/// `manifest.json`) into a timestamped `.zip` under `{data}/backups/`. Refused
-/// while a library scan runs, and when the backups directory has less than
-/// [`BACKUP_MIN_FREE_SPACE`] free; a create that fails leaves nothing behind.
+/// `manifest.json`) into a timestamped `.zip` under `{data}/backups/`. The
+/// body is required (`[FromBody] BackupOptionsDto`): none is a `415` or `400`,
+/// and `{}` takes the defaults. Refused while a library scan runs, and when the
+/// backups directory has less than [`BACKUP_MIN_FREE_SPACE`] free; a create
+/// that fails leaves nothing behind.
 #[utoipa::path(
     post,
     path = "/Backup/Create",
@@ -477,14 +565,13 @@ fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
 async fn create_backup(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    body: Option<JsonBody<BackupOptions>>,
+    JsonBody(options): JsonBody<BackupOptions>,
 ) -> Result<Json<BackupManifest>, ApiError> {
     let Ok(permit) = BACKUP_IN_FLIGHT.try_acquire() else {
         return Err(ApiError::ServiceUnavailable(
             "a backup is already in progress".to_owned(),
         ));
     };
-    let options = body.map(|JsonBody(b)| b).unwrap_or_default();
     // The create runs to its end on a task of its own, which holds the permit:
     // a caller that goes away mid-backup (dropping this future) must not free
     // it while the snapshot or the archive is still being written, or the next
@@ -505,14 +592,13 @@ async fn create_backup(
 async fn run_create(state: &AppState, options: BackupOptions) -> Result<BackupManifest, ApiError> {
     // Upstream refuses while a library scan runs (`IsScanRunning`): a backup
     // contends with the scan's writes and could capture the library half
-    // written. Its `InvalidOperationException` is a `500`; this answers the
-    // `503` the contract documents for the operation, as the in-flight refusal.
+    // written. Its `InvalidOperationException` is a `500`.
     if state.library.is_scan_running() {
-        return Err(ApiError::ServiceUnavailable(
-            "cannot create a backup while a library scan is running; try again once \
-             the scan has finished"
-                .to_owned(),
-        ));
+        return Err(ferrofin_traits::error::ServiceError::backend(
+            "cannot create a backup while a library scan is running; try again once the \
+             scan has finished",
+        )
+        .into());
     }
     let roots = TreeRoots::from_paths(state.config.application_paths().as_ref());
     let dir = backups_dir(state);
@@ -620,14 +706,17 @@ where
 
 /// Writes a backup archive (database + `config/` tree + the selected trees +
 /// `manifest.json` + the [`SCHEMA_HEAD_ENTRY`]) under `backups_dir`, returning
-/// the manifest. The database comes from `snapshot` when given (a consistent
-/// copy the caller produced, consumed — deleted — here), else from the live
-/// file (tests with no server).
-/// The archive is written under a scratch name and renamed into place once
-/// complete, so a failure, or a crash, never leaves a truncated archive under a
-/// backup's name; on an error the scratch file is removed (upstream deletes
-/// its partial archive in `CreateBackupAsync`'s catch). Pure over paths — no
-/// `AppState` — so it is unit-testable and shared by the handler.
+/// the manifest. The database comes only from `snapshot`, a consistent copy
+/// the caller produced, consumed (deleted) here.
+///
+/// The archive is named `ferrofin-backup-%Y%m%d-%H%M%S.zip`, or, when a
+/// create in the same second took that name, the first free `-1`, `-2`, …
+/// suffix; it never replaces an archive already there. It is written under a
+/// scratch name and renamed into place once complete, so a failure, or a
+/// crash, never leaves a truncated archive under a backup's name; on an error
+/// the scratch file is removed (upstream deletes its partial archive in
+/// `CreateBackupAsync`'s catch). Pure over paths — no `AppState` — so it is
+/// unit-testable and shared by the handler.
 fn write_backup(
     backups_dir: &Path,
     roots: &TreeRoots,
@@ -636,18 +725,43 @@ fn write_backup(
     snapshot: Option<&Path>,
 ) -> std::io::Result<BackupManifest> {
     std::fs::create_dir_all(backups_dir)?;
-    let file_name = format!("ferrofin-backup-{}.zip", now.format("%Y%m%d-%H%M%S"));
+    let stamp = now.format("%Y%m%d-%H%M%S");
+    let mut file_name = format!("ferrofin-backup-{stamp}.zip");
+    for n in 1.. {
+        if !backups_dir.join(&file_name).exists() {
+            break;
+        }
+        file_name = format!("ferrofin-backup-{stamp}-{n}.zip");
+    }
     let archive_path = backups_dir.join(&file_name);
     let manifest = BackupManifest {
-        path: archive_path.to_string_lossy().into_owned(),
-        date_created: now,
         server_version: env!("CARGO_PKG_VERSION").to_owned(),
         backup_engine_version: BACKUP_ENGINE_VERSION.to_owned(),
+        date_created: now,
+        path: archive_path.to_string_lossy().into_owned(),
         options,
     };
     let partial = ScratchFile(backups_dir.join(format!("{file_name}{PARTIAL_SUFFIX}")));
     write_archive(&partial.0, roots, &manifest, snapshot)?;
-    std::fs::rename(&partial.0, &archive_path)?;
+    // Creates are serialised, so only a file placed by hand while this one was
+    // written can have taken the name. A hard link is a move that never
+    // replaces it (dropping `partial` then removes the scratch name); on a
+    // filesystem without hard links, a check and a rename are the fallback.
+    let taken = || {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "{} appeared while the backup was written",
+                archive_path.display()
+            ),
+        )
+    };
+    match std::fs::hard_link(&partial.0, &archive_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(taken()),
+        Err(_) if archive_path.exists() => return Err(taken()),
+        Err(_) => std::fs::rename(&partial.0, &archive_path)?,
+    }
     Ok(manifest)
 }
 
@@ -668,13 +782,18 @@ fn write_archive(
     zip.start_file(SCHEMA_HEAD_ENTRY, opts)?;
     zip.write_all(ferrofin_db::schema_head().to_string().as_bytes())?;
 
-    // The database (skipped if absent — e.g. an in-memory test DB).
+    // The database, only ever from the snapshot: the live WAL-mode file can
+    // tear mid-copy, and an archive whose manifest says `Database` must hold it.
     if manifest.options.database {
-        let source = snapshot.filter(|p| p.is_file()).unwrap_or(&roots.database);
-        if let Ok(mut file) = std::fs::File::open(source) {
-            zip.start_file(format!("data/{DB_FILE_NAME}"), opts)?;
-            std::io::copy(&mut file, &mut zip)?;
-        }
+        let source = snapshot.filter(|p| p.is_file()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the database snapshot for the backup was not written",
+            )
+        })?;
+        let mut file = std::fs::File::open(source)?;
+        zip.start_file(format!("data/{DB_FILE_NAME}"), opts)?;
+        std::io::copy(&mut file, &mut zip)?;
     }
     // Zipped: the snapshot's disk goes back before the trees are read.
     if let Some(snapshot) = snapshot {
@@ -700,10 +819,11 @@ fn write_archive(
 /// `POST /Backup/Restore` — schedules a backup restore and restarts.
 ///
 /// Port of `BackupController.StartRestoreBackup` +
-/// `BackupService.ScheduleRestoreAndRestartServer`: the body's `ArchiveFileName`
-/// is reduced to a file name inside the backups directory (`404` when absent),
-/// recorded in the restore-pending marker, and the server restarts; the next
-/// boot applies it ([`apply_pending_restore`]) before the database is opened.
+/// `BackupService.ScheduleRestoreAndRestartServer`: the body is required, its
+/// `ArchiveFileName` is reduced to a file name inside the backups directory
+/// ([`sanitized_file_name`]; `404` when that is not a file), recorded in the
+/// restore-pending marker, and the server restarts; the next boot applies it
+/// ([`apply_pending_restore`]) before the database is opened.
 #[utoipa::path(
     post,
     path = "/Backup/Restore",
@@ -716,30 +836,38 @@ fn write_archive(
 async fn restore_backup(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    body: Option<JsonBody<BackupRestoreRequest>>,
-) -> Result<axum::http::StatusCode, ApiError> {
-    let name = body
-        .and_then(|JsonBody(b)| b.archive_file_name)
-        .as_deref()
-        .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
+    JsonBody(body): JsonBody<BackupRestoreRequest>,
+) -> Result<StatusCode, ApiError> {
+    // An empty name is upstream's `GetFullPath("")` `ArgumentException`, a 400.
+    let requested = body
+        .archive_file_name
         .filter(|n| !n.is_empty())
-        .map(str::to_owned)
         .ok_or_else(|| ApiError::BadRequest("missing 'ArchiveFileName'".to_owned()))?;
+    let name = sanitized_file_name(&requested);
     let dir = backups_dir(&state);
-    let archive = dir.join(&name);
-    if !archive.is_file() {
-        return Err(ApiError::NotFound(format!("backup {name}")));
+    // Checking the archive (two zip reads) and writing the marker is blocking
+    // file I/O, as in `list_backups`.
+    let refusal = blocking(move || {
+        let archive = dir.join(&name);
+        if !archive.is_file() {
+            return Ok(Some(ApiError::NotFound(format!("backup {requested}"))));
+        }
+        // Refuse an archive this engine cannot restore BEFORE scheduling a
+        // restart for nothing (a Jellyfin archive in a shared backups dir, a
+        // stray zip, an archive from a newer Ferrofin).
+        if let Some(reason) = restore_refusal(&archive) {
+            return Ok(Some(ApiError::BadRequest(reason)));
+        }
+        std::fs::write(dir.join(RESTORE_PENDING_FILE), &name)?;
+        Ok(None)
+    })
+    .await
+    .map_err(|e| io_err("schedule restore", &e))?;
+    if let Some(refusal) = refusal {
+        return Err(refusal);
     }
-    // Refuse an archive this engine cannot restore BEFORE scheduling a restart
-    // for nothing (a Jellyfin archive in a shared backups dir, a stray zip, an
-    // archive from a newer Ferrofin).
-    if let Some(reason) = restore_refusal(&archive) {
-        return Err(ApiError::BadRequest(reason));
-    }
-    std::fs::write(dir.join(RESTORE_PENDING_FILE), &name)
-        .map_err(|e| io_err("schedule restore", &e))?;
     state.system.restart().await?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Why a scheduled restore did not apply.
@@ -843,11 +971,13 @@ fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()
     let mut zip = zip::ZipArchive::new(file).map_err(std::io::Error::other)?;
     let db_entry = format!("data/{DB_FILE_NAME}");
     let mut roots = roots.clone();
-    // Two passes: everything but the metadata tree first, so the restored
+    // Two passes: everything but the metadata trees first, so the restored
     // `system.json` can name where the metadata belongs. The roots known at
     // boot come from the configuration being replaced; a backup whose
     // configuration relocates the metadata tree must put its metadata where
-    // that configuration will look for it, not beside the old one.
+    // that configuration will look for it, not beside the old one, and its
+    // `metadata-default` tree only while that is somewhere else ([`TreeRoots::
+    // trees`]), never over the metadata just restored.
     for metadata_pass in [false, true] {
         if metadata_pass && let Some(restored) = restored_metadata_root(&roots.config) {
             roots.metadata = restored;
@@ -857,7 +987,9 @@ fn restore_archive(archive_path: &Path, roots: &TreeRoots) -> std::io::Result<()
             let Some(enclosed) = entry.enclosed_name() else {
                 continue; // path-traversal guard (zip-slip)
             };
-            if enclosed.starts_with("metadata") != metadata_pass {
+            let metadata_tree =
+                enclosed.starts_with("metadata") || enclosed.starts_with("metadata-default");
+            if metadata_tree != metadata_pass {
                 continue;
             }
             if enclosed == Path::new(&db_entry) {
@@ -1002,7 +1134,7 @@ mod tests {
             zip.finish().unwrap();
         }
         // The manifest round-trips (path re-derived from the on-disk location).
-        let read = read_manifest(&archive).expect("manifest");
+        let read = read_manifest(&archive).unwrap().expect("manifest");
         assert_eq!(read.path, archive.to_string_lossy());
         assert_eq!(read.server_version, "9.9.9");
 
@@ -1023,8 +1155,14 @@ mod tests {
             "{names:?}"
         );
 
-        // A non-archive path yields no manifest.
-        assert!(read_manifest(tmp.path()).is_none());
+        // A non-archive path cannot be read; an archive without a manifest
+        // has none.
+        assert!(read_manifest(tmp.path()).is_err());
+        let bare = tmp.path().join("bare.zip");
+        zip::ZipWriter::new(std::fs::File::create(&bare).unwrap())
+            .finish()
+            .unwrap();
+        assert!(read_manifest(&bare).unwrap().is_none());
     }
 
     /// A restore that fails after extraction began leaves the trees partly
@@ -1049,7 +1187,7 @@ mod tests {
             &roots,
             BackupOptions::default(),
             "2024-05-06T07:08:09Z".parse().unwrap(),
-            None,
+            Some(&snapshot(tmp.path(), b"DB")),
         )
         .unwrap();
 
@@ -1142,7 +1280,7 @@ mod tests {
             &roots,
             BackupOptions::default(),
             "2024-05-06T07:08:09Z".parse().unwrap(),
-            None,
+            Some(&snapshot(tmp.path(), b"DB")),
         )
         .unwrap();
         let written = std::path::PathBuf::from(&written.path);
@@ -1197,7 +1335,7 @@ mod tests {
             &roots,
             BackupOptions {
                 metadata: true,
-                ..BackupOptions::default()
+                ..no_database()
             },
             "2024-05-06T07:08:09Z".parse().unwrap(),
             None,
@@ -1246,8 +1384,11 @@ mod tests {
             &program_data.join("config"),
             &program_data.join("ferrofin.db"),
         );
-        let manifest = write_backup(&backups, &roots, BackupOptions::default(), now, None).unwrap();
+        let db = snapshot(tmp.path(), b"DBv1");
+        let manifest =
+            write_backup(&backups, &roots, BackupOptions::default(), now, Some(&db)).unwrap();
         let archive = std::path::PathBuf::from(&manifest.path);
+        assert!(!db.exists(), "the snapshot is consumed");
         assert!(
             archive.starts_with(&backups),
             "absolute path: {}",
@@ -1344,16 +1485,23 @@ mod tests {
         );
         assert_eq!(super::apply_pending_restore(&boot_roots).unwrap(), None);
 
-        // Listing the backups directory finds the archive, newest first.
-        // A second, newer backup + a non-zip file that is ignored.
+        // Listing the backups directory finds the archive: a second, newer
+        // backup is listed beside it and a non-zip file is ignored.
         let newer = "2024-05-06T09:00:00Z".parse().unwrap();
-        let m2 = write_backup(&backups, &roots, BackupOptions::default(), newer, None).unwrap();
+        let db = snapshot(tmp.path(), b"DBv2");
+        let m2 =
+            write_backup(&backups, &roots, BackupOptions::default(), newer, Some(&db)).unwrap();
         std::fs::write(backups.join("notes.txt"), b"ignored").unwrap();
-        let listed = list_backups_in(&backups);
+        let listed = list_backups_in(&backups).unwrap();
         assert_eq!(listed.len(), 2, "two archives, txt ignored");
-        assert_eq!(listed[0].path, m2.path, "newest first");
+        assert!(listed.iter().any(|m| m.path == m2.path));
+        assert!(listed.iter().any(|m| m.path == manifest.path));
         // A missing directory lists nothing.
-        assert!(list_backups_in(&tmp.path().join("nope")).is_empty());
+        assert!(
+            list_backups_in(&tmp.path().join("nope"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// `CreateBackupAsync` always archives the library definitions (`Root`)
@@ -1390,7 +1538,7 @@ mod tests {
             &roots,
             BackupOptions::default(),
             now,
-            None,
+            Some(&snapshot(tmp.path(), b"DB")),
         )
         .unwrap();
 
@@ -1455,10 +1603,9 @@ mod tests {
     /// A second concurrent create is refused with the contract's `503` rather
     /// than queueing.
     ///
-    /// Two creates in the same second write the SAME archive path (the name is
-    /// second-granular), so one would silently destroy the other; and each
-    /// writes a database-sized snapshot, so N in flight need N x database size
-    /// of disk.
+    /// Each create picks a free archive name, which two picking at once could
+    /// both take; and each writes a database-sized snapshot, so N in flight
+    /// need N x database size of disk.
     #[tokio::test]
     async fn a_second_concurrent_create_is_refused() {
         use crate::create_router;
@@ -1768,6 +1915,7 @@ mod tests {
                 started.notify_one();
                 release.notified().await;
             }
+            std::fs::write(dest, b"a database").expect("snapshot");
             Ok(())
         }
         async fn free_space_of(&self, _path: &std::path::Path) -> i64 {
@@ -1777,8 +1925,8 @@ mod tests {
 
     /// `BackupService.CreateBackupAsync` refuses while a library scan runs
     /// (`IsScanRunning`): the backup would contend with the scan's writes and
-    /// could capture a library half-written. Ferrofin answers the `503` the
-    /// contract documents for this operation, and writes nothing.
+    /// could capture a library half-written. Its `InvalidOperationException`
+    /// is a `500`, and nothing is written.
     #[tokio::test]
     async fn create_is_refused_while_a_library_scan_runs() {
         let _serial = TEST_SERIAL.lock().await;
@@ -1790,7 +1938,7 @@ mod tests {
 
         assert_eq!(
             create_on(state).await,
-            axum::http::StatusCode::SERVICE_UNAVAILABLE
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(
             file_names(&backups),
@@ -1986,7 +2134,7 @@ mod tests {
         let written = super::write_backup(
             &backups,
             &roots,
-            BackupOptions::default(),
+            no_database(),
             "2024-05-06T07:08:09Z".parse().unwrap(),
             None,
         );
@@ -2075,6 +2223,476 @@ mod tests {
             hog.await.unwrap();
             assert_eq!(request.await.unwrap(), axum::http::StatusCode::OK);
         });
+        let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    /// One request to the backup routes on the elevated fake state: its status
+    /// and body. A `body` is sent as JSON; `None` sends no content type and no
+    /// body.
+    async fn send(method: &str, uri: &str, body: Option<&str>) -> (u16, String) {
+        use axum::body::{Body, to_bytes};
+        use axum::http::Request;
+        use tower::ServiceExt as _;
+
+        let mut request = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            request = request.header("Content-Type", "application/json");
+        }
+        let response = crate::create_router(crate::test_support::elevated_fake_state())
+            .oneshot(
+                request
+                    .body(Body::from(body.unwrap_or_default().to_owned()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status().as_u16();
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Program-data roots under `dir` with one configuration file.
+    fn small_roots(dir: &std::path::Path) -> TreeRoots {
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::write(dir.join("config/system.json"), b"{}").unwrap();
+        TreeRoots::defaults(dir, &dir.join("config"), &dir.join("ferrofin.db"))
+    }
+
+    /// Options without the database, for tests that need no snapshot.
+    fn no_database() -> BackupOptions {
+        BackupOptions {
+            database: false,
+            ..BackupOptions::default()
+        }
+    }
+
+    /// A database snapshot holding `bytes` in `dir`, as `snapshot_database`
+    /// leaves one for the archive to consume.
+    fn snapshot(dir: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(".snapshot-test.db");
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// With a `MetadataPath` elsewhere, `CreateBackupAsync` also archives the
+    /// default metadata folder (`Data/metadata-default`), which may still hold
+    /// data, and `RestoreBackupAsync` puts it back there. When the two are the
+    /// same folder it is archived once, as `metadata`.
+    #[test]
+    fn the_default_metadata_folder_goes_along_when_it_is_separate() {
+        use super::{restore_archive, write_backup};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let program_data = tmp.path().join("pd");
+        let mut roots = small_roots(&program_data);
+        roots.metadata = tmp.path().join("custom-metadata");
+        for (dir, file) in [
+            (&roots.metadata, "new.jpg"),
+            (&roots.metadata_default, "old.jpg"),
+        ] {
+            std::fs::create_dir_all(dir.join("library")).unwrap();
+            std::fs::write(dir.join("library").join(file), file).unwrap();
+        }
+        let with_metadata = BackupOptions {
+            metadata: true,
+            ..no_database()
+        };
+        let now = "2024-05-06T07:08:09Z".parse().unwrap();
+        let backups = tmp.path().join("backups");
+        let manifest = write_backup(&backups, &roots, with_metadata.clone(), now, None).unwrap();
+
+        // Restored onto a host whose metadata is configured elsewhere too.
+        let target = tmp.path().join("target");
+        let mut target_roots =
+            TreeRoots::defaults(&target, &target.join("config"), &target.join("ferrofin.db"));
+        target_roots.metadata = target.join("custom");
+        restore_archive(std::path::Path::new(&manifest.path), &target_roots).unwrap();
+        for (restored, file) in [("custom", "new.jpg"), ("metadata", "old.jpg")] {
+            let path = target.join(restored).join("library").join(file);
+            assert_eq!(std::fs::read(&path).unwrap(), file.as_bytes(), "{path:?}");
+        }
+
+        // Restored onto a host whose metadata is the default folder: the
+        // `metadata-default` tree is skipped, never written over the metadata.
+        let plain = tmp.path().join("plain");
+        let plain_roots =
+            TreeRoots::defaults(&plain, &plain.join("config"), &plain.join("ferrofin.db"));
+        restore_archive(std::path::Path::new(&manifest.path), &plain_roots).unwrap();
+        assert!(plain.join("metadata/library/new.jpg").is_file());
+        assert!(!plain.join("metadata/library/old.jpg").exists());
+
+        // The same folder: one tree, archived as `metadata`.
+        roots.metadata = roots.metadata_default.clone();
+        let once = write_backup(&backups, &roots, with_metadata, now, None).unwrap();
+        let file = std::fs::File::open(&once.path).unwrap();
+        let names: Vec<String> = zip::ZipArchive::new(file)
+            .unwrap()
+            .file_names()
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            names.contains(&"metadata/library/old.jpg".to_owned()),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("metadata-default/")),
+            "{names:?}"
+        );
+    }
+
+    /// `BackupManifestDto` declares `ServerVersion, BackupEngineVersion,
+    /// DateCreated, Path, Options`, and System.Text.Json writes that order
+    /// (Jellyfin 12.2's `POST /Backup/Create` answers it).
+    #[test]
+    fn manifest_members_come_out_in_upstreams_order() {
+        let manifest = BackupManifest {
+            path: "/b/x.zip".to_owned(),
+            date_created: "2024-01-02T03:04:05Z".parse().unwrap(),
+            server_version: "1.4.0".to_owned(),
+            backup_engine_version: super::BACKUP_ENGINE_VERSION.to_owned(),
+            options: BackupOptions::default(),
+        };
+        let json = serde_json::to_string(&manifest).unwrap();
+        let at: Vec<usize> = [
+            "\"ServerVersion\"",
+            "\"BackupEngineVersion\"",
+            "\"DateCreated\"",
+            "\"Path\"",
+            "\"Options\"",
+        ]
+        .iter()
+        .map(|key| json.find(key).expect(key))
+        .collect();
+        assert!(at.is_sorted(), "{json}");
+    }
+
+    /// `EnumerateBackups` lists `Directory.EnumerateFiles(BackupPath, "*.zip")`
+    /// as it enumerates: files only, in directory order, the extension matched
+    /// case-sensitively, and an archive whose manifest cannot be read left out.
+    /// Measured on Jellyfin 12.2: `COPY.ZIP` and a junk `.zip` are not listed.
+    #[tokio::test]
+    async fn listing_keeps_directory_order_and_matches_zip_exactly() {
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = clean_test_backups_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = small_roots(tmp.path());
+        // Newer first, so a newest-first sort and creation order disagree.
+        for now in ["2024-05-06T09:00:00Z", "2024-05-06T07:00:00Z"] {
+            super::write_backup(&backups, &roots, no_database(), now.parse().unwrap(), None)
+                .unwrap();
+        }
+        let first = file_names(&backups).remove(0);
+        std::fs::copy(backups.join(&first), backups.join("COPY.ZIP")).unwrap();
+        std::fs::write(backups.join("junk.zip"), b"not a zip").unwrap();
+        std::fs::create_dir(backups.join("dir.zip")).unwrap();
+
+        let (status, body) = send("GET", "/Backup", None).await;
+        assert_eq!(status, 200, "{body}");
+        let listed: Vec<String> = serde_json::from_str::<Vec<serde_json::Value>>(&body)
+            .unwrap()
+            .iter()
+            .map(|m| {
+                m["Path"]
+                    .as_str()
+                    .unwrap()
+                    .rsplit('/')
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        let in_directory_order: Vec<String> = std::fs::read_dir(&backups)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("ferrofin-backup-"))
+            .collect();
+        assert_eq!(listed, in_directory_order);
+        let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    /// The archive name is second-granular: a second create in the same
+    /// second takes the first free `-N` suffix instead of replacing the first
+    /// archive (upstream's `File.OpenWrite` collides the same way).
+    #[test]
+    fn creates_in_the_same_second_keep_both_archives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = small_roots(&tmp.path().join("pd"));
+        let backups = tmp.path().join("backups");
+        let now = "2024-05-06T07:08:09Z".parse().unwrap();
+        let written: Vec<String> = (0..3)
+            .map(|_| {
+                let manifest = super::write_backup(&backups, &roots, no_database(), now, None);
+                manifest.unwrap().path
+            })
+            .collect();
+        assert_eq!(
+            file_names(&backups),
+            [
+                "ferrofin-backup-20240506-070809-1.zip",
+                "ferrofin-backup-20240506-070809-2.zip",
+                "ferrofin-backup-20240506-070809.zip",
+            ]
+        );
+        assert!(written[1].ends_with("ferrofin-backup-20240506-070809-1.zip"));
+    }
+
+    /// `CreateBackup([FromBody] BackupOptionsDto)` takes a required body.
+    /// Measured on Jellyfin 12.2: no content type is a 415, an empty or
+    /// `null` JSON body a 400, and nothing is written.
+    #[tokio::test]
+    async fn create_requires_a_body() {
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = clean_test_backups_dir();
+        for (body, status) in [(None, 415), (Some(""), 400), (Some("null"), 400)] {
+            let (got, text) = send("POST", "/Backup/Create", body).await;
+            assert_eq!(got, status, "{body:?}: {text}");
+        }
+        assert_eq!(file_names(&backups), Vec::<String>::new());
+    }
+
+    /// `GetBackup` reduces `path` as `SanitizePath` does
+    /// (`Path.GetFileName(Path.GetFullPath(path))`), answers 404 when that is
+    /// not a file and 204 when the file is not a readable backup. Each status
+    /// was measured on Jellyfin 12.2.
+    #[tokio::test]
+    async fn manifest_answers_as_upstream() {
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = clean_test_backups_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        let written = super::write_backup(
+            &backups,
+            &small_roots(tmp.path()),
+            no_database(),
+            "2024-05-06T07:08:09Z".parse().unwrap(),
+            None,
+        )
+        .unwrap();
+        let archive = file_names(&backups).remove(0);
+        std::fs::write(backups.join("junk.zip"), b"not a zip").unwrap();
+        std::fs::write(backups.join("plain.txt"), b"not a zip").unwrap();
+        std::fs::create_dir(backups.join("dir.zip")).unwrap();
+
+        for (path, status) in [
+            (archive.clone(), 200),
+            (format!("/elsewhere/{archive}"), 200),
+            (format!("a/../{archive}"), 200),
+            (format!("{archive}/."), 200),
+            (format!("{archive}/.."), 404),
+            ("junk.zip".to_owned(), 204),
+            ("plain.txt".to_owned(), 204),
+            ("nope.zip".to_owned(), 404),
+            ("dir.zip".to_owned(), 404),
+            (format!("{archive}/"), 404),
+            ("..".to_owned(), 404),
+            (".".to_owned(), 404),
+            ("/".to_owned(), 404),
+            ("a/..".to_owned(), 404),
+            ("%20%20".to_owned(), 400),
+        ] {
+            let (got, body) = send("GET", &format!("/Backup/Manifest?path={path}"), None).await;
+            assert_eq!(got, status, "path={path}: {body}");
+            match status {
+                200 => assert!(body.contains(&written.path), "{body}"),
+                204 => assert_eq!(body, ""),
+                _ => {}
+            }
+        }
+        let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    /// `StartRestoreBackup([FromBody, BindRequired] BackupRestoreRequestDto)`
+    /// reduces `ArchiveFileName` with `SanitizePath` too. Each status was
+    /// measured on Jellyfin 12.2; none schedules a restore.
+    #[tokio::test]
+    async fn restore_answers_as_upstream() {
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = clean_test_backups_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        super::write_backup(
+            &backups,
+            &small_roots(tmp.path()),
+            no_database(),
+            "2024-05-06T07:08:09Z".parse().unwrap(),
+            None,
+        )
+        .unwrap();
+        let archive = file_names(&backups).remove(0);
+
+        for (body, status) in [
+            (None, 415),
+            (Some("{}".to_owned()), 400),
+            (Some(r#"{"ArchiveFileName":""}"#.to_owned()), 400),
+            (Some(r#"{"ArchiveFileName":"  "}"#.to_owned()), 404),
+            (Some(r#"{"ArchiveFileName":".."}"#.to_owned()), 404),
+            (Some(r#"{"ArchiveFileName":"."}"#.to_owned()), 404),
+            (Some(r#"{"ArchiveFileName":"/"}"#.to_owned()), 404),
+            (Some(r#"{"ArchiveFileName":"a/.."}"#.to_owned()), 404),
+            (Some(format!(r#"{{"ArchiveFileName":"{archive}/"}}"#)), 404),
+        ] {
+            let (got, text) = send("POST", "/Backup/Restore", body.as_deref()).await;
+            assert_eq!(got, status, "{body:?}: {text}");
+        }
+        assert!(!backups.join(super::RESTORE_PENDING_FILE).exists());
+        let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    /// `GET /Backup/Manifest` and `POST /Backup/Restore` open the archive on
+    /// the blocking pool, as `GET /Backup` does: with the pool starved,
+    /// neither answers. Inline, they would answer from the runtime worker.
+    #[test]
+    fn manifest_and_restore_read_the_archive_on_the_blocking_pool() {
+        use std::time::Duration;
+
+        // Only bounds the failing direction, as in
+        // `creating_a_backup_goes_through_the_blocking_pool`.
+        const STARVED_WAIT: Duration = Duration::from_millis(250);
+
+        let _serial = TEST_SERIAL.blocking_lock();
+        let backups = clean_test_backups_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        super::write_backup(
+            &backups,
+            &small_roots(tmp.path()),
+            no_database(),
+            "2024-05-06T07:08:09Z".parse().unwrap(),
+            None,
+        )
+        .unwrap();
+        let archive = file_names(&backups).remove(0);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (method, uri, body, answer) in [
+                ("GET", format!("/Backup/Manifest?path={archive}"), None, 200),
+                (
+                    "POST",
+                    "/Backup/Restore".to_owned(),
+                    Some(format!(r#"{{"ArchiveFileName":"{archive}"}}"#)),
+                    204,
+                ),
+            ] {
+                let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+                let hog = tokio::task::spawn_blocking(move || {
+                    busy_tx.send(()).ok();
+                    release_rx.recv().ok();
+                });
+                busy_rx.await.unwrap();
+                let mut request =
+                    tokio::spawn(async move { send(method, &uri, body.as_deref()).await.0 });
+
+                let starved = tokio::time::timeout(STARVED_WAIT, &mut request).await;
+                assert!(
+                    starved.is_err(),
+                    "{method} answered with the blocking pool starved, so it read the \
+                     archive on the async worker thread"
+                );
+                release_tx.send(()).unwrap();
+                hog.await.unwrap();
+                assert_eq!(request.await.unwrap(), answer, "{method}");
+            }
+        });
+        let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    /// `CreateEntryFromFile` throws on a file it cannot read, and the create
+    /// deletes its partial archive and fails (Jellyfin 12.2 answers 500 with
+    /// a `chmod 000` file under `root/`). A skipped file would be a backup
+    /// reported complete that is not.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_fails_the_backup() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = small_roots(&tmp.path().join("pd"));
+        let locked = roots.config.join("locked.json");
+        std::fs::write(&locked, b"{}").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&locked).is_ok() {
+            // Permission bits do not bind root; nothing fails to test.
+            return;
+        }
+        let backups = tmp.path().join("backups");
+        let now = "2024-05-06T07:08:09Z".parse().unwrap();
+
+        let failed = super::write_backup(&backups, &roots, no_database(), now, None).unwrap_err();
+        assert!(failed.to_string().contains("locked.json"), "{failed}");
+        assert_eq!(file_names(&backups), Vec::<String>::new());
+    }
+
+    /// A file whose name is not UTF-8 cannot go into the archive under its
+    /// name; the create fails naming it rather than leaving it out.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_with_a_non_utf8_name_fails_the_backup() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = small_roots(&tmp.path().join("pd"));
+        let odd = roots
+            .config
+            .join(std::ffi::OsStr::from_bytes(b"caf\xe9.json"));
+        if std::fs::write(&odd, b"{}").is_err() {
+            // A filesystem that only takes UTF-8 names: nothing to test.
+            return;
+        }
+        let backups = tmp.path().join("backups");
+        let now = "2024-05-06T07:08:09Z".parse().unwrap();
+
+        let failed = super::write_backup(&backups, &roots, no_database(), now, None).unwrap_err();
+        assert!(failed.to_string().contains("caf"), "{failed}");
+        assert_eq!(file_names(&backups), Vec::<String>::new());
+    }
+
+    /// The database goes into an archive only from the snapshot: with
+    /// `Database` selected and no snapshot written, the create fails instead
+    /// of copying the live WAL-mode file or leaving the database out.
+    #[test]
+    fn a_database_backup_without_a_snapshot_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let roots = small_roots(&tmp.path().join("pd"));
+        std::fs::write(&roots.database, b"LIVE").unwrap();
+        let backups = tmp.path().join("backups");
+        let now = "2024-05-06T07:08:09Z".parse().unwrap();
+
+        for snapshot in [None, Some(tmp.path().join("never-written.db"))] {
+            let written = super::write_backup(
+                &backups,
+                &roots,
+                BackupOptions::default(),
+                now,
+                snapshot.as_deref(),
+            );
+            assert!(written.is_err(), "{snapshot:?}");
+        }
+        assert_eq!(file_names(&backups), Vec::<String>::new());
+    }
+
+    /// `Directory.EnumerateFiles` throws on a backups directory it cannot
+    /// read: Jellyfin 12.2 answers `GET /Backup` with a 500, not an empty list.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_backups_directory_fails_the_listing() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let _serial = TEST_SERIAL.lock().await;
+        let backups = clean_test_backups_dir();
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&backups).is_ok();
+
+        let (status, body) = send("GET", "/Backup", None).await;
+        std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if !readable {
+            assert_eq!(status, 500, "{body}");
+        }
         let _ = std::fs::remove_dir_all(&backups);
     }
 }
