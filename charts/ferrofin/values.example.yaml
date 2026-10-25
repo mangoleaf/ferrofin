@@ -169,6 +169,10 @@ ferrofin:
     # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
     # hardware acceleration holds GPU memory; "1" matches Jellyfin.
     # FERROFIN_TRICKPLAY_CONCURRENCY: "1"
+    # Trade frame quality for speed when extracting chapter images, video
+    # thumbnails and embedded pictures: keyframes only, no 24-frame sampling
+    # (default "false", Jellyfin's FFmpeg:imgExtractPerfTradeoff).
+    # FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF: "true"
     # How long TheTVDB lookups (episode ids, a series' season list) are reused,
     # in whole hours (default 1, the TVDB plugin's CacheDurationInHours).
     # FERROFIN_TVDB_CACHE_HOURS: "1"

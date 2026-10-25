@@ -212,14 +212,17 @@ impl ChapterImageExtractor {
         Ok(outcome)
     }
 
-    async fn is_active_recording(&self, video: &BaseItemEntity) -> bool {
+    /// `Video.IsActiveRecording()`: whether Live TV is still writing the
+    /// video's file. A failed lookup counts as recording, so nothing is
+    /// extracted from a file that may be incomplete.
+    pub(crate) async fn is_active_recording(&self, video: &BaseItemEntity) -> bool {
         let Some(live_tv) = self.live_tv.as_ref().and_then(Weak::upgrade) else {
             return false;
         };
         match live_tv.active_recording_paths().await {
             Ok(paths) => paths.iter().any(|path| video.path.as_ref() == Some(path)),
             Err(error) => {
-                tracing::warn!(item = %video.id, %error, "chapter image recording lookup failed");
+                tracing::warn!(item_id = %video.id, %error, "active recording lookup failed");
                 true
             }
         }
