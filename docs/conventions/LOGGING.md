@@ -90,8 +90,15 @@ rules; cardinality doesn't bind logs).
 
 ## 6. The sinks are fixed
 
-File sink stays plain text; stdout stays JSON-default. Unchanged from TRACING.md;
-nothing in a log change may alter either.
+The sinks are fixed in kind: the file sink stays plain text; stdout stays
+JSON-default. Unchanged from TRACING.md; nothing in a log change may alter either.
+
+Within the plain text, no record can be forged: the text sinks write through
+`RecordLines` (`apps/ferrofin-server/src/log_lines.rs`), which turns a line feed
+inside an event into an indented continuation line and a carriage return into `\r`,
+so every line that starts at the left margin is a real record (owner decision
+2026-10-24). Free text a client or a plugin supplies is still logged as a field,
+with `?` (Debug escapes it), never as the message.
 
 ## 7. Panics must be visible
 

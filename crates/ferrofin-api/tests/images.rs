@@ -1775,6 +1775,47 @@ async fn image_uploads_reject_unknown_image_subtypes(#[case] route: &str) {
     assert!(s.providers.saved.lock().expect("lock").is_empty(), "{uri}");
 }
 
+/// gl-24: Jellyfin sets no `MaxRequestBodySize`, so Kestrel's 30,000,000-byte
+/// default is the only cap on an image upload. A 4 MB base64 body (a 3 MB
+/// image) saves on every user and item upload route instead of tripping axum's
+/// implicit 2 MiB limit, and a body past 30,000,000 bytes is a `413` that saves
+/// nothing.
+#[rstest::rstest]
+#[case::user_image("/UserImage")]
+#[case::legacy_user_image("/Users/{user}/Images/Primary")]
+#[case::indexed_legacy_user_image("/Users/{user}/Images/Primary/0")]
+#[case::item_image("/Items/{item}/Images/Primary")]
+#[case::item_image_by_index("/Items/{item}/Images/Primary/0")]
+#[tokio::test]
+async fn image_uploads_take_bodies_up_to_kestrels_default_limit(#[case] route: &str) {
+    let s = elevated_stubs(String::new(), String::new());
+    let uri = route
+        .replace("{user}", &USER_ID.to_string())
+        .replace("{item}", &ITEM_ID.to_string());
+    let (status, _) = send(
+        &s,
+        "POST",
+        &uri,
+        Some(("image/png", &"A".repeat(4_000_000))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{uri}");
+    let saved = || {
+        s.users.saved.lock().expect("lock").len() + s.providers.saved.lock().expect("lock").len()
+    };
+    assert_eq!(saved(), 1, "{uri}");
+
+    let (status, _) = send(
+        &s,
+        "POST",
+        &uri,
+        Some(("image/png", &"A".repeat(30_000_004))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+    assert_eq!(saved(), 1, "{uri}");
+}
+
 /// `=` before the end of the body is invalid data to `FromBase64Transform`, so
 /// the upload is refused and nothing is saved (gl-689).
 #[tokio::test]

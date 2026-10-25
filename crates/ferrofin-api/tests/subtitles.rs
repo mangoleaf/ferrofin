@@ -46,7 +46,9 @@ use ferrofin_traits::library::{LibraryManager, MediaSourceManager};
 use ferrofin_traits::media_encoding::SubtitleEncoder;
 use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use ferrofin_traits::persistence::ItemWithCounts;
-use ferrofin_traits::subtitles::{SubtitleManager, SubtitleResponse, SubtitleSearchRequest};
+use ferrofin_traits::subtitles::{
+    ProviderLogin, SubtitleManager, SubtitleResponse, SubtitleSearchRequest,
+};
 use ferrofin_traits::system::ServerApplicationPaths;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -355,6 +357,8 @@ type Logins = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 struct CannedSubtitles {
     deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
     logins: Logins,
+    /// The decoded size of each upload that reached the manager.
+    uploads: Arc<Mutex<Vec<usize>>>,
 }
 
 #[async_trait]
@@ -375,8 +379,9 @@ impl SubtitleManager for CannedSubtitles {
     async fn upload_subtitle(
         &self,
         _item_id: Uuid,
-        _response: &SubtitleResponse,
+        response: &SubtitleResponse,
     ) -> Result<(), ServiceError> {
+        self.uploads.lock().unwrap().push(response.content.len());
         Err(ServiceError::invalid_input("no providers"))
     }
     async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
@@ -392,16 +397,23 @@ impl SubtitleManager for CannedSubtitles {
     ) -> Result<Vec<ferrofin_model::providers::SubtitleProviderInfo>, ServiceError> {
         Ok(Vec::new())
     }
+    /// Accepts every account but `bad`, whose login OpenSubtitles refuses.
     async fn validate_provider_login(
         &self,
         provider_name: &str,
         config_json: &[u8],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<ProviderLogin, ServiceError> {
         self.logins
             .lock()
             .unwrap()
             .push((provider_name.to_owned(), config_json.to_vec()));
-        Ok(())
+        let config: serde_json::Value = serde_json::from_slice(config_json).unwrap();
+        if config["Username"] == "bad" {
+            return Err(ServiceError::Unauthorized("Unauthorized - nope".to_owned()));
+        }
+        Ok(ProviderLogin {
+            allowed_downloads: 20,
+        })
     }
 }
 
@@ -809,6 +821,14 @@ async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // gl-25: `Ok(new { Downloads = …AllowedDownloads ?? 0 })`.
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"Downloads": 20})
+    );
     let logins = subtitles.logins.lock().unwrap().clone();
     assert_eq!(logins.len(), 1);
     assert_eq!(logins[0].0, "opensubtitles");
@@ -822,6 +842,22 @@ async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
     let response = post(None, r#"{"Username":"u"}"#).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(subtitles.logins.lock().unwrap().len(), 1);
+
+    // gl-25: a refused login is `Unauthorized(new { Message = msg })`.
+    let response = post(
+        Some("application/json"),
+        r#"{"Username":"bad","Password":"p"}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"Message": "Unauthorized - nope"})
+    );
 }
 
 // ---- FallbackFont ----------------------------------------------------------
@@ -1010,6 +1046,14 @@ async fn subtitle_management_gates_every_operation_but_deletion_requires_admin()
                 "",
                 StatusCode::NO_CONTENT,
             ),
+            // gl-25: the plugin controller is `[Authorize(Policy =
+            // Policies.SubtitleManagement)]`, as the contract records.
+            (
+                "POST",
+                "/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo".to_owned(),
+                r#"{"Username":"u","Password":"p"}"#,
+                StatusCode::OK,
+            ),
         ] {
             let permitted = admin || api_key || (enabled && method != "DELETE");
             let response = create_router(app.clone())
@@ -1082,6 +1126,51 @@ async fn video_only_subtitle_routes_refuse_a_non_video_item() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
     }
+}
+
+/// gl-24: `UploadSubtitle` binds its `[FromBody]` DTO under Kestrel's
+/// 30,000,000-byte default, so a subtitle with embedded fonts past axum's
+/// implicit 2 MiB reaches the manager whole, and a body past the limit is a
+/// `413`, not a `400` claiming the body is required.
+#[tokio::test]
+async fn subtitle_upload_takes_bodies_up_to_kestrels_default_limit() {
+    let subtitles = Arc::new(CannedSubtitles::default());
+    let uploads = subtitles.uploads.clone();
+    let app = remote_search_state(subtitles);
+    let upload = |data: String| {
+        let app = app.clone();
+        async move {
+            let body = format!(
+                r#"{{"Language":"eng","Format":"ass","IsForced":false,"IsHearingImpaired":false,"Data":"{data}"}}"#
+            );
+            let response = create_router(app)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/Videos/{ITEM_ID}/Subtitles"))
+                        .header("X-Emby-Token", "tok")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+
+    let (status, body) = upload("A".repeat(4_000_000)).await;
+    // The canned manager refuses every upload: reaching it is the point.
+    assert_eq!(*uploads.lock().unwrap(), [3_000_000], "{status} {body}");
+
+    let (status, body) = upload("A".repeat(30_000_000)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!body.contains("The body field is required."), "{body}");
+    assert_eq!(uploads.lock().unwrap().len(), 1);
 }
 
 // ---- Graphical subtitles served raw ----------------------------------------

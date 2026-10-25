@@ -903,6 +903,42 @@ async fn lyrics_upload_passes_format_and_raw_body(
     );
 }
 
+/// gl-24: `UploadLyrics` copies `Request.Body` under Kestrel's 30,000,000-byte
+/// default, so a body past axum's implicit 2 MiB is saved whole, and one past
+/// the limit is a `413` that saves nothing.
+#[tokio::test]
+async fn lyrics_upload_takes_bodies_up_to_kestrels_default_limit() {
+    let saved = Arc::new(Mutex::new(None));
+    let canned = || CannedLyrics {
+        stored: Some(LyricDto::default()),
+        remote: None,
+        deleted: Arc::default(),
+        saved: Arc::clone(&saved),
+    };
+    let uri = format!("/Audio/{ITEM_ID}/Lyrics?fileName=s.lrc");
+    let (_dir, path) = temp_media();
+    let large = vec![b'a'; 3_000_000];
+    assert_eq!(
+        post_body(state(&path, Arc::new(canned())), &uri, large.clone()).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        saved.lock().unwrap().take(),
+        Some(("lrc".to_owned(), large))
+    );
+
+    assert_eq!(
+        post_body(
+            state(&path, Arc::new(canned())),
+            &uri,
+            vec![b'a'; 30_000_001]
+        )
+        .await,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert!(saved.lock().unwrap().is_none());
+}
+
 /// No extension (`Path.GetExtension` is empty, a trailing dot included) is
 /// the controller's `400`, and nothing is saved.
 #[rstest::rstest]

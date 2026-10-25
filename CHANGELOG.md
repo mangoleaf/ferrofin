@@ -454,6 +454,21 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   transform that would grow a file by more than 256 KiB leaves the file unchanged
 - WASM plugins with a semver prerelease or build version (`0.2.0-beta.1`, `1.0.0+git.abc`) can
   be enabled, disabled and uninstalled from the dashboard; those buttons answered `400`
+- `POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo` requires the subtitle management
+  permission, as the plugin does: any signed-in account could make the server try
+  OpenSubtitles logins of its choosing with the shared application key. It now answers as the
+  plugin does, `{"Downloads": n}` for a working account (logging the test session out again)
+  and `401 {"Message": …}` for a refused one, where it answered an empty 200 or `{"error": …}`
+- A host name in `KnownProxies` (a docker-compose service name, say) is resolved, as in
+  Jellyfin, instead of dropped without a word. Behind a proxy named that way every client
+  looked like the proxy, a LAN address, to the remote-access, IP-filter and local-access
+  checks. An entry of a disabled address family is dropped and an IPv4-mapped one unmapped, as
+  Jellyfin does, ASP.NET's loopback defaults (`::1`, `127.0.0.0/8`) stay trusted whenever the
+  list is not empty, and an entry that resolves to nothing is logged once at warning level
+- A line break in a logged value (the `DeviceId` a client sends, a WASM plugin's log text) can
+  no longer forge a line in the log file behind `/System/Logs`: the file continues the entry
+  on an indented line instead (a carriage return is written as `\r`), and a plugin's text is
+  logged escaped, under `guest_message`, cut at 8 KiB
 
 ### Bug Fixes
 - A backup no longer reports success with something left out:
@@ -640,6 +655,20 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   full or read-only database): the failure is logged as a warning and every library is still
   listed, where `GET /Library/VirtualFolders`, the home screen's views and the scheduled tasks
   that look libraries up all failed until a later listing succeeded
+- Image, user image, splashscreen, subtitle and lyric uploads take bodies up to 30,000,000
+  bytes, Kestrel's default that Jellyfin keeps: an image over about 1.5 MB (2 MiB once
+  base64-encoded) was refused with a 413. A body past a route's limit is a 413 everywhere,
+  where a JSON body over it was a 400 claiming the body was missing
+- A posted device profile the stream builder cannot evaluate is answered as Jellyfin answers
+  it, a 400 for a condition on a property the stream has none of and a 500 for a comparison
+  its value has none of, instead of a panic. A `VideoTimestamp` condition's value is read as
+  Jellyfin reads it, so an unknown one is a 400 rather than a condition never met
+- A resized image is written beside its cache path and renamed into place, so a request that
+  races its encode, or follows an encode that failed part-way, never serves (and pins for a
+  year, under the immutable cache header) a truncated image
+- The Merge Versions plugin's bulk merges and splits run one at a time, whether a route or a
+  daily task starts them: a merge and a split started together interleaved their version-link
+  writes
 
 ## [1.0.0] - 2026-09-05
 

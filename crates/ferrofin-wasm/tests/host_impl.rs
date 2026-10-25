@@ -55,6 +55,63 @@ fn log_and_get_config_work_at_every_level() {
     assert_eq!(s.get_config(), r#"{"k":"v"}"#);
 }
 
+/// A `MakeWriter` collecting every formatted event into one shared buffer.
+#[derive(Clone, Default)]
+struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What the text formatter (the file sink's) writes for `message` logged by
+/// the guest at `info`.
+fn logged_text(message: String) -> String {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        state(Arc::new(std::sync::OnceLock::new())).log(types::LogLevel::Info, message);
+    });
+    String::from_utf8(captured.0.lock().unwrap().clone()).unwrap()
+}
+
+/// gl-154: a guest's text is escaped data in a field of its own, never the
+/// event's message, so a line break, a carriage return or an escape sequence
+/// in it cannot forge a line in the plain-text log behind `/System/Logs`.
+#[test]
+fn a_guest_log_message_cannot_forge_a_log_line() {
+    let text = logged_text(
+        "real\n2026-10-24T00:00:00.000000Z ERROR ferrofin: forged\r\u{1b}[2K".to_owned(),
+    );
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains("wasm plugin log"), "{text}");
+    assert!(
+        text.contains(
+            r#"guest_message="real\n2026-10-24T00:00:00.000000Z ERROR ferrofin: forged\r\u{1b}[2K""#
+        ),
+        "{text}"
+    );
+}
+
+/// gl-154: a guest's message is cut at 8 KiB (on a character boundary) and
+/// says so, so one call cannot write megabytes into the log.
+#[test]
+fn a_guest_log_message_is_cut_at_8_kib() {
+    let text = logged_text("é".repeat(10_000));
+    assert!(text.len() < 8 * 1024 + 256, "{} bytes", text.len());
+    assert!(text.contains("(20000 bytes, truncated)"), "{text}");
+    assert!(text.contains(&"é".repeat(4096)), "kept 8 KiB of it");
+}
+
 #[test]
 fn clock_waits_are_clamped_to_the_call_deadline_then_trap() {
     use ferrofin_wasm::bindings::DeadlineClocks;

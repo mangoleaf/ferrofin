@@ -69,6 +69,36 @@ async fn post(
     (status, ct, String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// gl-24: a body past what a route reads (axum's 2 MiB default on every route
+/// that is no upload) is a `413`, not a `400` whose `errors` claim the body is
+/// required.
+#[tokio::test]
+async fn a_body_past_the_routes_limit_is_413_not_a_missing_body() {
+    for uri in ROUTES {
+        let body = format!(r#"{{"Username":"{}"}}"#, "a".repeat(3 * 1024 * 1024));
+        let response = create_router(state())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(*uri)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("The body field is required."),
+            "{uri}: {text}"
+        );
+    }
+}
+
 /// The three routes the matrix runs over, one per controller. `/LiveTv/Programs`
 /// is the op this was measured on; the other two are anonymous, so a failure
 /// there cannot be blamed on the auth stub.

@@ -193,18 +193,54 @@ impl monotonic_clock::Host for DeadlineClocksView<'_> {
 // trait is empty but must still be implemented for the linker bound.
 impl types::Host for HostState {}
 
+/// The most of one guest log message written to the log, in bytes of the
+/// guest's text; the rest is cut (on a character boundary) and the cut noted,
+/// so one call cannot write megabytes into the log. The bound is on the input:
+/// escaping control characters can lengthen the logged line (`\u{1}` is six
+/// bytes). Candidate server setting; it ships as this constant (owner,
+/// 2026-10-24).
+const MAX_GUEST_LOG_MESSAGE_BYTES: usize = 8 * 1024;
+
+/// `message` as the log records it: whole when it fits in
+/// [`MAX_GUEST_LOG_MESSAGE_BYTES`], else its head and how long it was.
+fn guest_log_text(message: &str) -> std::borrow::Cow<'_, str> {
+    if message.len() <= MAX_GUEST_LOG_MESSAGE_BYTES {
+        return std::borrow::Cow::Borrowed(message);
+    }
+    let mut end = MAX_GUEST_LOG_MESSAGE_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}… ({} bytes, truncated)",
+        &message[..end],
+        message.len()
+    ))
+}
+
 impl host::Host for HostState {
     fn log(&mut self, level: types::LogLevel, message: String) {
-        // Guest text is data, not format: log it as a field so a malicious
-        // message can never smuggle formatting or fake fields into our lines.
+        // Guest text is data, not format. It is a field of its own: named
+        // `message`, it would be the event's message, which the text log
+        // writes raw (so a line break forged a line in the file behind
+        // `/System/Logs`) and which replaces the static text in JSON. Debug
+        // formatting quotes it and escapes line breaks, carriage returns and
+        // escape sequences.
         let plugin = self.plugin_name.as_str();
         let plugin_id = self.plugin_id.as_str();
+        let guest_message = guest_log_text(&message);
         match level {
-            types::LogLevel::Trace => trace!(plugin, plugin_id, message, "wasm plugin log"),
-            types::LogLevel::Debug => debug!(plugin, plugin_id, message, "wasm plugin log"),
-            types::LogLevel::Info => info!(plugin, plugin_id, message, "wasm plugin log"),
-            types::LogLevel::Warn => warn!(plugin, plugin_id, message, "wasm plugin log"),
-            types::LogLevel::Error => error!(plugin, plugin_id, message, "wasm plugin log"),
+            types::LogLevel::Trace => {
+                trace!(plugin, plugin_id, ?guest_message, "wasm plugin log");
+            }
+            types::LogLevel::Debug => {
+                debug!(plugin, plugin_id, ?guest_message, "wasm plugin log");
+            }
+            types::LogLevel::Info => info!(plugin, plugin_id, ?guest_message, "wasm plugin log"),
+            types::LogLevel::Warn => warn!(plugin, plugin_id, ?guest_message, "wasm plugin log"),
+            types::LogLevel::Error => {
+                error!(plugin, plugin_id, ?guest_message, "wasm plugin log");
+            }
         }
     }
 

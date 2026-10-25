@@ -29,6 +29,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
+use crate::log_lines::RecordLines;
 
 /// The OTLP tracer provider, kept alive for its background batch exporter and so
 /// [`shutdown_tracing`] can flush it on graceful shutdown. `None` (unset) unless
@@ -204,7 +205,8 @@ type BoxedLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry
 /// Default (`text_mode = false`): JSON to stdout + plain text to the file. Text
 /// mode: a single human-readable layer tee'd to stdout + file. The file sink is
 /// always plain text (dashboard parity); when no file writer exists, only stdout
-/// is written.
+/// is written. Every text sink writes through [`RecordLines`], so a line break
+/// inside a logged value cannot forge a record of its own.
 fn build_fmt_layers(
     text_mode: bool,
     file_writer: Option<tracing_appender::non_blocking::NonBlocking>,
@@ -220,7 +222,7 @@ fn build_fmt_layers(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
                 .with_ansi(false)
-                .with_writer(std::io::stdout.and(writer))
+                .with_writer(RecordLines(std::io::stdout.and(writer)))
                 .boxed(),
         ),
         // Legacy fallback when the log dir can't be prepared: stdout-only text,
@@ -228,7 +230,7 @@ fn build_fmt_layers(
         (true, None) => layers.push(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
-                .with_writer(std::io::stdout)
+                .with_writer(RecordLines(std::io::stdout))
                 .boxed(),
         ),
         // Default: JSON to stdout (structured, `trace_id`-carrying) + plain text
@@ -245,7 +247,7 @@ fn build_fmt_layers(
                 tracing_subscriber::fmt::layer()
                     .with_target(true)
                     .with_ansi(false)
-                    .with_writer(writer)
+                    .with_writer(RecordLines(writer))
                     .boxed(),
             );
         }
@@ -1599,6 +1601,38 @@ mod tests {
         assert!(
             contents.contains("flush_probe_line"),
             "buffered line flushed to file: {contents:?}"
+        );
+    }
+
+    /// gl-154: the plain-text file sink `/System/Logs` serves keeps every event
+    /// on lines of its own record, in both formats: a line break inside a
+    /// logged value continues the record indented and never starts a forged
+    /// one at the left margin.
+    #[rstest::rstest]
+    #[case::json_with_text_file(false)]
+    #[case::text_tee(true)]
+    fn the_text_file_sink_cannot_be_forged_by_a_logged_line_break(#[case] text_mode: bool) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let file = CapturedLogs::default();
+        let (writer, guard) = tracing_appender::non_blocking(file.clone());
+        let layers = build_fmt_layers(text_mode, Some(writer));
+        let subscriber = tracing_subscriber::registry().with(layers);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                device = %"phone\n2026-10-24T00:00:00.000000Z ERROR ferrofin: forged",
+                "playback started"
+            );
+        });
+        drop(guard); // flushes the background queue
+
+        let text = file.text();
+        let forged = text
+            .lines()
+            .find(|line| line.contains("forged"))
+            .unwrap_or_else(|| panic!("logged: {text:?}"));
+        assert!(
+            forged.starts_with("    2026-10-24T00:00:00.000000Z ERROR"),
+            "{text:?}"
         );
     }
 

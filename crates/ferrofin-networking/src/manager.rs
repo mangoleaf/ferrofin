@@ -13,6 +13,7 @@ use std::sync::Arc;
 use ferrofin_model::net::{AddressFamily, IpData, IpNetwork, PublishedServerUriOverride};
 
 use crate::config_keys;
+use crate::known_proxies::KnownProxies;
 use crate::logger::{Logger, NullLogger};
 use crate::net_constants;
 use crate::net_utils;
@@ -132,7 +133,7 @@ pub struct NetworkManager {
     startup_config: StartupConfig,
     published_server_urls: Vec<PublishedServerUriOverride>,
     remote_address_filter: Vec<IpNetwork>,
-    known_proxies: Vec<IpNetwork>,
+    known_proxies: KnownProxies,
     interfaces: Vec<IpData>,
     lan_subnets: Vec<IpNetwork>,
     excluded_subnets: Vec<IpNetwork>,
@@ -205,7 +206,7 @@ impl NetworkManager {
             startup_config,
             published_server_urls: Vec::new(),
             remote_address_filter: Vec::new(),
-            known_proxies: Vec::new(),
+            known_proxies: KnownProxies::default(),
             interfaces: Vec::new(),
             lan_subnets: Vec::new(),
             excluded_subnets: Vec::new(),
@@ -251,15 +252,28 @@ impl NetworkManager {
     }
 
     /// Looks host names up with `resolver` instead of the operating system's
-    /// resolver, builder-style.
+    /// resolver, builder-style, and parses `KnownProxies` again with it.
     ///
     /// Only the textual-source paths ([`Self::get_bind_address`],
-    /// [`Self::is_in_local_network_str`]) resolve names, so tests use this to
-    /// keep them off live DNS. Every other constructor keeps the OS resolver.
+    /// [`Self::is_in_local_network_str`]) and `KnownProxies` host names resolve
+    /// names, so tests use this to keep them off live DNS. Every other
+    /// constructor keeps the OS resolver, and has already looked up any
+    /// `KnownProxies` host name in the configuration it was given with it:
+    /// start from one without host names and pass them to
+    /// [`Self::update_settings`] afterwards.
     #[must_use]
     pub fn with_resolver(mut self, resolver: net_utils::HostResolver) -> Self {
         self.resolver = resolver;
+        let proxies = KnownProxies::resolve(&self.config, resolver);
+        self.adopt_known_proxies(proxies);
         self
+    }
+
+    /// The host-name resolver, for a lookup made outside the manager's lock
+    /// ([`KnownProxies::resolve`]).
+    #[must_use]
+    pub fn resolver(&self) -> net_utils::HostResolver {
+        self.resolver
     }
 
     /// Replaces the supplied snapshot, including with an intentionally empty list.
@@ -323,8 +337,25 @@ impl NetworkManager {
         &self.published_server_urls
     }
 
+    /// [`Self::update_settings`] with `KnownProxies` already parsed (outside
+    /// the manager's lock, as host names can block on DNS). Proxies parsed from
+    /// another configuration are ignored, and `config`'s are parsed here.
+    pub fn update_settings_with_known_proxies(
+        &mut self,
+        config: &NetworkConfiguration,
+        proxies: KnownProxies,
+    ) {
+        if proxies.is_parsed_from(config) {
+            self.adopt_known_proxies(proxies);
+        }
+        self.update_settings(config);
+    }
+
     /// Reloads all settings and re-initializes the manager
     /// (`NetworkManager.UpdateSettings`).
+    ///
+    /// `KnownProxies` is parsed again only when its entries or the address
+    /// families changed, so an interface refresh resolves no host name.
     pub fn update_settings(&mut self, config: &NetworkConfiguration) {
         self.config = config.clone();
 
@@ -500,41 +531,43 @@ impl NetworkManager {
     }
 
     /// Parses `KnownProxies` into the networks a forwarded header may be
-    /// trusted from — C# `AddProxyAddresses`, which turns a bare address into a
-    /// single-host subnet (`/32`, `/128`) and takes a CIDR as written.
+    /// trusted from (C# `AddProxyAddresses`, [`KnownProxies::resolve`]),
+    /// unless it was already parsed from these entries and address families.
     fn initialize_known_proxies(&mut self, config: &NetworkConfiguration) {
-        let mut parsed: Vec<IpNetwork> = Vec::new();
-        let cidrs: Vec<String> = config
-            .known_proxies
-            .iter()
-            .filter(|x| x.contains('/'))
-            .cloned()
-            .collect();
-        if let Some(subnets) = net_utils::try_parse_to_subnets(&cidrs, false, None) {
-            parsed.extend(subnets.iter().map(|x| x.subnet));
+        if !self.known_proxies.is_parsed_from(config) {
+            let proxies = KnownProxies::resolve(config, self.resolver);
+            self.adopt_known_proxies(proxies);
         }
-        for proxy in config.known_proxies.iter().filter(|x| !x.contains('/')) {
-            if let Ok(ip) = proxy.trim().parse::<IpAddr>() {
-                let prefix = match ip {
-                    IpAddr::V4(_) => net_constants::MINIMUM_IPV4_PREFIX_SIZE,
-                    IpAddr::V6(_) => net_constants::MINIMUM_IPV6_PREFIX_SIZE,
-                };
-                parsed.push(IpNetwork::new(ip, prefix));
-            }
-        }
-        self.known_proxies = parsed;
     }
 
-    /// Whether `address` is one of the configured `KnownProxies`.
+    /// Takes `proxies` as the known proxies, warning once for each entry that
+    /// parsed to nothing: upstream drops it silently, which leaves an operator
+    /// no way to tell a mistyped proxy from a working one.
+    fn adopt_known_proxies(&mut self, proxies: KnownProxies) {
+        for entry in proxies.unresolved() {
+            tracing::warn!(
+                entry = ?entry,
+                "KnownProxies entry is not an address, a subnet or a resolvable host name; ignored"
+            );
+        }
+        self.known_proxies = proxies;
+    }
+
+    /// The networks `KnownProxies` was parsed into, in entry order: what
+    /// upstream's `AddProxyAddresses` files as
+    /// `ForwardedHeadersOptions.KnownProxies` (single hosts) and
+    /// `KnownIPNetworks` (subnets). ASP.NET's loopback defaults, which
+    /// [`Self::is_known_proxy`] also trusts, are not listed.
+    #[must_use]
+    pub fn known_proxies(&self) -> &[IpNetwork] {
+        self.known_proxies.networks()
+    }
+
+    /// Whether `address` may vouch for the client behind it
+    /// ([`KnownProxies::contains`]).
     #[must_use]
     pub fn is_known_proxy(&self, address: IpAddr) -> bool {
-        let address = match address {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(address, IpAddr::V4),
-            IpAddr::V4(_) => address,
-        };
-        self.known_proxies
-            .iter()
-            .any(|network| net_utils::subnet_contains_address(*network, address))
+        self.known_proxies.contains(address)
     }
 
     /// The address of the client that actually made the request, given the
@@ -546,7 +579,8 @@ impl NetworkManager {
     ///
     /// - with NO `KnownProxies` configured the header is ignored completely
     ///   (`ForwardedHeaders.None`) — which is the only safe default, since any
-    ///   client can send one;
+    ///   client can send one; a configured list whose entries all fail to parse
+    ///   still enables it, trusting only ASP.NET's loopback defaults;
     /// - otherwise the chain is walked from the RIGHT, and a hop is taken only
     ///   while the address currently being trusted is a known proxy. The walk
     ///   stops at the first address that is not, so a client cannot forge its
@@ -558,7 +592,7 @@ impl NetworkManager {
     /// ended there (`ferrofin-api`'s `forwarded_for`).
     #[must_use]
     pub fn client_address(&self, peer: IpAddr, forwarded_for: &[IpAddr]) -> IpAddr {
-        if self.known_proxies.is_empty() {
+        if !self.known_proxies.forwarding_enabled() {
             return peer;
         }
         let mut current = peer;

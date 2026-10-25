@@ -84,6 +84,16 @@ pub struct SubtitleSearchRequest {
     pub subtitle_fetcher_order: Vec<String>,
 }
 
+/// What a provider's login check reports on success: the plugin "validate
+/// login" action's answer (OpenSubtitles' `ValidateLoginInfo` returns
+/// `{ Downloads }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProviderLogin {
+    /// The account's allowed downloads per day, `0` when the provider does not
+    /// say (upstream's `AllowedDownloads ?? 0`).
+    pub allowed_downloads: i32,
+}
+
 /// The raw content of a downloaded subtitle.
 ///
 /// Port of `SubtitleResponse` — the C# stream-plus-metadata envelope returned by
@@ -149,7 +159,7 @@ pub trait SubtitleManager: Send + Sync {
         &self,
         provider_name: &str,
         config_json: &[u8],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<ProviderLogin, ServiceError> {
         let _ = (provider_name, config_json);
         Err(ServiceError::invalid_input(
             "login validation is not supported",
@@ -206,9 +216,11 @@ pub trait SubtitleProvider: Send + Sync {
     /// Validates a candidate configuration (e.g. account login) — backs the
     /// plugin "validate login" action. Providers that need no auth accept any
     /// config (the default). `config_json` is the provider's opaque config bytes.
-    async fn validate_login(&self, config_json: &[u8]) -> Result<(), ServiceError> {
+    /// A rejected login is [`ServiceError::Unauthorized`] carrying the
+    /// provider's own explanation.
+    async fn validate_login(&self, config_json: &[u8]) -> Result<ProviderLogin, ServiceError> {
         let _ = config_json;
-        Ok(())
+        Ok(ProviderLogin::default())
     }
 }
 

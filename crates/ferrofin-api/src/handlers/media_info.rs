@@ -24,6 +24,7 @@ use ferrofin_model::media_info::{
 };
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::PlayMethod;
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::RequestContext;
 use uuid::Uuid;
 
@@ -654,7 +655,7 @@ async fn set_device_specific_data(
             &policy,
             is_audio,
             &support,
-        );
+        )?;
         if let Some(decision) = decision {
             decisions.push((source.id.clone(), decision));
         }
@@ -938,17 +939,28 @@ impl StreamDecision {
 /// `MediaInfoHelper.SetDeviceSpecificData`'s choice of negotiation: an audio
 /// item takes the audio one (its own direct play/remux/transcode rules and
 /// `/audio/…` URLs), everything else the video one.
+///
+/// A profile the builder cannot evaluate is answered as upstream's
+/// `ExceptionMiddleware` answers the exception `StreamBuilder` throws for it:
+/// an `ArgumentException` is a 400, an `InvalidOperationException` a 500.
 fn optimal_stream(
     support: &FerrofinTranscoderSupport<'_>,
     options: &MediaOptions,
     is_audio: bool,
-) -> Option<ferrofin_model::dlna::StreamInfo> {
+) -> Result<Option<ferrofin_model::dlna::StreamInfo>, ApiError> {
     let builder = StreamBuilder::new(support);
-    if is_audio {
+    let stream = if is_audio {
         builder.get_optimal_audio_stream(options)
     } else {
         builder.get_optimal_video_stream(options)
-    }
+    };
+    stream.map_err(|error| {
+        if error.is_invalid_argument() {
+            ApiError::BadRequest(error.to_string())
+        } else {
+            ServiceError::backend(error.to_string()).into()
+        }
+    })
 }
 
 /// Runs the DLNA [`StreamBuilder`] for one media source against the client's
@@ -956,7 +968,8 @@ fn optimal_stream(
 /// otherwise `SupportsDirectPlay` is cleared and a `TranscodingUrl` (the HLS master
 /// / remux stream, with the negotiated codecs) is set so the client transcodes.
 /// Returns the decision summary for the metrics recorder ([`None`] when the
-/// builder produced no stream).
+/// builder produced no stream), or the error for a profile the builder cannot
+/// evaluate ([`optimal_stream`]).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // mirrors SetDeviceSpecificData
 fn apply_stream_decision(
     source: &mut MediaSourceInfo,
@@ -971,7 +984,7 @@ fn apply_stream_decision(
     policy: &ferrofin_model::users::UserPolicy,
     is_audio: bool,
     support: &FerrofinTranscoderSupport<'_>,
-) -> Option<StreamDecision> {
+) -> Result<Option<StreamDecision>, ApiError> {
     // MediaInfoHelper applies this again after negotiation, which may promote
     // a remux to Transcode. Audio-only sources require the audio permission;
     // video sources can still use HLS when any of the three operations is allowed.
@@ -1004,7 +1017,9 @@ fn apply_stream_decision(
         stream_selection.always_burn_in_subtitle_when_transcoding;
     options.media_sources = vec![source.clone()];
 
-    let mut stream = optimal_stream(support, &options, is_audio)?;
+    let Some(mut stream) = optimal_stream(support, &options, is_audio)? else {
+        return Ok(None);
+    };
     stream.start_position_ticks = stream_selection.start_time_ticks.unwrap_or(0);
 
     let profile_type = if is_audio {
@@ -1025,28 +1040,28 @@ fn apply_stream_decision(
                 .any(|p| p.profile_type == profile_type && p.context == options.context));
     let force_remote = source.is_remote && policy.force_remote_source_transcoding;
     if force_remote && stream.play_method == PlayMethod::DirectPlay {
-        return Some(force_remote_delivery(
+        return Ok(Some(force_remote_delivery(
             source,
             stream,
             token,
             play_session_id,
             support,
-        ));
+        )));
     }
     if stream.play_method == PlayMethod::DirectPlay {
         source.supports_direct_play = true;
         source.supports_direct_stream = true;
         apply_subtitle_delivery(source, &stream, support, token);
-        return Some(StreamDecision {
+        return Ok(Some(StreamDecision {
             play_method: "DirectPlay",
             transcode_reasons: String::new(),
             target_container: None,
             target_video_codec: None,
             target_audio_codec: None,
-        });
+        }));
     }
     if is_audio {
-        return Some(audio_transcode_decision(
+        return Ok(Some(audio_transcode_decision(
             source,
             stream,
             token,
@@ -1054,7 +1069,7 @@ fn apply_stream_decision(
             flags,
             force_remote,
             support,
-        ));
+        )));
     }
     // Not direct-play: deliver an HLS transcode. The negotiated codecs (typically
     // copy the compatible video, re-encode only the incompatible audio) are carried
@@ -1106,7 +1121,7 @@ fn apply_stream_decision(
     if !source.supports_transcoding {
         source.supports_transcoding = false;
         apply_subtitle_delivery(source, &stream, support, token);
-        return Some(StreamDecision::transcode(&stream));
+        return Ok(Some(StreamDecision::transcode(&stream)));
     }
     // The playback-session id rides the transcode URL so the spawned job is
     // psid-addressable (`DELETE /Videos/ActiveEncodings?playSessionId=…`).
@@ -1125,7 +1140,7 @@ fn apply_stream_decision(
     source.transcoding_sub_protocol = MediaStreamProtocol::hls;
     source.transcoding_container = Some(container.clone());
     apply_subtitle_delivery(source, &stream, support, token);
-    Some(StreamDecision::transcode(&stream))
+    Ok(Some(StreamDecision::transcode(&stream)))
 }
 
 /// `MediaInfoHelper.SetDeviceSpecificData` for an audio item that is not
@@ -2064,7 +2079,8 @@ mod tests {
                 &policy,
                 false,
                 &support(),
-            );
+            )
+            .expect("a profile the builder can evaluate");
             // SetDeviceSpecificSubtitleInfo stamps the decision's reasons.
             assert!(
                 source
@@ -2195,7 +2211,8 @@ mod tests {
                         &policy,
                         false,
                         &support(),
-                    );
+                    )
+                    .expect("a profile the builder can evaluate");
                     assert_eq!(source.supports_direct_play, direct && !(is_remote && force));
                     let url = source.transcoding_url.as_deref().unwrap_or_default();
                     assert_eq!(
@@ -2230,7 +2247,8 @@ mod tests {
                         &denied,
                         false,
                         &support(),
-                    );
+                    )
+                    .expect("a profile the builder can evaluate");
                     assert!(
                         !source.supports_transcoding,
                         "forcing never grants transcoding permission"
@@ -2304,7 +2322,8 @@ mod tests {
                         &policy,
                         !is_video,
                         &support(),
-                    );
+                    )
+                    .expect("a profile the builder can evaluate");
                     let expected = client_allows
                         && (policy.enable_audio_playback_transcoding
                             || (is_video
@@ -2433,6 +2452,7 @@ mod tests {
             false,
             &support(),
         )
+        .expect("a profile the builder can evaluate")
         .expect("a decision");
         assert_eq!(decision.play_method, "Transcode");
 
@@ -2532,6 +2552,7 @@ mod tests {
                 true,
                 &support(),
             )
+            .expect("a profile the builder can evaluate")
         };
 
         // Direct play, cover art and all.
