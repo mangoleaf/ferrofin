@@ -63,6 +63,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Find the playlists folder by its type when a playlist is created, as Jellyfin's
+  `GetPlaylistsFolder` does, instead of by its path or derived id, and write nothing during
+  the lookup. Startup now makes a playlists folder kept at the folder's directory under an id
+  of its own a `PlaylistsFolder` under the root, and puts playlists an older Ferrofin saved
+  without a parent into the playlists folder
 - Let a user named twice in a playlist's `Users` (create, update, or a playlist's stored
   `Shares` read back at startup) edit it when either entry can, as Jellyfin does, instead of
   keeping only the last entry's permission

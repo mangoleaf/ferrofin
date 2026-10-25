@@ -1573,8 +1573,9 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/playlists.rs create_playlist (CreatePlaylistQuery, effective_user_id) \
                → ferrofin-model playlists.rs CreatePlaylistDto → ferrofin-core \
                collection_manager.rs FerrofinPlaylistManager::create_playlist \
-               (PlaylistManager.CreatePlaylist: playlists_folder, a lookup like \
-               GetPlaylistsFolder; infer_media_type, require_user, \
+               (PlaylistManager.CreatePlaylist: playlists_folder → item_persistence_service \
+               playlists_folder_by_type, GetPlaylistsFolder's by-type lookup; \
+               infer_media_type, require_user, \
                new_playlist_folder_and_id, then report_item_added for AddChild's \
                ItemAdded; playlist_items for AddToPlaylistInternal and \
                Playlist.GetPlaylistItems)",
@@ -1591,11 +1592,10 @@ pub const VERIFIED: &[Verified] = &[
          to the next `1`-suffixed folder; upstream's GetTargetPath checks only \
          Directory.Exists, so a file makes CreateDirectory throw (500) and a row whose \
          folder went missing is saved over. Jellyfin bug not ported.",
-            "The playlists folder is found by its path (any row there, whatever its type or \
-         parent), then by the id derived from data\\playlists, not as GetPlaylistsFolder \
-         finds it (the first PlaylistsFolder child of the root, then of the user root, by \
-         type); and the lookup re-parents parentless playlists (adopt_orphans), where \
-         upstream's writes nothing. Fix path: gl-921.",
+            "The new playlist's directory is made in {data}/playlists, where upstream \
+         combines the found folder's Path; they differ only for a folder found by type away \
+         from that directory, since startup keeps the folder in use there \
+         (AggregateFolderStore::ensure).",
             "The first ForceSave refresh writes no playlist.xml into the new folder, where \
          upstream's PlaylistXmlSaver saves one. Fix path: gl-341.",
             "With no media type named and a mixed folder as the first deciding id, the type \

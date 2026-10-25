@@ -348,13 +348,14 @@ async fn collections_folder(
     Ok(container)
 }
 
-/// The playlists folder a created playlist belongs to, adopting any orphans a
-/// previous version left behind, and the id derivation its playlists are
-/// keyed by.
+/// The playlists folder a created playlist belongs to, and the id derivation
+/// its playlists are keyed by.
 ///
-/// A lookup only, as `PlaylistManager.GetPlaylistsFolder` is
-/// (v12.2 PlaylistManager.cs:566-572). The folder is startup's to make, and to
-/// keep at the data directory when that moved
+/// A lookup only, by type as `PlaylistManager.GetPlaylistsFolder` finds it
+/// (v12.2 PlaylistManager.cs:566-572; see
+/// [`crate::item_persistence_service::playlists_folder_by_type`]), writing
+/// nothing. The folder is startup's to make, to keep at the data directory
+/// when that moved, and to put the orphans an older Ferrofin left into
 /// ([`crate::AggregateFolderStore::ensure`], `LibraryManager.CreateRootFolder`
 /// at LibraryManager.cs:1101-1150, under the aggregate). Making it here as
 /// well disagreed with that rule: after a data-directory move this missed
@@ -369,35 +370,14 @@ async fn playlists_folder(
     db: &Database,
     paths: &Arc<dyn ServerApplicationPaths>,
 ) -> Result<(Uuid, crate::item_type_lookup::IdDerivation), ServiceError> {
-    // `PlaylistsFolder`, not `ManualPlaylistsFolder`: 10.11.8 has no class of
-    // the latter name — it is only `PlaylistsFolder.GetClientTypeName()` — and
-    // the row an adopted database carries is stored as
-    // `…Playlists.PlaylistsFolder`. Asking for the other one would never find
-    // Jellyfin's folder.
-    let path = format!("{}/playlists", paths.data_path());
-    let (mode, _root) = container_identity(db, paths).await?;
-    // By path first: a folder already at the directory under an id of its own
-    // (an earlier Ferrofin's `ManualPlaylistsFolder`) is the one in use, and
-    // startup provisions no second one beside it. Then by the id
-    // `CreateRootFolder` derives, from the program-data-relative
-    // `data\playlists`, which a moved data directory keeps where the path does
-    // not; upstream finds the folder by its type, wherever it is.
-    let found = match crate::item_persistence_service::container_at(db, &path).await? {
-        Some(id) => Some(id),
-        None => match crate::item_type_lookup::derive_item_id_with(
-            &mode,
-            BaseItemKind::PlaylistsFolder,
-            &path,
-        ) {
-            Some(id) if crate::item_persistence_service::row_exists(db, id).await? => Some(id),
-            _ => None,
-        },
-    };
-    let Some(folder) = found else {
-        return Err(ServiceError::invalid_input("parentFolder"));
-    };
-    crate::item_persistence_service::adopt_orphans(db, BaseItemKind::Playlist, folder).await?;
-    Ok((folder, mode))
+    let (mode, user_root) = container_identity(db, paths).await?;
+    let aggregate = crate::item_type_lookup::aggregate_folder_id(&mode, &paths.root_folder_path());
+    match crate::item_persistence_service::playlists_folder_by_type(db, aggregate, user_root)
+        .await?
+    {
+        Some(folder) => Ok((folder, mode)),
+        None => Err(ServiceError::invalid_input("parentFolder")),
+    }
 }
 
 /// Makes the folder `PlaylistManager.CreatePlaylist` gives a new playlist
@@ -2480,6 +2460,99 @@ mod tests {
 
         let folders = crate::test_support::items_at_path(&db, &folder).await;
         assert_eq!(folders, 1, "exactly one playlists folder at that path");
+    }
+
+    /// `GetPlaylistsFolder` finds the folder by its type among the aggregate
+    /// root's children (then the user root's), wherever it is stored and
+    /// whatever its id: a `PlaylistsFolder` at another path under an id of its
+    /// own is the one a create uses, and the lookup writes nothing.
+    #[tokio::test]
+    async fn a_create_finds_the_playlists_folder_by_type_wherever_it_is() {
+        let db = test_db().await;
+        let (mgr, _root) = bare_playlist_manager(&db);
+        let (mode, _) = super::container_identity(&db, &mgr.paths)
+            .await
+            .expect("id derivation");
+        let aggregate =
+            crate::item_type_lookup::aggregate_folder_id(&mode, &mgr.paths.root_folder_path())
+                .expect("aggregate id");
+        crate::test_support::seed_folder_item(
+            &db,
+            aggregate,
+            BaseItemKind::AggregateFolder,
+            "root",
+            None,
+        )
+        .await;
+        let folder = Uuid::from_u128(0xBEEF);
+        crate::test_support::seed_folder_item(
+            &db,
+            folder,
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(aggregate),
+        )
+        .await;
+        crate::test_support::set_item_path(&db, folder, "/elsewhere/playlists").await;
+
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Found".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..Default::default()
+            })
+            .await
+            .expect("create playlist");
+        let row = crate::test_support::fetch_item(
+            &db,
+            Uuid::parse_str(&created.id).expect("playlist id"),
+        )
+        .await;
+        assert_eq!(row.parent_id, Some(ferrofin_db::store::guid_to_db(folder)));
+    }
+
+    /// With no playlists folder under the aggregate root, `GetPlaylistsFolder`
+    /// takes the first one among the user root's children.
+    #[tokio::test]
+    async fn a_create_falls_back_to_a_playlists_folder_under_the_user_root() {
+        let db = test_db().await;
+        let (mgr, _root) = bare_playlist_manager(&db);
+        let (_, user_root) = super::container_identity(&db, &mgr.paths)
+            .await
+            .expect("id derivation");
+        let user_root = user_root.expect("user root id");
+        crate::test_support::seed_folder_item(
+            &db,
+            user_root,
+            BaseItemKind::UserRootFolder,
+            "Media Folders",
+            None,
+        )
+        .await;
+        let folder = Uuid::from_u128(0xBEE5);
+        crate::test_support::seed_folder_item(
+            &db,
+            folder,
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(user_root),
+        )
+        .await;
+
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Fallback".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..Default::default()
+            })
+            .await
+            .expect("create playlist");
+        let row = crate::test_support::fetch_item(
+            &db,
+            Uuid::parse_str(&created.id).expect("playlist id"),
+        )
+        .await;
+        assert_eq!(row.parent_id, Some(ferrofin_db::store::guid_to_db(folder)));
     }
 
     /// gl-910: `PlaylistManager.CreatePlaylist` only looks the playlists
