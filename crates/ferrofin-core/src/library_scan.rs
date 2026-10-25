@@ -12739,7 +12739,8 @@ impl LibraryScanner {
             };
             let out_dir = crate::dynamic_images::own_art_dir(&meta_root.resolve(), cf);
             let out = out_dir.join("primary.png");
-            self.merge_library_local_images(items, cf).await;
+            self.merge_library_local_images(items, cf, &folder.locations)
+                .await;
             if !self
                 .library_tile_due(items, &meta_root.resolve(), cf, force)
                 .await?
@@ -12803,13 +12804,21 @@ impl LibraryScanner {
     /// (`CollectionFolder.IsSaveLocalMetadataEnabled`) and where Jellyfin keeps
     /// one, so the image survives a rename, which moves the folder and mints a
     /// new row, and an adopted library's `folder.jpg` is found again. The
-    /// images in the library's media locations
-    /// (`CollectionFolderLocalImageProvider`) are a separate provider, not
-    /// read here yet (gl-788).
+    /// images in the library's media `locations` follow
+    /// (`CollectionFolderLocalImageProvider`, `Order` 1), so an image of a
+    /// type found in both comes from the library's own folder.
     /// A failure is logged and leaves the library as it was: one library's
     /// error never stops the others' tiles.
-    async fn merge_library_local_images(&self, items: &Arc<dyn ItemRepository>, library: Uuid) {
-        if let Err(err) = self.try_merge_library_local_images(items, library).await {
+    async fn merge_library_local_images(
+        &self,
+        items: &Arc<dyn ItemRepository>,
+        library: Uuid,
+        locations: &[String],
+    ) {
+        if let Err(err) = self
+            .try_merge_library_local_images(items, library, locations)
+            .await
+        {
             tracing::warn!(%err, library = %library, "failed to read the library's own images");
         }
     }
@@ -12819,6 +12828,7 @@ impl LibraryScanner {
         &self,
         items: &Arc<dyn ItemRepository>,
         library: Uuid,
+        locations: &[String],
     ) -> Result<(), ServiceError> {
         // A locked item runs no image provider (`RefreshWithProviders`
         // returns first, `MetadataService.cs:785-788`).
@@ -12829,7 +12839,15 @@ impl LibraryScanner {
         else {
             return Ok(());
         };
-        let found = discover_local_images(&row, &FsDirectoryService::new());
+        let dir = FsDirectoryService::new();
+        let mut found = discover_local_images(&row, &dir);
+        // Its own folder is the first of upstream's `PhysicalLocations`, and
+        // already read above.
+        let mut library_item = ImageItem::new(ImageItemKind::CollectionFolder);
+        library_item.physical_locations = locations.to_vec();
+        found.extend(local_image_infos(
+            ferrofin_providers::CollectionFolderLocalImageProvider::get_images(&library_item, &dir),
+        ));
         if found.is_empty() {
             return Ok(());
         }
@@ -22637,14 +22655,17 @@ fn discover_local_images<D: ferrofin_providers::DirectoryService>(
     });
     item.containing_folder_path = containing;
 
-    let found = if kind == ImageItemKind::Episode {
+    local_image_infos(if kind == ImageItemKind::Episode {
         EpisodeLocalImageProvider::get_images(&item, dir)
     } else if LocalImageProvider::supports(&item) {
         LocalImageProvider::get_images(&item, dir)
     } else {
         Vec::new()
-    };
+    })
+}
 
+/// Image rows for images a local provider found, dated by their files.
+fn local_image_infos(found: Vec<ferrofin_providers::LocalImageInfo>) -> Vec<ItemImageInfo> {
     found
         .into_iter()
         .map(|local| ItemImageInfo {

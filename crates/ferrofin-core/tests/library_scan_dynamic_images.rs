@@ -1099,3 +1099,35 @@ async fn a_librarys_own_folder_image_is_read_unless_it_is_locked(
         want
     );
 }
+
+/// gl-788: `CollectionFolderLocalImageProvider` (`Order` 1) reads a library's
+/// media locations after its own folder (`LocalImageProvider`, `Order` 0):
+/// a `folder.png` at the media root becomes the library's image in place of
+/// the collage, and one in the library's own folder wins over it, as
+/// `MergeImages` takes the first image found of a type.
+#[rstest::rstest]
+#[case::media_root(false, BLUE)]
+#[case::own_folder_first(true, RED)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_librarys_media_root_image_is_read_after_its_own_folder(
+    #[case] own_folder: bool,
+    #[case] want: [u8; 3],
+) {
+    let lib = PhotoLibrary::scanned(RED).await;
+    std::fs::write(lib.tmp.path().join("photos/folder.png"), png(BLUE)).expect("media image");
+    if own_folder {
+        std::fs::write(
+            lib.tmp.path().join("root/default/Photos/folder.png"),
+            png(RED),
+        )
+        .expect("own image");
+    }
+
+    lib.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        want
+    );
+}
