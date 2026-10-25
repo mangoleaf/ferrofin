@@ -15,9 +15,14 @@
 //! genre/studio ids), `UserData` predicates (favorite / played / liked /
 //! resumable — the last with v12's Series/Season descendant roll-up), and the
 //! ordering table are ported directly, as are 12.1's stream-language filters
-//! (`AudioLanguages` / `SubtitleLanguages`) and `HasSubtitles` with v12's
+//! (`AudioLanguages` / `SubtitleLanguages`), `HasSubtitles`, the four
+//! `HasNo*TrackWithLanguage` filters and `HasChapterImages` with v12's
 //! alternate-version and folder roll-up
-//! (`push_item_version_or_folder_matching`), and the resolution filters
+//! (`push_item_version_or_folder_matching`), `HasOfficialRating` and
+//! `IsPlaceHolder` with v12's item-or-descendant roll-up
+//! (`push_item_or_descendant_matching`), the provider-id maps
+//! (`WhereProviderMatch`), `TrailerTypes`, `HasDeadParentId`,
+//! `SeriesStatuses`, the parental-rating chain, and the resolution filters
 //! (`IsHD` / `Is4K`, `Min`/`Max` `Width`/`Height`) with v12's
 //! `VersionsMatchingDimension` and, for `IsHD` / `Is4K`, the folder
 //! descendant roll-up. The played filter and sort keys take v12.2's
@@ -959,6 +964,30 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
         push_in_list(qb, r#"bi."OfficialRating""#, &filter.official_ratings);
     }
 
+    // `e.TrailerTypes!.Any(w => trailerTypes.Contains(w.Id))`
+    // (`TranslateQuery.cs:427-431`).
+    if !filter.trailer_types.is_empty() {
+        let types: Vec<i64> = filter
+            .trailer_types
+            .iter()
+            .map(|t| i64::from(ferrofin_db::enums::trailer_type::to_i32(*t)))
+            .collect();
+        qb.push(
+            r#" AND EXISTS (SELECT 1 FROM "BaseItemTrailerTypes" tt WHERE tt."ItemId" = bi."Id" AND "#,
+        );
+        push_in_list(qb, r#"tt."Id""#, &types);
+        qb.push(")");
+    }
+    // `HasDeadParentId` (`TranslateQuery.cs:970-974`): the item names a parent
+    // no row but the placeholder has.
+    if filter.has_dead_parent_id == Some(true) {
+        qb.push(
+            r#" AND bi."ParentId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM "BaseItems" parent
+                WHERE parent."Id" = bi."ParentId" AND parent."Id" <> "#,
+        )
+        .push_bind(PLACEHOLDER_ID)
+        .push(")");
+    }
     if let Some(has) = filter.has_owner_id {
         if has {
             qb.push(" AND NOT ").push(NO_OWNER);
@@ -1603,12 +1632,13 @@ fn build_box_set_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryB
     qb
 }
 
-/// Appends the media-attribute predicates: subtitle presence, owned-extra
-/// presence (trailer / theme song / theme video / special feature), video
-/// types, and 3D.
+/// Appends the media-attribute predicates: subtitle presence, chapter
+/// images, image types, owned-extra presence (trailer / theme song / theme
+/// video / special feature), then the `Data`-blob matches
+/// ([`append_data_blob_predicates`]).
 ///
-/// Ports of C# `TranslateQuery`'s `HasSubtitles`, the `ExtraIds`-backed extra
-/// filters, and the `Data`-substring `VideoType` / `Video3DFormat` matches.
+/// Ports of C# `TranslateQuery`'s `HasSubtitles`, `HasChapterImages`,
+/// `ImageTypes` and the `ExtraIds`-backed extra filters.
 fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     // Subtitle presence (v12 `TranslateQuery.cs:897-918`, criteria
     // `HasSubtitles`): an item matches on its own subtitle streams or an
@@ -1619,11 +1649,19 @@ fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
     // complement in SQL too.
     if let Some(want) = filter.has_subtitles {
         qb.push(if want { " AND " } else { " AND NOT " });
-        push_item_version_or_folder_matching(qb, &|qb, alias| {
+        push_item_version_or_folder_matching(qb, MediaTable::Streams, &|qb, alias| {
             qb.push(format!(
                 r#"{alias}."StreamType" = {}"#,
                 i32::from(MediaStreamTypeEntity::Subtitle)
             ));
+        });
+    }
+    // Chapter pictures (`TranslateQuery.cs:946-968`, criteria
+    // `HasChapterImages`): the same roll-up over the chapter rows.
+    if let Some(want) = filter.has_chapter_images {
+        qb.push(if want { " AND " } else { " AND NOT " });
+        push_item_version_or_folder_matching(qb, MediaTable::Chapters, &|qb, alias| {
+            qb.push(format!(r#"{alias}."ImagePath" IS NOT NULL"#));
         });
     }
 
@@ -1676,6 +1714,13 @@ fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
         );
     }
 
+    append_data_blob_predicates(qb, filter);
+}
+
+/// The filters matched inside the serialized `Data` blob, by substring as C#
+/// does: video types and 3D, placeholders (rolled up), series statuses and
+/// box-set library folders.
+fn append_data_blob_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     // Video types / 3D live inside the serialized `Data` blob, matched by
     // substring exactly as C# does (`"VideoType":"BluRay"` / `Video3DFormat`).
     if !filter.video_types.is_empty() {
@@ -1724,6 +1769,20 @@ fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
         }
         qb.push(")");
     }
+    // `boxsetFolders.Any(f => e.Data!.Contains(f))`, each folder id in its "N"
+    // form (`TranslateQuery.cs:1174-1179`).
+    if !filter.box_set_library_folders.is_empty() {
+        qb.push(" AND (");
+        for (index, folder) in filter.box_set_library_folders.iter().enumerate() {
+            if index > 0 {
+                qb.push(" OR ");
+            }
+            qb.push(r#"instr(bi."Data", "#)
+                .push_bind(folder.simple().to_string())
+                .push(") > 0");
+        }
+        qb.push(")");
+    }
 }
 
 /// v12.2 `FolderAwareFilterExtensions.WhereItemOrDescendantMatches`: the row
@@ -1762,12 +1821,16 @@ const UNDETERMINED_LANGUAGE: &str = "und";
 /// `BaseItemRepository.TranslateQuery.cs:920-944`): an item matches when one
 /// of its own streams of that type, or one of an alternate version's, is in
 /// any listed language; a folder matches when such an item sits anywhere
-/// below it (see [`push_item_version_or_folder_matching`]).
+/// below it (see [`push_item_version_or_folder_matching`]). Then the four
+/// single-language `HasNo*TrackWithLanguage` filters (`:826-895`), each the
+/// complement of the same roll-up for its stream type and, for the internal
+/// and external subtitle forms, its side of `IsExternal`.
 ///
 /// The lists are matched exactly as stored — no `NormalizeLanguage` (unlike
-/// the single-language `HasNo*TrackWithLanguage` filters) and no case folding,
-/// so the `StreamType`/`Language` index serves the `IN`. Empty lists push
-/// nothing: the statement is byte-identical to one without the filters.
+/// the single-language filters) and no case folding, so the
+/// `StreamType`/`Language` index serves the `IN`. Empty lists and blank
+/// languages push nothing: the statement is byte-identical to one without
+/// the filters.
 fn append_stream_language_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     for (languages, stream_type) in [
         (&filter.subtitle_languages, MediaStreamTypeEntity::Subtitle),
@@ -1777,9 +1840,79 @@ fn append_stream_language_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
             continue;
         }
         qb.push(" AND ");
-        push_item_version_or_folder_matching(qb, &|qb, alias| {
+        push_item_version_or_folder_matching(qb, MediaTable::Streams, &|qb, alias| {
             push_stream_match(qb, alias, stream_type, languages);
         });
+    }
+    // The single-language absence filters (`TranslateQuery.cs:826-895`): an
+    // item matches when neither it nor an alternate version has such a
+    // stream, a folder when no item below it has one. Upstream's form is the
+    // exact complement of the roll-up, as for `HasSubtitles = false`.
+    for (language, stream_type, external) in [
+        (
+            &filter.has_no_audio_track_with_language,
+            MediaStreamTypeEntity::Audio,
+            None,
+        ),
+        (
+            &filter.has_no_internal_subtitle_track_with_language,
+            MediaStreamTypeEntity::Subtitle,
+            Some(false),
+        ),
+        (
+            &filter.has_no_external_subtitle_track_with_language,
+            MediaStreamTypeEntity::Subtitle,
+            Some(true),
+        ),
+        (
+            &filter.has_no_subtitle_track_with_language,
+            MediaStreamTypeEntity::Subtitle,
+            None,
+        ),
+    ] {
+        let Some(language) = non_blank(language.as_ref()) else {
+            continue;
+        };
+        let languages = [normalize_language(language)];
+        qb.push(" AND NOT ");
+        push_item_version_or_folder_matching(qb, MediaTable::Streams, &|qb, alias| {
+            push_stream_match(qb, alias, stream_type, &languages);
+            if let Some(external) = external {
+                qb.push(format!(
+                    r#" AND {alias}."IsExternal" = {}"#,
+                    i32::from(external)
+                ));
+            }
+        });
+    }
+}
+
+/// v12.2 `NormalizeLanguage` (`TranslateQuery.cs:69-71`): any casing of
+/// `und` is the code that also matches a stream with no language; every
+/// other code is kept as given.
+fn normalize_language(language: &str) -> String {
+    if language.eq_ignore_ascii_case(UNDETERMINED_LANGUAGE) {
+        UNDETERMINED_LANGUAGE.to_owned()
+    } else {
+        language.to_owned()
+    }
+}
+
+/// The per-item media table a v12 `FolderMatchCriteria` reads: the stream
+/// rows for `HasSubtitles` and `HasMediaStreamType`, the chapter rows for
+/// `HasChapterImages` (`DescendantQueryHelper.MatchingMediaOwnerIds`).
+#[derive(Clone, Copy)]
+enum MediaTable {
+    Streams,
+    Chapters,
+}
+
+impl MediaTable {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Streams => "MediaStreamInfos",
+            Self::Chapters => "Chapters",
+        }
     }
 }
 
@@ -1817,8 +1950,8 @@ fn push_stream_match(
 ///   || (IsFolder && Id in FolderIdsMatching)
 /// ```
 ///
-/// `matches` pushes the criteria over a `MediaStreamInfos` alias. The
-/// non-folder arm reads the item's own streams, then the primaries whose
+/// `matches` pushes the criteria over an alias of `table`'s rows. The
+/// non-folder arm reads the item's own rows, then the primaries whose
 /// alternate version matches ([`push_primary_versions_matching`]). The
 /// folder arm is `DescendantQueryHelper.GetFolderIdsMatching`
 /// (`DescendantQueryHelper.cs:177-217`): every closure ancestor of a matching
@@ -1836,34 +1969,35 @@ fn push_stream_match(
 /// ancestors, and the link walk and the last closure hop then seek once per
 /// folder rather than once per item — on the 20k-item bench library,
 /// `audioLanguages=und` resolves its folders in 32 ms instead of 75.
-/// `HasSubtitles` takes the same shape; so will the other v12 media criteria
-/// (the `HasNo*TrackWithLanguage` filters, `HasChapterImages`), whose
-/// predicates `TranslateQuery` does not translate yet.
+/// `HasSubtitles`, the `HasNo*TrackWithLanguage` filters and
+/// `HasChapterImages` take the same shape.
 ///
 /// `+`: the same plan pin as [`push_is_played`] on both `IsFolder` disjuncts,
 /// so a browse of three or more kinds keeps its `(Type, TopParentId)` seek
 /// instead of a `MULTI-INDEX OR` over every row of every library in scope.
 fn push_item_version_or_folder_matching(
     qb: &mut QueryBuilder<Sqlite>,
+    table: MediaTable,
     matches: &dyn Fn(&mut QueryBuilder<Sqlite>, &str),
 ) {
+    let media = table.name();
     let container_link = format!(
         r#"lc."ChildType" NOT IN ({}, {})"#,
         i32::from(LinkedChildType::LocalAlternateVersion),
         i32::from(LinkedChildType::LinkedAlternateVersion)
     );
-    qb.push(
-        r#"((+bi."IsFolder" = 0 AND (EXISTS (SELECT 1 FROM "MediaStreamInfos" ms WHERE ms."ItemId" = bi."Id" AND "#,
-    );
+    qb.push(format!(
+        r#"((+bi."IsFolder" = 0 AND (EXISTS (SELECT 1 FROM "{media}" ms WHERE ms."ItemId" = bi."Id" AND "#
+    ));
     matches(qb, "ms");
     qb.push(r#") OR bi."Id" IN ("#);
-    push_primary_versions_matching(qb, matches);
-    qb.push(
-        r#"))) OR (+bi."IsFolder" = 1 AND bi."Id" IN (WITH RECURSIVE matched("Id") AS (SELECT ms."ItemId" FROM "MediaStreamInfos" ms WHERE "#,
-    );
+    push_primary_versions_matching(qb, table, matches);
+    qb.push(format!(
+        r#"))) OR (+bi."IsFolder" = 1 AND bi."Id" IN (WITH RECURSIVE matched("Id") AS (SELECT ms."ItemId" FROM "{media}" ms WHERE "#
+    ));
     matches(qb, "ms");
     qb.push(" UNION ");
-    push_primary_versions_matching(qb, matches);
+    push_primary_versions_matching(qb, table, matches);
     qb.push(format!(
         r#"), hierarchy("Id") AS (
             SELECT DISTINCT a."ParentItemId" FROM "AncestorIds" a WHERE a."ItemId" IN (SELECT "Id" FROM matched)
@@ -1889,16 +2023,18 @@ fn push_item_version_or_folder_matching(
 
 /// Pushes v12 `DescendantQueryHelper.GetPrimaryVersionIdsMatching`
 /// (`DescendantQueryHelper.cs:231-253`): the `PrimaryVersionId` of every
-/// alternate version whose own streams match. Anchored on the alternates, so
-/// the partial `IX_BaseItems_PrimaryVersionId` keeps it to the few items that
-/// are second files, each costing one seek into the stream index.
+/// alternate version whose own rows of `table` match. Anchored on the
+/// alternates, so the partial `IX_BaseItems_PrimaryVersionId` keeps it to the
+/// few items that are second files, each costing one seek into the table.
 fn push_primary_versions_matching(
     qb: &mut QueryBuilder<Sqlite>,
+    table: MediaTable,
     matches: &dyn Fn(&mut QueryBuilder<Sqlite>, &str),
 ) {
-    qb.push(
-        r#"SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "MediaStreamInfos" ms WHERE ms."ItemId" = v."Id" AND "#,
-    );
+    qb.push(format!(
+        r#"SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "{}" ms WHERE ms."ItemId" = v."Id" AND "#,
+        table.name()
+    ));
     matches(qb, "ms");
     qb.push(")");
 }
@@ -2512,6 +2648,72 @@ fn append_provider_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &InternalIt
         }
         qb.push("))");
     }
+
+    // `ExcludeProviderIds`, `HasAnyProviderId` and `HasAnyProviderIds`
+    // (`TranslateQuery.cs:1057-1070`, `JellyfinQueryHelperExtensions`).
+    if let Some(ids) = &filter.exclude_provider_ids {
+        push_provider_match(qb, ids.iter().map(|(k, v)| (k.as_str(), v.as_str())), true);
+    }
+    if let Some(ids) = &filter.has_any_provider_id {
+        push_provider_match(qb, ids.iter().map(|(k, v)| (k.as_str(), v.as_str())), false);
+    }
+    if let Some(ids) = &filter.has_any_provider_ids {
+        // `Flatten`: a provider with no values asks for any value of it.
+        let pairs = ids.iter().flat_map(|(provider, values)| {
+            let values: Vec<&str> = if values.is_empty() {
+                vec![""]
+            } else {
+                values.iter().map(String::as_str).collect()
+            };
+            values
+                .into_iter()
+                .map(move |value| (provider.as_str(), value))
+        });
+        push_provider_match(qb, pairs, false);
+    }
+}
+
+/// v12.2 `WhereProviderMatch` (`JellyfinQueryHelperExtensions.cs:212-247`):
+/// one `EXISTS` over the item's provider rows, `NOT EXISTS` when `invert`. A
+/// pair with an empty value asks for any value of the provider
+/// (`ProviderId IN …`); the others match `ProviderId:ProviderValue` exactly,
+/// as EF's ordinal comparison does. No pairs push nothing. The pairs are
+/// sorted so a map's iteration order never changes the statement.
+fn push_provider_match<'a>(
+    qb: &mut QueryBuilder<Sqlite>,
+    pairs: impl Iterator<Item = (&'a str, &'a str)>,
+    invert: bool,
+) {
+    let mut any_value: Vec<String> = Vec::new();
+    let mut exact: Vec<String> = Vec::new();
+    for (provider, value) in pairs {
+        if value.is_empty() {
+            any_value.push(provider.to_owned());
+        } else {
+            exact.push(format!("{provider}:{value}"));
+        }
+    }
+    if any_value.is_empty() && exact.is_empty() {
+        return;
+    }
+    any_value.sort_unstable();
+    exact.sort_unstable();
+    qb.push(if invert {
+        " AND NOT EXISTS "
+    } else {
+        " AND EXISTS "
+    })
+    .push(r#"(SELECT 1 FROM "BaseItemProviders" p WHERE p."ItemId" = bi."Id" AND ("#);
+    if !any_value.is_empty() {
+        push_in_list(qb, r#"p."ProviderId""#, &any_value);
+    }
+    if !exact.is_empty() {
+        if !any_value.is_empty() {
+            qb.push(" OR ");
+        }
+        push_in_list(qb, r#"p."ProviderId" || ':' || p."ProviderValue""#, &exact);
+    }
+    qb.push("))");
 }
 
 /// The stored type names of the by-name kinds this query can return.

@@ -8,9 +8,12 @@
 //!   `TranslateQuery.cs:761-768, 1201-1208`);
 //! - `MinParentalRating`, `MaxParentalRating` and `HasParentalRating`
 //!   (`TranslateQuery.cs:690-759`), with the maximum clamped to the user's own
-//!   limit.
+//!   limit;
+//! - `TrailerTypes`, `HasDeadParentId` and the provider-id maps
+//!   (`ExcludeProviderIds`, `HasAnyProviderId`, `HasAnyProviderIds`;
+//!   `TranslateQuery.cs:427-431, 970-974, 1057-1070`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use ferrofin_core::item_type_lookup::{ItemTypeLookup, stored_type_name};
@@ -22,7 +25,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::LinkedChildType;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::entities::SeriesStatus;
+use ferrofin_model::entities::{SeriesStatus, TrailerType};
 use ferrofin_model::entities_media::ParentalRatingScore;
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService as _, ItemRepository as _};
@@ -494,4 +497,218 @@ async fn descendant_roll_up_plan_builds_its_set_once() {
         assert!(!plan.contains("SCAN lc "), "links are a seek: {plan}");
         assert!(!plan.contains("CORRELATED LIST SUBQUERY"), "{plan}");
     }
+}
+
+/// `e.TrailerTypes!.Any(w => trailerTypes.Contains(w.Id))`: an item with a
+/// trailer-type row of any listed type.
+#[tokio::test]
+async fn trailer_types_match_the_items_trailer_type_rows() {
+    let db = seeded().await;
+    for kind in [
+        TrailerType::ComingSoonToTheaters,
+        TrailerType::ComingSoonToDvd,
+    ] {
+        sqlx::query(r#"INSERT INTO "BaseItemTrailerTypes" ("Id", "ItemId") VALUES (?1, ?2)"#)
+            .bind(kind as i64)
+            .bind(guid_to_db(STUB))
+            .execute(db.writer())
+            .await
+            .expect("trailer type");
+    }
+    let query = |types: &[TrailerType]| InternalItemsQuery {
+        trailer_types: types.to_vec(),
+        ..InternalItemsQuery::default()
+    };
+    assert_eq!(
+        ids(&db, &query(&[TrailerType::ComingSoonToTheaters])).await,
+        set([STUB])
+    );
+    assert!(ids(&db, &query(&[TrailerType::Archive])).await.is_empty());
+    assert_eq!(
+        ids(
+            &db,
+            &query(&[TrailerType::Archive, TrailerType::ComingSoonToDvd])
+        )
+        .await,
+        set([STUB])
+    );
+}
+
+/// `HasDeadParentId = true`: the item names a parent that no row but the
+/// placeholder has. `false` is no filter, as upstream tests only `true`.
+#[tokio::test]
+async fn dead_parent_ids_name_a_parent_no_real_row_has() {
+    let db = seeded().await;
+    let (live, placeholder, missing) = (
+        Uuid::from_u128(0x3101),
+        Uuid::from_u128(0x3102),
+        Uuid::from_u128(0x3103),
+    );
+    let child = |id, parent: &str| BaseItemEntity {
+        parent_id: Some(parent.to_owned()),
+        ..row(id, BaseItemKind::Movie, None, None)
+    };
+    // A dangling parent only exists where foreign keys were off when it was
+    // written, as in an adopted database.
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(db.writer())
+        .await
+        .expect("keys off");
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[
+            child(live, &guid_to_db(CONTINUING)),
+            child(placeholder, "00000000-0000-0000-0000-000000000001"),
+            child(missing, &guid_to_db(Uuid::from_u128(0x3199))),
+        ])
+        .await
+        .expect("save");
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(db.writer())
+        .await
+        .expect("keys on");
+    let query = |dead| InternalItemsQuery {
+        has_dead_parent_id: Some(dead),
+        ..InternalItemsQuery::default()
+    };
+    let dead = translated_all(&db, &query(true)).await;
+    assert!(
+        dead.contains(&placeholder) && dead.contains(&missing),
+        "{dead:?}"
+    );
+    assert!(!dead.contains(&live));
+    assert!(
+        ALL.iter().all(|id| !dead.contains(id)),
+        "no parent, no match"
+    );
+    let any = translated_all(&db, &query(false)).await;
+    assert!(any.contains(&live) && any.contains(&missing));
+}
+
+/// The provider-id maps (`WhereProviderMatch`): an empty value asks for any
+/// value of the provider, the others match `ProviderId:ProviderValue`
+/// ordinally; the excluding form is `NOT EXISTS`.
+#[tokio::test]
+async fn provider_id_maps_match_like_where_provider_match() {
+    let db = seeded().await;
+    for (item, provider, value) in [
+        (STUB, "Tmdb", "603"),
+        (STUB, "Imdb", "tt0133093"),
+        (EMPTY_RATING, "Tmdb", "604"),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
+               VALUES (?1, ?2, ?3)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(provider)
+        .bind(value)
+        .execute(db.writer())
+        .await
+        .expect("provider id");
+    }
+    let one = |pairs: &[(&str, &str)]| -> Option<HashMap<String, String>> {
+        Some(
+            pairs
+                .iter()
+                .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+                .collect(),
+        )
+    };
+    let any_of = |map| InternalItemsQuery {
+        has_any_provider_id: map,
+        ..InternalItemsQuery::default()
+    };
+    assert_eq!(
+        ids(&db, &any_of(one(&[("Tmdb", "603")]))).await,
+        set([STUB])
+    );
+    assert_eq!(
+        ids(&db, &any_of(one(&[("Tmdb", "")]))).await,
+        set([STUB, EMPTY_RATING])
+    );
+    assert!(
+        ids(&db, &any_of(one(&[("tmdb", "603")]))).await.is_empty(),
+        "ordinal"
+    );
+    assert_eq!(
+        ids(&db, &any_of(Some(HashMap::new()))).await,
+        set(ALL),
+        "an empty map is no filter"
+    );
+    let many = InternalItemsQuery {
+        has_any_provider_ids: Some(HashMap::from([
+            ("Tmdb".to_owned(), vec!["604".to_owned(), "999".to_owned()]),
+            ("Imdb".to_owned(), Vec::new()),
+        ])),
+        ..InternalItemsQuery::default()
+    };
+    assert_eq!(ids(&db, &many).await, set([STUB, EMPTY_RATING]));
+    let excluded = InternalItemsQuery {
+        exclude_provider_ids: one(&[("Tmdb", "603")]),
+        ..InternalItemsQuery::default()
+    };
+    assert_eq!(ids(&db, &excluded).await, all_but([STUB]));
+    let excluded_any = InternalItemsQuery {
+        exclude_provider_ids: one(&[("Tmdb", "")]),
+        ..InternalItemsQuery::default()
+    };
+    assert_eq!(
+        ids(&db, &excluded_any).await,
+        all_but([STUB, EMPTY_RATING]),
+        "an empty value excludes any value of the provider"
+    );
+}
+
+/// `BoxSetLibraryFolders`: a folder id, in its "N" form, anywhere in the
+/// item's `Data` (`boxsetFolders.Any(f => e.Data!.Contains(f))`).
+#[tokio::test]
+async fn box_set_library_folders_match_the_folder_id_in_the_data_blob() {
+    let db = seeded().await;
+    let (folder, other_folder) = (Uuid::from_u128(0xF01D), Uuid::from_u128(0xF02D));
+    let collection = Uuid::from_u128(0x3201);
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[row(
+            collection,
+            BaseItemKind::BoxSet,
+            None,
+            Some(&format!(
+                r#"{{"LibraryFolderIds":["{}"]}}"#,
+                folder.simple()
+            )),
+        )])
+        .await
+        .expect("save");
+    let query = |folders: Vec<Uuid>| InternalItemsQuery {
+        box_set_library_folders: folders,
+        ..InternalItemsQuery::default()
+    };
+    assert_eq!(
+        translated_all(&db, &query(vec![folder])).await,
+        BTreeSet::from([collection])
+    );
+    assert_eq!(
+        translated_all(&db, &query(vec![other_folder, folder])).await,
+        BTreeSet::from([collection])
+    );
+    assert!(
+        translated_all(&db, &query(vec![other_folder]))
+            .await
+            .is_empty()
+    );
+}
+
+/// The provider match is a seek on the item's own provider rows.
+#[tokio::test]
+async fn provider_match_plan_seeks_the_items_rows() {
+    let db = seeded().await;
+    let filter = InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Movie],
+        has_any_provider_id: Some(HashMap::from([("Tmdb".to_owned(), "603".to_owned())])),
+        ..InternalItemsQuery::default()
+    };
+    let plan = plan(&db, &filter).await;
+    assert!(plan.contains("SEARCH p USING"), "{plan}");
+    assert!(plan.contains("(ItemId=?"), "{plan}");
+    assert!(!plan.contains("SCAN p "), "{plan}");
+    assert!(plan.contains("(Type=?"), "{plan}");
 }

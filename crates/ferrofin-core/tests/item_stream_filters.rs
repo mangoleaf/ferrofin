@@ -1,19 +1,19 @@
-//! The item filters that read media streams or resolution through an item's
-//! version group and, for folders, its descendants: 12.1's `AudioLanguages` /
-//! `SubtitleLanguages` and `HasSubtitles` (v12
-//! `BaseItemRepository.TranslateQuery.cs:897-944`, with
+//! The item filters that read media streams, chapters or resolution through
+//! an item's version group and, for folders, its descendants: 12.1's
+//! `AudioLanguages` / `SubtitleLanguages`, `HasSubtitles`, the four
+//! `HasNo*TrackWithLanguage` filters and `HasChapterImages` (v12
+//! `BaseItemRepository.TranslateQuery.cs:826-968`, with
 //! `DescendantQueryHelper.GetPrimaryVersionIdsMatching` /
 //! `GetFolderIdsMatching`), and `IsHD` / `Is4K` / `Min`/`Max`
 //! `Width`/`Height` (`TranslateQuery.cs:95-196`, `VersionsMatchingDimension`).
 //!
 //! The fixture is upstream's `BaseItemRepositoryStreamFilterTests.Seed`
-//! (`BaseItemRepositoryStreamFilterTests.cs:289-552`), less the chapter rows,
-//! plus a few rows of Ferrofin's own for the cases upstream does not pin
-//! (empty-language streams, a video stream carrying a language, cyclic and
-//! alternate-version links). Every upstream `[Fact]` over these filters is
-//! transliterated with its C# expectations as the oracle; the
-//! `HasChapterImages` and `HasNo*TrackWithLanguage` facts wait on those
-//! predicates. Upstream's `GetFolderIdsMatching_*` facts
+//! (`BaseItemRepositoryStreamFilterTests.cs:289-552`), plus a few rows of
+//! Ferrofin's own for the cases upstream does not pin (empty-language
+//! streams, a video stream carrying a language, an external subtitle, cyclic
+//! and alternate-version links). Every upstream `[Fact]` over these filters
+//! is transliterated with its C# expectations as the oracle. Upstream's
+//! `GetFolderIdsMatching_*` facts
 //! (`DescendantQueryHelperTests.cs:222-402`) run each on their own store.
 
 use std::collections::BTreeSet;
@@ -78,6 +78,9 @@ const CYCLE_B: Uuid = Uuid::from_u128(0x2004);
 /// A folder whose only link to a matching movie is an alternate-version edge.
 const LOCAL_VERSION_OWNER: Uuid = Uuid::from_u128(0x2005);
 const LINKED_VERSION_OWNER: Uuid = Uuid::from_u128(0x2006);
+/// A movie whose only `ger` subtitle is an external file, and its folder.
+const EXTERNAL_SUBTITLE_MOVIE: Uuid = Uuid::from_u128(0x2007);
+const EXTERNAL_SUBTITLE_FOLDER: Uuid = Uuid::from_u128(0x2008);
 
 async fn fresh_db() -> Database {
     let db = Database::connect_in_memory().await.expect("connect");
@@ -145,6 +148,48 @@ async fn streams(db: &Database, item: Uuid, rows: &[(MediaStreamTypeEntity, Opti
         .save_media_streams(item, &rows)
         .await
         .expect("streams");
+}
+
+/// Upstream's two chapter pictures (on `_withSubtitles` and on the alternate
+/// version), and Ferrofin's movie whose only `ger` subtitle is external.
+async fn seed_chapters_and_external_subtitle(db: &Database) {
+    chapter_image(db, WITH_SUBTITLES, "/chapter.jpg").await;
+    chapter_image(db, ALTERNATE_VERSION, "/alternate-chapter.jpg").await;
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[
+            row(EXTERNAL_SUBTITLE_MOVIE, BaseItemKind::Movie, None, None),
+            row(EXTERNAL_SUBTITLE_FOLDER, BaseItemKind::Folder, None, None),
+        ])
+        .await
+        .expect("save");
+    ancestor(db, EXTERNAL_SUBTITLE_MOVIE, EXTERNAL_SUBTITLE_FOLDER).await;
+    FerrofinMediaStreamRepository::new(db.clone())
+        .save_media_streams(
+            EXTERNAL_SUBTITLE_MOVIE,
+            &[MediaStreamInfoEntity {
+                item_id: guid_to_db(EXTERNAL_SUBTITLE_MOVIE),
+                stream_index: 0,
+                stream_type: i32::from(MediaStreamTypeEntity::Subtitle),
+                language: Some("ger".to_owned()),
+                is_external: true,
+                ..MediaStreamInfoEntity::default()
+            }],
+        )
+        .await
+        .expect("external subtitle");
+}
+
+/// Stores one chapter of `item` with a picture, as chapter extraction does.
+async fn chapter_image(db: &Database, item: Uuid, path: &str) {
+    sqlx::query(
+        r#"INSERT INTO "Chapters" ("ItemId", "ChapterIndex", "StartPositionTicks", "ImagePath")
+           VALUES (?1, 0, 0, ?2)"#,
+    )
+    .bind(guid_to_db(item))
+    .bind(path)
+    .execute(db.writer())
+    .await
+    .expect("chapter");
 }
 
 /// `BaseItemRepositoryStreamFilterTests.Seed` / `SeedVersionGroup` /
@@ -243,6 +288,7 @@ async fn seeded() -> Database {
     // Ferrofin's rows.
     streams(&db, EMPTY_LANGUAGE_MOVIE, &[(Audio, Some(""))]).await;
     streams(&db, GERMAN_VIDEO_MOVIE, &[(Video, Some("ger"))]).await;
+    seed_chapters_and_external_subtitle(&db).await;
     link(&db, CYCLE_A, CYCLE_B, LinkedChildType::Manual).await;
     link(&db, CYCLE_B, CYCLE_A, LinkedChildType::Manual).await;
     link(&db, CYCLE_A, LINKED_SERIES, LinkedChildType::Manual).await;
@@ -405,6 +451,159 @@ async fn link_walk_survives_cycles_and_skips_version_links() {
     assert!(german.contains(&CYCLE_B), "{german:?}");
     assert!(!german.contains(&LOCAL_VERSION_OWNER), "{german:?}");
     assert!(!german.contains(&LINKED_VERSION_OWNER), "{german:?}");
+}
+
+/// `GetItemIdsList(new InternalItemsQuery { … })` with one
+/// `HasNo*TrackWithLanguage` filter set by `set`.
+async fn ids_without(db: &Database, set: impl FnOnce(&mut InternalItemsQuery)) -> Vec<Uuid> {
+    let mut query = InternalItemsQuery::default();
+    set(&mut query);
+    query_ids(db, &query).await
+}
+
+fn has_chapter_images(want: bool) -> InternalItemsQuery {
+    InternalItemsQuery {
+        has_chapter_images: Some(want),
+        ..InternalItemsQuery::default()
+    }
+}
+
+/// `HasNoSubtitleTrackWithLanguage_ExcludesTheMatchingItemAndFolder`
+/// (`BaseItemRepositoryStreamFilterTests.cs:99-107`).
+#[tokio::test]
+async fn has_no_subtitle_track_with_language_excludes_the_matching_item_and_folder() {
+    let db = seeded().await;
+    let found = ids_without(&db, |q| {
+        q.has_no_subtitle_track_with_language = Some("ger".to_owned());
+    })
+    .await;
+    assert!(found.contains(&WITHOUT_SUBTITLES));
+    assert!(!found.contains(&WITH_SUBTITLES));
+    assert!(!found.contains(&LIBRARY));
+}
+
+/// `HasChapterImages_MatchesTheItemAndItsParentFolder`
+/// (`BaseItemRepositoryStreamFilterTests.cs:127-135`).
+#[tokio::test]
+async fn has_chapter_images_matches_the_item_and_its_parent_folder() {
+    let db = seeded().await;
+    let found = query_ids(&db, &has_chapter_images(true)).await;
+    assert!(found.contains(&WITH_SUBTITLES));
+    assert!(found.contains(&LIBRARY));
+    assert!(!found.contains(&WITHOUT_SUBTITLES));
+}
+
+/// `HasNoSubtitleTrackWithLanguage_ExcludesAnItemWhoseAlternateVersionHasIt`
+/// (`BaseItemRepositoryStreamFilterTests.cs:164-171`).
+#[tokio::test]
+async fn has_no_subtitle_track_with_language_excludes_an_item_whose_alternate_version_has_it() {
+    let db = seeded().await;
+    let found = ids_without(&db, |q| {
+        q.has_no_subtitle_track_with_language = Some("ger".to_owned());
+    })
+    .await;
+    assert!(!found.contains(&VERSIONED_MOVIE));
+    assert!(!found.contains(&VERSION_LIBRARY));
+}
+
+/// `HasNoAudioTrackWithLanguage_ExcludesAnItemWhoseAlternateVersionHasIt`
+/// (`BaseItemRepositoryStreamFilterTests.cs:179-183`).
+#[tokio::test]
+async fn has_no_audio_track_with_language_excludes_an_item_whose_alternate_version_has_it() {
+    let db = seeded().await;
+    let found = ids_without(&db, |q| {
+        q.has_no_audio_track_with_language = Some("fre".to_owned());
+    })
+    .await;
+    assert!(!found.contains(&VERSIONED_MOVIE));
+}
+
+/// `HasChapterImages_MatchesAnItemWhoseAlternateVersionCarriesThem`
+/// (`BaseItemRepositoryStreamFilterTests.cs:185-189`).
+#[tokio::test]
+async fn has_chapter_images_matches_an_item_whose_alternate_version_carries_them() {
+    let db = seeded().await;
+    assert!(
+        query_ids(&db, &has_chapter_images(true))
+            .await
+            .contains(&VERSIONED_MOVIE)
+    );
+}
+
+/// `HasNoAudioTrackWithLanguage_TreatsUndeterminedCaseInsensitively`
+/// (`BaseItemRepositoryStreamFilterTests.cs:276-287`): `NormalizeLanguage`
+/// folds any casing of `und` onto the code that matches a stream with no
+/// language.
+#[rstest]
+#[case("und")]
+#[case("UND")]
+#[tokio::test]
+async fn has_no_audio_track_with_language_treats_undetermined_case_insensitively(
+    #[case] language: &str,
+) {
+    let db = seeded().await;
+    let found = ids_without(&db, |q| {
+        q.has_no_audio_track_with_language = Some(language.to_owned());
+    })
+    .await;
+    assert!(!found.contains(&UNPROBED_MOVIE));
+    assert!(found.contains(&VERSIONED_MOVIE));
+}
+
+/// `HasNoInternal…`/`HasNoExternalSubtitleTrackWithLanguage` read only the
+/// subtitles on their side of `IsExternal`; `HasNoSubtitleTrackWithLanguage`
+/// reads both (`TranslateQuery.cs:845-895`).
+#[tokio::test]
+async fn subtitle_absence_filters_split_on_is_external() {
+    let db = seeded().await;
+    let internal = ids_without(&db, |q| {
+        q.has_no_internal_subtitle_track_with_language = Some("ger".to_owned());
+    })
+    .await;
+    assert!(internal.contains(&EXTERNAL_SUBTITLE_MOVIE));
+    assert!(internal.contains(&EXTERNAL_SUBTITLE_FOLDER), "folder arm");
+    assert!(!internal.contains(&WITH_SUBTITLES));
+    let external = ids_without(&db, |q| {
+        q.has_no_external_subtitle_track_with_language = Some("ger".to_owned());
+    })
+    .await;
+    assert!(!external.contains(&EXTERNAL_SUBTITLE_MOVIE));
+    assert!(!external.contains(&EXTERNAL_SUBTITLE_FOLDER), "folder arm");
+    assert!(external.contains(&WITH_SUBTITLES));
+    let either = ids_without(&db, |q| {
+        q.has_no_subtitle_track_with_language = Some("ger".to_owned());
+    })
+    .await;
+    assert!(!either.contains(&EXTERNAL_SUBTITLE_MOVIE));
+    assert!(!either.contains(&WITH_SUBTITLES));
+    // A blank language is no filter (`IsNullOrWhiteSpace`).
+    let blank = ids_without(&db, |q| {
+        q.has_no_subtitle_track_with_language = Some(" ".to_owned());
+    })
+    .await;
+    assert!(blank.contains(&WITH_SUBTITLES));
+}
+
+/// `HasChapterImages = false` is the exact complement of `true`.
+#[tokio::test]
+async fn has_chapter_images_false_is_the_complement() {
+    let db = seeded().await;
+    let with: BTreeSet<Uuid> = query_ids(&db, &has_chapter_images(true))
+        .await
+        .into_iter()
+        .collect();
+    let without: BTreeSet<Uuid> = query_ids(&db, &has_chapter_images(false))
+        .await
+        .into_iter()
+        .collect();
+    let all: BTreeSet<Uuid> = query_ids(&db, &InternalItemsQuery::default())
+        .await
+        .into_iter()
+        .collect();
+    assert!(with.is_disjoint(&without));
+    assert_eq!(&with | &without, all);
+    assert!(without.contains(&WITHOUT_SUBTITLES));
+    assert!(!without.contains(&VERSIONED_MOVIE));
 }
 
 /// Saves `items` as bare rows into a fresh database — upstream
@@ -1158,4 +1357,63 @@ async fn filtered_browse_plan_is_index_driven() {
         bi_steps(&unfiltered_plan),
         "the filter must not move the browse onto another index: {joined}"
     );
+}
+
+/// The language-absence and chapter-image filters take the same roll-up
+/// shape: the browse keeps its own `BaseItems` steps, the stream match set
+/// seeks the `StreamType`-led index, and an item's own chapters are a seek on
+/// the chapter key. The folder arm's chapter set (`ImagePath IS NOT NULL`)
+/// scans `Chapters`, which has only its key, as upstream's table does; it is
+/// uncorrelated, so it runs once, and only when a folder row reaches it.
+#[tokio::test]
+async fn absence_and_chapter_filter_plans_keep_the_browse_steps() {
+    let db = fresh_db().await;
+    let user = seed_user(&db, Uuid::from_u128(0xB02)).await;
+    let plain = InternalItemsQuery {
+        include_owned_items: true,
+        ..movie_browse(user)
+    };
+    let bi_steps = |steps: &[String]| -> Vec<String> {
+        steps
+            .iter()
+            .filter(|d| d.starts_with("SEARCH bi ") || d.starts_with("SCAN bi"))
+            .cloned()
+            .collect()
+    };
+    let unfiltered = bi_steps(&plan_of(&db, &plain).await);
+    let streams: [fn(&mut InternalItemsQuery); 4] = [
+        |q| q.has_no_audio_track_with_language = Some("eng".to_owned()),
+        |q| q.has_no_internal_subtitle_track_with_language = Some("eng".to_owned()),
+        |q| q.has_no_external_subtitle_track_with_language = Some("eng".to_owned()),
+        |q| q.has_no_subtitle_track_with_language = Some("eng".to_owned()),
+    ];
+    for set in streams {
+        let mut filter = plain.clone();
+        set(&mut filter);
+        let steps = plan_of(&db, &filter).await;
+        let joined = steps.join(" | ");
+        assert!(!steps.iter().any(|d| d.starts_with("SCAN ms")), "{joined}");
+        assert!(
+            steps.iter().any(|d| d.starts_with("SEARCH ms USING")
+                && d.contains("IX_MediaStreamInfos_StreamType_ItemId_Language_IsExternal")
+                && d.contains("StreamType=?")),
+            "{joined}"
+        );
+        assert_eq!(bi_steps(&steps), unfiltered, "{joined}");
+    }
+    for want in [true, false] {
+        let filter = InternalItemsQuery {
+            has_chapter_images: Some(want),
+            ..plain.clone()
+        };
+        let steps = plan_of(&db, &filter).await;
+        let joined = steps.join(" | ");
+        assert!(
+            steps
+                .iter()
+                .any(|d| d.starts_with("SEARCH ms USING") && d.contains("ItemId=?")),
+            "{joined}"
+        );
+        assert_eq!(bi_steps(&steps), unfiltered, "{joined}");
+    }
 }
