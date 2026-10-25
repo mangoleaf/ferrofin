@@ -1697,21 +1697,13 @@ pub async fn build_app_state(
         // `GetPlaybackMediaSources`' forced probe of a `.strm` shortcut or an
         // item with no main stream: a full refresh of that file with the
         // remote content probe on, awaited before the sources are read again.
-        .with_remote_probe({
-            let scanner = Arc::clone(&library_scanner);
-            Arc::new(move |path: String| {
-                let scanner = Arc::clone(&scanner);
-                Box::pin(async move {
-                    let options = ferrofin_traits::providers::MetadataRefreshOptions {
-                        metadata_refresh_mode:
-                            ferrofin_traits::providers::MetadataRefreshMode::FullRefresh,
-                        enable_remote_content_probe: true,
-                        ..Default::default()
-                    };
-                    scanner.scan_paths_with(&[path], &options).await.map(|_| ())
-                })
-            })
-        })
+        // It is the library manager's item refresh, never a scan of its own:
+        // the scan queue keeps it from running beside a library scan.
+        .with_remote_probe(
+            ferrofin_core::media_source_manager::item_refresh_remote_probe(Arc::downgrade(
+                &library,
+            )),
+        )
         // `GetPlaybackMediaSources`' per-user overwrite of
         // `SupportsTranscoding`/`SupportsDirectStream` reads the requesting
         // user's policy; without it the overwrite cannot run at all.
