@@ -63,6 +63,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Refuse a `POST /Users/{userId}/Policy` body that leaves out `AuthenticationProviderId` or
+  `PasswordResetProviderId`, or sends either blank, with Jellyfin's `400` naming each missing
+  member, instead of saving the user's providers as empty strings
 - Open an M3U tuner's playlist before saving it, as Jellyfin's `M3UTunerHost.Validate`
   does: a missing local playlist is a `404` and a failing playlist URL a `500`, where the
   tuner was saved and only the next guide refresh showed it empty. A Live TV source URL is

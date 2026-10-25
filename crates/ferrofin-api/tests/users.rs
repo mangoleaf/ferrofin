@@ -1782,9 +1782,7 @@ async fn update_policy_records_and_guards_last_admin() {
                 .uri(format!("/Users/{ADMIN_ID}/Policy"))
                 .header("X-Emby-Token", "t")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&UserPolicy::default()).unwrap(),
-                ))
+                .body(Body::from(serde_json::to_vec(&complete_policy()).unwrap()))
                 .unwrap(),
         )
         .await
@@ -1794,7 +1792,7 @@ async fn update_policy_records_and_guards_last_admin() {
     // Updating bob's policy is fine and is recorded.
     let policy = UserPolicy {
         max_active_sessions: 5,
-        ..UserPolicy::default()
+        ..complete_policy()
     };
     let ok = router
         .oneshot(
@@ -1812,6 +1810,79 @@ async fn update_policy_records_and_guards_last_admin() {
     let recorded = users.updated_policy.lock().unwrap().clone().unwrap();
     assert_eq!(recorded.0, BOB_ID);
     assert_eq!(recorded.1.max_active_sessions, 5);
+}
+
+/// A policy whose two `[Required]` provider ids are set, as every client that
+/// echoes a `GET /Users/{id}` policy back sends it.
+fn complete_policy() -> UserPolicy {
+    UserPolicy {
+        authentication_provider_id:
+            "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider".to_owned(),
+        password_reset_provider_id:
+            "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider".to_owned(),
+        ..UserPolicy::default()
+    }
+}
+
+/// `UserPolicy`'s provider ids are `[Required(AllowEmptyStrings = false)]`, so
+/// ASP.NET's model validation refuses a policy body that leaves either out,
+/// sends it null or blank, before the action runs (ahead of the unknown user's
+/// 404), naming each failing member. Measured on a live Jellyfin 12.2.
+#[rstest::rstest]
+#[case::empty_body(r"{}", BOB_ID, &["AuthenticationProviderId", "PasswordResetProviderId"])]
+#[case::no_reset_provider(r#"{"AuthenticationProviderId":"a"}"#, BOB_ID, &["PasswordResetProviderId"])]
+#[case::empty_auth_provider(
+    r#"{"AuthenticationProviderId":"","PasswordResetProviderId":"b"}"#,
+    BOB_ID,
+    &["AuthenticationProviderId"]
+)]
+#[case::blank_auth_provider(
+    r#"{"AuthenticationProviderId":"  ","PasswordResetProviderId":"b"}"#,
+    BOB_ID,
+    &["AuthenticationProviderId"]
+)]
+#[case::null_reset_provider(
+    r#"{"AuthenticationProviderId":"a","PasswordResetProviderId":null}"#,
+    BOB_ID,
+    &["PasswordResetProviderId"]
+)]
+#[case::unknown_user(r"{}", Uuid::from_u128(0xDEAD), &["AuthenticationProviderId", "PasswordResetProviderId"])]
+#[tokio::test]
+async fn update_policy_requires_both_provider_ids(
+    #[case] body: &str,
+    #[case] user: Uuid,
+    #[case] failing: &[&str],
+) {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{user}/Policy"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    let errors = json["errors"].as_object().expect("validation errors");
+    let mut keys: Vec<&str> = errors.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, failing);
+    for member in failing {
+        assert_eq!(
+            errors[*member][0],
+            format!("The {member} field is required.")
+        );
+    }
+    assert!(
+        users.updated_policy.lock().unwrap().is_none(),
+        "nothing saved"
+    );
 }
 
 #[tokio::test]

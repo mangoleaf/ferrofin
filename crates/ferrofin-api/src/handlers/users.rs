@@ -872,6 +872,7 @@ async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(),
     params(("userId" = String, Path, description = "The user id")),
     responses(
         (status = 204, description = "Policy updated"),
+        (status = 400, description = "A required provider id is missing or blank"),
         (status = 403, description = "Policy update forbidden"),
         (status = 404, description = "User not found")
     ),
@@ -882,7 +883,12 @@ async fn update_user_policy(
     RequireAdmin(_auth): RequireAdmin,
     Path(user_id): Path<Uuid>,
     JsonBody(new_policy): JsonBody<UserPolicy>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
+    // Model validation runs after the authorization policy and before the
+    // action, so it answers ahead of the unknown user's 404.
+    if let Some(problem) = policy_validation(&new_policy, "") {
+        return Ok(problem.into_response());
+    }
     load_user(&state, user_id).await?;
     // The guards run inside the save's transaction (`update_policy_guarded`),
     // so the tokens of a user it disabled go once it committed. Upstream
@@ -899,7 +905,35 @@ async fn update_user_policy(
     // `OnUserUpdated` for the device check.
     notify_user_updated(&state, user_id).await;
     refresh_device_access(&state, user_id).await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `UserPolicy`'s two `[Required(AllowEmptyStrings = false)]` members, checked
+/// as ASP.NET's model validation checks them before the action runs: a member
+/// the body leaves out or sends `null` (both bound as `""`) or blank
+/// (`IsNullOrWhiteSpace`) is a `400` keyed `{prefix}{member}`. `prefix` is
+/// `"Policy."` for the policy nested in a `UserDto` body.
+fn policy_validation(policy: &UserPolicy, prefix: &str) -> Option<ProblemDetails> {
+    ProblemDetails::members_validation(
+        [
+            (
+                "AuthenticationProviderId",
+                &policy.authentication_provider_id,
+            ),
+            (
+                "PasswordResetProviderId",
+                &policy.password_reset_provider_id,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, value)| value.trim().is_empty())
+        .map(|(member, _)| {
+            (
+                format!("{prefix}{member}"),
+                format!("The {member} field is required."),
+            )
+        }),
+    )
 }
 
 /// `POST /Users/Configuration` — update a user's configuration.
