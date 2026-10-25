@@ -319,6 +319,8 @@ fn document_encoding(head: &[u8]) -> Result<TextEncoding, String> {
     if LATIN5_LABELS.contains(&name.as_str()) {
         return Ok(TextEncoding::Latin5);
     }
+    // TODO(gl-939): a name only the WHATWG labels know (`iso8859-9`) is
+    // decoded here, where .NET's encoding table refuses it.
     match Encoding::for_label(label) {
         Some(encoding)
             if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE =>
@@ -463,8 +465,118 @@ impl<R: BufRead> BufRead for Decoded<R> {
     }
 }
 
+/// Where the reader stands against the guide's `<tv>` element.
+///
+/// `XmlTvReader.GetChannels` and `GetProgrammes` each find it with
+/// `ReadToDescendant("tv")` from the start of the document (the first element
+/// named `tv`, wherever it is), then the first channel or programme inside it
+/// with `ReadToDescendant`, and read on with `ReadToFollowing` to the end of
+/// the document. So channels before `<tv>` are never read, those after it only
+/// when `<tv>` held one, and programmes likewise.
+///
+/// `ReadToDescendant` compares the qualified name, so `<x:tv>` is not the
+/// guide. Channels, programmes and their children are still matched by local
+/// name, where upstream compares the qualified one; TODO(gl-942).
+#[derive(Debug, Default)]
+struct TvScope {
+    /// The depth of the `<tv>` element itself, while it is open.
+    open_at: Option<usize>,
+    /// Whether the `<tv>` element has closed.
+    closed: bool,
+    /// Whether a `<channel>` was met inside it.
+    held_channel: bool,
+    /// Whether a `<programme>` was met inside it.
+    held_programme: bool,
+}
+
+impl TvScope {
+    /// Whether the `<tv>` element has been met.
+    fn seen(&self) -> bool {
+        self.open_at.is_some() || self.closed
+    }
+
+    /// Whether a `<channel>` met now is read.
+    fn reads_channels(&self) -> bool {
+        self.open_at.is_some() || (self.closed && self.held_channel)
+    }
+
+    /// Whether a `<programme>` met now is read.
+    fn reads_programmes(&self) -> bool {
+        self.open_at.is_some() || (self.closed && self.held_programme)
+    }
+
+    /// Records a `<channel>` (`programme` false) or `<programme>` met now.
+    fn met(&mut self, programme: bool) {
+        if self.open_at.is_some() {
+            if programme {
+                self.held_programme = true;
+            } else {
+                self.held_channel = true;
+            }
+        }
+    }
+}
+
+/// Why `XmlReader` would refuse the element `e` (`root_closed`: read after
+/// the root element), if it would: a second root element, a malformed or
+/// repeated attribute, a `<` in an attribute value, or an attribute value
+/// that will not unescape (a bare `&`, or an entity no declaration defines:
+/// `XmlTvReader` reads with `DtdProcessing.Ignore`).
+fn element_error(e: &BytesStart<'_>, root_closed: bool) -> Option<String> {
+    if root_closed {
+        return Some("the XMLTV document has more than one root element".to_owned());
+    }
+    e.attributes().find_map(|attribute| match attribute {
+        Ok(a) if a.value.contains('<') => Some(format!(
+            "the XMLTV document is not well-formed: a `<` in the value of {}",
+            a.key.as_ref()
+        )),
+        Ok(a) => a
+            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+            .err()
+            .map(|error| format!("the XMLTV document is not well-formed: {error}")),
+        Err(error) => Some(format!("the XMLTV document is not well-formed: {error}")),
+    })
+}
+
+/// The error for content outside the root element (`XmlReader`'s "Data at the
+/// root level is invalid").
+const OUTSIDE_ROOT: &str = "the XMLTV document has text outside its root element";
+
+/// Whether `text` is XML white space only (space, tab, CR and LF), the only
+/// text `XmlReader` allows outside the root element.
+fn is_xml_blank(text: &str) -> bool {
+    text.bytes()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// `error`, with the offset into the document it was found near, so an
+/// operator can find the spot in a large guide. The offset counts the UTF-8
+/// text the reader sees, which is the file's bytes for a UTF-8 guide.
+fn located(error: impl std::fmt::Display, position: u64) -> String {
+    format!("{error} (near byte {position} of its UTF-8 text)")
+}
+
 /// Reads the XMLTV document `reader` yields, keeping the programmes `keep`
 /// accepts — see [`parse_xmltv_where`].
+///
+/// The guide is read where `XmlTvReader` reads it ([`TvScope`]), and what
+/// `XmlReader` would read on the way must be well-formed: a mismatched end
+/// tag, a second root element, text outside the root, an attribute
+/// [`element_error`] refuses, a reference to an undeclared entity, `--` in a
+/// comment and an XML declaration anywhere but at the start make the document
+/// unreadable ([`Xmltv::error`]). When `<tv>` held neither a channel nor a
+/// programme, both of upstream's reads stop at its end, so nothing after it
+/// is read.
+///
+/// Upstream reads the channels and the programmes in two passes, which can
+/// stop at different places; here one pass decides for both, so a document
+/// whose `<tv>` held programmes but no channel, followed by something not
+/// well-formed, has no readable channel list either, where upstream's
+/// `GetChannels` stops at `</tv>` and answers none (and the reverse for
+/// programmes). Undeclared namespace
+/// prefixes are not refused, where `XmlReader` refuses them. TODO(gl-942):
+/// both.
 #[allow(clippy::too_many_lines)] // one pull-parser state machine
 fn read_events<R: BufRead>(
     mut reader: Reader<R>,
@@ -472,7 +584,8 @@ fn read_events<R: BufRead>(
     mut keep: impl FnMut(&XmltvProgramme) -> bool,
 ) -> Xmltv {
     let config = reader.config_mut();
-    config.check_end_names = false;
+    config.check_end_names = true;
+    config.check_comments = true;
     config.trim_text(false);
 
     // The bytes of the event being read.
@@ -485,47 +598,59 @@ fn read_events<R: BufRead>(
     let mut text = String::new();
     // The `system` of the `<episode-num>` being read, if any.
     let mut episode_system: Option<String> = None;
-    // The number of elements open around the current one. An unbalanced tag
-    // (`check_end_names` is off) skews it until the programme or channel it
-    // sits in ends, losing that one's later children. A tag still open at EOF
-    // sets `error`, so the refresh keeps the stored guide, as upstream's
-    // `XmlReader` rejecting the document does. Best-effort only: a stray end
-    // tag can cancel an unclosed one.
+    // The number of elements open around the current one; end tags are
+    // checked against their start tags, so it is exact.
     let mut depth = 0_usize;
     let mut channel: Option<OpenChannel> = None;
     let mut programme: Option<OpenProgramme> = None;
+    // Whether an element has been read, and whether the root element ended.
     let mut root_seen = false;
+    let mut root_closed = false;
+    let mut tv = TvScope::default();
+    // Whether this is the document's first event: only there may the XML
+    // declaration stand.
+    let mut first_event = true;
 
     loop {
         buf.clear();
         let event = reader.read_event_into(&mut buf);
-        if !root_seen && let Ok(Event::Start(e) | Event::Empty(e)) = &event {
-            root_seen = true;
-            // Stricter than .NET's `XmlReader`, which rejects an HTML error
-            // page only when it is not well-formed: with `check_end_names` off
-            // this reader cannot tell, so any root but `<tv>` keeps the stored
-            // guide. TODO(gl-937): port `ReadToDescendant("tv")`'s empty guide
-            // for a well-formed document with another root.
-            if e.local_name().as_ref() != "tv" {
-                out.error = Some(format!(
-                    "the document's root element is <{}>, not <tv>",
-                    e.local_name().as_ref()
-                ));
+        let position = reader.buffer_position();
+        if let Ok(Event::Start(e) | Event::Empty(e)) = &event {
+            if let Some(error) = element_error(e, root_closed) {
+                out.error = Some(located(error, position));
                 break;
             }
+            root_seen = true;
         }
+        if matches!(event, Ok(Event::Decl(_))) && !first_event {
+            out.error = Some(located(
+                "the XMLTV document has an XML declaration that is not at its start",
+                position,
+            ));
+            break;
+        }
+        first_event = false;
         match event {
             Ok(Event::Start(e)) => {
+                if !tv.seen() && e.name().as_ref() == "tv" {
+                    tv.open_at = Some(depth);
+                    depth += 1;
+                    text.clear();
+                    continue;
+                }
                 match e.local_name().as_ref().as_bytes() {
-                    b"channel" => {
+                    b"channel" if tv.reads_channels() => {
+                        tv.met(false);
                         channel = Some(OpenChannel::new(
                             attr(&e, b"id").unwrap_or_default(),
                             depth + 1,
                         ));
                     }
-                    b"programme" => {
+                    b"programme" if tv.reads_programmes() => {
+                        tv.met(true);
                         programme = Some(OpenProgramme::new(read_programme(&e), depth + 1));
                     }
+                    b"channel" | b"programme" => {}
                     name => apply_start(
                         name,
                         &e,
@@ -540,9 +665,21 @@ fn read_events<R: BufRead>(
                 text.clear();
             }
             Ok(Event::Empty(e)) => {
+                if depth == 0 {
+                    root_closed = true;
+                }
+                if !tv.seen() && e.name().as_ref() == "tv" {
+                    // An empty `<tv/>` holds nothing, so both reads stop here.
+                    break;
+                }
                 // A self-closing element is its own start and end, with no text.
                 let name = e.local_name();
                 let name = name.as_ref().as_bytes();
+                match name {
+                    b"channel" if tv.reads_channels() => tv.met(false),
+                    b"programme" if tv.reads_programmes() => tv.met(true),
+                    _ => {}
+                }
                 apply_start(
                     name,
                     &e,
@@ -562,15 +699,40 @@ fn read_events<R: BufRead>(
                 );
             }
             Ok(Event::Text(e)) => {
-                saw_content |= !e.trim().is_empty();
+                if !is_xml_blank(e.as_ref()) {
+                    if depth == 0 {
+                        out.error = Some(located(OUTSIDE_ROOT, position));
+                        break;
+                    }
+                    saw_content = true;
+                }
                 text.push_str(e.as_ref());
             }
             Ok(Event::GeneralRef(e)) => {
-                if let Ok(value) = quick_xml::escape::unescape(&format!("&{};", e.as_ref())) {
-                    text.push_str(&value);
+                if depth == 0 {
+                    out.error = Some(located(OUTSIDE_ROOT, position));
+                    break;
                 }
+                let reference = format!("&{};", e.as_ref());
+                let Ok(value) = quick_xml::escape::unescape(&reference) else {
+                    // `DtdProcessing.Ignore` declares no entity: "Reference to
+                    // undeclared entity".
+                    out.error = Some(located(
+                        format_args!(
+                            "the XMLTV document refers to an undeclared entity &{};",
+                            e.as_ref()
+                        ),
+                        position,
+                    ));
+                    break;
+                };
+                text.push_str(&value);
             }
             Ok(Event::CData(e)) => {
+                if depth == 0 {
+                    out.error = Some(located(OUTSIDE_ROOT, position));
+                    break;
+                }
                 text.push_str(e.as_ref());
             }
             Ok(Event::End(e)) => {
@@ -608,6 +770,18 @@ fn read_events<R: BufRead>(
                     _ => {}
                 }
                 text.clear();
+                if depth == 0 {
+                    root_closed = true;
+                }
+                if tv.open_at == Some(depth) {
+                    tv.open_at = None;
+                    tv.closed = true;
+                    if !tv.held_channel && !tv.held_programme {
+                        // Both reads found nothing inside `<tv>` and stop at
+                        // its end tag.
+                        break;
+                    }
+                }
             }
             Ok(Event::Eof) => {
                 if depth > 0 {
@@ -622,7 +796,16 @@ fn read_events<R: BufRead>(
                 break;
             }
             Err(e) => {
-                out.error = Some(format!("the XMLTV document is not well-formed: {e}"));
+                // quick-xml leaves the error position at 0 for errors it does
+                // not raise itself (text that is not valid in the encoding).
+                let at = match reader.error_position() {
+                    0 => position,
+                    at => at,
+                };
+                out.error = Some(located(
+                    format_args!("the XMLTV document is not well-formed: {e}"),
+                    at,
+                ));
                 break;
             }
             Ok(_) => saw_content = true,
@@ -632,32 +815,17 @@ fn read_events<R: BufRead>(
     out
 }
 
-/// An attribute's value with XML entity references resolved, falling back to the
-/// raw bytes when the value will not unescape.
+/// An attribute's value as `XmlReader.GetAttribute` gives it: normalized, with
+/// XML entity references resolved, so a `channel="A&amp;E.us"` joins against
+/// the tuner's `tvg-id="A&E.us"`.
 ///
-/// Resolution matters for parity: `.NET`'s `XmlReader.GetAttribute` — what
-/// Jellyfin's `XmlTvReader` calls — unescapes attribute values, so a
-/// `channel="A&amp;E.us"` has to join against the tuner's `tvg-id="A&E.us"`.
-///
-/// The fallback is what keeps a sloppy guide working. `unescape_value` fails on
-/// a bare `&` (`http://x?a=1&b=2`) and on a reference to an entity XMLTV never
-/// defines, both of which real generators emit. Dropping the attribute there
-/// would empty `channel_id` and silently discard every programme on that
-/// channel — the exact failure this function exists to prevent, just moved to a
-/// different input. Returning the raw text instead keeps the join key that
-/// already matched before entity resolution was added.
-///
-/// This is more lenient than upstream: `.NET`'s `XmlReader` throws
-/// `XmlException` on a bare `&`, so Jellyfin fails the whole guide refresh.
-///
-/// TODO(gl-937): no accepted divergence covers this; port `XmlReader`'s
-/// rejection or have it accepted.
-fn unescaped_or_raw(a: &quick_xml::events::attributes::Attribute<'_>) -> String {
+/// [`element_error`] refuses a document whose attribute will not unescape as
+/// the element is read, as `XmlReader` throws on it, so the empty fallback is
+/// never reached.
+fn attribute_value(a: &quick_xml::events::attributes::Attribute<'_>) -> String {
     a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
-        .map_or_else(
-            |_| a.value.as_ref().to_owned(),
-            std::borrow::Cow::into_owned,
-        )
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or_default()
 }
 
 /// Reads a `<programme>` start tag's `channel`/`start`/`stop` attributes in a
@@ -665,7 +833,7 @@ fn unescaped_or_raw(a: &quick_xml::events::attributes::Attribute<'_>) -> String 
 fn read_programme(e: &BytesStart<'_>) -> XmltvProgramme {
     let mut p = XmltvProgramme::default();
     for a in e.attributes().flatten() {
-        let value = unescaped_or_raw(&a);
+        let value = attribute_value(&a);
         match a.key.local_name().as_ref().as_bytes() {
             b"channel" => p.channel_id = value,
             b"start" => p.start = parse_xmltv_time(&value),
@@ -859,7 +1027,7 @@ fn end_programme_run(p: &mut OpenProgramme, language: Option<&str>) {
 fn attr_exact(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
     e.attributes()
         .flatten()
-        .find_map(|a| (a.key.as_ref().as_bytes() == name).then(|| unescaped_or_raw(&a)))
+        .find_map(|a| (a.key.as_ref().as_bytes() == name).then(|| attribute_value(&a)))
 }
 
 /// An `<icon>` that `XmlTvReader.ProcessIconNode` keeps: one with a `src`, a
@@ -1230,11 +1398,11 @@ fn parse_offset(o: &str) -> Option<FixedOffset> {
 
 /// Reads an attribute by (local) name, with XML entity references resolved.
 ///
-/// The named attribute's value, entity-resolved (see [`unescaped_or_raw`]).
+/// The named attribute's value, entity-resolved (see [`attribute_value`]).
 fn attr(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         if a.key.local_name().as_ref().as_bytes() == name {
-            Some(unescaped_or_raw(&a))
+            Some(attribute_value(&a))
         } else {
             None
         }
@@ -1539,7 +1707,66 @@ mod tests {
         true
     )]
     #[case::unclosed_at_eof("<tv><channel id=\"a\">", true)]
-    #[case::html_root("<!DOCTYPE html><html><body>503</body></html>", true)]
+    #[case::html_unclosed_tag("<html><body><br>503</body></html>", true)]
+    #[case::well_formed_html_root("<!DOCTYPE html><html><body>503</body></html>", false)]
+    #[case::other_root("<rss><channel><title>News</title></channel></rss>", false)]
+    #[case::mismatched_end_tag(
+        "<tv><channel id=\"a\"><display-name>A</title></channel></tv>",
+        true
+    )]
+    #[case::stray_end_tag("<tv></channel></tv>", true)]
+    #[case::bare_ampersand_in_attribute(
+        "<tv><programme channel=\"A&E\"><title>T</title></programme></tv>",
+        true
+    )]
+    #[case::undeclared_entity_in_attribute(
+        "<tv><programme channel=\"a&nope;b\"><title>T</title></programme></tv>",
+        true
+    )]
+    #[case::undeclared_entity_in_text(
+        "<tv><channel id=\"a\"><display-name>A &nope; B</display-name></channel></tv>",
+        true
+    )]
+    #[case::duplicate_attribute(
+        "<tv><channel id=\"a\" id=\"b\"><display-name>A</display-name></channel></tv>",
+        true
+    )]
+    #[case::bad_attribute_outside_tv("<feed x=\"&\"><tv></tv></feed>", true)]
+    #[case::text_before_root("junk<tv></tv>", true)]
+    #[case::text_after_root(
+        "<tv><channel id=\"a\"><display-name>A</display-name></channel></tv>junk",
+        true
+    )]
+    #[case::second_root(
+        "<tv><channel id=\"a\"><display-name>A</display-name></channel></tv><tv/>",
+        true
+    )]
+    #[case::anything_after_an_empty_tv("<tv></tv><oops>", false)]
+    #[case::double_hyphen_in_comment("<tv><!-- a -- b --></tv>", true)]
+    #[case::less_than_in_attribute(
+        "<tv><channel id=\"a<b\"><display-name>A</display-name></channel></tv>",
+        true
+    )]
+    #[case::declaration_not_first(" <?xml version=\"1.0\"?><tv></tv>", true)]
+    #[case::declaration_after_a_byte_order_mark("\u{feff}<?xml version=\"1.0\"?><tv></tv>", false)]
+    #[case::declaration_after_comment("<!-- x --><?xml version=\"1.0\"?><tv></tv>", true)]
+    #[case::non_breaking_space_after_root(
+        "<tv><channel id=\"a\"><display-name>A</display-name></channel></tv>\u{a0}",
+        true
+    )]
+    #[case::entity_outside_root(
+        "<tv><channel id=\"a\"><display-name>A</display-name></channel></tv>&amp;",
+        true
+    )]
+    #[case::cdata_outside_root("<![CDATA[x]]><tv></tv>", true)]
+    #[case::junk_after_a_nested_tv(
+        "<root><tv><channel id=\"a\"><display-name>A</display-name></channel></tv></root>junk",
+        true
+    )]
+    #[case::stops_at_an_empty_nested_tv(
+        "<root><tv/><channel id=\"a\"><display-name>A</display-name></channel></root>junk",
+        false
+    )]
     #[case::empty_tv("<tv></tv>", false)]
     #[case::self_closing_tv("<tv/>", false)]
     #[case::prolog(
@@ -1549,6 +1776,53 @@ mod tests {
     #[case::prefixed_tv("<x:tv xmlns:x=\"urn:x\"></x:tv>", false)]
     fn unreadable_documents_report_an_error(#[case] xml: &str, #[case] unreadable: bool) {
         assert_eq!(parse_xmltv(xml).error.is_some(), unreadable, "{xml}");
+    }
+
+    /// `XmlTvReader` finds its `<tv>` with `ReadToDescendant("tv")` from the
+    /// start of the document, so a `<tv>` below another root is read, and a
+    /// well-formed document with none is an empty guide.
+    #[test]
+    fn the_guide_is_the_first_tv_element_wherever_it_is() {
+        let g = parse_xmltv(
+            "<feed><tv><channel id=\"a\"><display-name>A</display-name></channel></tv></feed>",
+        );
+        assert_eq!(g.error, None);
+        assert_eq!(g.channels.len(), 1);
+
+        let g = parse_xmltv(
+            "<rss><channel id=\"a\"><display-name>A</display-name></channel>\
+             <programme channel=\"a\" start=\"20260725060000\"><title>T</title></programme></rss>",
+        );
+        assert_eq!(g.error, None);
+        assert!(g.channels.is_empty(), "no <tv>, no guide");
+        assert!(g.programmes.is_empty());
+    }
+
+    /// `ReadToDescendant("channel")` looks inside `<tv>` and `ReadToFollowing`
+    /// then reads on past it, so channels after `<tv>` count only when `<tv>`
+    /// held one, and channels before it never do; programmes likewise.
+    #[test]
+    fn elements_around_the_tv_element_follow_read_to_following() {
+        let g = parse_xmltv(
+            "<root><channel id=\"before\"><display-name>B</display-name></channel>\
+             <tv><channel id=\"in\"><display-name>I</display-name></channel></tv>\
+             <channel id=\"after\"><display-name>A</display-name></channel>\
+             <programme channel=\"in\" start=\"20260725060000\"><title>T</title></programme></root>",
+        );
+        assert_eq!(g.error, None);
+        let ids: Vec<&str> = g.channels.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["in", "after"]);
+        assert!(g.programmes.is_empty(), "<tv> held no programme");
+
+        let g = parse_xmltv(
+            "<root><tv><programme channel=\"in\" start=\"20260725060000\"><title>T</title></programme></tv>\
+             <channel id=\"after\"><display-name>A</display-name></channel>\
+             <programme channel=\"in\" start=\"20260725070000\"><title>U</title></programme></root>",
+        );
+        assert_eq!(g.error, None);
+        assert!(g.channels.is_empty(), "<tv> held no channel");
+        let titles: Vec<&str> = g.programmes.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(titles, ["T", "U"]);
     }
 
     /// Attribute values carry XML entity references just like element text does,
@@ -1583,39 +1857,23 @@ mod tests {
         assert_eq!(p.icon.as_deref(), Some("http://x/art.png?a=1&b=2"));
     }
 
-    /// An attribute that will not unescape keeps its raw text — it is never
-    /// dropped.
-    ///
-    /// Dropping it is the same silent-programme-loss bug that entity resolution
-    /// was added to fix: an empty `channel_id` joins no tuner channel, so every
-    /// programme on it disappears. A bare `&` in a query string is the common
-    /// real-world case (`.NET`'s `XmlReader` throws outright, so Jellyfin loses
-    /// the whole refresh); an undefined entity reference is the rarer one. Both
-    /// fall back rather than vanish.
+    /// An attribute value that will not unescape (a bare `&`, an entity no
+    /// declaration defines) makes the document unreadable, as `XmlReader`
+    /// throws on it: the refresh keeps the stored guide, as Jellyfin's does.
+    /// What was read before it is still reported.
     #[test]
-    fn an_attribute_that_will_not_unescape_keeps_its_raw_text() {
-        // A bare `&` — the input a sloppy generator emits most often.
+    fn an_attribute_that_will_not_unescape_makes_the_guide_unreadable() {
         let g = parse_xmltv(
-            r#"<tv><programme start="20260725060000" channel="A&E.us"><title>T</title><icon src="http://x/a.png?a=1&b=2"/></programme></tv>"#,
+            r#"<tv><channel id="a"><display-name>A</display-name></channel><programme start="20260725060000" channel="A&E.us"><title>T</title></programme></tv>"#,
         );
-        assert_eq!(g.programmes.len(), 1);
-        assert_eq!(
-            g.programmes[0].channel_id, "A&E.us",
-            "the raw join key still matches a tuner's tvg-id=\"A&E.us\""
-        );
-        assert_eq!(
-            g.programmes[0].icon.as_deref(),
-            Some("http://x/a.png?a=1&b=2")
-        );
-        assert!(g.programmes[0].start.is_some());
+        assert!(g.error.is_some());
+        assert_eq!(g.channels.len(), 1, "read before the error");
+        assert!(g.programmes.is_empty());
 
-        // A reference to an entity no DTD-less document defines.
         let g = parse_xmltv(
-            r#"<tv><programme start="20260725060000" channel="a&nope;b"><title>T</title></programme></tv>"#,
+            r#"<tv><programme start="20260725060000" channel="a"><title>T</title><icon src="http://x/a.png?a=1&b=2"/></programme></tv>"#,
         );
-        assert_eq!(g.programmes.len(), 1);
-        assert_eq!(g.programmes[0].channel_id, "a&nope;b");
-        assert_eq!(g.programmes[0].title, "T");
+        assert!(g.error.is_some(), "in any element's attribute");
     }
 }
 
@@ -1982,6 +2240,20 @@ mod read_tests {
         let guide = read_xmltv_where(&utf8[..], None, |_| true);
         assert_eq!(guide.error, None);
         assert_eq!(guide.channels[0].display_name, "Ünï");
+
+        // The mark comes before the declaration, which is still the first
+        // thing in the document.
+        let declared = format!("<?xml version=\"1.0\"?>{text}");
+        let mut utf8 = b"\xEF\xBB\xBF".to_vec();
+        utf8.extend_from_slice(declared.as_bytes());
+        let guide = read_xmltv_where(trickle(&utf8, 4), None, |_| true);
+        assert_eq!(guide.error, None);
+        assert_eq!(guide.channels.len(), 1);
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(declared.encode_utf16().flat_map(u16::to_le_bytes));
+        let guide = read_xmltv_where(trickle(&utf16, 3), None, |_| true);
+        assert_eq!(guide.error, None);
+        assert_eq!(guide.channels.len(), 1);
     }
 
     /// Bytes that are not valid in the document's encoding, an encoding that

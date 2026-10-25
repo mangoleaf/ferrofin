@@ -25,6 +25,15 @@ major-version upgrade.
   channels (they cannot be played) until a guide refresh finishes cleanly; one that cannot
   read a tuner or a guide leaves them for the next. Migration 0046 rebuilds the Live TV channel
   table to allow this; it keeps every channel and airing.
+- **XMLTV guides must be well-formed XML, as in Jellyfin.** A guide with a bare `&` (say, in
+  an `<icon src="…?a=1&b=2">` URL), an undeclared entity, a mismatched or stray end tag,
+  text after its closing `</tv>`, an XML declaration that is not the very first thing in the
+  file (even a blank line before it), or any other well-formedness error used to load, and
+  now keeps the guide you already have,
+  with a warning in the log, until its source is fixed: escape `&` as `&amp;`. A
+  well-formed document that holds no `<tv>` element (an XHTML error page) now reads as an
+  empty guide and clears that provider's programmes, as in Jellyfin; an HTML page that is
+  not well-formed still keeps the stored guide.
 
 ## Unreleased — Live TV sources are checked and read as Jellyfin reads them
 

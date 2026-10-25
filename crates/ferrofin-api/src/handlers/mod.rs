@@ -1299,8 +1299,17 @@ pub const VERIFIED: &[Verified] = &[
                (ListingsBackend::of, provider_channels) → schedules_direct/mod.rs \
                SchedulesDirect::get_lineups (ListingsManager.GetLineups, \
                XmlTvListingsProvider.GetLineups, SchedulesDirect.GetHeadends)",
-        date: "2026-10-21",
+        date: "2026-10-24",
         divergences: &[
+            "An XMLTV guide declaring an encoding name the WHATWG labels know but .NET's \
+         encoding table does not (iso8859-9, iso88599, x-cp1254, …) is decoded by the \
+         WHATWG encoding; upstream's XmlReader refuses the name, so the guide is unreadable \
+         and Lineups answers 500. Fix path: gl-939.",
+            "An XMLTV guide using an undeclared namespace prefix is read, where upstream's \
+         XmlReader refuses it (500); a <tv> that held programmes but no channel, followed by \
+         something not well-formed, is unreadable here (500) where upstream's GetChannels \
+         stops at </tv> and answers []; and prefixed channel elements are matched by local \
+         name. Fix path: gl-942.",
             "A blank id is a 404 whatever the type; upstream calls \
          GetProvider(type).GetLineups(null, …), which is a 404 for an unknown type but \
          dereferences the null provider (500) for xmltv and SchedulesDirect. Jellyfin bug \

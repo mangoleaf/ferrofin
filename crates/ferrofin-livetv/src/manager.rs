@@ -12640,10 +12640,16 @@ mod tests {
         1
     )]
     #[case::html_page(
-        "<!DOCTYPE html><html><head><title>503</title></head><body>Down for maintenance</body></html>",
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>503</title></head><body>Down<br>for maintenance</body></html>",
         1
     )]
     #[case::well_formed_empty("<tv></tv>", 0)]
+    // `ReadToDescendant("tv")` finds no `<tv>` in a well-formed page, so the
+    // provider reads as an empty guide and drains, as upstream's does.
+    #[case::well_formed_xhtml_page(
+        "<!DOCTYPE html><html><head><title>503</title></head><body>Down for maintenance</body></html>",
+        0
+    )]
     #[tokio::test]
     async fn an_unreadable_guide_body_keeps_the_stored_guide(
         #[case] body: &str,

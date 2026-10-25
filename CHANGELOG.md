@@ -77,6 +77,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `GET /LiveTv/Channels` and the guide until the guide refresh it queues removes them,
   where they used to vanish from the guide at once while their items remained (migration
   0046 drops the tuner → channel cascade)
+- Read an XMLTV guide as strictly as Jellyfin's `XmlReader`: a mismatched end tag, a second
+  root element, text outside the root, a bare `&` or undeclared entity in an attribute or
+  in text, a `<` in an attribute, a repeated attribute, `--` in a comment and an XML
+  declaration that is not at the start make the guide unreadable (the refresh keeps the stored
+  guide), where they were read past; and the guide is the first `<tv>` element wherever it
+  is (`ReadToDescendant`), so a well-formed document without one is an empty guide
+  (Lineups `[]`, the refresh drains the provider) rather than an unreadable one
 - Open an M3U tuner's playlist before saving it, as Jellyfin's `M3UTunerHost.Validate`
   does: a missing local playlist is a `404` and a failing playlist URL a `500`, where the
   tuner was saved and only the next guide refresh showed it empty. A Live TV source URL is
