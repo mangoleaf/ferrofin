@@ -1401,17 +1401,37 @@ pub const VERIFIED: &[Verified] = &[
                policy_validation for the nested Policy's [Required] provider ids; UserDto's \
                serde default for a missing Configuration) → ferrofin-core user_manager.rs \
                rename_user (require_valid_username: ThrowIfInvalidUsername), \
-               update_configuration; handlers/users.rs refresh_device_access \
-               (DeviceAccessHost after a rename)",
+               update_configuration (one writer transaction, as one SaveChangesAsync; \
+               accepted_cast_receiver_id); handlers/users.rs notify_user_updated \
+               (UserUpdatedNotifier) and refresh_device_access (DeviceAccessHost), both after a \
+               rename only",
         date: "2026-10-25",
         divergences: &[
             "\"Configuration\": null skips the configuration save, where upstream dereferences \
          the null in UpdateConfigurationAsync and answers 500. Jellyfin bug not ported.",
-            "Every save pushes UserUpdated to the user's sessions once the configuration is \
-         saved, where upstream pushes it only from a rename (RenameUser raises \
-         UserUpdatedEventArgs; UpdateConfigurationAsync raises nothing). Fix path: gl-864.",
             "The 400 (invalid or taken name), 403 (update not allowed) and 404 (unknown user) \
          bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Users/Configuration",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "UpdateUserConfiguration",
+        ferrofin: "handlers/users.rs update_user_configuration (also behind the hidden \
+               POST /Users/{userId}/Configuration; JsonBody for the [Required] body; \
+               assert_can_update_user: RequestHelpers.AssertCanUpdateUser with \
+               restrictUserPreferences) → ferrofin-core user_manager.rs update_configuration \
+               (UserManager.UpdateConfigurationAsync: the Users columns and the OrderedViews, \
+               GroupedFolders, MyMediaExcludes and LatestItemExcludes preferences in one writer \
+               transaction; accepted_cast_receiver_id: a non-empty id naming a configured \
+               receiver, else the stored one is kept); no UserUpdated push, as \
+               UpdateConfigurationAsync raises no event",
+        date: "2026-10-25",
+        divergences: &[
+            "The 403 (update not allowed) and 404 (unknown user) bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
