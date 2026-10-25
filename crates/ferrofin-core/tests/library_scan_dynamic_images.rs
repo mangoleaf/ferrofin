@@ -728,6 +728,65 @@ async fn a_library_refresh_redraws_its_tile_unless_locked(
     );
 }
 
+/// gl-594: a library refresh runs every provider on the library's own first
+/// refresh (`isFirstRefresh` at `Default` or above), so a Default refresh of
+/// a library never refreshed before redraws its tile past the date gate. It
+/// stamps the library's `DateLastRefreshed`, so the next Default refresh is
+/// behind the gate again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_librarys_first_default_refresh_redraws_its_tile() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let mut library = lib.row(BaseItemKind::CollectionFolder, "Photos").await;
+    let library_id = uuid::Uuid::parse_str(&library.id).expect("id");
+    // A library whose tile was drawn before it was ever refreshed (a
+    // library row written by an older Ferrofin carries no stamp).
+    library.date_last_refreshed = None;
+    lib.persistence
+        .save_items(std::slice::from_ref(&library))
+        .await
+        .expect("unstamp");
+    let refresh = || async {
+        let default = MetadataRefreshOptions::default();
+        let above = MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::None,
+            image_refresh_mode: MetadataRefreshMode::None,
+            ..MetadataRefreshOptions::default()
+        };
+        let cancel = ScanCancel::new();
+        lib.scanner
+            .scan_target(
+                &ScanTarget::Library(library_id),
+                ScanRun::new(&default, &above, &cancel).with_passes(ScanPasses::Touched),
+            )
+            .await
+            .expect("refresh");
+    };
+
+    write_photo(&lib.album_dir, BLUE);
+    refresh().await;
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        dimmed(BLUE),
+        "the first refresh runs every provider"
+    );
+    assert!(
+        lib.row(BaseItemKind::CollectionFolder, "Photos")
+            .await
+            .date_last_refreshed
+            .is_some()
+    );
+
+    write_photo(&lib.album_dir, RED);
+    refresh().await;
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        dimmed(BLUE),
+        "a refreshed library's current tile is behind its gate"
+    );
+}
+
 /// The row's Primary image row.
 async fn primary_of(
     items: &Arc<dyn ItemRepository>,

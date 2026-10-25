@@ -2731,23 +2731,51 @@ enum ItemSaved {
     Cancelled,
 }
 
-/// Whether a refresh with `options` runs every provider whatever the item's
-/// own state — the options' half of `runAllProviders`
-/// (`MetadataService.cs:654-657`): "Replace all metadata" or a full refresh,
-/// with a metadata mode at all (`:160`).
+/// The refresh facts of a row the walk does not plan: nothing on disk feeds
+/// its decision.
 ///
-/// TODO(parity, open work item — NOT an accepted divergence; gl-594): the
-/// library tiles and the user root's image a library or root refresh
-/// reaches are forced by this alone; upstream also forces a row on its own
-/// first refresh or once its library's `AutomaticRefreshIntervalDays` have
-/// passed (`isFirstRefresh`/`requiresRefresh` at Default or above). Un-defer
-/// path: decide those rows with `plan_item_refresh` from their stored
-/// `DateLastRefreshed` and their library's options, as the walk decides the
-/// rows it plans, and test a Default root refresh of a never-refreshed root.
-fn runs_every_provider(options: &MetadataRefreshOptions) -> bool {
-    options.metadata_refresh_mode != MetadataRefreshMode::None
-        && (options.replace_all_metadata
-            || options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh)
+/// TODO(parity, open work item — NOT an accepted divergence; gl-337): a
+/// library's own `CollectionFolder.RequiresRefresh` (its folder's write time
+/// and its changed physical locations) does not fire yet; that issue ports
+/// it into `item_requires_refresh`.
+const UNWALKED_FACTS: FileFacts = FileFacts {
+    mtime: None,
+    probe: ProbeKind::None,
+    sidecars_changed: false,
+    lyrics_changed: false,
+    local_metadata: None,
+    supports_cumulative_run_time: false,
+    is_shortcut: false,
+    is_file_protocol: true,
+    is_placeholder: false,
+};
+
+/// The refresh plan of `row`, a row a library or root refresh reaches
+/// without the walk planning it: a library tile (`library` is its options)
+/// or the user root (no library, so upstream's default options). Its
+/// `run_all_providers` forces the row's dynamic image as
+/// `MetadataService.GetProviders` does: "Replace all metadata", a full
+/// refresh, or at `Default` or above the row's own first refresh or its
+/// library's elapsed `AutomaticRefreshIntervalDays`.
+/// [`decide_save`](crate::refresh_plan::decide_save) over it says whether the
+/// pass stamps the row's `DateLastRefreshed`.
+pub(crate) fn unwalked_refresh_plan(
+    row: Option<&BaseItemEntity>,
+    options: &MetadataRefreshOptions,
+    library: Option<&LibraryOptionsModel>,
+) -> ItemRefreshPlan {
+    let stored = row.map(music::stored_state);
+    crate::refresh_plan::plan_item_refresh(
+        stored.as_ref(),
+        &UNWALKED_FACTS,
+        &RefreshRequest {
+            options,
+            force_save: false,
+        },
+        library,
+        Utc::now(),
+        false,
+    )
 }
 
 /// Whether the external subtitle or audio files beside `item`'s video differ
@@ -7008,7 +7036,6 @@ impl LibraryScanner {
                 tracing::warn!(%err, "dynamic image pass failed");
             }
             let runs = run.options.metadata_refresh_mode != MetadataRefreshMode::None;
-            let force = runs_every_provider(run.options);
             // `CollectionFolderImageProvider`, of each library a library's or
             // the root's refresh validated.
             if run.cancel.is_cancelled() {
@@ -7016,9 +7043,9 @@ impl LibraryScanner {
             }
             if runs
                 && let Some(libraries) = libraries
-                && let Err(err) = self.refresh_library_images(libraries, force).await
+                && let Err(err) = self.refresh_library_images(libraries, run.options).await
             {
-                tracing::warn!(%err, "library image pass failed");
+                tracing::warn!(%err, "failed to record the library tiles' refresh");
             }
             // The user root's image a root's refresh reaches, after the tiles
             // it copies.
@@ -7027,7 +7054,9 @@ impl LibraryScanner {
             }
             if runs
                 && run.from_root
-                && let Err(err) = providers.refresh_user_root_between(force, &between).await
+                && let Err(err) = providers
+                    .refresh_user_root_between(run.options, &between)
+                    .await
             {
                 tracing::warn!(%err, "root image pass failed");
             }
@@ -8848,11 +8877,8 @@ impl LibraryScanner {
         // that fetch that content's artwork — otherwise a first scan sees no
         // art and the "My Media" tile keeps the icon placeholder.
         let started = std::time::Instant::now();
-        if let Err(err) = self
-            .refresh_library_images(folders, runs_every_provider(run.options))
-            .await
-        {
-            tracing::warn!(%err, "library image pass failed");
+        if let Err(err) = self.refresh_library_images(folders, run.options).await {
+            tracing::warn!(%err, "failed to record the library tiles' refresh");
         }
         timings.library_images = started.elapsed();
         if !self.between_passes(run, &mut done).await {
@@ -12708,8 +12734,10 @@ impl LibraryScanner {
     }
 
     /// Composites a Primary image for every library whose tile is missing or
-    /// stale, from up to [`LIBRARY_COLLAGE_SOURCES`] random descendants'
-    /// artwork (Backdrop > Primary > Thumb, upstream's preference).
+    /// stale, from the artwork of up to [`LIBRARY_COLLAGE_SOURCES`] random
+    /// items with a Primary ([`library_collage_inputs`](Self::library_collage_inputs):
+    /// a music library's artists, any other library's own kinds), after its
+    /// own and its media locations' images are merged.
     ///
     /// Port of `CollectionFolderImageProvider`: upstream refreshes each
     /// `CollectionFolder`'s dynamic image on library validation, composing a
@@ -12718,13 +12746,18 @@ impl LibraryScanner {
     /// this, the home screen's "My Media" tiles render the icon-on-blue
     /// fallback forever.
     ///
-    /// `force` is a library or root refresh that runs every provider
-    /// (`runAllProviders`); [`library_tile_due`](Self::library_tile_due) says
-    /// which tiles it redraws.
+    /// Each library is forced as its refresh plan says
+    /// ([`unwalked_refresh_plan`]): by `options` running every provider, or by
+    /// its own first or overdue refresh; [`library_tile_due`](Self::library_tile_due)
+    /// says which tiles it redraws. A library whose pass had no failure has
+    /// its `DateLastRefreshed` stamped when
+    /// [`decide_save`](crate::refresh_plan::decide_save) saves it, as
+    /// upstream's `RefreshMetadata` stamps every library it refreshes. One
+    /// library's failure is logged and never stops the others'.
     async fn refresh_library_images(
         &self,
         folders: &[VirtualFolderInfo],
-        force: bool,
+        options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
         let (Some(items), Some(processor), Some(meta_root)) = (
             &self.item_repository,
@@ -12733,68 +12766,145 @@ impl LibraryScanner {
         ) else {
             return Ok(());
         };
+        let request = RefreshRequest {
+            options,
+            force_save: false,
+        };
+        let mut refreshed = Vec::new();
         for folder in folders {
             let Some(cf) = collection_folder_id(folder) else {
                 continue;
             };
-            let out_dir = crate::dynamic_images::own_art_dir(&meta_root.resolve(), cf);
-            let out = out_dir.join("primary.png");
-            self.merge_library_local_images(items, cf, &folder.locations)
-                .await;
-            if !self
-                .library_tile_due(items, &meta_root.resolve(), cf, force)
-                .await?
-            {
-                continue;
-            }
-            let inputs = Self::library_collage_inputs(items, folder, cf).await?;
-            if inputs.is_empty() {
-                continue; // an empty library keeps the icon tile
-            }
-            if let Err(err) = std::fs::create_dir_all(&out_dir) {
-                tracing::warn!(%err, library = %cf, "failed to create the library art dir");
-                continue;
-            }
-            let options = ferrofin_traits::options::ImageCollageOptions {
-                input_paths: inputs,
-                output_path: out.to_string_lossy().into_owned(),
-                width: 960,
-                height: 540,
-            };
-            if let Err(err) = processor
-                .create_image_collage(&options, folder.name.as_deref())
-                .await
-            {
-                tracing::warn!(%err, library = %cf, "failed to composite the library image");
-                continue;
-            }
-            // Recorded as any saved image is: the file's own modification
-            // time, and its size and blurhash read back from it.
-            let mut info = ItemImageInfo {
-                path: options.output_path.clone(),
-                image_type: ImageType::Primary,
-                date_modified: crate::dynamic_images::file_date_modified(&out),
-                width: options.width,
-                height: options.height,
-                blur_hash: None,
-            };
-            crate::dynamic_images::fill_image_metadata(processor.as_ref(), &mut info).await;
-            // `ProviderManager.SaveImage` replaces the Primary only; the
-            // library's other images stay.
-            let mut images = match items.get_image_infos(cf).await {
-                Ok(images) => images,
+            let row = match items.retrieve_item(cf).await {
+                Ok(row) => row,
                 Err(err) => {
-                    tracing::warn!(%err, library = %cf, "failed to read the library images");
+                    tracing::warn!(%err, library = %cf, "failed to read the library row");
                     continue;
                 }
             };
-            images.retain(|i| i.image_type != ImageType::Primary);
-            images.insert(0, info);
-            if let Err(err) = self.persistence.save_item_images(cf, &images).await {
-                tracing::warn!(%err, library = %cf, "failed to persist the library image");
+            let plan =
+                unwalked_refresh_plan(row.as_ref(), options, folder.library_options.as_ref());
+            let pass = match self
+                .refresh_library_image(
+                    items,
+                    processor,
+                    &meta_root.resolve(),
+                    folder,
+                    cf,
+                    plan.run_all_providers,
+                )
+                .await
+            {
+                Ok(pass) => pass,
+                Err(err) => {
+                    tracing::warn!(%err, library = %cf, "library image pass failed");
+                    continue;
+                }
+            };
+            let decision = crate::refresh_plan::decide_save(plan, &request, pass);
+            if decision.save && decision.stamp_refreshed {
+                refreshed.push(cf);
             }
         }
+        if !refreshed.is_empty() {
+            self.persistence
+                .stamp_date_last_refreshed(&refreshed, Utc::now())
+                .await?;
+        }
         Ok(())
+    }
+
+    /// One library's part of [`refresh_library_images`](Self::refresh_library_images):
+    /// its own and its media locations' images merged, then its tile drawn
+    /// when due (`force`d past the date gate), and what that changed or
+    /// failed at. A failure to merge or draw is logged and reported in the
+    /// outcome; a failure to read the library's rows is returned.
+    async fn refresh_library_image(
+        &self,
+        items: &Arc<dyn ItemRepository>,
+        processor: &Arc<dyn ferrofin_traits::drawing::ImageProcessor>,
+        meta_root: &Path,
+        folder: &VirtualFolderInfo,
+        cf: Uuid,
+        force: bool,
+    ) -> Result<PassOutcome, ServiceError> {
+        let (merged, merge_failed) = match self
+            .merge_library_local_images(items, cf, &folder.locations)
+            .await
+        {
+            Ok(merged) => (merged, false),
+            Err(err) => {
+                tracing::warn!(%err, library = %cf, "failed to read the library's own images");
+                (false, true)
+            }
+        };
+        let failed = PassOutcome {
+            changed: merged,
+            failed: true,
+        };
+        if !self.library_tile_due(items, meta_root, cf, force).await? {
+            return Ok(PassOutcome {
+                changed: merged,
+                failed: merge_failed,
+            });
+        }
+        let inputs = Self::library_collage_inputs(items, folder, cf).await?;
+        if inputs.is_empty() {
+            // An empty library keeps the icon tile.
+            return Ok(PassOutcome {
+                changed: merged,
+                failed: merge_failed,
+            });
+        }
+        let out_dir = crate::dynamic_images::own_art_dir(meta_root, cf);
+        let out = out_dir.join("primary.png");
+        if let Err(err) = std::fs::create_dir_all(&out_dir) {
+            tracing::warn!(%err, library = %cf, "failed to create the library art dir");
+            return Ok(failed);
+        }
+        let options = ferrofin_traits::options::ImageCollageOptions {
+            input_paths: inputs,
+            output_path: out.to_string_lossy().into_owned(),
+            width: 960,
+            height: 540,
+        };
+        if let Err(err) = processor
+            .create_image_collage(&options, folder.name.as_deref())
+            .await
+        {
+            tracing::warn!(%err, library = %cf, "failed to composite the library image");
+            return Ok(failed);
+        }
+        // Recorded as any saved image is: the file's own modification
+        // time, and its size and blurhash read back from it.
+        let mut info = ItemImageInfo {
+            path: options.output_path.clone(),
+            image_type: ImageType::Primary,
+            date_modified: crate::dynamic_images::file_date_modified(&out),
+            width: options.width,
+            height: options.height,
+            blur_hash: None,
+        };
+        crate::dynamic_images::fill_image_metadata(processor.as_ref(), &mut info).await;
+        // `ProviderManager.SaveImage` replaces the Primary only; the
+        // library's other images stay.
+        let mut images = match items.get_image_infos(cf).await {
+            Ok(images) => images,
+            Err(err) => {
+                tracing::warn!(%err, library = %cf, "failed to read the library images");
+                return Ok(failed);
+            }
+        };
+        images.retain(|i| i.image_type != ImageType::Primary);
+        images.insert(0, info);
+        if let Err(err) = self.persistence.save_item_images(cf, &images).await {
+            tracing::warn!(%err, library = %cf, "failed to persist the library image");
+            return Ok(failed);
+        }
+        Ok(PassOutcome {
+            changed: true,
+            failed: merge_failed,
+        })
     }
 
     /// The images in a library's own folder (`root/default/<name>`) become its
@@ -12806,30 +12916,14 @@ impl LibraryScanner {
     /// new row, and an adopted library's `folder.jpg` is found again. The
     /// images in the library's media `locations` follow
     /// (`CollectionFolderLocalImageProvider`, `Order` 1), so an image of a
-    /// type found in both comes from the library's own folder.
-    /// A failure is logged and leaves the library as it was: one library's
-    /// error never stops the others' tiles.
+    /// type found in both comes from the library's own folder. Returns
+    /// whether the library's images changed.
     async fn merge_library_local_images(
         &self,
         items: &Arc<dyn ItemRepository>,
         library: Uuid,
         locations: &[String],
-    ) {
-        if let Err(err) = self
-            .try_merge_library_local_images(items, library, locations)
-            .await
-        {
-            tracing::warn!(%err, library = %library, "failed to read the library's own images");
-        }
-    }
-
-    /// [`Self::merge_library_local_images`], with its errors.
-    async fn try_merge_library_local_images(
-        &self,
-        items: &Arc<dyn ItemRepository>,
-        library: Uuid,
-        locations: &[String],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<bool, ServiceError> {
         // A locked item runs no image provider (`RefreshWithProviders`
         // returns first, `MetadataService.cs:785-788`).
         let Some(row) = items
@@ -12837,7 +12931,7 @@ impl LibraryScanner {
             .await?
             .filter(|row| !row.is_locked)
         else {
-            return Ok(());
+            return Ok(false);
         };
         let dir = FsDirectoryService::new();
         let mut found = discover_local_images(&row, &dir);
@@ -12849,13 +12943,14 @@ impl LibraryScanner {
             ferrofin_providers::CollectionFolderLocalImageProvider::get_images(&library_item, &dir),
         ));
         if found.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let mut images = items.get_image_infos(library).await?;
-        if merge_local_images(&mut images, &found) {
+        let changed = merge_local_images(&mut images, &found);
+        if changed {
             self.persistence.save_item_images(library, &images).await?;
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// The artwork a library tile is drawn from (v12.2
@@ -22699,6 +22794,44 @@ mod plan_paths_tests;
 
 #[cfg(test)]
 mod tests {
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+
+    /// gl-594, `MetadataService.GetProviders`' `runAllProviders` for a row
+    /// the walk does not plan (a library or the user root): the options, or
+    /// at `Default` or above the row's own first refresh or its library's
+    /// elapsed `AutomaticRefreshIntervalDays`.
+    #[rstest::rstest]
+    #[case::first_refresh(MetadataRefreshMode::Default, None, 0, true)]
+    #[case::first_refresh_validation_only(MetadataRefreshMode::ValidationOnly, None, 0, false)]
+    #[case::refreshed(MetadataRefreshMode::Default, Some(1), 0, false)]
+    #[case::refreshed_full_refresh(MetadataRefreshMode::FullRefresh, Some(1), 0, true)]
+    #[case::interval_elapsed(MetadataRefreshMode::Default, Some(8), 7, true)]
+    #[case::interval_not_elapsed(MetadataRefreshMode::Default, Some(6), 7, false)]
+    fn an_unwalked_row_runs_every_provider_as_get_providers_says(
+        #[case] mode: MetadataRefreshMode,
+        #[case] refreshed_days_ago: Option<i64>,
+        #[case] interval_days: i32,
+        #[case] want: bool,
+    ) {
+        let row = ferrofin_db::entities::base_items::BaseItemEntity {
+            date_last_refreshed: refreshed_days_ago
+                .map(|days| chrono::Utc::now() - chrono::TimeDelta::days(days)),
+            ..Default::default()
+        };
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: mode,
+            ..MetadataRefreshOptions::default()
+        };
+        let library = ferrofin_model::configuration::LibraryOptions {
+            automatic_refresh_interval_days: interval_days,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::unwalked_refresh_plan(Some(&row), &options, Some(&library)).run_all_providers,
+            want
+        );
+    }
+
     /// A library row with rows under it, and image files to give them, for
     /// the tile sample ([`super::LibraryScanner::library_collage_inputs`]).
     struct CollageLibrary {
