@@ -1668,13 +1668,15 @@ impl LocalProviderManager {
                 image_fetcher_enabled(library.as_ref(), global.as_ref(), kind, name)
             })
         };
+        // An extra is never asked a remote image provider, a plugin's
+        // included (`CanRefreshImages`' `ExtraType` check).
         let images_allowed =
             (!entity.is_locked || options.image_refresh_mode == MetadataRefreshMode::FullRefresh)
-                && ((entity.extra_type.is_none()
-                    && self
-                        .image_sources_for(entity)
-                        .iter()
-                        .any(|source| image_enabled(source.name())))
+                && entity.extra_type.is_none()
+                && (self
+                    .image_sources_for(entity)
+                    .iter()
+                    .any(|source| image_enabled(source.name()))
                     || self.dynamic_image_providers.iter().any(|provider| {
                         provider.library_gated() && image_enabled(provider.name())
                     }));
@@ -9154,6 +9156,28 @@ mod tests {
         };
         let gated = mgr.gated_options(&from_channel, &Opts::default()).await;
         assert_eq!(gated.metadata_refresh_mode, Mode::None);
+        assert_eq!(gated.image_refresh_mode, Mode::None);
+    }
+
+    /// `CanRefreshImages`: an extra is never asked a remote image provider,
+    /// a plugin's (`remote-images`) included, while its owner is.
+    #[tokio::test]
+    async fn an_extra_refuses_plugin_artwork() {
+        let mgr = LocalProviderManager::new(Vec::new())
+            .with_dynamic_image_providers(vec![Arc::new(OrderingArtwork)]);
+        let movie = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".to_owned(),
+            ..Default::default()
+        };
+        let gated = mgr.gated_options(&movie, &Opts::default()).await;
+        assert_eq!(gated.image_refresh_mode, Mode::Default);
+        let trailer = BaseItemEntity {
+            type_: "MediaBrowser.Controller.Entities.Trailer".to_owned(),
+            owner_id: Some("6f1e4c1a-2b3d-4e5f-6a7b-8c9d0e1f2a3b".to_owned()),
+            extra_type: Some(1),
+            ..Default::default()
+        };
+        let gated = mgr.gated_options(&trailer, &Opts::default()).await;
         assert_eq!(gated.image_refresh_mode, Mode::None);
     }
     // ── remote search: the library-options / IsLocked gate ──────────────────

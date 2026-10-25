@@ -363,6 +363,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   in Jellyfin; it took them from the last. The metadata language and country of an item in
   nested libraries now come from the innermost one, and `GET /Items/{itemId}/Ancestors`
   names the first library by sort name when two list the same folder
+- An extra (a trailer, featurette or theme song) is never looked up by a WASM plugin's
+  metadata or artwork source, as Jellyfin 12 never asks a remote provider about one: it has
+  no identity of its own online, so a lookup by its file name filled it with another title's
+  overview, people or Primary image. Its local readers, embedded images and extracted frames
+  still run. The item it belongs to is asked as before
 
 ### Performance
 - `/Persons` with a favourite filter: build the user's favourite-person set once per
