@@ -109,7 +109,8 @@ pub struct XmltvProgramme {
     pub is_new: bool,
     /// `true` when a `<premiere>` element is present, with or without text.
     pub is_premiere: bool,
-    /// `true` when a `<previously-shown>` element is present.
+    /// `true` when a `<previously-shown>` element marks a repeat: one without a
+    /// `start`, or whose `start` is not the programme's own start instant.
     pub is_previously_shown: bool,
     /// `true` when a `<live>` element is present (not in the XMLTV DTD, but
     /// Jellyfin 12 reads it).
@@ -680,16 +681,29 @@ fn apply_start(
         // `GetProgramme` matches on `xmlProg.Name.ToLower(...)`.
         match programme_child_name(name).as_ref() {
             b"episode-num" => *episode_system = attr(e, b"system"),
-            // `ProcessLive`/`ProcessNew`/`ProcessPremiereNode`/
-            // `ProcessPreviouslyShown`: the element is the flag, whatever its
-            // text. TODO(gl-683): `ProcessPreviouslyShown` also reads a `start`
-            // attribute and leaves an airing whose original-air date equals its
-            // own start a first showing; here every `<previously-shown>` is a
-            // repeat.
+            // `ProcessLive`/`ProcessNew`/`ProcessPremiereNode`: the element is
+            // the flag, whatever its text.
             b"live" => p.programme.is_live = true,
             b"new" => p.programme.is_new = true,
             b"premiere" => p.programme.is_premiere = true,
-            b"previously-shown" => p.programme.is_previously_shown = true,
+            // `ProcessPreviouslyShown` (Jellyfin.XmlTv XmlTvReader.cs:833-852):
+            // a `start` is the original air date, and an airing whose original
+            // air date is its own start instant is a first showing. Without a
+            // `start` it is a repeat; one that does not parse, or a programme
+            // whose own start does not, never matches.
+            b"previously-shown" => {
+                let first_showing = attr(e, b"start")
+                    .filter(|start| !start.is_empty())
+                    .is_some_and(|start| {
+                        matches!(
+                            (parse_xmltv_time(&start), p.programme.start),
+                            (Some(shown), Some(start)) if shown == start
+                        )
+                    });
+                if !first_showing {
+                    p.programme.is_previously_shown = true;
+                }
+            }
             b"icon" => {
                 if !p.icon_read
                     && let Some(icon) = populated_icon(e)
@@ -1693,5 +1707,72 @@ mod read_tests {
             read_xmltv_where(bytes, |_| true).error.as_deref(),
             Some("the XMLTV document is empty")
         );
+    }
+}
+
+/// `<previously-shown>` as `XmlTvReader.ProcessPreviouslyShown` reads it.
+#[cfg(test)]
+mod previously_shown_tests {
+    use super::parse_xmltv;
+
+    /// Whether the one programme of a guide whose airing starts at `start`
+    /// and carries `element` is previously shown.
+    fn previously_shown(start: &str, element: &str) -> bool {
+        let guide = parse_xmltv(&format!(
+            "<tv><programme start=\"{start}\" stop=\"20260726000000 +0000\" channel=\"a\">\
+             <title>T</title>{element}</programme></tv>"
+        ));
+        assert_eq!(guide.error, None);
+        guide.programmes[0].is_previously_shown
+    }
+
+    /// `result.PreviouslyShown != result.StartDate`: `DateTimeOffset`
+    /// compares instants, so the same moment written with another offset is
+    /// the same airing; no `start` (or an empty one) is a repeat, and so is
+    /// one `ParseDate` cannot read (`null` differs from every start).
+    #[rstest::rstest]
+    #[case::no_start("20260725200000 +0000", "<previously-shown/>", true)]
+    #[case::empty_start("20260725200000 +0000", "<previously-shown start=\"\"/>", true)]
+    #[case::same_start(
+        "20260725200000 +0000",
+        "<previously-shown start=\"20260725200000 +0000\"/>",
+        false
+    )]
+    #[case::same_instant_other_offset(
+        "20260725200000 +0000",
+        "<previously-shown start=\"20260725210000 +0100\"></previously-shown>",
+        false
+    )]
+    #[case::earlier_date(
+        "20260725200000 +0000",
+        "<previously-shown start=\"20070708000000\"/>",
+        true
+    )]
+    #[case::unparseable("20260725200000 +0000", "<previously-shown start=\"soon\"/>", true)]
+    #[case::date_only_at_midnight(
+        "20260725000000 +0000",
+        "<previously-shown start=\"20260725\"/>",
+        false
+    )]
+    #[case::date_only_later_in_the_day(
+        "20260725200000 +0000",
+        "<previously-shown start=\"20260725\"/>",
+        true
+    )]
+    fn an_airing_shown_at_its_own_start_is_a_first_showing(
+        #[case] start: &str,
+        #[case] element: &str,
+        #[case] repeat: bool,
+    ) {
+        assert_eq!(previously_shown(start, element), repeat, "{element}");
+    }
+
+    /// A programme whose own start does not parse matches no original air date.
+    #[test]
+    fn an_unreadable_programme_start_matches_no_original_air_date() {
+        assert!(previously_shown(
+            "soon",
+            "<previously-shown start=\"20260725200000\"/>"
+        ));
     }
 }
