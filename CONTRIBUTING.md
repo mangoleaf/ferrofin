@@ -16,9 +16,9 @@ cargo build --workspace
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
 ```
 
-On a fresh database the server seeds an admin user and logs a generated password —
-record it. ffmpeg/ffprobe are auto-discovered on `$PATH`; without them only
-transcoding is disabled.
+On a fresh database the server seeds an admin user with no password (Jellyfin's default),
+which the setup wizard at `/web` sets; `FERROFIN_ADMIN_PASSWORD` seeds one instead.
+ffmpeg/ffprobe are auto-discovered on `$PATH`; without them only transcoding is disabled.
 
 ## Quality gates (CI enforces all of these)
 

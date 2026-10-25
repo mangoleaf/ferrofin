@@ -87,6 +87,12 @@ pub trait AttachmentIo: Send + Sync {
     /// (`-dump_attachment:t ""`) writes each file relative to it, which is why
     /// C# sets `WorkingDirectory = outputFolder`.
     ///
+    /// `outputs` are the files the run writes, where they are known before it
+    /// starts. A run whose future is dropped before ffmpeg exits (the request
+    /// cancelled) kills ffmpeg and deletes them, as upstream's cancellation
+    /// does: `Kill(true)`, then the exit code -1 takes the failure path, which
+    /// deletes what the run may have half-written.
+    ///
     /// # Errors
     ///
     /// Returns an error string when `args` does not split into argv
@@ -96,6 +102,7 @@ pub trait AttachmentIo: Send + Sync {
         ffmpeg_path: &str,
         args: &str,
         working_dir: Option<&str>,
+        outputs: &[String],
     ) -> Result<i32, String>;
 }
 
@@ -134,6 +141,7 @@ impl AttachmentIo for NoopAttachmentIo {
         _ffmpeg_path: &str,
         _args: &str,
         _working_dir: Option<&str>,
+        _outputs: &[String],
     ) -> Result<i32, String> {
         Ok(0)
     }
@@ -287,7 +295,7 @@ where
             .to_owned();
         let exit_code = self
             .io
-            .run_ffmpeg(&self.media_encoder.encoder_path(), &args, None)
+            .run_ffmpeg(&self.media_encoder.encoder_path(), &args, None, &missing)
             .await
             .map_err(MediaEncodingError::process)?;
 
@@ -334,7 +342,10 @@ where
 
         let exit_code = self
             .io
-            .run_ffmpeg(&self.media_encoder.encoder_path(), &args, Some(folder))
+            // Its files are named by the media's own `filename` tags, so none
+            // is known to delete on a cancelled run; upstream's failure path
+            // only removes the folder when it is empty (`Directory.Delete`).
+            .run_ffmpeg(&self.media_encoder.encoder_path(), &args, Some(folder), &[])
             .await
             .map_err(MediaEncodingError::process)?;
 
@@ -420,7 +431,12 @@ where
 
             let exit_code = self
                 .io
-                .run_ffmpeg(&self.media_encoder.encoder_path(), &args, None)
+                .run_ffmpeg(
+                    &self.media_encoder.encoder_path(),
+                    &args,
+                    None,
+                    std::slice::from_ref(&attachment_path),
+                )
                 .await
                 .map_err(MediaEncodingError::process)?;
 
@@ -701,6 +717,7 @@ mod tests {
         last_args: Mutex<Option<String>>,
         created_dir: Mutex<Option<String>>,
         working_dir: Mutex<Option<String>>,
+        outputs: Mutex<Vec<String>>,
     }
 
     impl FakeIo {
@@ -714,6 +731,7 @@ mod tests {
                 last_args: Mutex::new(None),
                 created_dir: Mutex::new(None),
                 working_dir: Mutex::new(None),
+                outputs: Mutex::new(Vec::new()),
             }
         }
 
@@ -727,6 +745,11 @@ mod tests {
 
         fn args(&self) -> Option<String> {
             self.last_args.lock().unwrap().clone()
+        }
+
+        /// The outputs the last run named for deletion if it were cancelled.
+        fn outputs(&self) -> Vec<String> {
+            self.outputs.lock().unwrap().clone()
         }
     }
 
@@ -760,8 +783,10 @@ mod tests {
             _ffmpeg_path: &str,
             args: &str,
             working_dir: Option<&str>,
+            outputs: &[String],
         ) -> Result<i32, String> {
             *self.last_args.lock().unwrap() = Some(args.to_owned());
+            outputs.clone_into(&mut self.outputs.lock().unwrap());
             *self.working_dir.lock().unwrap() = working_dir.map(str::to_owned);
             if self.writes {
                 let tokens = crate::encoder::split_args(args)?;
@@ -840,6 +865,8 @@ mod tests {
         // path, so no working directory is needed.
         assert_eq!(ex.io.created_dir.lock().unwrap().as_deref(), Some("/cache"));
         assert_eq!(ex.io.working_dir.lock().unwrap().as_deref(), None);
+        // A cancelled run deletes the file it was writing.
+        assert_eq!(ex.io.outputs(), ["/cache/font.ttf"]);
     }
 
     #[tokio::test]
@@ -908,6 +935,9 @@ mod tests {
         );
         assert_eq!(ex_io.created_dir.lock().unwrap().as_deref(), Some("/cache"));
         assert_eq!(ex_io.working_dir.lock().unwrap().as_deref(), Some("/cache"));
+        // The media names the batch dump's files, so a cancelled run has none
+        // it could delete.
+        assert!(ex_io.outputs().is_empty());
     }
 
     /// The batch dump used to collapse every run of whitespace in the whole
@@ -985,6 +1015,9 @@ mod tests {
         let args = ex.io.args().unwrap();
         assert!(args.starts_with("-dump_attachment:4 "), "{args}");
         assert!(!args.contains("-dump_attachment:3"), "{args}");
+        // Only the file this run writes is deleted if it is cancelled, never
+        // the one already extracted.
+        assert_eq!(ex.io.outputs(), ["/cache/b.ttf"]);
 
         *ex.io.last_args.lock().unwrap() = None;
         ex.extract_all_attachments("/media/movie.mkv", &source)

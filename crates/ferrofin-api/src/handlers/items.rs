@@ -290,6 +290,16 @@ struct ItemsQuery {
     /// Comma-delimited album ids.
     #[serde(default)]
     album_ids: Option<String>,
+    /// Pipe-delimited album names. The first album of each name replaces
+    /// `albumIds`.
+    #[serde(default)]
+    albums: Option<String>,
+    /// Pipe-delimited artist names. Their artists replace `artistIds`.
+    #[serde(default)]
+    artists: Option<String>,
+    /// Pipe-delimited studio names. Their studios replace `studioIds`.
+    #[serde(default)]
+    studios: Option<String>,
     /// Restrict to favourited items.
     #[serde(default)]
     is_favorite: Option<bool>,
@@ -372,6 +382,31 @@ struct ItemsQuery {
     /// Restrict to items with (or without) a custom or official parental rating.
     #[serde(default, deserialize_with = "http_presence_filter")]
     has_parental_rating: Option<bool>,
+    /// Restrict to items with (or without) an official rating; a folder counts
+    /// as rated when an item below it is.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_official_rating: Option<bool>,
+    /// The lowest official rating to return, resolved to a parental-rating
+    /// score (`LocalizationManager.GetRatingScore`); unrated items stay in.
+    #[serde(default)]
+    min_official_rating: Option<String>,
+    /// The highest official rating to return, resolved like
+    /// `minOfficialRating`. It can lower the user's parental limit, never
+    /// raise it.
+    #[serde(default)]
+    max_official_rating: Option<String>,
+    /// Comma-delimited [`SeriesStatus`](ferrofin_model::entities::SeriesStatus)
+    /// set — jellyfin-web's TV Status filter.
+    #[serde(default)]
+    series_status: Option<String>,
+    /// Comma-delimited person types (`Actor`, `Director`, …) a `person` or
+    /// `personIds` credit must have.
+    #[serde(default)]
+    person_types: Option<String>,
+    /// Restrict to placeholder items (an offline disc stub), or exclude them;
+    /// a folder counts as one when an item below it is.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    is_place_holder: Option<bool>,
     /// Comma-delimited [`VideoType`](ferrofin_model::entities::VideoType) set
     /// (`BluRay`, `Dvd`, `Iso`).
     #[serde(default)]
@@ -546,6 +581,18 @@ async fn get_items(
     let user = resolve_user(&state, &auth, query.user_id).await?;
 
     let mut internal = items_query_options(&query, user)?;
+    // `query.MinParentalRating = _localization.GetRatingScore(minOfficialRating)`
+    // and the same for the maximum, each only when the parameter is not blank
+    // (v12.2 ItemsController.cs:515-525). The repository applies the stricter
+    // of the requested maximum and the user's own limit, so a request can
+    // lower a restricted user's ceiling but not raise it: upstream lets the
+    // request replace the limit `SetUser` copied from the user's policy, and an
+    // unrecognized rating there clears it.
+    internal.min_parental_rating =
+        official_rating_score(&state, query.min_official_rating.as_deref());
+    internal.max_parental_rating =
+        official_rating_score(&state, query.max_official_rating.as_deref());
+    resolve_name_filters(&state, &query, &mut internal).await?;
     // C# `ItemsController.GetItems` (ItemsController.cs:307, 525-529) answers a
     // non-recursive, id-less request whose parent resolves to the
     // `UserRootFolder` with `folder.GetChildren(user, true)` — not with a query.
@@ -562,7 +609,6 @@ async fn get_items(
     {
         internal.collapse_box_set_items = Some(false);
     }
-    order_search_by_sort_name(&mut internal);
     apply_media_stream_filter_rules(&mut internal);
     // `IsVirtualItem` is driven ONLY by these two parameters on this route
     // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
@@ -598,6 +644,10 @@ async fn get_items(
     // these rewrites on the folder that results.
     list_playlists_folder_as_playlists(&mut internal);
     apply_library_browse_defaults(&mut internal, library, query.recursive);
+    // The default order sees the final query: the resolved `artists` names and
+    // the rewritten types. The search order then leads with `SortName`.
+    apply_albums_by_artist_order(&mut internal);
+    order_search_by_sort_name(&mut internal);
     // `|| query.HasFilters` (v12.2 ItemsController.cs:592) with
     // `UserRootFolder.GetItemsInternal` (UserRootFolder.cs:77): at the user
     // root only an unfiltered request is the plain listing of the user's
@@ -724,6 +774,25 @@ fn apply_library_browse_defaults(
     }
 }
 
+/// "Apply default sorting if none requested" (v12.2 ItemsController.cs:579-586):
+/// an artist's albums, asked for with no `sortBy`, come newest first, then by
+/// name. `sortBy=Default` is a requested sort and keeps its own order. With an
+/// order set, an explicit-ids page keeps it rather than the requested id order
+/// ([`sort_items_by_request`]), as upstream's `Folder.GetItems` does.
+fn apply_albums_by_artist_order(internal: &mut InternalItemsQuery) {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    if internal.order_by.is_empty()
+        && !internal.artist_ids.is_empty()
+        && internal.include_item_types == [BaseItemKind::MusicAlbum]
+    {
+        internal.order_by = vec![
+            (ItemSortBy::ProductionYear, SortOrder::Descending),
+            (ItemSortBy::SortName, SortOrder::Ascending),
+        ];
+    }
+}
+
 /// Leads a searched query's sort keys with `SortName` ascending.
 ///
 /// v12.2 `ItemsController.GetItems` (ItemsController.cs:596-600) orders a
@@ -770,6 +839,44 @@ pub(crate) fn sort_items_by_request(query: &InternalItemsQuery, items: &mut [Bas
             .ok()
             .and_then(|id| ferrofin_util::read_only_list_extension::index_of(&query.item_ids, &id))
     });
+}
+
+/// The name filters replace their id lists (v12.2 ItemsController.cs:527-577):
+/// `artists` replaces `artistIds`, `albums` replaces `albumIds` and `studios`
+/// replaces `studioIds`. They resolve without writing a row, so an unknown name
+/// matches nothing; an absent or blank list leaves the id list as it is.
+async fn resolve_name_filters(
+    state: &AppState,
+    query: &ItemsQuery,
+    internal: &mut InternalItemsQuery,
+) -> Result<(), ApiError> {
+    use super::by_name::{resolve_album_ids, resolve_by_name_ids};
+    if let Some(ids) =
+        resolve_by_name_ids(state, BaseItemKind::MusicArtist, query.artists.as_deref()).await?
+    {
+        internal.artist_ids = ids;
+    }
+    if let Some(ids) = resolve_album_ids(state, query.albums.as_deref()).await? {
+        internal.album_ids = ids;
+    }
+    if let Some(ids) =
+        resolve_by_name_ids(state, BaseItemKind::Studio, query.studios.as_deref()).await?
+    {
+        internal.studio_ids = ids;
+    }
+    Ok(())
+}
+
+/// An official rating parameter as a parental-rating score:
+/// `!string.IsNullOrWhiteSpace(rating) ? _localization.GetRatingScore(rating)`
+/// with no country code, so `None` for a blank or unrecognized rating.
+fn official_rating_score(
+    state: &AppState,
+    rating: Option<&str>,
+) -> Option<ferrofin_model::entities_media::ParentalRatingScore> {
+    rating
+        .filter(|rating| !rating.trim().is_empty())
+        .and_then(|rating| state.localization.get_rating_score(rating, None))
 }
 
 /// Convert HTTP query fields once, retaining the resolved user for DTO projection.
@@ -829,6 +936,10 @@ fn items_query_options(
         has_tmdb_id: query.has_tmdb_id,
         has_tvdb_id: query.has_tvdb_id,
         has_parental_rating: query.has_parental_rating,
+        has_official_rating: query.has_official_rating,
+        series_statuses: parse_csv_enums_lenient(query.series_status.as_deref()),
+        person_types: parse_csv_strings(query.person_types.as_deref()),
+        is_place_holder: query.is_place_holder,
         video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
         has_subtitles: query.has_subtitles,
         has_trailer: query.has_trailer,
@@ -2156,6 +2267,11 @@ crate::query::query_parameters! {
         "enableImageTypes" => ',',
         "audioLanguages" => ',',
         "subtitleLanguages" => ',',
+        "seriesStatus" => ',',
+        "personTypes" => ',',
+        "albums" => '|',
+        "artists" => '|',
+        "studios" => '|',
     } => [("get", "/Items")];
     ItemQuery {} => [("get", "/Items/{itemId}")];
     DeleteItemsQuery {
@@ -2278,17 +2394,7 @@ mod tests {
     /// does not bind yet. Each is an open port from `ItemsController.GetItems`
     /// — bind it, honour it, and delete it here; the guard below fails on a
     /// stale entry, so this list can only shrink.
-    const UNBOUND_ITEMS_PARAMETERS: &[&str] = &[
-        "albums",
-        "artists",
-        "hasOfficialRating",
-        "isPlaceHolder",
-        "maxOfficialRating",
-        "minOfficialRating",
-        "personTypes",
-        "seriesStatus",
-        "studios",
-    ];
+    const UNBOUND_ITEMS_PARAMETERS: &[&str] = &[];
 
     /// Every `GET /Items` parameter in the vendored contracts — 10.11.8, the
     /// route gate's pin, and 12.1.0, the newest vendored Jellyfin spec (whose additions,
@@ -2567,6 +2673,43 @@ mod tests {
         let resume: ResumeQuery =
             serde_urlencoded::from_str("excludeActiveSessions=true").expect("parses");
         assert_eq!(resume.exclude_active_sessions, Some(true));
+    }
+
+    /// The albums-by-artist default is a sort, so an explicit-ids page of
+    /// that shape keeps the repository's year order (v12.2 Folder.cs:1072-1080
+    /// reorders by id only with no `OrderBy`).
+    #[test]
+    fn an_albums_by_artist_default_order_keeps_an_ids_page_in_that_order() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        let (a, b) = (Uuid::from_u128(0xA), Uuid::from_u128(0xB));
+        let mut query = InternalItemsQuery {
+            item_ids: vec![a, b],
+            artist_ids: vec![Uuid::from_u128(0xA7)],
+            include_item_types: vec![BaseItemKind::MusicAlbum],
+            ..InternalItemsQuery::default()
+        };
+        apply_albums_by_artist_order(&mut query);
+        assert_eq!(
+            query.order_by,
+            [
+                (ItemSortBy::ProductionYear, SortOrder::Descending),
+                (ItemSortBy::SortName, SortOrder::Ascending),
+            ]
+        );
+        let mut rows: Vec<BaseItemEntity> = [b, a]
+            .into_iter()
+            .map(|id| BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(id),
+                ..BaseItemEntity::default()
+            })
+            .collect();
+        sort_items_by_request(&query, &mut rows);
+        assert_eq!(
+            rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+            [b, a].map(ferrofin_db::store::guid_to_db),
+            "the repository's year order stands"
+        );
     }
 
     /// `SortItemsByRequest` (v12.2 Folder.cs:1065-1083): an unsorted request

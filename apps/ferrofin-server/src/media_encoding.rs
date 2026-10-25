@@ -504,16 +504,17 @@ impl SubtitleIo for FfmpegSubtitleIo {
     }
 }
 
-/// A subtitle extraction ffmpeg that has not exited on its own yet.
+/// A subtitle or attachment extraction ffmpeg that has not exited on its own
+/// yet.
 ///
-/// Port of upstream's cancellation path: the request's cancellation token and
-/// the timeout share one linked token, and either one kills the process
-/// (`Kill(true)`, exit code `-1`) and deletes every output it was writing
-/// (`ExtractSubtitlesForFile`). Here both cases are a drop before
-/// `finished` is set — the timeout returns early, and a cancelled request drops
-/// the future awaiting it. Without the deletion, a file cut off mid-write would
-/// stay in the subtitle cache and be served on every later request, because
-/// extraction skips any output that already exists.
+/// Port of upstream's cancellation path: the request's cancellation token (and,
+/// for a subtitle, the timeout linked to it) kills the process (`Kill(true)`,
+/// exit code `-1`) and deletes every output it was writing
+/// (`ExtractSubtitlesForFile`, `AttachmentExtractor`'s failure path). Here both
+/// cases are a drop before `finished` is set — the timeout returns early, and a
+/// cancelled request drops the future awaiting it. Without the deletion, a file
+/// cut off mid-write would stay in the cache and be served on every later
+/// request, because extraction skips any output that already exists.
 struct RunningExtraction<'a> {
     child: tokio::process::Child,
     output_paths: &'a [String],
@@ -527,14 +528,14 @@ impl Drop for RunningExtraction<'_> {
         }
         // Kill first, so ffmpeg can't keep writing once its outputs are gone.
         if let Err(error) = self.child.start_kill() {
-            tracing::debug!(%error, "the interrupted subtitle extraction had already exited");
+            tracing::debug!(%error, "the interrupted ffmpeg extraction had already exited");
         }
         for path in self.output_paths {
             match std::fs::remove_file(path) {
-                Ok(()) => tracing::debug!(path, "deleted an interrupted subtitle extraction"),
+                Ok(()) => tracing::debug!(path, "deleted an interrupted extraction output"),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    tracing::error!(%error, path, "deleting an interrupted subtitle extraction failed");
+                    tracing::error!(%error, path, "deleting an interrupted ffmpeg extraction's output failed");
                 }
             }
         }
@@ -685,6 +686,7 @@ impl AttachmentIo for FfmpegAttachmentIo {
         ffmpeg_path: &str,
         args: &str,
         working_dir: Option<&str>,
+        outputs: &[String],
     ) -> Result<i32, String> {
         // `args` is a pre-built ffmpeg command line (a single space-joined
         // string, matching the C# `arguments` string), split with the same
@@ -694,14 +696,28 @@ impl AttachmentIo for FfmpegAttachmentIo {
         if let Some(dir) = working_dir {
             command.current_dir(dir);
         }
-        let status = command
+        let child = command
             .args(&parts)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .status()
-            .await
+            .kill_on_drop(true)
+            .spawn()
             .map_err(|e| format!("spawn ffmpeg {ffmpeg_path}: {e}"))?;
+        // Until ffmpeg exits on its own, a cancelled request (its future
+        // dropped) kills it and deletes `outputs`. Upstream has no timeout
+        // here, only the cancellation (owner decision 2026-10-25).
+        let mut running = RunningExtraction {
+            child,
+            output_paths: outputs,
+            finished: false,
+        };
+        let status = running
+            .child
+            .wait()
+            .await
+            .map_err(|e| format!("wait for ffmpeg {ffmpeg_path}: {e}"))?;
+        running.finished = true;
         Ok(status.code().unwrap_or(-1))
     }
 }
@@ -1840,6 +1856,89 @@ mod tests {
         assert!(killed, "ffmpeg {pid} kept running after the cancellation");
     }
 
+    /// Dropping the request future mid-dump (a client giving up on a font)
+    /// kills ffmpeg and deletes the attachment it was writing, as upstream's
+    /// cancellation does (`Kill(true)`, then the failure path's delete), so a
+    /// truncated font is never served from the attachment cache.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_cancelled_attachment_extraction_kills_ffmpeg_and_deletes_its_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let output = tmp.path().join("font.ttf").to_string_lossy().into_owned();
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            &format!(
+                "printf partial > \"{output}\"; \
+                 echo $$ > \"{pid}.tmp\"; mv \"{pid}.tmp\" \"{pid}\"; exec sleep infinity",
+                pid = pid_file.display()
+            ),
+        );
+        let io = FfmpegAttachmentIo {
+            path_manager: Arc::new(FakePathManager {
+                root: tmp.path().to_string_lossy().into_owned(),
+            }),
+        };
+        let args = format!("-dump_attachment:3 \"{output}\" -i in.mkv -t 0 -f null null");
+        let outputs = [output.clone()];
+        // Boxed, not stack-pinned: `drop` must drop the future itself.
+        let mut dump = Box::pin(io.run_ffmpeg(&ffmpeg, &args, None, &outputs));
+
+        let mut started = false;
+        for _ in 0..CANCEL_POLL_ATTEMPTS {
+            tokio::select! {
+                result = &mut dump => panic!("the dump ended early: {result:?}"),
+                () = tokio::time::sleep(CANCEL_POLL) => {}
+            }
+            if pid_file.is_file() {
+                started = true;
+                break;
+            }
+        }
+        assert!(started, "the stand-in ffmpeg never started");
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(std::path::Path::new(&output).is_file());
+
+        // The request is cancelled.
+        drop(dump);
+
+        assert!(!std::path::Path::new(&output).exists());
+        let mut killed = false;
+        for _ in 0..CANCEL_POLL_ATTEMPTS {
+            if process_has_exited(&pid) {
+                killed = true;
+                break;
+            }
+            tokio::time::sleep(CANCEL_POLL).await;
+        }
+        assert!(killed, "ffmpeg {pid} kept running after the cancellation");
+    }
+
+    /// A dump that runs to its end keeps what it wrote, whatever its exit code:
+    /// deleting a failed run's outputs is the extractor's job.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_finished_attachment_extraction_keeps_its_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("font.ttf").to_string_lossy().into_owned();
+        let ffmpeg = fake_ffmpeg(tmp.path(), &format!("printf font > \"{output}\"; exit 1"));
+        let io = FfmpegAttachmentIo {
+            path_manager: Arc::new(FakePathManager {
+                root: tmp.path().to_string_lossy().into_owned(),
+            }),
+        };
+        let outputs = [output.clone()];
+        let code = io
+            .run_ffmpeg(&ffmpeg, "-i in.mkv", None, &outputs)
+            .await
+            .unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "font");
+    }
+
     #[tokio::test]
     async fn ffmpeg_attachment_io_paths_and_fs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1899,7 +1998,7 @@ mod tests {
             ferrofin_mediaencoding::encoder::quote("/cache/att/font.ttf"),
             ferrofin_mediaencoding::encoder::get_input_argument("file", media, MediaProtocol::File),
         );
-        assert_eq!(io.run_ffmpeg(&ffmpeg, &args, None).await.unwrap(), 0);
+        assert_eq!(io.run_ffmpeg(&ffmpeg, &args, None, &[]).await.unwrap(), 0);
         let recorded = std::fs::read_to_string(&record).unwrap();
         assert_eq!(
             recorded.lines().collect::<Vec<_>>(),
@@ -1917,7 +2016,7 @@ mod tests {
         );
         // Unbalanced quoting is refused rather than guessed at.
         assert!(
-            io.run_ffmpeg(&ffmpeg, r#"-i "unterminated"#, None)
+            io.run_ffmpeg(&ffmpeg, r#"-i "unterminated"#, None, &[])
                 .await
                 .is_err()
         );

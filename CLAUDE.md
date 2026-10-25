@@ -197,7 +197,8 @@ cargo build --workspace
 
 # Run the server. Config via flags, FERROFIN_* env, or {data_dir}/config.toml.
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
-#   On a fresh database it seeds an admin user and logs a generated password — record it.
+#   On a fresh database it seeds a passwordless admin user (the /web wizard sets the
+#   password; FERROFIN_ADMIN_PASSWORD seeds one).
 #   ffmpeg/ffprobe are auto-discovered ($PATH or --ffmpeg); absent ffmpeg only disables transcode.
 ```
 

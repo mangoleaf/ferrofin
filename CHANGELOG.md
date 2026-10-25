@@ -24,6 +24,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
 
 ### Tooling
+- `gates/parity/filed.toml` records the two differences of the 2026-10-24 replay that have an open
+  issue and no ledger entry (the HLS video segment's timestamps, the live HLS segment names); the
+  run's other groups are accepted by the ledger, gone under the current comparison, fixed since,
+  or came from the replay's older harness
+- The item repository's query translates eleven filter fields it used to ignore (trailer types,
+  chapter images, the provider-id maps, dead parents, box-set library folders and the four "has
+  no track in this language" filters), each with Jellyfin's alternate-version and folder roll-up
+  where it has one; no route sets them yet. A test now fails when a query field is read nowhere
 - The four live checks moved under `gates/`: `bench/` → `gates/bench/`, `adoption/` →
   `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. Every gate
   takes its directories from one output root, `FERROFIN_GATES_DIR` (absolute, on a local
@@ -94,6 +102,22 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Refuse a `POST /Users/{userId}/Policy` body that leaves out `AuthenticationProviderId` or
   `PasswordResetProviderId`, or sends either blank, with Jellyfin's `400` naming each missing
   member, instead of saving the user's providers as empty strings
+- `GET /Items` honours `seriesStatus` (jellyfin-web's TV Status filter), `minOfficialRating`,
+  `maxOfficialRating`, `personTypes`, `isPlaceHolder` and `hasOfficialRating`, and
+  `hasParentalRating=false` returns only the unrated items, as Jellyfin 12.2's `TranslateQuery`
+  does; each used to be ignored. A folder (a series, season or box set) counts as
+  rated, or as a placeholder, when an item below it or linked to it is. `maxOfficialRating` can
+  lower a restricted user's parental limit but never raise it: Jellyfin lets the request replace
+  the limit, and an unrecognized rating clears it there
+- `GET /Items` resolves its `studios`, `artists` and `albums` name filters, which replace
+  `studioIds`, `artistIds` and `albumIds` as in Jellyfin. Unlike Jellyfin, the lookup writes no
+  row; an unknown name matches nothing (Jellyfin answers the whole library for an unknown album)
+- On `GET /Items`, an artist's albums listed with no `sortBy` (`artistIds` or `artists`, with
+  `MusicAlbum` as the only `includeItemTypes`) come newest first, then by name, Jellyfin's default
+  for that request
+- `nameStartsWith` on `/Genres`, `/MusicGenres`, `/Studios`, `/Artists` and
+  `/Artists/AlbumArtists` is a literal prefix of the sort name, as on `/Items`: `%` and `_` match
+  only themselves, and a leading space is kept
 - Port Jellyfin's Screen Grabber (`VideoImageProvider`): a movie, episode, music video or
   home video with no Primary image after the local, remote and embedded providers gets a
   frame from its default video stream, 10 % into its runtime (10 s when the runtime is
@@ -417,6 +441,20 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   in Jellyfin; it took them from the last. The metadata language and country of an item in
   nested libraries now come from the innermost one, and `GET /Items/{itemId}/Ancestors`
   names the first library by sort name when two list the same folder
+- Library tiles are drawn as in Jellyfin 12.2. An image at the root of a library's media
+  folder (a `folder.jpg` in `/media/movies`) becomes the library's image, after one in the
+  library's own folder. A music library's collage comes from the artists its tracks credit,
+  not its albums, and every collage samples 8 items that have a Primary image; a library
+  whose items have none keeps the icon tile, where Ferrofin drew from any item. A library's
+  or the root's first refresh at the default mode, or one past the library's automatic
+  refresh interval, redraws the tile or the root's image, and the library and the root now
+  record their last refresh
+- Library renames and media-path removals compare paths as Jellyfin does, ignoring the case
+  of every letter, not only ASCII: on a case-insensitive file system, renaming `élan` to
+  `Élan` works instead of answering `409`, and the users' library preferences follow a
+  library whose stored path differs in a non-ASCII letter's case. Users' library and view
+  preferences are read as .NET parses a GUID: a padded or `(…)` value counts, a
+  `urn:uuid:` one does not
 
 ### Performance
 - `/Persons` with a favourite filter: build the user's favourite-person set once per
@@ -723,6 +761,34 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - The Merge Versions plugin's bulk merges and splits run one at a time, whether a route or a
   daily task starts them: a merge and a split started together interleaved their version-link
   writes
+- Renaming a library to its own name, or changing only its case while item ids ignore case,
+  keeps the library's database row. It was deleted and created again, which reset the
+  library's date added, dropped its images and left its items without the library above
+  them until the next scan
+- A transcode whose first segment takes longer than the idle timeout (60 s for HLS, 10 s
+  progressive), such as a cold 4K software encode or a slow tuner, is no longer killed by the
+  idle reaper while it starts. A transcode killed while it starts, by a stop request say, ends
+  its request at once instead of after three minutes
+- Playing a `.strm` shortcut, or an item with no main stream, refreshes it as an item refresh
+  queued with the library scans, as in Jellyfin. It no longer runs a scan of its own beside a
+  library scan, and a shortcut whose file is gone is no longer deleted while it is played
+- Two refreshes of one item's trickplay at once (a scan's and the daily task's, say) generate
+  its tiles once, and one no longer deletes a tile folder the other has just moved in
+- When the kernel's inotify queue overflows during a bulk import, the watched libraries are
+  rescanned, and a warning names the `fs.inotify.max_queued_events` sysctl to raise. The
+  missed changes used to stay out of the library, silently, until the next scheduled scan
+- A library change while the watches are still being set up at boot no longer leaves that
+  setup watching the libraries it had read, a removed one included, until the next restart.
+  An in-process restart stops the setup
+- Closing a stream from a legacy (pre-vchannel) HDHomeRun releases its tuner. Every close left
+  one tuner locked, and after as many closes as the device has tuners every open failed with
+  "No tuners available" until the device dropped the locks
+- An attachment or font extraction cancelled by a disconnecting client stops its ffmpeg, and
+  deletes the half-written files the cache would otherwise have served. A batch font dump,
+  whose files the media names, leaves what it wrote, as in Jellyfin
+- The README said a fresh install logs a generated admin password. It seeds the admin with
+  no password, as Jellyfin does: the setup wizard at `/web` sets it, or
+  `FERROFIN_ADMIN_PASSWORD` seeds one
 
 ## [1.0.0] - 2026-09-05
 

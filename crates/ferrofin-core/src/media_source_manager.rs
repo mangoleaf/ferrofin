@@ -18,7 +18,7 @@
 
 use ferrofin_model::configuration::{PathSubstitution, path_after_network_substitution};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use ferrofin_db::entities::base_items::{
@@ -31,13 +31,13 @@ use ferrofin_model::media_info::{LiveStreamRequest, MediaProtocol};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::MediaSourceManager;
+use ferrofin_traits::library::{LibraryManager, MediaSourceManager, ScanTarget};
 use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::persistence::{
     ItemRepository, MediaAttachmentQuery, MediaAttachmentRepository, MediaStreamQuery,
     MediaStreamRepository,
 };
-use ferrofin_traits::providers::ProviderManager;
+use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions, ProviderManager};
 
 use crate::db_error::media_stream_type_from_disc;
 
@@ -688,6 +688,39 @@ pub type RemoteProbe = Arc<
         + Send
         + Sync,
 >;
+
+/// The [`RemoteProbe`] the server wires: `GetPlaybackMediaSources`'
+/// `item.RefreshMetadata(FullRefresh, EnableRemoteContentProbe)` of the one
+/// file (`MediaSourceManager.cs:182-194`), as `library`'s item refresh
+/// ([`LibraryManager::run_refresh_scan`] over [`ScanTarget::Items`]).
+///
+/// The item-refresh lane runs inside a running scan between two of its items,
+/// never beside it, as every scan writer relies on; and an item refresh removes
+/// nothing, so a shortcut whose file is gone is left to the next scan, as
+/// upstream's single-item refresh leaves it. The library manager is held
+/// weakly: the media source manager never keeps it alive.
+#[must_use]
+pub fn item_refresh_remote_probe(library: Weak<dyn LibraryManager>) -> RemoteProbe {
+    Arc::new(move |path: String| {
+        let library = library.clone();
+        Box::pin(async move {
+            let Some(library) = library.upgrade() else {
+                return Err(ServiceError::backend(
+                    "the library manager has shut down; nothing can refresh the item",
+                ));
+            };
+            let options = MetadataRefreshOptions {
+                metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+                enable_remote_content_probe: true,
+                ..MetadataRefreshOptions::default()
+            };
+            library
+                .run_refresh_scan(ScanTarget::Items(vec![path]), &options)
+                .await
+                .map(|_| ())
+        })
+    })
+}
 
 /// The C# type name whose MD5 prefixes every Live TV `OpenToken` and
 /// `LiveStreamId`.

@@ -22,6 +22,23 @@ a sign-in restores `AuthenticationProviderId`; set `PasswordResetProviderId` (no
 `Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider`) with a
 `POST /Users/{userId}/Policy` that carries the user's full policy.
 
+## Unreleased — library tiles are drawn as Jellyfin 12.2 draws them
+
+Nothing to do. Some "My Media" tiles change on their next refresh:
+- **A library with artwork at the root of its media folder shows it.** A `folder.jpg`,
+  `poster.jpg` or similar in, say, `/media/movies` replaces the generated collage, as in
+  Jellyfin. Only the media folder's root is read, not its subfolders. An image in the
+  library's own folder (where an upload is saved) still wins.
+  Remove the file from the media folder to get the collage back.
+- **Music tiles come from artists.** A music library's collage samples the artists its
+  tracks credit that have an image, not its albums.
+- **Collages sample items that have a Primary image.** A library whose items have no
+  Primary image keeps the icon tile, where Ferrofin used to draw from any item's artwork.
+- **Each library tile and the root's image are redrawn once.** A library or root row
+  written by an earlier Ferrofin has never recorded a refresh, so its next refresh at the
+  default mode counts as its first and redraws the image past the 7-day gate, as Jellyfin
+  does for an item's first refresh.
+
 ## Unreleased — the Screen Grabber, and HDR chapter images
 
 Usually nothing to do. Three changes can show:

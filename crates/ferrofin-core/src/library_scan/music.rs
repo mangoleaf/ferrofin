@@ -481,7 +481,7 @@ const ARTIST_FACTS: FileFacts = FileFacts {
 };
 
 /// The decision state of a stored row.
-fn stored_state(row: &BaseItemEntity) -> StoredState {
+pub(super) fn stored_state(row: &BaseItemEntity) -> StoredState {
     StoredState {
         date_last_refreshed: row.date_last_refreshed,
         date_last_saved: row.date_last_saved,

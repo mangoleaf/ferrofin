@@ -19,7 +19,9 @@ pub mod configuration;
 pub mod encoder;
 pub mod encoding_helper;
 pub mod error;
-pub mod keyed_locks;
+// `KeyedLocks` lives in `ferrofin-util`, which `ferrofin-core` shares; the
+// ffmpeg paths here and in `ferrofin-hls` keep naming it at this path.
+pub use ferrofin_util::keyed_locks;
 pub mod probing;
 pub mod subtitles;
 pub mod transcoding;
