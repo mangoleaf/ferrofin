@@ -1754,13 +1754,127 @@ pub fn scale_filter(
 }
 
 /// Whether an external subtitle must be muxed as a second FFmpeg input. Port of
-/// `NeedsExternalSubtitleMuxing`.
-fn needs_external_subtitle_muxing(state: &EncodingJobInfo) -> bool {
+/// `NeedsExternalSubtitleMuxing`: an embedded external track, or a burned-in
+/// graphical one (a burned-in text file is read by the `subtitles` filter).
+#[must_use]
+pub fn needs_external_subtitle_muxing(state: &EncodingJobInfo) -> bool {
     state.subtitle_stream.as_ref().is_some_and(|sub| {
         sub.is_external
             && (state.subtitle_delivery_method == SubtitleDeliveryMethod::Embed
                 || (should_encode_subtitle(state) && !sub.is_text_subtitle_stream()))
     })
+}
+
+/// The first ffmpeg with the `-isync` input option, which offsets an input's
+/// timestamps onto another input's clock. Introduced in FFmpeg 5.1.
+const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
+
+/// The inputs that follow the media file on the command line, as argv tokens:
+/// the external subtitle [`needs_external_subtitle_muxing`] names (input 1),
+/// then an external audio track (input 1, or 2 after a subtitle). Port of the
+/// tail of `GetInputArgument`, which [`EncodingHelper::map_args`] and the
+/// overlay pads count on.
+///
+/// `fast_seek` is the media file's own `-ss` value, if it seeks: every input
+/// is seeked alike, so the tracks stay in step with the video. A subtitle
+/// input reads with the media file's `-analyzeduration` and `-probesize`, and
+/// a burned-in graphical one with its canvas size. A VobSub `.sub` is read
+/// through its `.idx` when one lies beside it, since the `.idx` names the
+/// `.sub` and carries the palette and timing.
+///
+/// Divergence: each external input is also synced to the media file's clock
+/// (`-isync 0`, from ffmpeg 5.1, `ffmpeg_version`). Without `-copyts` ffmpeg
+/// starts every input's timeline at that input's own first packet, and a
+/// bitmap subtitle file's first packet is its first cue, so a `.sup` whose
+/// first subtitle is at 60 s would show it at once. Upstream's HLS copies
+/// timestamps, which keeps the files on one clock; Ferrofin restarts ffmpeg
+/// per segment without `-copyts`, so it syncs the inputs instead (which also
+/// times an embedded sidecar right, where upstream's progressive command,
+/// without `-copyts`, shifts it).
+///
+/// Second divergence, where the sync is available: a burned-in sidecar is not
+/// seeked but read from its start, and the overlay draws each bitmap at its
+/// own time and drops those already over. Seeked and synced, ffmpeg (9.0.1,
+/// measured) decodes the bitmaps but never draws them. A subtitle on screen
+/// at the seek point is then drawn too, which a seek would skip.
+///
+/// TODO(gl-929): an ffmpeg older than 5.1, or one whose version cannot be
+/// read (it counts as the oldest supported, as for every version gate), gets
+/// upstream's unsynced form, so a bitmap sidecar there is still early by its
+/// first cue's time. Fix path: offset it by its probed start time.
+/// TODO(gl-930): an embedded `.srt` seeked into a progressive stream that
+/// starts mid-file can keep a cue from before the start, whose negative
+/// timestamp the muxer answers by shifting every stream.
+#[must_use]
+pub fn external_stream_input_arguments(
+    state: &EncodingJobInfo,
+    fast_seek: Option<&str>,
+    ffmpeg_version: Option<FfmpegVersion>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    let can_sync = ffmpeg_version.is_some_and(|version| version >= MIN_FFMPEG_INPUT_SYNC);
+    let seek = |args: &mut Vec<String>| {
+        if let Some(time) = fast_seek {
+            args.extend(["-ss".to_owned(), time.to_owned()]);
+        }
+    };
+    let sync = |args: &mut Vec<String>| {
+        if can_sync {
+            args.extend(["-isync".to_owned(), "0".to_owned()]);
+        }
+    };
+    if let Some(sub) = state
+        .subtitle_stream
+        .as_ref()
+        .filter(|_| needs_external_subtitle_muxing(state))
+    {
+        // An external stream always has a path. Were one missing, the input
+        // still has to be there: the maps and pads number the inputs after
+        // it, and ffmpeg then names the empty path in its error.
+        let mut path = sub.path.clone().unwrap_or_default();
+        let as_path = std::path::Path::new(&path);
+        if as_path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sub"))
+        {
+            let idx = as_path.with_extension("idx");
+            if idx.is_file() {
+                path = idx.to_string_lossy().into_owned();
+            }
+        }
+        args.extend([
+            "-analyzeduration".to_owned(),
+            crate::encoder::media_encoder::analyze_duration_value(
+                state.media_source.analyze_duration_ms,
+                crate::encoder::media_encoder::DEFAULT_ANALYZE_DURATION,
+            ),
+            "-probesize".to_owned(),
+            crate::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
+        ]);
+        let burned_in = should_encode_subtitle(state) && !sub.is_text_subtitle_stream();
+        if !(burned_in && can_sync) {
+            seek(&mut args);
+        }
+        if burned_in {
+            args.extend(
+                super::hw::input_args::graphical_sub_canvas_size(Some(sub), true)
+                    .split_whitespace()
+                    .map(str::to_owned),
+            );
+        }
+        sync(&mut args);
+        args.extend(["-i".to_owned(), format!("file:{path}")]);
+    }
+    if let Some(audio) = state
+        .audio_stream
+        .as_ref()
+        .filter(|audio| audio.is_external)
+    {
+        seek(&mut args);
+        sync(&mut args);
+        args.extend(["-i".to_owned(), audio.path.clone().unwrap_or_default()]);
+    }
+    args
 }
 
 /// The score (ascending-quality index) of a profile for a codec. Port of
