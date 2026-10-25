@@ -8065,6 +8065,31 @@ mod tests {
         );
     }
 
+    /// `TunerHostManager.DeleteTunerHost` queues a guide refresh, and that
+    /// refresh's `CleanDatabase` passes remove the host's channel and programme
+    /// items, the last host's included: the refresh has no early return for an
+    /// empty tuner list. The programme items are what this adds to
+    /// `an_empty_lineup_cleans_every_channel_item`: they belong to a listings
+    /// provider that is still configured.
+    #[tokio::test]
+    async fn a_refresh_after_the_last_tuner_is_deleted_removes_its_items() {
+        let lab = item_lab(M3U, Some(dated(XMLTV))).await;
+        let mgr = &lab.mgr;
+        mgr.refresh_guide().await.expect("refresh");
+        assert_eq!(stored_channel_items(mgr).await.len(), 2);
+        assert!(!stored_program_items(mgr).await.is_empty());
+
+        mgr.delete_tuner_host(lab.tuner.id.as_deref().expect("tuner id"))
+            .await
+            .expect("delete");
+        // The delete leaves the items to the refresh, as upstream's does.
+        assert_eq!(stored_channel_items(mgr).await.len(), 2);
+        assert!(!stored_program_items(mgr).await.is_empty());
+        mgr.refresh_guide().await.expect("refresh after the delete");
+        assert!(stored_channel_items(mgr).await.is_empty());
+        assert!(stored_program_items(mgr).await.is_empty());
+    }
+
     /// A channel that left the lineup and comes back gets its users' data
     /// back. `CleanDatabase` deleted its item, which parked the rows on the
     /// deletion placeholder. Upstream's first refresh of the recreated item
