@@ -698,6 +698,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   (`0600`). A state file that cannot be read or parsed is kept as `state.json.corrupt` and
   logged at error level instead of being silently replaced, along with the enabled switches
   and the record of installed versions it held
+- File Transformation: a callback endpoint that fails (an error status, a timeout, a refused
+  connection) logs one warning, then logs at debug level until it works again. It logged two
+  warnings on every matching `/web` request for as long as it stayed down
 
 ## [1.0.0] - 2026-09-05
 

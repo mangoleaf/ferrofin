@@ -24,7 +24,8 @@
 //! (both are .NET-process-specific; compiled-in extensions register natively
 //! through the [`FileTransformationService`] trait instead).
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -258,6 +259,11 @@ pub struct WebFileTransformationService {
     /// plugin's `new HttpClient()` keeps .NET's default `Timeout`
     /// ([`HTTP_CLIENT_DEFAULT_TIMEOUT`]; a test shortens it).
     endpoint_timeout: Duration,
+    /// The registrations, by `(id, pattern)`, whose last callback failed.
+    /// The pipeline runs on every matching `/web` request, so a failure
+    /// warns the first time and logs at `debug` while it repeats; a success,
+    /// or removing the registration, clears it.
+    failing: Mutex<HashSet<(Uuid, String)>>,
 }
 
 impl WebFileTransformationService {
@@ -272,6 +278,7 @@ impl WebFileTransformationService {
             local_api,
             http: reqwest::Client::new(),
             endpoint_timeout: HTTP_CLIENT_DEFAULT_TIMEOUT,
+            failing: Mutex::default(),
         }
     }
 
@@ -309,11 +316,12 @@ impl WebFileTransformationService {
     }
 
     /// Invokes an HTTP-callback endpoint with `contents`, returning the
-    /// response body, or `None` (leaving the contents unchanged) on any
-    /// failure. Port of the endpoint branch of
+    /// response body, or why it failed (the caller leaves the contents
+    /// unchanged). Port of the endpoint branch of
     /// `TransformationHelper.ApplyTransformation`.
     ///
     /// A relative endpoint is a path on this server. The plugin sends it to
+    /// the server's `PublishedServerUrl` when one is set, else to
     /// `http://localhost:{HttpPort}`; Ferrofin resolves it against the local
     /// access URL over HTTP instead, which carries the base URL (without it
     /// the request is redirected to the web client) and reaches a listener
@@ -321,17 +329,16 @@ impl WebFileTransformationService {
     /// server's own certificate need not be one this client trusts. With
     /// Require HTTPS on, the callback is redirected to HTTPS like any request,
     /// as the plugin's is.
-    async fn call_endpoint(&self, endpoint: &str, contents: &str) -> Option<String> {
+    async fn call_endpoint(&self, endpoint: &str, contents: &str) -> Result<String, String> {
         let url = if endpoint.starts_with("http") {
             endpoint.to_owned()
         } else {
-            match self.local_api.get_http_api_url_for_local_access().await {
-                Ok(base) => format!("{base}/{}", endpoint.trim_start_matches('/')),
-                Err(e) => {
-                    tracing::warn!(endpoint, error = %e, "transformation endpoint has no local api url");
-                    return None;
-                }
-            }
+            let base = self
+                .local_api
+                .get_http_api_url_for_local_access()
+                .await
+                .map_err(|e| format!("no local api url: {e}"))?;
+            format!("{base}/{}", endpoint.trim_start_matches('/'))
         };
         // `PostAsync` reads the whole response before it returns, so the
         // plugin's `HttpClient.Timeout` bounds the body read too.
@@ -343,27 +350,47 @@ impl WebFileTransformationService {
             .send()
             .await;
         match response {
-            // `if (!response.IsSuccessStatusCode) return;`: an error answer's
-            // body never replaces the file.
+            // The plugin writes the body whatever the status; an error
+            // answer's body never replaces the file here (a plugin bug, not
+            // ported).
             Ok(resp) if !resp.status().is_success() => {
-                tracing::warn!(
-                    url,
-                    status = resp.status().as_u16(),
-                    "transformation endpoint answered an error"
-                );
-                None
+                Err(format!("answered {}", resp.status().as_u16()))
             }
-            Ok(resp) => match resp.text().await {
-                Ok(text) => Some(text),
-                Err(e) => {
-                    tracing::warn!(url, error = %e, "transformation endpoint body read failed");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(url, error = %e, "transformation endpoint call failed");
-                None
-            }
+            Ok(resp) => resp
+                .text()
+                .await
+                .map_err(|e| format!("body read failed: {e}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Clears registration `(id, pattern)`'s failure ([`Self::endpoint_failed`]).
+    fn endpoint_worked(&self, id: Uuid, pattern: &str) {
+        let mut failing = self.failing.lock().unwrap_or_else(PoisonError::into_inner);
+        if !failing.is_empty() {
+            failing.remove(&(id, pattern.to_owned()));
+        }
+    }
+
+    /// Logs registration `(id, pattern)`'s callback failure once (LOGGING.md
+    /// §1): a `warn` the first time, `debug` while it repeats, and a `warn`
+    /// again once it has worked in between.
+    fn endpoint_failed(&self, id: Uuid, pattern: &str, endpoint: &str, error: &str) {
+        let first = self
+            .failing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((id, pattern.to_owned()));
+        if first {
+            tracing::warn!(
+                %id,
+                pattern,
+                endpoint,
+                error,
+                "transformation endpoint failed; serving the file unchanged until it works"
+            );
+        } else {
+            tracing::debug!(%id, pattern, endpoint, error, "transformation endpoint failed");
         }
     }
 }
@@ -399,7 +426,7 @@ impl FileTransformationService for WebFileTransformationService {
         // Snapshot the matching registered pipeline steps (in registration
         // order — the upstream per-pattern pipeline), then the admin-defined
         // search/replace steps.
-        let steps: Vec<(Uuid, TransformStep)> = {
+        let steps: Vec<(Uuid, String, TransformStep)> = {
             let regs = self
                 .registrations
                 .read()
@@ -411,23 +438,25 @@ impl FileTransformationService for WebFileTransformationService {
                         TransformKind::Builtin(t) => TransformStep::Builtin(Arc::clone(t)),
                         TransformKind::Endpoint(url) => TransformStep::Endpoint(url.clone()),
                     };
-                    (r.id, step)
+                    (r.id, r.pattern.clone(), step)
                 })
                 .collect()
         };
 
         let mut contents = contents;
-        for (id, step) in steps {
+        for (id, pattern, step) in steps {
             contents = match step {
                 TransformStep::Builtin(t) => t.transform(&path, contents).await,
-                TransformStep::Endpoint(url) => {
-                    if let Some(transformed) = self.call_endpoint(&url, &contents).await {
+                TransformStep::Endpoint(url) => match self.call_endpoint(&url, &contents).await {
+                    Ok(transformed) => {
+                        self.endpoint_worked(id, &pattern);
                         transformed
-                    } else {
-                        tracing::warn!(%id, "transformation left contents unchanged");
+                    }
+                    Err(error) => {
+                        self.endpoint_failed(id, &pattern, &url, &error);
                         contents
                     }
-                }
+                },
             };
         }
 
@@ -496,6 +525,10 @@ impl FileTransformationService for WebFileTransformationService {
             .write()
             .expect("registrations lock poisoned")
             .retain(|r| r.id != id);
+        self.failing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(failed, _)| *failed != id);
     }
 }
 
@@ -906,32 +939,46 @@ mod tests {
         status: &'static str,
         body: &'static str,
     ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        spawn_responder(vec![answer(status, body)])
+    }
+
+    /// A `Content-Length` response with `status` and `body`.
+    fn answer(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A callback endpoint answering its n-th request with the raw response
+    /// `answers[n]` (the last one from then on), recording each request's
+    /// head and body.
+    fn spawn_responder(answers: Vec<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read as _, Write as _};
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&seen);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            for (n, stream) in listener.incoming().enumerate() {
                 let Ok(mut stream) = stream else { break };
                 let mut buf = [0u8; 8192];
-                let n = stream.read(&mut buf).unwrap_or(0);
+                let read = stream.read(&mut buf).unwrap_or(0);
                 log.lock()
                     .expect("lock")
-                    .push(String::from_utf8_lossy(&buf[..n]).into_owned());
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
+                    .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+                let response = &answers[n.min(answers.len() - 1)];
+                let _ = stream.write_all(response.as_bytes());
             }
         });
         (format!("http://{addr}"), seen)
     }
 
-    /// A callback that answers with an error status leaves the file as it was
-    /// (`TransformationHelper`: `if (!response.IsSuccessStatusCode) return;`):
-    /// its error body never replaces a served web file.
+    /// A callback that answers with an error status leaves the file as it
+    /// was: its error body never replaces a served web file. The plugin at
+    /// `f4f01c3` writes the body whatever the status
+    /// (`TransformationHelper.ApplyTransformation`); serving a callback's error
+    /// page as a bundle is a plugin bug, not ported.
     #[tokio::test]
     async fn an_endpoint_error_leaves_the_contents_unchanged() {
         let (base, seen) = spawn_callback("500 Internal Server Error", "oops");
@@ -948,6 +995,76 @@ mod tests {
             seen.lock().expect("lock").len(),
             1,
             "the endpoint was called"
+        );
+    }
+
+    /// An in-memory sink for a scoped `fmt` subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        /// How many lines were logged at `level` (`"WARN"`, `"DEBUG"`).
+        fn count(&self, level: &str) -> usize {
+            String::from_utf8_lossy(&self.0.lock().expect("logs"))
+                .lines()
+                .filter(|line| line.split_whitespace().nth(1) == Some(level))
+                .count()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The pipeline runs on every matching `/web` request, so a callback
+    /// that keeps failing warns once, then logs at `debug` until it has
+    /// worked again; a failure after that warns again.
+    #[tokio::test]
+    async fn a_failing_endpoint_warns_once_until_it_recovers() {
+        let logs = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_env_filter("ferrofin_extensions=debug")
+                .finish(),
+        );
+        let fail = answer("500 Internal Server Error", "oops");
+        let (base, _) = spawn_responder(vec![
+            fail.clone(),
+            fail.clone(),
+            fail.clone(),
+            answer("200 OK", "patched"),
+            fail,
+        ]);
+        let svc = service_with("{}", true);
+        svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", &format!("{base}/cb"))
+            .await;
+        let serve = || svc.run_transformation("main.js", "original".to_owned());
+
+        for _ in 0..3 {
+            serve().await;
+        }
+        assert_eq!((logs.count("WARN"), logs.count("DEBUG")), (1, 2));
+        assert_eq!(serve().await, "patched");
+        serve().await;
+        assert_eq!(
+            (logs.count("WARN"), logs.count("DEBUG")),
+            (2, 2),
+            "a failure after a success warns again"
         );
     }
 

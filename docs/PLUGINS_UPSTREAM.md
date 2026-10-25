@@ -96,6 +96,12 @@ Conventions:
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,
   vendored assets `crates/ferrofin-extensions/assets/filetransformation/`.
+- Accepted divergences:
+  - **A failing callback leaves the file as it was.** The plugin writes a callback's body over
+    the file whatever its status (`TransformationHelper.ApplyTransformation`), so an error
+    page is served as the bundle, and a timeout or transport failure is an exception that
+    fails the request. Ferrofin serves the file unchanged and logs the failure once at warn,
+    then at debug until the callback works again.
 
 ### Merge Versions
 - Ferrofin files: `crates/ferrofin-extensions/src/merge_versions.rs` (the whole
