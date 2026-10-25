@@ -455,6 +455,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   library whose stored path differs in a non-ASCII letter's case. Users' library and view
   preferences are read as .NET parses a GUID: a padded or `(…)` value counts, a
   `urn:uuid:` one does not
+- An extra (a trailer, featurette or theme song) is never looked up by a WASM plugin's
+  metadata or artwork source, as Jellyfin 12 never asks a remote provider about one: it has
+  no identity of its own online, so a lookup by its file name filled it with another title's
+  overview, people or Primary image. Its local readers, embedded images and extracted frames
+  still run. The item it belongs to is asked as before
 
 ### Performance
 - `/Persons` with a favourite filter: build the user's favourite-person set once per
@@ -561,6 +566,22 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   no longer forge a line in the log file behind `/System/Logs`: the file continues the entry
   on an indented line instead (a carriage return is written as `\r`), and a plugin's text is
   logged escaped, under `guest_message`, cut at 8 KiB
+- WASM plugins: an `http-fetch` to an IPv6 address that carries a private IPv4 one is refused
+  like the IPv4 address itself, unless the plugin is granted private-network access. A NAT64
+  (`64:ff9b::/96`), 6to4 (`2002::/16`) or IPv4-compatible (`::a.b.c.d`) address reached, say,
+  the cloud metadata service or the server's own loopback through a gateway, where only the
+  IPv4-mapped form was unwrapped. The local-use NAT64 prefix `64:ff9b:1::/48` is refused
+  outright
+- WASM plugins: the engine grants a plugin only the WebAssembly features the host needs. A
+  plugin could use shared memory (threads), GC types, exception handling and the async
+  component model, which wasmtime turns on with its default build; a plugin that uses one no
+  longer loads, and none known does. The server also no longer builds wasmtime's profiling,
+  compilation cache, core dump and pooling allocator support, or WASI preview 1 and 3
+- File Transformation: what the pipeline serves for one `/web` file is capped at 16 MiB, so an
+  anonymous page load can no longer make the server allocate without bound. A callback
+  endpoint's answer is read no further than that, and a step that would grow the file past it
+  (an admin search/replace whose replace text multiplies the file, or another plugin's
+  transform) is skipped with one warning, leaving the file as it was before that step
 
 ### Bug Fixes
 - A backup no longer reports success with something left out:
@@ -789,6 +810,22 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - The README said a fresh install logs a generated admin password. It seeds the admin with
   no password, as Jellyfin does: the setup wizard at `/web` sets it, or
   `FERROFIN_ADMIN_PASSWORD` seeds one
+- WASM plugins: a web transform whose `path-pattern` is not a valid regex, such as the glob
+  `*.chunk.js` the plugin interface gave as an example, is refused at load with a warning; it
+  matched nothing, silently. The interface now says what a pattern is: an exact path under the
+  web root, else a regex matched anywhere in the path
+- Plugins: overlapping installs, updates and uninstalls can no longer lose a recorded entry
+  from the plugin state file (`plugins/state.json`) or tear it, and a plugin update racing a
+  manual install of the same plugin can no longer tear the staged `.wasm`. Every save is made
+  under the state lock and through its own synced temporary file, where three of them wrote an
+  older copy of the state outside the lock and every writer of a path shared one `.tmp` file.
+  These files (the state, plugin settings and staged `.wasm`) are now written owner-only
+  (`0600`). A state file that cannot be read or parsed is kept as `state.json.corrupt` and
+  logged at error level instead of being silently replaced, along with the enabled switches
+  and the record of installed versions it held
+- File Transformation: a callback endpoint that fails (an error status, a timeout, a refused
+  connection) logs one warning, then logs at debug level until it works again. It logged two
+  warnings on every matching `/web` request for as long as it stayed down
 
 ## [1.0.0] - 2026-09-05
 

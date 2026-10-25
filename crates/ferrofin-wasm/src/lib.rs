@@ -9,11 +9,12 @@
 //! to `ferrofin-api` a WASM plugin is indistinguishable from a Tier-1a one.
 //!
 //! # Security model
-//! Guests get **no filesystem and no direct network** — the world imports
-//! exactly one host interface (`log`, `get-config`, host-mediated
-//! `http-fetch`, read-only `query-items`, provider-scoped
-//! `write-media-segments`), so `wit/ferrofin-plugin.wit` is the entire
-//! attack surface. Every guest call
+//! Guests get **no filesystem and no direct network**: the world imports one
+//! host interface, `host` in `wit/ferrofin-plugin.wit`, and the WASI context
+//! a std guest links against grants nothing (no preopens, sockets or
+//! environment). That file is the entire attack surface and the one list of
+//! what a plugin may do, from logging and host-mediated `http-fetch` to the
+//! library writes and media extraction, each with its scope. Every guest call
 //! runs under an epoch deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`) and a
 //! linear-memory cap (`FERROFIN_WASM_MEMORY_LIMIT_MB`); a trap, overrun, or
 //! cap hit fails that call only, and repeated failures trip a breaker that
@@ -24,8 +25,8 @@ pub mod bindings;
 pub mod capabilities;
 pub mod runtime;
 
-/// The hand-written canonical-ABI component implementing the
-/// `ferrofin:plugin@0.4.0` world, as WAT text — the shared test fixture for
+/// The hand-written canonical-ABI component implementing the [`PLUGIN_ABI`]
+/// world, as WAT text — the shared test fixture for
 /// this crate's host tests and the server-level HTTP test (compiled at test
 /// time via the `wat` crate; no `.wasm` binaries in the repo). Not a public
 /// API: test support only.
@@ -1590,6 +1591,18 @@ impl WasmPluginHost {
                         plugin = %plugin.descriptor.id,
                         pattern = transform.path_pattern,
                         "wasm plugin web transform has a blank search; skipping it"
+                    );
+                    continue;
+                }
+                // The pipeline matches an exact path, else a regex. A pattern
+                // that is not a valid regex (a glob such as `*.chunk.js`)
+                // would match nothing, silently.
+                if let Err(e) = regex::Regex::new(&transform.path_pattern) {
+                    warn!(
+                        plugin = %plugin.descriptor.id,
+                        pattern = transform.path_pattern,
+                        error = %e,
+                        "wasm plugin web transform pattern is not a valid regex; skipping it"
                     );
                     continue;
                 }

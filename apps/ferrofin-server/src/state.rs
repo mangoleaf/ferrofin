@@ -2680,12 +2680,12 @@ pub async fn build_app_state(
         .with_intro_skipper_store(intro_skipper)
         .with_intro_skipper_analysis(intro_skipper_analysis);
 
-    // ---- plugin manager (Tier 1: compile-time plugins) --------------------
-    // Backs `/Plugins/*`, `/Packages/*`, and `/Repositories` over the compile-time
-    // plugin registry (built above with the OpenSubtitles plugin registered). The
-    // manager persists the repository list and per-plugin configuration under
-    // `{config}/plugins/`. Runtime install/load is Tier 2 (a WASM/libloading
-    // host); the compiled-in plugin design is described in `docs/PLUGINS_UPSTREAM.md`.
+    // ---- plugin manager ---------------------------------------------------
+    // Backs `/Plugins/*`, `/Packages/*`, and `/Repositories` over the plugin
+    // registry built above (the compiled-in plugins, OpenSubtitles among them,
+    // and the WASM plugins the host loaded). The manager persists the repository
+    // list and per-plugin configuration under `{config}/plugins/` and stages WASM
+    // installs for the next start; `docs/EXTENSIONS.md` describes the two tiers.
     let state = state.with_plugins(Arc::clone(&plugins));
 
     // ---- SyncPlay ---------------------------------------------------------

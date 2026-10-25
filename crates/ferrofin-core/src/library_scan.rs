@@ -10677,6 +10677,13 @@ impl LibraryScanner {
         known_ids: &[(String, String)],
         lookup: &ResolverGuesses,
     ) -> RemoteMetadata {
+        // `CanRefreshMetadata`: an extra is a local file belonging to
+        // another item, with no identity of its own in an online database,
+        // so no remote provider is asked about it (upstream's
+        // `forceEnableInternetMetadata` is always false here).
+        if entity.extra_type.is_some() {
+            return RemoteMetadata::default();
+        }
         let short = entity
             .type_
             .rsplit('.')
@@ -12502,18 +12509,23 @@ impl LibraryScanner {
         } else {
             fetcher_names::EMBEDDED_IMAGES
         };
+        // `CanRefreshImages`: remote artwork for an extra is always some
+        // other item's (it has no identity of its own online), so only the
+        // local and extracted sources below run for one.
+        let remote = fetch != ImageFetch::None
+            && !music::owns_providers(short)
+            && entity.extra_type.is_none();
         // Plugins without IHasOrder default to 50; registration breaks ties.
-        let mut sources: Vec<(&str, Step)> =
-            if fetch != ImageFetch::None && !music::owns_providers(short) {
-                self.dynamic_providers
-                    .iter()
-                    .filter(|p| p.library_gated() && policy.image_enabled(short, p.name()))
-                    .map(|p| (p.name(), Step::Plugin))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        if fetch != ImageFetch::None && !music::owns_providers(short) {
+        let mut sources: Vec<(&str, Step)> = if remote {
+            self.dynamic_providers
+                .iter()
+                .filter(|p| p.library_gated() && policy.image_enabled(short, p.name()))
+                .map(|p| (p.name(), Step::Plugin))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if remote {
             for (name, wired) in [
                 (fetcher_names::TVDB, self.tvdb.is_some()),
                 (fetcher_names::TMDB, self.tmdb.is_some()),
@@ -36452,6 +36464,83 @@ mod tests {
         // The NFO ran (default policy): its <title> renamed the row.
         let (overview, ..) = movie_detail_row(&db, "Movie 0001").await;
         assert_eq!(overview.as_deref(), Some("alpha"));
+    }
+
+    /// An extra has no identity of its own in an online database, so a
+    /// plugin's metadata and artwork sources are never asked about one
+    /// (upstream `CanRefreshMetadata` / `CanRefreshImages`, `ExtraType`),
+    /// while the item it belongs to still is.
+    #[tokio::test]
+    async fn a_plugin_source_is_never_asked_about_an_extra() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<(&'static str, String)>>);
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for Recorder {
+            fn name(&self) -> &'static str {
+                "recorder"
+            }
+            fn library_gated(&self) -> bool {
+                // Named: asked by the artwork pass too.
+                true
+            }
+            async fn lookup(
+                &self,
+                item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                self.0.lock().unwrap().push(("lookup", item.kind.clone()));
+                Ok(None)
+            }
+            async fn images(
+                &self,
+                item: &ferrofin_traits::providers::DynamicMetadataLookup,
+                _wanted: &[ferrofin_model::entities::ImageType],
+            ) -> Result<
+                Vec<(ferrofin_model::entities::ImageType, Vec<u8>)>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                self.0.lock().unwrap().push(("images", item.kind.clone()));
+                Ok(Vec::new())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("Heat (1995)");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Heat (1995).mkv"), b"").unwrap();
+        std::fs::write(folder.join("Heat (1995)-trailer.mkv"), b"").unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_metadata_dir(tmp.path().join("metadata"))
+            .with_dynamic_providers(vec![recorder.clone()]);
+        scanner.scan_all().await.unwrap();
+
+        let asked = recorder.0.lock().unwrap().clone();
+        assert!(asked.contains(&("lookup", "Movie".to_owned())), "{asked:?}");
+        assert!(asked.contains(&("images", "Movie".to_owned())), "{asked:?}");
+        assert!(asked.iter().all(|(_, kind)| kind == "Movie"), "{asked:?}");
     }
 
     // The dynamic artwork pass fills only the slots the built-in chain left

@@ -113,7 +113,11 @@ impl EgressPolicy {
 /// default: loopback, link-local (incl. cloud metadata services), RFC1918,
 /// CGNAT (`100.64.0.0/10` — Tailscale's default range), IPv6 ULA, and the
 /// reserved/multicast blocks a public HTTP fetch should never target.
-/// IPv4-mapped IPv6 unwraps to its IPv4 rule.
+/// An IPv6 address that carries an IPv4 one reaches that IPv4 host, so it
+/// takes the IPv4 rule: IPv4-mapped (`::ffff:0:0/96`), IPv4-compatible
+/// (`::/96`, RFC 4291), NAT64 (`64:ff9b::/96`, RFC 6052) and 6to4
+/// (`2002::/16`, RFC 3056). The local-use NAT64 prefix `64:ff9b:1::/48`
+/// (RFC 8215) is not globally reachable, so it is private whatever it embeds.
 ///
 /// The CGNAT and reserved-block checks are open-coded because
 /// `Ipv4Addr::is_shared`/`is_reserved` are still nightly-only and we pin
@@ -139,14 +143,28 @@ pub fn is_private_address(addr: std::net::IpAddr) -> bool {
                 || a >= 240
         }
         std::net::IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            let segments = v6.segments();
+            let from_segments =
+                |hi: u16, lo: u16| std::net::Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo));
+            // `to_ipv4` is the mapped and the compatible form; `::1` and `::`
+            // are caught above, since the compatible form reads them as
+            // `0.0.0.1` and `0.0.0.0`.
+            let embedded = v6.to_ipv4().or(match segments {
+                [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] | [0x2002, hi, lo, ..] => {
+                    Some(from_segments(hi, lo))
+                }
+                _ => None,
+            });
+            if let Some(v4) = embedded {
                 return is_private_address(std::net::IpAddr::V4(v4));
             }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
+            v6.is_multicast()
                 || v6.is_unicast_link_local()
                 || v6.is_unique_local()
+                || matches!(segments, [0x64, 0xff9b, 1, ..])
         }
     }
 }

@@ -25,10 +25,6 @@
 //! | Preview        | `Preview`            |
 //! | Recap          | `Recap`              |
 //! | Commercial     | `Commercial`         |
-//!
-//! One route is thinner than upstream because the backing subsystem does not
-//! exist in Ferrofin, documented at its handler:
-//! `FileTransformation/RegisterTransformation` (no web-asset pipeline to hook).
 
 use std::collections::HashMap;
 
