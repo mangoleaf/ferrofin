@@ -298,6 +298,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   loading one file skips only that file, and install checks a plugin the same way the load
   does, so one that installs is not skipped at the next boot for an invalid default
   configuration or name
+- WASM plugins: a web transform can no longer make the server run out of memory from anonymous
+  `/web` requests. A blank search text is refused (it matched between every character), and a
+  transform that would grow a file by more than 256 KiB leaves the file unchanged
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for

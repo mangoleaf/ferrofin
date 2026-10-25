@@ -224,6 +224,66 @@ fn a_file_squatting_a_compiled_in_id_is_never_loaded() {
     assert!(host.registered_plugins().is_empty());
 }
 
+/// Records the registrations a host makes into the `/web` pipeline.
+#[derive(Default)]
+struct RecordingTransforms(std::sync::Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl ferrofin_traits::plugins::FileTransformationService for RecordingTransforms {
+    async fn needs_transformation(&self, _path: &str) -> bool {
+        false
+    }
+    async fn run_transformation(&self, _path: &str, contents: String) -> String {
+        contents
+    }
+    async fn add_transformation(
+        &self,
+        _id: uuid::Uuid,
+        file_name_pattern: &str,
+        _transformer: Arc<dyn ferrofin_traits::plugins::FileTransformer>,
+    ) {
+        self.0.lock().unwrap().push(file_name_pattern.to_owned());
+    }
+    async fn add_endpoint_transformation(&self, _id: uuid::Uuid, _pattern: &str, _endpoint: &str) {}
+    async fn remove_transformation(&self, _id: uuid::Uuid) {}
+}
+
+#[tokio::test]
+async fn a_blank_web_transform_search_is_refused_at_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    // An empty `search` matches at every char boundary, so `replace` would
+    // land between every byte of the served file.
+    write_fixture(
+        dir.path(),
+        "blank",
+        &FIXTURE_WAT.replace(
+            "(i32.store (i32.const 1036) (i32.const 3))",
+            "(i32.store (i32.const 1036) (i32.const 0))",
+        ),
+    );
+    write_fixture(
+        dir.path(),
+        "normal",
+        &fixture_with_id("11111111-1111-1111-1111-111111111111"),
+    );
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.path().to_path_buf();
+        move || WasmPluginHost::load(&dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(host.plugins().len(), 2);
+    let recorded = Arc::new(RecordingTransforms::default());
+    let service: Arc<dyn ferrofin_traits::plugins::FileTransformationService> = recorded.clone();
+    host.register_web_transforms(&service, &manager()).await;
+    assert_eq!(
+        *recorded.0.lock().unwrap(),
+        ["fixture.txt"],
+        "only the normal plugin's transform is registered"
+    );
+}
+
 use common::named_provider_fixture;
 
 #[test]

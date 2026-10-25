@@ -227,7 +227,9 @@ plugins like Home Screen Sections possible):
   starve the scans, tasks and events that share the queue.
 - **`web-transforms`** — declared literal search/replace patches the server applies to
   matching `/web` files while the plugin is enabled (capped: 16 per plugin, 256 KiB per
-  text). This is how a plugin injects its client-side hooks into jellyfin-web.
+  text; a blank search is refused, and a transform that would grow a file by more than
+  256 KiB leaves it unchanged). This is how a plugin injects its client-side hooks into
+  jellyfin-web.
 
 Plugins can also act as **metadata and artwork providers**. A plugin's `metadata-lookup`
 export is a **remote metadata provider folded at its configured rank**, exactly like the

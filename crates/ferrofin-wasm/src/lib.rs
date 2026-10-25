@@ -34,6 +34,7 @@ pub const TEST_FIXTURE_WAT: &str = include_str!("test_fixture.wat");
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tracing::{error, info, warn};
@@ -1495,11 +1496,14 @@ struct LiteralTransform {
     plugins: Arc<dyn PluginManager>,
     search: String,
     replace: String,
+    /// Whether the over-the-cap skip was logged (once per transform: it
+    /// recurs on every serve of the file).
+    warned: AtomicBool,
 }
 
 #[async_trait]
 impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
-    async fn transform(&self, _path: &str, contents: String) -> String {
+    async fn transform(&self, path: &str, contents: String) -> String {
         // Checked per serve, like the host's other surfaces: Disable or
         // uninstall stops the injection at once, and Enable starts it.
         let enabled = self
@@ -1510,6 +1514,29 @@ impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
             .flatten()
             .is_some_and(|d| d.enabled);
         if !enabled {
+            return contents;
+        }
+        // Output is bounded, not just input: a common `search` with a large
+        // `replace` multiplies the file, recomputed on every anonymous /web
+        // GET. One step may add at most one full-size `replace`, so chained
+        // steps grow the file linearly, never compounding.
+        let growth = self.replace.len().saturating_sub(self.search.len());
+        if growth > 0
+            && contents
+                .matches(self.search.as_str())
+                .count()
+                .saturating_mul(growth)
+                > MAX_TRANSFORM_TEXT
+        {
+            if !self.warned.swap(true, Ordering::Relaxed) {
+                warn!(
+                    plugin = %self.plugin,
+                    path,
+                    max_growth = MAX_TRANSFORM_TEXT,
+                    "wasm plugin web transform would grow the file past the cap; \
+                     serving it unchanged"
+                );
+            }
             return contents;
         }
         contents.replace(&self.search, &self.replace)
@@ -1542,6 +1569,17 @@ impl WasmPluginHost {
                     );
                     continue;
                 }
+                // An empty search matches at every char boundary, so the
+                // replace would land between every byte (the admin-defined
+                // path skips blank text the same way).
+                if transform.search.trim().is_empty() {
+                    warn!(
+                        plugin = %plugin.descriptor.id,
+                        pattern = transform.path_pattern,
+                        "wasm plugin web transform has a blank search; skipping it"
+                    );
+                    continue;
+                }
                 info!(
                     plugin = %plugin.descriptor.id,
                     pattern = transform.path_pattern,
@@ -1556,6 +1594,7 @@ impl WasmPluginHost {
                             plugins: Arc::clone(plugin_manager),
                             search: transform.search.clone(),
                             replace: transform.replace.clone(),
+                            warned: AtomicBool::new(false),
                         }),
                     )
                     .await;
@@ -2057,6 +2096,7 @@ mod tests {
             plugins: Arc::clone(&plugins),
             search: "</head>".to_owned(),
             replace: "<script></script></head>".to_owned(),
+            warned: AtomicBool::new(false),
         };
         let injected = "<script></script></head>";
         let ours = transform(id);
@@ -2081,6 +2121,45 @@ mod tests {
             "</head>",
             "uninstalled (unknown to the manager): served unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn a_web_transform_that_would_outgrow_the_cap_serves_the_file_unchanged() {
+        use ferrofin_traits::plugins::FileTransformer as _;
+        let dir = tempfile::tempdir().unwrap();
+        let plugins: Arc<dyn PluginManager> =
+            Arc::new(ferrofin_core::plugin_manager::FerrofinPluginManager::new(
+                vec![ferrofin_core::plugin_manager::RegisteredPlugin::new(
+                    descriptor(),
+                    None,
+                )],
+                dir.path().to_path_buf(),
+            ));
+        let transform = |search: &str, replace: String| LiteralTransform {
+            plugin: descriptor().id,
+            plugins: Arc::clone(&plugins),
+            search: search.to_owned(),
+            replace,
+            warned: AtomicBool::new(false),
+        };
+        // A common search amplified by a large replace: 1000 matches × ~1 KiB.
+        let file = "<".repeat(1000);
+        let amplifier = transform("<", "x".repeat(1024));
+        assert_eq!(amplifier.transform("index.html", file.clone()).await, file);
+        assert!(
+            amplifier.warned.load(Ordering::Relaxed),
+            "the skip is logged"
+        );
+        // One full-size insertion is exactly the cap, and still applies.
+        let insert = "y".repeat(MAX_TRANSFORM_TEXT);
+        let injector = transform("</head>", format!("{insert}</head>"));
+        assert_eq!(
+            injector.transform("index.html", "</head>".into()).await,
+            format!("{insert}</head>")
+        );
+        // Shrinking or same-size rewrites are never capped.
+        let shrinker = transform("<", String::new());
+        assert_eq!(shrinker.transform("index.html", file).await, "");
     }
 
     fn descriptor() -> PluginDescriptor {

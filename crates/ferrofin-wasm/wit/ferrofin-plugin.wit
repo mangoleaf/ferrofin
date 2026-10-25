@@ -111,9 +111,12 @@ interface types {
         /// The served-file name pattern the transform applies to
         /// (e.g. `index.html`, `*.chunk.js`).
         path-pattern: string,
-        /// The literal text to find (the host caps it at 256 KiB).
+        /// The literal text to find (the host caps it at 256 KiB, and
+        /// refuses a blank one).
         search: string,
-        /// The literal replacement text (the host caps it at 256 KiB).
+        /// The literal replacement text (the host caps it at 256 KiB). A
+        /// transform that would grow a file by more than 256 KiB leaves it
+        /// unchanged.
         replace: string,
     }
 
