@@ -63,7 +63,7 @@ tracing.workspace = true
 # exporter here — that lives in ferrofin-server; these are API-only helpers.
 opentelemetry.workspace = true
 tracing-opentelemetry.workspace = true
-zip = { version = "2", default-features = false, features = ["deflate", "time"] }
+zip = { workspace = true, features = ["time"] }   # backup archives; `time` stamps entries with now
 
 [dev-dependencies]
 # Self dev-dependency so unit + integration tests build with the `test-util`

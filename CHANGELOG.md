@@ -69,6 +69,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   See the [support matrix and tested build](gates/adoption/README.md#supported-and-tested-versions).
   The harness now reports SQLite query failures and detects version promotions when the
   repaired count is zero, with five regression tests; all 40 shell tests passed.
+- Every dependency is declared once, in the root `[workspace.dependencies]`, and used: the
+  unused `axum-extra`, `argon2`, `insta` and seven dead crate edges are gone, and the backup
+  handler's inline zip 2 and ferrofin-util's rand 0.8 move to the workspace's zip and rand 0.10
 
 ### Parity
 - Find the playlists folder by its type when a playlist is created, as Jellyfin's

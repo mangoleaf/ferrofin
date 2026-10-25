@@ -15,8 +15,8 @@ workspace = true
 tokio = { workspace = true, optional = true }
 uuid.workspace = true
 thiserror.workspace = true
-rand = "0.8"
-unicode-normalization = "0.1"
+rand.workspace = true
+unicode-normalization.workspace = true
 regex.workspace = true
 icu_casemap.workspace = true
 icu_collator.workspace = true

@@ -84,7 +84,7 @@ tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compressio
 # Decoders for the response-compression tests only (the server never decodes a
 # response it just encoded). Streaming readers validate the wire response.
 flate2 = "1.1.10"
-zip = { version = "8", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books)
+zip = { version = "8", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-api, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
 sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
 brotli = "9.0.0"
@@ -183,6 +183,7 @@ uuid = { version = "1.26.1", features = ["v4", "serde"] }
 url = "2.5.8"
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.25"
+rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`)
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
 encoding_rs = "0.8.35"
 chardetng = "0.1.17"

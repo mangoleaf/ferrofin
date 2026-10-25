@@ -1,11 +1,11 @@
 //! Port of `ShuffleExtensions.cs` — in-place Fisher-Yates shuffle over a slice,
 //! with an RNG-injectable variant for determinism.
 
-use rand::Rng;
+use rand::{Rng, RngExt as _};
 
 /// Shuffles the items in a slice in place using the thread-local RNG.
 pub fn shuffle<T>(list: &mut [T]) {
-    shuffle_with(list, &mut rand::thread_rng());
+    shuffle_with(list, &mut rand::rng());
 }
 
 /// Shuffles the items in a slice in place using the supplied RNG.
@@ -15,7 +15,7 @@ pub fn shuffle<T>(list: &mut [T]) {
 pub fn shuffle_with<T, R: Rng + ?Sized>(list: &mut [T], rng: &mut R) {
     let mut n = list.len();
     while n > 1 {
-        let k = rng.gen_range(0..n);
+        let k = rng.random_range(0..n);
         n -= 1;
         list.swap(k, n);
     }
@@ -24,12 +24,11 @@ pub fn shuffle_with<T, R: Rng + ?Sized>(list: &mut [T], rng: &mut R) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngCore;
 
     #[test]
     fn shuffle_valid_correct() {
         let mut original = [0u8; 1 << 6];
-        rand::thread_rng().fill_bytes(&mut original);
+        rand::rng().fill_bytes(&mut original);
         let mut shuffled = original;
         shuffle(&mut shuffled);
 
