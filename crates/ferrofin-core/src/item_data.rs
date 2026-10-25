@@ -890,7 +890,8 @@ pub(crate) async fn hand_playlist_to_in(
 /// The share order is the rows' `rowid` order. Every writer inserts in the
 /// order upstream's `Shares` list holds (a create or an update in the
 /// request's order, the boot re-import in `Data`'s, a hand-over editors
-/// first), and every reader and the `Data` sync read in it.
+/// first), and every reader and the `Data` sync read in it. A whole list is
+/// written with [`add_listed_shares_in`].
 ///
 /// # Errors
 /// Returns [`ServiceError`] if the underlying queries fail.
@@ -919,6 +920,40 @@ pub(crate) async fn share_playlist_in(
     .execute(&mut *conn)
     .await
     .map_err(db_err)?;
+    Ok(())
+}
+
+/// Writes the share list a create, an update or the boot re-import gives
+/// `playlist` (C# `Shares = request.Users`, or `Data`'s `Shares`), in its
+/// order, after the caller cleared the old rows.
+///
+/// Upstream stores every entry and grants edit when any entry for the caller
+/// can (`Shares.Any(s => s.CanEdit && …)`). The share table holds one row per
+/// user, so a user listed more than once keeps one share, at their first
+/// entry's place (where upstream's `FirstOrDefault` readers find them), that
+/// can edit when any of their entries can.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the underlying queries fail.
+pub(crate) async fn add_listed_shares_in(
+    conn: &mut sqlx::SqliteConnection,
+    playlist_db: &str,
+    shares: &[(Uuid, bool)],
+) -> Result<(), ServiceError> {
+    for &(user, can_edit) in shares {
+        sqlx::query(
+            r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit")
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT("PlaylistId", "UserId") DO UPDATE
+               SET "CanEdit" = "CanEdit" OR excluded."CanEdit""#,
+        )
+        .bind(playlist_db)
+        .bind(guid_to_db(user))
+        .bind(can_edit)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_err)?;
+    }
     Ok(())
 }
 
@@ -1221,23 +1256,15 @@ pub(crate) async fn import_playlist_meta(
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
-        for share in shares {
-            let Ok(user) = Uuid::parse_str(&share.user_id) else {
-                continue;
-            };
-            sqlx::query(
-                r#"INSERT INTO "FerrofinPlaylistShares" ("PlaylistId", "UserId", "CanEdit")
-                   VALUES (?1, ?2, ?3)
-                   ON CONFLICT("PlaylistId", "UserId") DO UPDATE
-                   SET "CanEdit" = excluded."CanEdit""#,
-            )
-            .bind(container_db)
-            .bind(guid_to_db(user))
-            .bind(share.can_edit)
-            .execute(&mut *tx)
-            .await
-            .map_err(db_err)?;
-        }
+        let shares: Vec<(Uuid, bool)> = shares
+            .iter()
+            .filter_map(|share| {
+                Uuid::parse_str(&share.user_id)
+                    .ok()
+                    .map(|user| (user, share.can_edit))
+            })
+            .collect();
+        add_listed_shares_in(tx, container_db, &shares).await?;
     }
     Ok(())
 }

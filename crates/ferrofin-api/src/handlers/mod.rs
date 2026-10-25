@@ -1607,9 +1607,14 @@ pub const VERIFIED: &[Verified] = &[
             "A malformed id in the ids query is a 400; upstream's \
          CommaDelimitedCollectionModelBinder drops it, so an all-malformed list falls back \
          to the body's Ids. Fix path: gl-884.",
-            "A user named twice in Users keeps one share, with the last entry's CanEdit; \
-         upstream stores and lists both, and grants edit if either has CanEdit. Fix path: \
-         gl-886.",
+            "A user named twice in Users keeps one share, at their first entry's place, that \
+         can edit when any of their entries can: the permission upstream grants \
+         (Shares.Any(s => s.CanEdit && …)). Upstream stores and lists every entry, so GET \
+         /Playlists/{id}/Users lists such a user once here, GET \
+         /Playlists/{id}/Users/{userId} answers the combined CanEdit where upstream's \
+         FirstOrDefault answers the first entry's, and DELETE \
+         /Playlists/{id}/Users/{userId} removes the user's one share where upstream \
+         removes only the first entry (a second one keeps sharing). Fix path: gl-949.",
             "The 400 (no name, no playlists folder, an unknown id while the media type is \
          inferred, an API key that names no user) and 403 (another user's id without the \
          administrator role) bodies are Ferrofin's error shape, not upstream's. Fix path: \
@@ -1643,9 +1648,14 @@ pub const VERIFIED: &[Verified] = &[
             "SavePlaylistFile has no caller: a playlist file the scan found has no owner and \
          no editing share, so an update of it is a 403 here as upstream, and no update \
          reaches a file.",
-            "A user named twice in Users keeps one share, with the last entry's CanEdit; \
-         upstream stores and lists both, and grants edit if either has CanEdit. Fix path: \
-         gl-886.",
+            "A user named twice in Users keeps one share, at their first entry's place, that \
+         can edit when any of their entries can: the permission upstream grants \
+         (Shares.Any(s => s.CanEdit && …)). Upstream stores and lists every entry, so GET \
+         /Playlists/{id}/Users lists such a user once here, GET \
+         /Playlists/{id}/Users/{userId} answers the combined CanEdit where upstream's \
+         FirstOrDefault answers the first entry's, and DELETE \
+         /Playlists/{id}/Users/{userId} removes the user's one share where upstream \
+         removes only the first entry (a second one keeps sharing). Fix path: gl-949.",
             "A body Ids sent as a comma-delimited string is a 400; upstream's \
          JsonCommaDelimitedCollectionConverterFactory splits it and drops entries that do \
          not parse (so \"abc\" clears the playlist). Fix path: gl-883.",

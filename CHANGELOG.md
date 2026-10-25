@@ -63,6 +63,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Let a user named twice in a playlist's `Users` (create, update, or a playlist's stored
+  `Shares` read back at startup) edit it when either entry can, as Jellyfin does, instead of
+  keeping only the last entry's permission
 - Parse `POST /DisplayPreferences/{id}` values as Jellyfin's .NET parsers do: `IndexBy` and
   `chromecastVersion` also take an integer (an unnamed one is kept and written back as its
   number by `GET`), a comma list and padding, and a `chromecastVersion` that does not parse

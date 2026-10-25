@@ -1435,9 +1435,16 @@ impl PlaylistManager for FerrofinPlaylistManager {
             .await
             .map_err(db_err)?;
             // Seed the share list from the request (C# `Shares = options.Users`).
-            for share in &request.users {
-                item_data::share_playlist_in(&mut tx, id, share.user_id, share.can_edit).await?;
-            }
+            item_data::add_listed_shares_in(
+                &mut tx,
+                &guid_to_db(id),
+                &request
+                    .users
+                    .iter()
+                    .map(|s| (s.user_id, s.can_edit))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
             write_entries_in(&mut tx, &guid_to_db(id), &entries).await?;
             crate::item_persistence_service::stamp_playlist_in(
                 &mut tx,
@@ -1542,10 +1549,15 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
-            for share in users {
-                item_data::share_playlist_in(&mut tx, request.id, share.user_id, share.can_edit)
-                    .await?;
-            }
+            item_data::add_listed_shares_in(
+                &mut tx,
+                &guid_to_db(request.id),
+                &users
+                    .iter()
+                    .map(|s| (s.user_id, s.can_edit))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         }
         if let Some(entries) = &entries {
             write_entries_in(&mut tx, &guid_to_db(request.id), entries).await?;
@@ -4559,6 +4571,77 @@ mod tests {
         assert_eq!(
             mgr.get_playlist_shares(playlist_id).await.unwrap(),
             expected
+        );
+    }
+
+    /// Upstream keeps a user listed twice in `Users` twice and lets them edit
+    /// when either entry can (`Shares.Any(s => s.CanEdit && …)`). With one share
+    /// row per user, the user keeps one share at their first entry's place that
+    /// can edit when any entry can: on create, on update, and when the boot
+    /// re-import reads such a list from `Data` (as a Jellyfin database can hold).
+    #[tokio::test]
+    async fn a_user_listed_twice_keeps_one_share_that_can_edit_if_any_entry_can() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions as Share;
+        use ferrofin_traits::collections::PlaylistAccessLevel;
+
+        let db = test_db().await;
+        let (mgr, _root) = playlist_manager(&db).await;
+        let (owner, bob, carol) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Shared".to_owned()),
+                user_id: owner,
+                users: vec![Share::new(bob, true), Share::new(bob, false)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            vec![Share::new(bob, true)]
+        );
+        let bob_access = mgr.get_playlist_access(playlist_id, bob).await.unwrap();
+        assert_eq!(bob_access.level, PlaylistAccessLevel::CanEdit);
+
+        mgr.update_playlist(&PlaylistUpdateRequest {
+            id: playlist_id,
+            user_id: owner,
+            users: Some(vec![
+                Share::new(carol, false),
+                Share::new(bob, false),
+                Share::new(carol, true),
+                Share::new(bob, false),
+            ]),
+            ..PlaylistUpdateRequest::default()
+        })
+        .await
+        .expect("update");
+        let collapsed = vec![Share::new(carol, true), Share::new(bob, false)];
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            collapsed
+        );
+
+        // A `Data` list naming carol twice, read back by the boot re-import.
+        let shares = serde_json::json!([
+            {"UserId": bob.simple().to_string(), "CanEdit": false},
+            {"UserId": carol.simple().to_string(), "CanEdit": false},
+            {"UserId": bob.simple().to_string(), "CanEdit": true},
+        ]);
+        let mut conn = db.writer().acquire().await.expect("connection");
+        crate::item_data::set_data_key_in(&mut conn, playlist_id, "Shares", shares)
+            .await
+            .expect("write Data");
+        drop(conn);
+        crate::item_data::reconcile_playlist_permissions(&db)
+            .await
+            .expect("boot re-import");
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            vec![Share::new(bob, true), Share::new(carol, false)]
         );
     }
 
