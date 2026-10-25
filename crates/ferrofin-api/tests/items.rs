@@ -1883,6 +1883,75 @@ async fn get_items_with_filters_returns_query_result() {
     assert_eq!(json["Items"][0]["Id"], item_id.simple().to_string());
 }
 
+/// The query `GET /Items?{params}` hands the library, and the status it
+/// answered with.
+async fn items_query(params: &str) -> (StatusCode, Option<InternalItemsQuery>) {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items?{params}"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let query = seen.lock().unwrap().take();
+    (response.status(), query)
+}
+
+/// The filters v12.2 `GetItems` copies straight onto the query
+/// (ItemsController.cs:396-430, 491-525): `seriesStatus` (jellyfin-web's TV
+/// Status filter), `personTypes`, `isPlaceHolder` and `hasOfficialRating`, and
+/// the two official ratings as `GetRatingScore` scores. A blank or unknown
+/// rating sets no bound.
+#[tokio::test]
+async fn get_items_forwards_the_rating_status_and_placeholder_filters() {
+    use ferrofin_model::entities::SeriesStatus;
+    use ferrofin_model::entities_media::ParentalRatingScore;
+    let (status, query) = items_query(
+        "recursive=true&seriesStatus=Continuing,ended&minOfficialRating=PG\
+         &maxOfficialRating=pg-13&personTypes=Actor,Director&isPlaceHolder=true\
+         &hasOfficialRating=false",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query = query.expect("query_items ran");
+    assert_eq!(
+        query.series_statuses,
+        [SeriesStatus::Continuing, SeriesStatus::Ended]
+    );
+    assert_eq!(
+        query.min_parental_rating,
+        Some(ParentalRatingScore::new(10, None))
+    );
+    assert_eq!(
+        query.max_parental_rating,
+        Some(ParentalRatingScore::new(13, None))
+    );
+    assert_eq!(query.person_types, ["Actor", "Director"]);
+    assert_eq!(query.is_place_holder, Some(true));
+    assert_eq!(query.has_official_rating, Some(false));
+
+    for params in [
+        "minOfficialRating=%20&maxOfficialRating=",
+        "minOfficialRating=Unrated-Nonsense&maxOfficialRating=XYZ",
+    ] {
+        let (status, query) = items_query(&format!("recursive=true&{params}")).await;
+        assert_eq!(status, StatusCode::OK, "{params}");
+        let query = query.expect("query_items ran");
+        assert_eq!(query.min_parental_rating, None, "{params}");
+        assert_eq!(query.max_parental_rating, None, "{params}");
+    }
+    let (status, _) = items_query("recursive=true&isPlaceHolder=maybe").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 /// jellyfin-web's artist page filters by `AlbumArtistIds` (Albums),
 /// `ContributingArtistIds` (Appears On) and `ExcludeArtistIds` (More Like
 /// This), through both the query- and the path-scoped route. Each id set

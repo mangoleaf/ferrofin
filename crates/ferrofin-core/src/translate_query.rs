@@ -612,27 +612,53 @@ fn append_tagged_item_ids(qb: &mut QueryBuilder<Sqlite>, tags: &[String]) {
     push_in_list(qb, r#"tag_value."CleanValue""#, tags);
 }
 
+/// The parental ceiling a query applies, as `(score, sub-score)`: the
+/// stricter of the query's `max_parental_rating` and its user's policy limit.
+/// Upstream's `GetItems` lets `maxOfficialRating` replace the limit `SetUser`
+/// copied from the policy, so a restricted user could raise their own
+/// ceiling; here a request can only lower it.
+fn max_parental_limit(filter: &InternalItemsQuery) -> Option<(i64, i64)> {
+    let requested = filter.max_parental_rating.as_ref().map(|rating| {
+        (
+            i64::from(rating.score),
+            i64::from(rating.sub_score.unwrap_or(0)),
+        )
+    });
+    let policy = filter.user.as_ref().and_then(|user| {
+        user.max_parental_rating_score
+            .map(|score| (score, user.max_parental_rating_sub_score.unwrap_or(0)))
+    });
+    match (requested, policy) {
+        (Some(requested), Some(policy)) => Some(requested.min(policy)),
+        (requested, policy) => requested.or(policy),
+    }
+}
+
+/// v12.2 `TranslateQuery`'s `MinParentalRating` bound
+/// (`TranslateQuery.cs:690-701`): an unrated item, or one rated above the
+/// minimum, or at its score with at least its sub-score.
+fn append_min_parental_rating(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+    let Some(min) = filter.min_parental_rating.as_ref() else {
+        return;
+    };
+    let score = i64::from(min.score);
+    qb.push(
+        r#" AND (bi."InheritedParentalRatingValue" IS NULL OR bi."InheritedParentalRatingValue" > "#,
+    )
+    .push_bind(score)
+    .push(r#" OR (bi."InheritedParentalRatingValue" = "#)
+    .push_bind(score)
+    .push(r#" AND COALESCE(bi."InheritedParentalRatingSubValue", 0) >= "#)
+    .push_bind(i64::from(min.sub_score.unwrap_or(0)))
+    .push("))");
+}
+
 fn append_max_parental_rating(
     qb: &mut QueryBuilder<Sqlite>,
     filter: &InternalItemsQuery,
     alias: &str,
 ) {
-    let limit = filter
-        .max_parental_rating
-        .as_ref()
-        .map(|rating| {
-            (
-                i64::from(rating.score),
-                i64::from(rating.sub_score.unwrap_or(0)),
-            )
-        })
-        .or_else(|| {
-            filter.user.as_ref().and_then(|user| {
-                user.max_parental_rating_score
-                    .map(|score| (score, user.max_parental_rating_sub_score.unwrap_or(0)))
-            })
-        });
-    let Some((score, subscore)) = limit else {
+    let Some((score, subscore)) = max_parental_limit(filter) else {
         return;
     };
     // v12.2 `BuildMaxParentalRatingFilter` (`QueryBuilding.cs:663-689`): the
@@ -675,6 +701,18 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
         append_inherited_tags(qb, filter, "bi");
     } else {
         append_parental_restrictions(qb, filter, "bi");
+    }
+    // Every arm of the chain applies the minimum. The last one
+    // (`TranslateQuery.cs:755-759`) keeps only the unrated items for
+    // `hasParentalRating=false`, and only when no bound and no unrated-kind
+    // block applies.
+    append_min_parental_rating(qb, filter);
+    if filter.has_parental_rating == Some(false)
+        && filter.block_unrated_items.is_empty()
+        && filter.min_parental_rating.is_none()
+        && max_parental_limit(filter).is_none()
+    {
+        qb.push(r#" AND bi."InheritedParentalRatingValue" IS NULL"#);
     }
     // --- resolution: the best any version offers, folders on descendants ---
     if filter.is_hd.is_some() || filter.is_4k.is_some() {
@@ -905,12 +943,16 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
             qb.push(r#" AND (bi."Overview" IS NULL OR bi."Overview" = '')"#);
         }
     }
+    // `HasOfficialRating` rolls up (`TranslateQuery.cs:761-768`): a series or
+    // box set with no rating of its own is rated when an item below it or
+    // linked to it is.
     if let Some(has) = filter.has_official_rating {
-        if has {
-            qb.push(r#" AND (bi."OfficialRating" IS NOT NULL AND bi."OfficialRating" <> '')"#);
-        } else {
-            qb.push(r#" AND (bi."OfficialRating" IS NULL OR bi."OfficialRating" = '')"#);
-        }
+        qb.push(if has { " AND " } else { " AND NOT " });
+        push_item_or_descendant_matching(qb, &|qb, alias| {
+            qb.push(format!(
+                r#"{alias}."OfficialRating" IS NOT NULL AND {alias}."OfficialRating" <> ''"#
+            ));
+        });
     }
     if !filter.official_ratings.is_empty() {
         qb.push(" AND ");
@@ -1657,6 +1699,56 @@ fn append_media_attribute_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Int
             qb.push(r#" AND (bi."Data" IS NULL OR bi."Data" NOT LIKE '%Video3DFormat%')"#);
         }
     }
+    // `e.Data!.Contains("IsPlaceHolder\":true")`, rolled up like
+    // `HasOfficialRating` (`TranslateQuery.cs:1201-1208`).
+    if let Some(want) = filter.is_place_holder {
+        qb.push(if want { " AND " } else { " AND NOT " });
+        push_item_or_descendant_matching(qb, &|qb, alias| {
+            qb.push(format!(r#"instr({alias}."Data", "#))
+                .push_bind("IsPlaceHolder\":true")
+                .push(") > 0");
+        });
+    }
+    // `seriesStatus.Any(f => e.Data!.Contains(f))` (`TranslateQuery.cs:1167-1172`):
+    // the status name anywhere in `Data`. EF's `Contains` is `instr`, so the
+    // match is ordinal.
+    if !filter.series_statuses.is_empty() {
+        qb.push(" AND (");
+        for (index, status) in filter.series_statuses.iter().enumerate() {
+            if index > 0 {
+                qb.push(" OR ");
+            }
+            qb.push(r#"instr(bi."Data", "#)
+                .push_bind(crate::library_scan::series_status_name(*status))
+                .push(") > 0");
+        }
+        qb.push(")");
+    }
+}
+
+/// v12.2 `FolderAwareFilterExtensions.WhereItemOrDescendantMatches`: the row
+/// matches when it satisfies `condition`, or an item below it (`AncestorIds`)
+/// or linked to it (`LinkedChildren`, any link type) does. `condition` pushes
+/// the predicate over a `BaseItems` alias.
+///
+/// The set is uncorrelated, so SQLite builds it once per statement and probes
+/// it by id; `direct` is `MATERIALIZED` because it is read three times, and
+/// inlined it would scan `BaseItems` for each. `NOT` in front is
+/// `WhereNeitherItemNorDescendantMatches`, exact because no id in the set is
+/// NULL (every column it reads is `NOT NULL`).
+fn push_item_or_descendant_matching(
+    qb: &mut QueryBuilder<Sqlite>,
+    condition: &dyn Fn(&mut QueryBuilder<Sqlite>, &str),
+) {
+    qb.push(
+        r#"(bi."Id" IN (WITH direct("Id") AS MATERIALIZED (SELECT d."Id" FROM "BaseItems" d WHERE "#,
+    );
+    condition(qb, "d");
+    qb.push(
+        r#") SELECT "Id" FROM direct
+        UNION SELECT a."ParentItemId" FROM "AncestorIds" a WHERE a."ItemId" IN (SELECT "Id" FROM direct)
+        UNION SELECT lc."ParentId" FROM "LinkedChildren" lc WHERE lc."ChildId" IN (SELECT "Id" FROM direct)))"#,
+    );
 }
 
 /// The language code standing for "undetermined": a list carrying it also

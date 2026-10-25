@@ -191,35 +191,6 @@ kind = "value"
 issue = 849
 reason = "Image cache tags hash the image file's path where Jellyfin hashes the item's path, so every image tag differs."
 
-# The page follows the difference gl-809 tracks.
-[[entry]]
-request = "GetItems.hasOfficialRating.true"
-path = "Items[].Id"
-kind = "value"
-issue = 809
-reason = "The page follows the difference gl-809 tracks."
-
-[[entry]]
-request = "GetItems.hasParentalRating.false"
-path = "Items[].Id"
-kind = "value"
-issue = 809
-reason = "The page follows the difference gl-809 tracks."
-
-[[entry]]
-request = "GetItems.seriesStatus.continuing"
-path = "Items[].Id"
-kind = "value"
-issue = 809
-reason = "The page follows the difference gl-809 tracks."
-
-[[entry]]
-request = "GetItems.seriesStatus.ended"
-path = "Items[].Id"
-kind = "value"
-issue = 809
-reason = "The page follows the difference gl-809 tracks."
-
 # The page follows the difference gl-80 tracks.
 [[entry]]
 request = "GetItems.isUnaired.false"
@@ -1250,48 +1221,6 @@ issue = 66
 reason = "The Collections library is created as a bare row, with another id."
 
 # ── filed from the first sweep with the edge cases (formerly filed.toml) ──
-[[entry]]
-request = "GetItems.hasParentalRating.false"
-path = "TotalRecordCount"
-kind = "value"
-issue = 809
-reason = "Ferrofin has no predicate for this /Items filter (series status, official ratings, parental rating, placeholders)."
-
-[[entry]]
-request = "GetItems.hasOfficialRating.*"
-path = "TotalRecordCount"
-kind = "value"
-issue = 809
-reason = "Ferrofin has no predicate for this /Items filter (series status, official ratings, parental rating, placeholders)."
-
-[[entry]]
-request = "GetItems.isPlaceHolder.true"
-path = "TotalRecordCount"
-kind = "value"
-issue = 809
-reason = "Ferrofin has no predicate for this /Items filter (series status, official ratings, parental rating, placeholders)."
-
-[[entry]]
-request = "GetItems.isPlaceHolder.true"
-path = "Items"
-kind = "length"
-issue = 809
-reason = "Ferrofin has no predicate for this /Items filter (series status, official ratings, parental rating, placeholders)."
-
-[[entry]]
-request = "GetItems.seriesStatus.*"
-path = "TotalRecordCount"
-kind = "value"
-issue = 809
-reason = "Ferrofin has no predicate for this /Items filter (series status, official ratings, parental rating, placeholders)."
-
-[[entry]]
-request = "GetItems.seriesStatus.*"
-path = "Items"
-kind = "length"
-issue = 809
-reason = "Ferrofin has no predicate for this /Items filter (series status, official ratings, parental rating, placeholders)."
-
 [[entry]]
 request = "GetItems.studios.*"
 path = "TotalRecordCount"

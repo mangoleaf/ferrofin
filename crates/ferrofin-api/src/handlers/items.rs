@@ -372,6 +372,31 @@ struct ItemsQuery {
     /// Restrict to items with (or without) a custom or official parental rating.
     #[serde(default, deserialize_with = "http_presence_filter")]
     has_parental_rating: Option<bool>,
+    /// Restrict to items with (or without) an official rating; a folder counts
+    /// as rated when an item below it is.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    has_official_rating: Option<bool>,
+    /// The lowest official rating to return, resolved to a parental-rating
+    /// score (`LocalizationManager.GetRatingScore`); unrated items stay in.
+    #[serde(default)]
+    min_official_rating: Option<String>,
+    /// The highest official rating to return, resolved like
+    /// `minOfficialRating`. It can lower the user's parental limit, never
+    /// raise it.
+    #[serde(default)]
+    max_official_rating: Option<String>,
+    /// Comma-delimited [`SeriesStatus`](ferrofin_model::entities::SeriesStatus)
+    /// set — jellyfin-web's TV Status filter.
+    #[serde(default)]
+    series_status: Option<String>,
+    /// Comma-delimited person types (`Actor`, `Director`, …) a `person` or
+    /// `personIds` credit must have.
+    #[serde(default)]
+    person_types: Option<String>,
+    /// Restrict to placeholder items (an offline disc stub), or exclude them;
+    /// a folder counts as one when an item below it is.
+    #[serde(default, deserialize_with = "http_presence_filter")]
+    is_place_holder: Option<bool>,
     /// Comma-delimited [`VideoType`](ferrofin_model::entities::VideoType) set
     /// (`BluRay`, `Dvd`, `Iso`).
     #[serde(default)]
@@ -546,6 +571,17 @@ async fn get_items(
     let user = resolve_user(&state, &auth, query.user_id).await?;
 
     let mut internal = items_query_options(&query, user)?;
+    // `query.MinParentalRating = _localization.GetRatingScore(minOfficialRating)`
+    // and the same for the maximum, each only when the parameter is not blank
+    // (v12.2 ItemsController.cs:515-525). The repository applies the stricter
+    // of the requested maximum and the user's own limit, so a request can
+    // lower a restricted user's ceiling but not raise it: upstream lets the
+    // request replace the limit `SetUser` copied from the user's policy, and an
+    // unrecognized rating there clears it.
+    internal.min_parental_rating =
+        official_rating_score(&state, query.min_official_rating.as_deref());
+    internal.max_parental_rating =
+        official_rating_score(&state, query.max_official_rating.as_deref());
     // C# `ItemsController.GetItems` (ItemsController.cs:307, 525-529) answers a
     // non-recursive, id-less request whose parent resolves to the
     // `UserRootFolder` with `folder.GetChildren(user, true)` — not with a query.
@@ -772,6 +808,18 @@ pub(crate) fn sort_items_by_request(query: &InternalItemsQuery, items: &mut [Bas
     });
 }
 
+/// An official rating parameter as a parental-rating score:
+/// `!string.IsNullOrWhiteSpace(rating) ? _localization.GetRatingScore(rating)`
+/// with no country code, so `None` for a blank or unrecognized rating.
+fn official_rating_score(
+    state: &AppState,
+    rating: Option<&str>,
+) -> Option<ferrofin_model::entities_media::ParentalRatingScore> {
+    rating
+        .filter(|rating| !rating.trim().is_empty())
+        .and_then(|rating| state.localization.get_rating_score(rating, None))
+}
+
 /// Convert HTTP query fields once, retaining the resolved user for DTO projection.
 fn items_query_options(
     query: &ItemsQuery,
@@ -829,6 +877,10 @@ fn items_query_options(
         has_tmdb_id: query.has_tmdb_id,
         has_tvdb_id: query.has_tvdb_id,
         has_parental_rating: query.has_parental_rating,
+        has_official_rating: query.has_official_rating,
+        series_statuses: parse_csv_enums_lenient(query.series_status.as_deref()),
+        person_types: parse_csv_strings(query.person_types.as_deref()),
+        is_place_holder: query.is_place_holder,
         video_types: parse_csv_enums_lenient(query.video_types.as_deref()),
         has_subtitles: query.has_subtitles,
         has_trailer: query.has_trailer,
@@ -2156,6 +2208,8 @@ crate::query::query_parameters! {
         "enableImageTypes" => ',',
         "audioLanguages" => ',',
         "subtitleLanguages" => ',',
+        "seriesStatus" => ',',
+        "personTypes" => ',',
     } => [("get", "/Items")];
     ItemQuery {} => [("get", "/Items/{itemId}")];
     DeleteItemsQuery {
@@ -2278,17 +2332,7 @@ mod tests {
     /// does not bind yet. Each is an open port from `ItemsController.GetItems`
     /// — bind it, honour it, and delete it here; the guard below fails on a
     /// stale entry, so this list can only shrink.
-    const UNBOUND_ITEMS_PARAMETERS: &[&str] = &[
-        "albums",
-        "artists",
-        "hasOfficialRating",
-        "isPlaceHolder",
-        "maxOfficialRating",
-        "minOfficialRating",
-        "personTypes",
-        "seriesStatus",
-        "studios",
-    ];
+    const UNBOUND_ITEMS_PARAMETERS: &[&str] = &["albums", "artists", "studios"];
 
     /// Every `GET /Items` parameter in the vendored contracts — 10.11.8, the
     /// route gate's pin, and 12.1.0, the newest vendored Jellyfin spec (whose additions,
