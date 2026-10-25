@@ -907,21 +907,6 @@ kind = "length"
 issue = 862
 reason = "Ferrofin compiles in TheTVDB, FanArt and OpenSubtitles (documented scope), which stock Jellyfin lacks."
 
-# The similar-item providers are listed in another order.
-[[entry]]
-request = "GetLibraryOptionsInfo"
-path = "TypeOptions[].SimilarItemProviders[].DefaultEnabled"
-kind = "value"
-issue = 842
-reason = "The similar-item providers are listed in another order."
-
-[[entry]]
-request = "GetLibraryOptionsInfo"
-path = "TypeOptions[].SimilarItemProviders[].Name"
-kind = "value"
-issue = 842
-reason = "The similar-item providers are listed in another order."
-
 # The Screen Grabber image provider is not ported.
 [[entry]]
 request = "GetLibraryOptionsInfo"

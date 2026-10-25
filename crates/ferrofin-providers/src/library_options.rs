@@ -1076,12 +1076,18 @@ pub fn library_options_info(
                     .map(|(name, _)| dynamic_info(name, Cap::ImageFetcher, type_name)),
             );
             // C# `LibraryController`: local similarity providers are ticked by
-            // default, remote ones are not.
-            let mut similar_item_providers = per_type(Cap::LocalSimilarity);
-            similar_item_providers.extend(per_type(Cap::Similarity).into_iter().map(|mut info| {
-                info.default_enabled = false;
-                info
-            }));
+            // default, remote ones are not. The remote ones come first:
+            // `GetSimilarItemsProviders<T>()` keeps the export order, which
+            // reaches `MediaBrowser.Providers` (TMDb, ListenBrainz) before
+            // `Emby.Server.Implementations` (the local providers).
+            let mut similar_item_providers: Vec<LibraryOptionInfoDto> = per_type(Cap::Similarity)
+                .into_iter()
+                .map(|mut info| {
+                    info.default_enabled = false;
+                    info
+                })
+                .collect();
+            similar_item_providers.extend(per_type(Cap::LocalSimilarity));
             LibraryTypeOptionsDto {
                 type_: Some(type_name.clone()),
                 metadata_fetchers,
@@ -2104,5 +2110,37 @@ mod tests {
                 .any(|p| p["Name"] == "TheMovieDb" && p["DefaultEnabled"] == false)
         );
         assert!(!choices.iter().any(|p| p["Name"] == "ListenBrainz"));
+    }
+
+    /// `GetLibraryOptionsInfo` keeps the plugin summary's order, and the
+    /// summary takes `GetSimilarItemsProviders<T>()` unsorted, in export
+    /// order (`SimilarItemsManager.cs:81-89`). `MediaBrowser.Providers`
+    /// (TMDb's movie and series providers, ListenBrainz) is exported before
+    /// `Emby.Server.Implementations` (the local ones,
+    /// `ApplicationHost.GetComposablePartAssemblies`), so the remote provider
+    /// is listed first, unticked.
+    #[rstest::rstest]
+    #[case("Movie", &[("TheMovieDb", false), ("Local Genre/Tag", true)])]
+    #[case("Series", &[("TheMovieDb", false), ("Local Genre/Tag", true)])]
+    #[case("MusicArtist", &[("ListenBrainz", false), ("Local Genre/Tag", true)])]
+    #[case("MusicAlbum", &[("Local Genre/Tag", true)])]
+    #[case("Episode", &[])]
+    fn similarity_providers_list_the_remote_ones_first(
+        #[case] kind: &str,
+        #[case] expected: &[(&str, bool)],
+    ) {
+        for is_new_library in [true, false] {
+            let dto = library_options_info(&[kind.to_owned()], is_new_library, &[], &[]);
+            let listed: Vec<(String, bool)> = dto.type_options[0]
+                .similar_item_providers
+                .iter()
+                .map(|p| (p.name.clone().unwrap_or_default(), p.default_enabled))
+                .collect();
+            let expected: Vec<(String, bool)> = expected
+                .iter()
+                .map(|(name, enabled)| ((*name).to_owned(), *enabled))
+                .collect();
+            assert_eq!(listed, expected, "{kind}, new library: {is_new_library}");
+        }
     }
 }
