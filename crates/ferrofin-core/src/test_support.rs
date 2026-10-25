@@ -933,3 +933,108 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
         self.clone()
     }
 }
+
+/// gl-571's fixture: a user root holding two libraries with one movie each
+/// (file paths, so `GetLinkedChildren(user)` checks their library), a box set
+/// linking both, and a user blocked from the second library.
+pub struct BoxSetAcrossLibraries {
+    /// The root folders, for [`rooted_library_manager`].
+    pub roots: crate::aggregate_folder::RootFolderIds,
+    /// The box set.
+    pub set: Uuid,
+    /// The user, blocked from the second library.
+    pub user: UserEntity,
+    /// The movie in the library the user can open, named "Shown".
+    pub shown: Uuid,
+    /// The movie in the library the user is blocked from, named "Blocked".
+    pub blocked: Uuid,
+}
+
+/// Seeds [`BoxSetAcrossLibraries`].
+pub async fn seed_box_set_across_libraries(db: &Database) -> BoxSetAcrossLibraries {
+    use ferrofin_traits::persistence::LinkedChildrenService as _;
+    let roots = crate::aggregate_folder::RootFolderIds {
+        user_root: Uuid::new_v4(),
+        aggregate: Uuid::new_v4(),
+    };
+    let set = Uuid::new_v4();
+    let user = seed_user_with_defaults(db, Uuid::new_v4()).await;
+    seed_named_item(db, roots.aggregate, BaseItemKind::AggregateFolder, "root").await;
+    seed_named_item(
+        db,
+        roots.user_root,
+        BaseItemKind::UserRootFolder,
+        "Media Folders",
+    )
+    .await;
+    seed_child_item(db, set, BaseItemKind::BoxSet, "Heist", roots.user_root).await;
+    let links = crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone());
+    let mut seeded = Vec::new();
+    for name in ["Shown", "Blocked"] {
+        let (library, movie) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_child_item(
+            db,
+            library,
+            BaseItemKind::CollectionFolder,
+            name,
+            roots.user_root,
+        )
+        .await;
+        seed_child_item(db, movie, BaseItemKind::Movie, name, library).await;
+        let mut row = fetch_item(db, movie).await;
+        row.top_parent_id = Some(guid_to_db(library));
+        row.path = Some(format!("/media/{name}/{name}.mkv"));
+        save_item(db, &row).await;
+        links
+            .upsert_linked_child(set, movie, 0)
+            .await
+            .expect("link");
+        seeded.push((library, movie));
+    }
+    crate::user_entity_ext::set_preference(
+        db.pool(),
+        &user.id,
+        ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
+        &[guid_to_db(seeded[1].0)],
+    )
+    .await
+    .expect("block");
+    BoxSetAcrossLibraries {
+        roots,
+        set,
+        user,
+        shown: seeded[0].1,
+        blocked: seeded[1].1,
+    }
+}
+
+/// A library manager over `db` wired for browsing as the composition root
+/// wires it: the repository's root ids, `configuration` and the visibility
+/// evaluator.
+pub fn rooted_library_manager(
+    db: &Database,
+    roots: crate::aggregate_folder::RootFolderIds,
+    configuration: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+) -> crate::FerrofinLibraryManager {
+    let items = Arc::new(
+        crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        )
+        .with_root_ids(roots),
+    );
+    let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+        db.clone(),
+        items.clone(),
+        Arc::new(crate::LocalizationManager::new("US")),
+        "/nonexistent/ferrofin-test-data".to_owned(),
+    ));
+    crate::FerrofinLibraryManager::new(
+        items,
+        Arc::new(crate::FerrofinItemCountService::new(db.clone())),
+        Arc::new(crate::FerrofinItemPersistenceService::new(db.clone())),
+        Arc::new(crate::FerrofinPeopleRepository::new(db.clone())),
+    )
+    .with_dashboard_configuration(configuration)
+    .with_visibility(visibility)
+}
