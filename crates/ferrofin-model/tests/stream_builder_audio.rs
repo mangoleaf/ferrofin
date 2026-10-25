@@ -15,7 +15,7 @@ use ferrofin_model::dlna::profile_condition::ProfileCondition;
 use ferrofin_model::dlna::stream_builder::StreamBuilder;
 use ferrofin_model::dlna::transcoder_support::TranscoderSupport;
 use ferrofin_model::dlna::transcoding_profile::TranscodingProfile;
-use ferrofin_model::dlna::{DeviceProfile, MediaOptions};
+use ferrofin_model::dlna::{DeviceProfile, MediaOptions, StreamBuilderError};
 use ferrofin_model::dto::MediaSourceInfo;
 use ferrofin_model::entities::MediaStreamType;
 use ferrofin_model::entities_media::MediaStream;
@@ -88,7 +88,9 @@ fn options(profile: DeviceProfile, source: MediaSourceInfo) -> MediaOptions {
 }
 
 fn optimal(options: &MediaOptions) -> Option<ferrofin_model::dlna::stream_info::StreamInfo> {
-    StreamBuilder::new(&Mp3AndAac).get_optimal_audio_stream(options)
+    StreamBuilder::new(&Mp3AndAac)
+        .get_optimal_audio_stream(options)
+        .expect("a profile the builder can evaluate")
 }
 
 fn music_player() -> DeviceProfile {
@@ -190,6 +192,83 @@ fn a_codec_condition_the_audio_fails_sends_a_direct_play_to_transcoding() {
         stream.transcode_reasons
     );
     assert_eq!(stream.container.as_deref(), Some("mp3"));
+}
+
+/// gl-125: a codec condition on a property an audio file has none of is the
+/// `ArgumentException` upstream's `ConditionProcessor` throws, and so ends
+/// the negotiation with an error instead of a panic.
+#[test]
+fn a_codec_condition_on_a_property_audio_lacks_is_an_error() {
+    let mut profile = music_player();
+    profile.codec_profiles = vec![CodecProfile {
+        codec_type: CodecType::Audio,
+        conditions: vec![ProfileCondition::new(
+            ProfileConditionType::Equals,
+            ProfileConditionValue::Width,
+            "1".to_owned(),
+        )],
+        ..CodecProfile::default()
+    }];
+    let error = StreamBuilder::new(&Mp3AndAac)
+        .get_optimal_audio_stream(&options(profile, source("flac", "flac", 2, 900_000)))
+        .expect_err("no width on an audio file");
+    assert_eq!(
+        error,
+        StreamBuilderError::UnexpectedProperty {
+            stream: "audio",
+            property: ProfileConditionValue::Width
+        }
+    );
+    assert!(error.is_invalid_argument());
+}
+
+/// `ApplyConditions.All(…)` stops at the first apply condition that fails, so
+/// a later one upstream would throw for is never evaluated: the profile just
+/// does not apply.
+#[test]
+fn an_apply_condition_after_a_failing_one_is_never_evaluated() {
+    let mut profile = music_player();
+    profile.codec_profiles = vec![CodecProfile {
+        codec_type: CodecType::Audio,
+        apply_conditions: vec![
+            ProfileCondition::new(
+                ProfileConditionType::LessThanEqual,
+                ProfileConditionValue::AudioChannels,
+                "1".to_owned(),
+            ),
+            ProfileCondition::new(
+                ProfileConditionType::Equals,
+                ProfileConditionValue::Width,
+                "1".to_owned(),
+            ),
+        ],
+        conditions: vec![ProfileCondition::with_required(
+            ProfileConditionType::LessThanEqual,
+            ProfileConditionValue::AudioBitrate,
+            "1".to_owned(),
+            true,
+        )],
+        ..CodecProfile::default()
+    }];
+    let stream = optimal(&options(profile, source("mp3", "mp3", 2, 320_000))).unwrap();
+    assert_eq!(stream.play_method, PlayMethod::DirectPlay);
+}
+
+/// `ValidateMediaOptions`: options for no item and no device are its
+/// `ArgumentException`, not a panic.
+#[test]
+fn options_without_an_item_or_a_device_are_an_error() {
+    let mut options = options(music_player(), source("mp3", "mp3", 2, 320_000));
+    options.item_id = Uuid::nil();
+    options.device_id = None;
+    let error = StreamBuilder::new(&Mp3AndAac)
+        .get_optimal_audio_stream(&options)
+        .expect_err("no item and no device");
+    assert_eq!(
+        error,
+        StreamBuilderError::InvalidOptions("DeviceId is required")
+    );
+    assert!(error.is_invalid_argument());
 }
 
 #[test]

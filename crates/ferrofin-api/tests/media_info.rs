@@ -1417,6 +1417,68 @@ async fn posted_media_source_id_returns_only_that_version_with_the_picked_tracks
     assert_eq!(sources[0]["DefaultSubtitleStreamIndex"], -1);
 }
 
+/// gl-125: a posted profile condition upstream's `ConditionProcessor` cannot
+/// evaluate throws, and `ExceptionMiddleware` answers the exception: a
+/// property the stream kind has none of is an `ArgumentException` (400), a
+/// comparison the value's type has none of an `InvalidOperationException`
+/// (500). Ferrofin used to panic on both.
+#[rstest::rstest]
+#[case::property_an_audio_track_lacks(
+    "VideoAudio",
+    "aac",
+    "Width",
+    "Equals",
+    "1",
+    StatusCode::BAD_REQUEST
+)]
+#[case::comparison_a_string_lacks(
+    "Video",
+    "h264",
+    "VideoProfile",
+    "LessThanEqual",
+    "high",
+    StatusCode::INTERNAL_SERVER_ERROR
+)]
+#[tokio::test]
+async fn an_unevaluable_profile_condition_is_answered_as_upstream_does(
+    #[case] codec_type: &str,
+    #[case] codec: &str,
+    #[case] property: &str,
+    #[case] condition: &str,
+    #[case] value: &str,
+    #[case] expected: StatusCode,
+) {
+    let item_id = Uuid::from_u128(0xABCD);
+    let mut source = version(&item_id.simple().to_string(), "aac");
+    source.media_streams[0].profile = Some("High".to_owned());
+    let mut profile = web_profile();
+    profile["CodecProfiles"] = serde_json::json!([{
+        "Type": codec_type,
+        "Codec": codec,
+        "Conditions": [{"Condition": condition, "Property": property, "Value": value, "IsRequired": false}]
+    }]);
+    let state = versions_state(
+        item_id,
+        versioned(vec![source]),
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"DeviceProfile": profile}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), expected);
+}
+
 #[tokio::test]
 async fn track_picks_without_a_media_source_id_apply_to_no_version() {
     // SetDeviceSpecificData applies the picks only to the version whose id
