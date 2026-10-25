@@ -11,6 +11,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 ## [Unreleased]
 
 ### Database
+- Rebuild the Live TV channel table without its cascading key to the tuner hosts
+  (migration 0046), keeping every channel and airing; the guide refresh removes a deleted
+  tuner's channels
 - Converge the schema on Jellyfin 12.0 (migrations 0032–0034): table rebuilds with a
   pre-rebuild snapshot, 12.0's index set (Ferrofin's 14 duplicate `BaseItems` indexes are
   not recreated), `LinkedChildren` as the only membership store
@@ -69,6 +72,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Decode an XMLTV guide declared `ISO-8859-9` (or `latin5`, `l5` and its other .NET names)
   as .NET's code page 28599 does, with `0x80`-`0x9F` as the C1 controls, not as
   `windows-1254`
+- `DELETE /LiveTv/TunerHosts` removes only the tuner, as Jellyfin's
+  `TunerHostManager.DeleteTunerHost` does: its channels and their airings stay in
+  `GET /LiveTv/Channels` and the guide until the guide refresh it queues removes them,
+  where they used to vanish from the guide at once while their items remained (migration
+  0046 drops the tuner → channel cascade)
 - Open an M3U tuner's playlist before saving it, as Jellyfin's `M3UTunerHost.Validate`
   does: a missing local playlist is a `404` and a failing playlist URL a `500`, where the
   tuner was saved and only the next guide refresh showed it empty. A Live TV source URL is

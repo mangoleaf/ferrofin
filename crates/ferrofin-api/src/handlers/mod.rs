@@ -1312,6 +1312,18 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "delete",
+        path: "/LiveTv/TunerHosts",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "DeleteTunerHost",
+        ferrofin: "handlers/live_tv.rs delete_tuner_host → ferrofin-livetv manager.rs \
+               delete_tuner_host, then queue_guide_refresh → refresh_guide's clean_database \
+               prune (TunerHostManager.DeleteTunerHost, GuideManager.CleanDatabase)",
+        date: "2026-10-24",
+        divergences: &[],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/Items/{itemId}/ContentType",
         upstream_file: "Jellyfin.Api/Controllers/ItemUpdateController.cs",

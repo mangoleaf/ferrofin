@@ -1759,9 +1759,9 @@ impl FerrofinLiveTvManager {
     /// An UPSERT, not a delete-and-reinsert: `GuideManager.RefreshChannelsInternal`
     /// saves each channel it found and only removes the ones the pass did not
     /// re-emit, at the very end. Deleting first would cascade every programme of
-    /// the tuner away (`FK_LiveTvChannels_TunerHosts_TunerHostId ON DELETE
-    /// CASCADE` reaches them through the channel rows), so a client reading the
-    /// guide mid-refresh would see it empty and briefly wrong.
+    /// the tuner away (`FK_LiveTvPrograms_Channels_ChannelId ON DELETE
+    /// CASCADE`), so a client reading the guide mid-refresh would see it empty
+    /// and briefly wrong.
     async fn replace_channels(
         &self,
         tuner_id: &str,
@@ -2726,6 +2726,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        // Only the configuration row goes, as upstream edits only the
+        // configuration: the host's channels and airings stay listed until the
+        // guide refresh the handler queues prunes them (migration 0046 dropped
+        // the cascade).
+        //
         // Recount so deleting the last host hides the guide-refresh task. This
         // is bookkeeping, not part of the delete's contract: a failed recount
         // must not turn a committed delete into a client-visible error.
@@ -5580,16 +5585,18 @@ impl FerrofinLiveTvManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The tuner host with this id, or its defaults when the row has gone (the
-    /// channel outlives a deleted host only in a torn state, and upstream's
-    /// `TunerHostInfo` defaults are the same "nothing configured" answer).
+    /// The tuner host with this id.
+    ///
+    /// A channel outlives its deleted host until the guide refresh prunes it
+    /// (migration 0046), and opening it meanwhile is upstream's
+    /// `DefaultLiveTvService.GetChannelStream` finding no host:
+    /// `ResourceNotFoundException("Tuner not found.")`, a 404.
     async fn tuner_host(&self, id: &str) -> Result<TunerHostInfo, ServiceError> {
-        Ok(self
-            .get_tuner_hosts()
+        self.get_tuner_hosts()
             .await?
             .into_iter()
             .find(|t| t.id.as_deref() == Some(id))
-            .unwrap_or_default())
+            .ok_or_else(|| ServiceError::not_found("Tuner not found."))
     }
 
     /// The registered host that owns this tuner row.
@@ -7718,6 +7725,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one lineup's life: refresh, delete, refresh
     async fn refresh_populates_channels_and_guide() {
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
@@ -7787,7 +7795,10 @@ mod tests {
             1
         );
 
-        // Deleting the tuner host cascades its channels (and their programmes).
+        // Deleting the tuner host leaves its channels and their programmes
+        // listed, as `TunerHostManager.DeleteTunerHost` only edits the
+        // configuration; the refresh it queues removes them
+        // (`CleanDatabase`).
         let host_id = mgr
             .get_tuner_hosts()
             .await
@@ -7797,10 +7808,47 @@ mod tests {
             .id
             .unwrap();
         mgr.delete_tuner_host(&host_id).await.expect("del host");
+        assert!(mgr.get_tuner_hosts().await.expect("h2").is_empty());
         assert_eq!(
             mgr.get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
                 .await
                 .expect("c3")
+                .total_record_count,
+            2,
+            "listed until the refresh"
+        );
+        assert_eq!(
+            mgr.get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+                .await
+                .expect("p3")
+                .total_record_count,
+            1,
+            "airings stay with their channel"
+        );
+        // Meanwhile the channel has no tuner to open: "Tuner not found.".
+        let err = mgr
+            .open_channel_stream(chan_id, None)
+            .await
+            .expect_err("no tuner to open");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+        let err = mgr
+            .get_channel_media_sources(chan_id)
+            .await
+            .expect_err("no tuner to ask");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+        mgr.refresh_guide().await.expect("refresh3");
+        assert_eq!(
+            mgr.get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
+                .await
+                .expect("c4")
+                .total_record_count,
+            0,
+            "the refresh removes a deleted tuner's channels"
+        );
+        assert_eq!(
+            mgr.get_programs(&InternalItemsQuery::default(), &DtoOptions::default())
+                .await
+                .expect("p4")
                 .total_record_count,
             0
         );
@@ -8307,9 +8355,9 @@ mod tests {
     ///
     /// The upstream guard is the `cleanDatabase` flag, which ONLY a thrown
     /// `RefreshChannelsInternal` clears (v10.11.8 GuideManager.cs:130-134,
-    /// :145-148) — never an empty lineup. Removing the last tuner cascades its
-    /// channels away, so the next refresh sees an empty lineup and must take
-    /// the channel items with it rather than leave them answering
+    /// :145-148) — never an empty lineup. Removing the last tuner leaves no
+    /// lineup, so the next refresh sees an empty one and must take its channel
+    /// rows and items with it rather than leave them answering
     /// `GET /Items/{id}` for ever. Ferrofin has no empty-because-failed case to
     /// confuse this with: a failed lineup fetch never reaches
     /// `replace_channels`, so the cached channel rows survive and the lineup

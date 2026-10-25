@@ -20,6 +20,11 @@ major-version upgrade.
 - **An XMLTV guide declared `ISO-8859-9` is decoded as that code page.** Bytes `0x80`-`0x9F`
   read as control characters, as in Jellyfin, not as the `windows-1254` punctuation (`€`,
   `‚`, …) they were read as before. Turkish letters are unchanged.
+- **Removing a tuner leaves its channels listed until the guide refresh it starts finishes.**
+  As in Jellyfin, the guide and `GET /LiveTv/Channels` keep showing the removed tuner's
+  channels (they cannot be played) until a guide refresh finishes cleanly; one that cannot
+  read a tuner or a guide leaves them for the next. Migration 0046 rebuilds the Live TV channel
+  table to allow this; it keeps every channel and airing.
 
 ## Unreleased — Live TV sources are checked and read as Jellyfin reads them
 
