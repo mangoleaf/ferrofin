@@ -27,9 +27,9 @@ case "$DIR" in /mnt/mangonas*|/mnt/nvme0/k3s*) echo "refusing to build under $DI
 if "$PREPARE" && "$EXPORT_POOLS"; then echo "choose preparation or pool export, not both" >&2; exit 2; fi
 if "$PREPARE" || "$EXPORT_POOLS"; then
   for t in docker python3 jq sha256sum; do command -v "$t" >/dev/null || { echo "$t not installed" >&2; exit 1; }; done
-  [ -f "$DIR/config/data/jellyfin.db" ] && [ -f "$DIR/ids.json" ] && [ -f "$DIR/media/summary.json" ] || {
-    echo "build the 10.11.8 source fixture first" >&2; exit 1;
-  }
+  for built in config/data/jellyfin.db ids.json media/summary.json; do
+    [ -f "$DIR/$built" ] || { echo "build the 10.11.8 source fixture first" >&2; exit 1; }
+  done
   PREPARED=$DIR/jellyfin
   if "$EXPORT_POOLS"; then PREPARED=$DIR/cache/pool-export-$$; fi
   [ ! -e "$PREPARED" ] || { echo "$PREPARED exists; choose a new fixture directory or move the old preparation aside" >&2; exit 1; }

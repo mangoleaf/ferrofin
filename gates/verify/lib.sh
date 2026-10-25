@@ -124,7 +124,8 @@ verify_combine() {
   local dir=$1 rc=$2 kind rows libraries='{}'
   shift 2
   for kind; do
-    rows=$(jq -c . "$dir/rows-$kind.json" 2>/dev/null) && [ -n "$rows" ] || rows=null
+    rows=$(jq -c . "$dir/rows-$kind.json" 2>/dev/null) || rows=''
+    [ -n "$rows" ] || rows=null
     libraries=$(jq -c --arg kind "$kind" --argjson rows "$rows" '. + {($kind): $rows}' <<<"$libraries")
     rm -f -- "$dir/rows-$kind.json"
   done

@@ -99,7 +99,8 @@ until http "$URL/System/Info/Public" >/dev/null; do
 done
 TOKEN=$(VERIFY_PW=$PASSWORD jq -n '{Username: "verify", Pw: env.VERIFY_PW}' \
   | http -H "Authorization: $AUTH" -H 'Content-Type: application/json' --data-binary @- "$URL/Users/AuthenticateByName" \
-  | jq -r '.AccessToken // empty') && [ -n "$TOKEN" ] || fail "the administrator could not sign in"
+  | jq -r '.AccessToken // empty') || TOKEN=''
+[ -n "$TOKEN" ] || fail "the administrator could not sign in"
 (umask 077; printf 'Authorization: MediaBrowser Token="%s", Client="gates", Device="gates", DeviceId="gates-verify", Version="1"\n' "$TOKEN" > "$SECRETS/auth")
 # library <name> <collection type> <folder> <item type…>: an empty library on /media/<folder>, with
 # real-time monitoring off (the check refuses it on) and no metadata fetchers for those item types,

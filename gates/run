@@ -184,7 +184,7 @@ finish() { # finish <exit status>: the session's end, its report (gates/report.p
   else echo "run: the session report could not be written (gates/report.py $S)" >&2; fi
   exit "$1"
 }
-# shellcheck disable=SC2329  # invoked by the traps below
+# shellcheck disable=SC2317,SC2329  # invoked by the traps below (SC2317 is the code before shellcheck 0.11)
 interrupted() { # interrupted <exit status>: stop the running gate (its own cleanup runs), then finish
   trap '' INT TERM HUP
   if [ -n "$GATE_PID" ]; then kill -TERM -- "-$GATE_PID" 2>/dev/null; wait "$GATE_PID"; fi
