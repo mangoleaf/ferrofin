@@ -10,12 +10,13 @@ description = "Leaf utilities for Ferrofin (port of Jellyfin.Extensions)."
 workspace = true
 
 [dependencies]
-# `process_priority`'s `ChildProcess` for `tokio::process::Child`.
+# `process_priority`'s `ChildProcess` for `tokio::process::Child`, and the
+# async mutexes of `keyed_locks`.
 tokio = { workspace = true, optional = true }
 uuid.workspace = true
 thiserror.workspace = true
-rand = "0.8"
-unicode-normalization = "0.1"
+rand.workspace = true
+unicode-normalization.workspace = true
 regex.workspace = true
 icu_casemap.workspace = true
 icu_collator.workspace = true
@@ -27,7 +28,7 @@ icu_provider.workspace = true
 zerovec.workspace = true
 
 [features]
-# `process_priority::ChildProcess` for `tokio::process::Child`.
+# `process_priority::ChildProcess` for `tokio::process::Child`, and `keyed_locks`.
 tokio = ["dep:tokio"]
 
 # `process_priority`: the OS priority of background ffmpeg/ffprobe processes.

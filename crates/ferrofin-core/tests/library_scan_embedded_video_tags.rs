@@ -120,7 +120,14 @@ impl MediaEncoder for Tagged {
         _: Option<Video3DFormat>,
         _: Option<i64>,
     ) -> Result<String, ServiceError> {
-        Err(ServiceError::backend("no frames"))
+        // A first scan grabs a frame for a video with no artwork (the
+        // Screen Grabber); a real ffmpeg delivers one.
+        let frame = std::env::temp_dir().join(format!(
+            "ferrofin-test-frame-{}.jpg",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&frame, b"FRAME").map_err(ServiceError::backend_source)?;
+        Ok(frame.to_string_lossy().into_owned())
     }
     fn get_input_argument(&self, input_file: &str, _: &MediaSourceInfo) -> String {
         input_file.to_owned()

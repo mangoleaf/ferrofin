@@ -672,11 +672,12 @@ pub const REAL_ROUTES: &[(&str, &str)] = &[
     ("get", "/Branding/Splashscreen"),
     ("post", "/Branding/Splashscreen"),
     ("delete", "/Branding/Splashscreen"),
-    // Plugins Tier 1 — the plugin-manager surface (`PluginsController` +
-    // `PackageController`) over the compile-time plugin registry. Reads,
-    // enable/disable, config, and the repository list are real; install and
-    // uninstall are honest rejections (they need the Tier-2 dynamic host, not a
-    // faked success). See `handlers::plugins`.
+    // Plugins — the plugin-manager surface (`PluginsController` +
+    // `PackageController`) over the plugin registry: compiled-in (Tier 1a)
+    // plugins and the WASM (Tier 1b) plugins the host loaded. Reads,
+    // enable/disable, config, the repository list, and WASM install and
+    // uninstall are real; a compiled-in plugin refuses both. See
+    // `handlers::plugins`.
     ("get", "/Plugins"),
     ("get", "/Plugins/{pluginId}/Configuration"),
     ("post", "/Plugins/{pluginId}/Configuration"),
@@ -1073,7 +1074,7 @@ pub const VERIFIED: &[Verified] = &[
                (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
                to_extension, decode_base64) → ferrofin-core user_manager.rs \
                save_profile_image",
-        date: "2026-10-20",
+        date: "2026-10-24",
         divergences: &[
             "The body is decoded in full before anything is written, so a body the decoder \
          rejects is a 400 that changes nothing. Upstream clears the old profile image row \
@@ -1088,8 +1089,10 @@ pub const VERIFIED: &[Verified] = &[
          checked, so a body that is not UTF-8 is the extractor's 400 whatever the user or \
          type; upstream resolves the user and checks the type first, and fails such a body \
          with a 500 while decoding. Jellyfin bug not ported.",
-            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
-         Fix path: gl-24.",
+            "A body past Kestrel's 30,000,000-byte default (MAX_UPLOAD_BODY_BYTES, the same \
+         cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
+         Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
+         Jellyfin bug not ported.",
         ],
         refs: &[],
     },
@@ -1129,13 +1132,15 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/lyrics.rs upload_lyrics (upload_format, queue_high_priority_refresh) \
                → ferrofin-core lyric_manager.rs save_lyric (decode_stream_text, save_targets, \
                try_save_to_files)",
-        date: "2026-10-19",
+        date: "2026-10-24",
         divergences: &[
             "An upload with no Content-Length (a chunked body) is read and saved; upstream \
          tests Request.ContentLength and answers every chunked upload 400 \"No lyrics \
          uploaded\". Jellyfin bug not ported.",
-            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
-         Fix path: gl-24.",
+            "A body past Kestrel's 30,000,000-byte default (MAX_UPLOAD_BODY_BYTES, the same \
+         cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
+         Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
+         Jellyfin bug not ported.",
         ],
         refs: &[],
     },
@@ -1206,7 +1211,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/branding.rs upload_splashscreen → handlers/image_upload.rs \
                (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
                to_extension, decode_base64)",
-        date: "2026-10-20",
+        date: "2026-10-24",
         divergences: &[
             "The body is decoded in full before anything is written, and the location is \
          recorded only after the file is: a body the decoder rejects is a 400 that changes \
@@ -1222,8 +1227,10 @@ pub const VERIFIED: &[Verified] = &[
          that is not UTF-8 is the extractor's 400 whatever its type; upstream checks the \
          type first and fails such a body with a 500 while decoding. Jellyfin bug not \
          ported.",
-            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
-         Fix path: gl-24.",
+            "A body past Kestrel's 30,000,000-byte default (MAX_UPLOAD_BODY_BYTES, the same \
+         cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
+         Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
+         Jellyfin bug not ported.",
         ],
         refs: &[],
     },
@@ -1406,11 +1413,12 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Users/{userId}/Policy",
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "UpdateUserPolicy",
-        ferrofin: "handlers/users.rs update_user_policy → ferrofin-core user_manager.rs \
-               update_policy_guarded (save_policy: UserManager.UpdatePolicyAsync behind \
-               ferrofin-traits policy_update_refusal) → session_manager.rs revoke_user_tokens; \
-               handlers/users.rs refresh_device_access (DeviceAccessHost)",
-        date: "2026-10-24",
+        ferrofin: "handlers/users.rs update_user_policy (policy_validation: UserPolicy's \
+               [Required(AllowEmptyStrings = false)] provider ids) → ferrofin-core \
+               user_manager.rs update_policy_guarded (save_policy: UserManager.UpdatePolicyAsync \
+               behind ferrofin-traits policy_update_refusal) → session_manager.rs \
+               revoke_user_tokens; handlers/users.rs refresh_device_access (DeviceAccessHost)",
+        date: "2026-10-25",
         divergences: &[
             "The three guards (the last administrator, an administrator disabled, the last \
          enabled user) are read inside the transaction that saves, and a newly disabled \
@@ -1420,9 +1428,6 @@ pub const VERIFIED: &[Verified] = &[
          ported.",
             "The 403 (a guard refused) and 404 (unknown user) bodies are Ferrofin's error \
          shape, not upstream's. Fix path: gl-666.",
-            "A body without AuthenticationProviderId or PasswordResetProviderId, or with either \
-         empty, is saved with the empty string, where upstream's [Required(AllowEmptyStrings \
-         = false)] model validation answers 400. Fix path: gl-863.",
         ],
         refs: &[],
     },
@@ -1431,22 +1436,41 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Users",
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "UpdateUser",
-        ferrofin: "handlers/users.rs update_user (also behind the hidden POST /Users/{userId}) → \
-               ferrofin-core user_manager.rs rename_user, update_configuration; \
-               handlers/users.rs refresh_device_access (DeviceAccessHost after a rename)",
-        date: "2026-10-24",
+        ferrofin: "handlers/users.rs update_user (also behind the hidden POST /Users/{userId}; \
+               policy_validation for the nested Policy's [Required] provider ids; UserDto's \
+               serde default for a missing Configuration) → ferrofin-core user_manager.rs \
+               rename_user (require_valid_username: ThrowIfInvalidUsername), \
+               update_configuration (one writer transaction, as one SaveChangesAsync; \
+               accepted_cast_receiver_id); handlers/users.rs notify_user_updated \
+               (UserUpdatedNotifier) and refresh_device_access (DeviceAccessHost), both after a \
+               rename only",
+        date: "2026-10-25",
         divergences: &[
-            "A body without Name, or with a null one, keeps the name and answers 204, \
-         where upstream passes the null to RenameUser and ThrowIfInvalidUsername answers 400; \
-         a body without Configuration keeps the stored settings, where upstream's UserDto \
-         constructor supplies a default configuration that resets them. Fix path: gl-871.",
             "\"Configuration\": null skips the configuration save, where upstream dereferences \
          the null in UpdateConfigurationAsync and answers 500. Jellyfin bug not ported.",
-            "Every save pushes UserUpdated to the user's sessions once the configuration is \
-         saved, where upstream pushes it only from a rename (RenameUser raises \
-         UserUpdatedEventArgs; UpdateConfigurationAsync raises nothing). Fix path: gl-864.",
             "The 400 (invalid or taken name), 403 (update not allowed) and 404 (unknown user) \
          bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Users/Configuration",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "UpdateUserConfiguration",
+        ferrofin: "handlers/users.rs update_user_configuration (also behind the hidden \
+               POST /Users/{userId}/Configuration; JsonBody for the [Required] body; \
+               assert_can_update_user: RequestHelpers.AssertCanUpdateUser with \
+               restrictUserPreferences) → ferrofin-core user_manager.rs update_configuration \
+               (UserManager.UpdateConfigurationAsync: the Users columns and the OrderedViews, \
+               GroupedFolders, MyMediaExcludes and LatestItemExcludes preferences in one writer \
+               transaction; accepted_cast_receiver_id: a non-empty id naming a configured \
+               receiver, else the stored one is kept); no UserUpdated push, as \
+               UpdateConfigurationAsync raises no event",
+        date: "2026-10-25",
+        divergences: &[
+            "The 403 (update not allowed) and 404 (unknown user) bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1525,41 +1549,56 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/DisplayPreferences/{displayPreferencesId}",
+        upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
+        upstream_method: "GetDisplayPreferences",
+        ferrofin: "handlers/display_preferences.rs get_display_preferences (Query: \
+               ConvertEmptyStringToNull, then [Required] client from query/required.json; \
+               effective_user_id: RequestHelpers.GetUserId; resolve_item_id: Guid.TryParse \
+               else GetMD5; index_by_name, chromecast_name, home_section_name) → ferrofin-core \
+               display_preferences_manager.rs (get_display_preferences, \
+               get_item_display_preferences, list_custom_item_display_preferences, \
+               list_home_sections) → ferrofin-db database.rs home_sections (Order, then Id: \
+               the Include(HomeSections) load order); ferrofin-model \
+               dto/display_preferences_dto.rs",
+        date: "2026-10-25",
+        divergences: &[
+            "CustomPrefs members are written in hash order, not upstream's insertion order \
+         (the home sections, the scalar keys, then the stored preferences); the members and \
+         values are the same.",
+            "The 400 for a missing, empty or whitespace-only client or an unparsable userId \
+         and the 403 for another user's id without the administrator role are Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/DisplayPreferences/{displayPreferencesId}",
         upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
         upstream_method: "UpdateDisplayPreferences",
-        ferrofin: "handlers/display_preferences.rs update_display_preferences (JsonBody \
-               DisplayPreferencesDto, take_pref/take_nullable_pref, enum_try_parse) → \
-               ferrofin-core display_preferences_manager.rs (get_display_preferences, \
+        ferrofin: "handlers/display_preferences.rs update_display_preferences (Query: \
+               ConvertEmptyStringToNull, then [Required] client from query/required.json; \
+               JsonBody DisplayPreferencesDto, resolve_item_id: Guid.TryParse else GetMD5, \
+               take_pref/take_nullable_pref, enum_try_parse for Enum.TryParse/Enum.Parse, \
+               parse_dotnet_int/parse_dotnet_bool for int.Parse/bool.Parse) → ferrofin-core \
+               display_preferences_manager.rs (get_display_preferences, \
                get_item_display_preferences, set_custom_item_display_preferences, \
                update_item_display_preferences, update_display_preferences, \
                set_home_sections) → ferrofin-db database.rs replace_home_sections; \
                ferrofin-model dto/display_preferences_dto.rs",
-        date: "2026-10-24",
+        date: "2026-10-25",
         divergences: &[
-            "SortBy, SortOrder, RememberSorting and RememberIndexing are written to one \
-         shared empty-GUID ItemDisplayPreferences row per user and client unless the item \
-         already has its own row; upstream stores them under the item \
-         (GetItemDisplayPreferences creates the row under itemId, and the controller sets \
-         itemPrefs.ItemId = itemId). Fix path: gl-447.",
             "A missing or empty skipBackLength/skipForwardLength stores 10000/30000 ms; \
          upstream's controller stores 15000 for both. Fix path: gl-410.",
-            "chromecastVersion and IndexBy are read by exact member name only: upstream's \
-         Enum.Parse/Enum.TryParse also take an integer, a comma list and surrounding white \
-         space, and an unknown chromecastVersion is a 400 there (ArgumentException) where \
-         it is stored as Stable here; int.Parse and bool.Parse also ignore surrounding \
-         white space in the skip lengths, the homesection order and \
-         enableNextVideoInfoOverlay. Fix path: gl-880.",
-            "displayPreferencesId is parsed with Uuid::parse_str, not Guid.TryParse, so a \
-         urn:uuid: id is taken as a GUID where upstream MD5-hashes it, and a (…), {0x…} or \
-         padded id is MD5-hashed where upstream parses it. Fix path: gl-881.",
             "Values upstream fails on with a 500 take the defaults here: an \
          enableNextVideoInfoOverlay that is not true/false (bool.Parse) is true, a \
          non-numeric or overflowing skip length (int.Parse) is the fallback, a homesection \
          key with a non-numeric suffix is dropped, a bare homesection key stays a custom \
-         pref, and a negative order falls back to None instead of indexing defaults[-1]. \
-         Jellyfin bug not ported.",
+         pref, a negative order falls back to None instead of indexing defaults[-1], and a \
+         chromecastVersion integer outside Int32 is a 400 (Enum.Parse's OverflowException \
+         is a 500 there). Jellyfin bug not ported.",
             "Every save replaces the row's HomeSection children. Upstream clears the \
          collection of an entity loaded in a disposed context and attaches it to a new \
          one, so EF inserts the new sections but never deletes the old rows: they pile up, \
@@ -1567,9 +1606,10 @@ pub const VERIFIED: &[Verified] = &[
          Jellyfin bug not ported.",
             "An invalid landing-* ViewType is logged at warn, as bad client input \
          (docs/conventions/LOGGING.md), where upstream logs it at error.",
-            "The 400 for a missing or blank client or an unparsable userId, the 403 for \
-         another user's id without the administrator role, and the error text of a body \
-         that does not bind are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 400 for a missing, empty or whitespace-only client, an unparsable userId or \
+         a chromecastVersion Enum.Parse refuses, the 403 for another user's id without the \
+         administrator role, and the error text of a body that does not bind are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1581,12 +1621,13 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/playlists.rs create_playlist (CreatePlaylistQuery, effective_user_id) \
                → ferrofin-model playlists.rs CreatePlaylistDto → ferrofin-core \
                collection_manager.rs FerrofinPlaylistManager::create_playlist \
-               (PlaylistManager.CreatePlaylist: playlists_folder, a lookup like \
-               GetPlaylistsFolder; infer_media_type, require_user, \
+               (PlaylistManager.CreatePlaylist: playlists_folder → item_persistence_service \
+               playlists_folder_by_type, GetPlaylistsFolder's by-type lookup; \
+               infer_media_type, require_user, \
                new_playlist_folder_and_id, then report_item_added for AddChild's \
                ItemAdded; playlist_items for AddToPlaylistInternal and \
                Playlist.GetPlaylistItems)",
-        date: "2026-10-24",
+        date: "2026-10-25",
         divergences: &[
             "A request with neither a body nor a name query is a 400; upstream's \
          GetValidFilename(null) throws a NullReferenceException (500). Jellyfin bug not \
@@ -1599,11 +1640,10 @@ pub const VERIFIED: &[Verified] = &[
          to the next `1`-suffixed folder; upstream's GetTargetPath checks only \
          Directory.Exists, so a file makes CreateDirectory throw (500) and a row whose \
          folder went missing is saved over. Jellyfin bug not ported.",
-            "The playlists folder is found by its path (any row there, whatever its type or \
-         parent), then by the id derived from data\\playlists, not as GetPlaylistsFolder \
-         finds it (the first PlaylistsFolder child of the root, then of the user root, by \
-         type); and the lookup re-parents parentless playlists (adopt_orphans), where \
-         upstream's writes nothing. Fix path: gl-921.",
+            "The new playlist's directory is made in {data}/playlists, where upstream \
+         combines the found folder's Path; they differ only for a folder found by type away \
+         from that directory, since startup keeps the folder in use there \
+         (AggregateFolderStore::ensure).",
             "The first ForceSave refresh writes no playlist.xml into the new folder, where \
          upstream's PlaylistXmlSaver saves one. Fix path: gl-341.",
             "With no media type named and a mixed folder as the first deciding id, the type \
@@ -1615,16 +1655,61 @@ pub const VERIFIED: &[Verified] = &[
             "A malformed id in the ids query is a 400; upstream's \
          CommaDelimitedCollectionModelBinder drops it, so an all-malformed list falls back \
          to the body's Ids. Fix path: gl-884.",
-            "A Users entry without CanEdit or UserId is a 400; upstream binds \
-         PlaylistUserPermissions through its constructor, defaulting them to false and the \
-         empty GUID. Fix path: gl-885.",
-            "A user named twice in Users keeps one share, with the last entry's CanEdit; \
-         upstream stores and lists both, and grants edit if either has CanEdit. Fix path: \
-         gl-886.",
+            "A user named twice in Users keeps one share, at their first entry's place, that \
+         can edit when any of their entries can: the permission upstream grants \
+         (Shares.Any(s => s.CanEdit && …)). Upstream stores and lists every entry, so GET \
+         /Playlists/{id}/Users lists such a user once here, GET \
+         /Playlists/{id}/Users/{userId} answers the combined CanEdit where upstream's \
+         FirstOrDefault answers the first entry's, and DELETE \
+         /Playlists/{id}/Users/{userId} removes the user's one share where upstream \
+         removes only the first entry (a second one keeps sharing). Fix path: gl-949.",
             "The 400 (no name, no playlists folder, an unknown id while the media type is \
          inferred, an API key that names no user) and 403 (another user's id without the \
          administrator role) bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Playlists/{itemId}",
+        upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
+        upstream_method: "UpdatePlaylist",
+        ferrofin: "handlers/playlists.rs update_playlist (get_playlist_access + require_edit: \
+               GetPlaylistForUser and the owner-or-editing-share check) → ferrofin-model \
+               playlists.rs UpdatePlaylistDto, entities_media.rs PlaylistUserPermissions \
+               (constructor defaults) → ferrofin-core collection_manager.rs \
+               FerrofinPlaylistManager::update_playlist (PlaylistManager.UpdatePlaylist: \
+               playlist_items for the Ids' AddToPlaylistInternal, rename_named_item_in, \
+               OpenAccess, share_playlist_in, sync_container_data_in, queue_refresh)",
+        date: "2026-10-25",
+        divergences: &[
+            "Ids, Name, Users and IsPublic are saved in one transaction with the Data sync; \
+         upstream saves the cleared entries before it adds the new ones and then saves the \
+         rest, so a failure part way leaves a partial update. Jellyfin bug not ported.",
+            "An Ids entry naming a container that holds this playlist expands that container \
+         with this playlist's entries from before the update; upstream clears them first, so \
+         it expands without them. The playlist's own id expands to nothing on both.",
+            "When the entries change, the members are re-rated before the refresh is queued; \
+         upstream re-rates them in that refresh (MetadataService's UpdateRatingToItems). The \
+         ratings end the same.",
+            "SavePlaylistFile has no caller: a playlist file the scan found has no owner and \
+         no editing share, so an update of it is a 403 here as upstream, and no update \
+         reaches a file.",
+            "A user named twice in Users keeps one share, at their first entry's place, that \
+         can edit when any of their entries can: the permission upstream grants \
+         (Shares.Any(s => s.CanEdit && …)). Upstream stores and lists every entry, so GET \
+         /Playlists/{id}/Users lists such a user once here, GET \
+         /Playlists/{id}/Users/{userId} answers the combined CanEdit where upstream's \
+         FirstOrDefault answers the first entry's, and DELETE \
+         /Playlists/{id}/Users/{userId} removes the user's one share where upstream \
+         removes only the first entry (a second one keeps sharing). Fix path: gl-949.",
+            "A body Ids sent as a comma-delimited string is a 400; upstream's \
+         JsonCommaDelimitedCollectionConverterFactory splits it and drops entries that do \
+         not parse (so \"abc\" clears the playlist). Fix path: gl-883.",
+            "The 404 (no playlist the caller can see) and 403 (no editing share) bodies are \
+         Ferrofin's error shape, not upstream's (a \"Playlist not found\" string and an \
+         empty Forbid). Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1640,9 +1725,6 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
      that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
      answers with nothing.",
     UNKNOWN_PARENT_ID_DIVERGENCE,
-    "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
-     (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
-     append_by_name_filters.",
     "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
      user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
      ported.",
@@ -1652,6 +1734,10 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
      Un-defer path: make `ItemWithCounts.counts` an `Option` in ferrofin-traits.",
     "`minCommunityRating`, `person`, `personIds`, `personTypes` are accepted and ignored, \
      exactly as v12 — GetItemValues copies none of them onto either filter.",
+    "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
+     chosen on, and matches CleanName with, the raw lower-cased term rather than the \
+     cleaned one, a whitespace-only term filters nothing (upstream's IsNullOrEmpty applies \
+     it), and there is no OriginalTitle arm. Fix path: gl-957.",
 ];
 
 /// What `/Genres`, `/MusicGenres` and `/Studios` do differently from their v12
@@ -1668,9 +1754,10 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
     "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
      AncestorIds in every case, so a non-folder parent answers with nothing.",
     UNKNOWN_PARENT_ID_DIVERGENCE,
-    "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
-     (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
-     append_by_name_filters.",
+    "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
+     chosen on, and matches CleanName with, the raw lower-cased term rather than the \
+     cleaned one, a whitespace-only term filters nothing (upstream's IsNullOrEmpty applies \
+     it), and there is no OriginalTitle arm. Fix path: gl-957.",
 ];
 
 /// Included in the divergence lists of the five by-name VERIFIED rows; the

@@ -119,8 +119,12 @@ interface types {
     /// a strictly larger grant than settings pages (admin-only). It is the
     /// single strongest reason to install only plugins you trust.
     record web-transform {
-        /// The served-file name pattern the transform applies to
-        /// (e.g. `index.html`, `*.chunk.js`).
+        /// The served files the transform applies to, by their path under
+        /// the web root: an exact path (`index.html`), else a Rust regex
+        /// matched anywhere in the path, unanchored (`\.chunk\.js$` for
+        /// every chunk; a bare `index.html` also matches `xindex.html`).
+        /// It is not a glob: the host refuses a pattern that is not a
+        /// valid regex, such as `*.chunk.js`.
         path-pattern: string,
         /// The literal text to find (the host caps it at 256 KiB, and
         /// refuses a blank one).

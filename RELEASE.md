@@ -42,10 +42,12 @@ Pick the branch to release from:
 Either way, the steps are the same; "the release branch" below means the branch you release
 from.
 
-1. **Ensure the branch is green** — the `CI` workflow (lint, tests, per-crate coverage gate)
-   must have succeeded on the commit you are releasing; the workflow refuses otherwise. `main`
-   and `release/vX.Y.Z` get CI on every push, and the workflow reads that push run. The
-   release PR (release branch → `main`) shows the same run's checks and runs no CI of its own.
+1. **Ensure the branch is green** — the `CI` workflow (lint, tests, per-crate coverage gate,
+   the `dependencies` supply-chain check) must have succeeded on the commit you are releasing;
+   the workflow refuses otherwise, and re-runs `cargo deny check advisories` before it tags, so
+   an advisory published since that CI run blocks the release too. `main` and
+   `release/vX.Y.Z` get CI on every push, and the workflow reads that push run. The release
+   PR (release branch → `main`) shows the same run's checks and runs no CI of its own.
 2. **Freeze and measure the release branch.** PRs are not benchmarked individually, so this
    is the only performance gate.
 

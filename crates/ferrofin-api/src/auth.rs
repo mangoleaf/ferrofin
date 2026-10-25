@@ -711,6 +711,8 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrElevated {
 /// — run for this requirement too upstream, since `UserPermissionRequirement`
 /// derives from `DefaultAuthorizationRequirement`. Here they come from
 /// [`RequireAuth`], which this extractor runs before the permission check.
+///
+/// The policy itself is [`require_user_permission`].
 #[derive(Debug, Clone)]
 pub struct RequireLyricManagement(pub AuthorizationInfo);
 
@@ -721,23 +723,32 @@ impl FromRequestParts<AppState> for RequireLyricManagement {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let RequireAuth(info) = RequireAuth::from_request_parts(parts, state).await?;
-        if info.is_api_key {
-            return Ok(Self(info));
-        }
-        if let Some(user) = &info.user
-            && state
-                .users
-                .get_user_dto(user, None)
-                .await?
-                .policy
-                .is_some_and(|p| p.is_administrator || p.enable_lyric_management)
-        {
-            return Ok(Self(info));
-        }
-        Err(ApiError::Forbidden(
-            "lyric management access required".to_owned(),
-        ))
+        let (info, _) =
+            require_user_permission(parts, state, |p| p.enable_lyric_management).await?;
+        Ok(Self(info))
+    }
+}
+
+/// Extractor for handlers behind Jellyfin's `CollectionManagement` policy,
+/// which every `CollectionController` action declares.
+///
+/// Port of `new UserPermissionRequirement(PermissionKind.EnableCollectionManagement)`;
+/// the policy itself is [`require_user_permission`], whose administrator arm
+/// is why an administrator with `EnableCollectionManagement = 0` may create
+/// a collection on a real 10.11.8.
+#[derive(Debug, Clone)]
+pub struct RequireCollectionManagement(pub AuthorizationInfo);
+
+impl FromRequestParts<AppState> for RequireCollectionManagement {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let (info, _) =
+            require_user_permission(parts, state, |p| p.enable_collection_management).await?;
+        Ok(Self(info))
     }
 }
 

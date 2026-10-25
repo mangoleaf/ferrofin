@@ -88,7 +88,7 @@ pub async fn guid_preference(
     Ok(get_preference(pool, user_id, kind)
         .await?
         .iter()
-        .filter_map(|v| uuid::Uuid::parse_str(v).ok())
+        .filter_map(|v| ferrofin_util::guid_extensions::parse_dotnet_guid(v))
         .collect())
 }
 

@@ -728,6 +728,65 @@ async fn a_library_refresh_redraws_its_tile_unless_locked(
     );
 }
 
+/// gl-594: a library refresh runs every provider on the library's own first
+/// refresh (`isFirstRefresh` at `Default` or above), so a Default refresh of
+/// a library never refreshed before redraws its tile past the date gate. It
+/// stamps the library's `DateLastRefreshed`, so the next Default refresh is
+/// behind the gate again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_librarys_first_default_refresh_redraws_its_tile() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    let mut library = lib.row(BaseItemKind::CollectionFolder, "Photos").await;
+    let library_id = uuid::Uuid::parse_str(&library.id).expect("id");
+    // A library whose tile was drawn before it was ever refreshed (a
+    // library row written by an older Ferrofin carries no stamp).
+    library.date_last_refreshed = None;
+    lib.persistence
+        .save_items(std::slice::from_ref(&library))
+        .await
+        .expect("unstamp");
+    let refresh = || async {
+        let default = MetadataRefreshOptions::default();
+        let above = MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::None,
+            image_refresh_mode: MetadataRefreshMode::None,
+            ..MetadataRefreshOptions::default()
+        };
+        let cancel = ScanCancel::new();
+        lib.scanner
+            .scan_target(
+                &ScanTarget::Library(library_id),
+                ScanRun::new(&default, &above, &cancel).with_passes(ScanPasses::Touched),
+            )
+            .await
+            .expect("refresh");
+    };
+
+    write_photo(&lib.album_dir, BLUE);
+    refresh().await;
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        dimmed(BLUE),
+        "the first refresh runs every provider"
+    );
+    assert!(
+        lib.row(BaseItemKind::CollectionFolder, "Photos")
+            .await
+            .date_last_refreshed
+            .is_some()
+    );
+
+    write_photo(&lib.album_dir, RED);
+    refresh().await;
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        dimmed(BLUE),
+        "a refreshed library's current tile is behind its gate"
+    );
+}
+
 /// The row's Primary image row.
 async fn primary_of(
     items: &Arc<dyn ItemRepository>,
@@ -1097,5 +1156,75 @@ async fn a_librarys_own_folder_image_is_read_unless_it_is_locked(
         lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
             .await,
         want
+    );
+}
+
+/// gl-788: `CollectionFolderLocalImageProvider` (`Order` 1) reads a library's
+/// media locations after its own folder (`LocalImageProvider`, `Order` 0):
+/// a `folder.png` at the media root becomes the library's image in place of
+/// the collage, and one in the library's own folder wins over it, as
+/// `MergeImages` takes the first image found of a type.
+#[rstest::rstest]
+#[case::media_root(false, BLUE)]
+#[case::own_folder_first(true, RED)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_librarys_media_root_image_is_read_after_its_own_folder(
+    #[case] own_folder: bool,
+    #[case] want: [u8; 3],
+) {
+    let lib = PhotoLibrary::scanned(RED).await;
+    std::fs::write(lib.tmp.path().join("photos/folder.png"), png(BLUE)).expect("media image");
+    if own_folder {
+        std::fs::write(
+            lib.tmp.path().join("root/default/Photos/folder.png"),
+            png(RED),
+        )
+        .expect("own image");
+    }
+
+    lib.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        want
+    );
+}
+
+/// gl-788: the media locations are read without their subfolders
+/// (`GetFiles(path, …, recursive: false)`), so a poster inside a media
+/// subfolder never becomes the library's image; the tile stays its collage.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_media_subfolder_image_is_not_the_librarys() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    std::fs::write(lib.album_dir.join("poster.png"), png(BLUE)).expect("subfolder image");
+
+    lib.scanner.scan_all().await.expect("rescan");
+
+    let library =
+        uuid::Uuid::parse_str(&lib.row(BaseItemKind::CollectionFolder, "Photos").await.id)
+            .expect("id");
+    let primary = primary_of(&lib.items, library).await.path;
+    assert!(
+        primary.ends_with("primary.png") && !primary.contains("Trip"),
+        "the library keeps its collage: {primary}"
+    );
+}
+
+/// gl-788: the media-location read names the library's own files as
+/// upstream's `PopulatePrimaryImages` does, after the library folder
+/// (`FileNameWithoutExtension`): a `Photos.png` at the media root of the
+/// "Photos" library is its image.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_media_root_image_named_after_the_library_is_read() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    std::fs::write(lib.tmp.path().join("photos/Photos.png"), png(BLUE)).expect("named image");
+
+    lib.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        BLUE
     );
 }

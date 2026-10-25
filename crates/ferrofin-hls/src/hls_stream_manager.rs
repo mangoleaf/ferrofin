@@ -942,8 +942,9 @@ where
         // drop): marks this request an active consumer of an ALREADY-RUNNING
         // job, so the idle reaper leaves it alone while we read its playlist.
         // A job this request starts itself is not registered yet, so this
-        // guard resolves to nothing for it — the start branch takes its own
-        // guard below, once `start_ffmpeg` has registered the job.
+        // guard resolves to nothing for it: `start_ffmpeg` guards its own
+        // startup wait, and the start branch takes a guard below for the
+        // waits that follow it.
         // Ferrofin's guards are symmetric — upstream calls End without a
         // matching Begin when this request started the job, driving its
         // ActiveRequestCount to -1; that bug is deliberately not ported.
@@ -991,12 +992,12 @@ where
                         )));
                     }
                 };
-                // The wait IS an active consumer: without this mark the idle
-                // reaper kills the job we just started (its ping timeout is
-                // 60s, and a slow software transcode can need longer than that
-                // to produce `MinSegments` segments). The registry only knows
-                // the job now, after `start_ffmpeg` registered it — which is
-                // why the guard above could not cover this.
+                // The wait for `MinSegments` IS an active consumer: without
+                // this mark the idle reaper kills the job we just started (its
+                // ping timeout is 60s, and a slow software transcode can need
+                // longer than that to produce them). `start_ffmpeg`'s own guard
+                // ended when it returned, and the guard above found no job to
+                // mark before it registered this one.
                 let _start_guard = self
                     .manager
                     .begin_request_guard(&playlist_key, TranscodingJobType::Hls);

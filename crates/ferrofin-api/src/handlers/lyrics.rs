@@ -22,6 +22,7 @@
 //! and download queue it at high priority, delete awaits it.
 
 use axum::extract::{Path, State};
+use axum::handler::Handler;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -30,7 +31,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAuth, RequireLyricManagement};
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{Query, upload_body_limit};
 use crate::handlers::{queue_high_priority_refresh, run_item_refresh};
 use crate::state::AppState;
 
@@ -269,7 +270,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
             "/Audio/{itemId}/Lyrics",
-            get(get_lyrics).post(upload_lyrics).delete(delete_lyrics),
+            get(get_lyrics)
+                .post(upload_lyrics.layer(upload_body_limit()))
+                .delete(delete_lyrics),
         )
         .route(
             "/Audio/{itemId}/RemoteSearch/Lyrics",

@@ -100,6 +100,7 @@ fn build_video_item_simple_test(
 
     let stream_info = builder
         .get_optimal_video_stream(options)
+        .expect("a profile the builder can evaluate")
         .expect("stream info");
 
     if let Some(pm) = play_method {
@@ -2134,6 +2135,7 @@ fn build_video_item_with_secondary_audio_and_external_graphical_subtitle_keeps_v
     let support = MockTranscoderSupport;
     let stream_info = StreamBuilder::new(&support)
         .get_optimal_video_stream(&options)
+        .expect("a profile the builder can evaluate")
         .expect("stream info");
 
     assert_eq!(stream_info.play_method, PlayMethod::Transcode);

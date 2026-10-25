@@ -367,10 +367,14 @@ impl Database {
         Ok(())
     }
 
-    /// A display-preferences row's `HomeSection` children, ordered by `Order`.
+    /// A display-preferences row's `HomeSection` children, ordered by `Order`,
+    /// then `Id`.
     ///
     /// Stands in for EF's `.Include(e => e.HomeSections)` eager-load, which the
-    /// flat `sqlx` seam has no equivalent for.
+    /// flat `sqlx` seam has no equivalent for. A Jellyfin database holds several
+    /// rows per `Order` (upstream's save never deletes the old ones), loaded in
+    /// `Id` order, so the newest comes last and wins where a caller keys them by
+    /// `Order`, as upstream's `GET /DisplayPreferences` does.
     ///
     /// # Errors
     ///
@@ -383,7 +387,7 @@ impl Database {
             r#"SELECT "Id", "DisplayPreferencesId", "Order", "Type"
                FROM "HomeSection"
                WHERE "DisplayPreferencesId" = ?1
-               ORDER BY "Order""#,
+               ORDER BY "Order", "Id""#,
         )
         .bind(display_preferences_id)
         .fetch_all(&self.pool)

@@ -2377,3 +2377,116 @@ async fn image_infos_carry_the_photo_auto_orientation() {
         "{shown}"
     );
 }
+
+/// What `GET /Items`' `albums` and `artists` name filters resolve to and
+/// filter by. An album name is the first `MusicAlbum` of that `CleanName` by
+/// `SortName` (`GetItemIds(new InternalItemsQuery { IncludeItemTypes =
+/// [MusicAlbum], Name = name, Limit = 1 })`); `AlbumIds` keeps the album's
+/// tracks; and the nil id an unknown name takes matches nothing for
+/// `AlbumIds` and `ArtistIds`.
+#[tokio::test]
+async fn album_and_artist_filters_and_the_unresolved_name_id() {
+    use ferrofin_db::enums::ItemValueType;
+    use ferrofin_db::store::guid_to_db;
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    // The album that sorts first has the larger id, so neither id nor
+    // insertion order can pass for the SortName order.
+    let (first, second, other) = (
+        Uuid::from_u128(0xD02),
+        Uuid::from_u128(0xD01),
+        Uuid::from_u128(0xD03),
+    );
+    let (in_first, in_second, in_other) = (
+        Uuid::from_u128(0xD11),
+        Uuid::from_u128(0xD12),
+        Uuid::from_u128(0xD13),
+    );
+    let album = |id, name: &str, sort: &str| BaseItemEntity {
+        id: guid_to_db(id),
+        sort_name: Some(sort.to_owned()),
+        is_folder: true,
+        ..item(id, BaseItemKind::MusicAlbum, name)
+    };
+    let track = |id, parent: Uuid| BaseItemEntity {
+        id: guid_to_db(id),
+        parent_id: Some(guid_to_db(parent)),
+        ..item(id, BaseItemKind::Audio, "Track")
+    };
+    persist
+        .save_items(&[
+            album(second, "Greatest Hits", "Greatest Hits 2"),
+            album(first, "Greatest Hits", "Greatest Hits 1"),
+            album(other, "Other", "Other"),
+        ])
+        .await
+        .unwrap();
+    persist
+        .save_items(&[
+            track(in_first, first),
+            track(in_second, second),
+            track(in_other, other),
+        ])
+        .await
+        .unwrap();
+    persist
+        .save_item_values(
+            in_first,
+            &[(i32::from(ItemValueType::Artist), "Test Artist".to_owned())],
+        )
+        .await
+        .unwrap();
+
+    let by_name = InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::MusicAlbum],
+        name: Some("Greatest Hits".to_owned()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(repository.get_item_ids(&by_name).await.unwrap(), [first]);
+
+    let tracks = |album_ids: Vec<Uuid>, artist_ids: Vec<Uuid>| InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Audio],
+        album_ids,
+        artist_ids,
+        ..Default::default()
+    };
+    assert_eq!(
+        repository
+            .get_item_ids(&tracks(vec![first], Vec::new()))
+            .await
+            .unwrap(),
+        [in_first]
+    );
+    assert!(
+        repository
+            .get_item_ids(&tracks(vec![Uuid::nil()], Vec::new()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repository
+            .get_item_ids(&tracks(Vec::new(), vec![Uuid::nil()]))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let artist = repository
+        .get_item_ids(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::MusicArtist],
+            name: Some("Test Artist".to_owned()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(artist.len(), 1, "saving the value materialized the artist");
+    assert_eq!(
+        repository
+            .get_item_ids(&tracks(Vec::new(), artist))
+            .await
+            .unwrap(),
+        [in_first]
+    );
+}

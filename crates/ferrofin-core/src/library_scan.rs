@@ -963,6 +963,45 @@ fn stored_media_source(data: &serde_json::Map<String, serde_json::Value>) -> Med
     }
 }
 
+/// `VideoImageProvider`'s offset when the runtime is unknown: 10 s, in ticks.
+const SCREEN_GRAB_DEFAULT_OFFSET_TICKS: i64 = 10 * 10_000_000;
+
+/// `GetVideoImage`'s stream: the one at `DefaultVideoStreamIndex` (any type,
+/// as its first `GetMediaStreams` query asks), else the first video stream.
+fn pick_screen_grab_stream(
+    streams: &[MediaStreamInfoEntity],
+    default_index: i64,
+) -> Option<&MediaStreamInfoEntity> {
+    let video = crate::db_error::media_stream_type_to_disc(
+        ferrofin_model::entities::MediaStreamType::Video,
+    );
+    streams
+        .iter()
+        .find(|s| s.stream_index == default_index)
+        .or_else(|| streams.iter().find(|s| s.stream_type == video))
+}
+
+/// `GetVideoImage`'s offset, in ticks: 10 % into a known runtime, else 10 s.
+fn screen_grab_offset(run_time_ticks: Option<i64>) -> i64 {
+    run_time_ticks
+        .filter(|ticks| *ticks > 0)
+        .map_or(SCREEN_GRAB_DEFAULT_OFFSET_TICKS, |ticks| ticks / 10)
+}
+
+/// Whether `VideoImageProvider.Supports` takes the kind (`item is Video`).
+fn grabs_screens(type_name: &str) -> bool {
+    matches!(
+        crate::item_type_lookup::kind_from_type_name(type_name),
+        Some(
+            BaseItemKind::Movie
+                | BaseItemKind::Episode
+                | BaseItemKind::MusicVideo
+                | BaseItemKind::Trailer
+                | BaseItemKind::Video
+        )
+    )
+}
+
 /// `EmbeddedImageProvider.Supports` + `GetImage`: no shortcuts, remote
 /// sources, placeholders or DVD structures.
 fn embedded_image_eligible(path: &str, data: &serde_json::Map<String, serde_json::Value>) -> bool {
@@ -1052,6 +1091,29 @@ fn pick_embedded_picture(
         index: *index,
         format,
     })
+}
+
+/// Stores an extracted image (a temporary file) in `dir` as `stem` +
+/// `extension` (`".jpg"`), first removing the type's file under any other
+/// extension so the item keeps one. The temporary file is removed either way.
+fn store_extracted_art(
+    dir: &Path,
+    stem: &str,
+    extension: &str,
+    extracted: &str,
+) -> std::io::Result<PathBuf> {
+    let dest = dir.join(format!("{stem}{extension}"));
+    let stored = std::fs::create_dir_all(dir).and_then(|()| {
+        for old in ART_FILE_EXTENSIONS {
+            let old = dir.join(format!("{stem}.{old}"));
+            if old != dest {
+                let _ = std::fs::remove_file(&old);
+            }
+        }
+        std::fs::copy(extracted, &dest).map(|_| ())
+    });
+    let _ = std::fs::remove_file(extracted);
+    stored.map(|()| dest)
 }
 
 fn existing_art_file(dir: &Path, stem: &str) -> Option<PathBuf> {
@@ -2731,23 +2793,51 @@ enum ItemSaved {
     Cancelled,
 }
 
-/// Whether a refresh with `options` runs every provider whatever the item's
-/// own state — the options' half of `runAllProviders`
-/// (`MetadataService.cs:654-657`): "Replace all metadata" or a full refresh,
-/// with a metadata mode at all (`:160`).
+/// The refresh facts of a row the walk does not plan: nothing on disk feeds
+/// its decision.
 ///
-/// TODO(parity, open work item — NOT an accepted divergence; gl-594): the
-/// library tiles and the user root's image a library or root refresh
-/// reaches are forced by this alone; upstream also forces a row on its own
-/// first refresh or once its library's `AutomaticRefreshIntervalDays` have
-/// passed (`isFirstRefresh`/`requiresRefresh` at Default or above). Un-defer
-/// path: decide those rows with `plan_item_refresh` from their stored
-/// `DateLastRefreshed` and their library's options, as the walk decides the
-/// rows it plans, and test a Default root refresh of a never-refreshed root.
-fn runs_every_provider(options: &MetadataRefreshOptions) -> bool {
-    options.metadata_refresh_mode != MetadataRefreshMode::None
-        && (options.replace_all_metadata
-            || options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh)
+/// TODO(parity, open work item — NOT an accepted divergence; gl-337): a
+/// library's own `CollectionFolder.RequiresRefresh` (its folder's write time
+/// and its changed physical locations) does not fire yet; that issue ports
+/// it into `item_requires_refresh`.
+const UNWALKED_FACTS: FileFacts = FileFacts {
+    mtime: None,
+    probe: ProbeKind::None,
+    sidecars_changed: false,
+    lyrics_changed: false,
+    local_metadata: None,
+    supports_cumulative_run_time: false,
+    is_shortcut: false,
+    is_file_protocol: true,
+    is_placeholder: false,
+};
+
+/// The refresh plan of `row`, a row a library or root refresh reaches
+/// without the walk planning it: a library tile (`library` is its options)
+/// or the user root (no library, so upstream's default options). Its
+/// `run_all_providers` forces the row's dynamic image as
+/// `MetadataService.GetProviders` does: "Replace all metadata", a full
+/// refresh, or at `Default` or above the row's own first refresh or its
+/// library's elapsed `AutomaticRefreshIntervalDays`.
+/// [`decide_save`](crate::refresh_plan::decide_save) over it says whether the
+/// pass stamps the row's `DateLastRefreshed`.
+pub(crate) fn unwalked_refresh_plan(
+    row: Option<&BaseItemEntity>,
+    options: &MetadataRefreshOptions,
+    library: Option<&LibraryOptionsModel>,
+) -> ItemRefreshPlan {
+    let stored = row.map(music::stored_state);
+    crate::refresh_plan::plan_item_refresh(
+        stored.as_ref(),
+        &UNWALKED_FACTS,
+        &RefreshRequest {
+            options,
+            force_save: false,
+        },
+        library,
+        Utc::now(),
+        false,
+    )
 }
 
 /// Whether the external subtitle or audio files beside `item`'s video differ
@@ -5039,7 +5129,7 @@ impl LibraryScanner {
                         tracing::warn!(%err, library = %library, "could not record the library's completed scan");
                     }
                 }
-                self.refresh_box_sets(&folders, run).await;
+                self.refresh_box_sets(&folders, None, run).await;
             }
         }
         tracking
@@ -5062,13 +5152,16 @@ impl LibraryScanner {
     /// stored box-set paths and the library locations are expanded first: an
     /// adopted row stores `%AppDataPath%/collections/<name> [boxset]`.
     ///
-    /// TODO(gl-796): only a scan of whole libraries reaches this pass. A
-    /// scoped scan under a Collections library's location (a watcher-reported
-    /// change in `{data}/collections`, a folder refresh there) refreshes no box
-    /// set, where upstream refreshes the ones in the folder it validates; the
-    /// path is to run this pass over the box sets under the scope's paths in
-    /// `scan_scoped`/`scan_changed` too.
-    async fn refresh_box_sets(&self, folders: &[VirtualFolderInfo], run: ScanRun<'_>) {
+    /// `scope` narrows it to a path-scoped scan's roots (gl-796): upstream
+    /// refreshes the box sets in whichever folder it validates, so a box set
+    /// under a root, or whose folder holds one (a change inside it), is
+    /// refreshed, each once.
+    async fn refresh_box_sets(
+        &self,
+        folders: &[VirtualFolderInfo],
+        scope: Option<&[String]>,
+        run: ScanRun<'_>,
+    ) {
         let (Some(providers), Some(items)) = (&self.metadata_savers, &self.item_repository) else {
             return;
         };
@@ -5100,9 +5193,14 @@ impl LibraryScanner {
             }
             let in_library = row.path.as_deref().is_some_and(|path| {
                 let path = self.virtual_paths.expand(path);
-                locations
-                    .iter()
-                    .any(|root| Path::new(&path).starts_with(root))
+                let path = Path::new(&path);
+                locations.iter().any(|root| path.starts_with(root))
+                    && scope.is_none_or(|roots| {
+                        roots.iter().any(|root| {
+                            let root = Path::new(root);
+                            path.starts_with(root) || root.starts_with(path)
+                        })
+                    })
             });
             let Some(id) = in_library.then(|| Uuid::parse_str(&row.id).ok()).flatten() else {
                 continue;
@@ -5398,11 +5496,11 @@ impl LibraryScanner {
         changed: usize,
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
-        let roots = scope.roots;
+        let (roots, prune) = (scope.roots, scope.prune);
         let folders = self.virtual_folders.get_virtual_folders().await?;
         let affected = affected_libraries(&folders, roots, also_path);
         if affected.is_empty() {
-            if scope.prune {
+            if prune {
                 tracing::debug!(
                     paths = roots.len(),
                     "changed paths match no library; nothing to scan"
@@ -5449,7 +5547,7 @@ impl LibraryScanner {
             plan_ms = started.elapsed().as_millis(),
             "path-scoped scan planned"
         );
-        if !scope.prune {
+        if !prune {
             for root in roots {
                 let root = root.trim_end_matches('/');
                 if !plan.items.iter().any(|p| {
@@ -5473,6 +5571,15 @@ impl LibraryScanner {
         let result = self
             .run_scan(&affected, &folders, plan, Some(scope), run)
             .await;
+        // Only a folder's validation (a pruning scope) refreshes the box sets
+        // in it. An item's own refresh does not prune, and for a box set it is
+        // that box set's refresh already.
+        if prune
+            && !run.cancel.is_cancelled()
+            && result.as_ref().is_ok_and(|outcome| !outcome.stopped)
+        {
+            self.refresh_box_sets(&affected, Some(roots), run).await;
+        }
         tracking
             .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
             .await;
@@ -6991,7 +7098,6 @@ impl LibraryScanner {
                 tracing::warn!(%err, "dynamic image pass failed");
             }
             let runs = run.options.metadata_refresh_mode != MetadataRefreshMode::None;
-            let force = runs_every_provider(run.options);
             // `CollectionFolderImageProvider`, of each library a library's or
             // the root's refresh validated.
             if run.cancel.is_cancelled() {
@@ -6999,9 +7105,9 @@ impl LibraryScanner {
             }
             if runs
                 && let Some(libraries) = libraries
-                && let Err(err) = self.refresh_library_images(libraries, force).await
+                && let Err(err) = self.refresh_library_images(libraries, run.options).await
             {
-                tracing::warn!(%err, "library image pass failed");
+                tracing::warn!(%err, "failed to record the library tiles' refresh");
             }
             // The user root's image a root's refresh reaches, after the tiles
             // it copies.
@@ -7010,7 +7116,9 @@ impl LibraryScanner {
             }
             if runs
                 && run.from_root
-                && let Err(err) = providers.refresh_user_root_between(force, &between).await
+                && let Err(err) = providers
+                    .refresh_user_root_between(run.options, &between)
+                    .await
             {
                 tracing::warn!(%err, "root image pass failed");
             }
@@ -8831,11 +8939,8 @@ impl LibraryScanner {
         // that fetch that content's artwork — otherwise a first scan sees no
         // art and the "My Media" tile keeps the icon placeholder.
         let started = std::time::Instant::now();
-        if let Err(err) = self
-            .refresh_library_images(folders, runs_every_provider(run.options))
-            .await
-        {
-            tracing::warn!(%err, "library image pass failed");
+        if let Err(err) = self.refresh_library_images(folders, run.options).await {
+            tracing::warn!(%err, "failed to record the library tiles' refresh");
         }
         timings.library_images = started.elapsed();
         if !self.between_passes(run, &mut done).await {
@@ -10572,6 +10677,13 @@ impl LibraryScanner {
         known_ids: &[(String, String)],
         lookup: &ResolverGuesses,
     ) -> RemoteMetadata {
+        // `CanRefreshMetadata`: an extra is a local file belonging to
+        // another item, with no identity of its own in an online database,
+        // so no remote provider is asked about it (upstream's
+        // `forceEnableInternetMetadata` is always false here).
+        if entity.extra_type.is_some() {
+            return RemoteMetadata::default();
+        }
         let short = entity
             .type_
             .rsplit('.')
@@ -12079,22 +12191,13 @@ impl LibraryScanner {
                 return None;
             }
         };
-        let dest = dir.join(format!("{stem}{}", picture.format.extension()));
-        let stored = std::fs::create_dir_all(&dir).and_then(|()| {
-            // A replaced extraction may have another extension; keep one file.
-            for old in ART_FILE_EXTENSIONS {
-                let old = dir.join(format!("{stem}.{old}"));
-                if old != dest {
-                    let _ = std::fs::remove_file(&old);
-                }
+        let dest = match store_extracted_art(&dir, stem, picture.format.extension(), &extracted) {
+            Ok(dest) => dest,
+            Err(err) => {
+                tracing::warn!(%err, %item_id, "failed to store embedded image");
+                return None;
             }
-            std::fs::copy(&extracted, &dest).map(|_| ())
-        });
-        let _ = std::fs::remove_file(&extracted);
-        if let Err(err) = stored {
-            tracing::warn!(%err, item = %item_id, "failed to store embedded image");
-            return None;
-        }
+        };
         Some(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type,
@@ -12373,10 +12476,12 @@ impl LibraryScanner {
         )
     }
 
-    /// Run remote, embedded and plugin artwork in one configured order. A
-    /// provider only fills slots earlier providers/local discovery left empty.
-    // These are the existing per-item artwork pass inputs, shared with each step.
-    #[allow(clippy::too_many_arguments)]
+    /// Run remote, embedded, frame-grab and plugin artwork in one configured
+    /// order. A provider only fills slots earlier providers/local discovery
+    /// left empty.
+    // These are the existing per-item artwork pass inputs, shared with each
+    // step; the one match over every provider kind keeps their order visible.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn run_ordered_artwork(
         &self,
         item_id: Uuid,
@@ -12392,6 +12497,7 @@ impl LibraryScanner {
             Plugin,
             Remote,
             Embedded,
+            ScreenGrab,
             BookCover,
         }
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
@@ -12403,18 +12509,23 @@ impl LibraryScanner {
         } else {
             fetcher_names::EMBEDDED_IMAGES
         };
+        // `CanRefreshImages`: remote artwork for an extra is always some
+        // other item's (it has no identity of its own online), so only the
+        // local and extracted sources below run for one.
+        let remote = fetch != ImageFetch::None
+            && !music::owns_providers(short)
+            && entity.extra_type.is_none();
         // Plugins without IHasOrder default to 50; registration breaks ties.
-        let mut sources: Vec<(&str, Step)> =
-            if fetch != ImageFetch::None && !music::owns_providers(short) {
-                self.dynamic_providers
-                    .iter()
-                    .filter(|p| p.library_gated() && policy.image_enabled(short, p.name()))
-                    .map(|p| (p.name(), Step::Plugin))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-        if fetch != ImageFetch::None && !music::owns_providers(short) {
+        let mut sources: Vec<(&str, Step)> = if remote {
+            self.dynamic_providers
+                .iter()
+                .filter(|p| p.library_gated() && policy.image_enabled(short, p.name()))
+                .map(|p| (p.name(), Step::Plugin))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if remote {
             for (name, wired) in [
                 (fetcher_names::TVDB, self.tvdb.is_some()),
                 (fetcher_names::TMDB, self.tmdb.is_some()),
@@ -12428,6 +12539,19 @@ impl LibraryScanner {
         }
         if dynamic_images && policy.image_enabled(short, extractor) {
             sources.push((extractor, Step::Embedded));
+        }
+        // `VideoImageProvider` ("Screen Grabber", `Order => 100`) is dynamic
+        // like the embedded extractor, so a lock refuses it outside an image
+        // full refresh. Unlike the embedded extractor it has no change
+        // monitor, so `GetNonLocalImageProviders` runs it only when the
+        // refresh runs the remote providers (an image full refresh, or an
+        // item never refreshed).
+        if dynamic_images
+            && fetch != ImageFetch::None
+            && grabs_screens(&entity.type_)
+            && policy.image_enabled(short, fetcher_names::SCREEN_GRABBER)
+        {
+            sources.push((fetcher_names::SCREEN_GRABBER, Step::ScreenGrab));
         }
         // A book's two cover extractors (`ComicImageProvider`,
         // `EpubImageProvider`): dynamic providers like the embedded extractor,
@@ -12483,10 +12607,162 @@ impl LibraryScanner {
                     );
                 }
                 Step::Embedded => {}
+                Step::ScreenGrab => {
+                    if let Some(image) = self
+                        .grab_screen(item_id, entity, streams, policy, short, images)
+                        .await
+                    {
+                        images.push(image);
+                    }
+                }
                 Step::BookCover => {
                     self.add_book_cover(entity, name, policy, images).await;
                 }
             }
+        }
+    }
+
+    /// `VideoImageProvider` ("Screen Grabber") for a video that still has no
+    /// Primary: a frame of its default video stream, 10 % into its runtime
+    /// (10 s in when the runtime is unknown), stored beside the item's other
+    /// artwork. Best-effort like every extractor: no encoder, an ineligible
+    /// item, no video stream or a failed extraction yield nothing.
+    async fn grab_screen(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        streams: &[MediaStreamInfoEntity],
+        policy: FetcherPolicy<'_>,
+        kind: &str,
+        images: &[ItemImageInfo],
+    ) -> Option<ItemImageInfo> {
+        if images.iter().any(|i| i.image_type == ImageType::Primary)
+            || ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(policy.options, kind)
+                .limit(ImageType::Primary)
+                == 0
+        {
+            return None;
+        }
+        let (encoder, meta_root, path) = (
+            self.media_encoder.as_ref()?,
+            self.metadata_dir.as_ref()?,
+            entity.path.as_deref()?,
+        );
+        let data = crate::item_data::parse_data(entity.data.as_deref());
+        // `Supports` (not a shortcut, a file, not a placeholder, complete
+        // media) and `GetImage` (not a DVD).
+        if !embedded_image_eligible(path, &data) || self.is_active_recording(entity).await {
+            return None;
+        }
+        // `GetImage`: without a `DefaultVideoStreamIndex` there is no frame
+        // to grab; then the stream at that index, else the first video stream.
+        let Some(default_index) = data
+            .get("DefaultVideoStreamIndex")
+            .and_then(serde_json::Value::as_i64)
+        else {
+            tracing::debug!(%item_id, path, "no default video stream, no frame grabbed");
+            return None;
+        };
+        let stream = match self
+            .screen_grab_stream(item_id, streams, default_index)
+            .await
+        {
+            Ok(Some(stream)) => stream,
+            Ok(None) => {
+                tracing::debug!(%item_id, path, "no video stream, no frame grabbed");
+                return None;
+            }
+            Err(err) => {
+                // A throw inside `GetImage` is a provider failure too.
+                ferrofin_providers::rate_limit::note_request_failure();
+                tracing::debug!(%err, %item_id, "cannot read the streams to grab a frame from");
+                return None;
+            }
+        };
+        let offset = screen_grab_offset(entity.run_time_ticks);
+        let container = crate::item_data::read_data_string(&data, "Container").unwrap_or_default();
+        let threed = data.get("Video3DFormat").and_then(|value| {
+            serde_json::from_value::<ferrofin_model::entities::Video3DFormat>(value.clone()).ok()
+        });
+        let frame = match encoder
+            .extract_video_image(
+                path,
+                &container,
+                &stored_media_source(&data),
+                &stream,
+                threed,
+                Some(offset),
+            )
+            .await
+        {
+            Ok(frame) => frame,
+            Err(err) => {
+                // A failed dynamic provider counts against the refresh
+                // (`RefreshFromProvider`'s `result.Failures++`), so the item
+                // is not stamped and the next scan grabs again.
+                ferrofin_providers::rate_limit::note_request_failure();
+                tracing::debug!(%err, %item_id, "failed to grab a frame for the primary image");
+                return None;
+            }
+        };
+        let dest = match store_extracted_art(
+            &meta_root.join(&entity.id),
+            image_type_file_stem(ImageType::Primary),
+            ".jpg",
+            &frame,
+        ) {
+            Ok(dest) => dest,
+            Err(err) => {
+                ferrofin_providers::rate_limit::note_request_failure();
+                tracing::debug!(%err, %item_id, "failed to store a grabbed frame");
+                return None;
+            }
+        };
+        Some(ItemImageInfo {
+            path: dest.to_string_lossy().into_owned(),
+            image_type: ImageType::Primary,
+            date_modified: file_date_modified(&dest),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        })
+    }
+
+    /// `GetVideoImage`'s stream: the one at `DefaultVideoStreamIndex`, else
+    /// the first video stream, among the streams `GetMediaStreams` reads:
+    /// this pass's probe rows when it probed, else the stored ones.
+    async fn screen_grab_stream(
+        &self,
+        item_id: Uuid,
+        probed: &[MediaStreamInfoEntity],
+        default_index: i64,
+    ) -> Result<Option<ferrofin_model::entities_media::MediaStream>, ServiceError> {
+        let stored;
+        let streams = match &self.media_streams {
+            Some(repo) if probed.is_empty() => {
+                stored = repo
+                    .get_media_streams(&ferrofin_traits::persistence::MediaStreamQuery {
+                        item_id,
+                        stream_type: None,
+                        index: None,
+                    })
+                    .await?;
+                stored.as_slice()
+            }
+            _ => probed,
+        };
+        Ok(pick_screen_grab_stream(streams, default_index)
+            .cloned()
+            .map(crate::media_source_manager::stream_to_dto))
+    }
+
+    /// `Video.IsActiveRecording()`: whether Live TV is still writing the
+    /// item's file. The chapter-image extractor holds the Live TV seam; a
+    /// scanner without one (tests) sees no recording.
+    async fn is_active_recording(&self, entity: &BaseItemEntity) -> bool {
+        match self.chapter_image_extractor.get() {
+            Some(extractor) => extractor.is_active_recording(entity).await,
+            None => false,
         }
     }
 
@@ -12691,8 +12967,10 @@ impl LibraryScanner {
     }
 
     /// Composites a Primary image for every library whose tile is missing or
-    /// stale, from up to [`LIBRARY_COLLAGE_SOURCES`] random descendants'
-    /// artwork (Backdrop > Primary > Thumb, upstream's preference).
+    /// stale, from the artwork of up to [`LIBRARY_COLLAGE_SOURCES`] random
+    /// items with a Primary ([`library_collage_inputs`](Self::library_collage_inputs):
+    /// a music library's artists, any other library's own kinds), after its
+    /// own and its media locations' images are merged.
     ///
     /// Port of `CollectionFolderImageProvider`: upstream refreshes each
     /// `CollectionFolder`'s dynamic image on library validation, composing a
@@ -12701,13 +12979,18 @@ impl LibraryScanner {
     /// this, the home screen's "My Media" tiles render the icon-on-blue
     /// fallback forever.
     ///
-    /// `force` is a library or root refresh that runs every provider
-    /// (`runAllProviders`); [`library_tile_due`](Self::library_tile_due) says
-    /// which tiles it redraws.
+    /// Each library is forced as its refresh plan says
+    /// ([`unwalked_refresh_plan`]): by `options` running every provider, or by
+    /// its own first or overdue refresh; [`library_tile_due`](Self::library_tile_due)
+    /// says which tiles it redraws. A library whose pass had no failure has
+    /// its `DateLastRefreshed` stamped when
+    /// [`decide_save`](crate::refresh_plan::decide_save) saves it, as
+    /// upstream's `RefreshMetadata` stamps every library it refreshes. One
+    /// library's failure is logged and never stops the others'.
     async fn refresh_library_images(
         &self,
         folders: &[VirtualFolderInfo],
-        force: bool,
+        options: &MetadataRefreshOptions,
     ) -> Result<(), ServiceError> {
         let (Some(items), Some(processor), Some(meta_root)) = (
             &self.item_repository,
@@ -12716,67 +12999,145 @@ impl LibraryScanner {
         ) else {
             return Ok(());
         };
+        let request = RefreshRequest {
+            options,
+            force_save: false,
+        };
+        let mut refreshed = Vec::new();
         for folder in folders {
             let Some(cf) = collection_folder_id(folder) else {
                 continue;
             };
-            let out_dir = crate::dynamic_images::own_art_dir(&meta_root.resolve(), cf);
-            let out = out_dir.join("primary.png");
-            self.merge_library_local_images(items, cf).await;
-            if !self
-                .library_tile_due(items, &meta_root.resolve(), cf, force)
-                .await?
-            {
-                continue;
-            }
-            let inputs = Self::library_collage_inputs(items, folder, cf).await?;
-            if inputs.is_empty() {
-                continue; // an empty library keeps the icon tile
-            }
-            if let Err(err) = std::fs::create_dir_all(&out_dir) {
-                tracing::warn!(%err, library = %cf, "failed to create the library art dir");
-                continue;
-            }
-            let options = ferrofin_traits::options::ImageCollageOptions {
-                input_paths: inputs,
-                output_path: out.to_string_lossy().into_owned(),
-                width: 960,
-                height: 540,
-            };
-            if let Err(err) = processor
-                .create_image_collage(&options, folder.name.as_deref())
-                .await
-            {
-                tracing::warn!(%err, library = %cf, "failed to composite the library image");
-                continue;
-            }
-            // Recorded as any saved image is: the file's own modification
-            // time, and its size and blurhash read back from it.
-            let mut info = ItemImageInfo {
-                path: options.output_path.clone(),
-                image_type: ImageType::Primary,
-                date_modified: crate::dynamic_images::file_date_modified(&out),
-                width: options.width,
-                height: options.height,
-                blur_hash: None,
-            };
-            crate::dynamic_images::fill_image_metadata(processor.as_ref(), &mut info).await;
-            // `ProviderManager.SaveImage` replaces the Primary only; the
-            // library's other images stay.
-            let mut images = match items.get_image_infos(cf).await {
-                Ok(images) => images,
+            let row = match items.retrieve_item(cf).await {
+                Ok(row) => row,
                 Err(err) => {
-                    tracing::warn!(%err, library = %cf, "failed to read the library images");
+                    tracing::warn!(%err, library = %cf, "failed to read the library row");
                     continue;
                 }
             };
-            images.retain(|i| i.image_type != ImageType::Primary);
-            images.insert(0, info);
-            if let Err(err) = self.persistence.save_item_images(cf, &images).await {
-                tracing::warn!(%err, library = %cf, "failed to persist the library image");
+            let plan =
+                unwalked_refresh_plan(row.as_ref(), options, folder.library_options.as_ref());
+            let pass = match self
+                .refresh_library_image(
+                    items,
+                    processor,
+                    &meta_root.resolve(),
+                    folder,
+                    cf,
+                    plan.run_all_providers,
+                )
+                .await
+            {
+                Ok(pass) => pass,
+                Err(err) => {
+                    tracing::warn!(%err, library = %cf, "library image pass failed");
+                    continue;
+                }
+            };
+            let decision = crate::refresh_plan::decide_save(plan, &request, pass);
+            if decision.save && decision.stamp_refreshed {
+                refreshed.push(cf);
             }
         }
+        if !refreshed.is_empty() {
+            self.persistence
+                .stamp_date_last_refreshed(&refreshed, Utc::now())
+                .await?;
+        }
         Ok(())
+    }
+
+    /// One library's part of [`refresh_library_images`](Self::refresh_library_images):
+    /// its own and its media locations' images merged, then its tile drawn
+    /// when due (`force`d past the date gate), and what that changed or
+    /// failed at. A failure to merge or draw is logged and reported in the
+    /// outcome; a failure to read the library's rows is returned.
+    async fn refresh_library_image(
+        &self,
+        items: &Arc<dyn ItemRepository>,
+        processor: &Arc<dyn ferrofin_traits::drawing::ImageProcessor>,
+        meta_root: &Path,
+        folder: &VirtualFolderInfo,
+        cf: Uuid,
+        force: bool,
+    ) -> Result<PassOutcome, ServiceError> {
+        let (merged, merge_failed) = match self
+            .merge_library_local_images(items, cf, &folder.locations)
+            .await
+        {
+            Ok(merged) => (merged, false),
+            Err(err) => {
+                tracing::warn!(%err, library = %cf, "failed to read the library's own images");
+                (false, true)
+            }
+        };
+        let failed = PassOutcome {
+            changed: merged,
+            failed: true,
+        };
+        if !self.library_tile_due(items, meta_root, cf, force).await? {
+            return Ok(PassOutcome {
+                changed: merged,
+                failed: merge_failed,
+            });
+        }
+        let inputs = Self::library_collage_inputs(items, folder, cf).await?;
+        if inputs.is_empty() {
+            // An empty library keeps the icon tile.
+            return Ok(PassOutcome {
+                changed: merged,
+                failed: merge_failed,
+            });
+        }
+        let out_dir = crate::dynamic_images::own_art_dir(meta_root, cf);
+        let out = out_dir.join("primary.png");
+        if let Err(err) = std::fs::create_dir_all(&out_dir) {
+            tracing::warn!(%err, library = %cf, "failed to create the library art dir");
+            return Ok(failed);
+        }
+        let options = ferrofin_traits::options::ImageCollageOptions {
+            input_paths: inputs,
+            output_path: out.to_string_lossy().into_owned(),
+            width: 960,
+            height: 540,
+        };
+        if let Err(err) = processor
+            .create_image_collage(&options, folder.name.as_deref())
+            .await
+        {
+            tracing::warn!(%err, library = %cf, "failed to composite the library image");
+            return Ok(failed);
+        }
+        // Recorded as any saved image is: the file's own modification
+        // time, and its size and blurhash read back from it.
+        let mut info = ItemImageInfo {
+            path: options.output_path.clone(),
+            image_type: ImageType::Primary,
+            date_modified: crate::dynamic_images::file_date_modified(&out),
+            width: options.width,
+            height: options.height,
+            blur_hash: None,
+        };
+        crate::dynamic_images::fill_image_metadata(processor.as_ref(), &mut info).await;
+        // `ProviderManager.SaveImage` replaces the Primary only; the
+        // library's other images stay.
+        let mut images = match items.get_image_infos(cf).await {
+            Ok(images) => images,
+            Err(err) => {
+                tracing::warn!(%err, library = %cf, "failed to read the library images");
+                return Ok(failed);
+            }
+        };
+        images.retain(|i| i.image_type != ImageType::Primary);
+        images.insert(0, info);
+        if let Err(err) = self.persistence.save_item_images(cf, &images).await {
+            tracing::warn!(%err, library = %cf, "failed to persist the library image");
+            return Ok(failed);
+        }
+        Ok(PassOutcome {
+            changed: true,
+            failed: merge_failed,
+        })
     }
 
     /// The images in a library's own folder (`root/default/<name>`) become its
@@ -12786,23 +13147,16 @@ impl LibraryScanner {
     /// (`CollectionFolder.IsSaveLocalMetadataEnabled`) and where Jellyfin keeps
     /// one, so the image survives a rename, which moves the folder and mints a
     /// new row, and an adopted library's `folder.jpg` is found again. The
-    /// images in the library's media locations
-    /// (`CollectionFolderLocalImageProvider`) are a separate provider, not
-    /// read here yet (gl-788).
-    /// A failure is logged and leaves the library as it was: one library's
-    /// error never stops the others' tiles.
-    async fn merge_library_local_images(&self, items: &Arc<dyn ItemRepository>, library: Uuid) {
-        if let Err(err) = self.try_merge_library_local_images(items, library).await {
-            tracing::warn!(%err, library = %library, "failed to read the library's own images");
-        }
-    }
-
-    /// [`Self::merge_library_local_images`], with its errors.
-    async fn try_merge_library_local_images(
+    /// images in the library's media `locations` follow
+    /// (`CollectionFolderLocalImageProvider`, `Order` 1), so an image of a
+    /// type found in both comes from the library's own folder. Returns
+    /// whether the library's images changed.
+    async fn merge_library_local_images(
         &self,
         items: &Arc<dyn ItemRepository>,
         library: Uuid,
-    ) -> Result<(), ServiceError> {
+        locations: &[String],
+    ) -> Result<bool, ServiceError> {
         // A locked item runs no image provider (`RefreshWithProviders`
         // returns first, `MetadataService.cs:785-788`).
         let Some(row) = items
@@ -12810,56 +13164,70 @@ impl LibraryScanner {
             .await?
             .filter(|row| !row.is_locked)
         else {
-            return Ok(());
+            return Ok(false);
         };
-        let found = discover_local_images(&row, &FsDirectoryService::new());
+        let dir = FsDirectoryService::new();
+        let mut found = discover_local_images(&row, &dir);
+        if let Some(mut library) = local_image_item(&row) {
+            // Its own folder is the first of upstream's `PhysicalLocations`,
+            // and already read above.
+            library.kind = ImageItemKind::CollectionFolder;
+            library.physical_locations = locations.to_vec();
+            found.extend(local_image_infos(
+                ferrofin_providers::CollectionFolderLocalImageProvider::get_images(&library, &dir),
+            ));
+        }
         if found.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let mut images = items.get_image_infos(library).await?;
-        if merge_local_images(&mut images, &found) {
+        let changed = merge_local_images(&mut images, &found);
+        if changed {
             self.persistence.save_item_images(library, &images).await?;
         }
-        Ok(())
+        Ok(changed)
     }
 
-    /// The artwork a library tile is drawn from: up to
-    /// [`LIBRARY_COLLAGE_SOURCES`] random descendants' local Backdrop, else
-    /// Primary, else Thumb.
+    /// The artwork a library tile is drawn from (v12.2
+    /// `CollectionFolderImageProvider.GetItemsWithImages`): up to
+    /// [`LIBRARY_COLLAGE_SOURCES`] random rows with a Primary, each drawn
+    /// from its local Backdrop, else Primary, else Thumb. A music library
+    /// samples the artists its tracks credit, any other library its
+    /// collection type's kinds. An empty sample draws no tile.
     async fn library_collage_inputs(
         items: &Arc<dyn ItemRepository>,
         folder: &VirtualFolderInfo,
         cf: Uuid,
     ) -> Result<Vec<String>, ServiceError> {
-        // Random content sample; over-fetch since not every row has art.
-        // Upstream samples the collection type's own kinds (a music
-        // library's tile comes from its ALBUMS, whose covers are the art
-        // that exists — sampling leaf tracks found nothing and left the
-        // note-icon placeholder). The leaf fallback keeps a library whose
-        // typed rows have no art from losing its tile.
-        let kinds = collage_item_kinds(folder);
-        let sample = |include_item_types: Vec<BaseItemKind>, is_folder| InternalItemsQuery {
+        let mut sample = InternalItemsQuery {
             ancestor_ids: vec![cf],
-            recursive: true,
-            include_item_types,
-            is_folder,
-            is_virtual_item: Some(false),
-            limit: Some(LIBRARY_COLLAGE_SOURCES * 3),
+            image_types: vec![ImageType::Primary],
+            limit: Some(LIBRARY_COLLAGE_SOURCES),
             order_by: vec![(
                 ferrofin_model::live_tv::ItemSortBy::Random,
-                ferrofin_model::dto::SortOrder::Descending,
+                ferrofin_model::dto::SortOrder::Ascending,
             )],
             ..Default::default()
         };
-        let mut candidates = items.get_item_ids(&sample(kinds, None)).await?;
-        if candidates.is_empty() {
-            candidates = items.get_item_ids(&sample(Vec::new(), Some(false))).await?;
-        }
+        let candidates = if folder.collection_type == Some(CollectionTypeOptions::music) {
+            // "Music albums usually don't have dedicated backdrops, so use
+            // artist instead." An artist has no library of its own: it is
+            // found through the tracks under this one that credit it.
+            sample.enable_total_record_count = false;
+            items
+                .get_all_artists(&sample)
+                .await?
+                .items
+                .into_iter()
+                .filter_map(|artist| Uuid::parse_str(&artist.item.id).ok())
+                .collect()
+        } else {
+            sample.recursive = true;
+            sample.include_item_types = collage_item_kinds(folder);
+            items.get_item_ids(&sample).await?
+        };
         let mut inputs = Vec::new();
         for id in candidates {
-            if inputs.len() >= usize::try_from(LIBRARY_COLLAGE_SOURCES).unwrap_or(8) {
-                break;
-            }
             let infos = items.get_image_infos(id).await?;
             let best = infos
                 .iter()
@@ -17755,6 +18123,7 @@ fn first_album_tag(tracks: &[BaseItemEntity]) -> Option<String> {
 /// `DtoExtensions.GetBaseItemKindsForCollectionType`, which
 /// `CollectionFolderImageProvider` uses to pick the rows whose Primary images
 /// make up the tile. An unknown/absent collection type samples the mixed set.
+/// A music library samples its artists instead (`library_collage_inputs`).
 fn collage_item_kinds(folder: &VirtualFolderInfo) -> Vec<BaseItemKind> {
     match folder.collection_type {
         Some(CollectionTypeOptions::movies) => vec![BaseItemKind::Movie],
@@ -19820,7 +20189,7 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
 /// The [`SeriesStatus`](ferrofin_model::entities::SeriesStatus) name as
 /// Jellyfin serializes it into the `Data` blob — `Enum.ToString()`, which is
 /// also the `Status` string `DtoService` emits.
-fn series_status_name(status: ferrofin_model::entities::SeriesStatus) -> &'static str {
+pub(crate) fn series_status_name(status: ferrofin_model::entities::SeriesStatus) -> &'static str {
     use ferrofin_model::entities::SeriesStatus;
     match status {
         SeriesStatus::Continuing => "Continuing",
@@ -22359,20 +22728,26 @@ fn repoint_planned(planned: &mut [Planned], ids: &HashMap<Uuid, (Uuid, Option<&s
 }
 
 /// The names a series' seasons are created with: season `0` takes the
-/// library's `SeasonZeroDisplayName`, any other number the server's
-/// localized `NameSeasonNumber` ("Season {0}"), and a season with no number
-/// `NameSeasonUnknown` — `SeasonResolver.Resolve` (`SeasonResolver.cs:
-/// 95-104`) for a season folder, `SeriesMetadataService.
-/// GetValidSeasonNameForSeries` (`SeriesMetadataService.cs:466-478`) for a
-/// season with no folder of its own, whose id the name is part of
-/// ([`item_type_lookup::virtual_season_id`]).
+/// library's `SeasonZeroDisplayName`, any other number the localized
+/// `NameSeasonNumber` ("Season {0}"), and a season with no number
+/// `NameSeasonUnknown`. A season folder is named in the server's UI culture
+/// (`SeasonResolver.Resolve`, `SeasonResolver.cs:95-104`, which reads
+/// `GetServerLocalizedString` since 12.0); a season with no folder of its
+/// own, whose id the name is part of ([`item_type_lookup::virtual_season_id`]),
+/// in the ambient one, which a scan inherits from the request that queued it
+/// (`SeriesMetadataService.GetValidSeasonNameForSeries`,
+/// `SeriesMetadataService.cs:466-483`, still `GetLocalizedString` in v12.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SeasonNames {
     /// The library's `SeasonZeroDisplayName`.
     zero: String,
-    /// `NameSeasonNumber`, a `{0}` format.
+    /// `NameSeasonNumber` in the server's UI culture, a `{0}` format: a
+    /// season folder's.
+    folder: String,
+    /// `NameSeasonNumber` in the ambient culture, a `{0}` format: a season
+    /// with no folder's.
     numbered: String,
-    /// `NameSeasonUnknown`.
+    /// `NameSeasonUnknown`, in the ambient culture.
     unknown: String,
 }
 
@@ -22382,6 +22757,7 @@ impl Default for SeasonNames {
     fn default() -> Self {
         Self {
             zero: "Specials".to_owned(),
+            folder: "Season {0}".to_owned(),
             numbered: "Season {0}".to_owned(),
             unknown: "Season Unknown".to_owned(),
         }
@@ -22390,7 +22766,8 @@ impl Default for SeasonNames {
 
 impl SeasonNames {
     /// The names under `options` (none: the defaults), localized by
-    /// `localization` in the server's UI culture (none: `en-US`).
+    /// `localization` (none: `en-US`): a folder's in the server's UI culture,
+    /// the rest in the ambient one (gl-385).
     pub(crate) fn of(
         options: Option<&LibraryOptionsModel>,
         localization: Option<&crate::localization_manager::LocalizationManager>,
@@ -22400,26 +22777,32 @@ impl SeasonNames {
             names.zero.clone_from(&options.season_zero_display_name);
         }
         if let Some(localization) = localization {
+            names.folder = localization.get_server_localized_string("NameSeasonNumber");
             names.numbered = localization.get_localized_string("NameSeasonNumber");
             names.unknown = localization.get_localized_string("NameSeasonUnknown");
         }
         names
     }
 
-    /// A numbered season's name: `0`'s is the season-zero name, any other
+    /// A season folder's name: `0`'s is the season-zero name, any other
     /// `string.Format(InvariantCulture, NameSeasonNumber, number)`.
     pub(crate) fn numbered(&self, number: i32) -> String {
+        self.format(&self.folder, number)
+    }
+
+    /// `number`'s name under the `{0}` format `numbered`, or season zero's.
+    fn format(&self, numbered: &str, number: i32) -> String {
         if number == 0 {
             self.zero.clone()
         } else {
-            self.numbered.replace("{0}", &number.to_string())
+            numbered.replace("{0}", &number.to_string())
         }
     }
 
     /// The name of a season with no folder of its own
     /// (`GetValidSeasonNameForSeries(series, null, number)`).
     pub(crate) fn virtual_season(&self, number: Option<i32>) -> String {
-        number.map_or_else(|| self.unknown.clone(), |n| self.numbered(n))
+        number.map_or_else(|| self.unknown.clone(), |n| self.format(&self.numbered, n))
     }
 }
 
@@ -22582,9 +22965,23 @@ fn discover_local_images<D: ferrofin_providers::DirectoryService>(
     entity: &BaseItemEntity,
     dir: &D,
 ) -> Vec<ItemImageInfo> {
-    let Some(path) = entity.path.as_deref() else {
+    let Some(item) = local_image_item(entity) else {
         return Vec::new();
     };
+    local_image_infos(if item.kind == ImageItemKind::Episode {
+        EpisodeLocalImageProvider::get_images(&item, dir)
+    } else if LocalImageProvider::supports(&item) {
+        LocalImageProvider::get_images(&item, dir)
+    } else {
+        Vec::new()
+    })
+}
+
+/// The item as the local image providers see it: its kind, name, path,
+/// `FileNameWithoutExtension` and `ContainingFolderPath`. `None` for an item
+/// with no path.
+fn local_image_item(entity: &BaseItemEntity) -> Option<ImageItem> {
+    let path = entity.path.as_deref()?;
     let kind = image_item_kind(&entity.type_);
 
     // `ContainingFolderPath`: a folder's own path, a disc rip's too, a
@@ -22605,15 +23002,11 @@ fn discover_local_images<D: ferrofin_providers::DirectoryService>(
         file_stem(path)
     });
     item.containing_folder_path = containing;
+    Some(item)
+}
 
-    let found = if kind == ImageItemKind::Episode {
-        EpisodeLocalImageProvider::get_images(&item, dir)
-    } else if LocalImageProvider::supports(&item) {
-        LocalImageProvider::get_images(&item, dir)
-    } else {
-        Vec::new()
-    };
-
+/// Image rows for images a local provider found, dated by their files.
+fn local_image_infos(found: Vec<ferrofin_providers::LocalImageInfo>) -> Vec<ItemImageInfo> {
     found
         .into_iter()
         .map(|local| ItemImageInfo {
@@ -22643,6 +23036,208 @@ mod plan_paths_tests;
 
 #[cfg(test)]
 mod tests {
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+
+    /// gl-594, `MetadataService.GetProviders`' `runAllProviders` for a row
+    /// the walk does not plan (a library or the user root): the options, or
+    /// at `Default` or above the row's own first refresh or its library's
+    /// elapsed `AutomaticRefreshIntervalDays`.
+    #[rstest::rstest]
+    #[case::first_refresh(MetadataRefreshMode::Default, None, 0, true)]
+    #[case::first_refresh_validation_only(MetadataRefreshMode::ValidationOnly, None, 0, false)]
+    #[case::refreshed(MetadataRefreshMode::Default, Some(1), 0, false)]
+    #[case::refreshed_full_refresh(MetadataRefreshMode::FullRefresh, Some(1), 0, true)]
+    #[case::interval_elapsed(MetadataRefreshMode::Default, Some(8), 7, true)]
+    #[case::interval_not_elapsed(MetadataRefreshMode::Default, Some(6), 7, false)]
+    fn an_unwalked_row_runs_every_provider_as_get_providers_says(
+        #[case] mode: MetadataRefreshMode,
+        #[case] refreshed_days_ago: Option<i64>,
+        #[case] interval_days: i32,
+        #[case] want: bool,
+    ) {
+        let row = ferrofin_db::entities::base_items::BaseItemEntity {
+            date_last_refreshed: refreshed_days_ago
+                .map(|days| chrono::Utc::now() - chrono::TimeDelta::days(days)),
+            ..Default::default()
+        };
+        let options = MetadataRefreshOptions {
+            metadata_refresh_mode: mode,
+            ..MetadataRefreshOptions::default()
+        };
+        let library = ferrofin_model::configuration::LibraryOptions {
+            automatic_refresh_interval_days: interval_days,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::unwalked_refresh_plan(Some(&row), &options, Some(&library)).run_all_providers,
+            want
+        );
+    }
+
+    /// A library row with rows under it, and image files to give them, for
+    /// the tile sample ([`super::LibraryScanner::library_collage_inputs`]).
+    struct CollageLibrary {
+        tmp: tempfile::TempDir,
+        db: ferrofin_db::Database,
+    }
+
+    impl CollageLibrary {
+        const LIBRARY: uuid::Uuid = uuid::Uuid::from_u128(0x402_0000);
+
+        async fn new() -> Self {
+            let db = crate::test_support::test_db().await;
+            crate::test_support::seed_item(
+                &db,
+                Self::LIBRARY,
+                ferrofin_model::data::BaseItemKind::CollectionFolder,
+            )
+            .await;
+            Self {
+                tmp: tempfile::tempdir().expect("tempdir"),
+                db,
+            }
+        }
+
+        /// A `kind` row under the library, with an image file of each of
+        /// `images`, named after the type.
+        async fn row(
+            &self,
+            id: u128,
+            kind: ferrofin_model::data::BaseItemKind,
+            images: &[ferrofin_model::entities::ImageType],
+        ) -> uuid::Uuid {
+            use ferrofin_traits::persistence::ItemPersistenceService as _;
+            let id = uuid::Uuid::from_u128(id);
+            crate::test_support::seed_item(&self.db, id, kind).await;
+            crate::FerrofinItemPersistenceService::new(self.db.clone())
+                .set_ancestors(id, &[Self::LIBRARY])
+                .await
+                .expect("ancestors");
+            self.art(id, images).await;
+            id
+        }
+
+        /// Gives `id` an image file of each of `images`.
+        async fn art(&self, id: uuid::Uuid, images: &[ferrofin_model::entities::ImageType]) {
+            let infos: Vec<_> = images
+                .iter()
+                .map(|image_type| {
+                    crate::test_support::image_info(*image_type, &self.file(id, *image_type), None)
+                })
+                .collect();
+            for info in &infos {
+                std::fs::write(&info.path, b"art").expect("art");
+            }
+            crate::test_support::seed_images(&self.db, id, &infos).await;
+        }
+
+        fn file(&self, id: uuid::Uuid, image_type: ferrofin_model::entities::ImageType) -> String {
+            let name = format!("{}-{image_type:?}.png", id.simple());
+            self.tmp.path().join(name).to_string_lossy().into_owned()
+        }
+
+        async fn inputs(
+            &self,
+            collection_type: ferrofin_model::entities::CollectionTypeOptions,
+        ) -> Vec<String> {
+            let folder = ferrofin_model::entities_media::VirtualFolderInfo {
+                collection_type: Some(collection_type),
+                ..Default::default()
+            };
+            super::LibraryScanner::library_collage_inputs(
+                &crate::test_support::item_repository_over(self.db.clone()),
+                &folder,
+                Self::LIBRARY,
+            )
+            .await
+            .expect("sample")
+        }
+    }
+
+    /// gl-402, v12.2 `CollectionFolderImageProvider.GetItemsWithImages`: a
+    /// music library's tile samples the artists its tracks credit, as artist
+    /// or album artist, that have a Primary (`GetAllArtists` with
+    /// `ImageTypes = [Primary]`), not its albums, and never another library's
+    /// artists (upstream's `BaseItemRepositoryArtistLibraryScopeTests`).
+    #[tokio::test]
+    async fn a_music_library_tile_samples_its_credited_artists_with_a_primary() {
+        use crate::test_support::{seed_item_value, seed_music_artist_item};
+        use ferrofin_db::enums::ItemValueType;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
+
+        let lib = CollageLibrary::new().await;
+        let track = lib.row(0x402_0001, BaseItemKind::Audio, &[]).await;
+        lib.row(0x402_0002, BaseItemKind::MusicAlbum, &[ImageType::Primary])
+            .await;
+        let (credited, no_primary) = (
+            uuid::Uuid::from_u128(0x402_0003),
+            uuid::Uuid::from_u128(0x402_0004),
+        );
+        seed_music_artist_item(&lib.db, credited, "The Band").await;
+        seed_music_artist_item(&lib.db, no_primary, "No Poster").await;
+        lib.art(credited, &[ImageType::Primary]).await;
+        lib.art(no_primary, &[ImageType::Backdrop]).await;
+        seed_item_value(&lib.db, track, ItemValueType::Artist, "The Band").await;
+        seed_item_value(&lib.db, track, ItemValueType::Artist, "No Poster").await;
+        let album_artist = uuid::Uuid::from_u128(0x402_0007);
+        seed_music_artist_item(&lib.db, album_artist, "Album Artist").await;
+        lib.art(album_artist, &[ImageType::Primary]).await;
+        seed_item_value(&lib.db, track, ItemValueType::AlbumArtist, "Album Artist").await;
+        // Another library's track credits an artist with a Primary.
+        let (other_library, other_track, elsewhere) = (
+            uuid::Uuid::from_u128(0x402_1000),
+            uuid::Uuid::from_u128(0x402_1001),
+            uuid::Uuid::from_u128(0x402_1002),
+        );
+        crate::test_support::seed_item(&lib.db, other_library, BaseItemKind::CollectionFolder)
+            .await;
+        crate::test_support::seed_item(&lib.db, other_track, BaseItemKind::Audio).await;
+        {
+            use ferrofin_traits::persistence::ItemPersistenceService as _;
+            crate::FerrofinItemPersistenceService::new(lib.db.clone())
+                .set_ancestors(other_track, &[other_library])
+                .await
+                .expect("ancestors");
+        }
+        seed_music_artist_item(&lib.db, elsewhere, "Elsewhere").await;
+        lib.art(elsewhere, &[ImageType::Primary]).await;
+        seed_item_value(&lib.db, other_track, ItemValueType::Artist, "Elsewhere").await;
+
+        let mut sampled = lib.inputs(CollectionTypeOptions::music).await;
+        sampled.sort();
+        let mut want = vec![
+            lib.file(credited, ImageType::Primary),
+            lib.file(album_artist, ImageType::Primary),
+        ];
+        want.sort();
+        assert_eq!(sampled, want);
+    }
+
+    /// gl-402: any other library samples its kinds' rows that have a Primary
+    /// (`ImageTypes = [Primary]`), each drawn from its Backdrop first.
+    #[tokio::test]
+    async fn a_library_tile_samples_rows_with_a_primary() {
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
+
+        let lib = CollageLibrary::new().await;
+        let movie = lib
+            .row(
+                0x402_0005,
+                BaseItemKind::Movie,
+                &[ImageType::Primary, ImageType::Backdrop],
+            )
+            .await;
+        lib.row(0x402_0006, BaseItemKind::Movie, &[ImageType::Backdrop])
+            .await;
+
+        assert_eq!(
+            lib.inputs(CollectionTypeOptions::movies).await,
+            vec![lib.file(movie, ImageType::Backdrop)]
+        );
+    }
+
     /// `ItemImageProvider.MergeImages`: a found image replaces the stored one
     /// of its type when the paths differ, keeps it when they match (taking the
     /// file's time and clearing dimensions it moved past), and a found
@@ -24503,6 +25098,76 @@ mod tests {
             "/m/a.mkv",
             &data(r#"{"VideoType":"BluRay"}"#)
         ));
+    }
+
+    /// A video stream row at `index`.
+    fn video_row(index: i64) -> super::MediaStreamInfoEntity {
+        super::MediaStreamInfoEntity {
+            stream_index: index,
+            stream_type: crate::db_error::media_stream_type_to_disc(
+                ferrofin_model::entities::MediaStreamType::Video,
+            ),
+            ..super::MediaStreamInfoEntity::default()
+        }
+    }
+
+    /// `VideoImageProviderTests.GetImage_UnsupportedInput_ReturnsNoImage`: a
+    /// placeholder, no `DefaultVideoStreamIndex` (the probe found no video
+    /// stream; `library_scan_screen_grabber.rs` scans one), and a default
+    /// index with nothing there.
+    #[test]
+    fn unsupported_input_gets_no_grab() {
+        let placeholder = serde_json::json!({"IsPlaceHolder": true});
+        assert!(!super::embedded_image_eligible(
+            "/media/Heat (1995)/Heat (1995).mkv",
+            placeholder.as_object().unwrap()
+        ));
+        assert!(super::pick_screen_grab_stream(&[], 0).is_none());
+    }
+
+    /// `VideoImageProviderTests.GetImage_DefaultVideoStreams_ReturnsCorrectStreamImage`.
+    #[rstest::rstest]
+    #[case::default_not_first_stream(1, 1)]
+    #[case::default_out_of_valid_range(5, 0)]
+    fn the_grab_takes_the_default_video_stream(
+        #[case] default_index: i64,
+        #[case] target_index: i64,
+    ) {
+        let streams: Vec<_> = (0..=target_index).map(video_row).collect();
+        assert_eq!(
+            super::pick_screen_grab_stream(&streams, default_index).map(|s| s.stream_index),
+            Some(target_index)
+        );
+    }
+
+    /// `VideoImageProviderTests.GetImage_TimeSpan_SelectsCorrectTime`.
+    #[rstest::rstest]
+    #[case::default_time(None, 10)]
+    #[case::calculated_time(Some(500), 50)]
+    fn the_grab_selects_its_time(#[case] run_time_seconds: Option<i64>, #[case] expected: i64) {
+        const TICKS: i64 = 10_000_000;
+        assert_eq!(
+            super::screen_grab_offset(run_time_seconds.map(|s| s * TICKS)),
+            expected * TICKS
+        );
+    }
+
+    /// `VideoImageProvider.Supports`: `item is Video`.
+    #[rstest::rstest]
+    #[case("Movies.Movie", true)]
+    #[case("TV.Episode", true)]
+    #[case("MusicVideo", true)]
+    #[case("Trailer", true)]
+    #[case("Video", true)]
+    #[case("TV.Series", false)]
+    #[case("Audio.Audio", false)]
+    #[case("Photo", false)]
+    fn the_screen_grabber_takes_every_video_kind(#[case] name: &str, #[case] grabs: bool) {
+        assert_eq!(
+            super::grabs_screens(&format!("MediaBrowser.Controller.Entities.{name}")),
+            grabs,
+            "{name}"
+        );
     }
 
     #[test]
@@ -35801,6 +36466,83 @@ mod tests {
         assert_eq!(overview.as_deref(), Some("alpha"));
     }
 
+    /// An extra has no identity of its own in an online database, so a
+    /// plugin's metadata and artwork sources are never asked about one
+    /// (upstream `CanRefreshMetadata` / `CanRefreshImages`, `ExtraType`),
+    /// while the item it belongs to still is.
+    #[tokio::test]
+    async fn a_plugin_source_is_never_asked_about_an_extra() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<(&'static str, String)>>);
+        #[async_trait::async_trait]
+        impl ferrofin_traits::providers::DynamicMetadataProvider for Recorder {
+            fn name(&self) -> &'static str {
+                "recorder"
+            }
+            fn library_gated(&self) -> bool {
+                // Named: asked by the artwork pass too.
+                true
+            }
+            async fn lookup(
+                &self,
+                item: &ferrofin_traits::providers::DynamicMetadataLookup,
+            ) -> Result<
+                Option<ferrofin_traits::providers::DynamicMetadataResult>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                self.0.lock().unwrap().push(("lookup", item.kind.clone()));
+                Ok(None)
+            }
+            async fn images(
+                &self,
+                item: &ferrofin_traits::providers::DynamicMetadataLookup,
+                _wanted: &[ferrofin_model::entities::ImageType],
+            ) -> Result<
+                Vec<(ferrofin_model::entities::ImageType, Vec<u8>)>,
+                ferrofin_traits::error::ServiceError,
+            > {
+                self.0.lock().unwrap().push(("images", item.kind.clone()));
+                Ok(Vec::new())
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        let folder = media.join("Heat (1995)");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("Heat (1995).mkv"), b"").unwrap();
+        std::fs::write(folder.join("Heat (1995)-trailer.mkv"), b"").unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let recorder = Arc::new(Recorder::default());
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_metadata_dir(tmp.path().join("metadata"))
+            .with_dynamic_providers(vec![recorder.clone()]);
+        scanner.scan_all().await.unwrap();
+
+        let asked = recorder.0.lock().unwrap().clone();
+        assert!(asked.contains(&("lookup", "Movie".to_owned())), "{asked:?}");
+        assert!(asked.contains(&("images", "Movie".to_owned())), "{asked:?}");
+        assert!(asked.iter().all(|(_, kind)| kind == "Movie"), "{asked:?}");
+    }
+
     // The dynamic artwork pass fills only the slots the built-in chain left
     // empty, writes bytes as {metadata}/{id}/{stem}.jpg + a persisted image
     // row, and never overwrites art already on disk (earlier scan or user
@@ -38633,9 +39375,10 @@ mod tests {
     // button lands on the wrong episode, and on the alphabetically-last one it
     // has nowhere to go (dead button, no autoplay). File stems here are
     // deliberately inverted against their episode numbers.
-    // The library tile samples the collection type's own kinds — a music
-    // library's tile comes from its ALBUMS (whose covers exist), not from leaf
-    // tracks (which usually have none), and never from the wrong kind.
+    // The library tile samples the collection type's own kinds
+    // (`GetBaseItemKindsForCollectionType`), never the wrong kind. A music
+    // library's tile samples its artists instead, which
+    // `a_music_library_tile_samples_its_credited_artists_with_a_primary` pins.
     #[test]
     fn collage_samples_the_collection_types_kinds() {
         use ferrofin_model::data::BaseItemKind;
@@ -42032,5 +42775,29 @@ mod metadata_default_person_locale_tests {
                 .unwrap();
             assert_eq!(refreshed.overview, Some(format!("Biography {expected}")));
         }
+    }
+}
+
+#[cfg(test)]
+mod season_names_tests {
+    use super::SeasonNames;
+
+    /// gl-385: a scan queued from a request names a season folder in the
+    /// server UI culture (v12.2 `SeasonResolver.Resolve`,
+    /// `GetServerLocalizedString("NameSeasonNumber")`, the call the upstream
+    /// `SeasonResolverTests` mock now answers), and a season with no folder
+    /// in the request's (`GetValidSeasonNameForSeries`, still
+    /// `GetLocalizedString`).
+    #[tokio::test]
+    async fn season_folders_take_the_server_culture_virtual_seasons_the_request() {
+        let server = crate::LocalizationManager::default().with_ui_culture("de");
+        let names =
+            ferrofin_util::current_culture::scope_with_ui("fr".into(), Some("fr".into()), async {
+                SeasonNames::of(None, Some(&server))
+            })
+            .await;
+        assert_eq!(names.numbered(2), "Staffel 2");
+        assert_eq!(names.virtual_season(Some(2)), "Saison 2");
+        assert_eq!(names.virtual_season(None), "Saison inconnue");
     }
 }

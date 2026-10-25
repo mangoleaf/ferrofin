@@ -27,6 +27,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
 
 ### Tooling
+- `gates/parity/filed.toml` records the two differences of the 2026-10-24 replay that have an open
+  issue and no ledger entry (the HLS video segment's timestamps, the live HLS segment names); the
+  run's other groups are accepted by the ledger, gone under the current comparison, fixed since,
+  or came from the replay's older harness
+- The item repository's query translates eleven filter fields it used to ignore (trailer types,
+  chapter images, the provider-id maps, dead parents, box-set library folders and the four "has
+  no track in this language" filters), each with Jellyfin's alternate-version and folder roll-up
+  where it has one; no route sets them yet. A test now fails when a query field is read nowhere
 - The four live checks moved under `gates/`: `bench/` → `gates/bench/`, `adoption/` →
   `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. Every gate
   takes its directories from one output root, `FERROFIN_GATES_DIR` (absolute, on a local
@@ -64,6 +72,16 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   See the [support matrix and tested build](gates/adoption/README.md#supported-and-tested-versions).
   The harness now reports SQLite query failures and detects version promotions when the
   repaired count is zero, with five regression tests; all 40 shell tests passed.
+- Every dependency is declared once, in the root `[workspace.dependencies]`, and used: the
+  unused `axum-extra`, `argon2`, `insta` and seven dead crate edges are gone, and the backup
+  handler's inline zip 2 and ferrofin-util's rand 0.8 move to the workspace's zip and rand 0.10
+- One TLS crypto backend, aws-lc: sqlx no longer builds rustls with ring (SQLite has no network
+  transport), nor its unused `any` and `json` features, and webpki-roots is gone
+- Builds use the committed Cargo.lock: every cargo build, test, clippy and llvm-cov run in CI
+  (GitHub and GitLab), the release, the Docker image, the `deb:amd64` task and the WASM-guest
+  test pass `--locked`, so a manifest change without its lockfile fails instead of resolving
+  anew. The release's cargo-zigbuild and ziglang are pinned (0.23.4 and 0.16.0, the pair the
+  v1.3.2 aarch64 build used), and GitLab's `:latest` images to the versions they are today
 
 ### Parity
 - `POST /LiveTv/TunerHosts` with the id of a configured tuner in another case keeps the id
@@ -88,6 +106,76 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   guide), where they were read past; and the guide is the first `<tv>` element wherever it
   is (`ReadToDescendant`), so a well-formed document without one is an empty guide
   (Lineups `[]`, the refresh drains the provider) rather than an unreadable one
+- Find the playlists folder by its type when a playlist is created, as Jellyfin's
+  `GetPlaylistsFolder` does, instead of by its path or derived id, and write nothing during
+  the lookup. Startup now makes a playlists folder kept at the folder's directory under an id
+  of its own a `PlaylistsFolder` under the root, and puts playlists an older Ferrofin saved
+  without a parent into the playlists folder
+- Let a user named twice in a playlist's `Users` (create, update, or a playlist's stored
+  `Shares` read back at startup) edit it when either entry can, as Jellyfin does, instead of
+  keeping only the last entry's permission
+- Parse `POST /DisplayPreferences/{id}` values as Jellyfin's .NET parsers do: `IndexBy` and
+  `chromecastVersion` also take an integer (an unnamed one is kept and written back as its
+  number by `GET`), a comma list and padding, and a `chromecastVersion` that does not parse
+  is a `400` instead of being stored as stable; the skip lengths, the overlay flag and the
+  `homesection` order ignore the white space and trailing NULs .NET ignores
+- Accept a playlist `Users` entry without `CanEdit` or `UserId` on `POST /Playlists` and
+  `POST /Playlists/{id}`, as Jellyfin does: a missing `CanEdit` shares read-only, a missing
+  or null `UserId` is the empty GUID; a `null` `CanEdit` is still a `400`
+- Pin the order a display-preferences row's home sections are read in to `Order`, then `Id`:
+  on a database adopted from Jellyfin, which keeps every save's rows, `GET /DisplayPreferences`
+  answers the newest section of each order, as Jellyfin does. SQLite already returned them in
+  that order, but nothing guaranteed it
+- Read a display-preferences id as Jellyfin's `Guid.TryParse` reads it: a `(…)`, `{0x…}` or
+  space-padded GUID addresses that GUID's preferences, and an `urn:uuid:` id is hashed like
+  any other name
+- Bind a `POST /Users` body as Jellyfin does: a body without `Name`, or with a null one, is
+  a `400` (the name is invalid) instead of keeping the name, and the user's `Policy` in the
+  body is validated, so one without both provider ids is a `400` unless it is sent as
+  `null`. A body without `Configuration` still resets the user's settings to the defaults,
+  as on Jellyfin
+- Refuse a `POST /Users/{userId}/Policy` body that leaves out `AuthenticationProviderId` or
+  `PasswordResetProviderId`, or sends either blank, with Jellyfin's `400` naming each missing
+  member, instead of saving the user's providers as empty strings
+- `GET /Items` honours `seriesStatus` (jellyfin-web's TV Status filter), `minOfficialRating`,
+  `maxOfficialRating`, `personTypes`, `isPlaceHolder` and `hasOfficialRating`, and
+  `hasParentalRating=false` returns only the unrated items, as Jellyfin 12.2's `TranslateQuery`
+  does; each used to be ignored. A folder (a series, season or box set) counts as
+  rated, or as a placeholder, when an item below it or linked to it is. `maxOfficialRating` can
+  lower a restricted user's parental limit but never raise it: Jellyfin lets the request replace
+  the limit, and an unrecognized rating clears it there
+- `GET /Items` resolves its `studios`, `artists` and `albums` name filters, which replace
+  `studioIds`, `artistIds` and `albumIds` as in Jellyfin. Unlike Jellyfin, the lookup writes no
+  row; an unknown name matches nothing (Jellyfin answers the whole library for an unknown album)
+- On `GET /Items`, an artist's albums listed with no `sortBy` (`artistIds` or `artists`, with
+  `MusicAlbum` as the only `includeItemTypes`) come newest first, then by name, Jellyfin's default
+  for that request
+- `nameStartsWith` on `/Genres`, `/MusicGenres`, `/Studios`, `/Artists` and
+  `/Artists/AlbumArtists` is a literal prefix of the sort name, as on `/Items`: `%` and `_` match
+  only themselves, and a leading space is kept
+- Port Jellyfin's Screen Grabber (`VideoImageProvider`): a movie, episode, music video or
+  home video with no Primary image after the local, remote and embedded providers gets a
+  frame from its default video stream, 10 % into its runtime (10 s when the runtime is
+  unknown), on its first scan or a **Refresh metadata** that searches for missing metadata
+  or replaces it. The library's "Screen Grabber" image fetcher gates it, and a new library
+  ticks it. A first-scan grab that fails leaves the video to be refreshed again by the
+  next scan. `GET /Libraries/AvailableOptions` lists it last for
+  the video types, and lists each type's image fetchers in Jellyfin's order (the server-wide
+  image fetcher order, then each provider's own order) instead of registration order, so
+  the order a new library shows and saves is the order its scans already used
+- List each type's remote similarity providers (TheMovieDb, ListenBrainz) before Local
+  Genre/Tag in `GET /Libraries/AvailableOptions`, as Jellyfin 12.2 does
+- Extract a chapter image, video thumbnail or frame grab the standard way when the
+  I-frame attempt fails, as Jellyfin's `ExtractImage` does. A frame or embedded picture
+  counts as extracted only when ffmpeg exited successfully and wrote a non-empty file
+- Tone-map the frames of HDR10, HLG and Dolby Vision videos to SDR for chapter images,
+  thumbnails and frame grabs, as Jellyfin's `ExtractImageInternal` does: with `tonemapx`
+  (jellyfin-ffmpeg) when ffmpeg has it, else with `zscale` for all but Dolby Vision with
+  no HDR10, HLG or SDR base layer, under the 20 s HDR extraction timeout instead of 10 s
+- Port Jellyfin's `FFmpeg:imgExtractPerfTradeoff` startup option as
+  `FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF` (`ffmpeg_img_extract_perf_tradeoff` in
+  `config.toml`), off by default. On, frame extraction decodes keyframes only and skips
+  the 24-frame thumbnail sampling
 - Open an M3U tuner's playlist before saving it, as Jellyfin's `M3UTunerHost.Validate`
   does: a missing local playlist is a `404` and a failing playlist URL a `500`, where the
   tuner was saved and only the next guide refresh showed it empty. A Live TV source URL is
@@ -388,6 +476,25 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   in Jellyfin; it took them from the last. The metadata language and country of an item in
   nested libraries now come from the innermost one, and `GET /Items/{itemId}/Ancestors`
   names the first library by sort name when two list the same folder
+- Library tiles are drawn as in Jellyfin 12.2. An image at the root of a library's media
+  folder (a `folder.jpg` in `/media/movies`) becomes the library's image, after one in the
+  library's own folder. A music library's collage comes from the artists its tracks credit,
+  not its albums, and every collage samples 8 items that have a Primary image; a library
+  whose items have none keeps the icon tile, where Ferrofin drew from any item. A library's
+  or the root's first refresh at the default mode, or one past the library's automatic
+  refresh interval, redraws the tile or the root's image, and the library and the root now
+  record their last refresh
+- Library renames and media-path removals compare paths as Jellyfin does, ignoring the case
+  of every letter, not only ASCII: on a case-insensitive file system, renaming `élan` to
+  `Élan` works instead of answering `409`, and the users' library preferences follow a
+  library whose stored path differs in a non-ASCII letter's case. Users' library and view
+  preferences are read as .NET parses a GUID: a padded or `(…)` value counts, a
+  `urn:uuid:` one does not
+- An extra (a trailer, featurette or theme song) is never looked up by a WASM plugin's
+  metadata or artwork source, as Jellyfin 12 never asks a remote provider about one: it has
+  no identity of its own online, so a lookup by its file name filled it with another title's
+  overview, people or Primary image. Its local readers, embedded images and extracted frames
+  still run. The item it belongs to is asked as before
 
 ### Performance
 - `/Persons` with a favourite filter: build the user's favourite-person set once per
@@ -479,6 +586,47 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   transform that would grow a file by more than 256 KiB leaves the file unchanged
 - WASM plugins with a semver prerelease or build version (`0.2.0-beta.1`, `1.0.0+git.abc`) can
   be enabled, disabled and uninstalled from the dashboard; those buttons answered `400`
+- `POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo` requires the subtitle management
+  permission, as the plugin does: any signed-in account could make the server try
+  OpenSubtitles logins of its choosing with the shared application key. It now answers as the
+  plugin does, `{"Downloads": n}` for a working account (logging the test session out again)
+  and `401 {"Message": …}` for a refused one, where it answered an empty 200 or `{"error": …}`
+- A host name in `KnownProxies` (a docker-compose service name, say) is resolved, as in
+  Jellyfin, instead of dropped without a word. Behind a proxy named that way every client
+  looked like the proxy, a LAN address, to the remote-access, IP-filter and local-access
+  checks. An entry of a disabled address family is dropped and an IPv4-mapped one unmapped, as
+  Jellyfin does, ASP.NET's loopback defaults (`::1`, `127.0.0.0/8`) stay trusted whenever the
+  list is not empty, and an entry that resolves to nothing is logged once at warning level
+- A line break in a logged value (the `DeviceId` a client sends, a WASM plugin's log text) can
+  no longer forge a line in the log file behind `/System/Logs`: the file continues the entry
+  on an indented line instead (a carriage return is written as `\r`), and a plugin's text is
+  logged escaped, under `guest_message`, cut at 8 KiB
+- WASM plugins: an `http-fetch` to an IPv6 address that carries a private IPv4 one is refused
+  like the IPv4 address itself, unless the plugin is granted private-network access. A NAT64
+  (`64:ff9b::/96`), 6to4 (`2002::/16`) or IPv4-compatible (`::a.b.c.d`) address reached, say,
+  the cloud metadata service or the server's own loopback through a gateway, where only the
+  IPv4-mapped form was unwrapped. The local-use NAT64 prefix `64:ff9b:1::/48` is refused
+  outright
+- WASM plugins: the engine grants a plugin only the WebAssembly features the host needs. A
+  plugin could use shared memory (threads), GC types, exception handling and the async
+  component model, which wasmtime turns on with its default build; a plugin that uses one no
+  longer loads, and none known does. The server also no longer builds wasmtime's profiling,
+  compilation cache, core dump and pooling allocator support, or WASI preview 1 and 3
+- File Transformation: what the pipeline serves for one `/web` file is capped at 16 MiB, so an
+  anonymous page load can no longer make the server allocate without bound. A callback
+  endpoint's answer is read no further than that, and a step that would grow the file past it
+  (an admin search/replace whose replace text multiplies the file, or another plugin's
+  transform) is skipped with one warning, leaving the file as it was before that step
+- Dependencies with published RustSec advisories are upgraded: wasmtime and wasmtime-wasi
+  49.0.0 → 49.0.4 (25 advisories against the WASM plugin host, among them a WASI symlink-rename
+  sandbox escape, an aarch64 Cranelift miscompile and fuel-limit bypasses), zip 8 → 9 (three
+  extraction advisories), h2, tokio, ctutils, event-listener, webpki-root-certs (distrusted CA
+  roots), and quinn-proto, which Cargo.lock records although nothing builds it
+- A supply-chain gate: CI's `dependencies` job runs `cargo deny` (RustSec advisories, licenses
+  compatible with GPL-3.0-only, unused workspace entries, crates.io sources only),
+  `cargo machete` and `scripts/check-workspace-deps.py` (no inline dependency versions) on every
+  push and PR, and a release re-checks the advisories before it is tagged
+  ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
 - A Live TV tuner, guide provider, series timer or timer whose stored settings no longer
@@ -669,6 +817,72 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   full or read-only database): the failure is logged as a warning and every library is still
   listed, where `GET /Library/VirtualFolders`, the home screen's views and the scheduled tasks
   that look libraries up all failed until a later listing succeeded
+- Image, user image, splashscreen, subtitle and lyric uploads take bodies up to 30,000,000
+  bytes, Kestrel's default that Jellyfin keeps: an image over about 1.5 MB (2 MiB once
+  base64-encoded) was refused with a 413. A body past a route's limit is a 413 everywhere,
+  where a JSON body over it was a 400 claiming the body was missing
+- A posted device profile the stream builder cannot evaluate is answered as Jellyfin answers
+  it, a 400 for a condition on a property the stream has none of and a 500 for a comparison
+  its value has none of, instead of a panic. A `VideoTimestamp` condition's value is read as
+  Jellyfin reads it, so an unknown one is a 400 rather than a condition never met
+- A resized image is written beside its cache path and renamed into place, so a request that
+  races its encode, or follows an encode that failed part-way, never serves (and pins for a
+  year, under the immutable cache header) a truncated image
+- The Merge Versions plugin's bulk merges and splits run one at a time, whether a route or a
+  daily task starts them: a merge and a split started together interleaved their version-link
+  writes
+- Renaming a library to its own name, or changing only its case while item ids ignore case,
+  keeps the library's database row. It was deleted and created again, which reset the
+  library's date added, dropped its images and left its items without the library above
+  them until the next scan
+- A transcode whose first segment takes longer than the idle timeout (60 s for HLS, 10 s
+  progressive), such as a cold 4K software encode or a slow tuner, is no longer killed by the
+  idle reaper while it starts. A transcode killed while it starts, by a stop request say, ends
+  its request at once instead of after three minutes
+- Playing a `.strm` shortcut, or an item with no main stream, refreshes it as an item refresh
+  queued with the library scans, as in Jellyfin. It no longer runs a scan of its own beside a
+  library scan, and a shortcut whose file is gone is no longer deleted while it is played
+- Two refreshes of one item's trickplay at once (a scan's and the daily task's, say) generate
+  its tiles once, and one no longer deletes a tile folder the other has just moved in
+- When the kernel's inotify queue overflows during a bulk import, the watched libraries are
+  rescanned, and a warning names the `fs.inotify.max_queued_events` sysctl to raise. The
+  missed changes used to stay out of the library, silently, until the next scheduled scan
+- A library change while the watches are still being set up at boot no longer leaves that
+  setup watching the libraries it had read, a removed one included, until the next restart.
+  An in-process restart stops the setup
+- Closing a stream from a legacy (pre-vchannel) HDHomeRun releases its tuner. Every close left
+  one tuner locked, and after as many closes as the device has tuners every open failed with
+  "No tuners available" until the device dropped the locks
+- An attachment or font extraction cancelled by a disconnecting client stops its ffmpeg, and
+  deletes the half-written files the cache would otherwise have served. A batch font dump,
+  whose files the media names, leaves what it wrote, as in Jellyfin
+- The README said a fresh install logs a generated admin password. It seeds the admin with
+  no password, as Jellyfin does: the setup wizard at `/web` sets it, or
+  `FERROFIN_ADMIN_PASSWORD` seeds one
+- WASM plugins: a web transform whose `path-pattern` is not a valid regex, such as the glob
+  `*.chunk.js` the plugin interface gave as an example, is refused at load with a warning; it
+  matched nothing, silently. The interface now says what a pattern is: an exact path under the
+  web root, else a regex matched anywhere in the path
+- Plugins: overlapping installs, updates and uninstalls can no longer lose a recorded entry
+  from the plugin state file (`plugins/state.json`) or tear it, and a plugin update racing a
+  manual install of the same plugin can no longer tear the staged `.wasm`. Every save is made
+  under the state lock and through its own synced temporary file, where three of them wrote an
+  older copy of the state outside the lock and every writer of a path shared one `.tmp` file.
+  These files (the state, plugin settings and staged `.wasm`) are now written owner-only
+  (`0600`). A state file that cannot be read or parsed is kept as `state.json.corrupt` and
+  logged at error level instead of being silently replaced, along with the enabled switches
+  and the record of installed versions it held
+- File Transformation: a callback endpoint that fails (an error status, a timeout, a refused
+  connection) logs one warning, then logs at debug level until it works again. It logged two
+  warnings on every matching `/web` request for as long as it stayed down
+- The config file is read as TOML only: a `--config`/`FERROFIN_CONFIG_FILE` path named
+  `.json`, `.json5`, `.yaml`, `.yml`, `.ini` or `.ron` is refused instead of parsed in that format
+  (see [docs/UPGRADING.md](docs/UPGRADING.md)), and the server no longer builds those
+  parsers
+- OTLP trace export works with an `https://` collector: the exporter now has TLS (aws-lc) and
+  checks the collector against the system trust store. It refused an https endpoint before, and
+  that went unlogged, like every other exporter outcome: the server logged them before its
+  log output was set up. The startup log now says whether traces are exported, or why not
 
 ## [1.0.0] - 2026-09-05
 

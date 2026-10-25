@@ -118,6 +118,8 @@ struct MemUsers {
     updated_policy: Mutex<Option<(Uuid, UserPolicy)>>,
     /// Records the last configuration passed to `update_configuration`.
     updated_configuration: Mutex<Option<(Uuid, UserConfiguration)>>,
+    /// Records the last (user_id, new_name) passed to `rename_user`.
+    renamed: Mutex<Option<(Uuid, String)>>,
     /// Records whether `delete_user` was called and for whom.
     deleted: Mutex<Option<Uuid>>,
     /// Makes `delete_user` refuse, as the last user or the last admin.
@@ -161,10 +163,11 @@ impl UserManager for MemUsers {
     }
     async fn rename_user(
         &self,
-        _user_id: Uuid,
+        user_id: Uuid,
         _old_name: &str,
-        _new_name: &str,
+        new_name: &str,
     ) -> Result<(), ServiceError> {
+        *self.renamed.lock().unwrap() = Some((user_id, new_name.to_owned()));
         Ok(())
     }
     async fn update_user(&self, _user: &UserEntity) -> Result<(), ServiceError> {
@@ -339,10 +342,12 @@ impl QuickConnect for OkQuickConnect {
     }
 }
 
-/// Records token revocation while leaving unrelated session methods unused.
+/// Records token revocation and user-session pushes while leaving unrelated
+/// session methods unused.
 #[derive(Default)]
 struct NoopSessions {
     revoked: Mutex<Vec<(Uuid, String)>>,
+    pushed: Mutex<Vec<(Vec<Uuid>, SessionMessageType)>>,
 }
 
 #[async_trait]
@@ -422,12 +427,16 @@ impl SessionManager for NoopSessions {
     }
     async fn send_message_to_user_sessions(
         &self,
-        _user_ids: &[Uuid],
-        _message_type: SessionMessageType,
+        user_ids: &[Uuid],
+        message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
         // The user-update handlers push UserUpdated/UserDeleted here
         // best-effort; delivery is covered by ferrofin-core's tests.
+        self.pushed
+            .lock()
+            .unwrap()
+            .push((user_ids.to_vec(), message_type));
         Ok(())
     }
     async fn send_message_to_user_device_sessions(
@@ -1782,9 +1791,7 @@ async fn update_policy_records_and_guards_last_admin() {
                 .uri(format!("/Users/{ADMIN_ID}/Policy"))
                 .header("X-Emby-Token", "t")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&UserPolicy::default()).unwrap(),
-                ))
+                .body(Body::from(serde_json::to_vec(&complete_policy()).unwrap()))
                 .unwrap(),
         )
         .await
@@ -1794,7 +1801,7 @@ async fn update_policy_records_and_guards_last_admin() {
     // Updating bob's policy is fine and is recorded.
     let policy = UserPolicy {
         max_active_sessions: 5,
-        ..UserPolicy::default()
+        ..complete_policy()
     };
     let ok = router
         .oneshot(
@@ -1812,6 +1819,79 @@ async fn update_policy_records_and_guards_last_admin() {
     let recorded = users.updated_policy.lock().unwrap().clone().unwrap();
     assert_eq!(recorded.0, BOB_ID);
     assert_eq!(recorded.1.max_active_sessions, 5);
+}
+
+/// A policy whose two `[Required]` provider ids are set, as every client that
+/// echoes a `GET /Users/{id}` policy back sends it.
+fn complete_policy() -> UserPolicy {
+    UserPolicy {
+        authentication_provider_id:
+            "Jellyfin.Server.Implementations.Users.DefaultAuthenticationProvider".to_owned(),
+        password_reset_provider_id:
+            "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider".to_owned(),
+        ..UserPolicy::default()
+    }
+}
+
+/// `UserPolicy`'s provider ids are `[Required(AllowEmptyStrings = false)]`, so
+/// ASP.NET's model validation refuses a policy body that leaves either out,
+/// sends it null or blank, before the action runs (ahead of the unknown user's
+/// 404), naming each failing member. Measured on a live Jellyfin 12.2.
+#[rstest::rstest]
+#[case::empty_body(r"{}", BOB_ID, &["AuthenticationProviderId", "PasswordResetProviderId"])]
+#[case::no_reset_provider(r#"{"AuthenticationProviderId":"a"}"#, BOB_ID, &["PasswordResetProviderId"])]
+#[case::empty_auth_provider(
+    r#"{"AuthenticationProviderId":"","PasswordResetProviderId":"b"}"#,
+    BOB_ID,
+    &["AuthenticationProviderId"]
+)]
+#[case::blank_auth_provider(
+    r#"{"AuthenticationProviderId":"  ","PasswordResetProviderId":"b"}"#,
+    BOB_ID,
+    &["AuthenticationProviderId"]
+)]
+#[case::null_reset_provider(
+    r#"{"AuthenticationProviderId":"a","PasswordResetProviderId":null}"#,
+    BOB_ID,
+    &["PasswordResetProviderId"]
+)]
+#[case::unknown_user(r"{}", Uuid::from_u128(0xDEAD), &["AuthenticationProviderId", "PasswordResetProviderId"])]
+#[tokio::test]
+async fn update_policy_requires_both_provider_ids(
+    #[case] body: &str,
+    #[case] user: Uuid,
+    #[case] failing: &[&str],
+) {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{user}/Policy"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    let errors = json["errors"].as_object().expect("validation errors");
+    let mut keys: Vec<&str> = errors.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, failing);
+    for member in failing {
+        assert_eq!(
+            errors[*member][0],
+            format!("The {member} field is required.")
+        );
+    }
+    assert!(
+        users.updated_policy.lock().unwrap().is_none(),
+        "nothing saved"
+    );
 }
 
 #[tokio::test]
@@ -2089,7 +2169,7 @@ async fn user_scoped_update_user_forwards() {
     let users = Arc::new(MemUsers::default());
     let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
     // Same name → no rename; the configuration write is the observable effect.
-    let body = serde_json::json!({ "Name": "bob", "Configuration": {} });
+    let body = serde_json::json!({ "Name": "bob", "Configuration": {}, "Policy": null });
     let response = router
         .oneshot(
             Request::builder()
@@ -2106,6 +2186,189 @@ async fn user_scoped_update_user_forwards() {
     // The path user id reaches the manager (proving the alias forwarded).
     let (id, _) = users.updated_configuration.lock().unwrap().clone().unwrap();
     assert_eq!(id, BOB_ID);
+}
+
+/// Posts `body` to `POST /Users?userId={bob}` as the administrator, returning
+/// the status, the JSON body (`Null` when empty) and the store it wrote to.
+async fn update_bob(body: &str) -> (StatusCode, serde_json::Value, Arc<MemUsers>) {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users?userId={BOB_ID}"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, json, users)
+}
+
+/// ASP.NET validates the `Policy` nested in a `UserDto` body before the
+/// action runs. A body without one carries `UserDto`'s constructor policy,
+/// whose `[Required]` provider ids are null, so it is a 400 keyed
+/// `Policy.{member}`; only a complete policy or `"Policy": null` passes.
+/// Measured on a live Jellyfin 12.2.
+#[rstest::rstest]
+#[case::no_policy(
+    r#"{"Name":"bob"}"#,
+    &["Policy.AuthenticationProviderId", "Policy.PasswordResetProviderId"]
+)]
+#[case::empty_policy(
+    r#"{"Name":"bob","Policy":{}}"#,
+    &["Policy.AuthenticationProviderId", "Policy.PasswordResetProviderId"]
+)]
+#[case::blank_reset_provider(
+    r#"{"Name":"bob","Policy":{"AuthenticationProviderId":"a","PasswordResetProviderId":" "}}"#,
+    &["Policy.PasswordResetProviderId"]
+)]
+#[case::null_auth_provider(
+    r#"{"Name":"bob","Policy":{"AuthenticationProviderId":null,"PasswordResetProviderId":"b"}}"#,
+    &["Policy.AuthenticationProviderId"]
+)]
+#[tokio::test]
+async fn update_user_validates_the_nested_policy(#[case] body: &str, #[case] failing: &[&str]) {
+    let (status, json, users) = update_bob(body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let errors = json["errors"].as_object().expect("validation errors");
+    let mut keys: Vec<&str> = errors.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, failing);
+    assert!(users.updated_configuration.lock().unwrap().is_none());
+}
+
+/// The hidden `POST /Users/{userId}` forwards to the same validation.
+#[tokio::test]
+async fn user_scoped_update_user_validates_the_nested_policy() {
+    let users = Arc::new(MemUsers::default());
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{BOB_ID}"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"Name":"bob"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert!(json["errors"]["Policy.AuthenticationProviderId"].is_array());
+    assert!(users.updated_configuration.lock().unwrap().is_none());
+}
+
+#[rstest::rstest]
+#[case::null_policy(r#"{"Name":"bob","Policy":null}"#)]
+#[case::complete_policy(
+    r#"{"Name":"bob","Policy":{"AuthenticationProviderId":"a","PasswordResetProviderId":"b"}}"#
+)]
+#[tokio::test]
+async fn update_user_accepts_a_complete_or_null_policy(#[case] body: &str) {
+    let (status, _, _) = update_bob(body).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// C# compares the stored name with `updateUser.Name` and renames when they
+/// differ, so a missing or null name is handed to `RenameUser`, whose
+/// `ThrowIfInvalidUsername` refuses it (the real manager's
+/// `require_valid_username`, a 400). The same name renames nothing.
+#[rstest::rstest]
+#[case::no_name(r#"{"Policy":null}"#, Some(""))]
+#[case::null_name(r#"{"Name":null,"Policy":null}"#, Some(""))]
+#[case::same_name(r#"{"Name":"bob","Policy":null}"#, None)]
+#[tokio::test]
+async fn update_user_renames_whenever_the_name_differs(
+    #[case] body: &str,
+    #[case] renamed_to: Option<&str>,
+) {
+    let (status, _, users) = update_bob(body).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "the fake store renames to anything"
+    );
+    let renamed = users.renamed.lock().unwrap().clone();
+    assert_eq!(renamed.as_ref().map(|(_, name)| name.as_str()), renamed_to);
+}
+
+/// v12.2 raises `UserUpdatedEventArgs`, whose `UserUpdatedNotifier` is the only
+/// sender of `UserUpdated`, from `RenameUser` and `UpdatePolicyAsync` alone:
+/// `UpdateUser` renames only when the name changed, and
+/// `UpdateConfigurationAsync` raises nothing.
+#[rstest::rstest]
+#[case::update_without_rename("/Users?userId=BOB", r#"{"Name":"bob","Policy":null}"#, false)]
+#[case::update_with_rename("/Users?userId=BOB", r#"{"Name":"robert","Policy":null}"#, true)]
+#[case::user_scoped_update("/Users/BOB", r#"{"Name":"bob","Policy":null}"#, false)]
+#[case::configuration("/Users/Configuration?userId=BOB", "{}", false)]
+#[case::user_scoped_configuration("/Users/BOB/Configuration", "{}", false)]
+#[case::policy("/Users/BOB/Policy", "POLICY", true)]
+#[tokio::test]
+async fn only_a_rename_or_a_policy_save_pushes_user_updated(
+    #[case] uri: &str,
+    #[case] body: &str,
+    #[case] pushes: bool,
+) {
+    let sessions = Arc::new(NoopSessions::default());
+    let router = create_router(state_with_sessions(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(AdminAuth),
+        sessions.clone(),
+    ));
+    let body = if body == "POLICY" {
+        serde_json::to_string(&complete_policy()).unwrap()
+    } else {
+        body.to_owned()
+    };
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri.replace("BOB", &BOB_ID.to_string()))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let expected = if pushes {
+        vec![(vec![BOB_ID], SessionMessageType::UserUpdated)]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(*sessions.pushed.lock().unwrap(), expected);
+}
+
+/// `UserDto`'s constructor supplies a default `UserConfiguration`, so a body
+/// without `Configuration` resets the stored settings to the defaults, as a
+/// live Jellyfin 12.2 does. `"Configuration": null` (a 500 upstream) saves
+/// nothing.
+#[tokio::test]
+async fn update_user_without_configuration_saves_the_default_configuration() {
+    let (status, _, users) = update_bob(r#"{"Name":"bob","Policy":null}"#).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let saved = users.updated_configuration.lock().unwrap().clone();
+    assert_eq!(saved, Some((BOB_ID, UserConfiguration::default())));
+
+    let (status, _, users) =
+        update_bob(r#"{"Name":"bob","Policy":null,"Configuration":null}"#).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(users.updated_configuration.lock().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -2178,7 +2441,7 @@ async fn a_userless_caller_cannot_update_a_user_whose_stored_id_is_malformed() {
                 .uri(format!("/Users?userId={CORRUPT_ID}"))
                 .header("X-Emby-Token", "t")
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(r#"{"Name":"pwned"}"#))
+                .body(Body::from(r#"{"Name":"pwned","Policy":null}"#))
                 .unwrap(),
         )
         .await
@@ -2239,7 +2502,7 @@ async fn account_updates_respect_preferences_and_api_key_elevation() {
         }
     }
     for (path, body) in [
-        ("/Users", r#"{"Name":"new-name"}"#),
+        ("/Users", r#"{"Name":"new-name","Policy":null}"#),
         ("/Users/Password", r#"{"NewPw":"replacement"}"#),
         (
             "/Users/Configuration",

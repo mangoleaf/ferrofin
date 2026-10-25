@@ -236,10 +236,12 @@ impl AggregateFolderStore {
 
     /// `folder.ParentId = rootFolder.Id` for the playlists folder, plus the
     /// one-shot rewrite of a legacy `ManualPlaylistsFolder` row onto 10.11.8's
-    /// identity, the folder's row itself when there is none, and its move to
-    /// the data directory when the row is somewhere else.
+    /// identity, the folder's row itself when there is none, its move to the
+    /// data directory when the row is somewhere else, the retype of a folder
+    /// kept at the directory under an id of its own, and the playlists an
+    /// older Ferrofin left without a parent put into the folder.
     ///
-    /// Each is a write to one row, run once per process.
+    /// Each is idempotent, run once per process.
     async fn repair_playlists_folder(
         &self,
         aggregate: Uuid,
@@ -298,11 +300,9 @@ impl AggregateFolderStore {
                         .await?;
                 }
             }
-            None => {
-                if crate::item_persistence_service::container_at(&self.db, &path_str)
-                    .await?
-                    .is_none()
-                {
+            None => match crate::item_persistence_service::container_at(&self.db, &path_str).await?
+            {
+                None => {
                     if let Err(e) = tokio::fs::create_dir_all(&path).await {
                         tracing::warn!(path = %path.display(), %e,
                             "could not create the playlists directory");
@@ -317,7 +317,32 @@ impl AggregateFolderStore {
                     tracing::info!(item_id = %correct, path = %path.display(),
                         "created the playlists folder");
                 }
-            }
+                // A playlists folder kept at the folder's path is the folder in
+                // use, so it is made what a create looks up by type (gl-921):
+                // a `PlaylistsFolder` (an earlier Ferrofin stored it as
+                // `ManualPlaylistsFolder`) under the aggregate. Its id is its
+                // own, not derived from its type, so it stays. A row of any
+                // other type there is not this server's to change.
+                Some(found) => {
+                    if crate::item_persistence_service::retype_container(
+                        &self.db,
+                        found,
+                        BaseItemKind::ManualPlaylistsFolder,
+                        BaseItemKind::PlaylistsFolder,
+                    )
+                    .await?
+                    {
+                        crate::item_persistence_service::reparent_virtual_child(
+                            &self.db, found, aggregate, user_root,
+                        )
+                        .await?;
+                    } else {
+                        tracing::warn!(item_id = %found, path = %path.display(),
+                            "a row that is not a playlists folder holds the playlists directory; \
+                             no playlists folder is provisioned");
+                    }
+                }
+            },
         }
         // A row A4 parented straight to the `UserRootFolder` (or one left
         // parentless) moves onto the aggregate, where `CreateRootFolder` puts
@@ -326,7 +351,25 @@ impl AggregateFolderStore {
         crate::item_persistence_service::reparent_virtual_child(
             &self.db, correct, aggregate, user_root,
         )
-        .await
+        .await?;
+        // Playlists an older Ferrofin saved with neither parent nor top parent
+        // go into the folder a create finds. Startup's repair, once per
+        // process: upstream's lookup (`GetPlaylistsFolder`) writes nothing.
+        if let Some(folder) = crate::item_persistence_service::playlists_folder_by_type(
+            &self.db,
+            Some(aggregate),
+            Some(user_root),
+        )
+        .await?
+        {
+            crate::item_persistence_service::adopt_orphans(
+                &self.db,
+                BaseItemKind::Playlist,
+                folder,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Saves the playlists folder `id`, stored at `stored`, at this server's
@@ -535,14 +578,124 @@ mod tests {
                 !row_exists(&db, derived).await.expect("probe"),
                 "no second playlists folder under the derived id"
             );
+            let kept = fetch_item(&db, foreign).await;
             assert_eq!(
-                fetch_item(&db, foreign).await.path.as_deref(),
+                kept.path.as_deref(),
                 Some(stored_path.as_str()),
-                "the row found by path is kept as it is"
+                "the row found by path is kept at its path"
+            );
+            assert_eq!(
+                kept.parent_id,
+                Some(db_guid(store.id())),
+                "and hangs off the aggregate, where a create looks for it"
             );
         })
         .await
         .expect("the test finishes");
+    }
+
+    /// gl-921: a create finds the playlists folder by its type under the
+    /// aggregate, so a row an earlier Ferrofin kept at the folder's path as a
+    /// `ManualPlaylistsFolder` under an id of its own becomes the
+    /// `PlaylistsFolder` child of the aggregate, keeping its id.
+    #[tokio::test]
+    async fn ensure_makes_a_manual_playlists_folder_at_the_path_a_playlists_folder() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        let foreign = Uuid::from_u128(0xF0DE);
+        seed_folder_item(
+            &db,
+            foreign,
+            BaseItemKind::ManualPlaylistsFolder,
+            "Playlists",
+            None,
+        )
+        .await;
+        set_item_path(&db, foreign, &store.playlists_path().to_string_lossy()).await;
+
+        store.ensure().await.expect("ensure");
+
+        let kept = fetch_item(&db, foreign).await;
+        assert_eq!(
+            Some(kept.type_.as_str()),
+            item_type_lookup::stored_type_name(BaseItemKind::PlaylistsFolder)
+        );
+        assert_eq!(kept.parent_id, Some(db_guid(store.id())));
+        assert_eq!(
+            crate::item_persistence_service::playlists_folder_by_type(
+                &db,
+                Some(store.id()),
+                Some(store.user_root_id()),
+            )
+            .await
+            .expect("lookup"),
+            Some(foreign)
+        );
+    }
+
+    /// A playlist an older Ferrofin saved with neither parent nor top parent
+    /// is put into the playlists folder at startup, once: the create path's
+    /// lookup writes nothing, as `GetPlaylistsFolder` does not. A playlist
+    /// that has a parent (every one an adopted Jellyfin database carries)
+    /// stays where it is.
+    #[tokio::test]
+    async fn ensure_puts_orphaned_playlists_into_the_playlists_folder() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        let orphan = Uuid::from_u128(0x0A9);
+        seed_folder_item(&db, orphan, BaseItemKind::Playlist, "Orphan", None).await;
+        let elsewhere = Uuid::from_u128(0xE15);
+        seed_folder_item(&db, elsewhere, BaseItemKind::Folder, "Elsewhere", None).await;
+        let placed = Uuid::from_u128(0x91A);
+        seed_folder_item(
+            &db,
+            placed,
+            BaseItemKind::Playlist,
+            "Placed",
+            Some(elsewhere),
+        )
+        .await;
+
+        store.ensure().await.expect("ensure");
+
+        let playlists = db_guid(store.playlists_id().expect("playlists id"));
+        let row = fetch_item(&db, orphan).await;
+        assert_eq!(row.parent_id.as_deref(), Some(playlists.as_str()));
+        assert_eq!(row.top_parent_id.as_deref(), Some(playlists.as_str()));
+        assert_eq!(
+            fetch_item(&db, placed).await.parent_id,
+            Some(db_guid(elsewhere)),
+            "a playlist with a parent is left alone"
+        );
+    }
+
+    /// A row that is not a playlists folder at the folder's directory (here
+    /// a library) is not this server's to change: startup leaves its type and
+    /// parent alone and provisions no second folder beside it.
+    #[tokio::test]
+    async fn ensure_leaves_a_foreign_row_at_the_playlists_path_alone() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        let library = Uuid::from_u128(0xC0F);
+        seed_folder_item(&db, library, BaseItemKind::CollectionFolder, "Lib", None).await;
+        set_item_path(&db, library, &store.playlists_path().to_string_lossy()).await;
+
+        store.ensure().await.expect("ensure");
+
+        let row = fetch_item(&db, library).await;
+        assert_eq!(
+            Some(row.type_.as_str()),
+            item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
+        );
+        assert_eq!(row.parent_id, None);
+        assert!(
+            !row_exists(&db, store.playlists_id().expect("id"))
+                .await
+                .expect("probe")
+        );
     }
 
     /// The folder carries `CreateRootFolder`'s dates: created and modified

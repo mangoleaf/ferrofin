@@ -40,6 +40,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -282,6 +283,16 @@ pub struct FerrofinLibraryMonitor {
     /// Where the live `LibraryMonitorDelay` setting is read from. `None` (and
     /// no [`fixed_debounce`](Self::with_debounce)) means no debounce.
     config: Option<Arc<dyn ServerConfigurationManager>>,
+    /// Bumped by every `stop` (`LibraryMonitor._watcherGeneration`): a
+    /// `start` that began before the bump watches no further root.
+    generation: Arc<AtomicU64>,
+    /// Held by a `start` for its walk and by a `stop`, so a `stop` waits for
+    /// the root a `start` is walking and removes it with the rest. Upstream
+    /// disposes a stale generation's watcher instead, but it has one watcher
+    /// per root; this watcher keys its watches by path, so a stale start's
+    /// watch of a root cannot be told from a newer start's (owner decision
+    /// 2026-10-25).
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinLibraryMonitor {
@@ -311,6 +322,8 @@ impl FerrofinLibraryMonitor {
             flush: Arc::new(tokio::sync::Notify::new()),
             fixed_debounce: None,
             config: None,
+            generation: Arc::new(AtomicU64::new(0)),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -452,6 +465,10 @@ impl FerrofinLibraryMonitor {
 #[async_trait]
 impl LibraryMonitor for FerrofinLibraryMonitor {
     async fn start(&self) -> Result<(), ServiceError> {
+        // Read before waiting for a `stop` in progress, so that `stop` ends
+        // this start too, as upstream's generation read in `StartWatchingPath`.
+        let generation = self.generation.load(Ordering::SeqCst);
+        let _lifecycle = self.lifecycle.lock().await;
         let mut roots = self.roots.watch_roots().await;
         roots.sort();
         // Every library location is a library root to the metadata-only
@@ -462,6 +479,15 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
             .set_library_roots(&self.roots.library_locations().await);
         let mut watched_roots: Vec<String> = Vec::new();
         for root in roots {
+            // A `stop` since this start began: it is waiting to remove what
+            // this start watched, and the roots read above may be gone.
+            if self.generation.load(Ordering::SeqCst) != generation {
+                tracing::debug!(
+                    root,
+                    "library monitor stopped while starting; not watching the rest"
+                );
+                return Ok(());
+            }
             // `LibraryMonitor.Start` / `ContainsParentFolder`: a recursive
             // parent watch already covers its children and shared roots.
             // Compare directory boundaries, using .NET ordinal casing.
@@ -488,6 +514,10 @@ impl LibraryMonitor for FerrofinLibraryMonitor {
     }
 
     async fn stop(&self) -> Result<(), ServiceError> {
+        // Bump first, so a start walking a root goes no further; then wait
+        // for that walk, which records its root only once it is done.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let _lifecycle = self.lifecycle.lock().await;
         self.watcher.unwatch_all().await
     }
 
@@ -798,6 +828,92 @@ mod tests {
 
         monitor.stop().await.expect("stop");
         assert!(*watcher.unwatched_all.lock().unwrap());
+    }
+
+    /// A watcher whose walk of one root blocks until released, recording the
+    /// roots watched now and every root it was ever asked to watch.
+    struct SlowWalkWatcher {
+        slow: &'static str,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        watched: StdMutex<HashSet<String>>,
+        asked: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl FileSystemWatcher for SlowWalkWatcher {
+        async fn watch(&self, path: &str) -> Result<(), ServiceError> {
+            self.asked.lock().unwrap().push(path.to_owned());
+            if path == self.slow {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            // Like the real watcher, a root is recorded once its walk is done.
+            self.watched.lock().unwrap().insert(path.to_owned());
+            Ok(())
+        }
+        async fn unwatch(&self, path: &str) -> Result<(), ServiceError> {
+            self.watched.lock().unwrap().remove(path);
+            Ok(())
+        }
+        async fn unwatch_all(&self) -> Result<(), ServiceError> {
+            self.watched.lock().unwrap().clear();
+            Ok(())
+        }
+    }
+
+    /// A library-structure change during the boot walk (`stop` then `start`)
+    /// must not leave the old walk adding watches afterwards: upstream's
+    /// `Stop` bumps `_watcherGeneration`, and a watcher created for an older
+    /// generation is disposed. Ferrofin's `stop` waits for the root being
+    /// walked, removes it with the rest, and the old `start` watches no further
+    /// root; the `start` that follows the `stop` keeps its own watches.
+    #[tokio::test]
+    async fn a_stop_during_a_start_leaves_none_of_that_starts_watches() {
+        let watcher = Arc::new(SlowWalkWatcher {
+            slow: "/media/movies",
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            watched: StdMutex::new(HashSet::new()),
+            asked: StdMutex::new(Vec::new()),
+        });
+        let monitor = Arc::new(FerrofinLibraryMonitor::new(
+            watcher.clone(),
+            vec!["/media/movies".to_owned(), "/media/tv".to_owned()],
+        ));
+        let boot = tokio::spawn({
+            let monitor = Arc::clone(&monitor);
+            async move { monitor.start().await }
+        });
+        watcher.entered.notified().await;
+
+        let stop = tokio::spawn({
+            let monitor = Arc::clone(&monitor);
+            async move { monitor.stop().await }
+        });
+        // The stop has bumped the generation before the walk finishes.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while monitor.generation.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stop reached the monitor");
+        watcher.release.notify_one();
+        boot.await.unwrap().expect("boot start");
+        stop.await.unwrap().expect("stop");
+
+        assert!(
+            watcher.watched.lock().unwrap().is_empty(),
+            "the stopped start's watches outlived the stop: {:?}",
+            watcher.watched.lock().unwrap()
+        );
+        assert_eq!(*watcher.asked.lock().unwrap(), ["/media/movies"]);
+
+        // The next start's walk of the slow root goes straight through.
+        watcher.release.notify_one();
+        monitor.start().await.expect("the next start");
+        assert_eq!(watcher.watched.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

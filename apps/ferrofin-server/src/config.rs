@@ -134,6 +134,7 @@ struct FileConfig {
     musicbrainz_base_url: Option<String>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
+    ffmpeg_img_extract_perf_tradeoff: Option<bool>,
     library_roots: Option<Vec<PathBuf>>,
     server_name: Option<String>,
     log_level: Option<String>,
@@ -371,6 +372,15 @@ pub struct Config {
     /// Explicit `ffprobe` executable path. `None` derives it from the resolved
     /// ffmpeg path during discovery.
     pub ffprobe_path: Option<PathBuf>,
+
+    /// Jellyfin's `FFmpeg:imgExtractPerfTradeoff` startup option
+    /// (`GetFFmpegImgExtractPerfTradeoff`): chapter-image and thumbnail
+    /// extraction trades frame quality for speed, decoding keyframes only and
+    /// skipping the 24-frame thumbnail sampling. Resolved
+    /// `FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF` env >
+    /// `ffmpeg_img_extract_perf_tradeoff` in `config.toml` > `false`,
+    /// Jellyfin's default.
+    pub ffmpeg_img_extract_perf_tradeoff: bool,
 
     /// Initial media library roots used to seed a fresh install.
     pub library_roots: Vec<PathBuf>,
@@ -779,6 +789,12 @@ impl Config {
             musicbrainz_base_url,
             ffmpeg_path,
             ffprobe_path,
+            ffmpeg_img_extract_perf_tradeoff: parse_bool_var(
+                env,
+                "FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF",
+            )
+            .or(file.ffmpeg_img_extract_perf_tradeoff)
+            .unwrap_or(false),
             library_roots,
             server_name,
             log_level,
@@ -982,6 +998,7 @@ impl Config {
             musicbrainz_base_url: OFFLINE_PROVIDER_URL.to_owned(),
             ffmpeg_path: None,
             ffprobe_path: None,
+            ffmpeg_img_extract_perf_tradeoff: false,
             library_roots: Vec::new(),
             server_name: "ferrofin-test".to_owned(),
             log_level: "info".to_owned(),
@@ -1414,6 +1431,36 @@ mod tests {
         );
     }
 
+    /// The config file is TOML: a file named for another format is refused,
+    /// not read in a format the docs never describe, and so is one with no
+    /// extension, as before.
+    #[test]
+    fn config_file_in_another_format_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in [
+            ("config.json", "{\"port\": 5000}"),
+            ("config.json5", "{port: 5000}"),
+            ("config.yaml", "port: 5000\n"),
+            ("config.yml", "port: 5000\n"),
+            ("config.ini", "port=5000\n"),
+            ("config.ron", "(port: 5000)"),
+            ("config", "port = 5000\n"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, body).unwrap();
+            let cli = Cli {
+                config_file: Some(path),
+                ..Cli::default()
+            };
+            let err = Config::load_from(cli, &FakeEnv::new()).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("is not of a supported file format"),
+                "{name}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn db_pool_defaults_to_auto() {
         let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
@@ -1476,6 +1523,31 @@ mod tests {
             .unwrap()
             .disable_extensions
         );
+    }
+
+    /// `FFmpeg:imgExtractPerfTradeoff` is off unless set; the env var beats
+    /// `config.toml`.
+    #[test]
+    fn the_img_extract_perf_tradeoff_is_off_unless_set_and_env_beats_file() {
+        const VAR: &str = "FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF";
+        let load = |cli: Cli, env: &FakeEnv| {
+            Config::load_from(cli, env)
+                .unwrap()
+                .ffmpeg_img_extract_perf_tradeoff
+        };
+        assert!(!load(Cli::default(), &FakeEnv::new()));
+        assert!(load(Cli::default(), &FakeEnv::new().with(VAR, "1")));
+        assert!(!load(Cli::default(), &FakeEnv::new().with(VAR, "maybe")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "ffmpeg_img_extract_perf_tradeoff = true\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert!(load(cli(), &FakeEnv::new()));
+        assert!(!load(cli(), &FakeEnv::new().with(VAR, "off")));
     }
 
     #[test]

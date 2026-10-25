@@ -318,16 +318,19 @@ const COLLECTIONS_FOLDER_DATA: &str = r#"{"CollectionType":"boxsets"}"#;
 
 /// The "Collections" library a created box set belongs to, adopting any
 /// orphans a previous version left behind.
+///
+/// `name` is the name a new library takes; an existing one keeps its own.
 async fn collections_folder(
     db: &Database,
     paths: &Arc<dyn ServerApplicationPaths>,
+    name: &str,
 ) -> Result<Option<Uuid>, ServiceError> {
     let path = format!("{}/collections", paths.data_path());
     let (mode, root) = container_identity(db, paths).await?;
     let container = crate::item_persistence_service::ensure_container(
         db,
         BaseItemKind::CollectionFolder,
-        "Collections",
+        name,
         &path,
         &mode,
         root,
@@ -345,13 +348,14 @@ async fn collections_folder(
     Ok(container)
 }
 
-/// The playlists folder a created playlist belongs to, adopting any orphans a
-/// previous version left behind, and the id derivation its playlists are
-/// keyed by.
+/// The playlists folder a created playlist belongs to, and the id derivation
+/// its playlists are keyed by.
 ///
-/// A lookup only, as `PlaylistManager.GetPlaylistsFolder` is
-/// (v12.2 PlaylistManager.cs:566-572). The folder is startup's to make, and to
-/// keep at the data directory when that moved
+/// A lookup only, by type as `PlaylistManager.GetPlaylistsFolder` finds it
+/// (v12.2 PlaylistManager.cs:566-572; see
+/// [`crate::item_persistence_service::playlists_folder_by_type`]), writing
+/// nothing. The folder is startup's to make, to keep at the data directory
+/// when that moved, and to put the orphans an older Ferrofin left into
 /// ([`crate::AggregateFolderStore::ensure`], `LibraryManager.CreateRootFolder`
 /// at LibraryManager.cs:1101-1150, under the aggregate). Making it here as
 /// well disagreed with that rule: after a data-directory move this missed
@@ -366,35 +370,14 @@ async fn playlists_folder(
     db: &Database,
     paths: &Arc<dyn ServerApplicationPaths>,
 ) -> Result<(Uuid, crate::item_type_lookup::IdDerivation), ServiceError> {
-    // `PlaylistsFolder`, not `ManualPlaylistsFolder`: 10.11.8 has no class of
-    // the latter name — it is only `PlaylistsFolder.GetClientTypeName()` — and
-    // the row an adopted database carries is stored as
-    // `…Playlists.PlaylistsFolder`. Asking for the other one would never find
-    // Jellyfin's folder.
-    let path = format!("{}/playlists", paths.data_path());
-    let (mode, _root) = container_identity(db, paths).await?;
-    // By path first: a folder already at the directory under an id of its own
-    // (an earlier Ferrofin's `ManualPlaylistsFolder`) is the one in use, and
-    // startup provisions no second one beside it. Then by the id
-    // `CreateRootFolder` derives, from the program-data-relative
-    // `data\playlists`, which a moved data directory keeps where the path does
-    // not; upstream finds the folder by its type, wherever it is.
-    let found = match crate::item_persistence_service::container_at(db, &path).await? {
-        Some(id) => Some(id),
-        None => match crate::item_type_lookup::derive_item_id_with(
-            &mode,
-            BaseItemKind::PlaylistsFolder,
-            &path,
-        ) {
-            Some(id) if crate::item_persistence_service::row_exists(db, id).await? => Some(id),
-            _ => None,
-        },
-    };
-    let Some(folder) = found else {
-        return Err(ServiceError::invalid_input("parentFolder"));
-    };
-    crate::item_persistence_service::adopt_orphans(db, BaseItemKind::Playlist, folder).await?;
-    Ok((folder, mode))
+    let (mode, user_root) = container_identity(db, paths).await?;
+    let aggregate = crate::item_type_lookup::aggregate_folder_id(&mode, &paths.root_folder_path());
+    match crate::item_persistence_service::playlists_folder_by_type(db, aggregate, user_root)
+        .await?
+    {
+        Some(folder) => Ok((folder, mode)),
+        None => Err(ServiceError::invalid_input("parentFolder")),
+    }
 }
 
 /// Makes the folder `PlaylistManager.CreatePlaylist` gives a new playlist
@@ -544,6 +527,9 @@ pub struct FerrofinCollectionManager {
     /// Brackets the folder a new box set is made in, as `CollectionManager.CreateCollectionAsync` does
     /// (`ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
     self_writes: Option<Arc<dyn SelfWriteGuard>>,
+    /// Names a new Collections library in the server UI culture
+    /// ([`Self::collections_name`]). `None` in unit tests: "Collections".
+    localization: Option<Arc<dyn ferrofin_traits::localization::LocalizationManager>>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -570,7 +556,30 @@ impl FerrofinCollectionManager {
             visibility: None,
             providers: None,
             self_writes: None,
+            localization: None,
         }
+    }
+
+    /// Names a new Collections library in the server UI culture. Called once
+    /// by the composition root.
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) -> Self {
+        self.localization = Some(localization);
+        self
+    }
+
+    /// The name a new Collections library takes:
+    /// `GetServerLocalizedString("Collections")` (v12.2
+    /// `CollectionManager.EnsureLibraryFolder`), whatever the requesting
+    /// client's language. Upstream never renames the library afterwards.
+    fn collections_name(&self) -> String {
+        self.localization.as_ref().map_or_else(
+            || "Collections".to_owned(),
+            |localization| localization.get_server_localized_string("Collections"),
+        )
     }
 
     /// Brackets each new box set's folder on `guard`, so the library monitor
@@ -634,7 +643,7 @@ impl CollectionManager for FerrofinCollectionManager {
         &self,
         options: &CollectionCreationOptions,
     ) -> Result<BaseItemEntity, ServiceError> {
-        let parent = collections_folder(&self.db, &self.paths).await?;
+        let parent = collections_folder(&self.db, &self.paths, &self.collections_name()).await?;
         let (mode, _) = container_identity(&self.db, &self.paths).await?;
         // `GetCollectionsFolderPath()`: `{data}/collections`.
         let collections = format!("{}/collections", self.paths.data_path());
@@ -883,16 +892,29 @@ impl CollectionManager for FerrofinCollectionManager {
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
         // Port of `CollectionManager.EnsureLibraryFolder`
         // (v10.11.8 Emby.Server.Implementations/Collections/CollectionManager.cs
-        // :81-109): look the library up BY PATH, and provision it — directory,
+        // :81-109): look the library up BY PATH (then by its derived id, for a
+        // data directory that moved), and provision it — directory,
         // row, boxsets collection type and all — only when the caller asked for
         // it. This used to answer `Ok(None)` unconditionally under a "documented
         // deferral" comment; the tree it was said to need is the same
         // `ensure_container` the create path has been using all along.
         let path = format!("{}/collections", self.paths.data_path());
         let id = if create_if_needed {
-            collections_folder(&self.db, &self.paths).await?
-        } else {
+            collections_folder(&self.db, &self.paths, &self.collections_name()).await?
+        } else if let Some(id) =
             crate::item_persistence_service::container_at(&self.db, &path).await?
+        {
+            Some(id)
+        } else {
+            // A data directory that moved left the row at its old path (gl-922).
+            let (mode, _) = container_identity(&self.db, &self.paths).await?;
+            crate::item_persistence_service::moved_container(
+                &self.db,
+                BaseItemKind::CollectionFolder,
+                &path,
+                &mode,
+            )
+            .await?
         };
         let Some(id) = id else {
             return Ok(None);
@@ -1393,9 +1415,16 @@ impl PlaylistManager for FerrofinPlaylistManager {
             .await
             .map_err(db_err)?;
             // Seed the share list from the request (C# `Shares = options.Users`).
-            for share in &request.users {
-                item_data::share_playlist_in(&mut tx, id, share.user_id, share.can_edit).await?;
-            }
+            item_data::add_listed_shares_in(
+                &mut tx,
+                &guid_to_db(id),
+                &request
+                    .users
+                    .iter()
+                    .map(|s| (s.user_id, s.can_edit))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
             write_entries_in(&mut tx, &guid_to_db(id), &entries).await?;
             crate::item_persistence_service::stamp_playlist_in(
                 &mut tx,
@@ -1500,10 +1529,15 @@ impl PlaylistManager for FerrofinPlaylistManager {
                 .execute(&mut *tx)
                 .await
                 .map_err(db_err)?;
-            for share in users {
-                item_data::share_playlist_in(&mut tx, request.id, share.user_id, share.can_edit)
-                    .await?;
-            }
+            item_data::add_listed_shares_in(
+                &mut tx,
+                &guid_to_db(request.id),
+                &users
+                    .iter()
+                    .map(|s| (s.user_id, s.can_edit))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
         }
         if let Some(entries) = &entries {
             write_entries_in(&mut tx, &guid_to_db(request.id), entries).await?;
@@ -2131,6 +2165,125 @@ mod tests {
         assert_eq!(found.id, made.id, "the same row, found by path");
     }
 
+    /// gl-385: a new Collections library is named in the server UI culture,
+    /// whatever the requesting client's language (v12.2
+    /// `CollectionManager.EnsureLibraryFolder`, `GetServerLocalizedString`).
+    #[tokio::test]
+    async fn the_collections_library_takes_the_server_culture() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = FerrofinCollectionManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            test_paths_in(tmp.path()),
+        )
+        .with_localization(Arc::new(
+            crate::LocalizationManager::default().with_ui_culture("de"),
+        ));
+        let made = ferrofin_util::current_culture::scope_with_ui(
+            "fr".into(),
+            Some("fr".into()),
+            manager.get_collections_folder(true),
+        )
+        .await
+        .expect("provision")
+        .expect("a row");
+        assert_eq!(made.name.as_deref(), Some("Sammlungen"));
+    }
+
+    /// gl-922: the Collections library's id comes from its program-data-relative
+    /// path, its stored `Path` from the absolute one, so a data directory that
+    /// moved leaves the row at its old path under the same id. Both lookups
+    /// find it there and move it to the new path: box-set grouping keeps
+    /// finding its collections, and a create no longer fails on the primary key.
+    #[tokio::test]
+    async fn a_moved_data_directory_keeps_its_collections_library() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager_in = |dir: &str| {
+            FerrofinCollectionManager::new(
+                db.clone(),
+                library_manager_over(db.clone()),
+                Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+                test_paths_in(&tmp.path().join(dir)),
+            )
+        };
+        let made = manager_in("old")
+            .get_collections_folder(true)
+            .await
+            .expect("provision")
+            .expect("a row");
+
+        let moved = manager_in("new");
+        let found = moved
+            .get_collections_folder(false)
+            .await
+            .expect("lookup")
+            .expect("the row under its derived id");
+        assert_eq!(found.id, made.id);
+        let new_path = format!("{}/new/data/collections", tmp.path().display());
+        assert_eq!(found.path.as_deref(), Some(new_path.as_str()));
+
+        moved
+            .create_collection(&CollectionCreationOptions {
+                name: "Heist".to_owned(),
+                ..CollectionCreationOptions::default()
+            })
+            .await
+            .expect("a create after the move");
+    }
+
+    /// gl-922: only a `CollectionFolder` under the derived id moves. A row of
+    /// another kind there, or an adopted Collections library under its own
+    /// id, keeps its path.
+    #[tokio::test]
+    async fn only_the_derived_collections_row_moves() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths_in(tmp.path());
+        let path = format!("{}/collections", paths.data_path());
+        let mode =
+            crate::item_type_lookup::IdDerivation::from_meta(None, Some(paths.program_data_path()));
+        let derived = crate::item_type_lookup::derive_item_id_with(
+            &mode,
+            BaseItemKind::CollectionFolder,
+            &path,
+        )
+        .expect("an id");
+        let adopted = Uuid::new_v4();
+        for (id, kind, old) in [
+            (derived, BaseItemKind::Folder, "/old/data/collections"),
+            (
+                adopted,
+                BaseItemKind::CollectionFolder,
+                "/old/root/default/Collections",
+            ),
+        ] {
+            crate::test_support::seed_named_item(&db, id, kind, "Collections").await;
+            let mut row = crate::test_support::fetch_item(&db, id).await;
+            row.path = Some(old.to_owned());
+            crate::test_support::save_item(&db, &row).await;
+        }
+
+        let found = crate::item_persistence_service::moved_container(
+            &db,
+            BaseItemKind::CollectionFolder,
+            &path,
+            &mode,
+        )
+        .await
+        .expect("lookup");
+        assert_eq!(found, None);
+        for (id, old) in [
+            (derived, "/old/data/collections"),
+            (adopted, "/old/root/default/Collections"),
+        ] {
+            let row = crate::test_support::fetch_item(&db, id).await;
+            assert_eq!(row.path.as_deref(), Some(old));
+        }
+    }
+
     /// The auto-provisioned Collections library carries
     /// `"CollectionType":"boxsets"` in `Data` — the column 10.11.8 reads that
     /// field from.
@@ -2151,7 +2304,7 @@ mod tests {
                 format!("{root_dir}/cache"),
                 format!("{root_dir}/web"),
             ));
-        let id = collections_folder(&db, &paths)
+        let id = collections_folder(&db, &paths, "Collections")
             .await
             .expect("provision")
             .expect("an id");
@@ -2307,6 +2460,99 @@ mod tests {
 
         let folders = crate::test_support::items_at_path(&db, &folder).await;
         assert_eq!(folders, 1, "exactly one playlists folder at that path");
+    }
+
+    /// `GetPlaylistsFolder` finds the folder by its type among the aggregate
+    /// root's children (then the user root's), wherever it is stored and
+    /// whatever its id: a `PlaylistsFolder` at another path under an id of its
+    /// own is the one a create uses, and the lookup writes nothing.
+    #[tokio::test]
+    async fn a_create_finds_the_playlists_folder_by_type_wherever_it_is() {
+        let db = test_db().await;
+        let (mgr, _root) = bare_playlist_manager(&db);
+        let (mode, _) = super::container_identity(&db, &mgr.paths)
+            .await
+            .expect("id derivation");
+        let aggregate =
+            crate::item_type_lookup::aggregate_folder_id(&mode, &mgr.paths.root_folder_path())
+                .expect("aggregate id");
+        crate::test_support::seed_folder_item(
+            &db,
+            aggregate,
+            BaseItemKind::AggregateFolder,
+            "root",
+            None,
+        )
+        .await;
+        let folder = Uuid::from_u128(0xBEEF);
+        crate::test_support::seed_folder_item(
+            &db,
+            folder,
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(aggregate),
+        )
+        .await;
+        crate::test_support::set_item_path(&db, folder, "/elsewhere/playlists").await;
+
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Found".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..Default::default()
+            })
+            .await
+            .expect("create playlist");
+        let row = crate::test_support::fetch_item(
+            &db,
+            Uuid::parse_str(&created.id).expect("playlist id"),
+        )
+        .await;
+        assert_eq!(row.parent_id, Some(ferrofin_db::store::guid_to_db(folder)));
+    }
+
+    /// With no playlists folder under the aggregate root, `GetPlaylistsFolder`
+    /// takes the first one among the user root's children.
+    #[tokio::test]
+    async fn a_create_falls_back_to_a_playlists_folder_under_the_user_root() {
+        let db = test_db().await;
+        let (mgr, _root) = bare_playlist_manager(&db);
+        let (_, user_root) = super::container_identity(&db, &mgr.paths)
+            .await
+            .expect("id derivation");
+        let user_root = user_root.expect("user root id");
+        crate::test_support::seed_folder_item(
+            &db,
+            user_root,
+            BaseItemKind::UserRootFolder,
+            "Media Folders",
+            None,
+        )
+        .await;
+        let folder = Uuid::from_u128(0xBEE5);
+        crate::test_support::seed_folder_item(
+            &db,
+            folder,
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(user_root),
+        )
+        .await;
+
+        let created = mgr
+            .create_playlist(&PlaylistCreationRequest {
+                name: Some("Fallback".to_owned()),
+                user_id: Uuid::new_v4(),
+                ..Default::default()
+            })
+            .await
+            .expect("create playlist");
+        let row = crate::test_support::fetch_item(
+            &db,
+            Uuid::parse_str(&created.id).expect("playlist id"),
+        )
+        .await;
+        assert_eq!(row.parent_id, Some(ferrofin_db::store::guid_to_db(folder)));
     }
 
     /// gl-910: `PlaylistManager.CreatePlaylist` only looks the playlists
@@ -4345,6 +4591,131 @@ mod tests {
             .expect("now public");
         assert_eq!(stranger.level, PlaylistAccessLevel::Read);
         assert!(stranger.open_access);
+    }
+
+    /// A `Users` entry without a user id binds as the empty GUID (upstream's
+    /// `PlaylistUserPermissions` constructor default), and upstream stores and
+    /// lists that share as given. It is kept here too: listed, written into
+    /// `Data`, and brought back by the boot re-import.
+    #[tokio::test]
+    async fn an_empty_guid_share_is_stored_listed_and_survives_a_restart() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions;
+
+        let db = test_db().await;
+        let (mgr, _root) = playlist_manager(&db).await;
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Shared".to_owned()),
+                user_id: Uuid::new_v4(),
+                users: vec![PlaylistUserPermissions::new(Uuid::nil(), true)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        let expected = vec![PlaylistUserPermissions::new(Uuid::nil(), true)];
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            expected
+        );
+        let data = crate::test_support::fetch_item(&db, playlist_id)
+            .await
+            .data
+            .expect("Data");
+        let data: serde_json::Value = serde_json::from_str(&data).expect("json");
+        assert_eq!(
+            data["Shares"],
+            serde_json::json!([{"UserId": "00000000000000000000000000000000", "CanEdit": true}])
+        );
+
+        // Only `Data` holds the share now: the re-import must bring it back.
+        crate::item_data::clear_playlist_shares(&db, playlist_id).await;
+        assert!(
+            mgr.get_playlist_shares(playlist_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        crate::item_data::reconcile_playlist_permissions(&db)
+            .await
+            .expect("boot re-import");
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            expected
+        );
+    }
+
+    /// Upstream keeps a user listed twice in `Users` twice and lets them edit
+    /// when either entry can (`Shares.Any(s => s.CanEdit && …)`). With one share
+    /// row per user, the user keeps one share at their first entry's place that
+    /// can edit when any entry can: on create, on update, and when the boot
+    /// re-import reads such a list from `Data` (as a Jellyfin database can hold).
+    #[tokio::test]
+    async fn a_user_listed_twice_keeps_one_share_that_can_edit_if_any_entry_can() {
+        use ferrofin_model::entities_media::PlaylistUserPermissions as Share;
+        use ferrofin_traits::collections::PlaylistAccessLevel;
+
+        let db = test_db().await;
+        let (mgr, _root) = playlist_manager(&db).await;
+        let (owner, bob, carol) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let playlist_id = Uuid::parse_str(
+            &mgr.create_playlist(&PlaylistCreationRequest {
+                name: Some("Shared".to_owned()),
+                user_id: owner,
+                users: vec![Share::new(bob, true), Share::new(bob, false)],
+                ..PlaylistCreationRequest::default()
+            })
+            .await
+            .expect("create")
+            .id,
+        )
+        .expect("uuid");
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            vec![Share::new(bob, true)]
+        );
+        let bob_access = mgr.get_playlist_access(playlist_id, bob).await.unwrap();
+        assert_eq!(bob_access.level, PlaylistAccessLevel::CanEdit);
+
+        mgr.update_playlist(&PlaylistUpdateRequest {
+            id: playlist_id,
+            user_id: owner,
+            users: Some(vec![
+                Share::new(carol, false),
+                Share::new(bob, false),
+                Share::new(carol, true),
+                Share::new(bob, false),
+            ]),
+            ..PlaylistUpdateRequest::default()
+        })
+        .await
+        .expect("update");
+        let collapsed = vec![Share::new(carol, true), Share::new(bob, false)];
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            collapsed
+        );
+
+        // A `Data` list naming carol twice, read back by the boot re-import.
+        let shares = serde_json::json!([
+            {"UserId": bob.simple().to_string(), "CanEdit": false},
+            {"UserId": carol.simple().to_string(), "CanEdit": false},
+            {"UserId": bob.simple().to_string(), "CanEdit": true},
+        ]);
+        let mut conn = db.writer().acquire().await.expect("connection");
+        crate::item_data::set_data_key_in(&mut conn, playlist_id, "Shares", shares)
+            .await
+            .expect("write Data");
+        drop(conn);
+        crate::item_data::reconcile_playlist_permissions(&db)
+            .await
+            .expect("boot re-import");
+        assert_eq!(
+            mgr.get_playlist_shares(playlist_id).await.unwrap(),
+            vec![Share::new(bob, true), Share::new(carol, false)]
+        );
     }
 
     /// The stored `SortName` of row `id` (the raw row, no read-time derivation).

@@ -32,8 +32,9 @@ use ferrofin_common::extensions::get_md5;
 use ferrofin_db::entities::display_preferences::{
     DisplayPreferencesEntity, ItemDisplayPreferencesEntity,
 };
-use ferrofin_db::enums::{HomeSectionType, ViewType};
+use ferrofin_db::enums::{ChromecastVersion, HomeSectionType, IndexingKind, ViewType};
 use ferrofin_model::dto::{DisplayPreferencesDto, ScrollDirection, SortOrder};
+use ferrofin_util::guid_extensions::parse_dotnet_guid;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -70,9 +71,11 @@ struct DisplayPreferencesParams {
 }
 
 /// Resolves a `displayPreferencesId` into an item id: parse it as a `Guid`, else
-/// hash it with MD5 (C# `Guid.TryParse … else GetMD5()`).
+/// hash it with MD5 (C# `Guid.TryParse … else GetMD5()`). `Guid.TryParse`'s
+/// spellings, not `Uuid::parse_str`'s: an `urn:uuid:` id is hashed, and a
+/// `(…)`, `{0x…}` or padded one is parsed.
 fn resolve_item_id(raw: &str) -> Uuid {
-    Uuid::parse_str(raw).unwrap_or_else(|_| get_md5(raw))
+    parse_dotnet_guid(raw).unwrap_or_else(|| get_md5(raw))
 }
 
 /// Reads a C# enum without discarding unnamed integer values.
@@ -95,23 +98,40 @@ fn sort_order_to_i32(order: SortOrder) -> i32 {
     order.json_value()
 }
 
-/// The `IndexingKind` display name for a stored discriminant (C# `IndexBy?.ToString()`).
+/// The `IndexingKind` display name for a stored discriminant (C#
+/// `IndexBy?.ToString()`), which writes an unnamed value as its number.
 fn index_by_name(value: Option<i32>) -> Option<String> {
-    match value {
-        Some(0) => Some("PremiereDate".to_owned()),
-        Some(1) => Some("ProductionYear".to_owned()),
-        Some(2) => Some("CommunityRating".to_owned()),
-        _ => None,
-    }
+    value.map(|v| IndexingKind::try_from(v).map_or_else(|_| v.to_string(), |k| format!("{k:?}")))
 }
 
-/// Parses an `IndexingKind` display name back to its stored discriminant.
+/// Parses an `IndexingKind` back to its stored discriminant, as C#
+/// `Enum.TryParse<IndexingKind>(value, true, …) ? indexBy : null` does.
 fn index_by_from_name(name: Option<&str>) -> Option<i32> {
-    match name.map(str::to_ascii_lowercase) {
-        Some(n) if n == "premieredate" => Some(0),
-        Some(n) if n == "productionyear" => Some(1),
-        Some(n) if n == "communityrating" => Some(2),
-        _ => None,
+    name.and_then(|n| enum_try_parse(n, IndexingKind::ALL))
+}
+
+/// C# `int.Parse(value, CultureInfo.InvariantCulture)` (`NumberStyles.Integer`):
+/// a sign and ASCII digits, with the white space it allows around them
+/// (U+0009–U+000D, U+0020) and the trailing NULs .NET ignores. `None` where
+/// upstream throws (a 500 not ported).
+fn parse_dotnet_int(value: &str) -> Option<i32> {
+    value
+        .trim_end_matches('\0')
+        .trim_matches(|c| matches!(c, '\t'..='\r' | ' '))
+        .parse()
+        .ok()
+}
+
+/// C# `bool.Parse`: `True` or `False` in any case, ignoring white space and
+/// NULs around it. `None` where upstream throws (a 500 not ported).
+fn parse_dotnet_bool(value: &str) -> Option<bool> {
+    let value = value.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if value.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if value.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -272,20 +292,24 @@ async fn update_display_preferences(
 
     // Pull the scalar row fields out of CustomPrefs (removing each, as the C#
     // does, so they are not persisted as arbitrary custom prefs).
-    prefs.chromecast_version = take_pref(&mut dto.custom_prefs, "chromecastVersion")
-        .and_then(|v| chromecast_from_name(&v))
-        .unwrap_or(0);
+    // C# `Enum.Parse<ChromecastVersion>(value, true)` for a non-empty value,
+    // else `Stable`. `Enum.Parse` keeps an unnamed integer, and throws
+    // `ArgumentException` (a 400) for anything it cannot read.
+    prefs.chromecast_version = match take_pref(&mut dto.custom_prefs, "chromecastVersion") {
+        Some(v) if !v.is_empty() => enum_try_parse(&v, ChromecastVersion::ALL)
+            .ok_or_else(|| ApiError::BadRequest(format!("Requested value '{v}' was not found.")))?,
+        _ => 0,
+    };
     prefs.enable_next_video_info_overlay =
         take_pref(&mut dto.custom_prefs, "enableNextVideoInfoOverlay")
-            // Case-insensitive like C# `bool.Parse`: the client echoes back the
-            // "True"/"False" we send, which Rust's `parse::<bool>` rejects.
-            // Default true when absent/empty/garbage; only an explicit "false" is false.
-            .is_none_or(|v| v.is_empty() || !v.eq_ignore_ascii_case("false"));
+            // True when absent or empty; only a value `bool.Parse` reads as
+            // false is false (one it cannot read, a 500 upstream, stays true).
+            .is_none_or(|v| v.is_empty() || parse_dotnet_bool(&v) != Some(false));
     prefs.skip_backward_length = take_pref(&mut dto.custom_prefs, "skipBackLength")
-        .and_then(|v| v.parse::<i32>().ok())
+        .and_then(|v| parse_dotnet_int(&v))
         .unwrap_or(DEFAULT_SKIP_BACK_LENGTH_MS);
     prefs.skip_forward_length = take_pref(&mut dto.custom_prefs, "skipForwardLength")
-        .and_then(|v| v.parse::<i32>().ok())
+        .and_then(|v| parse_dotnet_int(&v))
         .unwrap_or(DEFAULT_SKIP_FORWARD_LENGTH_MS);
     // C# `TryGetValue(key, out var v) ? v : string.Empty` over a
     // `Dictionary<string, string?>`: an absent key stores the empty string, but a
@@ -314,7 +338,7 @@ async fn update_display_preferences(
         // C# `int.Parse` throws on a non-numeric suffix; Ferrofin drops the key
         // instead of 500-ing, which is the same observable state for a client
         // that never sends one.
-        let Ok(order) = key["homesection".len()..].parse::<i32>() else {
+        let Some(order) = parse_dotnet_int(&key["homesection".len()..]) else {
             continue;
         };
         let type_ = value
@@ -390,22 +414,12 @@ fn take_nullable_pref(prefs: &mut HashMap<String, Option<String>>, key: &str) ->
     prefs.remove(key).unwrap_or_else(|| Some(String::new()))
 }
 
-/// The `ChromecastVersion` display name for a stored discriminant.
+/// The `ChromecastVersion` display name for a stored discriminant (C#
+/// `ChromecastVersion.ToString().ToLowerInvariant()`), which writes an unnamed
+/// value as its number.
 fn chromecast_name(value: i32) -> String {
-    if value == 1 {
-        "unstable".to_owned()
-    } else {
-        "stable".to_owned()
-    }
-}
-
-/// Parses a `ChromecastVersion` name back to its stored discriminant.
-fn chromecast_from_name(name: &str) -> Option<i32> {
-    match name.to_ascii_lowercase().as_str() {
-        "stable" => Some(0),
-        "unstable" => Some(1),
-        _ => None,
-    }
+    ChromecastVersion::try_from(value)
+        .map_or_else(|_| value.to_string(), |v| format!("{v:?}").to_lowercase())
 }
 
 /// The per-`Order` fallback home-section types, verbatim from the C#

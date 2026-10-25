@@ -167,7 +167,8 @@ pub struct InternalItemsQuery {
     pub is_hd: Option<bool>,
     /// Restrict to (un)locked items.
     pub is_locked: Option<bool>,
-    /// Restrict to placeholder items.
+    /// Restrict to placeholder items (an offline disc stub), or exclude them;
+    /// a folder counts as one when an item below it or linked to it is.
     pub is_place_holder: Option<bool>,
 
     // --- provider-id presence filters ---
@@ -177,7 +178,8 @@ pub struct InternalItemsQuery {
     pub has_overview: Option<bool>,
     /// Restrict to items with a TMDb id.
     pub has_tmdb_id: Option<bool>,
-    /// Restrict to items with an official rating.
+    /// Restrict to items with (or without) an official rating; a folder
+    /// counts as rated when an item below it or linked to it is.
     pub has_official_rating: Option<bool>,
     /// Restrict to items with a TVDB id.
     pub has_tvdb_id: Option<bool>,
@@ -270,7 +272,9 @@ pub struct InternalItemsQuery {
     pub index_number: Option<i32>,
     /// Minimum permitted parental rating.
     pub min_parental_rating: Option<ParentalRatingScore>,
-    /// Maximum permitted parental rating (derived from the user).
+    /// Maximum permitted parental rating. With a user, the stricter of this
+    /// and the user's own limit applies, so a value here can lower that
+    /// limit but never raise it.
     pub max_parental_rating: Option<ParentalRatingScore>,
 
     // --- structural filters ---

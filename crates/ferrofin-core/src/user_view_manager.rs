@@ -101,10 +101,9 @@ fn live_tv_view_id_with(
 /// .ToString()`, the folder under `views/` and the tail of the id key.
 const LIVE_TV_VIEW_TYPE: &str = "livetv";
 
-/// The display name of the auto-provisioned Live TV view — C#
-/// `_localization.GetLocalizedString("HeaderLiveTV")` (LiveTvManager.cs:1263),
-/// which is "Live TV" in the `en-US` default culture Ferrofin ships. Since
-/// 12.0 it is display-only: the id is keyed on [`LIVE_TV_VIEW_TYPE`].
+/// The display name of the auto-provisioned Live TV view without a
+/// localization wired: `HeaderLiveTV` in `en-US`. Since 12.0 it is
+/// display-only: the id is keyed on [`LIVE_TV_VIEW_TYPE`].
 const LIVE_TV_VIEW_NAME: &str = "Live TV";
 
 /// The display name of the auto-provisioned playlists media folder
@@ -897,7 +896,21 @@ impl FerrofinUserViewManager {
         let Some(id) = self.live_tv_view_id(&view_path) else {
             return Ok(None);
         };
-        if persistence.item_exists(id).await? {
+        // v12.2 `GetInternalLiveTvFolder` (LiveTvManager.cs:1271-1275): the
+        // server-localized `HeaderLiveTV`, as name and forced sort name, and
+        // `GetNamedView` renames the row when that reads differently
+        // (LibraryManager.cs:3036-3042).
+        let name = self.localization.as_ref().map_or_else(
+            || LIVE_TV_VIEW_NAME.to_owned(),
+            |localization| localization.get_server_localized_string("HeaderLiveTV"),
+        );
+        if let Some(mut row) = self.items.retrieve_item(id).await? {
+            if row.name.as_deref() != Some(name.as_str()) {
+                row.sort_name = Some(ferrofin_util::sort_name::forced_sort_key(&name));
+                row.forced_sort_name = Some(name.clone());
+                row.name = Some(name);
+                persistence.save_items(std::slice::from_ref(&row)).await?;
+            }
             return Ok(Some(id));
         }
         // C# `Directory.CreateDirectory(path)` inside `GetNamedView`.
@@ -911,12 +924,12 @@ impl FerrofinUserViewManager {
             type_: item_type_lookup::stored_type_name(BaseItemKind::UserView)
                 .unwrap_or_default()
                 .to_owned(),
-            name: Some(LIVE_TV_VIEW_NAME.to_owned()),
             // C# `ForcedSortName = sortName` (= the name), and `BaseItem.SortName`
             // then short-circuits to `ModifySortChunks(ForcedSortName)
             // .ToLowerInvariant()` — the digit padding and lower-casing only.
-            sort_name: Some(ferrofin_util::sort_name::forced_sort_key(LIVE_TV_VIEW_NAME)),
-            forced_sort_name: Some(LIVE_TV_VIEW_NAME.to_owned()),
+            sort_name: Some(ferrofin_util::sort_name::forced_sort_key(&name)),
+            forced_sort_name: Some(name.clone()),
+            name: Some(name),
             path: Some(view_path.to_string_lossy().into_owned()),
             // Parentless, exactly as upstream: `GetUserRootFolder().Children`
             // never contains it, which is why `get_media_folders` must not
@@ -3869,6 +3882,47 @@ mod tests {
         ) -> Result<(), ServiceError> {
             Ok(())
         }
+    }
+
+    /// gl-385: the Live TV view is named the server-localized `HeaderLiveTV`
+    /// whatever culture the request runs under, and renamed when the server's
+    /// language changes (v12.2 `GetInternalLiveTvFolder` → `GetNamedView`,
+    /// LiveTvManager.cs:1271-1275, LibraryManager.cs:3036-3042).
+    #[tokio::test]
+    async fn the_live_tv_view_takes_the_server_culture_and_follows_it() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let config = Arc::new(DashboardConfiguration::default());
+        let localization = Arc::new(
+            crate::LocalizationManager::new("US").with_ui_culture_source({
+                let config = Arc::clone(&config);
+                move || config.0.lock().unwrap().ui_culture.clone()
+            }),
+        );
+        let manager = manager(&db)
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
+            .with_metadata_path(tmp.path().join("metadata"))
+            .with_database(db.clone())
+            .with_dashboard_configuration(config.clone(), localization);
+        let provision = || {
+            ferrofin_util::current_culture::scope_with_ui(
+                "fr".into(),
+                Some("fr".into()),
+                manager.get_internal_live_tv_folder_id(),
+            )
+        };
+        let names = |row: BaseItemEntity| (row.name, row.forced_sort_name);
+
+        let id = provision().await.expect("provision").expect("an id");
+        let row = crate::test_support::fetch_item(&db, id).await;
+        let english = Some("Live TV".to_owned());
+        assert_eq!(names(row), (english.clone(), english));
+
+        config.0.lock().unwrap().ui_culture = "fr".to_owned();
+        assert_eq!(provision().await.expect("provision"), Some(id));
+        let row = crate::test_support::fetch_item(&db, id).await;
+        let french = Some("TV en direct".to_owned());
+        assert_eq!(names(row), (french.clone(), french));
     }
 
     // One live sequence verifies identity across toggle, localization and hidden preferences.

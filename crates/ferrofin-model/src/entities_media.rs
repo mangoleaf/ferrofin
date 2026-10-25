@@ -276,14 +276,20 @@ impl ParentalRating {
 }
 
 /// Class to hold data on user permissions for playlists.
+///
+/// Upstream's only constructor is `(Guid userId, bool canEdit = false)`, so
+/// System.Text.Json binds through it and a member the body leaves out takes
+/// that parameter's default: `Guid.Empty` and `false`. A `null` `CanEdit` still
+/// fails (a non-nullable `bool`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct PlaylistUserPermissions {
     /// The user id.
     #[schema(value_type = String, format = "uuid")]
-    #[serde(with = "crate::json::guid")]
+    #[serde(default, with = "crate::json::guid")]
     pub user_id: Uuid,
     /// A value indicating whether the user has edit permissions.
+    #[serde(default)]
     pub can_edit: bool,
 }
 
@@ -1743,6 +1749,34 @@ mod tests {
         assert_eq!(json["CanEdit"], true);
         let back: PlaylistUserPermissions = serde_json::from_value(json).unwrap();
         assert_eq!(perm, back);
+    }
+
+    /// Upstream binds through `PlaylistUserPermissions(Guid userId, bool canEdit
+    /// = false)`: a missing member takes the parameter default, a `null`
+    /// `UserId` is `Guid.Empty` (`JsonGuidConverter`), a `null` `CanEdit` fails.
+    /// Measured on a live Jellyfin 12.2 through `POST /Playlists`.
+    #[rstest::rstest]
+    #[case::no_can_edit(
+        r#"{"UserId":"00000000000000000000000000000009"}"#,
+        Uuid::from_u128(9),
+        false
+    )]
+    #[case::no_user_id(r#"{"CanEdit":true}"#, Uuid::nil(), true)]
+    #[case::empty(r"{}", Uuid::nil(), false)]
+    #[case::null_user_id(r#"{"UserId":null,"CanEdit":true}"#, Uuid::nil(), true)]
+    fn playlist_user_permissions_bind_through_the_constructor_defaults(
+        #[case] body: &str,
+        #[case] user_id: Uuid,
+        #[case] can_edit: bool,
+    ) {
+        let perm: PlaylistUserPermissions = serde_json::from_str(body).unwrap();
+        assert_eq!(perm, PlaylistUserPermissions::new(user_id, can_edit));
+    }
+
+    #[test]
+    fn playlist_user_permissions_refuse_a_null_can_edit() {
+        let body = r#"{"UserId":"00000000000000000000000000000009","CanEdit":null}"#;
+        assert!(serde_json::from_str::<PlaylistUserPermissions>(body).is_err());
     }
 
     #[test]

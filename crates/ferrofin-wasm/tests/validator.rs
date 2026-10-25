@@ -37,6 +37,28 @@ async fn accepts_the_fixture_component_and_reports_its_id() {
     );
 }
 
+/// The engine grants a guest only the proposals the host needs: shared
+/// memories (threads), GC types and exception handling are not part of the
+/// sandbox, so a component using one never compiles. This also pins the
+/// wasmtime crate features: one that turns a proposal back on fails here.
+#[tokio::test]
+async fn proposals_outside_the_sandbox_do_not_compile() {
+    let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
+    for (proposal, module) in [
+        ("threads", "(memory 1 1 shared)"),
+        ("gc", "(type (struct))"),
+        ("exceptions", "(tag)"),
+    ] {
+        let component = wat::parse_str(format!("(component (core module {module}))")).unwrap();
+        let err = validator.validate(&component).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not a valid WebAssembly component"),
+            "{proposal}: {err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn rejects_garbage_and_non_component_wasm() {
     let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();

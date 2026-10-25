@@ -153,9 +153,10 @@ async fn plugin_at_version(
 
 /// Projects a manager [`PluginDescriptor`] into the `PluginInfo` wire DTO.
 ///
-/// The `enabled` flag becomes `Active`/`Disabled` (the only two states a
-/// compile-time plugin reaches — `Malfunctioned`/`NotSupported`/… require the
-/// runtime loader we don't have).
+/// The `enabled` flag becomes `Active`/`Disabled`, the only two states the
+/// manager tracks. TODO(gl-729): report `Restart` for a plugin whose update
+/// is staged and `Malfunctioned` for a WASM plugin the loader skipped, as
+/// upstream's `PluginManager` does.
 fn to_plugin_info(d: PluginDescriptor) -> PluginInfo {
     PluginInfo {
         name: d.name,
@@ -687,7 +688,8 @@ async fn install_package(
 
 /// `DELETE /Packages/Installing/{packageId}` — cancel a running install.
 ///
-/// No installs run (Tier-1 has no installer), so there is nothing to cancel.
+/// Installs are not tracked as cancellable, so this answers `404` for every
+/// id.
 #[utoipa::path(
     delete,
     path = "/Packages/Installing/{packageId}",
@@ -701,6 +703,9 @@ async fn cancel_package_installation(
     Path(package_id): Path<Uuid>,
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &auth).await?;
+    // TODO(gl-844): track an install while its `POST /Packages/Installed/{name}`
+    // runs, cancel it here and answer `204`, as upstream's `CancelInstallation`
+    // does.
     Err(ApiError::NotFound(format!("installation {package_id}")))
 }
 

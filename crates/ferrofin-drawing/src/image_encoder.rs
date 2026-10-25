@@ -188,6 +188,13 @@ impl ImageCrateEncoder {
     /// creating the parent directory first. JPEG and WebP (lossy, via libwebp)
     /// honour `quality`; PNG is lossless, so it ignores `quality`. Port of the
     /// `SKFileWStream`/`Encode(..., quality)` tail of `EncodeImage`.
+    ///
+    /// The image is encoded in memory and lands at `output_path` through a
+    /// temporary file and a rename, so the path never holds a partial image.
+    /// Upstream streams straight into the destination, and the processor
+    /// serves whatever file it finds at a cache path with an immutable
+    /// year-long cache header: a request racing an encode, or one after an
+    /// encode that failed part-way, would serve and pin the truncated file.
     fn write(
         image: &DynamicImage,
         output_path: &str,
@@ -201,8 +208,21 @@ impl ImageCrateEncoder {
                 .map_err(|e| DrawingError::io(format!("mkdir {}", parent.display()), e))?;
         }
 
+        let bytes = Self::encode(image, output_path, format, quality)?;
+        ferrofin_util::file_helper::atomic_write_media(Path::new(output_path), &bytes)
+            .map_err(|e| DrawingError::io(format!("write {output_path}"), e).into())
+    }
+
+    /// Encodes `image` in `format` at `quality`; `output_path` only names the
+    /// destination in errors.
+    fn encode(
+        image: &DynamicImage,
+        output_path: &str,
+        format: CrateFormat,
+        quality: i32,
+    ) -> Result<Vec<u8>, ServiceError> {
         if format == CrateFormat::Jpeg {
-            Self::write_jpeg(image, output_path, quality)
+            Self::encode_jpeg(image, output_path, quality)
         } else if format == CrateFormat::WebP {
             // LOSSY WebP via libwebp (the `webp` crate), mirroring Skia's
             // `bitmap.Encode(stream, Webp, quality)`. The `image` crate's own
@@ -230,16 +250,17 @@ impl ImageCrateEncoder {
             let bytes = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
                 .encode_simple(false, quality)
                 .map_err(|code| DrawingError::webp_encode(format!("encode {output_path}"), code))?;
-            std::fs::write(output_path, &*bytes)
-                .map_err(|e| DrawingError::io(format!("write {output_path}"), e).into())
+            Ok(bytes.to_vec())
         } else {
+            let mut bytes = std::io::Cursor::new(Vec::new());
             image
-                .save_with_format(output_path, format)
-                .map_err(|e| DrawingError::encode(format!("encode {output_path}"), e).into())
+                .write_to(&mut bytes, format)
+                .map_err(|e| DrawingError::encode(format!("encode {output_path}"), e))?;
+            Ok(bytes.into_inner())
         }
     }
 
-    /// Writes `image` to `output_path` as a baseline JPEG at `quality` (0-100)
+    /// Encodes `image` as a baseline JPEG at `quality` (0-100)
     /// with **4:2:0 chroma subsampling and optimized Huffman tables**, mirroring
     /// the C# oracle's `bitmap.Encode(stream, SKEncodedImageFormat.Jpeg, quality)`.
     ///
@@ -287,11 +308,11 @@ impl ImageCrateEncoder {
     /// 1/2/3. JPEG decoders bind components positionally and match the SOS
     /// selectors against whatever the SOF declared, so no client can observe
     /// this; the crate exposes no knob for it.
-    fn write_jpeg(
+    fn encode_jpeg(
         image: &DynamicImage,
         output_path: &str,
         quality: i32,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Vec<u8>, ServiceError> {
         let quality = quality.clamp(0, 100);
         // Truncation is safe: quality is clamped to 0..=100.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -307,16 +328,15 @@ impl ImageCrateEncoder {
                 rgb.height()
             )));
         };
-        let file = std::fs::File::create(output_path)
-            .map_err(|e| DrawingError::io(format!("create {output_path}"), e))?;
-        let writer = std::io::BufWriter::new(file);
-        let mut encoder = JpegEncoder::new(writer, quality);
+        let mut bytes = Vec::new();
+        let mut encoder = JpegEncoder::new(&mut bytes, quality);
         encoder.set_sampling_factor(SamplingFactor::F_2_2);
         encoder.set_chroma_subsampling_method(ChromaSubsamplingMethod::Average);
         encoder.set_optimized_huffman_tables(true);
         encoder
             .encode(rgb.as_raw(), width, height, JpegColorType::Rgb)
-            .map_err(|e| DrawingError::jpeg_encode(format!("encode {output_path}"), e).into())
+            .map_err(|e| DrawingError::jpeg_encode(format!("encode {output_path}"), e))?;
+        Ok(bytes)
     }
 
     /// Resizes `image` to exactly `size` using a high-quality Lanczos3 filter
@@ -750,8 +770,8 @@ impl ImageEncoder for ImageCrateEncoder {
 
     /// Port of `CreateSplashscreen`: builds `{DataPath}/splashscreen.png`
     /// ([`crate::splashscreen`]) when there is at least one poster and one
-    /// backdrop, and does nothing otherwise. The file is written beside the
-    /// final name and renamed over it, so a reader never sees half a PNG.
+    /// backdrop, and does nothing otherwise. [`Self::write`] lands it whole, so
+    /// a reader never sees half a PNG.
     async fn create_splashscreen(
         &self,
         posters: &[String],
@@ -775,31 +795,16 @@ impl ImageEncoder for ImageCrateEncoder {
             .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
         let (posters, backdrops) = (posters.to_vec(), backdrops.to_vec());
         tokio::task::spawn_blocking(move || {
-            // A scratch name per call: two validations finishing together must
-            // not write, or rename away, each other's file.
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            // Each write goes through its own temporary file, so two
+            // validations finishing together never touch each other's file.
             let splash = crate::splashscreen::generate_splash(&posters, &backdrops)?;
             let output = data_path.join("splashscreen.png");
-            let partial = data_path.join(format!(
-                "splashscreen.png.{}.partial",
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            let written = Self::write(
+            Self::write(
                 &DynamicImage::ImageRgba8(splash),
-                &partial.to_string_lossy(),
+                &output.to_string_lossy(),
                 CrateFormat::Png,
                 COLLAGE_QUALITY,
             )
-            .and_then(|()| {
-                std::fs::rename(&partial, &output).map_err(|e| {
-                    DrawingError::io(format!("rename {}", partial.display()), e).into()
-                })
-            });
-            if written.is_err() {
-                // Best effort: the scratch file may not exist at all.
-                let _ = std::fs::remove_file(&partial);
-            }
-            written
         })
         .await
         .map_err(|e| ServiceError::backend(format!("splashscreen task failed: {e}")))?
@@ -1020,6 +1025,48 @@ mod tests {
             .save(&path)
             .expect("write fixture");
         path.to_string_lossy().into_owned()
+    }
+
+    /// gl-143: an encode lands at its path only complete. The processor serves
+    /// any file it finds at a cache path (with a year-long immutable cache
+    /// header), so a request racing an encode, or one after an encode that
+    /// failed part-way, must never find a truncated image there.
+    #[rstest]
+    #[case::jpeg(CrateFormat::Jpeg, "out.jpg")]
+    #[case::png(CrateFormat::Png, "out.png")]
+    #[case::webp(CrateFormat::WebP, "out.webp")]
+    fn an_encode_appears_at_its_path_only_complete(
+        #[case] format: CrateFormat,
+        #[case] name: &str,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let source = gradient_fixture(&dir, "source.png", 2000, 2000);
+        let image = image::open(&source).expect("fixture decodes");
+        let output = out_path(&dir, name);
+        let writer = {
+            let output = output.clone();
+            std::thread::spawn(move || ImageCrateEncoder::write(&image, &output, format, 90))
+        };
+        let mut seen = 0;
+        while !writer.is_finished() {
+            if let Ok(bytes) = std::fs::read(&output) {
+                let decoded = image::load_from_memory(&bytes)
+                    .unwrap_or_else(|e| panic!("partial {name} of {} bytes: {e}", bytes.len()));
+                assert_eq!((decoded.width(), decoded.height()), (2000, 2000));
+                seen += 1;
+            }
+            std::thread::yield_now();
+        }
+        writer.join().expect("writer thread").expect("encode");
+        let decoded = image::open(&output).expect("final image decodes");
+        assert_eq!((decoded.width(), decoded.height()), (2000, 2000));
+        // Only the finished image is left in the directory: no temporary.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, [name, "source.png"], "seen complete {seen} times");
     }
 
     #[test]

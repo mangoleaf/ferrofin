@@ -1443,8 +1443,7 @@ impl FerrofinLibraryManager {
                 Some(BaseItemKind::BoxSet | BaseItemKind::MusicAlbum | BaseItemKind::MusicArtist)
             )
         {
-            resolved.collapse_box_set_items = None;
-            return self.items.get_items(&resolved).await.map(Some);
+            return self.direct_children(resolved).await.map(Some);
         }
         if resolved.recursive {
             if !resolved.force_direct && should_collapse {
@@ -1533,40 +1532,102 @@ impl FerrofinLibraryManager {
             }
         } else {
             let children = self.items.get_folder_children(&child_query).await?;
-            if let Some(user) = resolved.user.as_ref() {
-                let filter_linked = matches!(
-                    resolved.parent_type,
-                    Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
-                );
-                let roots = if filter_linked && children.iter().any(|child| child.linked) {
-                    if let Some(root) = self.get_user_root_folder().await? {
-                        let root_query = InternalItemsQuery {
-                            user: Some(user.clone()),
-                            parent_id: Uuid::parse_str(&root.id)
-                                .map_err(|error| ServiceError::backend(error.to_string()))?,
-                            user_root_children: true,
-                            group_by_presentation_unique_key: false,
-                            ..InternalItemsQuery::default()
-                        };
-                        self.items.get_items(&root_query).await?.items
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                };
-                let visibility = self
-                    .visibility
-                    .as_ref()
-                    .ok_or_else(|| ServiceError::backend("folder visibility is not configured"))?;
-                visibility
-                    .folder_children(children, user, filter_linked, &roots)
-                    .await?
-            } else {
-                children.into_iter().map(|child| child.item).collect()
-            }
+            self.visible_children(children, resolved).await?
         };
         Ok(children)
+    }
+
+    /// The `children` of `resolved.parent_id` that `Folder.GetChildren(user)`
+    /// keeps: each child's `IsVisible(user)` and, for a box set or playlist,
+    /// `GetLinkedChildren(user)`'s owner/library check. All of them without
+    /// a user.
+    async fn visible_children(
+        &self,
+        children: Vec<ferrofin_traits::persistence::FolderChild>,
+        resolved: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let Some(user) = resolved.user.as_ref() else {
+            return Ok(children.into_iter().map(|child| child.item).collect());
+        };
+        let filter_linked = matches!(
+            resolved.parent_type,
+            Some(BaseItemKind::BoxSet | BaseItemKind::Playlist)
+        );
+        let roots = if filter_linked && children.iter().any(|child| child.linked) {
+            if let Some(root) = self.get_user_root_folder().await? {
+                let root_query = InternalItemsQuery {
+                    user: Some(user.clone()),
+                    parent_id: Uuid::parse_str(&root.id)
+                        .map_err(|error| ServiceError::backend(error.to_string()))?,
+                    user_root_children: true,
+                    group_by_presentation_unique_key: false,
+                    ..InternalItemsQuery::default()
+                };
+                self.items.get_items(&root_query).await?.items
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        let visibility = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("folder visibility is not configured"))?;
+        visibility
+            .folder_children(children, user, filter_linked, &roots)
+            .await
+    }
+
+    /// A box set's, album's or artist's own listing: the repository query,
+    /// with no collection substitution, less the box-set members the user may
+    /// not see ([`Self::hidden_box_set_members`]).
+    async fn direct_children(
+        &self,
+        mut resolved: InternalItemsQuery,
+    ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
+        resolved.collapse_box_set_items = None;
+        let hidden = self.hidden_box_set_members(&resolved).await?;
+        resolved.exclude_item_ids.extend(hidden);
+        self.items.get_items(&resolved).await
+    }
+
+    /// The members of box set `resolved.parent_id` that [`Self::visible_children`]
+    /// drops for `resolved.user` (gl-571): `BoxSet.FilterLinkedChildrenPerUser`
+    /// keeps a member only from a library the user can open
+    /// (v12.2 `Folder.cs:1736-1793`), and `GetChildren(user)` only one the
+    /// user `IsVisible` to, which the SQL's parental filter already applies. The listing excludes them by id, so its
+    /// SQL keeps the set's order and paging. None for another parent or
+    /// without a user.
+    async fn hidden_box_set_members(
+        &self,
+        resolved: &InternalItemsQuery,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if resolved.parent_type != Some(BaseItemKind::BoxSet) || resolved.user.is_none() {
+            return Ok(Vec::new());
+        }
+        let children = self
+            .items
+            .get_folder_children(&InternalItemsQuery {
+                user: resolved.user.clone(),
+                parent_id: resolved.parent_id,
+                parent_type: resolved.parent_type,
+                group_by_presentation_unique_key: false,
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let ids: Vec<String> = children.iter().map(|child| child.item.id.clone()).collect();
+        let visible: std::collections::HashSet<String> = self
+            .visible_children(children, resolved)
+            .await?
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        Ok(ids
+            .iter()
+            .filter(|id| !visible.contains(*id))
+            .filter_map(|id| Uuid::parse_str(id).ok())
+            .collect())
     }
 
     /// Orders a box set's listing by its `DisplayOrder`: `Enum.TryParse<
@@ -7614,6 +7675,35 @@ mod tests {
         names.sort();
         assert_eq!(result.total_record_count, 2);
         assert_eq!(names, ["Empty set", "Shown set"]);
+    }
+
+    /// gl-571: a box set's own listing keeps only the members in libraries
+    /// the user can open — `Folder.GetLinkedChildren(User)` with
+    /// `BoxSet.FilterLinkedChildrenPerUser` (v12.2 `Folder.cs:1736-1793`) —
+    /// in the listing and its count.
+    #[tokio::test]
+    async fn a_box_set_lists_only_members_from_libraries_the_user_can_open() {
+        let db = test_db().await;
+        let fixture = crate::test_support::seed_box_set_across_libraries(&db).await;
+        let library = crate::test_support::rooted_library_manager(
+            &db,
+            fixture.roots,
+            Arc::new(CollapsingConfiguration::default()),
+        );
+        let result = library
+            .query_items(&InternalItemsQuery {
+                user: Some(fixture.user),
+                parent_id: fixture.set,
+                parent_type: Some(BaseItemKind::BoxSet),
+                apply_folder_display_options: true,
+                enable_total_record_count: true,
+                ..Default::default()
+            })
+            .await
+            .expect("listing");
+        let names: Vec<_> = result.items.into_iter().filter_map(|i| i.name).collect();
+        assert_eq!(names, ["Shown"]);
+        assert_eq!(result.total_record_count, 1);
     }
 
     /// `BoxSet.GetChildren` sorts the set's direct members by its

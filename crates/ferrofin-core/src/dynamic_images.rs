@@ -87,9 +87,9 @@
 //! - A library's or the root's refresh validates whole libraries the same
 //!   way, and also redraws the library tiles; the root's reaches the user
 //!   root's image too ([`DynamicImageProviders::refresh_user_root_between`]).
-//!   Those tiles and the root are forced by the refresh's options alone, not
-//!   yet by their own first or overdue refresh (see `runs_every_provider`
-//!   in the library scan).
+//!   The walk plans neither, so each is forced as its own refresh plan says
+//!   ([`unwalked_refresh_plan`](crate::library_scan::unwalked_refresh_plan)):
+//!   by the refresh's options, or by its own first or overdue refresh.
 //!
 //! Upstream's `GenresValidator`
 //! only refreshes genres it is seeing for the first time, so a genre whose
@@ -112,10 +112,11 @@ use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{ImageCollageOptions, InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
-use ferrofin_traits::providers::{GeneratedImageProvider, ItemUpdateType};
+use ferrofin_traits::providers::{GeneratedImageProvider, ItemUpdateType, MetadataRefreshOptions};
 use uuid::Uuid;
 
 use crate::item_type_lookup::kind_from_type_name;
+use crate::refresh_plan::{PassOutcome, RefreshRequest};
 
 /// Edge length of the square collage every provider here draws — upstream's
 /// `BaseDynamicImageProvider.CreateSquareCollage` (`600, 600`).
@@ -313,6 +314,14 @@ impl DynamicImageProviders {
     /// row — the library scan serves its priority lane there — and leaving
     /// out the rows in `done` (the ones a forced pass already drew).
     ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-950): the
+    /// user root is drawn here behind its gate and its refresh is never
+    /// recorded, where upstream's `ValidateTopLibraryFolders` refreshes it on
+    /// every library validation. Un-defer path: refresh it through
+    /// [`refresh_user_root_between`](Self::refresh_user_root_between) with
+    /// library validation's default options before this pass, and take it
+    /// out of the list below.
+    ///
     /// # Errors
     ///
     /// As [`refresh_all`](Self::refresh_all).
@@ -336,7 +345,6 @@ impl DynamicImageProviders {
                     BaseItemKind::UserRootFolder,
                     BaseItemKind::AggregateFolder,
                 ],
-                false,
                 done,
                 between,
             )
@@ -351,9 +359,11 @@ impl DynamicImageProviders {
 
     /// The user root's Primary, which a refresh of the root reaches besides
     /// the libraries it validates (`UserRootFolder` is the root clients
-    /// refresh, and its children are the libraries): forced when that refresh
-    /// runs every provider (`runAllProviders`), else gated. Awaits `between`
-    /// before the row.
+    /// refresh, and its children are the libraries): forced when the root's
+    /// refresh plan runs every provider (`runAllProviders`: the `options`, or
+    /// the root's own first refresh at `Default` or above), else gated, and
+    /// its `DateLastRefreshed` stamped as the save rule says. Awaits
+    /// `between` before the row.
     ///
     /// TODO(parity, open work item — NOT an accepted divergence; gl-595): an
     /// `AggregateFolder` refresh reaches its own image and every playlist's
@@ -368,24 +378,53 @@ impl DynamicImageProviders {
     /// As [`refresh_all`](Self::refresh_all).
     pub async fn refresh_user_root_between<'b>(
         &self,
-        force: bool,
+        options: &MetadataRefreshOptions,
         between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
     ) -> Result<DynamicImageReport, ServiceError> {
-        self.refresh_kinds_between(
-            &[BaseItemKind::UserRootFolder],
-            force,
-            &std::collections::HashSet::new(),
-            between,
-        )
-        .await
+        let mut report = DynamicImageReport::default();
+        if !self.processor.supports_image_collage_creation() {
+            return Ok(report);
+        }
+        let request = RefreshRequest {
+            options,
+            force_save: false,
+        };
+        let rows = self
+            .items
+            .get_item_list(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::UserRootFolder],
+                ..InternalItemsQuery::default()
+            })
+            .await?;
+        let mut refreshed = Vec::new();
+        for row in rows {
+            between().await;
+            // No library: `GetLibraryOptions` gives the root the defaults.
+            let plan = crate::library_scan::unwalked_refresh_plan(Some(&row), options, None);
+            let pass = self
+                .refresh_tallied(&row, plan.run_all_providers, &mut report)
+                .await;
+            let decision = crate::refresh_plan::decide_save(plan, &request, pass);
+            if decision.save
+                && decision.stamp_refreshed
+                && let Ok(id) = Uuid::parse_str(&row.id)
+            {
+                refreshed.push(id);
+            }
+        }
+        if !refreshed.is_empty() {
+            self.persistence
+                .stamp_date_last_refreshed(&refreshed, chrono::Utc::now())
+                .await?;
+        }
+        Ok(report)
     }
 
-    /// Every row of `kinds` but those in `skip`, in that order, forced or
-    /// gated as `force` says.
+    /// Every row of `kinds` but those in `skip`, in that order, each behind
+    /// its gate.
     async fn refresh_kinds_between<'b>(
         &self,
         kinds: &[BaseItemKind],
-        force: bool,
         skip: &std::collections::HashSet<Uuid>,
         between: &'b (dyn Fn() -> BetweenFuture<'b> + Send + Sync),
     ) -> Result<DynamicImageReport, ServiceError> {
@@ -406,7 +445,7 @@ impl DynamicImageProviders {
                     continue;
                 }
                 between().await;
-                self.refresh_tallied(&row, force, &mut report).await;
+                self.refresh_tallied(&row, false, &mut report).await;
             }
         }
         Ok(report)
@@ -470,22 +509,33 @@ impl DynamicImageProviders {
     /// One row of a pass, tallied into `report`; a failure is logged and the
     /// pass goes on — one unreadable poster must not lose every other image.
     /// A locked row is skipped: `RefreshWithProviders` returns before a locked
-    /// item's custom providers (`MetadataService.cs:785-788`).
+    /// item's custom providers (`MetadataService.cs:785-788`). Returns what
+    /// the row's pass changed or failed at, for the save rule.
     async fn refresh_tallied(
         &self,
         row: &BaseItemEntity,
         force: bool,
         report: &mut DynamicImageReport,
-    ) {
+    ) -> PassOutcome {
         if row.is_locked {
-            return;
+            return PassOutcome::default();
         }
         report.examined += 1;
         match self.refresh_item(row, force).await {
-            Ok(ItemUpdateType::ImageUpdate) => report.generated += 1,
-            Ok(_) => {}
+            Ok(ItemUpdateType::ImageUpdate) => {
+                report.generated += 1;
+                PassOutcome {
+                    changed: true,
+                    failed: false,
+                }
+            }
+            Ok(_) => PassOutcome::default(),
             Err(err) => {
                 tracing::warn!(%err, item_id = %row.id, kind = %row.type_, "dynamic image failed");
+                PassOutcome {
+                    changed: false,
+                    failed: true,
+                }
             }
         }
     }
@@ -976,6 +1026,7 @@ mod tests {
     use ferrofin_drawing::image_encoder::ImageCrateEncoder;
     use ferrofin_drawing::processor::ImageProcessor as DrawingProcessor;
     use ferrofin_traits::persistence::LinkedChildrenService;
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
 
     /// Writes a small solid-colour PNG and returns its path.
     fn write_png(dir: &Path, name: &str, rgb: [u8; 3]) -> String {
@@ -1609,9 +1660,10 @@ mod tests {
         );
     }
 
-    /// gl-576: a refresh of the root recopies the user root's image — past
-    /// the date gate when it runs every provider, behind it otherwise — and
-    /// never a locked root's.
+    /// gl-576 and gl-594: a refresh of the root recopies the user root's
+    /// image — past the date gate when it runs every provider (a full
+    /// refresh, or a Default one that is the root's first refresh), behind
+    /// it otherwise — and never a locked root's.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_root_refresh_recopies_the_roots_unless_locked() {
         let fx = fixture().await;
@@ -1637,16 +1689,39 @@ mod tests {
         };
         let first = copy().await;
 
+        let default = MetadataRefreshOptions::default();
+        let full = MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+            image_refresh_mode: MetadataRefreshMode::FullRefresh,
+            ..MetadataRefreshOptions::default()
+        };
+        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
+        let never_refreshed =
+            std::fs::read(write_png(&media, "library-tile.png", [6, 6, 6])).expect("tile");
+        assert_ne!(first, never_refreshed);
+        fx.providers
+            .refresh_user_root_between(&default, &nothing)
+            .await
+            .expect("first refresh");
+        assert_eq!(
+            copy().await,
+            never_refreshed,
+            "a never-refreshed root's first Default refresh runs every provider"
+        );
+
         let recoloured =
             std::fs::read(write_png(&media, "library-tile.png", [9, 9, 9])).expect("tile");
-        let nothing = || -> BetweenFuture<'_> { Box::pin(async {}) };
         fx.providers
-            .refresh_user_root_between(false, &nothing)
+            .refresh_user_root_between(&default, &nothing)
             .await
             .expect("gated");
-        assert_eq!(copy().await, first, "a current copy is behind its gate");
+        assert_eq!(
+            copy().await,
+            never_refreshed,
+            "a refreshed root's current copy is behind its gate"
+        );
         fx.providers
-            .refresh_user_root_between(true, &nothing)
+            .refresh_user_root_between(&full, &nothing)
             .await
             .expect("forced");
         assert_eq!(copy().await, recoloured, "a forced refresh recopies");
@@ -1664,7 +1739,7 @@ mod tests {
             .expect("lock");
         write_png(&media, "library-tile.png", [200, 200, 200]);
         fx.providers
-            .refresh_user_root_between(true, &nothing)
+            .refresh_user_root_between(&full, &nothing)
             .await
             .expect("forced");
         assert_eq!(copy().await, recoloured, "a locked root is left alone");

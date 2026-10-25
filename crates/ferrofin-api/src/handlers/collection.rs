@@ -9,7 +9,8 @@
 //!   collection.
 //!
 //! All three sit behind Jellyfin's `CollectionManagement` policy; here they take
-//! the [`RequireAuth`] extractor (a missing/invalid token is `401`). Item id
+//! the [`RequireCollectionManagement`] extractor (a missing/invalid token is
+//! `401`, a caller without the permission `403`). Item id
 //! lists arrive as the comma-delimited `ids` query parameter (Jellyfin's
 //! `CommaDelimitedCollectionModelBinder`) and are split via
 //! [`parse_csv_uuids`](crate::handlers::query_parse::parse_csv_uuids). The work
@@ -24,7 +25,7 @@ use ferrofin_model::collections::CollectionCreationResult;
 use ferrofin_traits::collections::CollectionCreationOptions;
 use uuid::Uuid;
 
-use crate::auth::RequireAuth;
+use crate::auth::RequireCollectionManagement;
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::query_parse::parse_csv_uuids;
@@ -60,32 +61,6 @@ struct CollectionItemsQuery {
     ids: Option<String>,
 }
 
-/// Rejects callers whose policy grants neither administration nor collection
-/// management — upstream's `[Authorize(Policy = CollectionManagement)]` on
-/// every `CollectionController` action. API-key callers (no user) pass, as
-/// upstream's policy treats them as elevated.
-async fn require_collection_management(
-    state: &AppState,
-    auth: &ferrofin_traits::options::AuthorizationInfo,
-) -> Result<(), ApiError> {
-    let Some(user) = &auth.user else {
-        return Ok(());
-    };
-    let allowed = state
-        .users
-        .get_user_dto(user, None)
-        .await?
-        .policy
-        .is_some_and(|p| p.is_administrator || p.enable_collection_management);
-    if allowed {
-        Ok(())
-    } else {
-        Err(ApiError::Forbidden(
-            "collection management is not enabled for this user".to_owned(),
-        ))
-    }
-}
-
 /// `POST /Collections` — creates a new collection.
 ///
 /// Port of `CollectionController.CreateCollection`; the authenticated caller's id
@@ -98,10 +73,9 @@ async fn require_collection_management(
 )]
 async fn create_collection(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireCollectionManagement(auth): RequireCollectionManagement,
     Query(query): Query<CreateCollectionQuery>,
 ) -> Result<Json<CollectionCreationResult>, ApiError> {
-    require_collection_management(&state, &auth).await?;
     let item_id_list = parse_csv_uuids(query.ids.as_deref())?;
     let user_id = auth.user_id();
     let user_ids = if user_id.is_nil() {
@@ -135,11 +109,10 @@ async fn create_collection(
 )]
 async fn add_to_collection(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireCollectionManagement(_auth): RequireCollectionManagement,
     Path(collection_id): Path<Uuid>,
     Query(query): Query<CollectionItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
-    require_collection_management(&state, &auth).await?;
     let ids = parse_csv_uuids(query.ids.as_deref())?;
     state
         .collections
@@ -160,11 +133,10 @@ async fn add_to_collection(
 )]
 async fn remove_from_collection(
     State(state): State<AppState>,
-    RequireAuth(auth): RequireAuth,
+    RequireCollectionManagement(_auth): RequireCollectionManagement,
     Path(collection_id): Path<Uuid>,
     Query(query): Query<CollectionItemsQuery>,
 ) -> Result<StatusCode, ApiError> {
-    require_collection_management(&state, &auth).await?;
     let ids = parse_csv_uuids(query.ids.as_deref())?;
     state
         .collections

@@ -284,6 +284,43 @@ async fn a_blank_web_transform_search_is_refused_at_registration() {
     );
 }
 
+#[tokio::test]
+async fn a_web_transform_pattern_that_is_not_a_regex_is_refused_at_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    // A glob is not a pattern: `*.chunk.txt` is an invalid regex, which the
+    // pipeline would match against nothing, silently. (Same byte length as
+    // `fixture.txt`: the WAT stores the pattern's length.)
+    write_fixture(
+        dir.path(),
+        "glob",
+        &FIXTURE_WAT.replace(
+            r#"(data (i32.const 448) "fixture.txt")"#,
+            r#"(data (i32.const 448) "*.chunk.txt")"#,
+        ),
+    );
+    write_fixture(
+        dir.path(),
+        "normal",
+        &fixture_with_id("11111111-1111-1111-1111-111111111111"),
+    );
+    let host = tokio::task::spawn_blocking({
+        let dir = dir.path().to_path_buf();
+        move || WasmPluginHost::load(&dir, &WasmSettings::default())
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(host.plugins().len(), 2);
+    let recorded = Arc::new(RecordingTransforms::default());
+    let service: Arc<dyn ferrofin_traits::plugins::FileTransformationService> = recorded.clone();
+    host.register_web_transforms(&service, &manager()).await;
+    assert_eq!(
+        *recorded.0.lock().unwrap(),
+        ["fixture.txt"],
+        "only the regex pattern is registered"
+    );
+}
+
 use common::named_provider_fixture;
 
 #[test]
@@ -323,9 +360,9 @@ fn colliding_provider_names_are_refused_at_load() {
         "e-empty",
         &named_provider_fixture("55555555-5555-5555-5555-555555555555", ""),
     );
-    // Skipped: a name on a new-library allowlist that Ferrofin registers no
-    // provider for (upstream's "Screen Grabber" image fetcher) — it would
-    // start ticked in a new library, unlike every other plugin.
+    // Skipped: the built-in frame grab's name ("Screen Grabber"), any casing.
+    // It is also on the new-library allowlist, so it would start ticked in a
+    // new library, unlike every other plugin.
     write_fixture(
         dir.path(),
         "f-screen-grabber",

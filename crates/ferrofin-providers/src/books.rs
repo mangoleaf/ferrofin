@@ -19,6 +19,7 @@
 //! its first page in name order (`ComicImageProvider`), or the EPUB's declared
 //! cover (`EpubImageProvider`).
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::Path;
@@ -874,7 +875,7 @@ fn is_tar_header(head: &[u8]) -> bool {
 fn zip_cover(file: std::fs::File) -> Option<(String, Vec<u8>)> {
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let names: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_owned()))
+        .filter_map(|i| archive.by_index(i).ok()?.name().ok().map(Cow::into_owned))
         .collect();
     let cover = pick_cover(&names)?;
     let mut entry = archive.by_name(&cover).ok()?;
@@ -1119,9 +1120,10 @@ fn read_archive_entry_bytes(path: &str, wanted_lower: &str) -> Option<Vec<u8>> {
     let file = std::fs::File::open(path).ok()?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let index = (0..archive.len()).find(|i| {
-        archive
-            .by_index(*i)
-            .is_ok_and(|e| e.name().to_lowercase() == wanted_lower)
+        archive.by_index(*i).is_ok_and(|e| {
+            e.name()
+                .is_ok_and(|name| name.to_lowercase() == wanted_lower)
+        })
     })?;
     let mut entry = archive.by_index(index).ok()?;
     read_capped(&mut entry)
@@ -1145,7 +1147,11 @@ fn read_capped_to(
     entry: &mut zip::read::ZipFile<'_, impl std::io::Read>,
     cap: u64,
 ) -> Option<Vec<u8>> {
-    let name = entry.name().to_owned();
+    // Only names the entry in a log line: an undecodable name is shown lossily.
+    let name = entry.name().map_or_else(
+        |_| String::from_utf8_lossy(entry.name_raw()).into_owned(),
+        Cow::into_owned,
+    );
     let size = entry.size();
     read_stream_capped(&name, size, entry, cap)
 }

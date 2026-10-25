@@ -799,8 +799,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             display: String::new(),
             is_user_paused: false,
             // Consumers are counted by begin/end request pairing (the guard);
-            // registration itself stamps last_activity, which keeps the idle
-            // reaper away until the initiating request attaches its guard.
+            // `start_ffmpeg` holds one over its startup wait. A job enrolled
+            // here directly has no consumer, and its idle countdown starts now.
             active_request_count: 0,
             last_activity: std::time::Instant::now(),
             handle: handle.clone(),
@@ -852,8 +852,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// # Errors
     ///
     /// Returns an error if the output directory cannot be created, the process
-    /// cannot be spawned, ffmpeg exits non-zero, or the first segment does not
-    /// appear within [`WAIT_FOR_FILE_TIMEOUT_MS`].
+    /// cannot be spawned, ffmpeg exits non-zero, the job is killed before its
+    /// first segment appears, or that segment does not appear within
+    /// [`WAIT_FOR_FILE_TIMEOUT_MS`].
     ///
     /// # Panics
     ///
@@ -918,6 +919,13 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         // plays so a later kill/reap log doesn't reduce to ids.
         self.register_job(handle.clone());
         self.set_job_display(&handle, &display);
+        // The startup wait below is the job's first consumer, as upstream's
+        // `OnTranscodeBeginning` starts it at `ActiveRequestCount = 1`: it can
+        // outlast the ping timeout (a cold 4K software encode), and the idle
+        // reaper must not kill the job this request is waiting on. A guard,
+        // not a count set in `register_job`: a start cancelled by a client
+        // disconnect drops it, so its job is still reaped.
+        let _startup = self.begin_request_guard(&handle.path, handle.job_type);
 
         // Tell the session layer what this job is, so the dashboard's transcode
         // panel is not blank. Only meaningful with a device to attach it to.
@@ -955,22 +963,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             .wait_for_path
             .clone()
             .unwrap_or_else(|| output_path.to_path_buf());
-        let waiter = FsWaiter::new(&target);
-        let deadline = Instant::now() + Duration::from_millis(WAIT_FOR_FILE_TIMEOUT_MS);
-        loop {
-            let exited = self.with_running(&handle, |r| r.child.has_exited());
-            if target.exists() || exited == Some(true) {
-                break;
-            }
-            if Instant::now() >= deadline {
-                self.kill_and_remove(&handle, true, false).await;
-                return Err(format!(
-                    "timed out waiting for {} after {WAIT_FOR_FILE_TIMEOUT_MS}ms",
-                    target.display()
-                ));
-            }
-            waiter.wait().await;
-        }
+        self.wait_for_first_output(&handle, &target).await?;
 
         self.wait_for_progressive_buffer(&handle, state).await;
 
@@ -995,6 +988,41 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self.start_segment_cleaner(state, &handle);
         // 10. Return the handle.
         Ok(handle)
+    }
+
+    /// `start_ffmpeg`'s wait for `target` (its first segment, or the
+    /// progressive output): returns once it exists or the process has exited,
+    /// and fails when the job is killed meanwhile or the wait outlasts
+    /// [`WAIT_FOR_FILE_TIMEOUT_MS`], which kills it.
+    async fn wait_for_first_output(
+        &self,
+        handle: &TranscodingJobHandle,
+        target: &Path,
+    ) -> Result<(), String> {
+        let waiter = FsWaiter::new(target);
+        let deadline = Instant::now() + Duration::from_millis(WAIT_FOR_FILE_TIMEOUT_MS);
+        loop {
+            let exited = self.with_running(handle, |r| r.child.has_exited());
+            if target.exists() || exited == Some(true) {
+                return Ok(());
+            }
+            // The job was killed while it started (a stop report, a device's
+            // jobs killed): nothing will ever write the target.
+            let Some(false) = exited else {
+                return Err(format!(
+                    "transcode job was stopped before {} appeared",
+                    target.display()
+                ));
+            };
+            if Instant::now() >= deadline {
+                self.kill_and_remove(handle, true, false).await;
+                return Err(format!(
+                    "timed out waiting for {} after {WAIT_FOR_FILE_TIMEOUT_MS}ms",
+                    target.display()
+                ));
+            }
+            waiter.wait().await;
+        }
     }
 
     fn start_segment_cleaner(&self, state: &EncodingJobInfo, handle: &TranscodingJobHandle) {
@@ -2437,6 +2465,103 @@ mod start_ffmpeg_tests {
         let killed = m.reap_idle_jobs().await;
         assert_eq!(killed.len(), 1);
         assert_eq!(m.active_job_count(), 0, "idle reaper removed the job");
+    }
+
+    /// Drives `start` until its job is registered with a running child, i.e.
+    /// it has reached the wait for its first output.
+    async fn reach_startup_wait<F: std::future::Future + Unpin>(
+        m: &TranscodeManagerImpl<NoopSessionReporter>,
+        start: &mut F,
+    ) where
+        F::Output: std::fmt::Debug,
+    {
+        for _ in 0..200 {
+            tokio::select! {
+                result = &mut *start => panic!("start_ffmpeg ended early: {result:?}"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+            if m.jobs.lock().unwrap().iter().any(|j| j.running.is_some()) {
+                return;
+            }
+        }
+        panic!("start_ffmpeg never reached its startup wait");
+    }
+
+    /// Ages every registered job past its idle window (`ping_timeout_ms = -1`
+    /// is exceeded by any elapsed time).
+    fn expire_idle_windows(m: &TranscodeManagerImpl<NoopSessionReporter>) {
+        for job in m.jobs.lock().unwrap().iter_mut() {
+            job.ping_timeout_ms = -1;
+        }
+    }
+
+    /// A first segment slower than the ping timeout (a cold 4K software encode,
+    /// a slow tuner) must not get its own job reaped while `start_ffmpeg`
+    /// waits for it: upstream's `OnTranscodeBeginning` starts the job with
+    /// `ActiveRequestCount = 1`. Once the job is handed back with no consumer,
+    /// the idle countdown runs again.
+    #[tokio::test]
+    async fn a_startup_slower_than_the_ping_timeout_is_not_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        // Writes nothing and keeps running: the first output is slow to appear.
+        let fake = FakeSegmentTranscoder::new(FakeScript::default());
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let mut start = Box::pin(m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![])));
+        reach_startup_wait(&m, &mut start).await;
+
+        expire_idle_windows(&m);
+        assert!(
+            m.reap_idle_jobs().await.is_empty(),
+            "the reaper killed a job during its own startup wait"
+        );
+
+        std::fs::write(&playlist, b"#EXTM3U\n").unwrap();
+        start.await.expect("the first output appeared");
+        expire_idle_windows(&m);
+        assert_eq!(m.reap_idle_jobs().await.len(), 1);
+    }
+
+    /// A client that disconnects during the startup wait drops `start_ffmpeg`;
+    /// its job must still be reaped, or ffmpeg would run with no consumer
+    /// forever (the cast-disconnect leak the reaper exists for).
+    #[tokio::test]
+    async fn a_cancelled_startup_is_still_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript::default());
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let mut start = Box::pin(m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![])));
+        reach_startup_wait(&m, &mut start).await;
+
+        drop(start);
+        expire_idle_windows(&m);
+        assert_eq!(m.reap_idle_jobs().await.len(), 1);
+        assert_eq!(m.active_job_count(), 0);
+    }
+
+    /// A job killed while `start_ffmpeg` waits for its first output (a stop
+    /// report, a device's jobs killed) ends the wait at once, instead of
+    /// polling a job that no longer exists until the 180 s deadline.
+    #[tokio::test]
+    async fn a_job_killed_during_startup_ends_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript::default());
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let mut start = Box::pin(m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![])));
+        reach_startup_wait(&m, &mut start).await;
+
+        let handle = m.jobs.lock().unwrap()[0].handle.clone();
+        m.kill_and_remove(&handle, true, false).await;
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), start)
+            .await
+            .expect("the startup wait ended with its job")
+            .expect_err("a killed job is not a started transcode");
+        assert!(error.contains("stopped"), "{error}");
     }
 
     #[tokio::test]

@@ -24,7 +24,7 @@ pub mod transcoder_support;
 pub mod transcoding_profile;
 
 pub use codec_profile::CodecProfile;
-pub use condition_processor::ConditionProcessor;
+pub use condition_processor::{ConditionProcessor, StreamBuilderError};
 pub use container_profile::ContainerProfile;
 pub use device_profile::DeviceProfile;
 pub use direct_play_profile::DirectPlayProfile;

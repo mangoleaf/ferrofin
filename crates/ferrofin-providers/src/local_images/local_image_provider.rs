@@ -88,8 +88,9 @@ impl LocalImageProvider {
     ///
     /// Port of `GetImages(BaseItem, IEnumerable<string>, IDirectoryService)` used
     /// by the collection-folder and internal-metadata providers: the image files
-    /// under each path are gathered (recursively), sorted by supported-extension
-    /// order, then populated with parent-series support disabled.
+    /// directly in each path are gathered (`GetFiles(path, SupportedImageExtensions,
+    /// true, false)`, not recursively), sorted by supported-extension order,
+    /// then populated with parent-series support disabled.
     #[must_use]
     pub fn get_images_from_paths<D: DirectoryService>(
         item: &ImageItem,
@@ -98,7 +99,7 @@ impl LocalImageProvider {
     ) -> Vec<LocalImageInfo> {
         let mut files: Vec<FileSystemMetadata> = paths
             .iter()
-            .flat_map(|p| directory_service.image_files(p, true))
+            .flat_map(|p| directory_service.image_files(p, false))
             .collect();
         files.sort_by_key(|f| {
             supported_image_extension_index(f.extension.as_deref().unwrap_or_default())

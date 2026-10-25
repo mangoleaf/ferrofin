@@ -5,7 +5,7 @@
 //! defined here (as forward references) because [`UserPolicy`] embeds them in
 //! the wire contract and they have no dedicated port unit.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -330,14 +330,28 @@ pub struct UserPolicy {
     pub remote_client_bitrate_limit: i32,
 
     /// Gets or sets the authentication provider id.
+    ///
+    /// `[Required(AllowEmptyStrings = false)]` upstream: a `null` binds as
+    /// `""`, which the policy endpoints refuse as they refuse a missing one.
+    #[serde(deserialize_with = "null_as_empty")]
     pub authentication_provider_id: String,
 
     /// Gets or sets the password reset provider id.
+    ///
+    /// `[Required(AllowEmptyStrings = false)]` upstream, read as
+    /// [`Self::authentication_provider_id`] is.
+    #[serde(deserialize_with = "null_as_empty")]
     pub password_reset_provider_id: String,
 
     /// Gets or sets a value indicating what `SyncPlay` features the user can
     /// access.
     pub sync_play_access: SyncPlayUserAccessType,
+}
+
+/// A C# `string` member under `#nullable disable`: System.Text.Json binds a
+/// `null` to it, so it reads as `""` here rather than failing the body.
+fn null_as_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[cfg(test)]

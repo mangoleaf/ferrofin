@@ -391,7 +391,7 @@ pub(crate) async fn save_named_configuration(
     .map_err(|error| ServiceError::backend(format!("configuration writer: {error}")))?
     .map_err(|error| ServiceError::backend(format!("persist configuration `{key}`: {error}")))?;
     if let Some(config) = network {
-        state.update_network_settings(&config);
+        state.update_network_settings(&config).await;
     }
     state.config.named_configuration_updated(&key, committed);
     run_committed_checks(&state, &key)

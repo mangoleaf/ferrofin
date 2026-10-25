@@ -457,10 +457,11 @@ pub(crate) async fn resolve_by_name_or_slug(
     Ok(None)
 }
 
-/// The id a by-name name filter takes for a name that resolves to no row: the
-/// empty GUID, which no stored item carries. The referenced-item match it
-/// feeds (`WhereReferencedItem`: the `CleanName` of the referenced rows) finds
-/// no row for it, so it matches nothing.
+/// The id a name filter takes for a name that resolves to no row: the empty
+/// GUID, which no stored item carries. The referenced-item match it feeds
+/// (`WhereReferencedItem`: the `CleanName` of the referenced rows) finds no row
+/// for it, and `AlbumIds` (`ParentId IN …`) matches no item either: `ParentId`
+/// is a foreign key to `BaseItems.Id`, so no row's parent is the empty GUID.
 const UNRESOLVED_NAME_ID: uuid::Uuid = uuid::Uuid::nil();
 
 /// Resolves a pipe-delimited by-name **name** filter to the ids of its
@@ -491,12 +492,13 @@ const UNRESOLVED_NAME_ID: uuid::Uuid = uuid::Uuid::nil();
 /// yet: upstream's minted row would match the items carrying it, a miss here
 /// matches none.
 ///
-/// For `Studio`-like kinds only. `GetArtist` (`artists` on `GET /Items`)
-/// special-cases `MusicArtist`: it takes an existing row by `Name`, ordered by
-/// `IsAccessedByName`, which a plain `CleanName` match does not reproduce, so
-/// that kind needs its own lookup. Not for `albums` either: `GetItems`
-/// resolves those with a plain `GetItemIds` that drops a miss, so a list of
-/// unknown albums is no filter there.
+/// `GetArtist` (`artists` on `GET /Items`) special-cases `MusicArtist`: it
+/// takes an existing row by `Name`, a folder-backed artist before a by-name
+/// one (`IsAccessedByName`), which a plain `CleanName` match does not order.
+/// The choice cannot change an `ArtistIds` filter, which reads the `CleanName`
+/// of the row it names and so matches the same items for any row of that
+/// name; it would matter to an id-keyed use. Not for `albums`: see
+/// [`resolve_album_ids`].
 pub(crate) async fn resolve_by_name_ids(
     state: &AppState,
     kind: ferrofin_model::data::BaseItemKind,
@@ -516,6 +518,40 @@ pub(crate) async fn resolve_by_name_ids(
             row.and_then(|row| uuid::Uuid::parse_str(&row.id).ok())
                 .unwrap_or(UNRESOLVED_NAME_ID),
         );
+    }
+    Ok(Some(ids))
+}
+
+/// Resolves `GET /Items`' pipe-delimited `albums` names to the ids that
+/// replace `albumIds`: `albums.SelectMany(name => GetItemIds(new
+/// InternalItemsQuery { IncludeItemTypes = [MusicAlbum], Name = name, Limit = 1 }))`
+/// (v12.2 `ItemsController.cs:554-561`) — the first album of each name by
+/// `SortName` (upstream's `ApplyOrder` default; ties fall to the engine), and
+/// no row written.
+///
+/// `None` when the parameter names nothing. A name no album has takes
+/// [`UNRESOLVED_NAME_ID`], so it matches nothing. Upstream drops it instead,
+/// and a list of unknown albums then leaves `AlbumIds` empty, which is no
+/// filter: `albums=<a typo>` answers the whole library there. That Jellyfin
+/// bug is not ported.
+pub(crate) async fn resolve_album_ids(
+    state: &AppState,
+    raw: Option<&str>,
+) -> Result<Option<Vec<uuid::Uuid>>, ApiError> {
+    let names = crate::handlers::query_parse::parse_pipe_strings(raw);
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let mut ids = Vec::with_capacity(names.len());
+    for name in names {
+        let query = ferrofin_traits::options::InternalItemsQuery {
+            include_item_types: vec![ferrofin_model::data::BaseItemKind::MusicAlbum],
+            name: Some(name),
+            limit: Some(1),
+            ..ferrofin_traits::options::InternalItemsQuery::default()
+        };
+        let found = state.library.get_item_ids(&query).await?;
+        ids.push(found.first().copied().unwrap_or(UNRESOLVED_NAME_ID));
     }
     Ok(Some(ids))
 }

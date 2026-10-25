@@ -35,6 +35,70 @@ major-version upgrade.
   empty guide and clears that provider's programmes, as in Jellyfin; an HTML page that is
   not well-formed still keeps the stored guide.
 
+## Unreleased — the config file must be TOML
+
+Usually nothing to do: `{data_dir}/config.toml` reads as before. A `--config` or
+`FERROFIN_CONFIG_FILE` path with another extension (`.json`, `.json5`, `.yaml`, `.yml`,
+`.ini`, `.ron`) used to be read in that format; it now stops the server with "is not of a
+supported file format". Rewrite the file as TOML under a `.toml` name.
+
+## Unreleased — user and policy saves need a complete body
+
+Usually nothing to do: the web client posts back the user it read. A script that calls
+`POST /Users` or `POST /Users/{userId}/Policy` must now send the policy's
+`AuthenticationProviderId` and `PasswordResetProviderId` (or, for `POST /Users`, the whole
+`Policy` or `"Policy": null`) and, for `POST /Users`, the user's `Name`; each is a `400`
+otherwise, as in Jellyfin.
+
+An earlier Ferrofin saved a partial policy body with empty provider ids. A user saved that
+way cannot have their profile or policy saved from the dashboard until both are set again:
+a sign-in restores `AuthenticationProviderId`; set `PasswordResetProviderId` (normally
+`Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider`) with a
+`POST /Users/{userId}/Policy` that carries the user's full policy.
+
+## Unreleased — library tiles are drawn as Jellyfin 12.2 draws them
+
+Nothing to do. Some "My Media" tiles change on their next refresh:
+- **A library with artwork at the root of its media folder shows it.** A `folder.jpg`,
+  `poster.jpg` or similar in, say, `/media/movies` replaces the generated collage, as in
+  Jellyfin. Only the media folder's root is read, not its subfolders. An image in the
+  library's own folder (where an upload is saved) still wins.
+  Remove the file from the media folder to get the collage back.
+- **Music tiles come from artists.** A music library's collage samples the artists its
+  tracks credit that have an image, not its albums.
+- **Collages sample items that have a Primary image.** A library whose items have no
+  Primary image keeps the icon tile, where Ferrofin used to draw from any item's artwork.
+- **Each library tile and the root's image are redrawn once.** A library or root row
+  written by an earlier Ferrofin has never recorded a refresh, so its next refresh at the
+  default mode counts as its first and redraws the image past the 7-day gate, as Jellyfin
+  does for an item's first refresh.
+
+## Unreleased — the Screen Grabber, and HDR chapter images
+
+Usually nothing to do. Three changes can show:
+- **Videos with no artwork get a frame as their poster.** The new "Screen Grabber" image
+  fetcher, which Jellyfin has, grabs a frame 10 % into a movie, episode, music video or
+  home video that has no Primary image from any other source. It runs on a video's first
+  scan and on a **Refresh metadata** that searches for missing metadata or replaces it, so
+  a library's first scan runs one more ffmpeg extraction per such video. A new library
+  ticks it, as does a library adopted from Jellyfin whose settings list it. A library that
+  saved image fetchers for a kind on an earlier Ferrofin (every library created from the
+  dashboard did) saved them without it, so it grabs nothing for that kind until you tick
+  **Screen Grabber** for it; a kind the library never saved choices for grabs. To grab
+  frames for videos scanned before, refresh the library once with **Search for missing
+  metadata** (Dashboard → Libraries → the library's menu → Refresh metadata). A video
+  whose first-scan grab fails is refreshed again by the next scan, as in Jellyfin.
+- **New libraries list image fetchers in Jellyfin's order.** The library dialog lists each
+  item type's image fetchers ordered by the server-wide order, then each provider's own
+  order (FanArt now comes before TheMovieDb for series, for example). This is the order a
+  library that never saved one already used, and a new library saves it. A library's
+  saved order is unchanged.
+- **HDR chapter images and thumbnails are tone-mapped.** Frames of HDR10, HLG and Dolby
+  Vision videos are converted to SDR when ffmpeg has `tonemapx` (jellyfin-ffmpeg) or
+  `zscale`; Dolby Vision with no HDR10, HLG or SDR base layer needs `tonemapx`. Images
+  extracted before stay as they were until they are extracted again; a frame-grabbed
+  poster is grabbed again by **Refresh metadata** with **Replace existing images**.
+
 ## Unreleased — Live TV sources are checked and read as Jellyfin reads them
 
 Usually nothing to do. Three changes can show on some Live TV sources:
