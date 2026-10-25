@@ -48,6 +48,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   gated A/B cells), with links to its own report. Adoption, parity and the A/B gate are judged
   by their own code. A gate that did not run, or whose result is missing or unreadable, is
   shown as such. `scan-behaviour.sh --json FILE` writes its rows as data
+- A root `Makefile` for the gates: `make run-gates` runs all four, `make run-verify`,
+  `run-adoption`, `run-parity` and `run-bench` one (`IMAGE=` and `PREVIOUS=` passed to
+  `gates/run`), and `make test-gates-offline` the gates' own shellcheck, bats and Python tests,
+  which CI's shell-tests job now runs through it
 - `gates/adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
   (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0) through an image on fresh
   fixture copies and diffs the answers against Jellyfin 12.2's own; fixtures are derived

@@ -53,6 +53,16 @@ status, times and exit status, beside each gate's own run directory and its `<ga
 fails does not stop the next; `gates/run` exits 1 when one failed and 2 when the preflight refused.
 Each gate's own script still runs on its own; its README says how.
 
+The root [`Makefile`](../Makefile) offers the same as targets: `make run-gates` for all four, and
+`make run-verify`, `make run-adoption`, `make run-parity` or `make run-bench` for one, with `IMAGE=`
+and `PREVIOUS=` passed through from the command line (`make run-gates IMAGE=ferrofin:v1.4.0-rc
+PREVIOUS=ghcr.io/mangoleaf/ferrofin:v1.3.2`); a bare `make` only lists them. `make test-gates-offline`
+runs the gates' own tests, which need no docker, server or fixtures, as CI's shell-tests job does:
+shellcheck, the bats tests and every gate's Python tests. They need `bats`, `shellcheck`, `sqlite3`,
+`jq`, `curl` and Python 3.11 or newer with Pillow, PyICU and PyYAML (on Debian or Ubuntu:
+`bats shellcheck sqlite3 jq curl python3-pil python3-icu python3-yaml`). There is no `make test`: it
+would read as the cargo tests.
+
 ## The session report
 
 However a session ends, `gates/run` writes its report, `index.html` and the same as `report.md`

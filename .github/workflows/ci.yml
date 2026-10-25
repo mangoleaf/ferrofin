@@ -194,8 +194,10 @@ jobs:
     # scan-behaviour check — its logic is driven with canned /metrics text, its refusals
     # against a python3 static file server, and whole runs against gates/verify/tests/fake_server.py,
     # which plays back a scripted server's scans), gates/parity/ (the live parity replay — its runner is
-    # driven against a fake docker and fake servers, its comparison with fixture response pairs) and
-    # scripts/ci-timings.py (CI time medians — its log parsing is driven with canned job logs).
+    # driven against a fake docker and fake servers, its comparison with fixture response pairs), every
+    # gate's Python tests (gates/bench's again, beside benchmark-report) and scripts/ci-timings.py (CI
+    # time medians — its log parsing is driven with canned job logs). The gates' part is one list, the
+    # Makefile's test-gates-offline target.
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -205,11 +207,10 @@ jobs:
           persist-credentials: false
           fetch-depth: 0   # version.bats reads tags
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil python3-icu python3-yaml
-      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh gates/lib.sh gates/run gates/verify/run.sh gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh gates/verify/lib.sh gates/verify/scan-behaviour.sh
-      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats gates/adoption/tests/adoption.bats gates/parity/tests/parity.bats gates/verify/tests/verify.bats gates/tests/gates.bats gates/tests/run.bats
-      - run: bats scripts/tests gates/tests gates/adoption/tests gates/parity/tests gates/verify/tests
-      - run: python3 -m unittest discover -s gates/parity/tests
-      - run: python3 -m unittest discover -s gates/tests
+      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh
+      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats
+      - run: bats scripts/tests
+      - run: make test-gates-offline   # the gates' own shellcheck, bats and Python tests: one list, in the Makefile
       - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - run: scripts/ci-config-check.sh check
 

@@ -59,7 +59,7 @@ EOS
   touch "$fixtures/oracle/smoke-jellyfin-12.2.txt" "$ROOT/fixtures/bench-testdata/ids.json" \
     "$ROOT/fixtures/bench-testdata/jellyfin/preparation.json"
   unset FAKE_RC_verify FAKE_RC_adoption FAKE_RC_parity FAKE_RC_bench FAKE_SLEEP FAKE_IDLE FAKE_LEFT FAKE_STALE FAKE_DOCKER_DOWN FAKE_MOVE \
-    FERROFIN_ADOPTION_FIXTURES ADOPTION_ORACLE PARITY_PIN
+    FERROFIN_ADOPTION_FIXTURES ADOPTION_ORACLE ADOPTION_WORK_DIR FERROFIN_BENCH_IMAGE PARITY_PIN   # a developer's own exports
 }
 
 fake_gate() { # fake_gate <path>: records "<gate> <arguments> work=… bench_image=…", makes --out, exits FAKE_RC_<gate>

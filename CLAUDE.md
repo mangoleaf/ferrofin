@@ -285,7 +285,8 @@ python3 gates/bench/report.py --serve                  # compare runs at 127.0.0
 
 `gates/run all` runs verify, adoption, parity and bench against one image as one session, after one
 preflight, and ends with one report, the session's `index.html` ([`gates/README.md`](gates/README.md));
-each gate's own script still runs alone.
+each gate's own script still runs alone. `make run-gates` (or `make run-<gate>`) does the same, and
+`make test-gates-offline` runs the gates' own tests (no docker), as CI does.
 
 Things that will otherwise cost you a run: the harness only ever *inspects* the
 `ferrofin:bench` image, so a stale image silently measures old code under a run name that
