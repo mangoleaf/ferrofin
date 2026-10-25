@@ -788,6 +788,7 @@ pub async fn build_app_state(
                 // task's pre-flight probes the same directory this writes to.
                 temp_dir: cache_root.child("temp"),
                 ffmpeg_version: ffmpeg.capabilities.ffmpeg_version(),
+                img_extract_perf_tradeoff: config.ffmpeg_img_extract_perf_tradeoff,
             },
         )
         .with_image_encoding_pool(Arc::clone(&thumbnail_pool))

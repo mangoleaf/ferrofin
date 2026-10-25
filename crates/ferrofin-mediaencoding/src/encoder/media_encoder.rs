@@ -107,6 +107,22 @@ pub struct MediaEncoderConfig {
     /// deprecated `-vsync` (`GetVideoSyncOption`). `None` means "unprobed" and
     /// takes `-vsync`, which every supported build still understands.
     pub ffmpeg_version: Option<FfmpegVersion>,
+    /// `FFmpeg:imgExtractPerfTradeoff` (`GetFFmpegImgExtractPerfTradeoff`,
+    /// default `false`): a frame extraction's I-frame attempt decodes
+    /// keyframes only and skips the 24-frame thumbnail sampling.
+    pub img_extract_perf_tradeoff: bool,
+}
+
+/// What an image extraction's arguments take from the server rather than the
+/// request: the probed ffmpeg, the thread count and the startup options.
+#[derive(Debug, Clone, Copy, Default)]
+struct ExtractionSettings {
+    /// Decides `-fps_mode` versus `-vsync`.
+    ffmpeg_version: Option<FfmpegVersion>,
+    /// The `-threads` count.
+    threads: i32,
+    /// `FFmpeg:imgExtractPerfTradeoff`.
+    perf_tradeoff: bool,
 }
 
 /// The resolved ffmpeg/ffprobe binary paths.
@@ -204,6 +220,15 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
                 timeout.as_millis()
             ))
         })
+    }
+
+    /// The server-side inputs of [`Self::extract_image_arguments`].
+    fn extraction_settings(&self) -> ExtractionSettings {
+        ExtractionSettings {
+            ffmpeg_version: self.config.ffmpeg_version,
+            threads: self.config.threads,
+            perf_tradeoff: self.config.img_extract_perf_tradeoff,
+        }
     }
 
     /// Stamps probe output with the server's real localized labels and
@@ -348,8 +373,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         offset_ticks: Option<i64>,
         use_iframe: bool,
         output_path: &str,
-        ffmpeg_version: Option<FfmpegVersion>,
-        threads: i32,
+        settings: ExtractionSettings,
         image_resolution: ImageResolution,
     ) -> String {
         let mut filters: Vec<String> = Vec::new();
@@ -382,7 +406,10 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         };
         filters.push(scaler.to_owned());
 
-        let enable_thumbnail = use_iframe && !container.eq_ignore_ascii_case("wtv");
+        // `useTradeoff` gives up the sampling for speed.
+        let use_tradeoff = settings.perf_tradeoff;
+        let enable_thumbnail =
+            !use_tradeoff && use_iframe && !container.eq_ignore_ascii_case("wtv");
         if enable_thumbnail {
             filters.push("thumbnail=n=24".to_owned());
         }
@@ -400,7 +427,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         // `error` adds nothing on the happy path.
         // `-fps_mode auto` (`-vsync -1` below ffmpeg 5.1): let ffmpeg decide,
         // which is what upstream passes here.
-        let sync = crate::encoding_helper::helper::video_sync_option("-1", ffmpeg_version);
+        let sync = crate::encoding_helper::helper::video_sync_option("-1", settings.ffmpeg_version);
         let resolution = image_resolution_parameter(image_resolution);
         // The graph is quoted, unlike upstream's bare `-vf {3}`: the 3D
         // scalers contain spaces, so the split into argv would cut them into
@@ -408,6 +435,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         // Jellyfin bug, not ported).
         let mut args = format!(
             "-i {input_path}{map_arg} -threads {threads} -v error -vframes 1 -vf {vf}{resolution}{sync} -f image2 {output}",
+            threads = settings.threads,
             vf = quote(&vf),
             output = quote(output_path),
         );
@@ -416,8 +444,10 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
             args = format!("-ss {} {args}", Self::format_time_parameter(offset));
         }
 
+        // The mpegts demuxer cannot seek to keyframes, so the decoder discards
+        // the rest, which may be corrupted; the trade-off does it everywhere.
         let seek_mpegts = offset_ticks.is_some() && container.eq_ignore_ascii_case("mpegts");
-        if use_iframe && seek_mpegts {
+        if use_iframe && (use_tradeoff || seek_mpegts) {
             args = format!("-skip_frame nokey {args}");
         }
 
@@ -585,8 +615,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             None,
             false,
             &output_path,
-            self.config.ffmpeg_version,
-            self.config.threads,
+            self.extraction_settings(),
             ImageResolution::MatchSource,
         );
         let ffmpeg = self.encoder_path();
@@ -688,8 +717,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
                 offset_ticks,
                 use_iframe,
                 &output_path,
-                self.config.ffmpeg_version,
-                self.config.threads,
+                self.extraction_settings(),
                 self.chapter_image_resolution
                     .as_ref()
                     .map_or(ImageResolution::MatchSource, |read| read()),
@@ -785,8 +813,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
                 None,
                 use_iframe,
                 &output_path,
-                self.config.ffmpeg_version,
-                self.config.threads,
+                self.extraction_settings(),
                 self.chapter_image_resolution
                     .as_ref()
                     .map_or(ImageResolution::MatchSource, |read| read()),
@@ -871,7 +898,7 @@ mod tests {
     use ferrofin_model::media_info::MediaProtocol;
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
-    use super::{MediaEncoderConfig, MediaEncoderImpl, TICKS_PER_SECOND};
+    use super::{ExtractionSettings, MediaEncoderConfig, MediaEncoderImpl, TICKS_PER_SECOND};
     use crate::encoder::Transcoder;
     use async_trait::async_trait;
 
@@ -1873,8 +1900,7 @@ mod tests {
             None,
             true,
             "/tmp/out.jpg",
-            None,
-            0,
+            ExtractionSettings::default(),
             ImageResolution::MatchSource,
         );
         assert!(args.contains("-v error"), "got: {args}");
@@ -1903,11 +1929,90 @@ mod tests {
             None,
             true,
             "/tmp/out.jpg",
-            version,
-            0,
+            ExtractionSettings {
+                ffmpeg_version: version,
+                ..ExtractionSettings::default()
+            },
             ImageResolution::MatchSource,
         );
         assert!(args.contains(expected), "got: {args}");
+    }
+
+    /// `ExtractImageInternal`'s two `useTradeoff` (`FFmpeg:imgExtractPerfTradeoff`)
+    /// terms: `enableThumbnail = !useTradeoff && useIFrame && container !=
+    /// "wtv"`, and `-skip_frame nokey` when `useIFrame && (useTradeoff ||
+    /// seekMpegTs)`, where `seekMpegTs` is a seek into an `mpegts` container.
+    #[rstest]
+    #[case::default(false, true, "matroska", true, (true, false))]
+    #[case::default_mpegts_seek(false, true, "mpegts", true, (true, true))]
+    #[case::default_mpegts_no_seek(false, true, "mpegts", false, (true, false))]
+    #[case::default_wtv(false, true, "wtv", true, (false, false))]
+    #[case::default_standard_way(false, false, "mpegts", true, (false, false))]
+    #[case::tradeoff(true, true, "matroska", true, (false, true))]
+    #[case::tradeoff_no_seek(true, true, "matroska", false, (false, true))]
+    #[case::tradeoff_mpegts_seek(true, true, "mpegts", true, (false, true))]
+    #[case::tradeoff_wtv(true, true, "wtv", true, (false, true))]
+    #[case::tradeoff_standard_way(true, false, "mpegts", true, (false, false))]
+    fn the_perf_tradeoff_trades_the_sampling_for_keyframes(
+        #[case] perf_tradeoff: bool,
+        #[case] use_iframe: bool,
+        #[case] container: &str,
+        #[case] seek: bool,
+        #[case] (thumbnail, keyframes): (bool, bool),
+    ) {
+        let args = MediaEncoderImpl::<NoopTranscoder>::extract_image_arguments(
+            "file:\"/media/movie\"",
+            container,
+            Some(&video_stream()),
+            None,
+            None,
+            seek.then_some(10 * TICKS_PER_SECOND),
+            use_iframe,
+            "/tmp/out.jpg",
+            ExtractionSettings {
+                perf_tradeoff,
+                ..ExtractionSettings::default()
+            },
+            ImageResolution::MatchSource,
+        );
+        assert_eq!(args.contains("thumbnail=n=24"), thumbnail, "{args}");
+        assert_eq!(args.starts_with("-skip_frame nokey "), keyframes, "{args}");
+    }
+
+    /// The configured trade-off reaches a chapter-image extraction.
+    #[tokio::test]
+    async fn the_configured_perf_tradeoff_reaches_the_frame_extraction() {
+        let temp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(RecordingFrames(std::sync::Mutex::new(Vec::new())));
+        let encoder = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "ffmpeg",
+            "ffprobe",
+            MediaEncoderConfig {
+                temp_dir: temp.path().to_path_buf().into(),
+                img_extract_perf_tradeoff: true,
+                ..Default::default()
+            },
+        );
+        let frame = encoder
+            .extract_video_image(
+                "movie.mkv",
+                "matroska",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                Some(10 * TICKS_PER_SECOND),
+            )
+            .await
+            .unwrap();
+        std::fs::remove_file(frame).unwrap();
+        let arguments = transcoder.0.lock().unwrap().clone();
+        assert_eq!(arguments.len(), 1, "{arguments:?}");
+        assert!(
+            arguments[0].starts_with("-skip_frame nokey ") && !arguments[0].contains("thumbnail"),
+            "{}",
+            arguments[0]
+        );
     }
 
     #[rstest]
@@ -1946,8 +2051,7 @@ mod tests {
             None,
             true,
             "/tmp/out.jpg",
-            None,
-            0,
+            ExtractionSettings::default(),
             ImageResolution::MatchSource,
         );
         assert!(args.contains(expected_prefix), "got: {args}");
@@ -1976,8 +2080,7 @@ mod tests {
                 None,
                 true,
                 "/tmp/out.jpg",
-                None,
-                0,
+                ExtractionSettings::default(),
                 ImageResolution::MatchSource,
             );
             assert_eq!(
@@ -2008,8 +2111,7 @@ mod tests {
                 None,
                 true,
                 "/tmp/out.jpg",
-                None,
-                0,
+                ExtractionSettings::default(),
                 ImageResolution::MatchSource,
             );
             let tokens = crate::encoder::split_args(&args).unwrap();
@@ -2326,8 +2428,7 @@ mod tests {
                 Some(150_000_000),
                 true,
                 "frame.jpg",
-                None,
-                0,
+                ExtractionSettings::default(),
                 resolution,
             );
             assert!(
