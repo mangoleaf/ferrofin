@@ -1059,8 +1059,10 @@ impl UserViewManager for FerrofinUserViewManager {
             // `item_repository::visible_views` still admits them).
             include_item_types: vec![
                 BaseItemKind::CollectionFolder,
-                // Both spellings of the playlists folder: Ferrofin provisions
-                // one, an adopted database carries the other.
+                // Both kinds of playlists folder: Ferrofin and Jellyfin both
+                // store `PlaylistsFolder`, but a row an earlier Ferrofin
+                // wrote as `ManualPlaylistsFolder` survives when startup
+                // finds the correct row beside it and does not re-key it.
                 BaseItemKind::ManualPlaylistsFolder,
                 BaseItemKind::PlaylistsFolder,
             ],
@@ -1487,8 +1489,9 @@ impl FerrofinUserViewManager {
     /// query that feeds the grouping in
     /// [`get_latest_items`](UserViewManager::get_latest_items) — the plain form,
     /// or, for a grouped request whose first typed parent is a library of one of
-    /// the two short-circuited types, that type's own query (one card per
-    /// newest series for tvshows, the newest albums for music).
+    /// the three short-circuited types, that type's own query (one card per
+    /// newest series for tvshows, the newest albums for music, the newest row
+    /// of each presentation key for movies).
     async fn items_for_latest_items(
         &self,
         query: &LatestItemsQuery,
@@ -1540,43 +1543,40 @@ impl FerrofinUserViewManager {
         }
 
         if query.group_items {
-            // The first typed parent decides (v12 `UserViewManager.cs:371-405`,
-            // `FirstOrDefault(type => type is not null)`): a tvshows or music
-            // library short-circuits into its own per-collection-type query,
-            // with `limit` now capping GROUPS (tvshows) or ALBUMS (music)
-            // rather than rows.
-            //
-            // Following that citation upward also reaches `Limit = limit * 2`
-            // (`:365`), which Ferrofin has NOT adopted — the plain path above
-            // still over-fetches 10.11.8's `limit * 5`
-            // ([`LATEST_OVER_FETCH_FACTOR`]). It cannot affect either
-            // short-circuit, both of which overwrite `limit` on the next line,
-            // so it is a live question only for the plain path: v12 returns
-            // fewer groups from a page of many small containers. Un-adopted,
-            // not decided.
+            // The first typed parent decides (v12 `UserViewManager.cs:396-430`,
+            // `FirstOrDefault(type => type is not null)`): a tvshows, music or
+            // movies library short-circuits into its own per-collection-type
+            // query, with `limit` now capping GROUPS (tvshows), ALBUMS (music)
+            // or presentation keys (movies) rather than rows.
             //
             // "First" is the parents' order, and with no `parentId` the parents
             // are the user's whole view list — so on a server whose first view
-            // by `SortName` is a music library, the UNSCOPED `/Items/Latest`
-            // (the home row) is albums too, not just `ParentId=<music view>`.
-            // That is upstream's behaviour, not an artifact of this port.
+            // by `SortName` is a movies library, the UNSCOPED `/Items/Latest`
+            // (the home row) is the movies arm too: the newest `limit` rows of
+            // EVERY library, one per key, grouped below — a burst of new tracks
+            // can fill it with a few album cards. That is upstream's behaviour
+            // (the owner chose to follow v12 here on 2026-10-24), not an
+            // artifact of this port.
             //
-            // The movies and `null`-collection-type branches v12 added
-            // alongside them (`:394-404`) are deliberately NOT taken here, and
-            // that divergence is an owner decision to leave standing: the
-            // movies arm changes which movies a movies library answers with,
-            // and the `null` arm changes a MIXED library's answer for both
-            // movies and episodes. They are also not the same size of job —
-            // movies needs `GetLatestMovieItems` (`Querying.cs:233-256`) alone,
-            // while `null` (`:134-144`) needs that beside the ported
-            // `GetLatestTvShowItems` (`latest_tv_repository`), then their
-            // concat re-sorted `DateCreated DESC, Id DESC` and cut to `limit`.
-            // Either way the routing is one more arm on the match below.
+            // The `null`-collection-type arm v12 added beside them
+            // (`:425-429`, a MIXED library's latest movies and shows) is not
+            // ported yet — gl-383. Port path: `GetLatestItemList`'s `unknown`
+            // arm (`Querying.cs:134-144`), the movies arm over the rows with no
+            // `SeriesName` concatenated with `latest_tv_repository`, re-sorted
+            // `DateCreated DESC, Id DESC` and cut to `limit`, then one more arm
+            // on the match below.
+            //
+            // The plain path below still over-fetches 10.11.8's `limit * 5`
+            // ([`LATEST_OVER_FETCH_FACTOR`]) where v12 fetches `limit * 2`
+            // (`:390`); the short-circuits overwrite it on the next line.
             let collection_type = parents
                 .iter()
                 .filter(|p| p.is_collection_folder() || p.is_user_view())
                 .find_map(|p| p.collection_type);
-            if let Some(ct @ (CollectionType::tvshows | CollectionType::music)) = collection_type {
+            if let Some(
+                ct @ (CollectionType::tvshows | CollectionType::music | CollectionType::movies),
+            ) = collection_type
+            {
                 internal.limit = Some(limit);
                 return self.items.get_latest_item_list(&internal, ct).await;
             }
@@ -2679,6 +2679,61 @@ mod tests {
         );
     }
 
+    /// A grouped request whose first typed view is a movies library takes v12's
+    /// movies arm (`UserViewManager.cs:419-423`, `GetLatestMovieItems`): the
+    /// newest `limit` rows of every view, one per presentation key, then
+    /// grouped. Two new episodes of one series fill a `limit=2` page, which
+    /// then shows ONE card; the plain path read `limit * 5` rows and filled
+    /// both cards (the series, then the movie).
+    #[tokio::test]
+    async fn latest_with_a_movies_first_view_reads_limit_rows_then_groups() {
+        let db = test_db().await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "Shows").await;
+        let series = Uuid::from_u128(0x251);
+        let (movie, e1, e2) = (
+            Uuid::from_u128(0x351),
+            Uuid::from_u128(0x352),
+            Uuid::from_u128(0x353),
+        );
+        seed(
+            &db,
+            &[
+                Row::new(series, BaseItemKind::Series, "Series 01", day(1), SHOWS),
+                Row::new(movie, BaseItemKind::Movie, "Movie 0001", day(3), MOVIES),
+                Row::new(e1, BaseItemKind::Episode, "S1E1", day(8), SHOWS)
+                    .under(series)
+                    .of_series(series, "Series 01"),
+                Row::new(e2, BaseItemKind::Episode, "S1E2", day(9), SHOWS)
+                    .under(series)
+                    .of_series(series, "Series 01"),
+            ],
+        )
+        .await;
+        let mgr = manager_with_folders(
+            &db,
+            vec![
+                (MOVIES, Some(CollectionTypeOptions::movies)),
+                (SHOWS, Some(CollectionTypeOptions::tvshows)),
+            ],
+        );
+
+        let query = |group_items| LatestItemsQuery {
+            limit: Some(2),
+            group_items,
+            ..LatestItemsQuery::default()
+        };
+        assert_eq!(
+            shape(&latest(&mgr, query(true)).await),
+            vec![(Some(series), vec![e2, e1])]
+        );
+        // Ungrouped requests never short-circuit: the plain path, two rows.
+        assert_eq!(
+            shape(&latest(&mgr, query(false)).await),
+            vec![(None, vec![e2]), (None, vec![e1])]
+        );
+    }
+
     /// Equal `DateCreated` (hard-linked fixtures share one btime) breaks on
     /// `SortName DESC` — Jellyfin's `0500, 0499, …`, not the old `ASC`.
     #[tokio::test]
@@ -3028,11 +3083,11 @@ mod tests {
     }
 
     /// The music branch fires on the parents' collection type and nothing else,
-    /// so a request scoped to a NON-music parent keeps the generic path even on
-    /// a server that does have a music library — and a stray `MusicAlbum` row
-    /// sitting in a movies library is a folder, which the generic query filters
-    /// out. The other half: a music library with no albums answers empty rather
-    /// than widening its top-parent scope.
+    /// so a request scoped to a movies parent takes the movies arm even on a
+    /// server that does have a music library — and a stray `MusicAlbum` row
+    /// sitting in a movies library is a folder, which the movies arm's filter
+    /// (`IsFolder = false`) leaves out. The other half: a music library with
+    /// no albums answers empty rather than widening its top-parent scope.
     #[tokio::test]
     async fn latest_music_branch_needs_a_music_parent() {
         let db = test_db().await;
@@ -3073,7 +3128,7 @@ mod tests {
         assert_eq!(
             shape(&movies),
             vec![(None, vec![movie])],
-            "a movies parent still takes the generic path, folders excluded"
+            "a movies parent takes the movies arm, folders excluded"
         );
 
         let empty = latest(
@@ -3094,9 +3149,11 @@ mod tests {
 
     /// `isPlayed` is a SQL predicate (it needs the user), not a post-filter
     /// over an already-cut page: SIX played movies are newer than the one
-    /// unplayed movie and the request over-fetches `limit * 5 = 5` rows, so a
-    /// post-filter over the page would return nothing while the SQL predicate
-    /// finds the fresh one. A music parent drops the filter entirely.
+    /// unplayed movie, and the plain path (ungrouped) over-fetches
+    /// `limit * 5 = 5` rows while the movies arm (grouped, Movies the first
+    /// view) reads `limit = 1`, so a post-filter over either page would return
+    /// nothing while the SQL predicate finds the fresh one. A music parent
+    /// drops the filter entirely.
     #[tokio::test]
     async fn latest_pushes_is_played_into_sql() {
         let db = test_db().await;
@@ -3126,20 +3183,27 @@ mod tests {
             ],
         );
 
-        let unplayed = latest(
-            &mgr,
-            LatestItemsQuery {
-                user: Some(user.clone()),
-                is_played: Some(false),
-                limit: Some(1),
-                ..LatestItemsQuery::default()
-            },
-        )
-        .await;
-        // The played movies are out; the played TRACK is out too — the views
-        // fallback keeps `isPlayed` (the music exemption is decided on the
-        // explicit parent only, as upstream).
-        assert_eq!(shape(&unplayed), vec![(None, vec![fresh])]);
+        for group_items in [false, true] {
+            let unplayed = latest(
+                &mgr,
+                LatestItemsQuery {
+                    user: Some(user.clone()),
+                    is_played: Some(false),
+                    group_items,
+                    limit: Some(1),
+                    ..LatestItemsQuery::default()
+                },
+            )
+            .await;
+            // The played movies are out; the played TRACK is out too — the
+            // views fallback keeps `isPlayed` (the music exemption is decided
+            // on the explicit parent only, as upstream).
+            assert_eq!(
+                shape(&unplayed),
+                vec![(None, vec![fresh])],
+                "group_items={group_items}"
+            );
+        }
 
         // `GroupItems = false` keeps a music parent on the generic path, which
         // is where `isPlayed` would still be a predicate — and it is not:

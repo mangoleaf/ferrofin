@@ -1300,7 +1300,7 @@ fn short_type(item: &BaseItemEntity) -> &str {
 /// The children of the `UserRootFolder` that are the aggregate's VIRTUAL
 /// children rather than its own rows — the plug-in folders
 /// `LibraryManager.CreateRootFolder` registers with `AddVirtualChild`
-/// (LibraryManager.cs:883, the only call site in 10.11.8: the playlists folder).
+/// (v12.2 LibraryManager.cs:1146, the only call site: the playlists folder).
 ///
 /// Named as a set because that is what it is in the C#: they are members of the
 /// candidate list `TranslateParentItem` searches, and their
@@ -1359,9 +1359,14 @@ async fn translate_parent_item(
     }
     // Candidate group 1: the `CollectionFolder` views.
     let folders = state.virtual_folders.library_folders().await?;
+    // `GetChildren(user, true).FirstOrDefault(…)`: the first by `SortName`,
+    // not by the listing, which comes in the file system's order.
     let Some(view_id) = folders
         .iter()
-        .find(|vf| vf.locations.iter().any(|loc| loc == path))
+        .filter(|vf| vf.locations.iter().any(|loc| loc == path))
+        .min_by_key(|vf| {
+            ferrofin_util::sort_name::create_sort_name(vf.name.as_deref().unwrap_or_default())
+        })
         .and_then(|vf| vf.item_id.as_deref())
         .and_then(|id| Uuid::parse_str(id).ok())
     else {

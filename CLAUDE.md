@@ -135,7 +135,7 @@ The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whos
 Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 12.0 database** (`0032` converges the
 10.11.8 shape the chain carried through `0029`; the gate adopts the exact
 `__EFMigrationsHistory` sets for 10.11.8–10.11.11, 12.0.0, 12.1.0 and 12.2.0, including both
-12.1 and both 12.2 upgrade routes in the [support matrix](adoption/README.md#supported-and-tested-versions)) — that is
+12.1 and both 12.2 upgrade routes in the [support matrix](gates/adoption/README.md#supported-and-tested-versions)) — that is
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
 migrates in place). Ferrofin-own tables/indexes live in a collision-proof
 `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the pin.
@@ -242,15 +242,24 @@ integration tests are gated behind an env var and skip if ffmpeg is absent:
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-hls          --test hls_stream_manager_ffmpeg
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test no_repeat_extraction_ffmpeg
+FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test subtitle_streams_ffmpeg
 ```
 
-The last one checks that chapter images, trickplay and Intro Skipper analysis are never
-redone for an unchanged file: library scans, the three scheduled tasks, every choice of
-jellyfin-web's refresh dialog but "replace trickplay images" (a deliberate redo) on a
-library, a series and an episode, and a restart, with extraction both during the scan and
-by the tasks. Intro Skipper's automatic timer is off there (its scheduled task drives the
-same engine). It needs an ffmpeg with libx264, and CI does not run it (CI never sets
-`FERROFIN_FFMPEG_TESTS`): run it by hand for changes to those paths.
+`no_repeat_extraction_ffmpeg` checks that chapter images, trickplay and Intro Skipper
+analysis are never redone for an unchanged file: library scans, the three scheduled tasks,
+every choice of jellyfin-web's refresh dialog but "replace trickplay images" (a deliberate
+redo) on a library, a series and an episode, and a restart, with extraction both during the
+scan and by the tasks. Intro Skipper's automatic timer is off there (its scheduled task
+drives the same engine).
+
+`subtitle_streams_ffmpeg` writes a PGS subtitle (ffmpeg has no PGS encoder) and checks it
+embedded from the movie and from a `.sup` sidecar and burned into a seeked HLS segment, at
+the right time; and it burns an ASS track in with the fonts its file ships, which must be
+extracted into the cache whatever their `filename` tags say.
+
+Both of these need an ffmpeg with libx264, and `subtitle_streams_ffmpeg` also needs ffmpeg
+5.1 or later. CI does not run them (CI never sets `FERROFIN_FFMPEG_TESTS`): run them by hand
+for changes to those paths.
 
 Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
@@ -261,25 +270,25 @@ runs it:
 FERROFIN_WASM_GUEST_TESTS=1 cargo test -p ferrofin-wasm --test wasm_hello_guest
 ```
 
-### Performance is measured per release, not per PR — the v3 benchmark is in `bench/`
+### Performance is measured per release, not per PR — the v3 benchmark is in `gates/bench/`
 **Suite v3 exists and is the tool to use** (v2, formerly `suite/`, was scrapped by owner
 decision on 2026-09-02 for policing itself instead of answering questions; do not
 resurrect it from git history). v3 answers four questions and nothing else:
 latency (screens and endpoints), time to first screen, memory, and response shape vs
-Jellyfin. Read [`bench/README.md`](bench/README.md) first — it defines every number in one
+Jellyfin. Read [`gates/bench/README.md`](gates/bench/README.md) first — it defines every number in one
 sentence.
 
 ```bash
 # needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid; ffprobe for TTFS
 # plus ffmpeg (libx264 + libx265) and Python Pillow to build the test data
 docker pull jellyfin/jellyfin:10.11.8
-docker pull "$(cat bench/testdata/jellyfin-image.txt)"
-bench/testdata/build.sh                          # source fixture, once: ~20 min, ~17 GB (gitignored)
-bench/testdata/build.sh --export-pools             # existing fixtures only; fresh builds already include pools
-bench/testdata/build.sh --prepare-jellyfin         # upgrade a copy, scan and verify, once
+docker pull "$(cat gates/bench/testdata/jellyfin-image.txt)"
+gates/bench/testdata/build.sh                          # source fixture, once: ~20 min, ~17 GB (gitignored)
+gates/bench/testdata/build.sh --export-pools             # existing fixtures only; fresh builds already include pools
+gates/bench/testdata/build.sh --prepare-jellyfin         # upgrade a copy, scan and verify, once
 docker build -t ferrofin:bench .                 # the commit under test — REBUILD IT
-bench/run.sh                                     # ~40 min → bench/runs/<tag>/report.md
-python3 bench/report.py --serve                  # compare runs at 127.0.0.1:8097
+gates/bench/run.sh                                     # ~40 min → gates/bench/runs/<tag>/report.md
+python3 gates/bench/report.py --serve                  # compare runs at 127.0.0.1:8097
 ```
 
 Things that will otherwise cost you a run: the harness only ever *inspects* the
@@ -289,10 +298,10 @@ claims the current commit. `run.sh` refuses to start unless the server/client co
 Publishable numbers (the Jellyfin comparison) come from **three** runs — `report.py` takes
 the median and prints the range each cell spanned.
 
-`bench/` is NOT a CI gate and is not meant to become one; it is a measuring instrument you
+`gates/bench/` is NOT a CI gate and is not meant to become one; it is a measuring instrument you
 run deliberately. **Measurement gates releases, not PRs** (owner decision 2026-10-16), which
 keeps day-to-day work fast:
-- No PR needs a `bench/` or hyperfine before/after. That includes issue fixes, features,
+- No PR needs a `gates/bench/` or hyperfine before/after. That includes issue fixes, features,
   `perf:` changes and query-plan changes. A plan change still needs its `EXPLAIN QUERY PLAN`
   pin test (below).
 - Every app release is measured before it is tagged, on the branch it is cut from:
@@ -301,20 +310,20 @@ keeps day-to-day work fast:
   - patch releases of the released line come from `main`.
 
   `RELEASE.md` has the procedure: the interleaved A/B gate
-  (`bench/gate.py ab <previous release image> <candidate>`), Ferrofin only, three pairs.
+  (`gates/bench/gate.py ab <previous release image> <candidate>`), Ferrofin only, three pairs.
   The three-server runs against Jellyfin produce the published tables and never decide a
   release.
-- A gated cell that regresses past both of its `bench/gate.toml` thresholds in at least 2 of
+- A gated cell that regresses past both of its `gates/bench/gate.toml` thresholds in at least 2 of
   the 3 pairs blocks the release until it is fixed or the owner accepts it. So does a gated
   cell that cannot be judged because the candidate's responses differ from the previous
   release's.
-- When chasing a regression, `bench/run.sh --servers ferrofin --only loaded` on two builds is
+- When chasing a regression, `gates/bench/run.sh --servers ferrofin --only loaded` on two builds is
   the cheap form, skipping Jellyfin.
 
-The fast stdlib reporter correctness tests (`bench/test_report.py`) do run in CI and gate
+The fast stdlib reporter correctness tests (`gates/bench/test_report.py`) do run in CI and gate
 releases; they start no servers and impose no performance thresholds. The benchmark
 reference is the Jellyfin release named by `UPSTREAM_TAG` (below), pinned by digest in
-`bench/testdata/jellyfin-image.txt`; `bench/oracle.py` refuses a release-gate run while a
+`gates/bench/testdata/jellyfin-image.txt`; `gates/bench/oracle.py` refuses a release-gate run while a
 newer Jellyfin release exists, and an ad-hoc run warns.
 
 Parity in the project's sense, implementation compared against the upstream C# and recorded
@@ -335,21 +344,21 @@ pin a chosen plan; `crates/ferrofin-core/tests/next_up_query_plan.rs` pins the o
 a query stays *off* a `CROSS JOIN`. `ANALYZE` is deliberately unused and `sqlite_stat1`
 never exists.
 
-### Adoption has its own live check — `adoption/`
-`adoption/run.sh --fixtures DIR --image ferrofin:bench` covers 10.11.8, 10.11.9,
+### Adoption has its own live check — `gates/adoption/`
+`gates/adoption/run.sh --fixtures DIR --image ferrofin:bench` covers 10.11.8, 10.11.9,
 10.11.10, 10.11.11, 12.0.0, 12.1.0 and 12.2.0 databases, with separate 12.1 and 12.2
 fixtures upgraded from 10.11.8 and from 12.0.0.  Every fixture is **synthetic**: build them
-once with `adoption/build-fixtures.sh` (invented media; the official Jellyfin images seed and upgrade
+once with `gates/adoption/build-fixtures.sh` (invented media; the official Jellyfin images seed and upgrade
 each database themselves); they are never committed.  Never point the suite at a real
 library or a network share — the scripts refuse a DIR on a network filesystem, because every
 fixture is booted and scanned repeatedly.  A build that fails part-way is never retried
 (seeding is not idempotent): build into a new DIR.  On fresh copies it checks
 generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
-repair-free second boot.  The [test record](adoption/README.md#supported-and-tested-versions)
+repair-free second boot.  The [test record](gates/adoption/README.md#supported-and-tested-versions)
 identifies which versions passed and the image used.  Run it for any change to the migration
 chain, the adoption gate or the boot repairs, because those risk user data. This per-change
 requirement is unaffected by the release-branch rule above. The full adoption validation
-(`adoption/run.sh` and the synthetic preservation matrix) also runs before every release,
+(`gates/adoption/run.sh` and the synthetic preservation matrix) also runs before every release,
 and a failure there blocks the release (see `RELEASE.md`).
 The shell tests in CI exercise the harness without these live fixtures.
 

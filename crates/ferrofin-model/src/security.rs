@@ -12,7 +12,7 @@ use crate::secret::Secret;
 /// Port of `MediaBrowser.Controller.Security.AuthenticationInfo`. Surfaced by
 /// `GET /Auth/Keys`, where each entry describes one stored server API key (its
 /// device-related fields are empty, matching the C# projection).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "PascalCase")]
 pub struct AuthenticationInfo {
     /// Gets or sets the identifier.
@@ -66,6 +66,27 @@ pub struct AuthenticationInfo {
     /// Gets or sets the user name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_name: Option<String>,
+}
+
+/// A new C# `AuthenticationInfo`: every member at its type's default, so both
+/// unassigned `DateTime`s are `DateTime.MinValue`, not chrono's Unix epoch.
+impl Default for AuthenticationInfo {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            access_token: None,
+            device_id: None,
+            app_name: None,
+            app_version: None,
+            device_name: None,
+            user_id: Uuid::nil(),
+            is_active: false,
+            date_created: crate::json::datetime::dotnet_min(),
+            date_revoked: None,
+            date_last_activity: crate::json::datetime::dotnet_min(),
+            user_name: None,
+        }
+    }
 }
 
 #[cfg(test)]

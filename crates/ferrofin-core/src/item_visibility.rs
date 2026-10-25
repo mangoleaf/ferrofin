@@ -345,6 +345,7 @@ impl ItemVisibility {
                     row_id(row),
                     crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(
                         std::path::Path::new(&path),
+                        &self.paths,
                     )
                     .await,
                 );
@@ -704,13 +705,11 @@ impl Context<'_> {
                                 })
                             })
                         })
+                    // `read_options` has already expanded these.
                     || self.options.get(id).is_some_and(|opts| {
-                        opts.path_infos.iter().any(|p| {
-                            self.service
-                                .paths
-                                .expand(&p.path)
-                                .eq_ignore_ascii_case(path)
-                        })
+                        opts.path_infos
+                            .iter()
+                            .any(|p| p.path.eq_ignore_ascii_case(path))
                     })
             })
             .collect())

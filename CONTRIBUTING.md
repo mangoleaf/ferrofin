@@ -68,15 +68,15 @@ A PR does not need a before/after. If it touches `ferrofin-core`, `ferrofin-db`,
 `ferrofin-api`, or the query/repository/DTO paths, say so in the description so the
 release run can be read against it.
 
-The benchmark suite lives in [`bench/`](bench/README.md): rebuild `ferrofin:bench`, run
-`bench/run.sh`, and compare with `python3 bench/report.py --serve`.
-`bench/run.sh --servers ferrofin --only loaded` on two builds is the cheap form when
+The benchmark suite lives in [`gates/bench/`](gates/bench/README.md): rebuild `ferrofin:bench`, run
+`gates/bench/run.sh`, and compare with `python3 gates/bench/report.py --serve`.
+`gates/bench/run.sh --servers ferrofin --only loaded` on two builds is the cheap form when
 chasing a regression. It is deliberately **not** a CI gate. Budget for the setup if you
 run it: it needs `docker`, `k6`, `jq`, `taskset`, `curl` and `python3` (plus `ffmpeg`
 with libx264/libx265, `ffprobe` and Python `Pillow` for the test data), the two Jellyfin
 images must be pulled, the test data is generated locally and gitignored
-(`bench/testdata/build.sh`, ~20 min and ~17 GB), and a full run needs a quiet machine for
-about forty minutes. `bench/README.md` has the complete recipe.
+(`gates/bench/testdata/build.sh`, ~20 min and ~17 GB), and a full run needs a quiet machine for
+about forty minutes. `gates/bench/README.md` has the complete recipe.
 
 > Green tests are necessary, not sufficient. When you touch a data, auth, or
 > stateful path, **run the binary and exercise it over real HTTP** — several

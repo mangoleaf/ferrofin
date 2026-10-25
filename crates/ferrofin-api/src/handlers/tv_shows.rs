@@ -162,7 +162,11 @@ fn season_episode_rows(
         })
         .collect();
     if number != Some(0) {
-        matches.sort_by(|(left, _, _), (right, _, _)| left.compare(right));
+        // `LibraryManager.Sort`'s LINQ `OrderBy`: stable, and the aired-order
+        // comparer is not a total order, on which `sort_by` may panic.
+        ferrofin_util::stable_sort::stable_sort_by(&mut matches, |(left, _, _), (right, _, _)| {
+            left.compare(right)
+        });
     }
     // Stable input SortName order remains for season zero and comparator ties.
     matches

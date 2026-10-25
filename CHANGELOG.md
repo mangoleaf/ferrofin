@@ -24,17 +24,48 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
 
 ### Tooling
-- `adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
+- The four live checks moved under `gates/`: `bench/` → `gates/bench/`, `adoption/` →
+  `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. Each gate
+  behaves as before; run directories default to `gates/bench/runs/` and
+  `gates/parity/runs/`, and the benchmark corpus to `gates/bench/testdata/`, so an existing
+  `bench/testdata/`, `bench/runs/` or `parity/runs/` is moved by hand (the corpus can also be
+  passed with `--testdata`)
+- `gates/adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
   (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0) through an image on fresh
   fixture copies and diffs the answers against Jellyfin 12.2's own; fixtures are derived
   from one supplied 10.11.8 snapshot
 - All seven 10.11–12.1 live fixture paths passed on 2026-09-16, including both 12.1 upgrade
   routes; 12.2 paths passed the synthetic suite on 2026-10-13.
-  See the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
+  See the [support matrix and tested build](gates/adoption/README.md#supported-and-tested-versions).
   The harness now reports SQLite query failures and detects version promotions when the
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Refuse a `POST /Playlists` body without a `Name`, or with a null or blank one, and an
+  `"IsPublic": null`, with `400` as Jellyfin does, instead of creating the playlist; a
+  query-string `name` does not rescue such a body. A request with neither a body nor a
+  `name` is a `400` too (Jellyfin fails it with a `500`), where Ferrofin created a
+  nameless playlist
+- Accept a partial body on `POST /DisplayPreferences/{id}`, as Jellyfin does: each member
+  left out takes the default of Jellyfin's `DisplayPreferencesDto` (`ShowBackdrop` true,
+  250 px images, the rest off or empty) instead of failing with `400 missing field`
+- Send every library type's `SimilarItemProviders` and `SimilarItemProviderOrder` in
+  `GET /Library/VirtualFolders` even when empty (`[]`), as Jellyfin does, instead of leaving
+  them out
+- Write a backup manifest's `DateCreated` as Jellyfin writes its `DateTimeOffset`, with a
+  `+00:00` offset instead of `Z` (`POST /Backup/Create`, `GET /Backup`,
+  `GET /Backup/Manifest` and the archive's `manifest.json`). Archives written with the `Z`
+  form still list and restore
+- Report an API key's `DateLastActivity` as `0001-01-01T00:00:00.0000000Z` (.NET's unset
+  date) in `GET /Auth/Keys`, as Jellyfin does, instead of the Unix epoch
+- Answer a grouped `/Items/Latest` whose first typed library is a movies library as
+  Jellyfin 12 does (`GetLatestMovieItems`): the newest `limit` items, one per presentation
+  key, then grouped into cards. The "Latest Movies" row is the same in nearly every case.
+  The unscoped home row on a server whose first typed library is Movies now reads `limit`
+  items instead of five times as many, so a batch of new tracks or episodes can fill it
+  with a few cards, and an unscoped request takes half the time (117 → 60 ms on the
+  benchmark corpus, one debug build before and after). See
+  [docs/UPGRADING.md](docs/UPGRADING.md).
 - Keep the playlists folder out of a user's library-wide queries until they can see a
   playlist, and a box-set library until they can see a box set, as Jellyfin's
   `GetUserViews` does. An unscoped recursive `/Items` (or `/Items/Counts`) from a user with
@@ -268,6 +299,33 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   the named studios replace `studioIds`, and since an artist carries no studios the list is
   empty, as in Jellyfin. The parameter was dropped and every artist listed. Unlike Jellyfin,
   an unknown name does not create a studio
+- `GET /Library/VirtualFolders` and the libraries of `GET /System/Info/Storage` come in the
+  order the file system lists the libraries folder, as in Jellyfin, instead of sorted by
+  name, and each library's `Locations` are sorted in the request's language, so
+  `/media/kids` comes before `/media/Movies`. A library folder that is a symbolic link to a
+  directory is listed (and scanned) as in Jellyfin; it was skipped. A media path an adopted
+  Jellyfin library stores as `%AppDataPath%/…` or `%MetadataPath%/…` is served and compared as
+  the real path in `LibraryOptions.PathInfos`, so removing that path from the dashboard
+  removes it from the library's options too. A library shortcut (`.mblink`) written with a
+  byte-order mark or in UTF-16 resolves as Jellyfin reads it, and one that cannot be read is
+  logged with its path instead of vanishing silently
+- A media folder two libraries share takes its library options (metadata language and
+  country, saving artwork beside media and the rest) from the first of them by sort name, as
+  in Jellyfin; it took them from the last. The metadata language and country of an item in
+  nested libraries now come from the innermost one, and `GET /Items/{itemId}/Ancestors`
+  names the first library by sort name when two list the same folder
+
+### Performance
+- `/Persons` with a favourite filter: build the user's favourite-person set once per
+  statement, as Jellyfin does, instead of probing it again for every person row. On the
+  benchmark corpus (one debug build, before and after; the figures below too) that is
+  6.1 s → 7 ms, and `isFavorite=false` (past a minute) → 9 ms
+- `/Artists` and `/Artists/AlbumArtists` with `mediaTypes`: keep the media-type filter
+  from driving the artist lookup (12.7 s → 32 ms for `mediaTypes=Video`). Skip the
+  played and total counts an artist page never shows, as Jellyfin does (plain `/Artists`
+  87 → 37 ms)
+- Recursive `/Items` sorted by `Artist`, `AlbumArtist` or `Studio`: read each item's own
+  values for the sort key (4.0 s → 0.26 s)
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -282,6 +340,19 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   and password) and each guide provider's password (the Schedules Direct password hash) come
   back blank for them. Jellyfin serves both to every signed-in user; only the dashboard's admin
   pages read them, so jellyfin-web is unaffected
+- A library scan's `LibraryChanged` push reaches each signed-in user through the per-user
+  filter, as in Jellyfin, instead of one payload sent to every session: a user no longer
+  receives the ids of items added to or changed in libraries they cannot open, nor of those
+  libraries' folders. Removed ids still reach every user, as Jellyfin sends them, so a deleted
+  item leaves every screen. The push now also names the items a rescan saved (`ItemsUpdated`), the
+  by-name artists a scan retires (`ItemsRemoved`), and, from the TMDb missing-episodes pass, the
+  virtual seasons it adds but not its pathless episodes, as Jellyfin's `FilterItem` does. It
+  goes out `LibraryUpdateDuration` after the scan announces it, like every other library
+  change. WASM plugins receive every batch of library changes as `LibraryChanged`
+- The `LibraryChanged` push tells each user about an added or changed item only when they may
+  see it on its own, as Jellyfin's `IsVisibleStandalone` check does: another user's private
+  playlist, or an item above the user's parental rating or behind a blocked tag, is no longer
+  named to them, nor a folder they cannot open
 - Adopting a Jellyfin 12.2 database keeps the parental score that unrated episodes and seasons
   carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
   had already run, and cleared it, so a user with a maximum parental rating saw those episodes
@@ -433,6 +504,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   tuner until a restart
 - The playlists folder is made only at startup, as Jellyfin does, instead of being looked for
   again, with a rule of its own, on every `GET /Library/MediaFolders` and Folders view request
+- After the data directory moves, startup moves the root folder and the playlists folder to
+  it, as Jellyfin's `CreateRootFolder` does, and creating a playlist only looks the playlists
+  folder up. Before, `POST /Playlists` missed the folder at its old path, tried to create it
+  again under the same id and failed with a 500
 - A DVR timer whose row cannot be read when it fires is retried every minute, up to ten
   times, and logged, instead of the recording being missed with no trace. A stored timer or
   series timer that no longer parses is logged when it is first read and when it misses its
@@ -448,6 +523,26 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   nothing
 - A request whose handler panics is answered `500` "Error processing request." and logged,
   as in Jellyfin. Before, its connection was dropped, over HTTP/2 with every other request on it
+- A season with more than 20 episodes that Jellyfin's aired-order rule cannot fully order (an
+  undated episode among dated ones without episode numbers, or an unnumbered one beside a
+  special placed before a later episode) is listed again: `GET /Shows/{id}/Episodes`, the
+  season's `GET /Items` and the scan's season premiere-date pass sort it the way Jellyfin's
+  stable sort does, instead of answering `500` or failing the scan
+- An M3U playlist is read line by line as it downloads and an HDHomeRun device's JSON is parsed
+  as it arrives, as Jellyfin does, instead of buffering the whole response: a large playlist is
+  no longer held whole in memory, a wrong playlist URL that serves a video stream keeps memory
+  flat (the guide refresh still waits on it, as Jellyfin's does), and a device answering with
+  something that is not JSON fails at once. A playlist whose first line follows a UTF-8
+  byte-order mark, or whose lines end with a lone carriage return, no longer loses channels
+- A new playlist is announced to the sessions that may see it as added, and renaming it,
+  making it public or private, changing who it is shared with, moving an entry or handing it
+  to a share when its owner is deleted announces it as changed and moves its `Etag`, as in
+  Jellyfin. Before, a new playlist was announced as changed, so another open jellyfin-web
+  session showed it only after a reload, and the other edits were not announced at all
+- Listing the libraries no longer fails when it cannot write a library's database row (a busy,
+  full or read-only database): the failure is logged as a warning and every library is still
+  listed, where `GET /Library/VirtualFolders`, the home screen's views and the scheduled tasks
+  that look libraries up all failed until a later listing succeeded
 
 ## [1.0.0] - 2026-09-05
 

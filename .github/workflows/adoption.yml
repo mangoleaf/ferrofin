@@ -1,6 +1,6 @@
 name: Adoption
 
-# The full synthetic adoption validation (adoption/README.md): adoption/run.sh (eleven Jellyfin
+# The full synthetic adoption validation (gates/adoption/README.md): gates/adoption/run.sh (eleven Jellyfin
 # paths, including the fresh-install 12.2 row) and the synthetic preservation matrix (ten paths;
 # the seedless fresh-install row is validated by run.sh alone), against an image built from this
 # commit. A green run on the frozen release commit is the release's adoption evidence
@@ -53,11 +53,11 @@ jobs:
           set -euo pipefail
           # Captured first: a failed command substitution in a for list or an echo argument
           # would not stop the script, and an empty digest would still make a key.
-          tags=$(cd adoption && python3 -c 'from synthetic import VERSIONS; print(*sorted({v for _, v, _ in VERSIONS}))')
+          tags=$(cd gates/adoption && python3 -c 'from synthetic import VERSIONS; print(*sorted({v for _, v, _ in VERSIONS}))')
           [ -n "$tags" ]
           {
-            (cd adoption && python3 -c 'from synthetic import recipe; print(recipe())')
-            sha256sum adoption/smoke.sh adoption/build-fixtures.sh adoption/messy.py adoption/scale.py
+            (cd gates/adoption && python3 -c 'from synthetic import recipe; print(recipe())')
+            sha256sum gates/adoption/smoke.sh gates/adoption/build-fixtures.sh gates/adoption/messy.py gates/adoption/scale.py
             for tag in $tags; do
               digest=$(docker buildx imagetools inspect "jellyfin/jellyfin:$tag" --format '{{json .Manifest.Digest}}')
               [ -n "$digest" ]
@@ -76,7 +76,7 @@ jobs:
       - name: build the fixtures (cache miss)
         if: steps.fixtures.outputs.cache-hit != 'true'
         run: |
-          adoption/build-fixtures.sh --fixtures "$RUNNER_TEMP/adoption"
+          gates/adoption/build-fixtures.sh --fixtures "$RUNNER_TEMP/adoption"
           df -h /
       # Saved before the checks, so a failing image does not cost the next run a rebuild.
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -86,14 +86,14 @@ jobs:
             ${{ runner.temp }}/adoption
             !${{ runner.temp }}/adoption/work
           key: ${{ steps.key.outputs.key }}
-      - name: adoption/run.sh
+      - name: gates/adoption/run.sh
         id: run-sh
-        run: adoption/run.sh --fixtures "$RUNNER_TEMP/adoption" --image ferrofin:adoption-ci
+        run: gates/adoption/run.sh --fixtures "$RUNNER_TEMP/adoption" --image ferrofin:adoption-ci
       # Runs even when run.sh failed, so one run reports both.
       - name: synthetic preservation matrix
         if: ${{ !cancelled() && steps.run-sh.conclusion != 'skipped' }}
-        run: python3 adoption/synthetic.py run --fixtures "$RUNNER_TEMP/adoption" --image ferrofin:adoption-ci
-      # The report of each run (adoption/adoption_report.py): one self-contained page, whatever the
+        run: python3 gates/adoption/synthetic.py run --fixtures "$RUNNER_TEMP/adoption" --image ferrofin:adoption-ci
+      # The report of each run (gates/adoption/adoption_report.py): one self-contained page, whatever the
       # verdict. Open it from disk, or list the downloaded directory in the viewer's Adoption tab.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}

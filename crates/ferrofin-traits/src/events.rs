@@ -77,6 +77,23 @@ pub trait LibraryChangeAudience: Send + Sync {
         Ok(libraries.to_vec())
     }
 
+    /// Which of `ids` `user_id` may see on their own:
+    /// `TranslatePhysicalItemToUserLibrary`'s `item.IsVisibleStandalone(user)`
+    /// in `LibraryChangedNotifier`, which besides the library applies the
+    /// item's parents, the user's parental rating and tag rules, and a
+    /// playlist's owner and shares. An id with no row is not visible.
+    ///
+    /// The default admits every id; only test doubles rely on it, and the
+    /// server's audience overrides it.
+    async fn visible_item_ids(
+        &self,
+        user_id: uuid::Uuid,
+        ids: &[uuid::Uuid],
+    ) -> Result<Vec<uuid::Uuid>, ServiceError> {
+        let _ = user_id;
+        Ok(ids.to_vec())
+    }
+
     /// Pushes one user's already-filtered payload to that user's sessions.
     async fn deliver(&self, user_id: uuid::Uuid, payload: &str) -> Result<(), ServiceError>;
 }

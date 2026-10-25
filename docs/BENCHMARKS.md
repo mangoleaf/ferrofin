@@ -1,16 +1,16 @@
 # Benchmarks — three-run results
 
 Measured on **2026-10-20** from server source **`d2bb9306`** (`release/v1.4.0`), against
-**Jellyfin 12.2.0** (pinned by digest in `bench/testdata/jellyfin-image.txt`), using three
+**Jellyfin 12.2.0** (pinned by digest in `gates/bench/testdata/jellyfin-image.txt`), using three
 complete repetitions. The root [README](../README.md#benchmarks) withholds flagged cells;
 this detailed report keeps flagged raw measurements as **diagnostics, not performance
-claims**. The [methodology](../bench/README.md) defines the measurements and checks.
+claims**. The [methodology](../gates/bench/README.md) defines the measurements and checks.
 
 Every run passed the start-of-run idle check (92.8 %, 98.0 % and 98.1 %). The first run
 then saw 42–49 % p95 interference on the server cores during measurement, against 13–14 %
 in the other two; the ranges below include it.
 
-Everything between the two rules is the unedited output of `bench/report.py` for the three runs.
+Everything between the two rules is the unedited output of `gates/bench/report.py` for the three runs.
 
 ---
 
@@ -660,12 +660,12 @@ Average cores busy is CPU-seconds divided by observed wall seconds; 1.0 means on
 
 ## Reproduce the reports
 
-Raw evidence stays under ignored `bench/runs/` directories. Role credentials must not be
+Raw evidence stays under ignored `gates/bench/runs/` directories. Role credentials must not be
 published.
 
 ```sh
-python3 bench/report.py \
-  bench/runs/v1.3.2-603-d2bb9306 \
-  bench/runs/v1.3.2-603-d2bb9306-run2 \
-  bench/runs/v1.3.2-603-d2bb9306-run3
+python3 gates/bench/report.py \
+  gates/bench/runs/v1.3.2-603-d2bb9306 \
+  gates/bench/runs/v1.3.2-603-d2bb9306-run2 \
+  gates/bench/runs/v1.3.2-603-d2bb9306-run3
 ```

@@ -254,9 +254,9 @@ The reproducible harness is now checked in:
 
 ```sh
 RUSTC_WRAPPER= cargo build --locked --offline -p ferrofin-server
-python3 bench/per_user_visibility.py jellyfin /path/to/jellyfin.dll \
+python3 gates/bench/per_user_visibility.py jellyfin /path/to/jellyfin.dll \
   --dotnet /path/to/dotnet
-python3 bench/per_user_visibility.py ferrofin target/debug/ferrofin-server \
+python3 gates/bench/per_user_visibility.py ferrofin target/debug/ferrofin-server \
   --reference /tmp/ferrofin-visibility-jellyfin-EXAMPLE/results.json
 ```
 
@@ -304,9 +304,9 @@ database with 64 movies in two libraries; the allowed SyncPlay queue contained
 after, after, before, before, after; our compilation and coverage jobs had finished.
 
 ```sh
-python3 bench/per_user_visibility.py ferrofin /path/to/before/ferrofin-server \
+python3 gates/bench/per_user_visibility.py ferrofin /path/to/before/ferrofin-server \
   --benchmark 100 --library-size 64
-python3 bench/per_user_visibility.py ferrofin target/debug/ferrofin-server \
+python3 gates/bench/per_user_visibility.py ferrofin target/debug/ferrofin-server \
   --benchmark 100 --library-size 64
 ```
 
