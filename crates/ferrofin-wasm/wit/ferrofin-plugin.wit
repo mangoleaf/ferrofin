@@ -28,7 +28,8 @@ interface types {
         /// Stable plugin id — a UUID in canonical string form. A component
         /// whose id does not parse as a UUID is rejected at load.
         id: string,
-        /// Human-readable display name.
+        /// Human-readable display name. A blank name, one over 256 bytes,
+        /// or one with control characters is rejected at install and load.
         name: string,
         /// Semantic version string of the plugin itself.
         version: string,

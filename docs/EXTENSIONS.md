@@ -109,7 +109,12 @@ source of truth). Install matches Jellyfin's repository flow: an admin adds a pl
 repository URL (Dashboard → Plugins → Repositories), picks the plugin from the catalog,
 and the server downloads, verifies, and stages it into `{data_dir}/plugins/`; a restart
 activates it (`SystemInfo.HasPendingRestart` flips true). Dropping the `.wasm` file into
-`{data_dir}/plugins/` by hand and restarting works identically (the dev/air-gapped path).
+`{data_dir}/plugins/` by hand and restarting works identically (the dev/air-gapped path),
+except that the load, not the repository, refuses a file whose id belongs to a compiled-in
+plugin (OpenSubtitles, the in-tree providers, the built-in extensions). Install and load
+share one check of what a component says about itself (its id, name, default configuration
+and provider name), so an artifact is never installed only to be skipped at boot for one of
+those.
 The repository install pipeline is deliberately strict, in order: the manifest's
 `targetAbi` must equal this server's plugin ABI; the download must be **HTTPS**
 (cleartext-to-loopback allowed only when the *configured repository* is itself loopback —

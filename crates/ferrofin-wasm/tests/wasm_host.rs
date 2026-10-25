@@ -111,6 +111,7 @@ fn tight_settings() -> WasmSettings {
         write_content_mb: 2,
         subtitle_extract_mb: 10,
         private_http_allow: Vec::new(),
+        reserved_ids: Vec::new(),
     }
 }
 
@@ -172,6 +173,55 @@ fn duplicate_plugin_ids_keep_only_the_first() {
     write_fixture(dir.path(), "b-second", FIXTURE_WAT);
     let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
     assert_eq!(host.plugins().len(), 1, "same id must load once");
+}
+
+/// The fixture re-identified, so two copies can load side by side.
+fn fixture_with_id(id: &str) -> String {
+    FIXTURE_WAT.replace("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff", id)
+}
+
+#[test]
+fn a_control_character_in_the_descriptor_name_skips_only_that_file() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    // A WIT string may hold U+0000. The name once became the runtime
+    // thread's name, whose interior NUL panicked the whole batch.
+    write_fixture(
+        dir.path(),
+        "a-nul",
+        &FIXTURE_WAT.replace(
+            r#"(data (i32.const 64)  "Hello")"#,
+            r#"(data (i32.const 64)  "He\00lo")"#,
+        ),
+    );
+    write_fixture(
+        dir.path(),
+        "b-good",
+        &fixture_with_id("11111111-1111-1111-1111-111111111111"),
+    );
+    let host = WasmPluginHost::load(dir.path(), &WasmSettings::default()).unwrap();
+    let ids: Vec<String> = host
+        .plugins()
+        .iter()
+        .map(|p| p.descriptor.id.to_string())
+        .collect();
+    assert_eq!(ids, ["11111111-1111-1111-1111-111111111111"]);
+}
+
+#[test]
+fn a_file_squatting_a_compiled_in_id_is_never_loaded() {
+    init_test_logging();
+    let dir = tempfile::tempdir().unwrap();
+    write_fixture(dir.path(), "squatter", FIXTURE_WAT);
+    let compiled_in: uuid::Uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeffff".parse().unwrap();
+    let settings = WasmSettings::default().with_reserved_ids([compiled_in]);
+    let host = WasmPluginHost::load(dir.path(), &settings).unwrap();
+    // Every surface is built from the loaded set, so none is wired for it:
+    // no tasks, providers, registry entry, or web route.
+    assert!(host.plugins().is_empty());
+    assert!(host.scheduled_tasks(&manager()).is_empty());
+    assert!(host.metadata_providers().is_empty());
+    assert!(host.registered_plugins().is_empty());
 }
 
 use common::named_provider_fixture;

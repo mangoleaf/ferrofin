@@ -286,6 +286,18 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
   had already run, and cleared it, so a user with a maximum parental rating saw those episodes
   in lists, counts, Latest, Resume and Next Up until the next full library scan
+- WASM plugins: a `.wasm` dropped into the plugins folder by hand whose id belongs to a
+  compiled-in plugin (OpenSubtitles, TMDb and the other in-tree providers, Intro Skipper, File
+  Transformation, Merge Versions) is no longer loaded. It ran every task, provider and route
+  it declared under the compiled-in plugin's enabled switch and was handed that plugin's
+  settings (the OpenSubtitles user name and password among them), while `/Plugins` listed
+  only the compiled-in one
+- WASM plugins: one plugin file can no longer drop every other plugin for a boot. A name with
+  a NUL byte panicked the loader (the name became the plugin thread's name); names that are
+  blank, longer than 256 bytes or carry control characters are now refused, a panic while
+  loading one file skips only that file, and install checks a plugin the same way the load
+  does, so one that installs is not skipped at the next boot for an invalid default
+  configuration or name
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for
