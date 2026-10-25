@@ -63,6 +63,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Read a display-preferences id as Jellyfin's `Guid.TryParse` reads it: a `(…)`, `{0x…}` or
+  space-padded GUID addresses that GUID's preferences, and an `urn:uuid:` id is hashed like
+  any other name
 - Bind a `POST /Users` body as Jellyfin does: a body without `Name`, or with a null one, is
   a `400` (the name is invalid) instead of keeping the name, and the user's `Policy` in the
   body is validated, so one without both provider ids is a `400` unless it is sent as

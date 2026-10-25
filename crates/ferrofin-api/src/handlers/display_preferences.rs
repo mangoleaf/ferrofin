@@ -34,6 +34,7 @@ use ferrofin_db::entities::display_preferences::{
 };
 use ferrofin_db::enums::{HomeSectionType, ViewType};
 use ferrofin_model::dto::{DisplayPreferencesDto, ScrollDirection, SortOrder};
+use ferrofin_util::guid_extensions::parse_dotnet_guid;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
@@ -70,9 +71,11 @@ struct DisplayPreferencesParams {
 }
 
 /// Resolves a `displayPreferencesId` into an item id: parse it as a `Guid`, else
-/// hash it with MD5 (C# `Guid.TryParse … else GetMD5()`).
+/// hash it with MD5 (C# `Guid.TryParse … else GetMD5()`). `Guid.TryParse`'s
+/// spellings, not `Uuid::parse_str`'s: an `urn:uuid:` id is hashed, and a
+/// `(…)`, `{0x…}` or padded one is parsed.
 fn resolve_item_id(raw: &str) -> Uuid {
-    Uuid::parse_str(raw).unwrap_or_else(|_| get_md5(raw))
+    parse_dotnet_guid(raw).unwrap_or_else(|| get_md5(raw))
 }
 
 /// Reads a C# enum without discarding unnamed integer values.

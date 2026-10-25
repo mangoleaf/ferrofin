@@ -244,6 +244,8 @@ struct StubDisplayPreferences {
     item: Mutex<Option<ItemDisplayPreferencesEntity>>,
     custom: Mutex<Option<std::collections::HashMap<String, Option<String>>>>,
     sections: Mutex<Option<Vec<(i32, i32)>>>,
+    /// The item id the last `get_display_preferences` asked for.
+    asked_item: Mutex<Option<Uuid>>,
 }
 
 fn canned_prefs() -> DisplayPreferencesEntity {
@@ -286,9 +288,10 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
     async fn get_display_preferences(
         &self,
         _user_id: Uuid,
-        _item_id: Uuid,
+        item_id: Uuid,
         _client: &str,
     ) -> Result<DisplayPreferencesEntity, ServiceError> {
+        *self.asked_item.lock().unwrap() = Some(item_id);
         Ok(canned_prefs())
     }
     async fn get_item_display_preferences(
@@ -1129,4 +1132,58 @@ async fn display_preferences_self_as_non_admin_is_allowed() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(prefs.row.lock().unwrap().is_some());
+}
+
+/// `displayPreferencesId` is a GUID when .NET's `Guid.TryParse` reads it, and
+/// is MD5-hashed otherwise. Measured on a live Jellyfin 12.2: the `(…)`, `{…}`,
+/// `{0x…}` and padded spellings address the GUID's row, and `urn:uuid:` is
+/// hashed (`Uuid::parse_str` would take it as the GUID).
+#[rstest::rstest]
+#[case::n_form(
+    "0123456789abcdef0123456789abcdef",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::d_form(
+    "01234567-89ab-cdef-0123-456789abcdef",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::p_form(
+    "(01234567-89ab-cdef-0123-456789abcdef)",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::b_form(
+    "%7B01234567-89ab-cdef-0123-456789abcdef%7D",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::x_form(
+    "%7B0x01234567,0x89ab,0xcdef,%7B0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef%7D%7D",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::padded(
+    "%200123456789abcdef0123456789abcdef%20",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::urn("urn:uuid:01234567-89ab-cdef-0123-456789abcdef", None)]
+#[case::name("usersettings", None)]
+#[tokio::test]
+async fn display_preferences_id_is_read_as_guid_try_parse_reads_it(
+    #[case] raw: &str,
+    #[case] guid: Option<&str>,
+) {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let (status, _) = get(
+        state_with_display_prefs(prefs.clone()),
+        &format!("/DisplayPreferences/{raw}?client=web"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let decoded = raw
+        .replace("%7B", "{")
+        .replace("%7D", "}")
+        .replace("%20", " ");
+    let expected = guid.map_or_else(
+        || ferrofin_common::extensions::get_md5(&decoded),
+        |g| Uuid::parse_str(g).unwrap(),
+    );
+    assert_eq!(*prefs.asked_item.lock().unwrap(), Some(expected));
 }

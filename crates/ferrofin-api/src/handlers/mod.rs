@@ -1489,18 +1489,55 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "get",
+        path: "/DisplayPreferences/{displayPreferencesId}",
+        upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
+        upstream_method: "GetDisplayPreferences",
+        ferrofin: "handlers/display_preferences.rs get_display_preferences (effective_user_id: \
+               RequestHelpers.GetUserId; resolve_item_id: Guid.TryParse else GetMD5; \
+               index_by_name, chromecast_name, home_section_name) → ferrofin-core \
+               display_preferences_manager.rs (get_display_preferences, \
+               get_item_display_preferences, list_custom_item_display_preferences, \
+               list_home_sections) → ferrofin-db database.rs home_sections; ferrofin-model \
+               dto/display_preferences_dto.rs",
+        date: "2026-10-25",
+        divergences: &[
+            "SortBy, SortOrder, RememberSorting and RememberIndexing come from one shared \
+         empty-GUID ItemDisplayPreferences row per user and client unless the item has its \
+         own row; upstream's GetItemDisplayPreferences reads, or creates, the row under the \
+         item. Fix path: gl-447.",
+            "A stored IndexBy or ChromecastVersion outside the named members is answered as \
+         null and \"stable\"; upstream's Enum.ToString() writes it as its number. Fix path: \
+         gl-880.",
+            "Among several HomeSection rows with one Order (an adopted Jellyfin database, \
+         whose saves never delete the old rows) the one answered is unspecified; upstream \
+         loads them in Id order, so the newest wins. Fix path: gl-882.",
+            "CustomPrefs members are written in hash order, not upstream's insertion order \
+         (the home sections, the scalar keys, then the stored preferences); the members and \
+         values are the same.",
+            "A whitespace-only client is a client name here (the row is read, or created, \
+         for it); upstream's [Required] string client binds it as null and answers 400. Fix \
+         path: gl-948.",
+            "The 400 for a missing or empty client or an unparsable userId and the 403 for \
+         another user's id without the administrator role are Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "post",
         path: "/DisplayPreferences/{displayPreferencesId}",
         upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
         upstream_method: "UpdateDisplayPreferences",
         ferrofin: "handlers/display_preferences.rs update_display_preferences (JsonBody \
-               DisplayPreferencesDto, take_pref/take_nullable_pref, enum_try_parse) → \
-               ferrofin-core display_preferences_manager.rs (get_display_preferences, \
+               DisplayPreferencesDto, resolve_item_id: Guid.TryParse else GetMD5, \
+               take_pref/take_nullable_pref, enum_try_parse) → ferrofin-core \
+               display_preferences_manager.rs (get_display_preferences, \
                get_item_display_preferences, set_custom_item_display_preferences, \
                update_item_display_preferences, update_display_preferences, \
                set_home_sections) → ferrofin-db database.rs replace_home_sections; \
                ferrofin-model dto/display_preferences_dto.rs",
-        date: "2026-10-24",
+        date: "2026-10-25",
         divergences: &[
             "SortBy, SortOrder, RememberSorting and RememberIndexing are written to one \
          shared empty-GUID ItemDisplayPreferences row per user and client unless the item \
@@ -1515,9 +1552,6 @@ pub const VERIFIED: &[Verified] = &[
          it is stored as Stable here; int.Parse and bool.Parse also ignore surrounding \
          white space in the skip lengths, the homesection order and \
          enableNextVideoInfoOverlay. Fix path: gl-880.",
-            "displayPreferencesId is parsed with Uuid::parse_str, not Guid.TryParse, so a \
-         urn:uuid: id is taken as a GUID where upstream MD5-hashes it, and a (…), {0x…} or \
-         padded id is MD5-hashed where upstream parses it. Fix path: gl-881.",
             "Values upstream fails on with a 500 take the defaults here: an \
          enableNextVideoInfoOverlay that is not true/false (bool.Parse) is true, a \
          non-numeric or overflowing skip length (int.Parse) is the fallback, a homesection \
@@ -1531,7 +1565,9 @@ pub const VERIFIED: &[Verified] = &[
          Jellyfin bug not ported.",
             "An invalid landing-* ViewType is logged at warn, as bad client input \
          (docs/conventions/LOGGING.md), where upstream logs it at error.",
-            "The 400 for a missing or blank client or an unparsable userId, the 403 for \
+            "A whitespace-only client is a client name here; upstream's [Required] string \
+         client binds it as null and answers 400. Fix path: gl-948.",
+            "The 400 for a missing or empty client or an unparsable userId, the 403 for \
          another user's id without the administrator role, and the error text of a body \
          that does not bind are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
