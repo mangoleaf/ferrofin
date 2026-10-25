@@ -792,6 +792,8 @@ pub async fn build_app_state(
             },
         )
         .with_image_encoding_pool(Arc::clone(&thumbnail_pool))
+        // Frame extraction tone-maps an HDR source with the filters it has.
+        .with_capabilities(Arc::new(ffmpeg.capabilities.clone()))
         // A local video probe reads its first frame for HDR10+ when ffprobe can.
         .with_first_video_frame_probe(ffmpeg.capabilities.prober_supports_first_video_frame())
         .with_localization(Arc::clone(&localization))
