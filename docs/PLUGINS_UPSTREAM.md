@@ -102,6 +102,10 @@ Conventions:
     page is served as the bundle, and a timeout or transport failure is an exception that
     fails the request. Ferrofin serves the file unchanged and logs the failure once at warn,
     then at debug until the callback works again.
+  - **The pipeline's output is capped at 16 MiB** (`MAX_TRANSFORMED_BYTES`). The plugin reads
+    a callback's whole answer and applies every search/replace. Ferrofin reads no more than
+    16 MiB of an answer, and skips a step that would grow the file past 16 MiB, because the
+    pipeline runs on every anonymous `/web` request. jellyfin-web's bundles are a few MiB.
 
 ### Merge Versions
 - Ferrofin files: `crates/ferrofin-extensions/src/merge_versions.rs` (the whole

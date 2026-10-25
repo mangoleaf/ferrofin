@@ -485,6 +485,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   component model, which wasmtime turns on with its default build; a plugin that uses one no
   longer loads, and none known does. The server also no longer builds wasmtime's profiling,
   compilation cache, core dump and pooling allocator support, or WASI preview 1 and 3
+- File Transformation: what the pipeline serves for one `/web` file is capped at 16 MiB, so an
+  anonymous page load can no longer make the server allocate without bound. A callback
+  endpoint's answer is read no further than that, and a step that would grow the file past it
+  (an admin search/replace whose replace text multiplies the file, or another plugin's
+  transform) is skipped with one warning, leaving the file as it was before that step
 
 ### Bug Fixes
 - A backup no longer reports success with something left out:

@@ -162,6 +162,18 @@ const MAX_PATTERN_LEN: usize = 1024;
 /// FLAGGED as a candidate setting — plausible range 256…8192, default 2048.
 const MAX_ENDPOINT_LEN: usize = 2048;
 
+/// The most the pipeline serves for one file, in bytes: a callback's answer
+/// is read no further, and a step whose output would pass it is skipped,
+/// leaving the contents as they were.
+///
+/// The pipeline runs on every anonymous `/web` GET of a matching file, so
+/// this bounds what one request can make the server allocate. jellyfin-web's
+/// bundles are a few MiB, far below it. Owner decision (gl-933, 2026-10-25):
+/// 16 MiB, one cap for the callback body and the pipeline's output, not a
+/// setting. An accepted hardening divergence: the plugin reads a callback's
+/// whole answer and applies every search/replace.
+const MAX_TRANSFORMED_BYTES: usize = 16 * 1024 * 1024;
+
 /// Whether a registration may be admitted, given the registry's current
 /// contents. Refusals are logged and dropped (the upstream controller always
 /// answers `Ok()`, so refusing must not change the HTTP status).
@@ -356,32 +368,51 @@ impl WebFileTransformationService {
             Ok(resp) if !resp.status().is_success() => {
                 Err(format!("answered {}", resp.status().as_u16()))
             }
-            Ok(resp) => resp
-                .text()
-                .await
-                .map_err(|e| format!("body read failed: {e}")),
+            Ok(resp) => read_capped(resp).await,
             Err(e) => Err(e.to_string()),
         }
     }
 
-    /// Clears registration `(id, pattern)`'s failure ([`Self::endpoint_failed`]).
-    fn endpoint_worked(&self, id: Uuid, pattern: &str) {
+    /// Clears step `(id, pattern)`'s failure ([`Self::first_failure`]).
+    fn step_worked(&self, id: Uuid, pattern: &str) {
         let mut failing = self.failing.lock().unwrap_or_else(PoisonError::into_inner);
         if !failing.is_empty() {
             failing.remove(&(id, pattern.to_owned()));
         }
     }
 
-    /// Logs registration `(id, pattern)`'s callback failure once (LOGGING.md
-    /// §1): a `warn` the first time, `debug` while it repeats, and a `warn`
-    /// again once it has worked in between.
-    fn endpoint_failed(&self, id: Uuid, pattern: &str, endpoint: &str, error: &str) {
-        let first = self
-            .failing
+    /// Records a failure of step `(id, pattern)` (a registration, or an
+    /// admin-defined search/replace), answering whether it is the first since
+    /// the step last worked: that one is a `warn`, a repeat a `debug`
+    /// (LOGGING.md §1).
+    fn first_failure(&self, id: Uuid, pattern: &str) -> bool {
+        self.failing
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert((id, pattern.to_owned()));
-        if first {
+            .insert((id, pattern.to_owned()))
+    }
+
+    /// Logs once ([`Self::first_failure`]) that step `(id, pattern)` was
+    /// skipped because it would grow the file to `len` bytes, past
+    /// [`MAX_TRANSFORMED_BYTES`].
+    fn step_over_cap(&self, id: Uuid, pattern: &str, len: usize) {
+        if self.first_failure(id, pattern) {
+            tracing::warn!(
+                %id,
+                pattern,
+                len,
+                max = MAX_TRANSFORMED_BYTES,
+                "transformation would grow the file past the size cap; serving it without this step"
+            );
+        } else {
+            tracing::debug!(%id, pattern, len, "transformation skipped: past the size cap");
+        }
+    }
+
+    /// Logs registration `(id, pattern)`'s callback failure once
+    /// ([`Self::first_failure`]).
+    fn endpoint_failed(&self, id: Uuid, pattern: &str, endpoint: &str, error: &str) {
+        if self.first_failure(id, pattern) {
             tracing::warn!(
                 %id,
                 pattern,
@@ -446,10 +477,25 @@ impl FileTransformationService for WebFileTransformationService {
         let mut contents = contents;
         for (id, pattern, step) in steps {
             contents = match step {
-                TransformStep::Builtin(t) => t.transform(&path, contents).await,
+                TransformStep::Builtin(t) => {
+                    // ponytail: a copy of the file per in-process step, to
+                    // fall back to; a transformer that reported its growth
+                    // up front (as `LiteralTransform` computes it) would not
+                    // need it.
+                    let transformed = t.transform(&path, contents.clone()).await;
+                    if transformed.len() > MAX_TRANSFORMED_BYTES
+                        && transformed.len() > contents.len()
+                    {
+                        self.step_over_cap(id, &pattern, transformed.len());
+                        contents
+                    } else {
+                        self.step_worked(id, &pattern);
+                        transformed
+                    }
+                }
                 TransformStep::Endpoint(url) => match self.call_endpoint(&url, &contents).await {
                     Ok(transformed) => {
-                        self.endpoint_worked(id, &pattern);
+                        self.step_worked(id, &pattern);
                         transformed
                     }
                     Err(error) => {
@@ -461,13 +507,30 @@ impl FileTransformationService for WebFileTransformationService {
         }
 
         // Admin-defined search/replace (skipped when either side is blank,
-        // matching `HandlePluginConfigTransformation`).
+        // matching `HandlePluginConfigTransformation`). A common search with
+        // a long replace multiplies the file, so one that would grow it past
+        // the cap is skipped.
         for t in self.configured_transformations().await {
             if Self::configured_matches(&t.filename_pattern, &path)
                 && !t.search_text.trim().is_empty()
                 && !t.replace_text.trim().is_empty()
             {
-                contents = contents.replace(&t.search_text, &t.replace_text);
+                let growth = t.replace_text.len().saturating_sub(t.search_text.len());
+                let grown = if growth == 0 {
+                    0
+                } else {
+                    contents
+                        .matches(t.search_text.as_str())
+                        .count()
+                        .saturating_mul(growth)
+                        .saturating_add(contents.len())
+                };
+                if grown > MAX_TRANSFORMED_BYTES {
+                    self.step_over_cap(t.id, &t.filename_pattern, grown);
+                } else {
+                    self.step_worked(t.id, &t.filename_pattern);
+                    contents = contents.replace(&t.search_text, &t.replace_text);
+                }
             }
         }
 
@@ -530,6 +593,38 @@ impl FileTransformationService for WebFileTransformationService {
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(failed, _)| *failed != id);
     }
+}
+
+/// Reads a callback's answer, giving up before buffering more than
+/// [`MAX_TRANSFORMED_BYTES`]: at once for a `Content-Length` over it, else as
+/// the body streams in. Decoded as UTF-8, lossily, as `text()` decodes in
+/// this build (reqwest's `charset` feature is off); each invalid byte becomes
+/// a 3-byte U+FFFD, so the decoded text is held to the cap as well.
+async fn read_capped(mut resp: reqwest::Response) -> Result<String, String> {
+    let over_cap = || format!("answered more than the {MAX_TRANSFORMED_BYTES}-byte cap");
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_TRANSFORMED_BYTES as u64)
+    {
+        return Err(over_cap());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("body read failed: {e}"))?
+    {
+        if body.len() + chunk.len() > MAX_TRANSFORMED_BYTES {
+            return Err(over_cap());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8(body)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    if text.len() > MAX_TRANSFORMED_BYTES {
+        return Err(over_cap());
+    }
+    Ok(text)
 }
 
 /// A pipeline step snapshotted out of the registration lock (so the async
@@ -953,7 +1048,9 @@ mod tests {
     /// A callback endpoint answering its n-th request with the raw response
     /// `answers[n]` (the last one from then on), recording each request's
     /// head and body.
-    fn spawn_responder(answers: Vec<String>) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    fn spawn_responder<A: AsRef<[u8]> + Send + 'static>(
+        answers: Vec<A>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read as _, Write as _};
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&seen);
@@ -968,7 +1065,7 @@ mod tests {
                     .expect("lock")
                     .push(String::from_utf8_lossy(&buf[..read]).into_owned());
                 let response = &answers[n.min(answers.len() - 1)];
-                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.write_all(response.as_ref());
             }
         });
         (format!("http://{addr}"), seen)
@@ -1066,6 +1163,83 @@ mod tests {
             (2, 2),
             "a failure after a success warns again"
         );
+    }
+
+    /// Past the output cap, a callback's answer is not read on: with a
+    /// `Content-Length` over it, or streaming past it without one, the file
+    /// is served as it was.
+    #[tokio::test]
+    async fn an_endpoint_answer_over_the_cap_leaves_the_contents_unchanged() {
+        let body = "x".repeat(MAX_TRANSFORMED_BYTES + 1);
+        for head in [format!("Content-Length: {}\r\n", body.len()), String::new()] {
+            let (base, seen) = spawn_responder(vec![format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{head}Connection: close\r\n\r\n{body}"
+            )]);
+            let svc = service_with("{}", true);
+            svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", &format!("{base}/cb"))
+                .await;
+
+            let out = svc
+                .run_transformation("main.js", "original".to_owned())
+                .await;
+
+            assert_eq!(out, "original", "{head:?}");
+            assert_eq!(seen.lock().expect("lock").len(), 1);
+        }
+    }
+
+    /// An answer under the cap in bytes that decodes past it: every invalid
+    /// UTF-8 byte becomes a 3-byte U+FFFD.
+    #[tokio::test]
+    async fn an_endpoint_answer_that_decodes_past_the_cap_leaves_the_contents_unchanged() {
+        let body = vec![0xFF_u8; MAX_TRANSFORMED_BYTES / 2];
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let (base, _) = spawn_responder(vec![response]);
+        let svc = service_with("{}", true);
+        svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", &format!("{base}/cb"))
+            .await;
+
+        let out = svc
+            .run_transformation("main.js", "original".to_owned())
+            .await;
+
+        assert_eq!(out, "original");
+    }
+
+    /// A transformer that answers more than the output cap.
+    struct Huge;
+    #[async_trait]
+    impl FileTransformer for Huge {
+        async fn transform(&self, _path: &str, _contents: String) -> String {
+            "x".repeat(MAX_TRANSFORMED_BYTES + 1)
+        }
+    }
+
+    /// A step whose output would pass the cap is skipped and the rest still
+    /// run: an in-process transformer's answer, and an admin search/replace
+    /// whose replace text multiplies the file.
+    #[tokio::test]
+    async fn a_step_over_the_output_cap_is_skipped() {
+        let cfg = format!(
+            r#"{{"Transformations":[{{"Id":"00000000-0000-0000-0000-000000000001","FilenamePattern":"main.js","SearchText":"A","ReplaceText":"{}"}},{{"Id":"00000000-0000-0000-0000-000000000002","FilenamePattern":"main.js","SearchText":"B","ReplaceText":"c"}}]}}"#,
+            "y".repeat(1024)
+        );
+        let svc = service_with(&cfg, true);
+        svc.add_transformation(Uuid::from_u128(3), "main.js", Arc::new(Huge))
+            .await;
+        svc.add_transformation(Uuid::from_u128(4), "main.js", Arc::new(Upper))
+            .await;
+        // After `Upper`, 20 000 matches of a 1 KiB replace: about 20 MiB.
+        let input = format!("{}b", "a".repeat(20_000));
+
+        let out = svc.run_transformation("main.js", input).await;
+
+        assert_eq!(out, format!("{}c", "A".repeat(20_000)));
     }
 
     /// A callback endpoint that accepts each connection and reads the request,
