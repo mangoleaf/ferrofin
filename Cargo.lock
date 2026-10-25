@@ -346,28 +346,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "axum-extra"
-version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be44683b41ccb9ab2d23a5230015c9c3c55be97a25e4428366de8873103f7970"
-dependencies = [
- "axum",
- "axum-core",
- "bytes",
- "futures-core",
- "futures-util",
- "headers",
- "http",
- "http-body",
- "http-body-util",
- "mime",
- "pin-project-lite",
- "tower-layer",
- "tower-service",
- "tracing",
-]
-
-[[package]]
 name = "axum-macros"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -797,17 +775,6 @@ dependencies = [
  "toml",
  "winnow",
  "yaml-rust2",
-]
-
-[[package]]
-name = "console"
-version = "0.16.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fe5f465a4f6fee88fad41b85d990f84c835335e85b5d9e6e63e0d06d28cba7c"
-dependencies = [
- "encode_unicode",
- "libc",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1296,12 +1263,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
 
 [[package]]
-name = "encode_unicode"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
-
-[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1390,7 +1351,6 @@ version = "0.4.1"
 dependencies = [
  "async-trait",
  "axum",
- "axum-extra",
  "brotli 9.0.0",
  "chrono",
  "ferrofin-api",
@@ -1444,7 +1404,6 @@ dependencies = [
  "pbkdf2",
  "regex",
  "rstest",
- "serde",
  "sha1 0.11.0",
  "sha2 0.11.0",
  "thiserror",
@@ -1502,7 +1461,6 @@ dependencies = [
  "ferrofin-util",
  "libsqlite3-sys",
  "rstest",
- "serde",
  "sqlx",
  "tempfile",
  "thiserror",
@@ -1676,7 +1634,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tower",
- "tracing",
 ]
 
 [[package]]
@@ -1686,7 +1643,6 @@ dependencies = [
  "bitflags",
  "chrono",
  "ferrofin-util",
- "insta",
  "rstest",
  "secrecy",
  "serde",
@@ -1707,7 +1663,6 @@ dependencies = [
  "icu_collator",
  "regex",
  "rstest",
- "serde",
 ]
 
 [[package]]
@@ -1715,7 +1670,6 @@ name = "ferrofin-networking"
 version = "0.4.1"
 dependencies = [
  "fancy-regex",
- "ferrofin-common",
  "ferrofin-model",
  "ferrofin-util",
  "if-addrs",
@@ -1785,7 +1739,6 @@ dependencies = [
  "ferrofin-mediaencoding",
  "ferrofin-metrics",
  "ferrofin-model",
- "ferrofin-naming",
  "ferrofin-networking",
  "ferrofin-providers",
  "ferrofin-traits",
@@ -2222,30 +2175,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
 dependencies = [
  "hashbrown 0.16.1",
-]
-
-[[package]]
-name = "headers"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3314d5adb5d94bcdf56771f2e50dbbc80bb4bdf88967526706205ac9eff24eb"
-dependencies = [
- "base64 0.22.1",
- "bytes",
- "headers-core",
- "http",
- "httpdate",
- "mime",
- "sha1 0.10.7",
-]
-
-[[package]]
-name = "headers-core"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54b4a22553d4242c49fddb9ba998a99962b5cc6f22cb5a3482bec22522403ce4"
-dependencies = [
- "http",
 ]
 
 [[package]]
@@ -2695,19 +2624,6 @@ checksum = "3b5cf4372d022092674a83b8febf5865f7a573cc0c5baec5e49c879b6a20978f"
 dependencies = [
  "block-padding",
  "hybrid-array",
-]
-
-[[package]]
-name = "insta"
-version = "1.48.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86f0f8fee8c926415c58d6ae43a08523a26faccb2323f5e6b644fe7dd4ef6b82"
-dependencies = [
- "console",
- "once_cell",
- "serde",
- "similar",
- "tempfile",
 ]
 
 [[package]]
@@ -4488,12 +4404,6 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "similar"
-version = "2.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "slab"

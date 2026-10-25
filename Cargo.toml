@@ -79,7 +79,6 @@ ferrofin-api = { path = "crates/ferrofin-api" }
 
 # ── http / async ───────────────────────────────────────────────────
 axum = "0.8"
-axum-extra = { version = "0.12.6", features = ["typed-header"] }
 tower = "0.5"
 tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 # Decoders for the response-compression tests only (the server never decodes a
@@ -191,7 +190,6 @@ shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencodi
 async-trait = "0.1.92"
 libc = "0.2"
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
-argon2 = "0.6.0"
 pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
 sha2 = "0.11.0"            # PBKDF2-HMAC-SHA512 (default hash id)
 sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
@@ -230,7 +228,6 @@ lofty = "0.25.4"
 
 # ── dev / test ─────────────────────────────────────────────────────
 rstest = "0.27.0"         # [Theory]/[InlineData] → #[case] transliteration
-insta = { version = "1", features = ["json"] }   # golden-file parity snapshots
 tempfile = "3"          # temp SQLite files for ferrofin-db tests
 
 # ── build profiles ─────────────────────────────────────────────────

@@ -17,7 +17,6 @@ libsqlite3-sys.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 chrono.workspace = true
-serde.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
 
