@@ -71,6 +71,37 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Find the playlists folder by its type when a playlist is created, as Jellyfin's
+  `GetPlaylistsFolder` does, instead of by its path or derived id, and write nothing during
+  the lookup. Startup now makes a playlists folder kept at the folder's directory under an id
+  of its own a `PlaylistsFolder` under the root, and puts playlists an older Ferrofin saved
+  without a parent into the playlists folder
+- Let a user named twice in a playlist's `Users` (create, update, or a playlist's stored
+  `Shares` read back at startup) edit it when either entry can, as Jellyfin does, instead of
+  keeping only the last entry's permission
+- Parse `POST /DisplayPreferences/{id}` values as Jellyfin's .NET parsers do: `IndexBy` and
+  `chromecastVersion` also take an integer (an unnamed one is kept and written back as its
+  number by `GET`), a comma list and padding, and a `chromecastVersion` that does not parse
+  is a `400` instead of being stored as stable; the skip lengths, the overlay flag and the
+  `homesection` order ignore the white space and trailing NULs .NET ignores
+- Accept a playlist `Users` entry without `CanEdit` or `UserId` on `POST /Playlists` and
+  `POST /Playlists/{id}`, as Jellyfin does: a missing `CanEdit` shares read-only, a missing
+  or null `UserId` is the empty GUID; a `null` `CanEdit` is still a `400`
+- Pin the order a display-preferences row's home sections are read in to `Order`, then `Id`:
+  on a database adopted from Jellyfin, which keeps every save's rows, `GET /DisplayPreferences`
+  answers the newest section of each order, as Jellyfin does. SQLite already returned them in
+  that order, but nothing guaranteed it
+- Read a display-preferences id as Jellyfin's `Guid.TryParse` reads it: a `(…)`, `{0x…}` or
+  space-padded GUID addresses that GUID's preferences, and an `urn:uuid:` id is hashed like
+  any other name
+- Bind a `POST /Users` body as Jellyfin does: a body without `Name`, or with a null one, is
+  a `400` (the name is invalid) instead of keeping the name, and the user's `Policy` in the
+  body is validated, so one without both provider ids is a `400` unless it is sent as
+  `null`. A body without `Configuration` still resets the user's settings to the defaults,
+  as on Jellyfin
+- Refuse a `POST /Users/{userId}/Policy` body that leaves out `AuthenticationProviderId` or
+  `PasswordResetProviderId`, or sends either blank, with Jellyfin's `400` naming each missing
+  member, instead of saving the user's providers as empty strings
 - `GET /Items` honours `seriesStatus` (jellyfin-web's TV Status filter), `minOfficialRating`,
   `maxOfficialRating`, `personTypes`, `isPlaceHolder` and `hasOfficialRating`, and
   `hasParentalRating=false` returns only the unrated items, as Jellyfin 12.2's `TranslateQuery`

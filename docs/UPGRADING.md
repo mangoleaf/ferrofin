@@ -8,6 +8,20 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — user and policy saves need a complete body
+
+Usually nothing to do: the web client posts back the user it read. A script that calls
+`POST /Users` or `POST /Users/{userId}/Policy` must now send the policy's
+`AuthenticationProviderId` and `PasswordResetProviderId` (or, for `POST /Users`, the whole
+`Policy` or `"Policy": null`) and, for `POST /Users`, the user's `Name`; each is a `400`
+otherwise, as in Jellyfin.
+
+An earlier Ferrofin saved a partial policy body with empty provider ids. A user saved that
+way cannot have their profile or policy saved from the dashboard until both are set again:
+a sign-in restores `AuthenticationProviderId`; set `PasswordResetProviderId` (normally
+`Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider`) with a
+`POST /Users/{userId}/Policy` that carries the user's full policy.
+
 ## Unreleased — library tiles are drawn as Jellyfin 12.2 draws them
 
 Nothing to do. Some "My Media" tiles change on their next refresh:

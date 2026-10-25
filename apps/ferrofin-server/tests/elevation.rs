@@ -392,6 +392,10 @@ async fn the_administrator_still_reaches_the_elevated_surface() {
     assert_eq!(status, StatusCode::OK);
     let created: serde_json::Value = serde_json::from_slice(&body).expect("user json");
     let id = created["Id"].as_str().expect("id");
+    // The served policy, as jellyfin-web posts it back: its provider ids are
+    // `[Required]`, so a partial policy is a 400.
+    let mut policy = created["Policy"].clone();
+    policy["IsAdministrator"] = serde_json::json!(true);
 
     let (status, _) = call_as(
         &router,
@@ -399,7 +403,7 @@ async fn the_administrator_still_reaches_the_elevated_surface() {
         &format!("/Users/{id}/Policy"),
         Some(&admin_token),
         "elev-admin",
-        Some(serde_json::json!({ "IsAdministrator": true })),
+        Some(policy),
     )
     .await;
     assert_eq!(

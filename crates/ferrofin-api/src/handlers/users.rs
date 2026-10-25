@@ -773,6 +773,7 @@ async fn create_user_by_name(
     params(("userId" = Option<String>, Query, description = "The user id (defaults to caller)")),
     responses(
         (status = 204, description = "User updated"),
+        (status = 400, description = "Invalid name, or an incomplete policy"),
         (status = 403, description = "Update not allowed"),
         (status = 404, description = "User not found")
     ),
@@ -783,25 +784,40 @@ async fn update_user(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<UserIdQuery>,
     JsonBody(body): JsonBody<UserDto>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
+    // Model validation walks into the nested `Policy` before the action runs.
+    // A body without one gets `UserDto`'s constructor policy, whose provider
+    // ids are null, so only a complete policy or `"Policy": null` passes.
+    if let Some(problem) = body
+        .policy
+        .as_ref()
+        .and_then(|policy| policy_validation(policy, "Policy."))
+    {
+        return Ok(problem.into_response());
+    }
     let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
     let user = load_user(&state, user_id).await?;
     assert_can_update_user(&state, &auth, &user).await?;
 
-    if let Some(new_name) = &body.name
-        && new_name != &user.username
-    {
+    // C# renames whenever `updateUser.Name` differs from the stored name, so a
+    // missing or null name reaches `RenameUser` too, and its
+    // `ThrowIfInvalidUsername` refuses it (400) as it refuses a blank one.
+    let new_name = body.name.as_deref().unwrap_or_default();
+    if new_name != user.username {
         state
             .users
             .rename_user(user_id, &user.username, new_name)
             .await?;
         refresh_device_access(&state, user_id).await;
     }
+    // A body without `Configuration` binds `UserDto`'s constructor default, so
+    // the save resets the user's settings as upstream's does; `null` (a 500
+    // upstream, `UpdateConfigurationAsync` dereferences it) saves nothing.
     if let Some(config) = &body.configuration {
         state.users.update_configuration(user_id, config).await?;
     }
     notify_user_updated(&state, user_id).await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Port of `DeviceAccessHost.OnUserUpdated`, registered since Jellyfin 12.1:
@@ -872,6 +888,7 @@ async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(),
     params(("userId" = String, Path, description = "The user id")),
     responses(
         (status = 204, description = "Policy updated"),
+        (status = 400, description = "A required provider id is missing or blank"),
         (status = 403, description = "Policy update forbidden"),
         (status = 404, description = "User not found")
     ),
@@ -882,7 +899,12 @@ async fn update_user_policy(
     RequireAdmin(_auth): RequireAdmin,
     Path(user_id): Path<Uuid>,
     JsonBody(new_policy): JsonBody<UserPolicy>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
+    // Model validation runs after the authorization policy and before the
+    // action, so it answers ahead of the unknown user's 404.
+    if let Some(problem) = policy_validation(&new_policy, "") {
+        return Ok(problem.into_response());
+    }
     load_user(&state, user_id).await?;
     // The guards run inside the save's transaction (`update_policy_guarded`),
     // so the tokens of a user it disabled go once it committed. Upstream
@@ -899,7 +921,35 @@ async fn update_user_policy(
     // `OnUserUpdated` for the device check.
     notify_user_updated(&state, user_id).await;
     refresh_device_access(&state, user_id).await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `UserPolicy`'s two `[Required(AllowEmptyStrings = false)]` members, checked
+/// as ASP.NET's model validation checks them before the action runs: a member
+/// the body leaves out or sends `null` (both bound as `""`) or blank
+/// (`IsNullOrWhiteSpace`) is a `400` keyed `{prefix}{member}`. `prefix` is
+/// `"Policy."` for the policy nested in a `UserDto` body.
+fn policy_validation(policy: &UserPolicy, prefix: &str) -> Option<ProblemDetails> {
+    ProblemDetails::members_validation(
+        [
+            (
+                "AuthenticationProviderId",
+                &policy.authentication_provider_id,
+            ),
+            (
+                "PasswordResetProviderId",
+                &policy.password_reset_provider_id,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, value)| value.trim().is_empty())
+        .map(|(member, _)| {
+            (
+                format!("{prefix}{member}"),
+                format!("The {member} field is required."),
+            )
+        }),
+    )
 }
 
 /// `POST /Users/Configuration` — update a user's configuration.
@@ -1139,7 +1189,7 @@ async fn update_user_for_user(
     auth: RequireAuth,
     Path(user_id): Path<Uuid>,
     body: JsonBody<UserDto>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),
     };

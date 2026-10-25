@@ -1183,7 +1183,7 @@ async fn a_policy_save_or_a_rename_signs_out_disallowed_devices() {
             "POST",
             &format!("/Users?userId={id}"),
             Some(&admin),
-            Some(json!({"Name":"renamed"}))
+            Some(json!({"Name":"renamed","Policy":null}))
         )
         .await
         .0,
