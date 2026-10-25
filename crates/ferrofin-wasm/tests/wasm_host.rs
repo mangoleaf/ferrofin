@@ -323,9 +323,9 @@ fn colliding_provider_names_are_refused_at_load() {
         "e-empty",
         &named_provider_fixture("55555555-5555-5555-5555-555555555555", ""),
     );
-    // Skipped: a name on a new-library allowlist that Ferrofin registers no
-    // provider for (upstream's "Screen Grabber" image fetcher) — it would
-    // start ticked in a new library, unlike every other plugin.
+    // Skipped: the built-in frame grab's name ("Screen Grabber"), any casing.
+    // It is also on the new-library allowlist, so it would start ticked in a
+    // new library, unlike every other plugin.
     write_fixture(
         dir.path(),
         "f-screen-grabber",

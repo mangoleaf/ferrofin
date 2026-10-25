@@ -963,6 +963,45 @@ fn stored_media_source(data: &serde_json::Map<String, serde_json::Value>) -> Med
     }
 }
 
+/// `VideoImageProvider`'s offset when the runtime is unknown: 10 s, in ticks.
+const SCREEN_GRAB_DEFAULT_OFFSET_TICKS: i64 = 10 * 10_000_000;
+
+/// `GetVideoImage`'s stream: the one at `DefaultVideoStreamIndex` (any type,
+/// as its first `GetMediaStreams` query asks), else the first video stream.
+fn pick_screen_grab_stream(
+    streams: &[MediaStreamInfoEntity],
+    default_index: i64,
+) -> Option<&MediaStreamInfoEntity> {
+    let video = crate::db_error::media_stream_type_to_disc(
+        ferrofin_model::entities::MediaStreamType::Video,
+    );
+    streams
+        .iter()
+        .find(|s| s.stream_index == default_index)
+        .or_else(|| streams.iter().find(|s| s.stream_type == video))
+}
+
+/// `GetVideoImage`'s offset, in ticks: 10 % into a known runtime, else 10 s.
+fn screen_grab_offset(run_time_ticks: Option<i64>) -> i64 {
+    run_time_ticks
+        .filter(|ticks| *ticks > 0)
+        .map_or(SCREEN_GRAB_DEFAULT_OFFSET_TICKS, |ticks| ticks / 10)
+}
+
+/// Whether `VideoImageProvider.Supports` takes the kind (`item is Video`).
+fn grabs_screens(type_name: &str) -> bool {
+    matches!(
+        crate::item_type_lookup::kind_from_type_name(type_name),
+        Some(
+            BaseItemKind::Movie
+                | BaseItemKind::Episode
+                | BaseItemKind::MusicVideo
+                | BaseItemKind::Trailer
+                | BaseItemKind::Video
+        )
+    )
+}
+
 /// `EmbeddedImageProvider.Supports` + `GetImage`: no shortcuts, remote
 /// sources, placeholders or DVD structures.
 fn embedded_image_eligible(path: &str, data: &serde_json::Map<String, serde_json::Value>) -> bool {
@@ -1052,6 +1091,29 @@ fn pick_embedded_picture(
         index: *index,
         format,
     })
+}
+
+/// Stores an extracted image (a temporary file) in `dir` as `stem` +
+/// `extension` (`".jpg"`), first removing the type's file under any other
+/// extension so the item keeps one. The temporary file is removed either way.
+fn store_extracted_art(
+    dir: &Path,
+    stem: &str,
+    extension: &str,
+    extracted: &str,
+) -> std::io::Result<PathBuf> {
+    let dest = dir.join(format!("{stem}{extension}"));
+    let stored = std::fs::create_dir_all(dir).and_then(|()| {
+        for old in ART_FILE_EXTENSIONS {
+            let old = dir.join(format!("{stem}.{old}"));
+            if old != dest {
+                let _ = std::fs::remove_file(&old);
+            }
+        }
+        std::fs::copy(extracted, &dest).map(|_| ())
+    });
+    let _ = std::fs::remove_file(extracted);
+    stored.map(|()| dest)
 }
 
 fn existing_art_file(dir: &Path, stem: &str) -> Option<PathBuf> {
@@ -12096,22 +12158,13 @@ impl LibraryScanner {
                 return None;
             }
         };
-        let dest = dir.join(format!("{stem}{}", picture.format.extension()));
-        let stored = std::fs::create_dir_all(&dir).and_then(|()| {
-            // A replaced extraction may have another extension; keep one file.
-            for old in ART_FILE_EXTENSIONS {
-                let old = dir.join(format!("{stem}.{old}"));
-                if old != dest {
-                    let _ = std::fs::remove_file(&old);
-                }
+        let dest = match store_extracted_art(&dir, stem, picture.format.extension(), &extracted) {
+            Ok(dest) => dest,
+            Err(err) => {
+                tracing::warn!(%err, %item_id, "failed to store embedded image");
+                return None;
             }
-            std::fs::copy(&extracted, &dest).map(|_| ())
-        });
-        let _ = std::fs::remove_file(&extracted);
-        if let Err(err) = stored {
-            tracing::warn!(%err, item = %item_id, "failed to store embedded image");
-            return None;
-        }
+        };
         Some(ItemImageInfo {
             path: dest.to_string_lossy().into_owned(),
             image_type,
@@ -12390,10 +12443,12 @@ impl LibraryScanner {
         )
     }
 
-    /// Run remote, embedded and plugin artwork in one configured order. A
-    /// provider only fills slots earlier providers/local discovery left empty.
-    // These are the existing per-item artwork pass inputs, shared with each step.
-    #[allow(clippy::too_many_arguments)]
+    /// Run remote, embedded, frame-grab and plugin artwork in one configured
+    /// order. A provider only fills slots earlier providers/local discovery
+    /// left empty.
+    // These are the existing per-item artwork pass inputs, shared with each
+    // step; the one match over every provider kind keeps their order visible.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn run_ordered_artwork(
         &self,
         item_id: Uuid,
@@ -12409,6 +12464,7 @@ impl LibraryScanner {
             Plugin,
             Remote,
             Embedded,
+            ScreenGrab,
             BookCover,
         }
         let short = entity.type_.rsplit('.').next().unwrap_or(&entity.type_);
@@ -12445,6 +12501,19 @@ impl LibraryScanner {
         }
         if dynamic_images && policy.image_enabled(short, extractor) {
             sources.push((extractor, Step::Embedded));
+        }
+        // `VideoImageProvider` ("Screen Grabber", `Order => 100`) is dynamic
+        // like the embedded extractor, so a lock refuses it outside an image
+        // full refresh. Unlike the embedded extractor it has no change
+        // monitor, so `GetNonLocalImageProviders` runs it only when the
+        // refresh runs the remote providers (an image full refresh, or an
+        // item never refreshed).
+        if dynamic_images
+            && fetch != ImageFetch::None
+            && grabs_screens(&entity.type_)
+            && policy.image_enabled(short, fetcher_names::SCREEN_GRABBER)
+        {
+            sources.push((fetcher_names::SCREEN_GRABBER, Step::ScreenGrab));
         }
         // A book's two cover extractors (`ComicImageProvider`,
         // `EpubImageProvider`): dynamic providers like the embedded extractor,
@@ -12500,10 +12569,162 @@ impl LibraryScanner {
                     );
                 }
                 Step::Embedded => {}
+                Step::ScreenGrab => {
+                    if let Some(image) = self
+                        .grab_screen(item_id, entity, streams, policy, short, images)
+                        .await
+                    {
+                        images.push(image);
+                    }
+                }
                 Step::BookCover => {
                     self.add_book_cover(entity, name, policy, images).await;
                 }
             }
+        }
+    }
+
+    /// `VideoImageProvider` ("Screen Grabber") for a video that still has no
+    /// Primary: a frame of its default video stream, 10 % into its runtime
+    /// (10 s in when the runtime is unknown), stored beside the item's other
+    /// artwork. Best-effort like every extractor: no encoder, an ineligible
+    /// item, no video stream or a failed extraction yield nothing.
+    async fn grab_screen(
+        &self,
+        item_id: Uuid,
+        entity: &BaseItemEntity,
+        streams: &[MediaStreamInfoEntity],
+        policy: FetcherPolicy<'_>,
+        kind: &str,
+        images: &[ItemImageInfo],
+    ) -> Option<ItemImageInfo> {
+        if images.iter().any(|i| i.image_type == ImageType::Primary)
+            || ferrofin_providers::image_policy::ImageAcquisitionPolicy::new(policy.options, kind)
+                .limit(ImageType::Primary)
+                == 0
+        {
+            return None;
+        }
+        let (encoder, meta_root, path) = (
+            self.media_encoder.as_ref()?,
+            self.metadata_dir.as_ref()?,
+            entity.path.as_deref()?,
+        );
+        let data = crate::item_data::parse_data(entity.data.as_deref());
+        // `Supports` (not a shortcut, a file, not a placeholder, complete
+        // media) and `GetImage` (not a DVD).
+        if !embedded_image_eligible(path, &data) || self.is_active_recording(entity).await {
+            return None;
+        }
+        // `GetImage`: without a `DefaultVideoStreamIndex` there is no frame
+        // to grab; then the stream at that index, else the first video stream.
+        let Some(default_index) = data
+            .get("DefaultVideoStreamIndex")
+            .and_then(serde_json::Value::as_i64)
+        else {
+            tracing::debug!(%item_id, path, "no default video stream, no frame grabbed");
+            return None;
+        };
+        let stream = match self
+            .screen_grab_stream(item_id, streams, default_index)
+            .await
+        {
+            Ok(Some(stream)) => stream,
+            Ok(None) => {
+                tracing::debug!(%item_id, path, "no video stream, no frame grabbed");
+                return None;
+            }
+            Err(err) => {
+                // A throw inside `GetImage` is a provider failure too.
+                ferrofin_providers::rate_limit::note_request_failure();
+                tracing::debug!(%err, %item_id, "cannot read the streams to grab a frame from");
+                return None;
+            }
+        };
+        let offset = screen_grab_offset(entity.run_time_ticks);
+        let container = crate::item_data::read_data_string(&data, "Container").unwrap_or_default();
+        let threed = data.get("Video3DFormat").and_then(|value| {
+            serde_json::from_value::<ferrofin_model::entities::Video3DFormat>(value.clone()).ok()
+        });
+        let frame = match encoder
+            .extract_video_image(
+                path,
+                &container,
+                &stored_media_source(&data),
+                &stream,
+                threed,
+                Some(offset),
+            )
+            .await
+        {
+            Ok(frame) => frame,
+            Err(err) => {
+                // A failed dynamic provider counts against the refresh
+                // (`RefreshFromProvider`'s `result.Failures++`), so the item
+                // is not stamped and the next scan grabs again.
+                ferrofin_providers::rate_limit::note_request_failure();
+                tracing::debug!(%err, %item_id, "failed to grab a frame for the primary image");
+                return None;
+            }
+        };
+        let dest = match store_extracted_art(
+            &meta_root.join(&entity.id),
+            image_type_file_stem(ImageType::Primary),
+            ".jpg",
+            &frame,
+        ) {
+            Ok(dest) => dest,
+            Err(err) => {
+                ferrofin_providers::rate_limit::note_request_failure();
+                tracing::debug!(%err, %item_id, "failed to store a grabbed frame");
+                return None;
+            }
+        };
+        Some(ItemImageInfo {
+            path: dest.to_string_lossy().into_owned(),
+            image_type: ImageType::Primary,
+            date_modified: file_date_modified(&dest),
+            width: 0,
+            height: 0,
+            blur_hash: None,
+        })
+    }
+
+    /// `GetVideoImage`'s stream: the one at `DefaultVideoStreamIndex`, else
+    /// the first video stream, among the streams `GetMediaStreams` reads:
+    /// this pass's probe rows when it probed, else the stored ones.
+    async fn screen_grab_stream(
+        &self,
+        item_id: Uuid,
+        probed: &[MediaStreamInfoEntity],
+        default_index: i64,
+    ) -> Result<Option<ferrofin_model::entities_media::MediaStream>, ServiceError> {
+        let stored;
+        let streams = match &self.media_streams {
+            Some(repo) if probed.is_empty() => {
+                stored = repo
+                    .get_media_streams(&ferrofin_traits::persistence::MediaStreamQuery {
+                        item_id,
+                        stream_type: None,
+                        index: None,
+                    })
+                    .await?;
+                stored.as_slice()
+            }
+            _ => probed,
+        };
+        Ok(pick_screen_grab_stream(streams, default_index)
+            .cloned()
+            .map(crate::media_source_manager::stream_to_dto))
+    }
+
+    /// `Video.IsActiveRecording()`: whether Live TV is still writing the
+    /// item's file. The chapter-image extractor holds the Live TV seam; a
+    /// scanner without one (tests) sees no recording.
+    async fn is_active_recording(&self, entity: &BaseItemEntity) -> bool {
+        match self.chapter_image_extractor.get() {
+            Some(extractor) => extractor.is_active_recording(entity).await,
+            None => false,
         }
     }
 
@@ -24534,6 +24755,76 @@ mod tests {
             "/m/a.mkv",
             &data(r#"{"VideoType":"BluRay"}"#)
         ));
+    }
+
+    /// A video stream row at `index`.
+    fn video_row(index: i64) -> super::MediaStreamInfoEntity {
+        super::MediaStreamInfoEntity {
+            stream_index: index,
+            stream_type: crate::db_error::media_stream_type_to_disc(
+                ferrofin_model::entities::MediaStreamType::Video,
+            ),
+            ..super::MediaStreamInfoEntity::default()
+        }
+    }
+
+    /// `VideoImageProviderTests.GetImage_UnsupportedInput_ReturnsNoImage`: a
+    /// placeholder, no `DefaultVideoStreamIndex` (the probe found no video
+    /// stream; `library_scan_screen_grabber.rs` scans one), and a default
+    /// index with nothing there.
+    #[test]
+    fn unsupported_input_gets_no_grab() {
+        let placeholder = serde_json::json!({"IsPlaceHolder": true});
+        assert!(!super::embedded_image_eligible(
+            "/media/Heat (1995)/Heat (1995).mkv",
+            placeholder.as_object().unwrap()
+        ));
+        assert!(super::pick_screen_grab_stream(&[], 0).is_none());
+    }
+
+    /// `VideoImageProviderTests.GetImage_DefaultVideoStreams_ReturnsCorrectStreamImage`.
+    #[rstest::rstest]
+    #[case::default_not_first_stream(1, 1)]
+    #[case::default_out_of_valid_range(5, 0)]
+    fn the_grab_takes_the_default_video_stream(
+        #[case] default_index: i64,
+        #[case] target_index: i64,
+    ) {
+        let streams: Vec<_> = (0..=target_index).map(video_row).collect();
+        assert_eq!(
+            super::pick_screen_grab_stream(&streams, default_index).map(|s| s.stream_index),
+            Some(target_index)
+        );
+    }
+
+    /// `VideoImageProviderTests.GetImage_TimeSpan_SelectsCorrectTime`.
+    #[rstest::rstest]
+    #[case::default_time(None, 10)]
+    #[case::calculated_time(Some(500), 50)]
+    fn the_grab_selects_its_time(#[case] run_time_seconds: Option<i64>, #[case] expected: i64) {
+        const TICKS: i64 = 10_000_000;
+        assert_eq!(
+            super::screen_grab_offset(run_time_seconds.map(|s| s * TICKS)),
+            expected * TICKS
+        );
+    }
+
+    /// `VideoImageProvider.Supports`: `item is Video`.
+    #[rstest::rstest]
+    #[case("Movies.Movie", true)]
+    #[case("TV.Episode", true)]
+    #[case("MusicVideo", true)]
+    #[case("Trailer", true)]
+    #[case("Video", true)]
+    #[case("TV.Series", false)]
+    #[case("Audio.Audio", false)]
+    #[case("Photo", false)]
+    fn the_screen_grabber_takes_every_video_kind(#[case] name: &str, #[case] grabs: bool) {
+        assert_eq!(
+            super::grabs_screens(&format!("MediaBrowser.Controller.Entities.{name}")),
+            grabs,
+            "{name}"
+        );
     }
 
     #[test]
