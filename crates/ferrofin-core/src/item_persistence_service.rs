@@ -520,6 +520,38 @@ pub(crate) async fn container_at(db: &Database, path: &str) -> Result<Option<Uui
         .transpose()
 }
 
+/// The `kind` row stored under the id `path` derives, moved to `path`, or
+/// `None`: the container [`container_at`] misses once the data directory moved.
+///
+/// The Jellyfin derivation keys a data-directory container on its
+/// program-data-relative path (`data\collections`), so the id survives the
+/// move where the stored absolute `Path` does not. Upstream's library follows
+/// the move through its shortcut, stored as `%AppDataPath%/collections` and
+/// expanded on read (v12.2 LibraryManager.cs:1636,4162). Only the row under the
+/// derived id is moved, and only if it is a `kind`: an adopted Jellyfin library
+/// under another id is never touched. Under the legacy lowercase derivation
+/// the id comes from the absolute path, so a moved row is not found here.
+pub(crate) async fn moved_container(
+    db: &Database,
+    kind: BaseItemKind,
+    path: &str,
+    mode: &crate::item_type_lookup::IdDerivation,
+) -> Result<Option<Uuid>, ServiceError> {
+    let Some(id) = crate::item_type_lookup::derive_item_id_with(mode, kind, path) else {
+        return Ok(None);
+    };
+    let Some(row) = container_row(db, id).await? else {
+        return Ok(None);
+    };
+    if crate::item_type_lookup::kind_from_type_name(&row.type_) != Some(kind) {
+        return Ok(None);
+    }
+    set_container_path(db.writer(), id, path).await?;
+    tracing::info!(item_id = %id, from = row.path.as_deref().unwrap_or_default(), path,
+        "moved a container to the data directory");
+    Ok(Some(id))
+}
+
 /// The `BaseItems` row a user-created container hangs off, provisioning it if
 /// this server has never had one.
 ///
@@ -536,7 +568,8 @@ pub(crate) async fn container_at(db: &Database, path: &str) -> Result<Option<Uui
 /// only looks it up, as `PlaylistManager.GetPlaylistsFolder` does.
 ///
 /// Matched by exact path — see [`container_at`] for why by path and never by
-/// type, and which two spellings are accepted.
+/// type, and which two spellings are accepted — then by the derived id, for a
+/// data directory that moved ([`moved_container`]).
 pub(crate) async fn ensure_container(
     db: &Database,
     kind: BaseItemKind,
@@ -546,7 +579,11 @@ pub(crate) async fn ensure_container(
     parent: Option<Uuid>,
     data: Option<&str>,
 ) -> Result<Option<Uuid>, ServiceError> {
-    if let Some(id) = container_at(db, path).await? {
+    let found = match container_at(db, path).await? {
+        Some(id) => Some(id),
+        None => moved_container(db, kind, path, mode).await?,
+    };
+    if let Some(id) = found {
         // Adopt a row that was created before the user root existed — the
         // parent is set on the first provision that CAN set it, rather than
         // staying null forever because the row is already there.
@@ -577,8 +614,7 @@ pub(crate) async fn ensure_container(
     // (`1071671e7bffa0532e930debee501d2e`, `/config/data/playlists`) on both
     // servers, because `CreateRootFolder` builds that one directly.
     //
-    // TODO(open-work, tracked on `GET /Library/MediaFolders` in
-    // suite/parity/classifications.json): route the COLLECTIONS provision
+    // TODO(gl-66): route the COLLECTIONS provision
     // through the virtual-folder path (`{root}/default/Collections` +
     // `.mblink` -> `{data}/collections`, registered so it shows in
     // `GET /Library/VirtualFolders`) so the id converges. That is an id change

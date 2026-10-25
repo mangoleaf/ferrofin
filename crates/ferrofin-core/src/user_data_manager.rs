@@ -1213,10 +1213,14 @@ fn member_query(
     let user_entity = Some(user.clone());
     match kind_from_type_name(&folder.type_) {
         // `BoxSet.GetLinkedChildren(user)`: the parent query merges the
-        // manual links (a legacy set's children are its rows on disk).
+        // manual links (a legacy set's children are its rows on disk), and
+        // the box set's own listing keeps only the members from libraries
+        // the user can open (gl-571).
         Some(BaseItemKind::BoxSet) => InternalItemsQuery {
             parent_id: id,
+            parent_type: Some(BaseItemKind::BoxSet),
             user: user_entity,
+            apply_folder_display_options: true,
             enable_total_record_count: false,
             ..InternalItemsQuery::default()
         },
@@ -5092,17 +5096,26 @@ mod tests {
     ) {
         let counts: Arc<dyn ferrofin_traits::persistence::ItemCountService> =
             Arc::new(crate::FerrofinItemCountService::new(db.clone()));
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+            Arc::new(crate::FerrofinItemRepository::new(
+                db.clone(),
+                Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+            ));
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            Arc::clone(&items),
+            Arc::new(crate::LocalizationManager::new("US")),
+            "/nonexistent/ferrofin-test-data".to_owned(),
+        ));
         let library: Arc<dyn ferrofin_traits::library::LibraryManager> = Arc::new(
             crate::FerrofinLibraryManager::new(
-                Arc::new(crate::FerrofinItemRepository::new(
-                    db.clone(),
-                    Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
-                )),
+                items,
                 Arc::clone(&counts),
                 Arc::new(crate::FerrofinItemPersistenceService::new(db.clone())),
                 Arc::new(crate::FerrofinPeopleRepository::new(db.clone())),
             )
-            .with_dashboard_configuration(config()),
+            .with_dashboard_configuration(config())
+            .with_visibility(visibility),
         );
         let mgr = FerrofinUserDataManager::new(db.clone(), config());
         mgr.set_container_members(Arc::downgrade(&library), counts);
@@ -5419,6 +5432,28 @@ mod tests {
         mgr.mark_played(user, playlist, None).await.unwrap();
         assert!(data(&mgr, track, user).await.played);
         assert!(mgr.read_row(playlist, user).await.unwrap().is_none());
+    }
+
+    /// gl-571: a box set marks only the members `GetLinkedChildren(user)`
+    /// keeps (v12.2 BoxSet.cs:205-232): never one from a library the user
+    /// cannot open.
+    #[tokio::test]
+    async fn marking_a_box_set_skips_members_from_libraries_the_user_cannot_open() {
+        let db = test_db().await;
+        let fixture = crate::test_support::seed_box_set_across_libraries(&db).await;
+        let library: Arc<dyn ferrofin_traits::library::LibraryManager> = Arc::new(
+            crate::test_support::rooted_library_manager(&db, fixture.roots, config()),
+        );
+        let mgr = FerrofinUserDataManager::new(db.clone(), config());
+        mgr.set_container_members(
+            Arc::downgrade(&library),
+            Arc::new(crate::FerrofinItemCountService::new(db.clone())),
+        );
+        let user = Uuid::parse_str(&fixture.user.id).unwrap();
+
+        mgr.mark_played(user, fixture.set, None).await.unwrap();
+        assert!(data(&mgr, fixture.shown, user).await.played);
+        assert!(!data(&mgr, fixture.blocked, user).await.played);
     }
 
     /// Earlier builds wrote a container's own row when it was marked.

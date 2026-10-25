@@ -5039,7 +5039,7 @@ impl LibraryScanner {
                         tracing::warn!(%err, library = %library, "could not record the library's completed scan");
                     }
                 }
-                self.refresh_box_sets(&folders, run).await;
+                self.refresh_box_sets(&folders, None, run).await;
             }
         }
         tracking
@@ -5062,13 +5062,16 @@ impl LibraryScanner {
     /// stored box-set paths and the library locations are expanded first: an
     /// adopted row stores `%AppDataPath%/collections/<name> [boxset]`.
     ///
-    /// TODO(gl-796): only a scan of whole libraries reaches this pass. A
-    /// scoped scan under a Collections library's location (a watcher-reported
-    /// change in `{data}/collections`, a folder refresh there) refreshes no box
-    /// set, where upstream refreshes the ones in the folder it validates; the
-    /// path is to run this pass over the box sets under the scope's paths in
-    /// `scan_scoped`/`scan_changed` too.
-    async fn refresh_box_sets(&self, folders: &[VirtualFolderInfo], run: ScanRun<'_>) {
+    /// `scope` narrows it to a path-scoped scan's roots (gl-796): upstream
+    /// refreshes the box sets in whichever folder it validates, so a box set
+    /// under a root, or whose folder holds one (a change inside it), is
+    /// refreshed, each once.
+    async fn refresh_box_sets(
+        &self,
+        folders: &[VirtualFolderInfo],
+        scope: Option<&[String]>,
+        run: ScanRun<'_>,
+    ) {
         let (Some(providers), Some(items)) = (&self.metadata_savers, &self.item_repository) else {
             return;
         };
@@ -5100,9 +5103,14 @@ impl LibraryScanner {
             }
             let in_library = row.path.as_deref().is_some_and(|path| {
                 let path = self.virtual_paths.expand(path);
-                locations
-                    .iter()
-                    .any(|root| Path::new(&path).starts_with(root))
+                let path = Path::new(&path);
+                locations.iter().any(|root| path.starts_with(root))
+                    && scope.is_none_or(|roots| {
+                        roots.iter().any(|root| {
+                            let root = Path::new(root);
+                            path.starts_with(root) || root.starts_with(path)
+                        })
+                    })
             });
             let Some(id) = in_library.then(|| Uuid::parse_str(&row.id).ok()).flatten() else {
                 continue;
@@ -5398,11 +5406,11 @@ impl LibraryScanner {
         changed: usize,
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
-        let roots = scope.roots;
+        let (roots, prune) = (scope.roots, scope.prune);
         let folders = self.virtual_folders.get_virtual_folders().await?;
         let affected = affected_libraries(&folders, roots, also_path);
         if affected.is_empty() {
-            if scope.prune {
+            if prune {
                 tracing::debug!(
                     paths = roots.len(),
                     "changed paths match no library; nothing to scan"
@@ -5449,7 +5457,7 @@ impl LibraryScanner {
             plan_ms = started.elapsed().as_millis(),
             "path-scoped scan planned"
         );
-        if !scope.prune {
+        if !prune {
             for root in roots {
                 let root = root.trim_end_matches('/');
                 if !plan.items.iter().any(|p| {
@@ -5473,6 +5481,15 @@ impl LibraryScanner {
         let result = self
             .run_scan(&affected, &folders, plan, Some(scope), run)
             .await;
+        // Only a folder's validation (a pruning scope) refreshes the box sets
+        // in it. An item's own refresh does not prune, and for a box set it is
+        // that box set's refresh already.
+        if prune
+            && !run.cancel.is_cancelled()
+            && result.as_ref().is_ok_and(|outcome| !outcome.stopped)
+        {
+            self.refresh_box_sets(&affected, Some(roots), run).await;
+        }
         tracking
             .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
             .await;
@@ -22359,20 +22376,26 @@ fn repoint_planned(planned: &mut [Planned], ids: &HashMap<Uuid, (Uuid, Option<&s
 }
 
 /// The names a series' seasons are created with: season `0` takes the
-/// library's `SeasonZeroDisplayName`, any other number the server's
-/// localized `NameSeasonNumber` ("Season {0}"), and a season with no number
-/// `NameSeasonUnknown` — `SeasonResolver.Resolve` (`SeasonResolver.cs:
-/// 95-104`) for a season folder, `SeriesMetadataService.
-/// GetValidSeasonNameForSeries` (`SeriesMetadataService.cs:466-478`) for a
-/// season with no folder of its own, whose id the name is part of
-/// ([`item_type_lookup::virtual_season_id`]).
+/// library's `SeasonZeroDisplayName`, any other number the localized
+/// `NameSeasonNumber` ("Season {0}"), and a season with no number
+/// `NameSeasonUnknown`. A season folder is named in the server's UI culture
+/// (`SeasonResolver.Resolve`, `SeasonResolver.cs:95-104`, which reads
+/// `GetServerLocalizedString` since 12.0); a season with no folder of its
+/// own, whose id the name is part of ([`item_type_lookup::virtual_season_id`]),
+/// in the ambient one, which a scan inherits from the request that queued it
+/// (`SeriesMetadataService.GetValidSeasonNameForSeries`,
+/// `SeriesMetadataService.cs:466-483`, still `GetLocalizedString` in v12.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SeasonNames {
     /// The library's `SeasonZeroDisplayName`.
     zero: String,
-    /// `NameSeasonNumber`, a `{0}` format.
+    /// `NameSeasonNumber` in the server's UI culture, a `{0}` format: a
+    /// season folder's.
+    folder: String,
+    /// `NameSeasonNumber` in the ambient culture, a `{0}` format: a season
+    /// with no folder's.
     numbered: String,
-    /// `NameSeasonUnknown`.
+    /// `NameSeasonUnknown`, in the ambient culture.
     unknown: String,
 }
 
@@ -22382,6 +22405,7 @@ impl Default for SeasonNames {
     fn default() -> Self {
         Self {
             zero: "Specials".to_owned(),
+            folder: "Season {0}".to_owned(),
             numbered: "Season {0}".to_owned(),
             unknown: "Season Unknown".to_owned(),
         }
@@ -22390,7 +22414,8 @@ impl Default for SeasonNames {
 
 impl SeasonNames {
     /// The names under `options` (none: the defaults), localized by
-    /// `localization` in the server's UI culture (none: `en-US`).
+    /// `localization` (none: `en-US`): a folder's in the server's UI culture,
+    /// the rest in the ambient one (gl-385).
     pub(crate) fn of(
         options: Option<&LibraryOptionsModel>,
         localization: Option<&crate::localization_manager::LocalizationManager>,
@@ -22400,26 +22425,32 @@ impl SeasonNames {
             names.zero.clone_from(&options.season_zero_display_name);
         }
         if let Some(localization) = localization {
+            names.folder = localization.get_server_localized_string("NameSeasonNumber");
             names.numbered = localization.get_localized_string("NameSeasonNumber");
             names.unknown = localization.get_localized_string("NameSeasonUnknown");
         }
         names
     }
 
-    /// A numbered season's name: `0`'s is the season-zero name, any other
+    /// A season folder's name: `0`'s is the season-zero name, any other
     /// `string.Format(InvariantCulture, NameSeasonNumber, number)`.
     pub(crate) fn numbered(&self, number: i32) -> String {
+        self.format(&self.folder, number)
+    }
+
+    /// `number`'s name under the `{0}` format `numbered`, or season zero's.
+    fn format(&self, numbered: &str, number: i32) -> String {
         if number == 0 {
             self.zero.clone()
         } else {
-            self.numbered.replace("{0}", &number.to_string())
+            numbered.replace("{0}", &number.to_string())
         }
     }
 
     /// The name of a season with no folder of its own
     /// (`GetValidSeasonNameForSeries(series, null, number)`).
     pub(crate) fn virtual_season(&self, number: Option<i32>) -> String {
-        number.map_or_else(|| self.unknown.clone(), |n| self.numbered(n))
+        number.map_or_else(|| self.unknown.clone(), |n| self.format(&self.numbered, n))
     }
 }
 
@@ -42032,5 +42063,29 @@ mod metadata_default_person_locale_tests {
                 .unwrap();
             assert_eq!(refreshed.overview, Some(format!("Biography {expected}")));
         }
+    }
+}
+
+#[cfg(test)]
+mod season_names_tests {
+    use super::SeasonNames;
+
+    /// gl-385: a scan queued from a request names a season folder in the
+    /// server UI culture (v12.2 `SeasonResolver.Resolve`,
+    /// `GetServerLocalizedString("NameSeasonNumber")`, the call the upstream
+    /// `SeasonResolverTests` mock now answers), and a season with no folder
+    /// in the request's (`GetValidSeasonNameForSeries`, still
+    /// `GetLocalizedString`).
+    #[tokio::test]
+    async fn season_folders_take_the_server_culture_virtual_seasons_the_request() {
+        let server = crate::LocalizationManager::default().with_ui_culture("de");
+        let names =
+            ferrofin_util::current_culture::scope_with_ui("fr".into(), Some("fr".into()), async {
+                SeasonNames::of(None, Some(&server))
+            })
+            .await;
+        assert_eq!(names.numbered(2), "Staffel 2");
+        assert_eq!(names.virtual_season(Some(2)), "Saison 2");
+        assert_eq!(names.virtual_season(None), "Saison inconnue");
     }
 }
