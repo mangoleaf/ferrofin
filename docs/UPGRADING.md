@@ -8,6 +8,16 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — Live TV sources and guides follow Jellyfin more closely
+
+- **A local M3U playlist is opened exactly as configured.** An M3U tuner configured as a
+  `file://` URL (`file:///srv/tv/list.m3u`) is no longer read from the path it names: like
+  Jellyfin, Ferrofin now takes the whole value as a file path, which does not exist. Saving
+  such a tuner is refused with `404`. A stored one can no longer be read: the guide refresh
+  logs a warning and keeps the channels and guide it already has. Configure the plain path
+  (`/srv/tv/list.m3u`) instead. (An XMLTV guide's `file://` path was already refused on
+  save, and is now not read either.)
+
 ## Unreleased — Live TV sources are checked and read as Jellyfin reads them
 
 Usually nothing to do. Three changes can show on some Live TV sources:

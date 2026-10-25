@@ -63,6 +63,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Open a local M3U playlist or XMLTV guide exactly as configured, as Jellyfin's
+  `AsyncFile.OpenRead` does: a `file://` URL is no longer stripped to the path it names,
+  so saving a `file://` M3U tuner is refused with `404`
 - Open an M3U tuner's playlist before saving it, as Jellyfin's `M3UTunerHost.Validate`
   does: a missing local playlist is a `404` and a failing playlist URL a `500`, where the
   tuner was saved and only the next guide refresh showed it empty. A Live TV source URL is

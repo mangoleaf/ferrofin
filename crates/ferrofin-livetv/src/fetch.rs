@@ -675,10 +675,9 @@ impl SourceFetcher for ReqwestFetcher {
                 .await
                 .map_err(|e| LiveTvError::http(format!("read {url}"), e).into())
         } else {
-            let path = url.strip_prefix("file://").unwrap_or(url);
-            tokio::fs::read_to_string(path)
+            tokio::fs::read_to_string(url)
                 .await
-                .map_err(|e| LiveTvError::io(format!("read {path}"), e).into())
+                .map_err(|e| LiveTvError::io(format!("read {url}"), e).into())
         }
     }
 
@@ -696,16 +695,16 @@ impl SourceFetcher for ReqwestFetcher {
             })
         } else {
             // `AsyncFile.OpenRead`: a file that cannot be opened is an error,
-            // as upstream's `FileNotFoundException` is, not a status.
-            let path = url.strip_prefix("file://").unwrap_or(url);
-            let file = tokio::fs::File::open(path)
+            // as upstream's `FileNotFoundException` is, not a status. The value
+            // is the path as given: `file:///x` is a relative path there too.
+            let file = tokio::fs::File::open(url)
                 .await
-                .map_err(|e| LiveTvError::io(format!("read {path}"), e))?;
+                .map_err(|e| LiveTvError::io(format!("read {url}"), e))?;
             // `AsyncFile.OpenRead` refuses a directory (`UnauthorizedAccessException`),
             // where a Unix `open` succeeds and only the first read fails.
             if file.metadata().await.is_ok_and(|meta| meta.is_dir()) {
                 return Err(LiveTvError::io(
-                    format!("read {path}"),
+                    format!("read {url}"),
                     std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory"),
                 )
                 .into());
@@ -714,7 +713,7 @@ impl SourceFetcher for ReqwestFetcher {
                 status: 200,
                 body: Box::new(FileBody {
                     reader: tokio::io::BufReader::new(file),
-                    path: path.to_owned(),
+                    path: url.to_owned(),
                 }),
             })
         }
@@ -730,8 +729,7 @@ impl SourceFetcher for ReqwestFetcher {
             });
             (final_url, body)
         } else {
-            let path = url.strip_prefix("file://").unwrap_or(url).to_owned();
-            (path, self.open(url, None).await?.body)
+            (url.to_owned(), self.open(url, None).await?.body)
         };
         Ok(if is_gzip_name(&name) {
             Box::new(GunzipBody::new(body, name))
@@ -749,10 +747,9 @@ impl SourceFetcher for ReqwestFetcher {
                 .map(|b| b.to_vec())
                 .map_err(|e| http_failure("read", url, e))
         } else {
-            let path = url.strip_prefix("file://").unwrap_or(url);
-            tokio::fs::read(path)
+            tokio::fs::read(url)
                 .await
-                .map_err(|e| LiveTvError::io(format!("read {path}"), e).into())
+                .map_err(|e| LiveTvError::io(format!("read {url}"), e).into())
         }
     }
 
