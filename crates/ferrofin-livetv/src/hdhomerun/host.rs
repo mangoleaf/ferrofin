@@ -280,8 +280,9 @@ impl HdHomerunHost {
     ///
     /// # Errors
     ///
-    /// Fails when `discover.json` fails, the lineup cannot be fetched, or the
-    /// body is not a JSON array of lineup entries.
+    /// Fails when `discover.json` fails, the lineup address is not an HTTP
+    /// URL, the lineup cannot be fetched, or the body is not a JSON array of
+    /// lineup entries.
     pub async fn get_lineup(
         &self,
         info: &TunerHostInfo,
@@ -291,6 +292,14 @@ impl HdHomerunHost {
             .lineup_url
             .clone()
             .unwrap_or_else(|| format!("{}/lineup.json", model.base_url.unwrap_or_default()));
+        // The address comes from the device. Upstream requests it with
+        // `HttpClient.GetAsync`, which takes only an HTTP(S) URI, so a value
+        // naming a local file fails there and is never opened as one here.
+        if !crate::fetch::is_http(&url) {
+            return Err(ServiceError::backend(format!(
+                "the device's lineup address is not an HTTP URL: {url}"
+            )));
+        }
         // Read as it arrives, whatever the status (v12.2
         // HdHomerunHost.cs:77-78); a `null` document is an empty lineup
         // (`?? Enumerable.Empty<Channels>()`).

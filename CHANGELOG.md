@@ -63,6 +63,17 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Open an M3U tuner's playlist before saving it, as Jellyfin's `M3UTunerHost.Validate`
+  does: a missing local playlist is a `404` and a failing playlist URL a `500`, where the
+  tuner was saved and only the next guide refresh showed it empty. A Live TV source URL is
+  remote when it starts with `http` in any case, so an `HTTP://` playlist or guide is no
+  longer read as a file, and a HDHomeRun device's lineup address must be an HTTP URL
+- Read XMLTV guides as Jellyfin's `XmlTvReader` does: in the encoding the declaration or
+  byte-order mark names (`ISO-8859-1` and `US-ASCII` as .NET decodes them), with a byte
+  invalid in it making the guide unreadable; titles, episode titles, descriptions,
+  categories and channel names in the provider's preferred language, else the server's
+  metadata language; no channel without a name or an id; and an airing whose
+  `<previously-shown start>` is its own start is a first showing, not a repeat
 - Refuse a `POST /Playlists` body without a `Name`, or with a null or blank one, and an
   `"IsPublic": null`, with `400` as Jellyfin does, instead of creating the playlist; a
   query-string `name` does not rescue such a body. A request with neither a body nor a
@@ -624,6 +635,17 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   flat (the guide refresh still waits on it, as Jellyfin's does), and a device answering with
   something that is not JSON fails at once. A playlist whose first line follows a UTF-8
   byte-order mark, or whose lines end with a lone carriage return, no longer loses channels
+- An XMLTV guide is downloaded into its cache file and read from it as a stream, gunzipped
+  on the way, as Jellyfin does, instead of being held whole in memory for the download, the
+  cache and both reads of a guide refresh: a large IPTV guide no longer makes every refresh
+  peak at its size, and a source that never ends no longer grows memory until the download
+  times out. A download that fails or is abandoned leaves no temporary file behind
+- A guide refresh re-arms a live recording timer that has no arm, as Jellyfin's refresh of
+  every timer does, not only one the refreshed guide changed, so a timer whose arm was lost
+  records again; a timer fired while its capture is still starting no longer risks recording
+  the showing twice
+- Deleting a tuner host queues a guide refresh, as Jellyfin 12 does, so its channels and
+  programmes leave item queries, search and genre lists at once instead of up to a day later
 - A new playlist is announced to the sessions that may see it as added, and renaming it,
   making it public or private, changing who it is shared with, moving an entry or handing it
   to a share when its owner is deleted announces it as changed and moves its `Etag`, as in

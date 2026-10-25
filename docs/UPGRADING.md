@@ -8,6 +8,26 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — Live TV sources are checked and read as Jellyfin reads them
+
+Usually nothing to do. Three changes can show on some Live TV sources:
+- **Saving an M3U tuner opens its playlist first.** A local playlist that does not exist is
+  refused with `404`, and a playlist URL that fails with `500`; the dashboard shows the
+  error instead of saving a tuner that never has channels. A tuner whose playlist is down
+  cannot be saved again until it is back, as in Jellyfin. Tuners already saved keep working.
+- **XMLTV guides are decoded by their declaration.** A guide is read in the encoding its
+  `<?xml … encoding="…"?>` declaration or byte-order mark names, else as UTF-8. A byte
+  that is not valid in that encoding, or a declaration naming an encoding that does not
+  exist, makes the guide unreadable: the refresh keeps the guide it has and logs a warning. A local guide in Latin-1 or UTF-16 now loads. A guide
+  downloaded over HTTP that is not valid UTF-8 and declares no other encoding used to load
+  with replacement characters and now does not, as in Jellyfin; fix the guide's
+  declaration, or its source.
+- **XMLTV text follows the guide language.** In a guide with several languages, the
+  programme titles, episode titles, descriptions, categories and channel names are now
+  taken in the listings provider's preferred language (its `PreferredLanguage`), else the
+  server's preferred metadata language, as Jellyfin takes them. A channel with no name or no
+  id in the guide is no longer listed.
+
 ## Unreleased — creating a backup needs a JSON body
 
 A script that calls `POST /Backup/Create` with no body must now send `{}` with
