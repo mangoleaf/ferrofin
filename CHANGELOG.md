@@ -229,6 +229,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   embedded-subtitle extraction that exceeds the configured timeout is killed and its
   partial output cleaned up. A drop guard ensures cleanup even on cancellation. As upstream,
   the default is 30 minutes
+- Stop playback a client abandoned, as Jellyfin does: a session playing without a progress
+  report for five minutes is stopped at the client's last position, and with
+  `InactiveSessionThreshold` set, a session paused past it is told to stop. A client that
+  vanished mid-playback no longer stays "playing" and no longer makes transcode cleanup and
+  database optimization skip every run
 - Port `TrimCopiedAudio` noise bitstream filter: when a video is being transcoded but the
   audio is direct-copied, ffmpeg 5.0+ trims the leading audio silence to match the
   requested seek point, eliminating the A/V desync on mid-file seeks into remuxed HLS. The
