@@ -25,6 +25,20 @@ server log names the file: fix the file's permissions and create the backup agai
 backups folder the server cannot read fails `GET /Backup` the same way, where the dashboard
 used to show no backups. A create during a library scan answers `500` instead of `503`.
 
+## Unreleased — abandoned playback is stopped, and paused sessions can be
+
+Ferrofin now runs Jellyfin's two playback checks:
+- **Idle playback:** a session that has been playing without reporting progress for more
+  than five minutes is stopped where its client last reported. Its device stops showing as
+  playing, its resume point is saved, and the usual rules may mark the item played. Before,
+  a client that vanished mid-playback over plain HTTP stayed "playing", and the "Clean
+  Transcode Directory" and "Optimize database" tasks skipped every run while it did.
+- **Inactive sessions:** the setting `InactiveSessionThreshold` (minutes, in
+  `config/system.json`, or through `POST /System/Configuration`) now applies. A session
+  paused longer than that is sent a stop command, which reaches clients connected over a
+  WebSocket, as in Jellyfin. It was ignored before, including when carried over from an
+  adopted Jellyfin configuration. At `0`, the default, nothing is stopped.
+
 ## Unreleased — the Latest row follows Jellyfin 12 for movies libraries
 
 Nothing to do. A grouped **Latest** request whose first library with a content type is a
