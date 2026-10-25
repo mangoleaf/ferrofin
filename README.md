@@ -145,8 +145,12 @@ disables transcoding):
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
 ```
 
-On a fresh database Ferrofin seeds an `admin` user and **logs a generated password. Record
-it**, or set `FERROFIN_ADMIN_PASSWORD` for a headless install. Then:
+On a fresh database Ferrofin seeds an `admin` user **with no password**, as Jellyfin does,
+and logs a warning: the setup wizard at `/web` sets the password. Until it does, anyone who
+can reach the server can sign in as that administrator, so keep it bound to loopback (or,
+for the container image, which listens on all interfaces, keep its port unpublished) until
+setup is done, or set `FERROFIN_ADMIN_PASSWORD` to seed the password for a headless
+install. Then:
 
 ```sh
 curl http://localhost:8096/System/Info/Public   # smoke test
