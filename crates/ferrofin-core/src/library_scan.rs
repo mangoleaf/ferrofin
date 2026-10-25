@@ -5039,7 +5039,7 @@ impl LibraryScanner {
                         tracing::warn!(%err, library = %library, "could not record the library's completed scan");
                     }
                 }
-                self.refresh_box_sets(&folders, run).await;
+                self.refresh_box_sets(&folders, None, run).await;
             }
         }
         tracking
@@ -5062,13 +5062,16 @@ impl LibraryScanner {
     /// stored box-set paths and the library locations are expanded first: an
     /// adopted row stores `%AppDataPath%/collections/<name> [boxset]`.
     ///
-    /// TODO(gl-796): only a scan of whole libraries reaches this pass. A
-    /// scoped scan under a Collections library's location (a watcher-reported
-    /// change in `{data}/collections`, a folder refresh there) refreshes no box
-    /// set, where upstream refreshes the ones in the folder it validates; the
-    /// path is to run this pass over the box sets under the scope's paths in
-    /// `scan_scoped`/`scan_changed` too.
-    async fn refresh_box_sets(&self, folders: &[VirtualFolderInfo], run: ScanRun<'_>) {
+    /// `scope` narrows it to a path-scoped scan's roots (gl-796): upstream
+    /// refreshes the box sets in whichever folder it validates, so a box set
+    /// under a root, or whose folder holds one (a change inside it), is
+    /// refreshed, each once.
+    async fn refresh_box_sets(
+        &self,
+        folders: &[VirtualFolderInfo],
+        scope: Option<&[String]>,
+        run: ScanRun<'_>,
+    ) {
         let (Some(providers), Some(items)) = (&self.metadata_savers, &self.item_repository) else {
             return;
         };
@@ -5100,9 +5103,14 @@ impl LibraryScanner {
             }
             let in_library = row.path.as_deref().is_some_and(|path| {
                 let path = self.virtual_paths.expand(path);
-                locations
-                    .iter()
-                    .any(|root| Path::new(&path).starts_with(root))
+                let path = Path::new(&path);
+                locations.iter().any(|root| path.starts_with(root))
+                    && scope.is_none_or(|roots| {
+                        roots.iter().any(|root| {
+                            let root = Path::new(root);
+                            path.starts_with(root) || root.starts_with(path)
+                        })
+                    })
             });
             let Some(id) = in_library.then(|| Uuid::parse_str(&row.id).ok()).flatten() else {
                 continue;
@@ -5398,11 +5406,11 @@ impl LibraryScanner {
         changed: usize,
         run: ScanRun<'_>,
     ) -> Result<ScanOutcome, ServiceError> {
-        let roots = scope.roots;
+        let (roots, prune) = (scope.roots, scope.prune);
         let folders = self.virtual_folders.get_virtual_folders().await?;
         let affected = affected_libraries(&folders, roots, also_path);
         if affected.is_empty() {
-            if scope.prune {
+            if prune {
                 tracing::debug!(
                     paths = roots.len(),
                     "changed paths match no library; nothing to scan"
@@ -5449,7 +5457,7 @@ impl LibraryScanner {
             plan_ms = started.elapsed().as_millis(),
             "path-scoped scan planned"
         );
-        if !scope.prune {
+        if !prune {
             for root in roots {
                 let root = root.trim_end_matches('/');
                 if !plan.items.iter().any(|p| {
@@ -5473,6 +5481,15 @@ impl LibraryScanner {
         let result = self
             .run_scan(&affected, &folders, plan, Some(scope), run)
             .await;
+        // Only a folder's validation (a pruning scope) refreshes the box sets
+        // in it. An item's own refresh does not prune, and for a box set it is
+        // that box set's refresh already.
+        if prune
+            && !run.cancel.is_cancelled()
+            && result.as_ref().is_ok_and(|outcome| !outcome.stopped)
+        {
+            self.refresh_box_sets(&affected, Some(roots), run).await;
+        }
         tracking
             .finish(result.as_ref().is_ok_and(|outcome| !outcome.stopped))
             .await;

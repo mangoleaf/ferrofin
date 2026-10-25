@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use ferrofin_core::item_type_lookup::ItemTypeLookup;
 use ferrofin_core::{
     FerrofinItemPersistenceService, FerrofinItemRepository, FerrofinVirtualFolderManager,
-    LibraryScanner,
+    LibraryScanner, ScanCancel, ScanRun,
 };
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
@@ -17,7 +17,7 @@ use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::VirtualFolderManager;
+use ferrofin_traits::library::{ScanTarget, VirtualFolderManager};
 use ferrofin_traits::persistence::{ItemPersistenceService as _, ItemRepository};
 use ferrofin_traits::providers::{
     ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
@@ -132,10 +132,11 @@ impl ProviderManager for RecordingRefreshes {
 /// and box sets outside the Collections library's location: one in the movies
 /// library, one in a sibling `collections2` folder.
 struct Lab {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     scanner: LibraryScanner,
     refreshes: Arc<RecordingRefreshes>,
     vf: Arc<dyn VirtualFolderManager>,
+    collections: std::path::PathBuf,
     inside: Uuid,
     adopted: Uuid,
 }
@@ -257,10 +258,11 @@ async fn lab() -> Lab {
         )),
     );
     Lab {
-        _tmp: tmp,
+        tmp,
         scanner,
         refreshes,
         vf,
+        collections,
         inside,
         adopted,
     }
@@ -349,6 +351,93 @@ async fn a_scan_of_another_library_refreshes_no_box_set() {
         .expect("the movies library");
     lab.scanner
         .scan_with(Some(movies), &MetadataRefreshOptions::default())
+        .await
+        .expect("scan");
+    assert!(lab.refreshes.refreshed.lock().expect("log").is_empty());
+}
+
+/// gl-796: a path-scoped scan under the Collections library's location — a
+/// folder refresh there, or a change the library monitor reports in it —
+/// refreshes the box sets in its scope, as upstream's
+/// `ValidateChildrenInternal2` does for whichever folder it validates. A box
+/// set is in scope when it sits under a scanned path or holds one.
+#[rstest::rstest]
+#[case::the_library_folder("", true)]
+#[case::one_box_set("Heist [boxset]", false)]
+#[case::a_file_in_a_box_set("Heist [boxset]/collection.xml", false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scoped_scan_refreshes_the_box_sets_in_its_scope(
+    #[case] below: &str,
+    #[case] all: bool,
+    #[values(false, true)] reported: bool,
+) {
+    let lab = lab().await;
+    let path = lab.collections.join(below).to_string_lossy().into_owned();
+    let options = MetadataRefreshOptions::default();
+    let target = if reported {
+        ScanTarget::Changed(vec![path])
+    } else {
+        ScanTarget::Paths(vec![path])
+    };
+    lab.scanner
+        .scan_target(
+            &target,
+            ScanRun::new(&options, &options, &ScanCancel::new()),
+        )
+        .await
+        .expect("scan");
+    let expected = if all {
+        sorted([lab.inside, lab.adopted]).to_vec()
+    } else {
+        vec![lab.inside]
+    };
+    assert_eq!(refreshed_ids(&lab), expected);
+}
+
+/// A scoped scan of another library refreshes no box set, not even one stored
+/// under the scanned folder, and a cancelled scoped scan runs no pass.
+#[rstest::rstest]
+#[case::another_library(false)]
+#[case::cancelled(true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scoped_scan_elsewhere_or_cancelled_refreshes_no_box_set(#[case] cancelled: bool) {
+    let lab = lab().await;
+    let options = MetadataRefreshOptions::default();
+    let cancel = ScanCancel::new();
+    let path = if cancelled {
+        cancel.cancel();
+        lab.collections.clone()
+    } else {
+        // "Elsewhere [boxset]" sits in the movies folder, outside every
+        // boxsets library.
+        lab.tmp.path().join("movies")
+    };
+    lab.scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![path.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &options, &cancel),
+        )
+        .await
+        .expect("scan");
+    assert!(lab.refreshes.refreshed.lock().expect("log").is_empty());
+}
+
+/// A single item's refresh (`ScanTarget::Items`) is the box set's own refresh
+/// already: it runs no box-set pass of its own on top.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_item_refresh_runs_no_box_set_pass() {
+    let lab = lab().await;
+    let options = MetadataRefreshOptions::default();
+    lab.scanner
+        .scan_target(
+            &ScanTarget::Items(vec![
+                lab.collections
+                    .join("Heist [boxset]")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]),
+            ScanRun::new(&options, &options, &ScanCancel::new()),
+        )
         .await
         .expect("scan");
     assert!(lab.refreshes.refreshed.lock().expect("log").is_empty());
