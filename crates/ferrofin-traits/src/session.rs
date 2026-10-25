@@ -328,7 +328,20 @@ pub trait SessionManager: Send + Sync {
         current_access_token: &str,
     ) -> Result<(), ServiceError>;
 
-    /// Closes the given live stream if no session still needs it.
+    /// Releases a viewer's hold on a live stream and closes the stream when
+    /// that release calls for it (C# `CloseLiveStreamIfNeededAsync`).
+    ///
+    /// `session_or_play_session_id` names the viewer, by either of its ids.
+    /// Which streams count as held comes from play-state reports that name a
+    /// `LiveStreamId`. Three cases:
+    /// - the id holds the stream: the viewer's hold (under both ids) is dropped
+    ///   and the stream is closed;
+    /// - the stream has holders but not this id: nothing is closed;
+    /// - the stream has no holder at all (no report named it, or its last
+    ///   holder already released): the stream is closed.
+    ///
+    /// Closing is one `MediaSourceManager::close_live_stream`, which lowers the
+    /// stream's consumer count; the tuner goes when the count reaches zero.
     async fn close_live_stream_if_needed(
         &self,
         live_stream_id: &str,

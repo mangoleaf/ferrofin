@@ -714,12 +714,10 @@ pub struct TypeOptions {
 
     /// The similarity providers enabled for this type. A remote provider runs
     /// only when listed here (local similarity is always on).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub similar_item_providers: Vec<String>,
 
     /// The admin-chosen order of [`similar_item_providers`](Self::similar_item_providers);
     /// a provider absent from the list sorts last.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub similar_item_provider_order: Vec<String>,
 }
 
@@ -1666,6 +1664,18 @@ mod tests {
         let json = serde_json::to_value(&opts).unwrap();
         assert_eq!(json["EnableLUFSScan"], false);
         assert_eq!(json["Enabled"], true);
+    }
+
+    /// Upstream's `TypeOptions` constructor sets both similarity lists to `[]`
+    /// and System.Text.Json writes them empty, like every other list member.
+    #[test]
+    fn type_options_write_empty_similarity_lists() {
+        let json = serde_json::to_value(TypeOptions::default()).unwrap();
+        assert_eq!(json["SimilarItemProviders"], serde_json::json!([]));
+        assert_eq!(json["SimilarItemProviderOrder"], serde_json::json!([]));
+        let back: TypeOptions = serde_json::from_str(r#"{"Type":"Movie"}"#).unwrap();
+        assert!(back.similar_item_providers.is_empty());
+        assert!(back.similar_item_provider_order.is_empty());
     }
 
     #[test]

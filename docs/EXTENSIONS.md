@@ -431,6 +431,10 @@ Plugins receive server events (`LibraryChanged`, `PlaybackStart`, task completio
 through the `on-event` export via a bounded per-plugin queue
 (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`, default 256) — a slow guest loses events rather
 than slowing the server; the database, not the event stream, is the source of truth.
+`LibraryChanged` carries each batch of library changes the server announces (scans, metadata
+edits, deletions, playlists and collections), unfiltered by user, `LibraryUpdateDuration`
+seconds after the batch's first change, as Jellyfin's `LibraryChangedNotifier` sends its
+batches; a batch holds at most 2000 items.
 
 Authoring: any language that targets the WASM component model. **Start from the
 template**: [`ferrofin-plugin-template`](https://github.com/mangoleaf/ferrofin-plugin-template)

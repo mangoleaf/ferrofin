@@ -1511,9 +1511,10 @@ async fn stopping_playback_closes_the_reported_live_stream() {
         "a report without a live stream id closes nothing"
     );
 
-    // A stream this session never reported playing is not its to release
-    // (upstream's `_activeLiveStreamSessions` has no mapping, so
-    // `liveStreamNeedsToBeClosed` stays false).
+    // A stream no session registered (its start and progress reports did not
+    // name it) is closed by the stop that does: upstream's
+    // `_activeLiveStreamSessions` has no entry for it, and the `else` branch
+    // sets `liveStreamNeedsToBeClosed`.
     mgr.on_playback_stopped(&PlaybackStopInfo {
         session_id: session.id.clone(),
         item_id: Uuid::nil(),
@@ -1522,21 +1523,29 @@ async fn stopping_playback_closes_the_reported_live_stream() {
     })
     .await
     .unwrap();
-    assert!(
-        sources.closed.lock().expect("closed mutex").is_empty(),
-        "an unregistered live stream closes nothing"
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["never-started".to_owned()],
+        "an unregistered live stream is closed once"
     );
 
-    // Playback start registers the holder; the stop then releases it.
-    mgr.on_playback_start(&ferrofin_model::session::PlaybackStartInfo {
-        session_id: session.id.clone(),
-        item_id: Uuid::nil(),
-        live_stream_id: Some("live-42".to_owned()),
-        play_session_id: Some("play-42".to_owned()),
-        ..ferrofin_model::session::PlaybackStartInfo::default()
-    })
-    .await
-    .unwrap();
+    // Playback start registers the holder; the stop then releases it. A second
+    // viewer holds the same stream, so its entry outlives this viewer's.
+    let other = mgr
+        .log_session_activity("Web", "1.0", "dev-live-2", "TV 2", "e", Some(&user))
+        .await
+        .unwrap();
+    for (holder, play) in [(&session, "play-42"), (&other, "play-other")] {
+        mgr.on_playback_start(&ferrofin_model::session::PlaybackStartInfo {
+            session_id: holder.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("live-42".to_owned()),
+            play_session_id: Some(play.to_owned()),
+            ..ferrofin_model::session::PlaybackStartInfo::default()
+        })
+        .await
+        .unwrap();
+    }
     mgr.on_playback_stopped(&PlaybackStopInfo {
         session_id: session.id.clone(),
         item_id: Uuid::nil(),
@@ -1547,21 +1556,113 @@ async fn stopping_playback_closes_the_reported_live_stream() {
     .unwrap();
     assert_eq!(
         *sources.closed.lock().expect("closed mutex"),
-        vec!["live-42".to_owned()],
+        vec!["never-started".to_owned(), "live-42".to_owned()],
         "the reported live stream is closed exactly once"
     );
 
     // The same viewer under its OTHER id (the play session) must not release a
-    // second consumer — that is what would tear the tuner out from under
-    // another viewer of the same channel.
+    // second consumer while the stream still has a holder — that is what would
+    // tear the tuner out from under the other viewer of the same channel.
     mgr.close_live_stream_if_needed("live-42", "play-42")
         .await
         .unwrap();
     assert_eq!(
         sources.closed.lock().expect("closed mutex").len(),
-        1,
+        2,
         "one viewer releases once, however many of its ids report"
     );
+}
+
+/// A release for a live stream no session registered closes it (C#
+/// `CloseLiveStreamIfNeededAsync`'s `else { liveStreamNeedsToBeClosed = true; }`,
+/// from jellyfin#17178 in 12.0-rc2). This is the transcode teardown of a
+/// vanished client whose play-state reports never named the stream: the
+/// releaser passes the job's play-session id, or nothing when the job has none.
+/// Without the close the tuner stays open until a restart.
+#[tokio::test]
+async fn a_live_stream_no_session_registered_is_closed() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let db = test_db().await;
+        let sources = Arc::new(RecordingMediaSources {
+            closed: Mutex::new(Vec::new()),
+        });
+        let mgr = manager_recording_releases(&db, &sources);
+
+        mgr.close_live_stream_if_needed("live-job", "play-job")
+            .await
+            .unwrap();
+        assert_eq!(
+            *sources.closed.lock().expect("closed mutex"),
+            vec!["live-job".to_owned()],
+            "a teardown release of an unregistered stream closes it once"
+        );
+
+        mgr.close_live_stream_if_needed("live-job2", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            *sources.closed.lock().expect("closed mutex"),
+            vec!["live-job".to_owned(), "live-job2".to_owned()],
+            "a job without a play session closes its unregistered stream once"
+        );
+    })
+    .await
+    .expect("the test finished in time");
+}
+
+/// The case the holder map guards: a stream registered by one viewer is not
+/// closed by a release under an id that is not among its holders (C#
+/// `activeSessionMappings.TryRemove` fails, so `liveStreamNeedsToBeClosed`
+/// stays false). The holder's own release still closes it.
+#[tokio::test]
+async fn a_release_by_a_stranger_does_not_close_a_registered_stream() {
+    use ferrofin_model::session::{PlaybackStartInfo, PlaybackStopInfo};
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let db = test_db().await;
+        let sources = Arc::new(RecordingMediaSources {
+            closed: Mutex::new(Vec::new()),
+        });
+        let mgr = manager_recording_releases(&db, &sources);
+        let user = seed_named_user(&db, Uuid::new_v4(), "bob").await;
+        let bob = mgr
+            .log_session_activity("Web", "1.0", "dev-bob", "TV", "e", Some(&user))
+            .await
+            .unwrap();
+        mgr.on_playback_start(&PlaybackStartInfo {
+            session_id: bob.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("shared".to_owned()),
+            play_session_id: Some("play-bob".to_owned()),
+            ..PlaybackStartInfo::default()
+        })
+        .await
+        .unwrap();
+
+        mgr.close_live_stream_if_needed("shared", "stranger")
+            .await
+            .unwrap();
+        assert!(
+            sources.closed.lock().expect("closed mutex").is_empty(),
+            "a release by an id that holds nothing closes nothing"
+        );
+
+        mgr.on_playback_stopped(&PlaybackStopInfo {
+            session_id: bob.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("shared".to_owned()),
+            ..PlaybackStopInfo::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *sources.closed.lock().expect("closed mutex"),
+            vec!["shared".to_owned()],
+            "the holder's own stop closes it"
+        );
+    })
+    .await
+    .expect("the test finished in time");
 }
 
 /// Two viewers of one channel: the first to stop must not close the stream the
@@ -2024,7 +2125,9 @@ async fn a_logout_or_an_already_stopped_stream_is_not_released_on_session_end() 
 /// `PlayState.LiveStreamId = info.LiveStreamId`), so a progress report
 /// without one clears it. A stop refused for its negative position releases
 /// the stream and keeps the play state, so the socket closing afterwards
-/// releases nothing more.
+/// releases it again: the refused stop emptied the stream's holders, and C#
+/// `CloseLiveStreamIfNeededAsync` closes a stream with no holder entry. The
+/// second close finds no consumer left unless an unregistered viewer shares it.
 #[tokio::test]
 async fn the_sessions_live_stream_follows_the_reports() {
     use ferrofin_model::session::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
@@ -2096,8 +2199,8 @@ async fn the_sessions_live_stream_follows_the_reports() {
     mgr.close_if_needed(&session_id).await.unwrap();
     assert_eq!(
         *sources.closed.lock().expect("closed mutex"),
-        vec!["live-follow".to_owned()],
-        "released once, by the refused stop"
+        vec!["live-follow".to_owned(), "live-follow".to_owned()],
+        "released by the refused stop, then by the socket closing, as upstream"
     );
 }
 

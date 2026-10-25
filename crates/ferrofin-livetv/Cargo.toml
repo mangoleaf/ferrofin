@@ -40,3 +40,5 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 # The real user manager, for the EnabledUsers test (no cycle: core does not depend on livetv).
 ferrofin-core.workspace = true
+# Captures the DVR fire path's and the stored-row readers' log lines.
+tracing-subscriber.workspace = true

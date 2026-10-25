@@ -28,7 +28,7 @@ only() {
     any=1
     case $f in
       .github/workflows/*.yml | .github/workflows/*.yaml | .gitlab-ci.yml) ci=1 ;;
-      crates/* | apps/* | scripts/* | adoption/* | verify/*) return 1 ;; # Markdown here is still source tree
+      crates/* | apps/* | scripts/* | gates/adoption/* | gates/verify/*) return 1 ;; # Markdown here is still source tree
       *.md) ;;
       *) return 1 ;;
     esac

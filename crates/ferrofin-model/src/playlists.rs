@@ -1,6 +1,7 @@
 //! Port of `MediaBrowser.Model.Playlists`.
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -89,7 +90,14 @@ pub struct PlaylistUpdateRequest {
 #[serde(rename_all = "PascalCase")]
 pub struct CreatePlaylistDto {
     /// Gets or sets the name of the new playlist.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// C#'s `required string Name` under nullable annotations: a body without
+    /// it fails deserialization, and MVC's implicit `[Required]` refuses a null
+    /// or blank one, so each is a `400`. [`Default`] (no body at all) is `None`.
+    #[serde(
+        deserialize_with = "required_name",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub name: Option<String>,
 
     /// Gets or sets item ids to add to the playlist.
@@ -116,14 +124,29 @@ pub struct CreatePlaylistDto {
     /// Gets or sets a value indicating whether the playlist is public.
     ///
     /// C#'s `bool IsPublic { get; set; } = true`: a body without the member is
-    /// public. [`Default`] (no body at all) stays `None`, which the manager
-    /// stores as private, as upstream's `createPlaylistRequest?.IsPublic` does.
+    /// public, and a JSON `null` fails the non-nullable `bool` (`400`).
+    /// [`Default`] (no body at all) stays `None`, which the manager stores as
+    /// private, as upstream's `createPlaylistRequest?.IsPublic` does.
     #[serde(
         default = "body_default_is_public",
+        deserialize_with = "non_null_bool",
         skip_serializing_if = "Option::is_none"
     )]
-    #[serde(deserialize_with = "crate::json::value::nullable")]
     pub is_public: Option<bool>,
+}
+
+/// [`CreatePlaylistDto::name`]: refuses a null or blank name as
+/// `RequiredAttribute` (`AllowEmptyStrings = false`) does.
+fn required_name<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    match Option::<String>::deserialize(deserializer)? {
+        Some(name) if !name.trim().is_empty() => Ok(Some(name)),
+        _ => Err(D::Error::custom("The Name field is required.")),
+    }
+}
+
+/// [`CreatePlaylistDto::is_public`]: a C# `bool`, so `null` does not bind.
+fn non_null_bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D::Error> {
+    bool::deserialize(deserializer).map(Some)
 }
 
 /// [`CreatePlaylistDto::is_public`] for a body that omits it.

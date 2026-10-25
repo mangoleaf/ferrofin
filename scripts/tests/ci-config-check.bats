@@ -91,8 +91,8 @@ commit_file() {
   [ "$status" -eq 1 ]
 }
 
-@test "only: Markdown under apps/, adoption/, verify/ and scripts/ takes the full path" {
-  for f in apps/s/README.md adoption/README.md verify/README.md scripts/README.md; do
+@test "only: Markdown under apps/, gates/adoption/, gates/verify/ and scripts/ takes the full path" {
+  for f in apps/s/README.md gates/adoption/README.md gates/verify/README.md scripts/README.md; do
     git reset -q --hard main
     commit_file .gitlab-ci.yml
     commit_file "$f"

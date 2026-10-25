@@ -4,7 +4,8 @@
 //! route never 404s. Unit 1 (INFRA) points them all at the shared
 //! `not_implemented` stub (`501`); later waves register real handlers over the
 //! matching entries. The router also mounts the health probes, the OpenAPI spec,
-//! the auth-context middleware, CORS from the configured `CorsHosts`
+//! the auth-context middleware, the panic boundary
+//! ([`crate::panic_boundary`]), CORS from the configured `CorsHosts`
 //! ([`crate::cors`]) and tracing.
 
 use axum::extract::{MatchedPath, Request};
@@ -39,7 +40,7 @@ fn stub_for(method: &str) -> Option<MethodRouter<AppState>> {
 ///
 /// Registers all vendored contract routes (as `501` stubs in this unit), merges
 /// the health-probe router and the OpenAPI spec, and layers the auth-context
-/// middleware, CORS, and HTTP tracing.
+/// middleware, the panic boundary, CORS, and HTTP tracing.
 ///
 /// # Panics
 ///
@@ -88,6 +89,14 @@ pub fn create_router(state: AppState) -> Router {
     .with_state(state)
     .merge(ferrofin_health::health_router(health_checkers))
     .merge(spec_router())
+    // `ExceptionMiddleware`: a panic below is answered `500` instead of
+    // dropping the connection. Startup runs it outside the response-time,
+    // compression and CORS middleware, which still dress its answer (theirs
+    // apply at `OnStarting`); inside them and the request span, its `500`
+    // gets the same headers and is traced like any other.
+    .layer(middleware::from_fn(
+        crate::panic_boundary::panic_boundary_layer,
+    ))
     // Route-templated per-request span (traces group by endpoint, not raw URL);
     // a sampled request's `trace_id` is stamped on for log↔trace correlation.
     // With OTLP export off the OTel context is invalid, so no `trace_id` is
@@ -342,6 +351,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(spec.status(), StatusCode::OK);
+    }
+
+    /// Everything logged while a test runs.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A panicking handler (here a readiness check, so no production route is
+    /// added) gets `ExceptionMiddleware`'s answer for an untyped exception
+    /// instead of a dropped connection: `500`, `text/plain`, its fixed body, and
+    /// the layers outside it still run. The panic is logged once with the
+    /// method, the path and the message, never the query, and the router keeps
+    /// serving.
+    #[tokio::test]
+    async fn a_handler_panic_is_answered_500_and_logged_once() {
+        use crate::response_time::RESPONSE_TIME_HEADER;
+        use axum::http::header::CONTENT_TYPE;
+
+        const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let exploding = ferrofin_health::FnChecker::new("exploding", || async {
+            panic!("the health check exploded")
+        });
+        let router =
+            create_router(fake_state().with_health_checkers(vec![std::sync::Arc::new(exploding)]));
+
+        let response = tokio::time::timeout(
+            ANSWER_TIMEOUT,
+            router.clone().oneshot(
+                Request::builder()
+                    .uri("/health?api_key=secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("answered in time")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()[CONTENT_TYPE], "text/plain");
+        assert!(response.headers().contains_key(RESPONSE_TIME_HEADER));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"Error processing request.");
+
+        let log = String::from_utf8(captured.0.lock().expect("log").clone()).expect("utf-8");
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("Error processing request"))
+            .collect();
+        assert_eq!(lines.len(), 1, "one boundary line: {log}");
+        assert!(lines[0].contains(" ERROR "), "{}", lines[0]);
+        // The event's own fields, after the request span's prefix.
+        let (_, fields) = lines[0]
+            .split_once("Error processing request")
+            .expect("the message");
+        assert!(fields.contains("http.request.method=GET"), "{fields}");
+        assert!(fields.contains("url.path=/health "), "{fields}");
+        assert!(
+            fields.contains("panic=the health check exploded"),
+            "{fields}"
+        );
+        assert!(!log.contains("api_key"), "the query is never logged: {log}");
+
+        let live = tokio::time::timeout(
+            ANSWER_TIMEOUT,
+            router.oneshot(
+                Request::builder()
+                    .uri("/health/live")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("answered in time")
+        .unwrap();
+        assert_eq!(live.status(), StatusCode::OK);
     }
 
     #[test]

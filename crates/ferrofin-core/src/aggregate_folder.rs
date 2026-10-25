@@ -3,12 +3,16 @@
 //! it.
 //!
 //! Port of `LibraryManager.CreateRootFolder()`
-//! (`Emby.Server.Implementations/Library/LibraryManager.cs:838-888`). Upstream:
+//! (v12.2 `Emby.Server.Implementations/Library/LibraryManager.cs:1101-1150`).
+//! Upstream:
 //!
 //! 1. resolves (or creates) an `AggregateFolder` at
 //!    `ApplicationPaths.RootFolderPath` (`{program data}/root`) whose id is
-//!    `GetNewItemId(rootFolderPath, typeof(AggregateFolder))`;
-//! 2. creates `{program data}/data/playlists` and a `PlaylistsFolder` for it;
+//!    `GetNewItemId(rootFolderPath, typeof(AggregateFolder))`, resetting its
+//!    `Path` when the program data directory moved;
+//! 2. creates `{program data}/data/playlists` and a `PlaylistsFolder` for it,
+//!    keeping the row stored under that folder's id only while it is at that
+//!    directory, and saving the folder at the directory otherwise;
 //! 3. sets `folder.ParentId = rootFolder.Id` and calls
 //!    `rootFolder.AddVirtualChild(folder)`.
 //!
@@ -35,7 +39,7 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::persistence::ItemPersistenceService as _;
 use uuid::Uuid;
 
-use crate::item_persistence_service::row_exists;
+use crate::item_persistence_service::{container_row, row_exists};
 use crate::item_type_lookup::{self, IdDerivation};
 
 /// The display name Jellyfin gives the aggregate (physical) root folder — the
@@ -153,8 +157,9 @@ impl AggregateFolderStore {
         )
     }
 
-    /// Provisions the aggregate root and re-parents its virtual children,
-    /// returning both root ids.
+    /// Provisions the aggregate root and the playlists folder, moves both to
+    /// this server's directories when the stored rows are elsewhere, and
+    /// re-parents the aggregate's virtual children, returning both root ids.
     ///
     /// Idempotent, and meant to be called **once per process** from the
     /// composition root — it is startup work, not request work.
@@ -166,14 +171,34 @@ impl AggregateFolderStore {
     pub async fn ensure(&self) -> Result<RootFolderIds, ServiceError> {
         let aggregate = self.id();
         let user_root = self.user_root_id();
-        if !row_exists(&self.db, aggregate).await? {
-            if let Err(e) = tokio::fs::create_dir_all(&self.root_folder_path).await {
-                tracing::warn!(path = %self.root_folder_path.display(), %e,
-                    "could not create the physical root directory");
+        let root_path = self.root_folder_path.to_string_lossy();
+        match container_row(&self.db, aggregate).await? {
+            None => {
+                if let Err(e) = tokio::fs::create_dir_all(&self.root_folder_path).await {
+                    tracing::warn!(path = %self.root_folder_path.display(), %e,
+                        "could not create the physical root directory");
+                }
+                self.insert_aggregate(aggregate).await?;
+                tracing::info!(item_id = %aggregate, path = %root_path,
+                    "created the aggregate (physical) root folder");
             }
-            self.insert_aggregate(aggregate).await?;
-            tracing::info!(item_id = %aggregate, path = %self.root_folder_path.display(),
-                "created the aggregate (physical) root folder");
+            // "In case program data folder was moved": the stored path,
+            // expanded, against this server's, compared ordinally
+            // (LibraryManager.cs:1109-1113). The id is derived from the
+            // program-data-relative key, so it survives the move; the path
+            // does not.
+            Some(row)
+                if row.path.as_deref().map(|p| self.expand(p)).as_deref()
+                    != Some(root_path.as_ref()) =>
+            {
+                crate::item_persistence_service::repath_root_folder(
+                    &self.db, aggregate, &root_path,
+                )
+                .await?;
+                tracing::info!(item_id = %aggregate, from = row.path.as_deref().unwrap_or_default(),
+                    path = %root_path, "reset the root folder's path");
+            }
+            Some(_) => {}
         }
         self.repair_playlists_folder(aggregate, user_root).await?;
         Ok(RootFolderIds {
@@ -196,9 +221,23 @@ impl AggregateFolderStore {
         .await
     }
 
+    /// A path as `BaseItemRepository.Map` reads it back: Jellyfin's
+    /// `%AppDataPath%` token, in any case, replaced by this server's data
+    /// directory (`ExpandVirtualPath`, ApplicationHost.cs:286-297). Only the
+    /// data token: neither folder this store keeps lives under the metadata
+    /// directory.
+    fn expand(&self, stored: &str) -> String {
+        ferrofin_util::string_extensions::replace_ignore_ascii_case(
+            stored,
+            crate::app_paths::FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH,
+            &self.data_path.to_string_lossy(),
+        )
+    }
+
     /// `folder.ParentId = rootFolder.Id` for the playlists folder, plus the
     /// one-shot rewrite of a legacy `ManualPlaylistsFolder` row onto 10.11.8's
-    /// identity, and the folder's row itself when there is none.
+    /// identity, the folder's row itself when there is none, and its move to
+    /// the data directory when the row is somewhere else.
     ///
     /// Each is a write to one row, run once per process.
     async fn repair_playlists_folder(
@@ -227,25 +266,58 @@ impl AggregateFolderStore {
         // `CreateRootFolder` saves the folder whenever its row is missing, so
         // a fresh server has it — and a user who can see a playlist the
         // library scan found has a Playlists view — before any playlist is
-        // made through the API. A row Jellyfin wrote with a moved data
-        // directory is found by its `%AppDataPath%` path and kept.
+        // made through the API. This is the one place that provisions it:
+        // upstream runs `CreateRootFolder` once per process
+        // (`LibraryManager.RootFolder`, LibraryManager.cs:226), and no request
+        // path here makes the row either.
+        //
+        // Upstream looks the row up by id (`GetItemById(folder.Id)`,
+        // LibraryManager.cs:1132) and keeps it only while its path, expanded,
+        // is the folder's (`OrdinalIgnoreCase`, :1134); otherwise it saves the
+        // folder at its directory under the same id (:1139-1144). That id is
+        // derived from the program-data-relative key `data\playlists`, so a
+        // database adopted from a Jellyfin whose data directory was elsewhere,
+        // or one whose data directory moved, still carries the row under this
+        // id, and Jellyfin never writes it under another. The path fallback
+        // (`container_at` accepts the resolved path and the `%AppDataPath%`
+        // token) is defensive: a row already at the folder's path under some
+        // other id is kept, rather than given a second folder beside it that
+        // would split the playlists and list two Playlists views.
         let path = self.playlists_path();
-        if !row_exists(&self.db, correct).await?
-            && crate::item_persistence_service::container_at(&self.db, &path.to_string_lossy())
-                .await?
-                .is_none()
-        {
-            if let Err(e) = tokio::fs::create_dir_all(&path).await {
-                tracing::warn!(path = %path.display(), %e,
-                    "could not create the playlists directory");
+        let path_str = path.to_string_lossy();
+        match container_row(&self.db, correct).await? {
+            Some(row) => {
+                let at_folder = row.path.as_deref().is_some_and(|stored| {
+                    ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                        &self.expand(stored),
+                        &path_str,
+                    )
+                });
+                if !at_folder {
+                    self.repath_playlists_folder(correct, aggregate, row.path.as_deref())
+                        .await?;
+                }
             }
-            let dir = tokio::fs::metadata(&path).await.ok();
-            let row = playlists_folder_row(correct, &path, Some(aggregate), dir.as_ref());
-            crate::item_persistence_service::FerrofinItemPersistenceService::new(self.db.clone())
-                .save_items(std::slice::from_ref(&row))
-                .await?;
-            tracing::info!(item_id = %correct, path = %path.display(),
-                "created the playlists folder");
+            None => {
+                if crate::item_persistence_service::container_at(&self.db, &path_str)
+                    .await?
+                    .is_none()
+                {
+                    if let Err(e) = tokio::fs::create_dir_all(&path).await {
+                        tracing::warn!(path = %path.display(), %e,
+                            "could not create the playlists directory");
+                    }
+                    let dir = tokio::fs::metadata(&path).await.ok();
+                    let row = playlists_folder_row(correct, &path, Some(aggregate), dir.as_ref());
+                    crate::item_persistence_service::FerrofinItemPersistenceService::new(
+                        self.db.clone(),
+                    )
+                    .save_items(std::slice::from_ref(&row))
+                    .await?;
+                    tracing::info!(item_id = %correct, path = %path.display(),
+                        "created the playlists folder");
+                }
+            }
         }
         // A row A4 parented straight to the `UserRootFolder` (or one left
         // parentless) moves onto the aggregate, where `CreateRootFolder` puts
@@ -255,6 +327,46 @@ impl AggregateFolderStore {
             &self.db, correct, aggregate, user_root,
         )
         .await
+    }
+
+    /// Saves the playlists folder `id`, stored at `stored`, at this server's
+    /// `{data}/playlists` under the aggregate, dated from that directory as a
+    /// new folder is: what `CreateRootFolder` does when the data directory
+    /// moved (LibraryManager.cs:1116-1144).
+    ///
+    /// Not onto a directory another row already holds: that would list two
+    /// Playlists folders at one path, so both rows are left as they are.
+    async fn repath_playlists_folder(
+        &self,
+        id: Uuid,
+        aggregate: Uuid,
+        stored: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        let path = self.playlists_path();
+        let path_str = path.to_string_lossy();
+        if let Some(other) =
+            crate::item_persistence_service::container_at(&self.db, &path_str).await?
+        {
+            tracing::warn!(item_id = %id, other = %other, from = stored.unwrap_or_default(),
+                path = %path_str,
+                "playlists folder left at its old path: another row holds its directory");
+            return Ok(());
+        }
+        if let Err(e) = tokio::fs::create_dir_all(&path).await {
+            tracing::warn!(path = %path_str, %e, "could not create the playlists directory");
+        }
+        let dir = tokio::fs::metadata(&path).await.ok();
+        let now = chrono::Utc::now();
+        let dates = dir
+            .as_ref()
+            .map_or((now, now), crate::library_scan::created_and_modified);
+        crate::item_persistence_service::repath_virtual_child(
+            &self.db, id, &path_str, aggregate, dates, now,
+        )
+        .await?;
+        tracing::info!(item_id = %id, from = stored.unwrap_or_default(), path = %path_str,
+            "moved the playlists folder to the data directory");
+        Ok(())
     }
 }
 
@@ -301,8 +413,9 @@ pub(crate) fn playlists_folder_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{fetch_item, seed_folder_item, test_db};
+    use crate::test_support::{fetch_item, seed_folder_item, set_item_path, test_db};
     use ferrofin_db::store::guid_to_db as db_guid;
+    use rstest::rstest;
 
     fn store(db: &Database, tmp: &tempfile::TempDir) -> AggregateFolderStore {
         AggregateFolderStore::new(
@@ -383,6 +496,53 @@ mod tests {
         );
         assert!(store.playlists_path().is_dir());
         assert_eq!(store.ensure().await.expect("again"), ids);
+    }
+
+    /// gl-343: a playlists folder already at the folder's path under another
+    /// id, stored resolved or with Jellyfin's `%AppDataPath%` token, is kept
+    /// as it is: startup provisions no second folder beside it.
+    #[rstest]
+    #[case::resolved_path(false)]
+    #[case::app_data_token(true)]
+    #[tokio::test]
+    async fn ensure_keeps_a_playlists_folder_found_by_path(#[case] token: bool) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let db = test_db().await;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let store = store(&db, &tmp);
+            let stored_path = if token {
+                "%AppDataPath%/playlists".to_owned()
+            } else {
+                store.playlists_path().to_string_lossy().into_owned()
+            };
+            let foreign = Uuid::from_u128(0xADA);
+            seed_folder_item(
+                &db,
+                foreign,
+                BaseItemKind::PlaylistsFolder,
+                "Playlists",
+                None,
+            )
+            .await;
+            set_item_path(&db, foreign, &stored_path).await;
+
+            store.ensure().await.expect("ensure");
+            store.ensure().await.expect("again");
+
+            let derived = store.playlists_id().expect("id");
+            assert_ne!(derived, foreign);
+            assert!(
+                !row_exists(&db, derived).await.expect("probe"),
+                "no second playlists folder under the derived id"
+            );
+            assert_eq!(
+                fetch_item(&db, foreign).await.path.as_deref(),
+                Some(stored_path.as_str()),
+                "the row found by path is kept as it is"
+            );
+        })
+        .await
+        .expect("the test finishes");
     }
 
     /// The folder carries `CreateRootFolder`'s dates: created and modified
@@ -534,5 +694,155 @@ mod tests {
 
         assert_eq!(fetch_item(&db, legacy).await.id, db_guid(legacy));
         assert_eq!(fetch_item(&db, correct).await.id, db_guid(correct));
+    }
+
+    /// gl-910: a data directory moved under an existing database leaves both
+    /// rows at the old paths, under the same ids (both derive from
+    /// program-data-relative keys). `CreateRootFolder` resets the root
+    /// folder's path and saves the playlists folder at the new one, under the
+    /// aggregate and dated from its directory (LibraryManager.cs:1109-1144),
+    /// and the next start finds nothing to do.
+    #[tokio::test]
+    async fn ensure_repaths_the_root_and_playlists_folders_after_a_move() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        let user_root = store.user_root_id();
+        let aggregate = store.id();
+        let playlists = store.playlists_id().expect("playlists id");
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        set_item_path(&db, aggregate, "/moved-from/root").await;
+        seed_folder_item(
+            &db,
+            user_root,
+            BaseItemKind::UserRootFolder,
+            "Media Folders",
+            None,
+        )
+        .await;
+        seed_folder_item(
+            &db,
+            playlists,
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            Some(user_root),
+        )
+        .await;
+        set_item_path(&db, playlists, "/moved-from/data/playlists").await;
+        let dir = store.playlists_path();
+        std::fs::create_dir_all(&dir).expect("dir");
+        let written = chrono::DateTime::parse_from_rfc3339("2021-02-03T04:05:06Z")
+            .expect("date")
+            .with_timezone(&chrono::Utc);
+        std::fs::File::open(&dir)
+            .expect("open dir")
+            .set_modified(written.into())
+            .expect("set mtime");
+
+        let before = chrono::Utc::now();
+        let ids = store.ensure().await.expect("ensure");
+        let after = chrono::Utc::now();
+
+        assert_eq!(ids.aggregate, aggregate);
+        assert_eq!(
+            fetch_item(&db, aggregate).await.path.as_deref(),
+            Some(store.path().to_string_lossy().as_ref()),
+            "Resetting root folder path"
+        );
+        let row = fetch_item(&db, playlists).await;
+        assert_eq!(
+            row.path.as_deref(),
+            Some(dir.to_string_lossy().as_ref()),
+            "the playlists folder is saved at the new path"
+        );
+        assert_eq!(row.parent_id, Some(db_guid(aggregate)));
+        assert_eq!(row.top_parent_id, Some(db_guid(playlists)));
+        assert_eq!(row.date_modified, Some(written), "LastWriteTimeUtc");
+        assert_eq!(row.date_created, Some(written), "CreationTimeUtc");
+        let saved = row.date_last_saved.expect("saved");
+        assert!((before..=after).contains(&saved), "{saved}");
+
+        // The next start is repair-free: neither row is written again.
+        let root_row = fetch_item(&db, aggregate).await;
+        store.ensure().await.expect("again");
+        assert_eq!(fetch_item(&db, aggregate).await, root_row);
+        assert_eq!(fetch_item(&db, playlists).await, row);
+    }
+
+    /// The re-path is for a moved folder only. A row already at the folder,
+    /// stored resolved, with Jellyfin's `%AppDataPath%` token, or differing
+    /// only in case (`CreateRootFolder` compares the expanded path
+    /// `OrdinalIgnoreCase`), is kept exactly as it is, and so is the root.
+    #[rstest]
+    #[case::resolved(None)]
+    #[case::app_data_token(Some("%AppDataPath%/playlists"))]
+    #[case::token_in_another_case(Some("%APPDATAPATH%/Playlists"))]
+    #[tokio::test]
+    async fn ensure_keeps_a_playlists_folder_already_at_its_path(#[case] stored: Option<&str>) {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        let ids = store.ensure().await.expect("provision");
+        let playlists = store.playlists_id().expect("playlists id");
+        if let Some(stored) = stored {
+            set_item_path(&db, playlists, stored).await;
+        }
+        let (root_row, row) = (
+            fetch_item(&db, ids.aggregate).await,
+            fetch_item(&db, playlists).await,
+        );
+
+        store.ensure().await.expect("again");
+
+        assert_eq!(fetch_item(&db, ids.aggregate).await, root_row);
+        assert_eq!(fetch_item(&db, playlists).await, row);
+    }
+
+    /// A root folder row with no path at all is given this server's, as
+    /// `CreateRootFolder`'s ordinal compare treats a null path as moved.
+    #[tokio::test]
+    async fn ensure_sets_the_root_folder_path_when_it_has_none() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        let aggregate = store.id();
+        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
+        assert_eq!(fetch_item(&db, aggregate).await.path, None);
+
+        store.ensure().await.expect("ensure");
+
+        assert_eq!(
+            fetch_item(&db, aggregate).await.path.as_deref(),
+            Some(store.path().to_string_lossy().as_ref())
+        );
+    }
+
+    /// A moved playlists folder is not saved onto a path another row already
+    /// holds: that would list two Playlists folders at one directory.
+    #[tokio::test]
+    async fn ensure_does_not_repath_onto_a_folder_another_row_holds() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = store(&db, &tmp);
+        store.ensure().await.expect("provision");
+        let playlists = store.playlists_id().expect("playlists id");
+        set_item_path(&db, playlists, "/moved-from/data/playlists").await;
+        let foreign = Uuid::from_u128(0xADA);
+        seed_folder_item(
+            &db,
+            foreign,
+            BaseItemKind::PlaylistsFolder,
+            "Playlists",
+            None,
+        )
+        .await;
+        set_item_path(&db, foreign, &store.playlists_path().to_string_lossy()).await;
+
+        store.ensure().await.expect("again");
+
+        assert_eq!(
+            fetch_item(&db, playlists).await.path.as_deref(),
+            Some("/moved-from/data/playlists")
+        );
     }
 }

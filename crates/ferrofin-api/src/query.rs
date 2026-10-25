@@ -239,8 +239,9 @@ fn route_shape(path: &str) -> String {
         .join("/")
 }
 
-/// Serde calls `deserialize_struct` with aliases as well as declared names.
-fn fields<T: DeserializeOwned>() -> &'static [&'static str] {
+/// The query keys a DTO binds: serde calls `deserialize_struct` with aliases as
+/// well as declared names.
+pub(crate) fn fields<T: DeserializeOwned>() -> &'static [&'static str] {
     match T::deserialize(Capture) {
         Err(Captured(fields)) => fields,
         Ok(_) => &[],

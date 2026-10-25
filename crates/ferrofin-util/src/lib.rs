@@ -4,7 +4,11 @@
 //! translated to idiomatic Rust while preserving observable behavior (the
 //! upstream xUnit tests are ported verbatim as the oracle). [`process_priority`]
 //! is the OS process priority Jellyfin sets through .NET's
-//! `Process.PriorityClass`.
+//! `Process.PriorityClass`, [`http_client`] holds the .NET `HttpClient`
+//! defaults Jellyfin's outbound requests inherit, [`panic`](mod@panic)
+//! reads a caught panic's message where upstream's `catch` reads
+//! `Exception.Message`, and [`stable_sort`] is LINQ `OrderBy`'s tolerance of a
+//! comparer that is not a total order.
 
 pub mod copy_to_extensions;
 pub mod current_culture;
@@ -15,6 +19,8 @@ pub mod error;
 pub mod file_helper;
 pub mod formatting_stream_writer;
 pub mod guid_extensions;
+pub mod http_client;
+pub mod panic;
 pub mod path_extensions;
 pub mod path_helper;
 pub mod process_priority;
@@ -22,6 +28,7 @@ pub mod read_only_list_extension;
 pub mod shuffle_extensions;
 pub mod sort_name;
 pub mod split_string_extensions;
+pub mod stable_sort;
 pub mod stream_extensions;
 pub mod string_builder_extensions;
 pub mod string_extensions;

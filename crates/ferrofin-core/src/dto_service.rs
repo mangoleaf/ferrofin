@@ -4831,12 +4831,25 @@ impl FerrofinDtoService {
         // UserData can carry UnplayedItemCount (C# AttachUserSpecificInfo folder branch).
         let played_counts = match user {
             Some(user) if options.enable_user_data => {
+                // The folders whose `UserData` reads the counts: v12.2 batches
+                // `SupportsUserDataFromChildren && (SupportsPlayedStatus ||
+                // RecursiveItemCount)` (DtoService.cs:207-209), the guards the
+                // fill site applies. A music artist supports no played status,
+                // so an artists page without `RecursiveItemCount` counts
+                // nothing — batched anyway, the plain `/Artists` list paid two
+                // closure counts over every artist and dropped them.
                 let counted = |i: &&BaseItemEntity| {
+                    let kind = row_kind(i);
                     runtime_is_folder(i)
                         && !matches!(
-                            row_kind(i),
+                            kind,
                             BaseItemKind::CollectionFolder | BaseItemKind::UserView
                         )
+                        && kinds::supports_user_data_from_children(kind)
+                        && (kinds::supports_played_status(
+                            kind,
+                            parse_media_type(i.media_type.as_deref()),
+                        ) || options.contains_field(ItemFields::RecursiveItemCount))
                 };
                 let folder_ids: Vec<Uuid> = items.iter().filter(counted).map(row_id).collect();
                 // Only a page has a batch: `GetBaseItemDto` (by id) passes none
@@ -4852,20 +4865,11 @@ impl FerrofinDtoService {
                 };
                 // `Folder.FillUserDataDtoValues` (v12.2 Folder.cs:2032-2060)
                 // counts a folder with no batch entry (0/0 on a page, or read by
-                // id) per item, behind the same guards the fill site applies:
-                // through its links when it has any, else through its
-                // descendants.
+                // id) per item, behind the same guards: through its links when
+                // it has any, else through its descendants.
                 let unbatched: Vec<Uuid> = items
                     .iter()
                     .filter(counted)
-                    .filter(|i| {
-                        let kind = row_kind(i);
-                        kinds::supports_user_data_from_children(kind)
-                            && (kinds::supports_played_status(
-                                kind,
-                                parse_media_type(i.media_type.as_deref()),
-                            ) || options.contains_field(ItemFields::RecursiveItemCount))
-                    })
                     .map(row_id)
                     .filter(|id| !counts.contains_key(id))
                     .collect();
@@ -6882,6 +6886,74 @@ mod tests {
         );
     }
 
+    /// v12.2 `DtoService.cs:207-209`: a page batches the played/total counts
+    /// only of the folders whose `UserData` reads them —
+    /// `SupportsUserDataFromChildren && (SupportsPlayedStatus ||
+    /// RecursiveItemCount)`. A music artist folder supports no played status
+    /// (`MusicArtist.cs:48`), so an artists page without `RecursiveItemCount`
+    /// has nothing to count: batched anyway, the plain `/Artists` list paid two
+    /// closure counts over every artist (22 ms of its 47 on the gl-637 corpus)
+    /// and dropped them at the fill site.
+    #[tokio::test]
+    async fn a_page_batches_only_the_folders_its_user_data_reads() {
+        let db = test_db().await;
+        let music = Uuid::new_v4();
+        seed_folder_item(&db, music, BaseItemKind::Folder, "music", None).await;
+        let artist_id = Uuid::new_v4();
+        seed_folder_item(
+            &db,
+            artist_id,
+            BaseItemKind::MusicArtist,
+            "OnDisk",
+            Some(music),
+        )
+        .await;
+        let season_id = Uuid::new_v4();
+        seed_folder_item(&db, season_id, BaseItemKind::Season, "Season 1", None).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let page = [
+            fetch_item(&db, artist_id).await,
+            fetch_item(&db, season_id).await,
+        ];
+        for (fields, expected) in [
+            (vec![], vec![season_id]),
+            (
+                vec![ItemFields::RecursiveItemCount],
+                vec![artist_id, season_id],
+            ),
+        ] {
+            let counts = FakeCounts::default();
+            let asks = Arc::clone(&counts.played_batch_asks);
+            let svc = service_with_counts(db.clone(), counts);
+            let options = DtoOptions {
+                fields: fields.clone(),
+                ..DtoOptions::default()
+            };
+            let dtos = svc
+                .get_base_item_dtos(&page, &options, Some(&user), None, true)
+                .await
+                .unwrap();
+            assert_eq!(*asks.lock().expect("asks"), expected, "fields {fields:?}");
+            let artist = &dtos[0];
+            assert_eq!(
+                artist.recursive_item_count,
+                (!fields.is_empty()).then_some(4),
+                "fields {fields:?}"
+            );
+            assert_eq!(
+                artist
+                    .user_data
+                    .as_ref()
+                    .and_then(|u| u.unplayed_item_count),
+                None
+            );
+            assert_eq!(
+                dtos[1].user_data.as_ref().unwrap().unplayed_item_count,
+                Some(3)
+            );
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // a flat sequence of per-kind assertions
     async fn folder_user_data_carries_unplayed_item_count() {
@@ -7186,6 +7258,8 @@ mod tests {
         total: i32,
         /// Every parent id the child-count batch was asked for, in order.
         child_count_asks: Arc<std::sync::Mutex<Vec<Uuid>>>,
+        /// Every folder id the played/total batch was asked for, in order.
+        played_batch_asks: Arc<std::sync::Mutex<Vec<Uuid>>>,
     }
 
     impl Default for FakeCounts {
@@ -7195,6 +7269,7 @@ mod tests {
                 played: 1,
                 total: 4,
                 child_count_asks: Arc::default(),
+                played_batch_asks: Arc::default(),
             }
         }
     }
@@ -7270,6 +7345,10 @@ mod tests {
             _user: &UserEntity,
         ) -> Result<HashMap<Uuid, ferrofin_traits::persistence::PlayedAndTotal>, ServiceError>
         {
+            self.played_batch_asks
+                .lock()
+                .expect("asks")
+                .extend_from_slice(folder_ids);
             // Every folder reports the same counts (1 of 4 leaf descendants
             // played → 3 unplayed, by default); 0/0 is left out, as the real
             // service leaves it.

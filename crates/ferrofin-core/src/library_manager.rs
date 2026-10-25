@@ -55,6 +55,7 @@ use ferrofin_traits::persistence::{
     ItemCountService, ItemPersistenceService, ItemRepository, ItemWithCounts, PeopleRepository,
 };
 use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+use ferrofin_util::stable_sort::stable_sort_by;
 
 use crate::library_scan::{LaneRefresh, PriorityLane, ScanCancel, ScanPasses, ScanRun};
 use ferrofin_traits::library::ScanProgressSink;
@@ -427,7 +428,9 @@ pub(crate) async fn season_episode_rows(
         }
     }
     if number != Some(0) {
-        matches.sort_by(|(left, _), (right, _)| left.compare(right));
+        // `LibraryManager.Sort`'s LINQ `OrderBy`: stable, and the aired-order
+        // comparer is not a total order, on which `sort_by` may panic.
+        stable_sort_by(&mut matches, |(left, _), (right, _)| left.compare(right));
     }
     Ok(matches.into_iter().map(|(_, row)| row).collect())
 }
@@ -1497,22 +1500,8 @@ impl FerrofinLibraryManager {
             }
             None => Vec::new(),
         };
-        let mut episodes = self.items.filter_folder_children(episodes, query).await?;
-        let mut post_query = query.clone();
-        if let [(ferrofin_model::live_tv::ItemSortBy::AiredEpisodeOrder, direction)] =
-            query.order_by.as_slice()
-        {
-            episodes.sort_by(|left, right| {
-                let ordering = episode_air_order(left).compare(&episode_air_order(right));
-                if *direction == ferrofin_model::dto::SortOrder::Descending {
-                    ordering.reverse()
-                } else {
-                    ordering
-                }
-            });
-            post_query.order_by.clear();
-        }
-        self.folder_post_filter_result(episodes, &post_query).await
+        let episodes = self.items.filter_folder_children(episodes, query).await?;
+        self.folder_post_filter_result(episodes, query).await
     }
 
     /// Load physical and linked Folder children with the existing access checks.
@@ -6877,6 +6866,165 @@ mod tests {
         ) -> Result<(), ServiceError> {
             Ok(())
         }
+    }
+
+    /// One episode row of [`long_season_episodes`]: its name (also its
+    /// `SortName` order), season and episode numbers, premiere day and
+    /// `Data` blob.
+    type LongSeasonRow = (
+        String,
+        i64,
+        Option<i64>,
+        Option<i64>,
+        Option<serde_json::Value>,
+    );
+
+    /// Saves a series with seasons 0 and 2 and `episodes` (all in season 2's
+    /// presentation, specials in season 0), then lists season 2 through
+    /// `season_episode_rows` (the season listing's and the scan's sort) and
+    /// returns the names in the order it gave.
+    async fn long_season_episodes(
+        episodes: Vec<LongSeasonRow>,
+        include_specials: bool,
+    ) -> Vec<String> {
+        let db = test_db().await;
+        let library = manager(&db);
+        let series = Uuid::new_v4();
+        let key = "long-series";
+        let season = |id: Uuid, number: i64| BaseItemEntity {
+            id: guid_to_db(id),
+            type_: "MediaBrowser.Controller.Entities.TV.Season".into(),
+            name: Some(format!("Season {number}")),
+            index_number: Some(number),
+            parent_id: Some(guid_to_db(series)),
+            series_id: Some(guid_to_db(series)),
+            series_presentation_unique_key: Some(key.into()),
+            presentation_unique_key: Some(format!("long-season-{number}")),
+            is_folder: true,
+            ..Default::default()
+        };
+        let (specials, two) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut rows = vec![
+            BaseItemEntity {
+                id: guid_to_db(series),
+                type_: "MediaBrowser.Controller.Entities.TV.Series".into(),
+                name: Some("Long show".into()),
+                is_folder: true,
+                presentation_unique_key: Some(key.into()),
+                ..Default::default()
+            },
+            season(specials, 0),
+            season(two, 2),
+        ];
+        for (name, season_number, index, day, data) in episodes {
+            let season_id = if season_number == 0 { specials } else { two };
+            rows.push(BaseItemEntity {
+                id: guid_to_db(Uuid::new_v4()),
+                type_: "MediaBrowser.Controller.Entities.TV.Episode".into(),
+                sort_name: Some(name.to_lowercase()),
+                name: Some(name),
+                parent_id: Some(guid_to_db(season_id)),
+                season_id: Some(guid_to_db(season_id)),
+                series_id: Some(guid_to_db(series)),
+                series_presentation_unique_key: Some(key.into()),
+                parent_index_number: Some(season_number),
+                index_number: index,
+                premiere_date: day.map(|day| {
+                    chrono::DateTime::from_timestamp(1_600_000_000 + day * 86_400, 0).unwrap()
+                }),
+                data: data.map(|data| data.to_string()),
+                ..Default::default()
+            });
+        }
+        library.persistence.save_items(&rows).await.unwrap();
+        let season_row = library.items.retrieve_item(two).await.unwrap().unwrap();
+        season_episode_rows(
+            library.items.as_ref(),
+            two,
+            season_row,
+            &InternalItemsQuery::default(),
+            include_specials,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|row| row.name)
+        .collect()
+    }
+
+    /// gl-905, the undated shape: 22 unnumbered season-2 episodes in
+    /// `SortName` order, premiered on days 20 to 11, then one undated, then
+    /// days 10 to 0. The aired-order comparer calls the undated row equal to
+    /// two rows it orders apart, which `slice::sort_by` panicked on.
+    #[tokio::test]
+    async fn a_season_with_an_undated_episode_among_dated_ones_lists_them_by_date() {
+        let days = (11..=20)
+            .rev()
+            .map(Some)
+            .chain([None])
+            .chain((0..=10).rev().map(Some));
+        let rows = days
+            .enumerate()
+            .map(|(row, day)| {
+                let name = day.map_or_else(
+                    || format!("Row {row:02} undated"),
+                    |day| format!("Row {row:02} day {day:02}"),
+                );
+                (name, 2, None, day, None)
+            })
+            .collect();
+        let names = long_season_episodes(rows, false).await;
+        assert_eq!(names.len(), 22);
+        let dated: Vec<_> = names
+            .iter()
+            .filter(|name| !name.ends_with("undated"))
+            .collect();
+        let mut by_day = dated.clone();
+        by_day.sort_by_key(|name| name.rsplit(' ').next().map(str::to_owned));
+        assert_eq!(dated, by_day, "the dated episodes keep their date order");
+    }
+
+    /// gl-905, the positioned-special shape: a special that airs before
+    /// episode 20 of season 2, an unnumbered undated season-2 episode, then
+    /// episodes 20 down to 1, in that `SortName` order. The unnumbered row
+    /// comes before episode 1, episode 1 before the special, yet the comparer
+    /// calls the unnumbered row equal to the special ("Can't really compare").
+    #[tokio::test]
+    async fn a_season_with_a_special_and_an_unnumbered_episode_keeps_the_episode_order() {
+        let mut rows: Vec<LongSeasonRow> = vec![
+            (
+                "Row 00 special".into(),
+                0,
+                Some(1),
+                None,
+                Some(serde_json::json!({
+                    "AirsBeforeSeasonNumber": 2,
+                    "AirsBeforeEpisodeNumber": 20,
+                })),
+            ),
+            ("Row 01 unnumbered".into(), 2, None, None, None),
+        ];
+        rows.extend((1..=20).rev().enumerate().map(|(row, episode)| {
+            (
+                format!("Row {:02} episode {episode:02}", row + 2),
+                2,
+                Some(episode),
+                None,
+                None,
+            )
+        }));
+        let names = long_season_episodes(rows, true).await;
+        assert_eq!(names.len(), 22);
+        let episodes: Vec<_> = names
+            .iter()
+            .filter(|name| name.contains("episode"))
+            .collect();
+        let mut numbered = episodes.clone();
+        numbered.sort_by_key(|name| name.rsplit(' ').next().map(str::to_owned));
+        assert_eq!(episodes, numbered, "the numbered episodes keep their order");
+        let at = |suffix: &str| names.iter().position(|name| name.ends_with(suffix));
+        assert!(at("special") < at("episode 20"), "{names:?}");
+        assert!(at("special") > at("episode 19"), "{names:?}");
     }
 
     #[tokio::test]

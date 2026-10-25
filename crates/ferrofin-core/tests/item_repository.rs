@@ -1398,6 +1398,59 @@ async fn premiere_date_sort_falls_back_to_production_year() {
     assert_eq!(names, ["Newer", "Older"]);
 }
 
+/// A query sorted by `AiredEpisodeOrder` orders by `SortName`, as upstream's
+/// SQL does: `OrderMapper.MapOrderByField` has no arm for the key, and
+/// `ApplyOrder` adds the final `SortName`. The aired-order comparer belongs to
+/// the in-memory sorts only, so seasons and other items are not pushed to the
+/// front and specials not to the back.
+#[tokio::test]
+async fn aired_episode_order_query_sorts_by_sort_name() {
+    tokio::time::timeout(std::time::Duration::from_mins(1), async {
+        let db = fresh_db().await;
+        let persist = FerrofinItemPersistenceService::new(db.clone());
+        let repository = repo(&db);
+        let row = |id: u128, kind: BaseItemKind, name: &str, sort_name: &str| {
+            let mut row = item(Uuid::from_u128(id), kind, name);
+            row.sort_name = Some(sort_name.to_owned());
+            row
+        };
+        let mut episode = row(0xD02, BaseItemKind::Episode, "b", "001 - 0002 - b");
+        episode.parent_index_number = Some(1);
+        episode.index_number = Some(2);
+        let mut special = row(0xD03, BaseItemKind::Episode, "s", "000 - 0001 - s");
+        special.parent_index_number = Some(0);
+        special.index_number = Some(1);
+        let mut season = row(0xD04, BaseItemKind::Season, "Season 1", "0001");
+        season.index_number = Some(1);
+        persist
+            .save_items(&[
+                row(0xD01, BaseItemKind::Movie, "alpha", "alpha"),
+                episode,
+                special,
+                season,
+            ])
+            .await
+            .expect("save");
+
+        for (order, expected) in [
+            (SortOrder::Ascending, ["s", "Season 1", "b", "alpha"]),
+            (SortOrder::Descending, ["alpha", "b", "Season 1", "s"]),
+        ] {
+            let rows = repository
+                .get_item_list(&InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::AiredEpisodeOrder, order)],
+                    ..Default::default()
+                })
+                .await
+                .expect("query");
+            let names: Vec<_> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+            assert_eq!(names, expected, "sortBy=AiredEpisodeOrder {order:?}");
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
 #[tokio::test]
 async fn paged_user_data_sort_with_total_count_works() {
     use ferrofin_db::entities::users::UserEntity;

@@ -904,3 +904,32 @@ pub async fn configuration_with_path_substitution(
     config.update_configuration(&settings).await.expect("save");
     std::sync::Arc::new(config)
 }
+
+/// An in-memory log sink for a scoped `fmt` subscriber
+/// (`tracing_subscriber::fmt().with_writer(logs.clone())`).
+#[derive(Clone, Default)]
+pub struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    /// Everything logged so far, as text.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
