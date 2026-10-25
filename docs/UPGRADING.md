@@ -25,6 +25,32 @@ Nothing to do. Some "My Media" tiles change on their next refresh:
   default mode counts as its first and redraws the image past the 7-day gate, as Jellyfin
   does for an item's first refresh.
 
+## Unreleased — the Screen Grabber, and HDR chapter images
+
+Usually nothing to do. Three changes can show:
+- **Videos with no artwork get a frame as their poster.** The new "Screen Grabber" image
+  fetcher, which Jellyfin has, grabs a frame 10 % into a movie, episode, music video or
+  home video that has no Primary image from any other source. It runs on a video's first
+  scan and on a **Refresh metadata** that searches for missing metadata or replaces it, so
+  a library's first scan runs one more ffmpeg extraction per such video. A new library
+  ticks it, as does a library adopted from Jellyfin whose settings list it. A library that
+  saved image fetchers for a kind on an earlier Ferrofin (every library created from the
+  dashboard did) saved them without it, so it grabs nothing for that kind until you tick
+  **Screen Grabber** for it; a kind the library never saved choices for grabs. To grab
+  frames for videos scanned before, refresh the library once with **Search for missing
+  metadata** (Dashboard → Libraries → the library's menu → Refresh metadata). A video
+  whose first-scan grab fails is refreshed again by the next scan, as in Jellyfin.
+- **New libraries list image fetchers in Jellyfin's order.** The library dialog lists each
+  item type's image fetchers ordered by the server-wide order, then each provider's own
+  order (FanArt now comes before TheMovieDb for series, for example). This is the order a
+  library that never saved one already used, and a new library saves it. A library's
+  saved order is unchanged.
+- **HDR chapter images and thumbnails are tone-mapped.** Frames of HDR10, HLG and Dolby
+  Vision videos are converted to SDR when ffmpeg has `tonemapx` (jellyfin-ffmpeg) or
+  `zscale`; Dolby Vision with no HDR10, HLG or SDR base layer needs `tonemapx`. Images
+  extracted before stay as they were until they are extracted again; a frame-grabbed
+  poster is grabbed again by **Refresh metadata** with **Replace existing images**.
+
 ## Unreleased — Live TV sources are checked and read as Jellyfin reads them
 
 Usually nothing to do. Three changes can show on some Live TV sources:

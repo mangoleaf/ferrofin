@@ -63,6 +63,29 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Port Jellyfin's Screen Grabber (`VideoImageProvider`): a movie, episode, music video or
+  home video with no Primary image after the local, remote and embedded providers gets a
+  frame from its default video stream, 10 % into its runtime (10 s when the runtime is
+  unknown), on its first scan or a **Refresh metadata** that searches for missing metadata
+  or replaces it. The library's "Screen Grabber" image fetcher gates it, and a new library
+  ticks it. A first-scan grab that fails leaves the video to be refreshed again by the
+  next scan. `GET /Libraries/AvailableOptions` lists it last for
+  the video types, and lists each type's image fetchers in Jellyfin's order (the server-wide
+  image fetcher order, then each provider's own order) instead of registration order, so
+  the order a new library shows and saves is the order its scans already used
+- List each type's remote similarity providers (TheMovieDb, ListenBrainz) before Local
+  Genre/Tag in `GET /Libraries/AvailableOptions`, as Jellyfin 12.2 does
+- Extract a chapter image, video thumbnail or frame grab the standard way when the
+  I-frame attempt fails, as Jellyfin's `ExtractImage` does. A frame or embedded picture
+  counts as extracted only when ffmpeg exited successfully and wrote a non-empty file
+- Tone-map the frames of HDR10, HLG and Dolby Vision videos to SDR for chapter images,
+  thumbnails and frame grabs, as Jellyfin's `ExtractImageInternal` does: with `tonemapx`
+  (jellyfin-ffmpeg) when ffmpeg has it, else with `zscale` for all but Dolby Vision with
+  no HDR10, HLG or SDR base layer, under the 20 s HDR extraction timeout instead of 10 s
+- Port Jellyfin's `FFmpeg:imgExtractPerfTradeoff` startup option as
+  `FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF` (`ffmpeg_img_extract_perf_tradeoff` in
+  `config.toml`), off by default. On, frame extraction decodes keyframes only and skips
+  the 24-frame thumbnail sampling
 - Open an M3U tuner's playlist before saving it, as Jellyfin's `M3UTunerHost.Validate`
   does: a missing local playlist is a `404` and a failing playlist URL a `500`, where the
   tuner was saved and only the next guide refresh showed it empty. A Live TV source URL is
