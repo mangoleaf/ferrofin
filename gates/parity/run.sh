@@ -7,13 +7,15 @@
 #
 #   --oracle     the Jellyfin image (the pinned release image in gates/bench/testdata/jellyfin-image.txt)
 #   --ferrofin   the Ferrofin image under test
-#   --testdata   the benchmark corpus (config/, media/, ids.json, jellyfin/): default gates/bench/testdata
+#   --testdata   the benchmark corpus (config/, media/, ids.json, jellyfin/): default
+#                $FERROFIN_GATES_DIR/fixtures/bench-testdata
 #   --requests   a request file, or a directory of them (every *.jsonl in it); repeat it to send several
 #                sets as one (the sweep and the edge cases: --requests gates/parity/requests/sweep
 #                --requests gates/parity/requests/edge): default
 #                gates/parity/requests/tracer.jsonl; the full sweep is gates/parity/requests/sweep. Its writes each run
 #                on a fresh database copy: gates/parity/reset.sh restores both servers to the snapshot taken at boot
-#   --out        the run directory: default gates/parity/runs/<name>; never reused
+#   --out        the run directory: default $FERROFIN_GATES_DIR/runs/parity-<name>; never reused
+#                (the output root's layout is in gates/lib.sh)
 #   --gate       a release-gate run: a stale oracle pin, or an --oracle other than the pin, is refused
 #                (an ad-hoc run only warns)
 #
@@ -34,6 +36,8 @@ set -euo pipefail
 CALLER=$PWD
 cd "$(dirname "$0")/../.."
 START_EPOCH=$(date +%s)
+# shellcheck source=gates/lib.sh
+source gates/lib.sh          # the output root and the local-disk check
 # shellcheck source=gates/parity/lib.sh
 source gates/parity/lib.sh   # READY_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S, KILL_GRACE_S, POLL_S, and the readiness check
 
@@ -50,7 +54,7 @@ ORACLE_PORT=${PARITY_ORACLE_PORT:-18111}    # beside the benchmark's 18101 and 1
 FERROFIN_PORT=${PARITY_FERROFIN_PORT:-18113}
 
 ORACLE_IMAGE=""; FERROFIN_IMAGE=""; GATE=false
-TESTDATA=$PWD/gates/bench/testdata; REQUESTS=(); OUT=""
+TESTDATA=""; REQUESTS=(); OUT=""
 die() { echo "parity: $*" >&2; exit 2; }
 while [ $# -gt 0 ]; do
   case "$1" in --oracle|--ferrofin|--testdata|--requests|--out) [ $# -ge 2 ] || die "$1 needs a value";; esac
@@ -75,6 +79,7 @@ done
 (( ORACLE_PORT <= 65535 && FERROFIN_PORT <= 65535 && ORACLE_PORT != FERROFIN_PORT )) || die "the two ports are different and at most 65535"
 [[ "$PIN" =~ ^[01]$ ]] || die "PARITY_PIN is 0 or 1"
 ! $GATE || [ "$PIN" = 1 ] || die "a release-gate run is pinned: PARITY_PIN=0 is for ad-hoc runs and the harness's own tests"
+[ -n "$TESTDATA" ] || TESTDATA=$(gates_dir parity fixtures/bench-testdata) || exit 2
 TESTDATA=$(realpath -m "$(abs "$TESTDATA")")
 (( ${#REQUESTS[@]} )) || REQUESTS=("$PWD/gates/parity/requests/tracer.jsonl")
 request_args=()   # --requests once per set, in the order given: they are sent as one set
@@ -83,29 +88,19 @@ export READY_TIMEOUT_S HTTP_TIMEOUT_S CLEANUP_TIMEOUT_S   # gates/parity/reset.s
 DEADLINE=$((START_EPOCH + PARITY_CAP_S))
 
 SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
-RUNS_DIR=$PWD/gates/parity/runs
 run_name() {
   local base n=1 candidate
-  base="$(date +%Y%m%d-%H%M)-$SHA"
+  base="parity-$(date +%Y%m%d-%H%M)-$SHA"
   [ -z "$(git status --porcelain 2>/dev/null)" ] || base="$base-dirty"
   candidate=$base
   while [ -e "$RUNS_DIR/$candidate" ]; do n=$((n + 1)); candidate="$base-run$n"; done
   echo "$candidate"
 }
-OUT=$(realpath -m "$(abs "${OUT:-$RUNS_DIR/$(run_name)}")")
-# Every run copies and boots the corpus: that load belongs on a local disk, never a network share
-# (the same judgement as gates/adoption/lib.sh adoption_require_local, by the nearest existing parent).
-require_local() {
-  local dir=$1 types fs
-  until [ -e "$dir" ]; do dir=$(dirname "$dir"); done
-  types=$(findmnt -n -o FSTYPE -T "$dir") || die "refusing $1: cannot tell its filesystem"
-  for fs in $types; do
-    case $fs in nfs*|cifs|smb*|9p|ceph|afs|glusterfs|davfs|fuse.sshfs|fuse.rclone|fuse.glusterfs|fuse.s3fs|fuse.davfs2)
-      die "refusing $1: it is on a network filesystem ($fs); use a local disk";; esac
-  done
-}
+[ -n "$OUT" ] || { RUNS_DIR=$(gates_dir parity runs) || exit 2; OUT=$RUNS_DIR/$(run_name); }
+OUT=$(realpath -m "$(abs "$OUT")")
+# Every run copies and boots the corpus: that load belongs on a local disk, never a network share.
 command -v findmnt >/dev/null || die "findmnt not installed"
-require_local "$TESTDATA"; require_local "$OUT"
+gates_require_local "$TESTDATA" && gates_require_local "$OUT" || exit 2
 
 # ── preflight: nothing is booted, so a refusal leaves no run directory ─────────────────────────
 for t in docker python3 jq curl timeout; do command -v "$t" >/dev/null || die "$t not installed"; done
@@ -343,5 +338,5 @@ if [ ! -f "$OUT/report.html" ]; then
   FAIL_REASON=${FAIL_REASON:-the comparison wrote no report: $(tail -n1 "$OUT/diff.err")}
   rc=1
 fi
-echo "parity: report $OUT/report.html  (compare runs: python3 gates/bench/report.py --serve --parity-dir gates/parity/runs)"
+echo "parity: report $OUT/report.html  (compare runs: python3 gates/bench/report.py --serve 8097 $(dirname "$OUT") --parity-dir $(dirname "$OUT"))"
 exit "$rc"

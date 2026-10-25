@@ -178,7 +178,8 @@ containers_gone() { # no container left in the fake docker, no server process le
 }
 
 @test "run.sh: a ledger entry without a link fails the run before anything boots" {
-  mkdir -p repo/gates && cp -r "$PARITY" repo/gates/parity && ln -s "$PARITY/../bench" repo/gates/bench   # the layout run.sh finds its helpers in
+  mkdir -p repo/gates && cp -r "$PARITY" repo/gates/parity && ln -s "$PARITY/../bench" repo/gates/bench \
+    && ln -s "$PARITY/../lib.sh" repo/gates/lib.sh   # the layout run.sh finds its helpers in
   printf 'version = 1\n[[entry]]\nrequest = "a"\npath = "X"\nreason = "no link"\n' > repo/gates/parity/ledger.toml
   run repo/gates/parity/run.sh --testdata td --out out --oracle "$PIN" --ferrofin ferrofin:ok
   [ "$status" -eq 2 ]

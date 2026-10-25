@@ -25,11 +25,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Tooling
 - The four live checks moved under `gates/`: `bench/` → `gates/bench/`, `adoption/` →
-  `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. Each gate
-  behaves as before; run directories default to `gates/bench/runs/` and
-  `gates/parity/runs/`, and the benchmark corpus to `gates/bench/testdata/`, so an existing
-  `bench/testdata/`, `bench/runs/` or `parity/runs/` is moved by hand (the corpus can also be
-  passed with `--testdata`)
+  `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. The adoption,
+  benchmark and parity scripts take their directories from one output root, `FERROFIN_GATES_DIR` (absolute, on a local
+  disk, outside the repository): fixtures in `fixtures/` (`adoption-<recipe>`,
+  `bench-testdata`), scratch in `work/<gate>/`, runs in `runs/<gate>-<name>/`
+  (`gates/lib.sh`). `--fixtures`, `--testdata`, `--out` and `ADOPTION_WORK_DIR` still win;
+  with neither, a gate stops and names the variable. An existing corpus or run directory
+  (`bench/testdata/`, `bench/runs/`, `parity/runs/`) is moved under the root by hand (a run
+  renamed `bench-<name>` or `parity-<name>`), or passed with `--testdata` or `--out`
 - `gates/adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
   (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0) through an image on fresh
   fixture copies and diffs the answers against Jellyfin 12.2's own; fixtures are derived

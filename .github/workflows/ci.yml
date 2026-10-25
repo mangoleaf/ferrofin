@@ -185,7 +185,8 @@ jobs:
 
   shell-tests:
     if: *not-release-pr
-    # The shell tooling has its own tests: scripts/version.sh (release versioning),
+    # The shell tooling has its own tests: scripts/version.sh (release versioning), gates/lib.sh (the
+    # gates' output root, and how each gate's script takes its directories from it),
     # gates/adoption/ (the Jellyfin-adoption harness — its checks are driven with canned logs and
     # throwaway SQLite files; the real fixtures never run here), gates/verify/ (the live
     # scan-behaviour check — its logic is driven with canned /metrics text, its refusals
@@ -202,9 +203,9 @@ jobs:
           persist-credentials: false
           fetch-depth: 0   # version.bats reads tags
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil python3-icu python3-yaml
-      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh gates/verify/lib.sh gates/verify/scan-behaviour.sh
-      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats gates/adoption/tests/adoption.bats gates/parity/tests/parity.bats gates/verify/tests/verify.bats
-      - run: bats scripts/tests gates/adoption/tests gates/parity/tests gates/verify/tests
+      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh gates/lib.sh gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh gates/verify/lib.sh gates/verify/scan-behaviour.sh
+      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats gates/adoption/tests/adoption.bats gates/parity/tests/parity.bats gates/verify/tests/verify.bats gates/tests/gates.bats
+      - run: bats scripts/tests gates/tests gates/adoption/tests gates/parity/tests gates/verify/tests
       - run: python3 -m unittest discover -s gates/parity/tests
       - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - run: scripts/ci-config-check.sh check

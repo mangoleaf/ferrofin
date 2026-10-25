@@ -20,11 +20,16 @@
 # request catalogue alone, one endpoint at a time, p50/p95/p99 each (gates/bench/endpoints.py). `gate.py
 # endpoints PREVIOUS CANDIDATE` runs it A/B.
 #
+# --testdata defaults to $FERROFIN_GATES_DIR/fixtures/bench-testdata and --out to
+# $FERROFIN_GATES_DIR/runs/bench-<name> (the output root's layout is in gates/lib.sh).
+#
 # Requires: docker, k6, python3, jq; the pinned Jellyfin image
 # and ferrofin:bench (docker build -t ferrofin:bench .).
 set -euo pipefail
 CALLER=$PWD
 cd "$(dirname "$0")/../.."
+# shellcheck source=gates/lib.sh
+source gates/lib.sh
 
 # ── tunables (§2) ──────────────────────────────────────────────────────────
 WARMUP_S=${WARMUP_S:-30}        # discarded seconds at the same rate before each window
@@ -96,7 +101,7 @@ export SERVER_CPUS=${SERVER_CPUS:-8-15}    # cpuset for the server under test
 export CLIENT_CPUS=${CLIENT_CPUS:-16-19}   # cpuset for k6 / the python clients / the sampler
 MEMORY=${MEMORY:-8g}                # cgroup limit, swap disabled (part of the memory number's definition)
 
-TESTDATA=$PWD/gates/bench/testdata; SERVERS=jellyfin,ferrofin; ONLY=""; OUT=""
+TESTDATA=""; SERVERS=jellyfin,ferrofin; ONLY=""; OUT=""
 while [ $# -gt 0 ]; do case "$1" in
   --testdata) TESTDATA=$2; shift 2;; --servers) SERVERS=$2; shift 2;;
   --only) ONLY=${2:-}; [ -n "$ONLY" ] || { echo "--only requires a phase or comma list" >&2; exit 2; }; shift 2;;
@@ -122,10 +127,11 @@ for server in ${SERVERS//,/ }; do
   case "$server" in jellyfin|ferrofin) ;; *) echo "unknown server $server" >&2; exit 2;; esac
 done
 abs() { case "$1" in /*) echo "$1";; *) echo "$CALLER/$1";; esac; }   # user paths are relative to the caller's shell
+[ -n "$TESTDATA" ] || TESTDATA=$(gates_dir bench fixtures/bench-testdata) || exit 2
 TESTDATA=$(realpath -m "$(abs "$TESTDATA")")
 SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-# A run is named for the code it measured, so a run dir can be traced back to a build:
+# A run is named bench-<the code it measured>, so a run dir can be traced back to a build:
 #   on a tag            v0.42.1                 (and v0.42.1-run2, -run3 … for repeats)
 #   ahead of a tag      v0.42.1-3-7e80268       (3 commits past the tag, at that sha)
 #   dirty working tree  …-dirty                 the tree had uncommitted changes when the
@@ -133,7 +139,6 @@ SHA=$(git rev-parse --short HEAD 2>/dev/null || echo nogit)
 #                                               it; image.txt and run.json.sha record what
 #                                               actually ran
 #   no tags / no git    20260903-1412-7e80268   the date form, as before
-RUNS_DIR=$PWD/gates/bench/runs
 run_name() {
   local base n
   if base=$(git describe --tags --exact-match 2>/dev/null); then
@@ -145,6 +150,7 @@ run_name() {
     base="$(date +%Y%m%d-%H%M)-$SHA"
   fi
   [ -z "$(git status --porcelain 2>/dev/null)" ] || base="$base-dirty"
+  base="bench-$base"   # runs/<gate>-<name> under the output root
   # Repeats are counted as -run2, -run3 …, so a rerun never lands in a populated dir
   # and the count cannot be misread as part of the version: a bare -2 reads as "two
   # commits on" exactly as much as "the second run", and a word cannot. No spaces or
@@ -158,7 +164,8 @@ run_name() {
   done
   echo "$candidate"
 }
-OUT=$(realpath -m "$(abs "${OUT:-$RUNS_DIR/$(run_name)}")")
+[ -n "$OUT" ] || { RUNS_DIR=$(gates_dir bench runs) || exit 2; OUT=$RUNS_DIR/$(run_name); }
+OUT=$(realpath -m "$(abs "$OUT")")
 for p in "$TESTDATA" "$OUT"; do case "$p" in /mnt/mangonas*|/mnt/nvme0/k3s*) echo "refusing to touch $p" >&2; exit 1;; esac; done
 
 docker_cmd() { timeout --kill-after=2 "$HTTP_TIMEOUT_S" docker "$@"; }
@@ -204,7 +211,7 @@ ORACLE=$(python3 gates/bench/oracle.py check) || die "cannot read the Jellyfin o
 # The image ID measured, so a run can never be credited to the wrong build (gate.py retags).
 FERROFIN_IMAGE=$([[ ",$SERVERS," != *,ferrofin,* ]] || docker_cmd image inspect -f '{{.Id}}' ferrofin:bench)
 DIRTY=$([ -z "$(git status --porcelain 2>/dev/null)" ] && echo false || echo true)
-jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$(basename "$OUT")" --argjson dirty "$DIRTY" --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)" \
+jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$(basename "$OUT" | sed 's/^bench-//')" --argjson dirty "$DIRTY" --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)" \
   --arg browse_user "$U" --arg playback_user "$(jq -r .viewer "$IDS")" --arg mem "$MEMORY" --arg cpus "$SERVER_CPUS" --arg k6 "$(k6 version | head -1)" --arg testdata "$(jq -c .counts "$IDS")" \
   --argjson rate_unloaded "$RATE_UNLOADED" --argjson rate_loaded "$RATE_LOADED" --argjson rate_stress "$RATE_STRESS" \
   --argjson idle "$idle" --argjson idle_min "$CORE_IDLE_MIN" --argjson topology "$topology" --argjson bracket "$SAMPLE_BRACKET_INTERVALS" --argjson gap "$SAMPLE_GAP_INTERVALS" \
@@ -602,5 +609,5 @@ for s in ${SERVERS//,/ }; do
 done
 python3 gates/bench/report.py "$OUT" > "$OUT/report.md" || rc=1
 python3 gates/bench/report.py --html "$OUT" > /dev/null || rc=1
-echo "report: $OUT/report.md, $OUT/report.html  —  compare in the browser: python3 gates/bench/report.py --serve"
+echo "report: $OUT/report.md, $OUT/report.html  —  compare in the browser: python3 gates/bench/report.py --serve 8097 $(dirname "$OUT")"
 exit "$rc"

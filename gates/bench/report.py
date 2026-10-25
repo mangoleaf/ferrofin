@@ -8,10 +8,12 @@
                                              BEGIN/END GENERATED BENCHMARKS markers in place
     report.py --html RUN_DIR                 write RUN_DIR/report.html (self-contained; run.sh does this)
     report.py --serve [PORT] [RUNS_DIR] [--adoption-dir DIR] [--parity-dir DIR]
-                                             the viewer on http://127.0.0.1:PORT (default 8097, gates/bench/runs):
+                                             the viewer on http://127.0.0.1:PORT (default 8097; RUNS_DIR defaults
+                                             to $FERROFIN_GATES_DIR/runs, else gates/bench/runs):
                                              Benchmark, Adoption and Parity tabs, each listing that harness's
                                              runs (a report.html each) and comparing two side by side. The
-                                             directories also come from FERROFIN_ADOPTION_RUNS / FERROFIN_PARITY_RUNS.
+                                             directories also come from FERROFIN_ADOPTION_RUNS / FERROFIN_PARITY_RUNS,
+                                             else from the output root ($FERROFIN_GATES_DIR/work, /runs).
 
 One run dir: the numbers of that run. Several: each cell is the median across runs, and
 where the runs disagreed at the precision published, the range they spanned; a cell that
@@ -1317,7 +1319,7 @@ def render_readme(m, run_dirs):
     notes = Notes()
     out = []
     p = out.append
-    cmd = "python3 gates/bench/report.py --readme README.md " + " ".join(f"gates/bench/runs/{os.path.basename(r.rstrip('/'))}" for r in run_dirs)
+    cmd = "python3 gates/bench/report.py --readme README.md " + " ".join(f"\"$FERROFIN_GATES_DIR\"/runs/{os.path.basename(r.rstrip('/'))}" for r in run_dirs)
     p(f"{README_BEGIN} — do not edit by hand. Regenerate with:\n     {cmd} -->")
     cpus = str(meta.get("server_cpus", ""))
     try:
@@ -1881,6 +1883,17 @@ PICKER_CSS = """
 """
 
 
+#: The gates name their run directories <gate>-<name> under the output root (gates/lib.sh), so one
+#: directory can hold every gate's runs: each tab leaves out the names another gate's prefix starts.
+#: A name with no gate prefix (a run from before the output root) is listed as before.
+GATE_PREFIXES = {"benchmark": "bench-", "adoption": "adoption-", "parity": "parity-", "verify": "verify-"}
+
+
+def other_gate(harness, name):
+    """Whether run directory `name` belongs to a gate other than `harness`, by its prefix."""
+    return any(name.startswith(prefix) for key, prefix in GATE_PREFIXES.items() if key != harness)
+
+
 def list_runs(runs_dir):
     """Run dirs under runs_dir (anything with a run.json), newest first by the run's own date.
     A `gate.py` session (a directory holding `gate.json`) is searched one level down, and the
@@ -1889,6 +1902,8 @@ def list_runs(runs_dir):
     gate's own page, which is the only one a scan session has."""
     out = []
     for session in os.listdir(runs_dir):
+        if other_gate("benchmark", session):
+            continue
         top = os.path.join(runs_dir, session)
         nested = os.path.isfile(os.path.join(top, "gate.json"))
         if nested and os.path.isfile(os.path.join(top, "report.html")):
@@ -1920,7 +1935,7 @@ nav.tabs a.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:600
 
 #: The viewer's tabs, in order: the harness key, its tab label, the flag and the
 #: environment variable that name the directory holding its runs. The benchmark's runs
-#: are `gates/bench/runs` (or the `--serve` argument); the other two harnesses decide where
+#: are the `--serve` argument (default `$FERROFIN_GATES_DIR/runs`, else `gates/bench/runs`); the other two harnesses decide where
 #: their runs go, so the viewer is told.
 HARNESSES = (("benchmark", "Benchmark", None, None),
              ("adoption", "Adoption", "--adoption-dir", "FERROFIN_ADOPTION_RUNS"),
@@ -1951,6 +1966,8 @@ def discover(harness, root):
         return list_runs(root)
     out, seen = [], set()
     for name in sorted(os.listdir(root)) + [os.path.basename(os.path.abspath(root))]:
+        if other_gate(harness, name):
+            continue
         d = run_dir(root, name)
         page = d and os.path.join(d, "report.html")
         if name not in seen and page and os.path.isfile(page):
@@ -1978,7 +1995,8 @@ def tab_html(harness, runs, a, b, picker=""):
     body = [f"<h1>{label} runs</h1>"]
     if not runs:
         where = (f"Run the benchmark (<code>gates/bench/run.sh</code>) to create one." if harness == "benchmark"
-                 else f"Point the viewer at the directory holding them with <code>{flag} DIR</code> or <code>{env}=DIR</code>.")
+                 else f"Point the viewer at the directory holding them with <code>{flag} DIR</code> or <code>{env}=DIR</code>, "
+                      f"or set <code>FERROFIN_GATES_DIR</code> to the gates' output root.")
         body.append(f"<p class='lede runs-note'>No {e(label.lower())} runs yet. {where}</p>")
         return page_html(f"Ferrofin {label}", "".join(body) + picker, harness)
     names = {n for n, _ in runs}
@@ -2154,6 +2172,9 @@ def main():
     if args and args[0] == "--serve":
         rest = args[1:]
         roots = {}
+        # Under the output root (gates/lib.sh) each tab has a default: runs/, and adoption's work/.
+        gates = os.environ.get("FERROFIN_GATES_DIR")
+        under_root = {"adoption": "work", "parity": "runs"}
         for key, _, flag, env in HARNESSES[1:]:
             if flag in rest:
                 i = rest.index(flag)
@@ -2164,15 +2185,24 @@ def main():
                 if not os.path.isdir(roots[key]):
                     sys.exit(f"{roots[key]} is not a directory")
             else:  # a variable may be set for every shell: a missing directory is an empty tab
-                roots[key] = os.environ.get(env) or None
+                source = env if os.environ.get(env) else "FERROFIN_GATES_DIR" if gates else None
+                roots[key] = os.environ.get(env) or (gates and os.path.join(gates, under_root[key])) or None
                 if roots[key] and not os.path.isdir(roots[key]):
-                    sys.stderr.write(f"{env}={roots[key]} is not a directory: the {key} tab stays empty\n")
+                    sys.stderr.write(f"{roots[key]} (from {source}) is not a directory: the {key} tab stays empty\n")
                     roots[key] = None
         port = int(rest.pop(0)) if rest and rest[0].isdigit() else 8097
-        runs_dir = rest.pop(0) if rest else os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
+        from_root = not rest and bool(gates)
+        if rest:
+            runs_dir = rest.pop(0)
+        elif from_root:  # runs/ appears with the first bench or parity run: until then the tab is empty
+            runs_dir = os.path.join(gates, "runs")
+            if not os.path.isdir(runs_dir):
+                sys.stderr.write(f"{runs_dir} (from FERROFIN_GATES_DIR) is not a directory: the benchmark tab stays empty\n")
+        else:
+            runs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs")
         if rest:
             sys.exit(__doc__)
-        if not os.path.isdir(runs_dir):
+        if not os.path.isdir(runs_dir) and not from_root:
             sys.exit(f"{runs_dir} is not a directory")
         serve(port, {"benchmark": runs_dir, **roots})
         return

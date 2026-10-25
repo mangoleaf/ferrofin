@@ -1,5 +1,6 @@
 """The local report viewer (`report.py --serve`): run discovery, the tab index, the
 side-by-side compare and the served reports, against synthetic run directories."""
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -50,6 +51,16 @@ class ViewerTests(unittest.TestCase):
     def test_discovery_accepts_the_run_directory_itself(self):
         self.report_html(self.root, 'adoption', '<p>work dir</p>')
         self.assertEqual([n for n, _ in report.discover('adoption', str(self.adoption))], ['adoption'])
+
+    def test_one_directory_of_every_gate_s_runs_lists_each_in_its_own_tab(self):
+        runs = self.root / 'runs'   # the output root's runs/ (gates/lib.sh): every run has a report.html
+        for name in ('bench-v1', 'parity-20261024-1200-abc', 'verify-20261024-1201', 'old-unprefixed'):
+            self.report_html(runs, name, f'<p>{name}</p>')
+            (runs / name / 'run.json').write_text('{"date": "2026-10-24T12:00:00"}')
+        listed = {h: {n for n, _ in report.discover(h, str(runs))} for h in ('benchmark', 'parity', 'adoption')}
+        self.assertEqual(listed, {'benchmark': {'bench-v1', 'old-unprefixed'},
+                                  'parity': {'parity-20261024-1200-abc', 'old-unprefixed'},
+                                  'adoption': {'old-unprefixed'}})
 
     def test_discovery_without_a_directory_is_empty(self):
         self.assertEqual(report.discover('parity', None), [])
@@ -229,6 +240,46 @@ class ViewerTests(unittest.TestCase):
                 self.adoption.mkdir(exist_ok=True)
                 report.main()
                 serve.assert_called_once_with(port, roots)
+
+    def test_serve_takes_every_tab_from_the_output_root_when_nothing_names_one(self):
+        gates = self.root / 'gates'
+        runs, work = gates / 'runs', gates / 'work'
+        cases = [  # (argv, environment beyond the root, the tabs served)
+            (['--serve'], {}, {'benchmark': str(runs), 'adoption': str(work), 'parity': str(runs)}),
+            # a positional RUNS_DIR, a flag and a variable each still win over the root
+            (['--serve', str(self.bench), '--parity-dir', str(self.parity)], {'FERROFIN_ADOPTION_RUNS': str(self.adoption)},
+             {'benchmark': str(self.bench), 'adoption': str(self.adoption), 'parity': str(self.parity)}),
+            # a variable naming a missing directory is an empty tab, not the root's
+            (['--serve'], {'FERROFIN_PARITY_RUNS': str(self.root / 'missing')},
+             {'benchmark': str(runs), 'adoption': str(work), 'parity': None}),
+        ]
+        self.parity.mkdir()
+        self.adoption.mkdir()
+        work.mkdir(parents=True)
+        for create_runs in (True, False):
+            if create_runs:
+                runs.mkdir()
+            else:  # an adoption-only root has no runs/ yet: empty benchmark and parity tabs, not an exit
+                runs.rmdir()
+                cases = [(['--serve'], {}, {'benchmark': str(runs), 'adoption': str(work), 'parity': None})]
+            for argv, env, tabs in cases:
+                with self.subTest(argv=argv, env=env, runs=create_runs), \
+                        patch.dict('os.environ', {'FERROFIN_GATES_DIR': str(gates), **env}, clear=True), \
+                        patch.object(report.sys, 'argv', ['report.py', *argv]), patch.object(report, 'serve') as serve, \
+                        patch.object(report.sys, 'stderr', new_callable=io.StringIO) as stderr:
+                    report.main()
+                    serve.assert_called_once_with(8097, tabs)
+                    if not create_runs:
+                        self.assertIn(f"{runs} (from FERROFIN_GATES_DIR) is not a directory: the benchmark tab stays empty",
+                                      stderr.getvalue())
+                        self.assertIn(f"{runs} (from FERROFIN_GATES_DIR) is not a directory: the parity tab stays empty",
+                                      stderr.getvalue())
+        # a RUNS_DIR given on the command line that is missing still refuses, however it is spelled
+        for missing in (str(runs), str(runs) + '/', str(gates / 'other')):
+            with self.subTest(missing=missing), patch.dict('os.environ', {'FERROFIN_GATES_DIR': str(gates)}, clear=True), \
+                    patch.object(report.sys, 'argv', ['report.py', '--serve', missing]), patch.object(report, 'serve'):
+                with self.assertRaisesRegex(SystemExit, 'is not a directory'):
+                    report.main()
 
     def test_serve_refuses_a_missing_flag_directory_and_leftover_arguments(self):
         for argv in (['--serve', '--adoption-dir'], ['--serve', '--adoption-dir', str(self.root / 'missing')],

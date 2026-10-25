@@ -159,7 +159,7 @@ class RunShArgumentTests(unittest.TestCase):
     """run.sh's ramp arguments, checked before any fixture or docker access."""
 
     def run_sh(self, *args, **env):
-        return subprocess.run(["bash", str(Path(__file__).parent / "run.sh"), "--testdata", "/nonexistent-testdata", *args],
+        return subprocess.run(["bash", str(Path(__file__).parent / "run.sh"), "--testdata", "/nonexistent-testdata", "--out", "/nonexistent-out", *args],
                               env=dict(os.environ, **env), capture_output=True, text=True)
 
     def test_the_ramp_is_ferrofin_only(self):

@@ -1555,7 +1555,7 @@ class GateTests(unittest.TestCase):
                                                               'Jellyfin v12.3 is out; the oracle pin is v12.2')), \
                 patch.object(gate, 'image_ref', side_effect=AssertionError('docker touched')):
             with self.assertRaisesRegex(SystemExit, 'v12.3 is out'):
-                gate.main(['ab', 'old', 'new', '--out', str(out)])
+                gate.main(['ab', 'old', 'new', '--out', str(out), '--testdata', str(self.root / 'td')])
         self.assertFalse(out.exists())
 
     def test_a_gate_run_records_the_oracle_it_checked_in_gate_json(self):
@@ -1564,7 +1564,7 @@ class GateTests(unittest.TestCase):
         with patch.object(gate.oracle, 'check', return_value=(pin, None)), \
                 patch.object(gate, 'image_ref', return_value='sha256:img'), \
                 patch.object(gate, 'run_session'), patch.object(gate, 'render', return_value=('', [])):
-            self.assertEqual(gate.main(['ab', 'old', 'new', '--out', str(out)]), 0)
+            self.assertEqual(gate.main(['ab', 'old', 'new', '--out', str(out), '--testdata', str(self.root / 'td')]), 0)
         self.assertEqual(json.loads((out / 'gate.json').read_text())['oracle'], pin)
 
     def test_the_session_report_names_the_oracle(self):

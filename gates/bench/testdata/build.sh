@@ -3,7 +3,7 @@
 #   gen.py media tree → Jellyfin 10.11.8 scans it and is seeded over its API → drained
 #   → stopped. The resulting DIR/{config,media,ids.json} is what run.sh boots copies of.
 #
-#   build.sh [DIR] [--scale F] [--seed N]      DIR defaults to gates/bench/testdata
+#   build.sh [DIR] [--scale F] [--seed N]      DIR defaults to $FERROFIN_GATES_DIR/fixtures/bench-testdata
 #   build.sh [DIR] --export-pools            read pools from a disposable source copy
 #   build.sh [DIR] --prepare-jellyfin          upgrade a copy, scan, verify, stop
 #
@@ -11,12 +11,15 @@
 set -euo pipefail
 CALLER=$PWD
 cd "$(dirname "$0")/../../.."
-DIR=$PWD/gates/bench/testdata; SCALE=1.0; SEED=1; PREPARE=false; EXPORT_POOLS=false
+# shellcheck source=gates/lib.sh
+source gates/lib.sh
+DIR=""; SCALE=1.0; SEED=1; PREPARE=false; EXPORT_POOLS=false
 while [ $# -gt 0 ]; do case "$1" in
   --export-pools) EXPORT_POOLS=true; shift;;
   --prepare-jellyfin) PREPARE=true; shift;;
   --scale) SCALE=$2; shift 2;; --seed) SEED=$2; shift 2;; -*) echo "unknown $1" >&2; exit 2;; *) DIR=$1; shift;;
 esac; done
+[ -n "$DIR" ] || DIR=$(gates_dir build fixtures/bench-testdata) || exit 2
 case "$DIR" in /*) ;; *) DIR=$CALLER/$DIR;; esac   # a user-supplied relative DIR is relative to the caller's shell
 DIR=$(realpath -m "$DIR")
 case "$DIR" in /mnt/mangonas*|/mnt/nvme0/k3s*) echo "refusing to build under $DIR" >&2; exit 1;; esac

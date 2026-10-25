@@ -194,7 +194,7 @@ class RunShArgumentTests(unittest.TestCase):
     """run.sh's soak arguments, checked before any fixture or docker access."""
 
     def run_sh(self, *args, **env):
-        return subprocess.run(["bash", RUN_SH, "--testdata", "/nonexistent-testdata", *args],
+        return subprocess.run(["bash", RUN_SH, "--testdata", "/nonexistent-testdata", "--out", "/nonexistent-out", *args],
                               env=dict(os.environ, **env), capture_output=True, text=True)
 
     def test_the_soak_is_ferrofin_only(self):
