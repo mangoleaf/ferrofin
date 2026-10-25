@@ -12858,43 +12858,46 @@ impl LibraryScanner {
         Ok(())
     }
 
-    /// The artwork a library tile is drawn from: up to
-    /// [`LIBRARY_COLLAGE_SOURCES`] random descendants' local Backdrop, else
-    /// Primary, else Thumb.
+    /// The artwork a library tile is drawn from (v12.2
+    /// `CollectionFolderImageProvider.GetItemsWithImages`): up to
+    /// [`LIBRARY_COLLAGE_SOURCES`] random rows with a Primary, each drawn
+    /// from its local Backdrop, else Primary, else Thumb. A music library
+    /// samples the artists its tracks credit, any other library its
+    /// collection type's kinds. An empty sample draws no tile.
     async fn library_collage_inputs(
         items: &Arc<dyn ItemRepository>,
         folder: &VirtualFolderInfo,
         cf: Uuid,
     ) -> Result<Vec<String>, ServiceError> {
-        // Random content sample; over-fetch since not every row has art.
-        // Upstream samples the collection type's own kinds (a music
-        // library's tile comes from its ALBUMS, whose covers are the art
-        // that exists — sampling leaf tracks found nothing and left the
-        // note-icon placeholder). The leaf fallback keeps a library whose
-        // typed rows have no art from losing its tile.
-        let kinds = collage_item_kinds(folder);
-        let sample = |include_item_types: Vec<BaseItemKind>, is_folder| InternalItemsQuery {
+        let mut sample = InternalItemsQuery {
             ancestor_ids: vec![cf],
-            recursive: true,
-            include_item_types,
-            is_folder,
-            is_virtual_item: Some(false),
-            limit: Some(LIBRARY_COLLAGE_SOURCES * 3),
+            image_types: vec![ImageType::Primary],
+            limit: Some(LIBRARY_COLLAGE_SOURCES),
             order_by: vec![(
                 ferrofin_model::live_tv::ItemSortBy::Random,
-                ferrofin_model::dto::SortOrder::Descending,
+                ferrofin_model::dto::SortOrder::Ascending,
             )],
             ..Default::default()
         };
-        let mut candidates = items.get_item_ids(&sample(kinds, None)).await?;
-        if candidates.is_empty() {
-            candidates = items.get_item_ids(&sample(Vec::new(), Some(false))).await?;
-        }
+        let candidates = if folder.collection_type == Some(CollectionTypeOptions::music) {
+            // "Music albums usually don't have dedicated backdrops, so use
+            // artist instead." An artist has no library of its own: it is
+            // found through the tracks under this one that credit it.
+            sample.enable_total_record_count = false;
+            items
+                .get_all_artists(&sample)
+                .await?
+                .items
+                .into_iter()
+                .filter_map(|artist| Uuid::parse_str(&artist.item.id).ok())
+                .collect()
+        } else {
+            sample.recursive = true;
+            sample.include_item_types = collage_item_kinds(folder);
+            items.get_item_ids(&sample).await?
+        };
         let mut inputs = Vec::new();
         for id in candidates {
-            if inputs.len() >= usize::try_from(LIBRARY_COLLAGE_SOURCES).unwrap_or(8) {
-                break;
-            }
             let infos = items.get_image_infos(id).await?;
             let best = infos
                 .iter()
@@ -17790,6 +17793,7 @@ fn first_album_tag(tracks: &[BaseItemEntity]) -> Option<String> {
 /// `DtoExtensions.GetBaseItemKindsForCollectionType`, which
 /// `CollectionFolderImageProvider` uses to pick the rows whose Primary images
 /// make up the tile. An unknown/absent collection type samples the mixed set.
+/// A music library samples its artists instead (`library_collage_inputs`).
 fn collage_item_kinds(folder: &VirtualFolderInfo) -> Vec<BaseItemKind> {
     match folder.collection_type {
         Some(CollectionTypeOptions::movies) => vec![BaseItemKind::Movie],
@@ -22695,6 +22699,170 @@ mod plan_paths_tests;
 
 #[cfg(test)]
 mod tests {
+    /// A library row with rows under it, and image files to give them, for
+    /// the tile sample ([`super::LibraryScanner::library_collage_inputs`]).
+    struct CollageLibrary {
+        tmp: tempfile::TempDir,
+        db: ferrofin_db::Database,
+    }
+
+    impl CollageLibrary {
+        const LIBRARY: uuid::Uuid = uuid::Uuid::from_u128(0x402_0000);
+
+        async fn new() -> Self {
+            let db = crate::test_support::test_db().await;
+            crate::test_support::seed_item(
+                &db,
+                Self::LIBRARY,
+                ferrofin_model::data::BaseItemKind::CollectionFolder,
+            )
+            .await;
+            Self {
+                tmp: tempfile::tempdir().expect("tempdir"),
+                db,
+            }
+        }
+
+        /// A `kind` row under the library, with an image file of each of
+        /// `images`, named after the type.
+        async fn row(
+            &self,
+            id: u128,
+            kind: ferrofin_model::data::BaseItemKind,
+            images: &[ferrofin_model::entities::ImageType],
+        ) -> uuid::Uuid {
+            use ferrofin_traits::persistence::ItemPersistenceService as _;
+            let id = uuid::Uuid::from_u128(id);
+            crate::test_support::seed_item(&self.db, id, kind).await;
+            crate::FerrofinItemPersistenceService::new(self.db.clone())
+                .set_ancestors(id, &[Self::LIBRARY])
+                .await
+                .expect("ancestors");
+            self.art(id, images).await;
+            id
+        }
+
+        /// Gives `id` an image file of each of `images`.
+        async fn art(&self, id: uuid::Uuid, images: &[ferrofin_model::entities::ImageType]) {
+            let infos: Vec<_> = images
+                .iter()
+                .map(|image_type| {
+                    crate::test_support::image_info(*image_type, &self.file(id, *image_type), None)
+                })
+                .collect();
+            for info in &infos {
+                std::fs::write(&info.path, b"art").expect("art");
+            }
+            crate::test_support::seed_images(&self.db, id, &infos).await;
+        }
+
+        fn file(&self, id: uuid::Uuid, image_type: ferrofin_model::entities::ImageType) -> String {
+            let name = format!("{}-{image_type:?}.png", id.simple());
+            self.tmp.path().join(name).to_string_lossy().into_owned()
+        }
+
+        async fn inputs(
+            &self,
+            collection_type: ferrofin_model::entities::CollectionTypeOptions,
+        ) -> Vec<String> {
+            let folder = ferrofin_model::entities_media::VirtualFolderInfo {
+                collection_type: Some(collection_type),
+                ..Default::default()
+            };
+            super::LibraryScanner::library_collage_inputs(
+                &crate::test_support::item_repository_over(self.db.clone()),
+                &folder,
+                Self::LIBRARY,
+            )
+            .await
+            .expect("sample")
+        }
+    }
+
+    /// gl-402, v12.2 `CollectionFolderImageProvider.GetItemsWithImages`: a
+    /// music library's tile samples the artists its tracks credit, as artist
+    /// or album artist, that have a Primary (`GetAllArtists` with
+    /// `ImageTypes = [Primary]`), not its albums, and never another library's
+    /// artists (upstream's `BaseItemRepositoryArtistLibraryScopeTests`).
+    #[tokio::test]
+    async fn a_music_library_tile_samples_its_credited_artists_with_a_primary() {
+        use crate::test_support::{seed_item_value, seed_music_artist_item};
+        use ferrofin_db::enums::ItemValueType;
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
+
+        let lib = CollageLibrary::new().await;
+        let track = lib.row(0x402_0001, BaseItemKind::Audio, &[]).await;
+        lib.row(0x402_0002, BaseItemKind::MusicAlbum, &[ImageType::Primary])
+            .await;
+        let (credited, no_primary) = (
+            uuid::Uuid::from_u128(0x402_0003),
+            uuid::Uuid::from_u128(0x402_0004),
+        );
+        seed_music_artist_item(&lib.db, credited, "The Band").await;
+        seed_music_artist_item(&lib.db, no_primary, "No Poster").await;
+        lib.art(credited, &[ImageType::Primary]).await;
+        lib.art(no_primary, &[ImageType::Backdrop]).await;
+        seed_item_value(&lib.db, track, ItemValueType::Artist, "The Band").await;
+        seed_item_value(&lib.db, track, ItemValueType::Artist, "No Poster").await;
+        let album_artist = uuid::Uuid::from_u128(0x402_0007);
+        seed_music_artist_item(&lib.db, album_artist, "Album Artist").await;
+        lib.art(album_artist, &[ImageType::Primary]).await;
+        seed_item_value(&lib.db, track, ItemValueType::AlbumArtist, "Album Artist").await;
+        // Another library's track credits an artist with a Primary.
+        let (other_library, other_track, elsewhere) = (
+            uuid::Uuid::from_u128(0x402_1000),
+            uuid::Uuid::from_u128(0x402_1001),
+            uuid::Uuid::from_u128(0x402_1002),
+        );
+        crate::test_support::seed_item(&lib.db, other_library, BaseItemKind::CollectionFolder)
+            .await;
+        crate::test_support::seed_item(&lib.db, other_track, BaseItemKind::Audio).await;
+        {
+            use ferrofin_traits::persistence::ItemPersistenceService as _;
+            crate::FerrofinItemPersistenceService::new(lib.db.clone())
+                .set_ancestors(other_track, &[other_library])
+                .await
+                .expect("ancestors");
+        }
+        seed_music_artist_item(&lib.db, elsewhere, "Elsewhere").await;
+        lib.art(elsewhere, &[ImageType::Primary]).await;
+        seed_item_value(&lib.db, other_track, ItemValueType::Artist, "Elsewhere").await;
+
+        let mut sampled = lib.inputs(CollectionTypeOptions::music).await;
+        sampled.sort();
+        let mut want = vec![
+            lib.file(credited, ImageType::Primary),
+            lib.file(album_artist, ImageType::Primary),
+        ];
+        want.sort();
+        assert_eq!(sampled, want);
+    }
+
+    /// gl-402: any other library samples its kinds' rows that have a Primary
+    /// (`ImageTypes = [Primary]`), each drawn from its Backdrop first.
+    #[tokio::test]
+    async fn a_library_tile_samples_rows_with_a_primary() {
+        use ferrofin_model::data::BaseItemKind;
+        use ferrofin_model::entities::{CollectionTypeOptions, ImageType};
+
+        let lib = CollageLibrary::new().await;
+        let movie = lib
+            .row(
+                0x402_0005,
+                BaseItemKind::Movie,
+                &[ImageType::Primary, ImageType::Backdrop],
+            )
+            .await;
+        lib.row(0x402_0006, BaseItemKind::Movie, &[ImageType::Backdrop])
+            .await;
+
+        assert_eq!(
+            lib.inputs(CollectionTypeOptions::movies).await,
+            vec![lib.file(movie, ImageType::Backdrop)]
+        );
+    }
+
     /// `ItemImageProvider.MergeImages`: a found image replaces the stored one
     /// of its type when the paths differ, keeps it when they match (taking the
     /// file's time and clearing dimensions it moved past), and a found
@@ -38685,9 +38853,10 @@ mod tests {
     // button lands on the wrong episode, and on the alphabetically-last one it
     // has nowhere to go (dead button, no autoplay). File stems here are
     // deliberately inverted against their episode numbers.
-    // The library tile samples the collection type's own kinds — a music
-    // library's tile comes from its ALBUMS (whose covers exist), not from leaf
-    // tracks (which usually have none), and never from the wrong kind.
+    // The library tile samples the collection type's own kinds
+    // (`GetBaseItemKindsForCollectionType`), never the wrong kind. A music
+    // library's tile samples its artists instead, which
+    // `a_music_library_tile_samples_its_credited_artists_with_a_primary` pins.
     #[test]
     fn collage_samples_the_collection_types_kinds() {
         use ferrofin_model::data::BaseItemKind;
