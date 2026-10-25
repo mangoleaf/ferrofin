@@ -30,10 +30,9 @@ use quick_xml::events::{BytesStart, Event};
 pub struct XmltvChannel {
     /// The `id` attribute — the join key against tuner channels' `tvg-id`.
     pub id: String,
-    /// The first `<display-name>`. Upstream `ProcessNode` prefers the one
-    /// whose `lang` matches the provider's or server's preferred language;
-    /// that pick is not ported yet and is tracked with the programme fields'
-    /// language pick in gl-684.
+    /// The `<display-name>` in the guide's language, as `ProcessNode` picks it
+    /// (see [`read_xmltv_where`]). A channel without one, or without an id, is
+    /// not read at all.
     pub display_name: String,
     /// The channel number: the last `<display-name>` that reads as a number
     /// once `-` and `_` become `.` (Jellyfin.XmlTv `SetChannelNumber`), in
@@ -77,13 +76,15 @@ pub struct XmltvProgramme {
     /// Airing end (parsed from the `stop` attribute), keeping the offset the
     /// file declared.
     pub stop: Option<DateTime<FixedOffset>>,
-    /// `<title>`.
+    /// `<title>`, in the guide's language (see [`read_xmltv_where`]).
     pub title: String,
-    /// `<sub-title>` — the episode title, when present.
+    /// `<sub-title>` — the episode title, when present, in the guide's
+    /// language.
     pub sub_title: Option<String>,
-    /// `<desc>` — the synopsis, when present.
+    /// `<desc>` — the synopsis, when present, in the guide's language.
     pub desc: Option<String>,
-    /// All `<category>` values.
+    /// The `<category>` values, those in the guide's language when there are
+    /// any.
     pub categories: Vec<String>,
     /// The `src` of the programme's first own `<icon>` that has a `src`,
     /// `width` or `height` (`Icons.FirstOrDefault()?.Source`), when it has one.
@@ -152,10 +153,11 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
 /// the document is readable.
 ///
 /// The text is already decoded, so an encoding the document declares is not
-/// applied again.
+/// applied again, and it is read with no language, as `new XmlTvReader(path)`
+/// reads it.
 #[must_use]
 pub fn parse_xmltv_where(xml: &str, keep: impl FnMut(&XmltvProgramme) -> bool) -> Xmltv {
-    read_events(Reader::from_str(xml), keep)
+    read_events(Reader::from_str(xml), None, keep)
 }
 
 /// [`parse_xmltv_where`] over a document read as it arrives, from a file or
@@ -165,13 +167,23 @@ pub fn parse_xmltv_where(xml: &str, keep: impl FnMut(&XmltvProgramme) -> bool) -
 /// cached file (Jellyfin.XmlTv `XmlTvReader.CreateXmlTextReader`): by the
 /// byte-order mark, else by the `<?xml … encoding="…"?>` declaration, else as
 /// UTF-8. A byte sequence that is not valid in that encoding makes the
-/// document unreadable ([`Xmltv::error`]), as it makes `XmlReader` throw. An
-/// encoding name is looked up by the WHATWG rules, so `ISO-8859-1` reads as
-/// `windows-1252`, which differs from .NET's Latin-1 only in the C1 control
-/// range.
+/// document unreadable ([`Xmltv::error`]), as it makes `XmlReader` throw.
+/// `ISO-8859-1` and `US-ASCII` (and their other names) decode as .NET's
+/// `Latin1Encoding` and `ASCIIEncoding` do; any other name is looked up by the
+/// WHATWG rules, which agree with .NET's code pages except for a few legacy
+/// names (`ISO-8859-9` reads as `windows-1254`).
+///
+/// `language` is the reader's (`new XmlTvReader(path, language)`). In a run
+/// of sibling `<title>`, `<sub-title>`, `<desc>` or `<display-name>` elements
+/// the first whose `lang` is `language` ignoring case is taken, else the first
+/// with a blank `lang`, else the first (`ProcessNode`); of a run of
+/// `<category>` elements only those whose `lang` is exactly `language` are
+/// kept, when there are any (`ProcessMultipleNodes`). With no language, an
+/// element without a `lang` is the match.
 #[must_use]
 pub fn read_xmltv_where<R: BufRead>(
     mut source: R,
+    language: Option<&str>,
     keep: impl FnMut(&XmltvProgramme) -> bool,
 ) -> Xmltv {
     // The head, up to the end of its first markup (`?>` for a declaration),
@@ -197,10 +209,14 @@ pub fn read_xmltv_where<R: BufRead>(
     let encoding = document_encoding(&head);
     let source = std::io::Read::chain(std::io::Cursor::new(head), source);
     match encoding {
-        Ok(encoding) if encoding == encoding_rs::UTF_8 => {
-            read_events(Reader::from_reader(source), keep)
+        Ok(TextEncoding::Whatwg(encoding)) if encoding == encoding_rs::UTF_8 => {
+            read_events(Reader::from_reader(source), language, keep)
         }
-        Ok(encoding) => read_events(Reader::from_reader(Decoded::new(source, encoding)), keep),
+        Ok(encoding) => read_events(
+            Reader::from_reader(Decoded::new(source, encoding)),
+            language,
+            keep,
+        ),
         Err(error) => Xmltv {
             error: Some(error),
             ..Xmltv::default()
@@ -212,6 +228,48 @@ pub fn read_xmltv_where<R: BufRead>(
 /// encoding: more than any XML declaration a guide writes.
 const HEAD_BYTES: usize = 1024;
 
+/// How a document's bytes become text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextEncoding {
+    /// An encoding `encoding_rs` decodes, strictly.
+    Whatwg(&'static Encoding),
+    /// .NET's `Latin1Encoding`: every byte is the code point of its value.
+    Latin1,
+    /// .NET's `ASCIIEncoding`: a byte above `0x7F` reads as `?`.
+    Ascii,
+}
+
+/// The names .NET gives `Latin1Encoding` (code page 28591), which the WHATWG
+/// rules read as `windows-1252` instead.
+const LATIN1_LABELS: &[&str] = &[
+    "cp819",
+    "csisolatin1",
+    "ibm819",
+    "iso-8859-1",
+    "iso-ir-100",
+    "iso8859-1",
+    "iso_8859-1",
+    "iso_8859-1:1987",
+    "l1",
+    "latin1",
+];
+
+/// The names .NET gives `ASCIIEncoding` (code page 20127), which the WHATWG
+/// rules read as `windows-1252` instead.
+const ASCII_LABELS: &[&str] = &[
+    "ansi_x3.4-1968",
+    "ansi_x3.4-1986",
+    "ascii",
+    "cp367",
+    "csascii",
+    "ibm367",
+    "iso-ir-6",
+    "iso646-us",
+    "iso_646.irv:1991",
+    "us",
+    "us-ascii",
+];
+
 /// The text encoding of a document whose first bytes are `head`, by
 /// `XmlReader`'s rules: a byte-order mark, the UTF-16 shape of `<?`, then the
 /// XML declaration's `encoding`, else UTF-8.
@@ -221,32 +279,42 @@ const HEAD_BYTES: usize = 1024;
 /// The declaration names an encoding that does not exist, or a UTF-16 one in
 /// a document that is not UTF-16 (`XmlReader`'s "There is no Unicode byte
 /// order mark. Cannot switch to Unicode.").
-fn document_encoding(head: &[u8]) -> Result<&'static Encoding, String> {
+fn document_encoding(head: &[u8]) -> Result<TextEncoding, String> {
     if let Some((encoding, _)) = Encoding::for_bom(head) {
-        return Ok(encoding);
+        return Ok(TextEncoding::Whatwg(encoding));
     }
     if head.starts_with(&[b'<', 0, b'?', 0]) {
-        return Ok(encoding_rs::UTF_16LE);
+        return Ok(TextEncoding::Whatwg(encoding_rs::UTF_16LE));
     }
     if head.starts_with(&[0, b'<', 0, b'?']) {
-        return Ok(encoding_rs::UTF_16BE);
+        return Ok(TextEncoding::Whatwg(encoding_rs::UTF_16BE));
     }
     let Some(label) = declared_encoding(head) else {
-        return Ok(encoding_rs::UTF_8);
+        return Ok(TextEncoding::Whatwg(encoding_rs::UTF_8));
     };
+    let name = String::from_utf8_lossy(label).trim().to_ascii_lowercase();
+    if LATIN1_LABELS.contains(&name.as_str()) {
+        return Ok(TextEncoding::Latin1);
+    }
+    if ASCII_LABELS.contains(&name.as_str()) {
+        return Ok(TextEncoding::Ascii);
+    }
+    // TODO(gl-936): the WHATWG rules read a few other legacy names (ISO-8859-9,
+    // ISO-8859-11, TIS-620) as a related Windows code page, where .NET's code
+    // pages decode the named one; give them exact tables as `Latin1` has.
     match Encoding::for_label(label) {
         Some(encoding)
             if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE =>
         {
             Err(format!(
-                "the XMLTV document declares {} but is not UTF-16",
-                String::from_utf8_lossy(label)
+                "the XMLTV document declares {name} but is not UTF-16"
             ))
         }
-        Some(encoding) if encoding != encoding_rs::REPLACEMENT => Ok(encoding),
+        Some(encoding) if encoding != encoding_rs::REPLACEMENT => {
+            Ok(TextEncoding::Whatwg(encoding))
+        }
         _ => Err(format!(
-            "the XMLTV document declares an unsupported encoding: {}",
-            String::from_utf8_lossy(label)
+            "the XMLTV document declares an unsupported encoding: {name}"
         )),
     }
 }
@@ -276,8 +344,11 @@ const DECODED_BUFFER: usize = 16 * 1024;
 struct Decoded<R> {
     /// The encoded bytes.
     source: R,
-    /// The decoder; it removes a byte-order mark.
-    decoder: encoding_rs::Decoder,
+    /// The decoder for a [`TextEncoding::Whatwg`] document; it removes a
+    /// byte-order mark. `None` for the single-byte .NET encodings.
+    decoder: Option<encoding_rs::Decoder>,
+    /// The document's encoding.
+    encoding: TextEncoding,
     /// Decoded text; `out[at..len]` is not read yet.
     out: Box<[u8]>,
     /// Where the unread text starts.
@@ -289,10 +360,14 @@ struct Decoded<R> {
 }
 
 impl<R> Decoded<R> {
-    fn new(source: R, encoding: &'static Encoding) -> Self {
+    fn new(source: R, encoding: TextEncoding) -> Self {
         Self {
             source,
-            decoder: encoding.new_decoder_with_bom_removal(),
+            decoder: match encoding {
+                TextEncoding::Whatwg(encoding) => Some(encoding.new_decoder_with_bom_removal()),
+                TextEncoding::Latin1 | TextEncoding::Ascii => None,
+            },
+            encoding,
             out: vec![0; DECODED_BUFFER].into_boxed_slice(),
             at: 0,
             len: 0,
@@ -316,20 +391,32 @@ impl<R: BufRead> BufRead for Decoded<R> {
         while self.at == self.len && !self.finished {
             let input = self.source.fill_buf()?;
             let last = input.is_empty();
-            let (result, read, written) =
-                self.decoder
-                    .decode_to_utf8_without_replacement(input, &mut self.out, last);
-            self.source.consume(read);
             self.at = 0;
+            let Some(decoder) = self.decoder.as_mut() else {
+                // One byte is one character of at most two UTF-8 bytes.
+                let take = input.len().min(self.out.len() / 2);
+                let mut written = 0;
+                for &byte in &input[..take] {
+                    let c = match self.encoding {
+                        TextEncoding::Ascii if !byte.is_ascii() => '?',
+                        _ => char::from(byte),
+                    };
+                    written += c.encode_utf8(&mut self.out[written..]).len();
+                }
+                self.source.consume(take);
+                self.len = written;
+                self.finished = last;
+                continue;
+            };
+            let (result, read, written) =
+                decoder.decode_to_utf8_without_replacement(input, &mut self.out, last);
+            self.source.consume(read);
             self.len = written;
             match result {
                 DecoderResult::Malformed(..) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!(
-                            "a byte sequence is not valid {}",
-                            self.decoder.encoding().name()
-                        ),
+                        format!("a byte sequence is not valid {}", decoder.encoding().name()),
                     ));
                 }
                 DecoderResult::InputEmpty if last => self.finished = true,
@@ -349,6 +436,7 @@ impl<R: BufRead> BufRead for Decoded<R> {
 #[allow(clippy::too_many_lines)] // one pull-parser state machine
 fn read_events<R: BufRead>(
     mut reader: Reader<R>,
+    language: Option<&str>,
     mut keep: impl FnMut(&XmltvProgramme) -> bool,
 ) -> Xmltv {
     let config = reader.config_mut();
@@ -384,7 +472,8 @@ fn read_events<R: BufRead>(
             // Stricter than .NET's `XmlReader`, which rejects an HTML error
             // page only when it is not well-formed: with `check_end_names` off
             // this reader cannot tell, so any root but `<tv>` keeps the stored
-            // guide.
+            // guide. TODO(gl-937): port `ReadToDescendant("tv")`'s empty guide
+            // for a well-formed document with another root.
             if e.local_name().as_ref() != "tv" {
                 out.error = Some(format!(
                     "the document's root element is <{}>, not <tv>",
@@ -409,6 +498,7 @@ fn read_events<R: BufRead>(
                         name,
                         &e,
                         depth,
+                        language,
                         &mut episode_system,
                         channel.as_mut(),
                         programme.as_mut(),
@@ -425,6 +515,7 @@ fn read_events<R: BufRead>(
                     name,
                     &e,
                     depth,
+                    language,
                     &mut episode_system,
                     channel.as_mut(),
                     programme.as_mut(),
@@ -463,16 +554,23 @@ fn read_events<R: BufRead>(
                     programme.as_mut(),
                 );
                 match name {
+                    // `GetChannel` returns no channel without an id or a
+                    // display-name. Text is trimmed here, so a white-space-only
+                    // name counts as none, where upstream keeps it.
                     b"channel" => {
-                        if let Some(c) = channel.take() {
-                            out.channels.push(c.channel);
+                        if let Some(mut c) = channel.take() {
+                            end_channel_run(&mut c, language);
+                            if !c.channel.id.is_empty() && !c.channel.display_name.is_empty() {
+                                out.channels.push(c.channel);
+                            }
                         }
                     }
                     b"programme" => {
-                        if let Some(p) = programme.take()
-                            && keep(&p.programme)
-                        {
-                            out.programmes.push(p.programme);
+                        if let Some(mut p) = programme.take() {
+                            end_programme_run(&mut p, language);
+                            if keep(&p.programme) {
+                                out.programmes.push(p.programme);
+                            }
                         }
                     }
                     _ => {}
@@ -517,9 +615,11 @@ fn read_events<R: BufRead>(
 /// different input. Returning the raw text instead keeps the join key that
 /// already matched before entity resolution was added.
 ///
-/// This is deliberately more lenient than upstream: `.NET`'s `XmlReader` throws
-/// `XmlException` on a bare `&`, so Jellyfin fails the whole guide refresh. A
-/// guide that mostly parses is more useful than no guide at all.
+/// This is more lenient than upstream: `.NET`'s `XmlReader` throws
+/// `XmlException` on a bare `&`, so Jellyfin fails the whole guide refresh.
+///
+/// TODO(gl-937): no accepted divergence covers this; port `XmlReader`'s
+/// rejection or have it accepted.
 fn unescaped_or_raw(a: &quick_xml::events::attributes::Attribute<'_>) -> String {
     a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
         .map_or_else(
@@ -551,6 +651,10 @@ struct OpenChannel {
     child_depth: usize,
     /// Whether its first populated `<icon>` has been read.
     icon_read: bool,
+    /// The run of `<display-name>`s being read.
+    run: Option<TextRun>,
+    /// The `lang` of the `<display-name>` being read.
+    run_lang: Option<String>,
 }
 
 impl OpenChannel {
@@ -562,6 +666,8 @@ impl OpenChannel {
             },
             child_depth,
             icon_read: false,
+            run: None,
+            run_lang: None,
         }
     }
 }
@@ -584,6 +690,11 @@ struct OpenProgramme {
     still_read: bool,
     /// Whether its first `backdrop` `<image>` has been read.
     backdrop_read: bool,
+    /// The run of `<title>`, `<sub-title>`, `<desc>` or `<category>`
+    /// elements being read.
+    run: Option<TextRun>,
+    /// The `lang` of the element of that run being read.
+    run_lang: Option<String>,
 }
 
 impl OpenProgramme {
@@ -597,6 +708,8 @@ impl OpenProgramme {
             image_type: None,
             still_read: false,
             backdrop_read: false,
+            run: None,
+            run_lang: None,
         }
     }
 }
@@ -609,6 +722,112 @@ struct OpenRating {
     /// Set by an empty `<value>`: `ProcessRating` then returns without adding
     /// the rating, so it is never the programme's first.
     dropped: bool,
+}
+
+/// A run of consecutive sibling elements of one name, which
+/// `XmlTvReader.ProcessNode` and `ProcessMultipleNodes` read as one before
+/// choosing by language: each value with its `lang`.
+struct TextRun {
+    /// The elements' name, as written: a sibling named otherwise ends the run.
+    name: Vec<u8>,
+    /// Each element's text and `lang` attribute, in document order.
+    values: Vec<(String, Option<String>)>,
+}
+
+impl TextRun {
+    /// Adds an element of `name` to `run`, starting the run if there is none.
+    fn push(run: &mut Option<Self>, name: &[u8], text: &str, lang: Option<String>) {
+        run.get_or_insert_with(|| Self {
+            name: name.to_vec(),
+            values: Vec::new(),
+        })
+        .values
+        .push((text.to_owned(), lang));
+    }
+
+    /// `ProcessNode`'s pick: the first value whose `lang` is `language`
+    /// (`string.Equals(languageRequired, lang, OrdinalIgnoreCase)`, so no
+    /// language picks a value without one), else the first with a blank
+    /// `lang`, else the first.
+    fn pick_one(self, language: Option<&str>) -> String {
+        let at = self
+            .values
+            .iter()
+            .position(|(_, lang)| same_language(language, lang.as_deref()))
+            .or_else(|| {
+                self.values
+                    .iter()
+                    .position(|(_, lang)| lang.as_deref().is_none_or(|l| l.trim().is_empty()))
+            })
+            .unwrap_or(0);
+        self.values
+            .into_iter()
+            .nth(at)
+            .map(|(value, _)| value)
+            .unwrap_or_default()
+    }
+
+    /// `ProcessMultipleNodes`' pick: only the values whose `lang` is exactly
+    /// `language` (an ordinal, case-sensitive `==`) when there are any, else
+    /// all of them.
+    fn pick_all(self, language: Option<&str>) -> impl Iterator<Item = String> {
+        let any = self
+            .values
+            .iter()
+            .any(|(_, lang)| lang.as_deref() == language);
+        self.values
+            .into_iter()
+            .filter(move |(_, lang)| !any || lang.as_deref() == language)
+            .map(|(value, _)| value)
+    }
+}
+
+/// `string.Equals(a, b, StringComparison.OrdinalIgnoreCase)`: two missing
+/// languages are equal, a missing one equals nothing else.
+fn same_language(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a
+            .chars()
+            .flat_map(char::to_uppercase)
+            .eq(b.chars().flat_map(char::to_uppercase)),
+        _ => false,
+    }
+}
+
+/// Ends the open channel's run of `<display-name>`s: the run's pick is the
+/// channel's name (`ProcessNode(xmlChannel, s => result.DisplayName = s, …)`).
+fn end_channel_run(c: &mut OpenChannel, language: Option<&str>) {
+    if let Some(run) = c.run.take() {
+        c.channel.display_name = run.pick_one(language);
+    }
+}
+
+/// Ends the open programme's run of one text child. A later run of the same
+/// child replaces an earlier one's pick, as upstream's setter does; categories
+/// add up.
+fn end_programme_run(p: &mut OpenProgramme, language: Option<&str>) {
+    let Some(run) = p.run.take() else { return };
+    let programme = &mut p.programme;
+    match programme_child_name(&run.name).as_ref() {
+        b"category" => programme
+            .categories
+            .extend(run.pick_all(language).filter(|value| !value.is_empty())),
+        b"title" => programme.title = run.pick_one(language),
+        b"sub-title" => {
+            programme.sub_title = Some(run.pick_one(language)).filter(|v| !v.is_empty());
+        }
+        b"desc" => programme.desc = Some(run.pick_one(language)).filter(|v| !v.is_empty()),
+        _ => {}
+    }
+}
+
+/// An attribute by its exact name, prefix included (`XmlReader.GetAttribute`),
+/// entity-resolved: `lang` and not `xml:lang`.
+fn attr_exact(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
+    e.attributes()
+        .flatten()
+        .find_map(|a| (a.key.as_ref().as_bytes() == name).then(|| unescaped_or_raw(&a)))
 }
 
 /// An `<icon>` that `XmlTvReader.ProcessIconNode` keeps: one with a `src`, a
@@ -670,6 +889,7 @@ fn apply_start(
     name: &[u8],
     e: &BytesStart<'_>,
     depth: usize,
+    language: Option<&str>,
     episode_system: &mut Option<String>,
     channel: Option<&mut OpenChannel>,
     programme: Option<&mut OpenProgramme>,
@@ -678,8 +898,16 @@ fn apply_start(
         if depth != p.child_depth {
             return;
         }
+        // `ProcessNode`/`ProcessMultipleNodes` read siblings of one name
+        // (`reader.Name == currentElementName`) and stop at the first other.
+        if p.run.as_ref().is_some_and(|run| run.name != name) {
+            end_programme_run(p, language);
+        }
         // `GetProgramme` matches on `xmlProg.Name.ToLower(...)`.
         match programme_child_name(name).as_ref() {
+            b"title" | b"sub-title" | b"desc" | b"category" => {
+                p.run_lang = attr_exact(e, b"lang");
+            }
             b"episode-num" => *episode_system = attr(e, b"system"),
             // `ProcessLive`/`ProcessNew`/`ProcessPremiereNode`: the element is
             // the flag, whatever its text.
@@ -717,14 +945,24 @@ fn apply_start(
             _ => {}
         }
     } else if let Some(c) = channel
-        // `GetChannel` matches its children case-sensitively.
         && depth == c.child_depth
-        && name == b"icon"
-        && !c.icon_read
-        && let Some(icon) = populated_icon(e)
     {
-        c.icon_read = true;
-        c.channel.icon = icon.src;
+        if c.run.as_ref().is_some_and(|run| run.name != name) {
+            end_channel_run(c, language);
+        }
+        // `GetChannel` matches its children case-sensitively.
+        match name {
+            b"display-name" => c.run_lang = attr_exact(e, b"lang"),
+            b"icon" => {
+                if !c.icon_read
+                    && let Some(icon) = populated_icon(e)
+                {
+                    c.icon_read = true;
+                    c.channel.icon = icon.src;
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -814,14 +1052,14 @@ fn apply_end(
 ) {
     let text = text.trim();
     if let Some(c) = channel {
-        let c = &mut c.channel;
-        if name == b"display-name" {
-            if c.display_name.is_empty() && !text.is_empty() {
-                text.clone_into(&mut c.display_name);
-            }
+        if name == b"display-name" && depth == c.child_depth {
+            // `ProcessNode`'s `allOccurrencesSetter`: every display-name of
+            // the run is tried as the number.
             if let Some(number) = channel_number(text) {
-                c.number = Some(number);
+                c.channel.number = Some(number);
             }
+            let lang = c.run_lang.take();
+            TextRun::push(&mut c.run, name, text, lang);
         }
         return;
     }
@@ -850,10 +1088,11 @@ fn apply_end(
     }
     let p = &mut open.programme;
     match programme_child_name(name).as_ref() {
-        b"title" if p.title.is_empty() => text.clone_into(&mut p.title),
-        b"sub-title" if !text.is_empty() => p.sub_title = Some(text.to_owned()),
-        b"desc" if !text.is_empty() => p.desc = Some(text.to_owned()),
-        b"category" if !text.is_empty() => p.categories.push(text.to_owned()),
+        // Chosen by language when the run ends (`end_programme_run`).
+        b"title" | b"sub-title" | b"desc" | b"category" => {
+            let lang = open.run_lang.take();
+            TextRun::push(&mut open.run, name, text, lang);
+        }
         b"date" => p.year = text.get(0..4).and_then(|y| y.parse().ok()),
         // `XmlTvReader.ProcessEpisodeNum` dispatches on `system`; a later
         // element assigns only the parts it carries (a part that does not parse
@@ -1624,7 +1863,7 @@ mod read_tests {
     #[case(8192)]
     fn a_guide_read_as_it_arrives_reads_as_the_string_does(#[case] step: usize) {
         let expected = parse_xmltv(GUIDE);
-        let read = read_xmltv_where(trickle(GUIDE.as_bytes(), step), |_| true);
+        let read = read_xmltv_where(trickle(GUIDE.as_bytes(), step), None, |_| true);
         assert_eq!(read.error, None);
         assert_eq!(read.channels, expected.channels);
         assert_eq!(read.programmes, expected.programmes);
@@ -1643,15 +1882,42 @@ mod read_tests {
             BODY,
         ]
         .concat();
-        let guide = read_xmltv_where(trickle(&latin1, 5), |_| true);
+        let guide = read_xmltv_where(trickle(&latin1, 5), None, |_| true);
         assert_eq!(guide.error, None);
         assert_eq!(guide.channels[0].display_name, "Télé");
 
         // Single quotes and spacing around `=` are the declaration's too.
         let latin1 = [&b"<?xml version='1.0' encoding = 'latin1' ?>"[..], BODY].concat();
-        let guide = read_xmltv_where(&latin1[..], |_| true);
+        let guide = read_xmltv_where(&latin1[..], None, |_| true);
         assert_eq!(guide.error, None);
         assert_eq!(guide.channels[0].display_name, "Télé");
+    }
+
+    /// `ISO-8859-1` and `US-ASCII` are .NET's `Latin1Encoding` and
+    /// `ASCIIEncoding`, not the WHATWG `windows-1252` both names map to there;
+    /// `windows-1252` itself is `windows-1252`.
+    #[rstest::rstest]
+    #[case::latin1("ISO-8859-1", b'\x80', "\u{80}")]
+    #[case::latin1_other_name("latin1", b'\xe9', "é")]
+    #[case::ascii("us-ascii", b'\xe9', "?")]
+    #[case::windows_1252("windows-1252", b'\x80', "€")]
+    fn single_byte_encodings_decode_as_dotnet_does(
+        #[case] label: &str,
+        #[case] byte: u8,
+        #[case] text: &str,
+    ) {
+        let document = [
+            format!(
+                "<?xml version=\"1.0\" encoding=\"{label}\"?><tv><channel id=\"a\"><display-name>"
+            )
+            .as_bytes(),
+            &[byte],
+            b"</display-name></channel></tv>",
+        ]
+        .concat();
+        let guide = read_xmltv_where(trickle(&document, 7), None, |_| true);
+        assert_eq!(guide.error, None);
+        assert_eq!(guide.channels[0].display_name, text);
     }
 
     /// A byte-order mark decides, UTF-16 included.
@@ -1660,13 +1926,13 @@ mod read_tests {
         let text = "<tv><channel id=\"a\"><display-name>Ünï</display-name></channel></tv>";
         let mut utf16 = vec![0xFF, 0xFE];
         utf16.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
-        let guide = read_xmltv_where(trickle(&utf16, 3), |_| true);
+        let guide = read_xmltv_where(trickle(&utf16, 3), None, |_| true);
         assert_eq!(guide.error, None);
         assert_eq!(guide.channels[0].display_name, "Ünï");
 
         let mut utf8 = b"\xEF\xBB\xBF".to_vec();
         utf8.extend_from_slice(text.as_bytes());
-        let guide = read_xmltv_where(&utf8[..], |_| true);
+        let guide = read_xmltv_where(&utf8[..], None, |_| true);
         assert_eq!(guide.error, None);
         assert_eq!(guide.channels[0].display_name, "Ünï");
     }
@@ -1680,7 +1946,7 @@ mod read_tests {
     #[case::unknown_encoding(&b"<?xml version=\"1.0\" encoding=\"klingon\"?><tv></tv>"[..])]
     #[case::utf16_declared_on_bytes(&b"<?xml version=\"1.0\" encoding=\"utf-16\"?><tv></tv>"[..])]
     fn a_guide_its_encoding_cannot_read_is_unreadable(#[case] bytes: &[u8]) {
-        assert!(read_xmltv_where(bytes, |_| true).error.is_some());
+        assert!(read_xmltv_where(bytes, None, |_| true).error.is_some());
     }
 
     /// A lone surrogate is not UTF-16, even in a well-formed document.
@@ -1695,7 +1961,7 @@ mod read_tests {
             utf16("</display-name></channel></tv>"),
         ]
         .concat();
-        assert!(read_xmltv_where(&bytes[..], |_| true).error.is_some());
+        assert!(read_xmltv_where(&bytes[..], None, |_| true).error.is_some());
     }
 
     /// An empty or white-space source is an empty document, not a rootless one.
@@ -1704,7 +1970,7 @@ mod read_tests {
     #[case(&b" \n\t"[..])]
     fn an_empty_source_is_an_empty_document(#[case] bytes: &[u8]) {
         assert_eq!(
-            read_xmltv_where(bytes, |_| true).error.as_deref(),
+            read_xmltv_where(bytes, None, |_| true).error.as_deref(),
             Some("the XMLTV document is empty")
         );
     }
@@ -1774,5 +2040,190 @@ mod previously_shown_tests {
             "soon",
             "<previously-shown start=\"20260725200000\"/>"
         ));
+    }
+}
+
+/// Text children chosen by the guide language, as `XmlTvReader.ProcessNode`
+/// and `ProcessMultipleNodes` choose them.
+#[cfg(test)]
+mod language_tests {
+    use super::{Xmltv, read_xmltv_where};
+
+    /// Jellyfin.XmlTv's `Test Data/MultilanguageData.xml` (MIT), as its
+    /// `XmlTvReaderLanguageTests` read it.
+    const MULTILANGUAGE: &str = r#"<?xml version="1.0" encoding="ISO-8859-1"?>
+<tv date="20151126" generator-name="XMLTV GUI V. 3.14.01W" generator-url="http://www.birtles.org.uk/xmltv">
+  <channel id="UK_RT_2667">
+    <display-name lang="en">BBC1 HD</display-name>
+  </channel>
+  <programme start="20151126100000 +0000" stop="20151126110000 +0000" channel="UK_RT_2667">
+    <title lang="es">Homes Under the Hammer - Spanish</title>
+    <title lang="es">Homes Under the Hammer - Spanish 2</title>
+    <title lang="en">Homes Under the Hammer - English</title>
+    <title lang="en">Homes Under the Hammer - English 2</title>
+    <title lang="">Homes Under the Hammer - Empty Language</title>
+    <title>Homes Under the Hammer - No Language</title>
+    <desc lang="en">Lucy Alexander, Martin Roberts and Dion Dublin explore a semi in Chingford, London, a one-bedroom flat in Brighton and a Victorian terrace in Normanton, Derby.</desc>
+    <credits>
+      <actor>Presenter - Lucy Alexander</actor>
+      <actor>Presenter - Martin Roberts</actor>
+      <actor>Presenter - Dion Dublin</actor>
+    </credits>
+    <category lang="en">Property - English</category>
+    <category lang="es">Property - Spanish</category>
+    <category lang="">Property - Empty Language</category>
+    <category>Property - No Language</category>
+    <length units="minutes">60</length>
+    <episode-num system="xmltv_ns">18.50/30.</episode-num>
+    <video>
+      <aspect>16:9</aspect>
+    </video>
+    <subtitles type="teletext">
+      <language lang="en">English</language>
+    </subtitles>
+  </programme>
+  <programme start="20151126110000 +0000" stop="20151126120000 +0000" channel="UK_RT_2667">
+    <title lang="en">Homes Under the Hammer - English</title>
+    <title lang="en">Homes Under the Hammer - English 2</title>
+    <title lang="">Homes Under the Hammer - No Language</title>
+    <desc lang="en">Lucy Alexander, Martin Roberts and Dion Dublin explore a semi in Chingford, London, a one-bedroom flat in Brighton and a Victorian terrace in Normanton, Derby.</desc>
+    <credits>
+      <actor>Presenter - Lucy Alexander</actor>
+      <actor>Presenter - Martin Roberts</actor>
+      <actor>Presenter - Dion Dublin</actor>
+    </credits>
+    <category lang="en">Property - English</category>
+    <category lang="">Property - Empty Language</category>
+    <length units="minutes">60</length>
+    <episode-num system="xmltv_ns">18.50/30.</episode-num>
+    <video>
+      <aspect>16:9</aspect>
+    </video>
+    <subtitles type="teletext">
+      <language lang="en">English</language>
+    </subtitles>
+  </programme>
+</tv>"#;
+
+    fn read(xml: &str, language: Option<&str>) -> Xmltv {
+        let guide = read_xmltv_where(xml.as_bytes(), language, |_| true);
+        assert_eq!(guide.error, None);
+        guide
+    }
+
+    /// `FirstMatchingLanguageESTest`, `FirstMatchingLanguageENTest`,
+    /// `FirstMatchingNoLanguageTest` and `FirstMatchingEmptyLanguageTest`: the
+    /// first programme's title and its only category.
+    #[rstest::rstest]
+    #[case::es(Some("es"), "Homes Under the Hammer - Spanish", "Property - Spanish")]
+    #[case::en(Some("en"), "Homes Under the Hammer - English", "Property - English")]
+    #[case::no_language(None, "Homes Under the Hammer - No Language", "Property - No Language")]
+    #[case::empty_language(
+        Some(""),
+        "Homes Under the Hammer - Empty Language",
+        "Property - Empty Language"
+    )]
+    fn the_first_value_in_the_guide_language_wins(
+        #[case] language: Option<&str>,
+        #[case] title: &str,
+        #[case] category: &str,
+    ) {
+        let guide = read(MULTILANGUAGE, language);
+        assert_eq!(guide.channels[0].id, "UK_RT_2667");
+        let programme = &guide.programmes[0];
+        assert_eq!(programme.title, title);
+        assert_eq!(programme.categories, [category]);
+    }
+
+    /// `FirstNoMatchFoundTest` and `FirstNoLanguageTest`: with no title in the
+    /// language, the first with a blank `lang` is taken, and with no category
+    /// in it, every category is kept.
+    #[rstest::rstest]
+    #[case::no_match(Some("es"))]
+    #[case::no_language(None)]
+    fn without_the_language_a_blank_one_and_every_category_are_taken(
+        #[case] language: Option<&str>,
+    ) {
+        let guide = read(MULTILANGUAGE, language);
+        let programme = &guide.programmes[1];
+        assert_eq!(programme.title, "Homes Under the Hammer - No Language");
+        assert_eq!(
+            programme.categories,
+            ["Property - English", "Property - Empty Language"]
+        );
+    }
+
+    /// `ProcessNode` matches the language ignoring case; `ProcessMultipleNodes`
+    /// matches it exactly.
+    #[test]
+    fn titles_match_the_language_ignoring_case_and_categories_exactly() {
+        let guide = read(
+            "<tv><programme start=\"20260725060000 +0000\" channel=\"a\">\
+             <title lang=\"de\">Tagesschau</title><title lang=\"EN\">News</title>\
+             <category lang=\"de\">Nachrichten</category><category lang=\"EN\">News</category>\
+             </programme></tv>",
+            Some("en"),
+        );
+        assert_eq!(guide.programmes[0].title, "News");
+        assert_eq!(guide.programmes[0].categories, ["Nachrichten", "News"]);
+    }
+
+    /// A sub-title and a description are chosen the same way, and the run
+    /// ends at a sibling of another name: a later run of the same element
+    /// replaces the earlier one's choice, as upstream's setter does.
+    #[test]
+    fn each_run_of_siblings_is_chosen_on_its_own() {
+        let guide = read(
+            "<tv><programme start=\"20260725060000 +0000\" channel=\"a\">\
+             <sub-title lang=\"de\">Folge</sub-title><sub-title lang=\"en\">Episode</sub-title>\
+             <desc lang=\"en\">English.</desc><desc lang=\"de\">Deutsch.</desc>\
+             <title lang=\"en\">First</title><category>A</category>\
+             <title lang=\"en\">Second</title><category>B</category>\
+             </programme></tv>",
+            Some("en"),
+        );
+        let programme = &guide.programmes[0];
+        assert_eq!(programme.sub_title.as_deref(), Some("Episode"));
+        assert_eq!(programme.desc.as_deref(), Some("English."));
+        assert_eq!(programme.title, "Second");
+        assert_eq!(programme.categories, ["A", "B"]);
+    }
+
+    /// `xml:lang` is another attribute: `GetAttribute("lang")` does not read it.
+    #[test]
+    fn only_the_lang_attribute_names_the_language() {
+        let guide = read(
+            "<tv><programme start=\"20260725060000 +0000\" channel=\"a\">\
+             <title xml:lang=\"en\">Prefixed</title><title>Plain</title>\
+             </programme></tv>",
+            Some("en"),
+        );
+        assert_eq!(guide.programmes[0].title, "Prefixed");
+    }
+
+    /// `GetChannel` reads the display-name by the same rule, tries every one
+    /// as the channel number, and drops a channel with no id or no name.
+    #[test]
+    fn channel_display_names_are_chosen_by_language() {
+        let guide = read(
+            "<tv>\
+             <channel id=\"a\"><display-name lang=\"de\">Erstes</display-name>\
+             <display-name lang=\"en\">First</display-name><display-name>4-1</display-name></channel>\
+             <channel id=\"b\"><display-name lang=\"de\">Nur Deutsch</display-name></channel>\
+             <channel id=\"\"><display-name>No id</display-name></channel>\
+             <channel id=\"c\"><icon src=\"http://x/c.png\"/></channel>\
+             <channel id=\"d\"><display-name/></channel>\
+             </tv>",
+            Some("en"),
+        );
+        let names: Vec<_> = guide
+            .channels
+            .iter()
+            .map(|c| (c.id.as_str(), c.display_name.as_str(), c.number.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [("a", "First", Some("4.1")), ("b", "Nur Deutsch", None)]
+        );
     }
 }

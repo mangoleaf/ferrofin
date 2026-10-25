@@ -857,6 +857,17 @@ pub async fn build_app_state(
         )
         .with_users(Arc::clone(&users))
         .with_self_writes(Arc::clone(&self_writes_guard))
+        // `XmlTvListingsProvider.GetLanguage`'s fallback, read live so a changed
+        // setting applies to the next guide read.
+        .with_metadata_language({
+            let config_mgr = Arc::clone(&config_mgr);
+            Arc::new(move || {
+                config_mgr
+                    .snapshot_shared()
+                    .preferred_metadata_language
+                    .clone()
+            })
+        })
         // `M3UTunerHost`'s `IsInLocalNetwork(uri.Host)`: the configured
         // policy, resolving tuner host names. The name is resolved with the
         // policy's lock released, so a slow resolver never holds up a

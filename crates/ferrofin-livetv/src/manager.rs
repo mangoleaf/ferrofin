@@ -463,6 +463,9 @@ pub struct FerrofinLiveTvManager {
     /// The NFO options' `ReleaseDateFormat`, for a recording's sidecar NFO
     /// ([`with_release_date_format`](Self::with_release_date_format)).
     release_date_format: crate::recording_metadata::ReleaseDateFormat,
+    /// The server's `PreferredMetadataLanguage`, read live
+    /// ([`with_metadata_language`](Self::with_metadata_language)).
+    metadata_language: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     /// Serializes "join or open", so two clients tuning the same channel at
     /// once cannot both miss the join and both dial the tuner.
     ///
@@ -922,11 +925,12 @@ impl Drop for FiringClaim {
 /// `XmlTvReader.GetChannels`/`GetProgrammes`), so neither read holds it whole.
 async fn parse_guide(
     document: XmlTvDocument,
+    language: Option<String>,
     keep: impl FnMut(&XmltvProgramme) -> bool + Send + 'static,
 ) -> Result<(XmlTvDocument, Xmltv), ServiceError> {
     tokio::task::spawn_blocking(move || {
         let guide = match document.reader() {
-            Ok(reader) => read_xmltv_where(reader, keep),
+            Ok(reader) => read_xmltv_where(reader, language.as_deref(), keep),
             Err(e) => Xmltv {
                 error: Some(format!("the XMLTV document could not be read: {e}")),
                 ..Xmltv::default()
@@ -1006,6 +1010,7 @@ impl FerrofinLiveTvManager {
             encoder: None,
             self_writes: None,
             release_date_format: crate::recording_metadata::default_release_date_format(),
+            metadata_language: None,
             open_lock: Arc::new(tokio::sync::Mutex::new(())),
             guide_lock: Arc::new(tokio::sync::Mutex::new(())),
             refresh_generation: Arc::new(AtomicU64::new(0)),
@@ -1054,6 +1059,31 @@ impl FerrofinLiveTvManager {
     ) -> Self {
         self.release_date_format = format;
         self
+    }
+
+    /// Reads the server's `PreferredMetadataLanguage` through `language`, each
+    /// time a guide is read, so a changed setting applies to the next read.
+    /// It is the language an XMLTV guide is read in when its provider names
+    /// none ([`guide_language`](Self::guide_language)). Without one (tests) a
+    /// guide is read with no language.
+    #[must_use]
+    pub fn with_metadata_language(
+        mut self,
+        language: Arc<dyn Fn() -> String + Send + Sync>,
+    ) -> Self {
+        self.metadata_language = Some(language);
+        self
+    }
+
+    /// The language an XMLTV guide is read in: `XmlTvListingsProvider.GetLanguage`
+    /// (v12.2 :53-60), the provider's `PreferredLanguage` unless it is blank,
+    /// else the server's `PreferredMetadataLanguage`.
+    fn guide_language(&self, provider: &ListingsProviderInfo) -> Option<String> {
+        provider
+            .preferred_language
+            .clone()
+            .filter(|language| !language.trim().is_empty())
+            .or_else(|| self.metadata_language.as_ref().map(|language| language()))
     }
 
     /// Sets the on-disk locations the live-stream buffer and DVR recordings use.
@@ -1833,7 +1863,7 @@ impl FerrofinLiveTvManager {
         }
         let document = self.xmltv.get_xml(info).await?;
         // The channels only: every airing is dropped as soon as it is read.
-        let (_, guide) = parse_guide(document, |_| false).await?;
+        let (_, guide) = parse_guide(document, self.guide_language(info), |_| false).await?;
         // Upstream's `GetChannels` throws on a bad document, so the mapping
         // dialog shows an error instead of "no channels".
         if let Some(e) = guide.error {
@@ -2125,7 +2155,7 @@ impl FerrofinLiveTvManager {
         // `clean_programs` replace the bound channels' airings with a partial
         // set, so the refresh stops before any prune instead.
         let bound: HashSet<String> = by_epg_channel.keys().cloned().collect();
-        let (document, guide) = parse_guide(document, move |prog| {
+        let (document, guide) = parse_guide(document, self.guide_language(provider), move |prog| {
             bound.contains(&prog.channel_id)
                 && Self::in_guide_window(prog, window_start, window_end)
         })
@@ -2317,7 +2347,8 @@ impl FerrofinLiveTvManager {
             Ok(document) => {
                 // The channels and whether the document is readable; every
                 // airing is dropped as it is read.
-                let (document, probe) = parse_guide(document, |_| false).await?;
+                let (document, probe) =
+                    parse_guide(document, self.guide_language(provider), |_| false).await?;
                 if let Some(e) = &probe.error {
                     tracing::warn!(%path, error = %e, "live tv: guide document unreadable; keeping the stored guide");
                     Ok((None, false))
@@ -7351,6 +7382,45 @@ mod tests {
             .await
             .expect("a URL");
         assert_eq!(mgr.get_listing_providers().await.expect("list").len(), 2);
+    }
+
+    /// `XmlTvListingsProvider.GetLanguage`: a guide is read in its provider's
+    /// `PreferredLanguage`, else in the server's `PreferredMetadataLanguage`,
+    /// read as it is when the guide is read.
+    #[tokio::test]
+    async fn a_guide_is_read_in_the_provider_or_the_server_language() {
+        let guide = "<tv><channel id=\"a\">\
+            <display-name lang=\"de\">Erstes</display-name>\
+            <display-name lang=\"en\">First</display-name></channel></tv>";
+        let server = Arc::new(std::sync::Mutex::new("de".to_owned()));
+        let mgr = manager_with(FakeFetcher(HashMap::from([(
+            "http://guide/xmltv.xml".to_owned(),
+            guide.to_owned(),
+        )])))
+        .await
+        .with_metadata_language({
+            let server = Arc::clone(&server);
+            Arc::new(move || server.lock().expect("lock").clone())
+        });
+        let name = |language: Option<&str>| {
+            let mgr = mgr.clone();
+            let provider = as_xmltv(ListingsProviderInfo {
+                path: Some("http://guide/xmltv.xml".to_owned()),
+                preferred_language: language.map(str::to_owned),
+                ..ListingsProviderInfo::default()
+            });
+            async move {
+                mgr.provider_channels(&provider).await.expect("channels")[0]
+                    .name
+                    .clone()
+            }
+        };
+
+        assert_eq!(name(Some("en")).await, "First");
+        assert_eq!(name(None).await, "Erstes");
+        assert_eq!(name(Some("  ")).await, "Erstes", "a blank one is none");
+        *server.lock().expect("lock") = "en".to_owned();
+        assert_eq!(name(None).await, "First", "the setting is read live");
     }
 
     /// `TunerHostManager.SaveTunerHost` runs `M3UTunerHost.Validate` first, so

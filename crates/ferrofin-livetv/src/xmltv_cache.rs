@@ -658,7 +658,8 @@ mod tests {
             .get_xml(&provider(Some(&id), guide.to_str().expect("utf-8")))
             .await
             .expect("guide");
-        let read = crate::xmltv::read_xmltv_where(document.reader().expect("reader"), |_| true);
+        let read =
+            crate::xmltv::read_xmltv_where(document.reader().expect("reader"), None, |_| true);
         assert_eq!(read.error, None);
         assert_eq!(read.channels[0].display_name, "Télé");
     }

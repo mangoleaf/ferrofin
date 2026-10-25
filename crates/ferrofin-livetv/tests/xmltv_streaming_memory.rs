@@ -172,7 +172,7 @@ async fn download_and_read(cache: &XmlTvCache, url: String) -> usize {
     PEAK.store(before, Ordering::SeqCst);
     let document = cache.get_xml(&info).await.expect("guide");
     let guide = tokio::task::spawn_blocking(move || {
-        read_xmltv_where(document.reader().expect("reader"), |_| false)
+        read_xmltv_where(document.reader().expect("reader"), None, |_| false)
     })
     .await
     .expect("parse");
