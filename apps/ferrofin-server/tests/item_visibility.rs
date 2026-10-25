@@ -1107,32 +1107,43 @@ async fn public_user_picker_filters_authenticated_devices_after_setup() {
     assert!(users.as_array().unwrap().iter().any(|u| u["Id"] == id));
 }
 
+/// Jellyfin 12.1 runs `DeviceAccessHost` after a policy save and after a
+/// rename (`UserManager.UpdatePolicyAsync` and `RenameUser` raise
+/// `OnUserUpdated`): every device of the user that the saved policy no longer
+/// allows is logged out, and signing in from it again is a security error.
 #[tokio::test]
-async fn renamed_user_loses_existing_tokens_on_disallowed_devices() {
+async fn a_policy_save_or_a_rename_signs_out_disallowed_devices() {
     let h = boot().await;
     let router = ferrofin_api::create_router(h.wired.state.clone());
     let (admin, _) = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
     let id = create_user(&router, &admin, "device-user", "pw").await;
     let (user, _) = login(&router, "device-user", "pw").await;
-    let (_, mut dto) = call(&router, "GET", &format!("/Users/{id}"), Some(&admin), None).await;
-    dto["Policy"]["EnableAllDevices"] = json!(false);
-    dto["Policy"]["EnabledDevices"] = json!([]);
-    assert_eq!(
-        call(
-            &router,
-            "POST",
-            &format!("/Users/{id}/Policy"),
-            Some(&admin),
-            Some(dto["Policy"].clone())
-        )
-        .await
-        .0,
-        StatusCode::NO_CONTENT
-    );
+    let (_, dto) = call(&router, "GET", &format!("/Users/{id}"), Some(&admin), None).await;
+    let open = dto["Policy"].clone();
+    let mut restricted = open.clone();
+    restricted["EnableAllDevices"] = json!(false);
+    restricted["EnabledDevices"] = json!([]);
+    let save = |policy: Value| {
+        let router = router.clone();
+        let admin = admin.clone();
+        let id = id.clone();
+        async move {
+            call(
+                &router,
+                "POST",
+                &format!("/Users/{id}/Policy"),
+                Some(&admin),
+                Some(policy),
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(save(restricted.clone()).await, StatusCode::NO_CONTENT);
     assert_eq!(
         call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
-        StatusCode::OK,
-        "policy saves do not emit OnUserUpdated in the pinned source"
+        StatusCode::UNAUTHORIZED,
+        "the policy save signs out the device it no longer allows"
     );
     assert_eq!(
         call(
@@ -1146,6 +1157,25 @@ async fn renamed_user_loses_existing_tokens_on_disallowed_devices() {
         .0,
         StatusCode::FORBIDDEN,
         "a denied device is a security error, not bad credentials"
+    );
+
+    // The rename leg: a token on a device the stored policy refuses, the
+    // policy written without the save's device check, is signed out by a
+    // rename.
+    assert_eq!(save(open).await, StatusCode::NO_CONTENT);
+    let (user, _) = login(&router, "device-user", "pw").await;
+    let policy: ferrofin_model::users::UserPolicy =
+        serde_json::from_value(restricted).expect("policy");
+    h.wired
+        .state
+        .users
+        .update_policy(uuid::Uuid::parse_str(&id).expect("id"), &policy)
+        .await
+        .expect("policy saved without the device check");
+    assert_eq!(
+        call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
+        StatusCode::OK,
+        "nothing has run the device check yet"
     );
     assert_eq!(
         call(
@@ -1161,7 +1191,8 @@ async fn renamed_user_loses_existing_tokens_on_disallowed_devices() {
     );
     assert_eq!(
         call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
-        StatusCode::UNAUTHORIZED
+        StatusCode::UNAUTHORIZED,
+        "the rename runs the device check"
     );
 }
 

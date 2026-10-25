@@ -28,9 +28,12 @@ interface types {
         /// Stable plugin id — a UUID in canonical string form. A component
         /// whose id does not parse as a UUID is rejected at load.
         id: string,
-        /// Human-readable display name.
+        /// Human-readable display name. A blank name, one over 256 bytes,
+        /// or one with control characters is rejected at install and load.
         name: string,
-        /// Semantic version string of the plugin itself.
+        /// Semantic version string of the plugin itself. The dashboard's
+        /// versioned routes (`/Plugins/{id}/{version}/…`) address the plugin
+        /// by this exact string when it is not a .NET `Version`.
         version: string,
         /// One-line description shown in the dashboard.
         description: string,
@@ -68,6 +71,9 @@ interface types {
     /// (plugin assets are loaded via plain `<script src>` tags), so
     /// `handle-request` is an anonymous attack surface. Check
     /// `is-authenticated` / `is-admin` before doing anything sensitive.
+    /// The identity has passed Jellyfin's default authorization policy: a
+    /// disabled account, a remote caller without remote access, or a user
+    /// outside their access schedule arrives as anonymous.
     record plugin-request {
         /// The HTTP method (`GET`, `POST`, …).
         method: string,
@@ -92,7 +98,13 @@ interface types {
     record plugin-response {
         /// The HTTP status code.
         status: u16,
-        /// Response headers as (name, value) pairs.
+        /// Response headers as (name, value) pairs. Served on the server's
+        /// own origin, so the host owns some: framing headers, `set-cookie`,
+        /// `clear-site-data`, `content-security-policy` and
+        /// `x-content-type-options` are dropped, and every response is sent
+        /// with `nosniff` and `content-security-policy: sandbox allow-scripts
+        /// allow-forms allow-popups` (a served HTML page runs in an opaque
+        /// origin, without the server origin's stored tokens).
         headers: list<tuple<string, string>>,
         /// The response body bytes.
         body: list<u8>,
@@ -110,9 +122,12 @@ interface types {
         /// The served-file name pattern the transform applies to
         /// (e.g. `index.html`, `*.chunk.js`).
         path-pattern: string,
-        /// The literal text to find (the host caps it at 256 KiB).
+        /// The literal text to find (the host caps it at 256 KiB, and
+        /// refuses a blank one).
         search: string,
-        /// The literal replacement text (the host caps it at 256 KiB).
+        /// The literal replacement text (the host caps it at 256 KiB). A
+        /// transform that would grow a file by more than 256 KiB leaves it
+        /// unchanged.
         replace: string,
     }
 

@@ -50,25 +50,34 @@ pub fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
-/// The `X-Forwarded-For` chain, left to right as sent, keeping only entries that
-/// parse as addresses.
+/// The `X-Forwarded-For` entries the client-address walk can reach, left to
+/// right as sent: the ones right of the rightmost entry that does not parse as
+/// an address.
 ///
-/// A port may be appended to an entry (`203.0.113.9:41234`), and an IPv6 entry
-/// may be bracketed; both spellings are read. An entry that is neither is
-/// dropped rather than ending the walk, since a proxy that writes an obfuscated
-/// identifier should not silently pin the client to the hop before it.
+/// ASP.NET's `ApplyForwarders` walks the entries from the right while the
+/// address it trusts so far is a known proxy, and stops at the first one that
+/// does not parse ("Stop at the first unparsable IP"), keeping the last
+/// address it trusted. No entry left of that one is ever reached, so none is
+/// returned. A known proxy that writes an obfuscated token for its client
+/// (Squid's `unknown`) therefore leaves the proxy as the client, and the
+/// entries before the token, which that client wrote itself, cannot be taken
+/// for its address.
 ///
-/// TODO(gl-184): end the walk at such an entry, as ASP.NET's `ApplyForwarders`
-/// and [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers) do.
+/// The entries are split and unquoted as `GetCommaSeparatedValues` does, the
+/// list [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers)
+/// walks for the scheme and host. A port may be appended to an entry
+/// (`203.0.113.9:41234`), and an IPv6 entry may be bracketed; both spellings
+/// are read.
 #[must_use]
 pub fn forwarded_for(headers: &axum::http::HeaderMap) -> Vec<std::net::IpAddr> {
-    headers
-        .get_all("x-forwarded-for")
+    let entries = crate::forwarded_headers::comma_separated_values(headers, "x-forwarded-for");
+    let mut reachable: Vec<std::net::IpAddr> = entries
         .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .filter_map(|entry| parse_forwarded_entry(entry.trim()))
-        .collect()
+        .rev()
+        .map_while(|entry| parse_forwarded_entry(entry))
+        .collect();
+    reachable.reverse();
+    reachable
 }
 
 /// One `X-Forwarded-For` entry as an address.

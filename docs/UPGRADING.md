@@ -8,6 +8,48 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — creating a backup needs a JSON body
+
+A script that calls `POST /Backup/Create` with no body must now send `{}` with
+`Content-Type: application/json` to get the default backup, as Jellyfin requires. Without a
+body the request fails: `415` with no content type, `400` with an empty or `null` body.
+`POST /Backup/Restore` with no content type is a `415` too, instead of a `400`.
+
+`GET /Backup` lists the archives in the order the backups folder holds them, as Jellyfin
+does, not newest first; a script that takes the first entry as the latest backup should
+sort by `DateCreated`. Files ending in `.ZIP` or another case are no longer listed.
+
+A backup also fails now where it used to leave something out. A file it cannot read
+(wrong ownership after a manual copy, for example) fails the create with a `500`, and the
+server log names the file: fix the file's permissions and create the backup again. A
+backups folder the server cannot read fails `GET /Backup` the same way, where the dashboard
+used to show no backups. A create during a library scan answers `500` instead of `503`.
+
+## Unreleased — clients are no longer told which accounts have no password
+
+`HasPassword` and `HasConfiguredPassword` now read `true` for every user, as Jellyfin 12
+reports them. Before, an account without a password read `false`, including on the
+login-screen list that `GET /Users/Public` serves to callers who have not signed in.
+
+A client that used the flag to sign a passwordless user in with one click now asks for a
+password instead. Upstream names jellyfin-web's login screen among those clients. Leave the
+password empty: the account still signs in, because sign-in checks the stored password and
+not the flag.
+
+## Unreleased — abandoned playback is stopped, and paused sessions can be
+
+Ferrofin now runs Jellyfin's two playback checks:
+- **Idle playback:** a session that has been playing without reporting progress for more
+  than five minutes is stopped where its client last reported. Its device stops showing as
+  playing, its resume point is saved, and the usual rules may mark the item played. Before,
+  a client that vanished mid-playback over plain HTTP stayed "playing", and the "Clean
+  Transcode Directory" and "Optimize database" tasks skipped every run while it did.
+- **Inactive sessions:** the setting `InactiveSessionThreshold` (minutes, in
+  `config/system.json`, or through `POST /System/Configuration`) now applies. A session
+  paused longer than that is sent a stop command, which reaches clients connected over a
+  WebSocket, as in Jellyfin. It was ignored before, including when carried over from an
+  adopted Jellyfin configuration. At `0`, the default, nothing is stopped.
+
 ## Unreleased — the Latest row follows Jellyfin 12 for movies libraries
 
 Nothing to do. A grouped **Latest** request whose first library with a content type is a

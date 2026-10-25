@@ -116,14 +116,27 @@ fn parse_dotnet_version(raw: &str) -> Option<[i64; 4]> {
 /// pair against Jellyfin 10.11.8, `DELETE /Plugins/{omdb}/{version}`:
 /// `10.11.8.0` -> 204 on both; `9.9.9.9` -> J 404 / F 204; `10.11.8` -> J 404 /
 /// F 204; `notaversion` -> J 400 / F 204.
+///
+/// A WASM plugin's version is semver (`0.2.0-beta.1`, `1.0.0+git.abc`), which
+/// no .NET `Version` can hold, and jellyfin-web sends it back verbatim. So a
+/// path version that is not a `Version` still addresses the plugin whose
+/// stored version is exactly that string; any other one stays the binder's
+/// `400`. Upstream manifests are always a `Version`, so no Jellyfin-reachable
+/// request changes answer.
 async fn plugin_at_version(
     state: &AppState,
     plugin_id: Uuid,
     version: &str,
 ) -> Result<PluginDescriptor, ApiError> {
-    let requested = parse_dotnet_version(version)
-        // The model binder's own wording, which is what a client reads.
-        .ok_or_else(|| ApiError::BadRequest(format!("The value '{version}' is not valid.")))?;
+    let Some(requested) = parse_dotnet_version(version) else {
+        return match state.plugins.get_plugin(plugin_id).await? {
+            Some(descriptor) if descriptor.version == version => Ok(descriptor),
+            // The model binder's own wording, which is what a client reads.
+            _ => Err(ApiError::BadRequest(format!(
+                "The value '{version}' is not valid."
+            ))),
+        };
+    };
     let not_found = || ApiError::NotFound(format!("plugin {plugin_id} {version}"));
     let descriptor = state
         .plugins
@@ -701,9 +714,12 @@ const CREDENTIAL_HEADERS: [&str; 5] = [
     "x-mediabrowser-token",
 ];
 
-/// Framing and hop-by-hop response headers belong to the transport, not
-/// the guest — forwarding them fights hyper's own framing.
-const RESERVED_RESPONSE_HEADERS: [&str; 7] = [
+/// Response headers the guest never sets. Framing and hop-by-hop headers
+/// belong to the transport (forwarding them fights hyper's own framing). The
+/// rest decide what a browser lets the response do on the server's origin,
+/// where jellyfin-web keeps every user's token, so the host owns them: no
+/// cookies, no wiping the origin's storage, and the policy below.
+const RESERVED_RESPONSE_HEADERS: [&str; 11] = [
     "content-length",
     "transfer-encoding",
     "connection",
@@ -711,7 +727,18 @@ const RESERVED_RESPONSE_HEADERS: [&str; 7] = [
     "upgrade",
     "te",
     "trailer",
+    "set-cookie",
+    "clear-site-data",
+    "content-security-policy",
+    "x-content-type-options",
 ];
+
+/// The policy on every plugin-routed response: a document the guest serves
+/// runs in an opaque origin (`sandbox` without `allow-same-origin`), so its
+/// script cannot read the server origin's storage or cookies. Assets and API
+/// answers a settings page fetches are unaffected (a CSP binds the document
+/// it arrives with).
+const PLUGIN_CONTENT_SECURITY_POLICY: &str = "sandbox allow-scripts allow-forms allow-popups";
 
 /// Max inbound body for a plugin-routed request — an abuse guard on an
 /// anonymous surface, not a tuning knob (plugin APIs move JSON, not media).
@@ -737,15 +764,29 @@ async fn plugin_web_request(
         return Err(ApiError::NotFound("no runtime plugin host".to_owned()));
     };
     // The caller's identity, resolved by the auth middleware — forwarded as
-    // plain facts, never the token. Admin is a policy read, same as the
-    // admin gate above, but non-fatal here.
-    let auth = request
-        .extensions()
+    // plain facts, never the token, and only when Jellyfin's default policy
+    // admits the caller (an upstream `[Authorize]` plugin controller never
+    // sees one it rejects): a disabled account, a remote call without remote
+    // access, or a child outside its schedule reaches the guest as anonymous.
+    let (parts, body) = request.into_parts();
+    let resolved = parts
+        .extensions
         .get::<ferrofin_traits::options::AuthorizationInfo>()
         .cloned()
-        .unwrap_or_default();
-    let is_admin = require_admin(&state, &auth).await.is_ok();
-    let body = axum::body::to_bytes(request.into_body(), PLUGIN_REQUEST_BODY_MAX)
+        .filter(|info| info.is_authenticated);
+    let auth = match resolved {
+        Some(info) => crate::auth::default_authorization(info, &parts, &state, true)
+            .await
+            .ok(),
+        None => None,
+    };
+    let is_admin = match &auth {
+        Some(info) => crate::auth::is_administrator_identity(&state, info)
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
+    let body = axum::body::to_bytes(body, PLUGIN_REQUEST_BODY_MAX)
         .await
         .map_err(|_| {
             ApiError::BadRequest(format!(
@@ -782,17 +823,26 @@ async fn plugin_web_request(
             })
             .collect(),
         body: (!body.is_empty()).then(|| body.to_vec()),
-        user_id: auth.user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok()),
+        user_id: auth
+            .as_ref()
+            .and_then(|info| info.user.as_ref())
+            .and_then(|u| Uuid::parse_str(&u.id).ok()),
         is_admin,
-        is_authenticated: auth.is_authenticated,
+        is_authenticated: auth.is_some(),
     };
     let Some(reply) = dispatch.handle(plugin_id, web_request).await? else {
         return Err(ApiError::NotFound(format!("plugin {plugin_id}")));
     };
-    let mut response = axum::http::Response::builder().status(
-        axum::http::StatusCode::from_u16(reply.status)
-            .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
-    );
+    let mut response = axum::http::Response::builder()
+        .status(
+            axum::http::StatusCode::from_u16(reply.status)
+                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),
+        )
+        .header(axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            PLUGIN_CONTENT_SECURITY_POLICY,
+        );
     for (name, value) in reply.headers {
         // Invalid guest-supplied header names/values are dropped, not fatal.
         if RESERVED_RESPONSE_HEADERS

@@ -12,7 +12,7 @@ setup() {
   TMP="$BATS_TEST_TMPDIR/fixtures"
   mkdir -p "$TMP"
   cd "$TMP" || exit 1
-  unset FERROFIN_ADOPTION_FIXTURES IMAGE ADOPTION_USER ADOPTION_WORK_DIR ADOPTION_SCAN_TIMEOUT ADOPTION_ORACLE ORACLE_VERSION
+  unset FERROFIN_ADOPTION_FIXTURES FERROFIN_GATES_DIR IMAGE ADOPTION_USER ADOPTION_WORK_DIR ADOPTION_SCAN_TIMEOUT ADOPTION_ORACLE ORACLE_VERSION
 }
 
 # A smoke output in the real format: "status  metric  path".
@@ -232,6 +232,28 @@ EOS
 
 # --- run.sh command line -----------------------------------------------------------
 
+# copy_gates: gates/ copied into a repository of its own, its adoption/ in COPY. gates/lib.sh refuses an
+# output root inside the repository it runs from, so a root under the test's directory is refused when
+# TMPDIR itself is inside this checkout (the pre-push CI mirror keeps scratch files there): from the copy
+# it is beside the repository, as it would be on a real host.
+copy_gates() {
+  mkdir -p "$BATS_TEST_TMPDIR/repo" && cp -r "$ADOPTION/.." "$BATS_TEST_TMPDIR/repo/gates" && git -C "$BATS_TEST_TMPDIR/repo" init -q
+  COPY=$BATS_TEST_TMPDIR/repo/gates/adoption
+}
+
+copy_fixtures_dir() { # the copy's adoption_fixtures_dir (the same name: the copy's files are the same)
+  # shellcheck disable=SC2016  # expanded by the inner bash
+  bash -c '. "$1"; adoption_fixtures_dir test' _ "$COPY/lib.sh"
+}
+
+one_row_fixture() { # one_row_fixture <dir>: the smallest fixture run.sh adopts (one messy row)
+  mkdir -p "$1/oracle" "$1/media" "$1/jellyfin-12.2-messy/data"
+  smoke "$1/oracle/smoke-jellyfin-12.2.txt" 120
+  empty_adoption_db "$1/jellyfin-12.2-messy/data/jellyfin.db"
+  printf '{"lineage": "12.x", "shapes": {}}' > "$1/jellyfin-12.2-messy/messy.json"
+  printf '{"shapes": {}}' > "$1/jellyfin-12.2-messy/messy-oracle.json"
+}
+
 bin_first() { # the fake binaries in $TMP/bin win over the real ones (a function: shellcheck reads a @test body as a subshell)
   PATH="$TMP/bin:$PATH"
 }
@@ -245,10 +267,103 @@ EOS
   chmod +x bin/docker; PATH="$TMP/bin:$PATH"
 }
 
-@test "run.sh: refuses to run without a fixtures directory" {
-  run "$ADOPTION/run.sh"
+@test "run.sh, build-fixtures.sh and synthetic.py: with no output root and no --fixtures, one line naming FERROFIN_GATES_DIR" {
+  for cmd in "$ADOPTION/run.sh" "$ADOPTION/build-fixtures.sh" "python3 $ADOPTION/synthetic.py run"; do
+    run $cmd
+    [ "$status" -eq 2 ]
+    [ "${#lines[@]}" -eq 1 ]
+    [[ "$output" == *"set FERROFIN_GATES_DIR"* ]]
+  done
+}
+
+@test "run.sh: with only FERROFIN_GATES_DIR, the fixtures and the work directory come from the root; --fixtures and ADOPTION_WORK_DIR win" {
+  copy_gates
+  export FERROFIN_GATES_DIR="$BATS_TEST_TMPDIR/root"
+  before=$(find "$BATS_TEST_TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)
+  dir=$(copy_fixtures_dir)
+  [[ "$dir" == "$FERROFIN_GATES_DIR"/fixtures/adoption-???????????? ]]   # named for the recipe
+  run "$COPY/run.sh" --image any
   [ "$status" -eq 2 ]
-  [[ "$output" == *"--fixtures DIR"* ]]
+  [[ "$output" == *"$dir missing — run gates/adoption/build-fixtures.sh first"* ]]
+  one_row_fixture "$dir"; one_row_fixture fixtures
+  mkdir -p bin; cat > bin/docker <<'EOS'
+#!/usr/bin/env bash
+case "$1" in
+  image|run|restart|rm|logs) exit 0;;
+  inspect) echo false; exit 0;;
+esac
+echo "unexpected docker $*" >&2; exit 99
+EOS
+  chmod +x bin/docker; bin_first
+  run "$COPY/run.sh" --image any --only jellyfin-12.2-messy
+  [ "$status" -eq 1 ]
+  [ -f "$FERROFIN_GATES_DIR/work/adoption/report.html" ]
+  [ -d "$FERROFIN_GATES_DIR/work/adoption/jellyfin-12.2-messy" ]   # the copy, too
+  [ ! -e "$dir/work" ]
+  [ "$(find "$BATS_TEST_TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)" -eq $((before + 1)) ]   # nothing new beside the root itself
+  # --fixtures names the fixtures; the work directory stays the root's
+  rm -rf "$FERROFIN_GATES_DIR/work"
+  run "$COPY/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ "$status" -eq 1 ]
+  [ -f "$FERROFIN_GATES_DIR/work/adoption/report.html" ]
+  [ ! -e fixtures/work ]
+  # ADOPTION_WORK_DIR names the work directory
+  ADOPTION_WORK_DIR="$TMP/mine" run "$COPY/run.sh" --image any --only jellyfin-12.2-messy
+  [ "$status" -eq 1 ]
+  [ -f mine/report.html ]
+  # FERROFIN_ADOPTION_FIXTURES names them as --fixtures does, for synthetic.py too
+  FERROFIN_ADOPTION_FIXTURES="$TMP/elsewhere" run "$COPY/run.sh" --image any
+  [[ "$output" == *"$TMP/elsewhere missing"* ]]
+  unset FERROFIN_GATES_DIR
+  FERROFIN_ADOPTION_FIXTURES="$TMP/elsewhere" run python3 "$COPY/synthetic.py" run --image any
+  [[ "$output" != *FERROFIN_GATES_DIR* ]]
+  [[ "$output" == *"synthetic adoption failed"* ]]
+  # without a root, --fixtures keeps its work beside it, as before the root existed
+  run "$COPY/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ "$status" -eq 1 ]
+  [ -f fixtures/work/run/report.html ]
+}
+
+@test "build-fixtures.sh: with only FERROFIN_GATES_DIR it builds into the root's fixtures; --fixtures wins" {
+  mkdir -p bin; printf '#!/usr/bin/env bash\nexit 1\n' > bin/docker; chmod +x bin/docker; bin_first   # stops at the first pull
+  copy_gates
+  root="$BATS_TEST_TMPDIR/root"
+  before=$(find "$BATS_TEST_TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)
+  FERROFIN_GATES_DIR=$root run "$COPY/build-fixtures.sh"
+  [ "$status" -ne 0 ]
+  [ -d "$(FERROFIN_GATES_DIR=$root copy_fixtures_dir)" ]
+  [ "$(find "$BATS_TEST_TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)" -eq $((before + 1)) ]   # nothing beside the root
+  rm -r "$root"
+  FERROFIN_GATES_DIR=$root run "$COPY/build-fixtures.sh" --fixtures mine
+  [ -d mine ]
+  [ ! -e "$root" ]
+}
+
+@test "adoption_fixtures_dir: the name follows every file that builds the fixtures, as CI's fixture cache key does" {
+  mkdir -p tree/gates && cp -r "$ADOPTION" tree/gates/adoption && cp "$ADOPTION/../lib.sh" tree/gates/
+  git -C tree init -q   # a repository of its own: the root beside it is outside it, wherever TMPDIR is
+  # shellcheck disable=SC2016  # expanded by the inner bash
+  key() { FERROFIN_GATES_DIR="$BATS_TEST_TMPDIR/root" bash -c '. "$1"; adoption_fixtures_dir test' _ tree/gates/adoption/lib.sh; }
+  first=$(key)
+  for input in synthetic.py smoke.sh build-fixtures.sh messy.py scale.py; do
+    echo "# changed" >> "tree/gates/adoption/$input"
+    now=$(key)
+    [ "$now" != "$first" ]
+    first=$now
+  done
+  rm tree/gates/adoption/scale.py
+  run --separate-stderr key
+  [ "$status" -eq 2 ]
+  # shellcheck disable=SC2154  # $stderr is set by bats' run --separate-stderr
+  [[ "$stderr" == *"test: cannot read the fixture builders in gates/adoption/"* ]]
+  # the hashed list is the recipe's files plus the files CI's key adds (.github/workflows/adoption.yml)
+  listed=$(declare -f adoption_fixtures_dir | grep -o '[a-z_-]*\.\(py\|sh\)' | sort -u)
+  recipe=$(python3 -c 'import ast, sys
+tree = ast.parse(open(sys.argv[1]).read())
+fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "recipe")
+print(*sorted({c.value for c in ast.walk(fn) if isinstance(c, ast.Constant) and str(c.value).endswith(".py")}), sep="\n")' "$ADOPTION/synthetic.py")
+  ci=$(grep -o 'sha256sum gates/adoption/.*' "$ADOPTION/../../.github/workflows/adoption.yml" | grep -o '[a-z_-]*\.\(py\|sh\)')
+  [ "$listed" = "$(printf '%s\n' "$recipe" "$ci" | sort -u)" ]
 }
 
 @test "run.sh: refuses to run without the oracle" {
@@ -358,28 +473,6 @@ EOS
 
 fake_findmnt() { # fake_findmnt <fstype[,fstype…]> — every path reports these mount types, one per line
   mkdir -p bin; printf '#!/usr/bin/env bash\nprintf "%%s\\n" %s\n' "${1//,/ }" > bin/findmnt; chmod +x bin/findmnt
-}
-
-@test "adoption_require_local: network filesystems are refused, local ones (FUSE included) accepted" {
-  for fs in nfs nfs4 cifs smb3 9p ceph afs glusterfs fuse.sshfs fuse.rclone autofs,nfs; do
-    fake_findmnt "$fs"
-    run bash -c '. "$1/lib.sh"; PATH="$2:$PATH" adoption_require_local "$3"' _ "$ADOPTION" "$TMP/bin" "$TMP"
-    [ "$status" -eq 1 ]
-    [[ "$output" == *"network filesystem (${fs##*,})"* ]]
-  done
-  for fs in ext4 btrfs tmpfs fuseblk fuse.mergerfs; do
-    fake_findmnt "$fs"
-    run bash -c '. "$1/lib.sh"; PATH="$2:$PATH" adoption_require_local "$3"' _ "$ADOPTION" "$TMP/bin" "$TMP"
-    [ "$status" -eq 0 ]
-  done
-  # a directory not created yet is judged by its nearest existing parent
-  run adoption_require_local "$TMP/not/yet/made"
-  [ "$status" -eq 0 ]
-  # a filesystem findmnt cannot name is refused, never assumed local
-  printf '#!/usr/bin/env bash\nexit 1\n' > bin/findmnt
-  run bash -c '. "$1/lib.sh"; PATH="$2:$PATH" adoption_require_local "$3"' _ "$ADOPTION" "$TMP/bin" "$TMP"
-  [ "$status" -eq 1 ]
-  [[ "$output" == *"cannot tell its filesystem"* ]]
 }
 
 @test "run.sh: the only media mounted is the fixtures' own media, read-only" {
@@ -539,7 +632,7 @@ EOS
   # shellcheck disable=SC2154  # $stderr is set by bats' run --separate-stderr
   [[ "$stderr" != *"report"* ]]   # a run that wrote its page says nothing about it
   # the same run from a copy of the harness whose report module crashes, then from one that has none
-  cp -r "$ADOPTION" copy
+  cp -r "$ADOPTION" copy; cp "$ADOPTION/../lib.sh" .   # the gates' shared library, one level up as in gates/
   printf 'raise SystemExit(7)\n' > copy/adoption_report.py
   rm -rf fixtures/work
   run --separate-stderr copy/run.sh --fixtures fixtures --image any --only jellyfin-12.2-messy

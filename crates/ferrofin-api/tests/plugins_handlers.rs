@@ -51,6 +51,13 @@ impl RecordingPlugins {
     fn not_found(id: Uuid) -> ServiceError {
         ServiceError::not_found(format!("plugin {id}"))
     }
+
+    /// One of the [`extra`](Self::extra) plugins, which every per-id call
+    /// resolves like the known one.
+    fn extra_plugin(&self, id: Uuid) -> Option<PluginDescriptor> {
+        let extra = self.extra.lock().expect("extra lock");
+        extra.iter().find(|p| p.id == id).cloned()
+    }
 }
 
 #[async_trait::async_trait]
@@ -61,17 +68,19 @@ impl PluginManager for RecordingPlugins {
         Ok(all)
     }
     async fn get_plugin(&self, id: Uuid) -> Result<Option<PluginDescriptor>, ServiceError> {
-        Ok((id == known_id()).then(Self::descriptor))
+        Ok((id == known_id())
+            .then(Self::descriptor)
+            .or_else(|| self.extra_plugin(id)))
     }
     async fn enable_plugin(&self, id: Uuid) -> Result<(), ServiceError> {
-        if id == known_id() {
+        if id == known_id() || self.extra_plugin(id).is_some() {
             Ok(())
         } else {
             Err(Self::not_found(id))
         }
     }
     async fn disable_plugin(&self, id: Uuid) -> Result<(), ServiceError> {
-        if id == known_id() {
+        if id == known_id() || self.extra_plugin(id).is_some() {
             Ok(())
         } else {
             Err(Self::not_found(id))
@@ -82,6 +91,8 @@ impl PluginManager for RecordingPlugins {
             Err(ServiceError::invalid_input(
                 "cannot uninstall a compiled-in plugin",
             ))
+        } else if self.extra_plugin(id).is_some() {
+            Ok(())
         } else {
             Err(Self::not_found(id))
         }
@@ -300,6 +311,75 @@ async fn versioned_routes_match_the_installed_version() {
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A WASM plugin's version is semver (the WIT says so), which a .NET
+/// `Version` cannot hold: jellyfin-web sends it back verbatim, and only that
+/// exact string addresses the plugin.
+#[tokio::test]
+async fn a_semver_plugin_version_addresses_only_its_own_plugin() {
+    let prerelease = Uuid::from_u128(0x5E1);
+    let build_tagged = Uuid::from_u128(0x5E2);
+    let fake = Arc::new(RecordingPlugins::default());
+    for (id, version) in [
+        (prerelease, "0.2.0-beta.1"),
+        (build_tagged, "1.0.0+git.abc"),
+    ] {
+        fake.extra
+            .lock()
+            .expect("extra lock")
+            .push(PluginDescriptor {
+                id,
+                version: version.to_owned(),
+                ..RecordingPlugins::descriptor()
+            });
+    }
+    for (method, uri, expect) in [
+        (
+            "POST",
+            format!("/Plugins/{prerelease}/0.2.0-beta.1/Enable"),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "POST",
+            format!("/Plugins/{prerelease}/0.2.0-beta.1/Disable"),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "DELETE",
+            format!("/Plugins/{prerelease}/0.2.0-beta.1"),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "POST",
+            format!("/Plugins/{build_tagged}/1.0.0%2Bgit.abc/Enable"),
+            StatusCode::NO_CONTENT,
+        ),
+        // Another non-.NET string is still a model-binding failure.
+        (
+            "POST",
+            format!("/Plugins/{prerelease}/0.2.0-beta.2/Enable"),
+            StatusCode::BAD_REQUEST,
+        ),
+        // A real `Version` never equals a stored semver string.
+        (
+            "POST",
+            format!("/Plugins/{prerelease}/0.2.0/Enable"),
+            StatusCode::NOT_FOUND,
+        ),
+        // The exact string of ANOTHER plugin addresses nothing here.
+        (
+            "POST",
+            format!("/Plugins/{}/0.2.0-beta.1/Enable", known_id()),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let resp = router(Arc::clone(&fake))
+            .oneshot(authed(method, &uri, Body::empty()))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), expect, "{method} {uri}");
+    }
 }
 
 #[tokio::test]
@@ -771,6 +851,214 @@ async fn plugin_route_strips_credentials_and_reserved_headers() {
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// The guest's response is served on the server's own origin, where
+/// jellyfin-web keeps every user's token: the host owns the headers that
+/// decide what a browser lets it do.
+#[tokio::test]
+async fn plugin_route_responses_are_sandboxed_from_the_server_origin() {
+    struct HostileHandler;
+    #[async_trait::async_trait]
+    impl ferrofin_traits::plugins::PluginRequestHandler for HostileHandler {
+        async fn handle(
+            &self,
+            _plugin_id: Uuid,
+            _request: ferrofin_traits::plugins::PluginWebRequest,
+        ) -> Result<Option<ferrofin_traits::plugins::PluginWebResponse>, ServiceError> {
+            Ok(Some(ferrofin_traits::plugins::PluginWebResponse {
+                status: 200,
+                headers: [
+                    ("content-type", "text/html"),
+                    ("Set-Cookie", "session=stolen"),
+                    ("Content-Security-Policy", "default-src *"),
+                    ("X-Content-Type-Options", "none"),
+                    ("Clear-Site-Data", "\"storage\""),
+                ]
+                .map(|(n, v)| (n.to_owned(), v.to_owned()))
+                .into(),
+                body: b"<script>localStorage</script>".to_vec(),
+            }))
+        }
+    }
+    let state = authed_state_with_plugins(Arc::new(RecordingPlugins::default()))
+        .with_plugin_request_handler(Arc::new(HostileHandler));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Plugins/{}/web/page", known_id()))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let headers = resp.headers();
+    let all = |name: &str| -> Vec<&str> {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().expect("ascii"))
+            .collect()
+    };
+    assert_eq!(all("content-type"), ["text/html"], "benign headers pass");
+    assert!(
+        all("set-cookie").is_empty(),
+        "no cookies on the server origin"
+    );
+    assert!(
+        all("clear-site-data").is_empty(),
+        "no wiping the origin's storage"
+    );
+    assert_eq!(all("x-content-type-options"), ["nosniff"]);
+    assert_eq!(
+        all("content-security-policy"),
+        ["sandbox allow-scripts allow-forms allow-popups"],
+        "an opaque origin: no access to the server origin's storage"
+    );
+}
+
+/// What the auth middleware resolves for every request in a test.
+struct FixedIdentity(ferrofin_traits::options::AuthorizationInfo);
+
+#[async_trait::async_trait]
+impl ferrofin_traits::net::AuthorizationContext for FixedIdentity {
+    async fn get_authorization_info(
+        &self,
+        _request: &ferrofin_traits::net::RequestContext,
+    ) -> Result<ferrofin_traits::options::AuthorizationInfo, ServiceError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// What a plugin route forwards to the guest when the auth middleware
+/// resolves `info` for a request from `peer`.
+async fn forwarded_request(
+    info: ferrofin_traits::options::AuthorizationInfo,
+    peer: std::net::SocketAddr,
+) -> ferrofin_traits::plugins::PluginWebRequest {
+    let handler = Arc::new(RecordingRequestHandler::default());
+    let state = ferrofin_api::test_support::plugin_state_with_context(
+        Arc::new(RecordingPlugins::default()),
+        Arc::new(FixedIdentity(info)),
+    )
+    .with_plugin_request_handler(handler.clone());
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Plugins/{}/web/hook", known_id()))
+                .extension(axum::extract::ConnectInfo(peer))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("resp");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    handler.seen.lock().unwrap().clone().expect("captured")
+}
+
+/// The guest sees a caller as authenticated only when Jellyfin's default
+/// authorization policy would admit them (`DefaultAuthorizationHandler`):
+/// a disabled account, a user calling remotely without remote access, or a
+/// child outside its access schedule reaches it as anonymous.
+#[tokio::test]
+async fn plugin_route_forwards_identity_only_through_the_default_policy() {
+    use ferrofin_model::users::UserPolicy;
+    use ferrofin_traits::options::AuthorizationInfo;
+    let identity = |is_authenticated: bool, policy: UserPolicy| AuthorizationInfo {
+        is_authenticated,
+        user: Some(ferrofin_api::test_support::sample_user()),
+        user_policy: Some(Arc::new(policy)),
+        ..AuthorizationInfo::default()
+    };
+    let admin = UserPolicy {
+        is_administrator: true,
+        enable_remote_access: true,
+        ..UserPolicy::default()
+    };
+    let lan: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let wan: std::net::SocketAddr = "203.0.113.9:5000".parse().unwrap();
+    let never = vec![ferrofin_model::users::AccessSchedule {
+        day_of_week: ferrofin_model::users::DynamicDayOfWeek::Everyday,
+        // An hour window no clock reaches.
+        start_hour: -2.0,
+        end_hour: -1.0,
+        ..ferrofin_model::users::AccessSchedule::default()
+    }];
+    for (label, info, peer, expect_user, expect_admin) in [
+        (
+            "admin on the LAN",
+            identity(true, admin.clone()),
+            lan,
+            true,
+            true,
+        ),
+        (
+            // Disabling keeps user and policy on the context but clears
+            // `is_authenticated`; the admin bit once leaked through.
+            "disabled admin",
+            identity(
+                false,
+                UserPolicy {
+                    is_disabled: true,
+                    ..admin.clone()
+                },
+            ),
+            lan,
+            false,
+            false,
+        ),
+        (
+            "remote user without remote access",
+            identity(true, UserPolicy::default()),
+            wan,
+            false,
+            false,
+        ),
+        (
+            "user outside the access schedule",
+            identity(
+                true,
+                UserPolicy {
+                    enable_remote_access: true,
+                    access_schedules: never.clone(),
+                    ..UserPolicy::default()
+                },
+            ),
+            lan,
+            false,
+            false,
+        ),
+        (
+            "remote user with remote access",
+            identity(
+                true,
+                UserPolicy {
+                    enable_remote_access: true,
+                    ..UserPolicy::default()
+                },
+            ),
+            wan,
+            true,
+            false,
+        ),
+    ] {
+        let seen = forwarded_request(info, peer).await;
+        assert_eq!(
+            seen.is_authenticated, expect_user,
+            "{label}: is-authenticated"
+        );
+        assert_eq!(seen.user_id.is_some(), expect_user, "{label}: user-id");
+        assert_eq!(seen.is_admin, expect_admin, "{label}: is-admin");
+    }
+    // An API key is admitted and elevated, with no user behind it.
+    let api_key = AuthorizationInfo {
+        is_authenticated: true,
+        is_api_key: true,
+        ..AuthorizationInfo::default()
+    };
+    let seen = forwarded_request(api_key, wan).await;
+    assert!(seen.is_authenticated && seen.is_admin && seen.user_id.is_none());
 }
 
 /// A plugin with no room for another web request, as the WASM host reports it.

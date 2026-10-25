@@ -510,8 +510,10 @@ pub fn spawn(
         ))),
         plugin_name: spec.plugin_name.clone(),
     };
+    // Named from the validated id: the descriptor name is guest-controlled,
+    // and an interior NUL in a thread name panics `spawn`.
     std::thread::Builder::new()
-        .name(format!("wasm-plugin-{}", spec.plugin_name))
+        .name(format!("wasm-plugin-{}", spec.plugin_id))
         .spawn(move || {
             let mut receiver = receiver;
             run_loop(&spec, store, plugin, &mut receiver, &dead);

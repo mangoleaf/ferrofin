@@ -440,7 +440,7 @@ class RunReportTests(unittest.TestCase):
 
 class RunShArgumentTests(unittest.TestCase):
     def run_sh(self, *args, **env):
-        return subprocess.run(["bash", RUN_SH, "--testdata", "/nonexistent-testdata", *args],
+        return subprocess.run(["bash", RUN_SH, "--testdata", "/nonexistent-testdata", "--out", "/nonexistent-out", *args],
                               env=dict(os.environ, **env), capture_output=True, text=True)
 
     def test_endpoints_is_a_known_phase_for_both_servers(self):

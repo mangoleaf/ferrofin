@@ -281,20 +281,26 @@ sentence.
 ```bash
 # needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid; ffprobe for TTFS
 # plus ffmpeg (libx264 + libx265) and Python Pillow to build the test data
+export FERROFIN_GATES_DIR=/srv/gates           # output root: absolute, local disk, outside the repo (gates/lib.sh)
 docker pull jellyfin/jellyfin:10.11.8
 docker pull "$(cat gates/bench/testdata/jellyfin-image.txt)"
-gates/bench/testdata/build.sh                          # source fixture, once: ~20 min, ~17 GB (gitignored)
+gates/bench/testdata/build.sh                          # source fixture, once: ~20 min, ~17 GB → $FERROFIN_GATES_DIR/fixtures/
 gates/bench/testdata/build.sh --export-pools             # existing fixtures only; fresh builds already include pools
 gates/bench/testdata/build.sh --prepare-jellyfin         # upgrade a copy, scan and verify, once
 docker build -t ferrofin:bench .                 # the commit under test — REBUILD IT
-gates/bench/run.sh                                     # ~40 min → gates/bench/runs/<tag>/report.md
+gates/bench/run.sh                                     # ~40 min → $FERROFIN_GATES_DIR/runs/bench-<tag>/report.md
 python3 gates/bench/report.py --serve                  # compare runs at 127.0.0.1:8097
 ```
+
+`gates/run all` runs verify, adoption, parity and bench against one image as one session, after one
+preflight, and ends with one report, the session's `index.html` ([`gates/README.md`](gates/README.md));
+each gate's own script still runs alone. `make run-gates` (or `make run-<gate>`) does the same, and
+`make test-gates-offline` runs the gates' own tests (no docker), as CI does.
 
 Things that will otherwise cost you a run: the harness only ever *inspects* the
 `ferrofin:bench` image, so a stale image silently measures old code under a run name that
 claims the current commit. `run.sh` refuses to start unless the server/client cores are
-90 % idle including their SMT siblings, and rejects shared physical cores. A rerun of the same code lands in `<tag>-run2`, never on top of the first.
+90 % idle including their SMT siblings, and rejects shared physical cores. A rerun of the same code lands in `bench-<tag>-run2`, never on top of the first.
 Publishable numbers (the Jellyfin comparison) come from **three** runs — `report.py` takes
 the median and prints the range each cell spanned.
 
@@ -345,14 +351,16 @@ a query stays *off* a `CROSS JOIN`. `ANALYZE` is deliberately unused and `sqlite
 never exists.
 
 ### Adoption has its own live check — `gates/adoption/`
-`gates/adoption/run.sh --fixtures DIR --image ferrofin:bench` covers 10.11.8, 10.11.9,
+`gates/adoption/run.sh --image ferrofin:bench` (fixtures and work directory from `FERROFIN_GATES_DIR`, or
+`--fixtures DIR`) covers 10.11.8, 10.11.9,
 10.11.10, 10.11.11, 12.0.0, 12.1.0 and 12.2.0 databases, with separate 12.1 and 12.2
 fixtures upgraded from 10.11.8 and from 12.0.0.  Every fixture is **synthetic**: build them
 once with `gates/adoption/build-fixtures.sh` (invented media; the official Jellyfin images seed and upgrade
 each database themselves); they are never committed.  Never point the suite at a real
 library or a network share — the scripts refuse a DIR on a network filesystem, because every
 fixture is booted and scanned repeatedly.  A build that fails part-way is never retried
-(seeding is not idempotent): build into a new DIR.  On fresh copies it checks
+(seeding is not idempotent): build into a new DIR (`--fixtures`), or move the half-built
+one aside.  On fresh copies it checks
 generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
 repair-free second boot.  The [test record](gates/adoption/README.md#supported-and-tested-versions)
 identifies which versions passed and the image used.  Run it for any change to the migration

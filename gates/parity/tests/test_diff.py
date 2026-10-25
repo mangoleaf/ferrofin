@@ -9,6 +9,7 @@ import _thread
 import contextlib
 import io
 import json
+import signal
 import sys
 import tempfile
 import threading
@@ -322,6 +323,9 @@ class Concurrency(Scratch):
             return diff.Response(200, b"{}", 0.0)
 
         requests = [diff.Request(f"r{i}", "GET", f"/r{i}", {}, None, "", "", 200) for i in range(200)]
+        # interrupt_main() does nothing while SIGINT is ignored, as it is for a job a script starts in the
+        # background (the pre-push CI mirror runs these tests so): Python's own handler, for this test.
+        self.addCleanup(signal.signal, signal.SIGINT, signal.signal(signal.SIGINT, signal.default_int_handler))
         with self.assertRaises(KeyboardInterrupt):
             diff.run_requests(requests, IDS, "o", "f", {"oracle": "t", "ferrofin": "t"}, [], [], 30, None, send=send, concurrency=2)
         self.assertLess(len(sent), 20)

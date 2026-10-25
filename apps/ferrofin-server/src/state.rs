@@ -614,7 +614,24 @@ pub async fn build_app_state(
         .with_image_download_mb(config.wasm_image_download_mb)
         .with_image_timeout_secs(config.wasm_image_timeout_secs)
         .with_write_content_mb(config.wasm_write_content_mb)
-        .with_subtitle_extract_mb(config.wasm_subtitle_extract_mb);
+        .with_subtitle_extract_mb(config.wasm_subtitle_extract_mb)
+        // A hand-dropped file must never run as a compiled-in plugin (on its
+        // enabled flag, with its configuration): those ids are refused at
+        // load, before any surface is wired. Extensions are reserved even
+        // with `disable_extensions`, so the outcome never depends on it.
+        .with_reserved_ids(
+            std::iter::once(ferrofin_providers::opensubtitles::PLUGIN_ID)
+                .chain(
+                    ferrofin_providers::builtin_plugins::ALL
+                        .iter()
+                        .map(|p| p.id),
+                )
+                .chain(
+                    ferrofin_extensions::builtin_extensions()
+                        .iter()
+                        .map(|extension| extension.id()),
+                ),
+        );
         let wasm_dir = config.data_dir.join("plugins");
         match tokio::task::spawn_blocking(move || {
             ferrofin_wasm::WasmPluginHost::load(&wasm_dir, &wasm_settings)
@@ -2162,7 +2179,7 @@ pub async fn build_app_state(
     // delivery path for Play/Playstate/GeneralCommand pushes.
     let session_bus: Arc<dyn ferrofin_traits::session_bus::SessionMessageBus> =
         Arc::new(ferrofin_core::FerrofinSessionMessageBus::new());
-    let sessions: Arc<dyn ferrofin_traits::session::SessionManager> = Arc::new(
+    let sessions_impl = Arc::new(
         FerrofinSessionManager::new(
             Arc::clone(&users),
             Arc::clone(&devices),
@@ -2181,6 +2198,18 @@ pub async fn build_app_state(
         // `SendPlayCommand` -> `TranslateItemForInstantMix`).
         .with_music_manager(Arc::clone(&music)),
     );
+    // The idle-playback and inactive-session checks (C# `StartCheckTimers`),
+    // for this host's lifetime.
+    background.push(tokio::spawn(tracing::Instrument::instrument(
+        Arc::clone(&sessions_impl).run_playback_checks(Arc::clone(&config_trait)),
+        tracing::info_span!(
+            parent: None,
+            "playback_checks",
+            task = "playback_checks",
+            trigger = "startup"
+        ),
+    )));
+    let sessions: Arc<dyn ferrofin_traits::session::SessionManager> = sessions_impl;
     // Every user-data save but a progress report reaches the user's sessions
     // as a batched `UserDataChanged` (upstream's `UserDataChangeNotifier`).
     user_data_impl.set_user_data_changed_sink(Arc::new(

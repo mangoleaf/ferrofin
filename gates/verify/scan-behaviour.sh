@@ -31,6 +31,8 @@
 #                       rewrites an NFO (default 62: upstream re-reads an NFO only once it is
 #                       more than a minute newer than the item's last save). Raise it when the
 #                       server's clock and the file server's differ (NFS, a remote pod).
+#   --json FILE         also write the rows, when they end, to FILE as data:
+#                       {"rows": [{"row", "scenario", "result", "detail"}…], "summary": {"pass", "fail", "skip"}}
 #
 # Needs curl and jq. The server must run with /metrics on (FERROFIN_ENABLE_METRICS=true), and
 # the library with real-time monitoring off (the watcher would process the scratch changes
@@ -47,12 +49,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 
 # usage: the header above, without its comment markers.
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
-CLIP=; SCAN_TIMEOUT=300; NFO_WAIT=62; ARGS=()
+CLIP=; SCAN_TIMEOUT=300; NFO_WAIT=62; JSON=; ARGS=()
 while [ $# -gt 0 ]; do
   case $1 in
-    --clip|--timeout|--nfo-wait)
+    --clip|--timeout|--nfo-wait|--json)
       if [ $# -lt 2 ]; then echo "scan-behaviour: $1 needs a value" >&2; exit 2; fi
-      case $1 in --clip) CLIP=$2 ;; --timeout) SCAN_TIMEOUT=$2 ;; *) NFO_WAIT=$2 ;; esac
+      case $1 in --clip) CLIP=$2 ;; --timeout) SCAN_TIMEOUT=$2 ;; --json) JSON=$2 ;; *) NFO_WAIT=$2 ;; esac
       shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --*) echo "scan-behaviour: unknown option $1" >&2; exit 2 ;;
@@ -405,6 +407,18 @@ row_end() {
   verify_row_line "$ROW" "$result" "${SCENARIO[$ROW]}" "$detail"
 }
 row_skip() { SCENARIO[$1]=$2; RESULT[$1]=SKIP; DETAIL[$1]=$3; verify_row_line "$1" SKIP "$2" "$3"; }
+# write_json: the rows finish() prints, as data, when --json named a file (gates/report.py reads it).
+write_json() {
+  [ -n "$JSON" ] || return 0
+  local row
+  for row in $(printf '%s\n' "${!RESULT[@]}" | sort -n); do
+    jq -n --argjson row "$row" --arg scenario "${SCENARIO[$row]}" --arg result "${RESULT[$row]}" \
+      --arg detail "${DETAIL[$row]}" '{row: $row, scenario: $scenario, result: $result, detail: $detail}'
+  done | jq -s '{rows: ., summary: {pass: map(select(.result == "PASS")) | length,
+                                    fail: map(select(.result == "FAIL")) | length,
+                                    skip: map(select(.result != "PASS" and .result != "FAIL")) | length}}' > "$JSON" \
+    || echo "scan-behaviour: the rows could not be written to $JSON" >&2
+}
 finish() {
   local row pass=0 fail=0 skip=0
   echo
@@ -414,6 +428,7 @@ finish() {
     case ${RESULT[$row]} in PASS) pass=$((pass + 1)) ;; FAIL) fail=$((fail + 1)) ;; *) skip=$((skip + 1)) ;; esac
   done
   echo "summary: $pass PASS, $fail FAIL, $skip SKIP"
+  write_json
   [ "$fail" -eq 0 ] && exit 0
   exit 1
 }

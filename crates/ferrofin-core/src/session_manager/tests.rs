@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -169,20 +170,7 @@ fn library_manager(db: &Database) -> Arc<FerrofinLibraryManager> {
 
 /// Builds a session manager wired over `db` with the real sibling managers.
 fn manager(db: &Database) -> Arc<FerrofinSessionManager> {
-    let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
-        config: default_server_configuration(),
-    });
-    let library = library_manager(db);
-    Arc::new(FerrofinSessionManager::new(
-        Arc::new(FerrofinUserManager::new(db.clone())),
-        Arc::new(FerrofinDeviceManager::new(db.clone())),
-        Arc::new(FerrofinUserDataManager::new(db.clone(), config)),
-        library,
-        Arc::new(UnusedDtoService),
-        Arc::new(FerrofinEventManager::new()),
-        db.clone(),
-        "server-1".to_owned(),
-    ))
+    manager_with_events(db).0
 }
 
 /// Inserts a minimal `Users` row with the given username, returning the row.
@@ -242,9 +230,81 @@ async fn log_session_activity_creates_and_reuses_a_session() {
     assert_eq!(again.application_version.as_deref(), Some("1.1"));
 }
 
+/// The session id is Jellyfin's byte for byte: `GetSessionKey` is
+/// `appName + deviceId + userId.ToString("N")` (v12.2 `SessionManager.cs:481`)
+/// and the id its MD5 as a `Guid` "N". The expected id is the one Jellyfin
+/// 12.2 answered in a parity replay for this user, client and device.
+#[tokio::test]
+async fn the_session_id_is_derived_from_the_client_device_and_user() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::parse_str("8f877f4cfc08426d895fc28d2d871ee4").unwrap();
+    let user = seed_named_user(&db, user_id, "parity-user").await;
+
+    let session = mgr
+        .log_session_activity("parity", "12.2", "parity", "parity", "e", Some(&user))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.id.as_deref(),
+        Some("a870e5be90a2a7581e6e659320003bfe")
+    );
+}
+
+/// Upstream commit b1e3cf1341 (in v12.0-rc7): the client name and device id
+/// come from request headers, not from the token, so a user sending another
+/// user's pair must get a session of their own. Before, the existing session
+/// was re-attributed to the caller, who could then control the victim's
+/// player without `EnableRemoteControlOfOtherUsers`.
+#[tokio::test]
+async fn another_users_client_and_device_does_not_take_over_their_session() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let alice_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    let mallory_id = Uuid::new_v4();
+    let mallory = seed_named_user(&db, mallory_id, "mallory").await;
+
+    let victim = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "e", Some(&alice))
+        .await
+        .unwrap();
+    let intruder = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "e", Some(&mallory))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        victim.id, intruder.id,
+        "each user gets a session of their own"
+    );
+    assert_eq!(intruder.user_id, mallory_id);
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, victim.id);
+    assert_eq!(
+        sessions[0].user_id, alice_id,
+        "the victim's session stays theirs"
+    );
+    let refused = mgr
+        .assert_can_control(
+            intruder.id.as_deref().expect("intruder id"),
+            victim.id.as_deref().expect("victim id"),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(ServiceError::Forbidden(_))),
+        "{refused:?}"
+    );
+}
+
 /// `RequestHelpers.GetSession` logs an API-key caller's activity with no user:
 /// the session's `UserId` is `Guid.Empty`, it has no `UserName`, and it is
-/// keyed like any other (`{appName}{deviceId}`).
+/// keyed like any other, with the empty user id's 32 zeros
+/// (`{appName}{deviceId}{Guid.Empty:N}`).
 #[tokio::test]
 async fn a_session_logged_without_a_user_has_none() {
     let db = test_db().await;
@@ -731,6 +791,106 @@ async fn logout_by_token_ends_the_session() {
         .await
         .unwrap_err();
     assert!(matches!(err, ServiceError::Unauthorized(_)));
+}
+
+/// Signs `user` in on `device_id` (`AuthenticateDirect`), returning the token.
+async fn sign_in(mgr: &FerrofinSessionManager, user_id: Uuid, device_id: &str) -> String {
+    let request = AuthenticationRequest {
+        user_id: Some(user_id),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some(device_id.to_owned()),
+        device_name: Some(device_id.to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    mgr.authenticate_direct(&request)
+        .await
+        .unwrap()
+        .access_token
+        .expose()
+        .to_owned()
+}
+
+/// Every stored device id, sorted, as the device manager lists them.
+async fn device_ids(db: &Database) -> Vec<String> {
+    use ferrofin_traits::devices::{DeviceManager, DeviceQuery};
+    let mut ids: Vec<String> = FerrofinDeviceManager::new(db.clone())
+        .get_devices(&DeviceQuery::default())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|d| d.device_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `SessionManager.RevokeUserTokens(userId, currentAccessToken)`: every device
+/// of the user except the one holding `currentAccessToken` (compared ignoring
+/// case) is logged out (`Logout(Device)`: the device row goes and its sessions
+/// end), and nobody else's device is touched. Password change, user deletion
+/// and disabling a user all rely on it.
+#[tokio::test]
+async fn revoking_a_users_tokens_keeps_only_the_current_device() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let alice_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    let bob_id = Uuid::new_v4();
+    let bob = seed_named_user(&db, bob_id, "bob").await;
+    for user in [&alice, &bob] {
+        set_permission(
+            db.writer(),
+            &user.id,
+            PermissionKind::EnableAllDevices,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    let current = sign_in(&mgr, alice_id, "alice-phone").await;
+    let other = sign_in(&mgr, alice_id, "alice-tv").await;
+    let bobs = sign_in(&mgr, bob_id, "bob-laptop").await;
+    mgr.log_session_activity("Web", "1.0", "alice-tv", "TV", "e", Some(&alice))
+        .await
+        .unwrap();
+    let on_tv = |sessions: &[SessionInfoDto]| {
+        sessions
+            .iter()
+            .any(|s| s.device_id.as_deref() == Some("alice-tv"))
+    };
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert!(on_tv(&sessions), "the TV has a live session to end");
+
+    mgr.revoke_user_tokens(alice_id, &current.to_uppercase())
+        .await
+        .unwrap();
+
+    assert_eq!(device_ids(&db).await, ["alice-phone", "bob-laptop"]);
+    for (token, device) in [(&current, "alice-phone"), (&bobs, "bob-laptop")] {
+        mgr.get_session_by_authentication_token(token, device, "e")
+            .await
+            .unwrap_or_else(|e| panic!("{device} keeps its token: {e}"));
+    }
+    let err = mgr
+        .get_session_by_authentication_token(&other, "alice-tv", "e")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::Unauthorized(_)), "{err:?}");
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert!(!on_tv(&sessions), "the revoked device's session ended");
+
+    // With no current token, every device of the user goes (user deletion,
+    // and a disable through the policy).
+    mgr.revoke_user_tokens(alice_id, "").await.unwrap();
+    assert_eq!(device_ids(&db).await, ["bob-laptop"]);
 }
 
 #[tokio::test]
@@ -3479,4 +3639,345 @@ async fn session_activity_stamps_the_users_last_activity_at_most_once_a_minute()
         .await
         .unwrap();
     assert_eq!(stored(bob_id).await, None, "active within the minute");
+}
+
+// ---- idle and inactive playback (C# `CheckForIdlePlayback` / `CheckForInactiveSteams`).
+
+/// A session manager over `db` with its event manager exposed, for recording
+/// what it publishes.
+fn manager_with_events(db: &Database) -> (Arc<FerrofinSessionManager>, Arc<FerrofinEventManager>) {
+    let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+        config: default_server_configuration(),
+    });
+    let events = Arc::new(FerrofinEventManager::new());
+    let mgr = Arc::new(FerrofinSessionManager::new(
+        Arc::new(FerrofinUserManager::new(db.clone())),
+        Arc::new(FerrofinDeviceManager::new(db.clone())),
+        Arc::new(FerrofinUserDataManager::new(db.clone(), config)),
+        library_manager(db),
+        Arc::new(UnusedDtoService),
+        Arc::clone(&events) as Arc<dyn ferrofin_traits::events::EventManager>,
+        db.clone(),
+        "server-1".to_owned(),
+    ));
+    (mgr, events)
+}
+
+/// Records the payloads published as `event`.
+fn record_event(events: &FerrofinEventManager, event: &str) -> Arc<Mutex<Vec<serde_json::Value>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    events.subscribe(
+        event,
+        Arc::new(move |payload: &str| {
+            sink.lock()
+                .unwrap()
+                .push(serde_json::from_str(payload).expect("event payload"));
+            crate::event_manager::consumer_done()
+        }),
+    );
+    seen
+}
+
+/// A user's session playing a seeded movie from `position_ticks`, `paused` or
+/// not. Returns the session id and the item id.
+async fn playing_session(
+    db: &Database,
+    mgr: &FerrofinSessionManager,
+    device: &str,
+    position_ticks: Option<i64>,
+    paused: bool,
+) -> (String, Uuid, Uuid) {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackStartInfo;
+
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(db, user_id, &format!("user-{device}")).await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(db, item_id, BaseItemKind::Movie).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", device, "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let session_id = session.id.unwrap();
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: Some(session_id.clone()),
+        item_id,
+        media_source_id: Some(item_id.simple().to_string()),
+        position_ticks,
+        is_paused: paused,
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    (session_id, item_id, user_id)
+}
+
+/// Moves a session's last playback check-in back to `at`.
+async fn checked_in_at(mgr: &FerrofinSessionManager, session_id: &str, at: DateTime<Utc>) {
+    let mut sessions = mgr.sessions.lock().await;
+    let session = sessions
+        .values_mut()
+        .find(|s| s.id == session_id)
+        .expect("session");
+    session.last_playback_check_in = at;
+}
+
+/// When the session last did something (`LastActivityDate`).
+async fn activity_of(mgr: &FerrofinSessionManager, session_id: &str) -> DateTime<Utc> {
+    mgr.sessions
+        .lock()
+        .await
+        .values()
+        .find(|s| s.id == session_id)
+        .expect("session")
+        .last_activity_date
+}
+
+/// Moves the start of a session's pause back to `at`.
+async fn paused_since(mgr: &FerrofinSessionManager, session_id: &str, at: DateTime<Utc>) {
+    let mut sessions = mgr.sessions.lock().await;
+    let session = sessions
+        .values_mut()
+        .find(|s| s.id == session_id)
+        .expect("session");
+    session.last_paused_date = Some(at);
+}
+
+/// `IdlePlaybackTests.CheckForIdlePlayback_StopsAtLastClientReportedPosition`:
+/// a session that has not checked in for more than five minutes is stopped at
+/// the position the client last reported, `null` when it reported none.
+#[rstest::rstest]
+#[case(None, None)]
+#[case(Some(123_456_789), Some(123_456_789))]
+#[tokio::test]
+async fn idle_playback_stops_at_the_last_client_reported_position(
+    #[case] client_position_ticks: Option<i64>,
+    #[case] expected_position_ticks: Option<i64>,
+) {
+    let db = test_db().await;
+    let (mgr, events) = manager_with_events(&db);
+    let stopped = record_event(&events, "PlaybackStopped");
+    let (session_id, item_id, _) =
+        playing_session(&db, &mgr, "dev-idle", client_position_ticks, false).await;
+    let now = Utc::now();
+    checked_in_at(&mgr, &session_id, now - chrono::Duration::seconds(301)).await;
+    let active_before = activity_of(&mgr, &session_id).await;
+
+    mgr.check_for_idle_playback(now).await;
+
+    // Only the client's own requests mark the session active, as upstream:
+    // the server stopping it does not.
+    assert_eq!(activity_of(&mgr, &session_id).await, active_before);
+
+    let stopped = stopped.lock().unwrap().clone();
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(stopped[0]["SessionId"], session_id.as_str());
+    assert_eq!(stopped[0]["ItemId"], serde_json::json!(item_id));
+    assert_eq!(
+        stopped[0]["PositionTicks"],
+        serde_json::json!(expected_position_ticks)
+    );
+    assert!(!mgr.has_active_playback().await.unwrap());
+}
+
+/// `TotalMinutes > 5`: a session that checked in five minutes ago, or that is
+/// not playing, is left alone.
+#[tokio::test]
+async fn a_recent_check_in_or_no_playback_is_not_idle() {
+    let db = test_db().await;
+    let (mgr, events) = manager_with_events(&db);
+    let stopped = record_event(&events, "PlaybackStopped");
+    let (session_id, _, _) = playing_session(&db, &mgr, "dev-recent", Some(10), false).await;
+    let user = seed_named_user(&db, Uuid::new_v4(), "browsing").await;
+    let browsing = mgr
+        .log_session_activity("Web", "1.0", "dev-browse", "TV", "e", Some(&user))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let now = Utc::now();
+    checked_in_at(&mgr, &session_id, now - chrono::Duration::minutes(5)).await;
+    checked_in_at(&mgr, &browsing, now - chrono::Duration::hours(1)).await;
+
+    mgr.check_for_idle_playback(now).await;
+
+    assert!(stopped.lock().unwrap().is_empty());
+    assert!(mgr.has_active_playback().await.unwrap());
+}
+
+/// The idle stop reports the media source the client last named, so the
+/// position is kept against the version that was playing, as a client's own
+/// stop would (`GetProgressItem`), and the session forgets the source.
+#[tokio::test]
+async fn an_idle_stop_keeps_the_position_against_the_version_played() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackStartInfo;
+    use ferrofin_traits::library::UserDataManager as _;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "viewer").await;
+    let (primary, version) = (Uuid::new_v4(), Uuid::new_v4());
+    for id in [primary, version] {
+        crate::test_support::seed_item(&db, id, BaseItemKind::Movie).await;
+        let mut row = crate::test_support::fetch_item(&db, id).await;
+        row.run_time_ticks = Some(72_000_000_000);
+        if id == version {
+            row.owner_id = Some(guid_to_db(primary));
+            row.primary_version_id = Some(guid_to_db(primary));
+        }
+        crate::test_support::save_item(&db, &row).await;
+    }
+    let session_id = mgr
+        .log_session_activity("Web", "1.0", "dev-version", "TV", "e", Some(&user))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let halfway = 36_000_000_000;
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: Some(session_id.clone()),
+        item_id: primary,
+        media_source_id: Some(version.simple().to_string()),
+        position_ticks: Some(halfway),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    let now = Utc::now();
+    checked_in_at(&mgr, &session_id, now - chrono::Duration::minutes(6)).await;
+
+    mgr.check_for_idle_playback(now).await;
+
+    let user_data = FerrofinUserDataManager::new(
+        db.clone(),
+        Arc::new(FixedConfig {
+            config: default_server_configuration(),
+        }),
+    );
+    let position = |id: Uuid| {
+        let user_data = &user_data;
+        async move {
+            user_data
+                .get_user_data_dto(id, user_id)
+                .await
+                .unwrap()
+                .map_or(0, |d| d.playback_position_ticks)
+        }
+    };
+    assert_eq!(position(version).await, halfway, "the version played");
+    assert_eq!(position(primary).await, 0, "not the item shown");
+    let sessions = mgr.sessions.lock().await;
+    let session = sessions
+        .values()
+        .find(|s| s.id == session_id)
+        .expect("session");
+    assert!(session.now_playing_item_id.is_none());
+    assert!(session.now_playing_media_source_id.is_none());
+}
+
+/// One tick of the loop: the inactive check only with a threshold above 0,
+/// the idle check only on every fifth minute.
+#[tokio::test]
+async fn each_minute_runs_the_checks_that_are_due() {
+    let db = test_db().await;
+    let (mgr, events) = manager_with_events(&db);
+    let stopped = record_event(&events, "PlaybackStopped");
+    let (idle_id, _, _) = playing_session(&db, &mgr, "dev-tick-idle", Some(1), false).await;
+    let (paused_id, _, _) = playing_session(&db, &mgr, "dev-tick-paused", Some(2), true).await;
+    let connection = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(
+        &paused_id,
+        connection.clone() as Arc<dyn WebSocketConnection>,
+    )
+    .await
+    .unwrap();
+    let now = Utc::now();
+    checked_in_at(&mgr, &idle_id, now - chrono::Duration::minutes(6)).await;
+    checked_in_at(&mgr, &paused_id, now).await;
+    paused_since(&mgr, &paused_id, now - chrono::Duration::hours(1)).await;
+    let stops_sent = |connection: &FakeConnection| {
+        connection
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| {
+                serde_json::from_slice::<serde_json::Value>(frame).unwrap()["MessageType"]
+                    == "Playstate"
+            })
+            .count()
+    };
+
+    // Minute 4, no threshold: neither check runs.
+    mgr.run_playback_checks_at(4, 0, now).await;
+    assert!(stopped.lock().unwrap().is_empty());
+    assert_eq!(stops_sent(&connection), 0);
+
+    // Minute 4 with a threshold: only the inactive check.
+    mgr.run_playback_checks_at(4, 30, now).await;
+    assert!(stopped.lock().unwrap().is_empty());
+    assert_eq!(stops_sent(&connection), 1);
+
+    // Minute 5: the idle check too.
+    mgr.run_playback_checks_at(5, 0, now).await;
+    assert_eq!(stopped.lock().unwrap().len(), 1);
+    assert_eq!(stops_sent(&connection), 1);
+}
+
+/// `CheckForInactiveSteams`: a session paused longer than
+/// `InactiveSessionThreshold` minutes is sent a `Stop` at its position, as
+/// from itself.
+#[tokio::test]
+async fn a_session_paused_past_the_threshold_is_told_to_stop() {
+    let db = test_db().await;
+    let (mgr, _) = manager_with_events(&db);
+    let (session_id, _, user_id) = playing_session(&db, &mgr, "dev-paused", Some(42), true).await;
+    let connection = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(
+        &session_id,
+        connection.clone() as Arc<dyn WebSocketConnection>,
+    )
+    .await
+    .unwrap();
+    let now = Utc::now();
+    let playstates = |connection: &FakeConnection| -> Vec<serde_json::Value> {
+        connection
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|frame| serde_json::from_slice::<serde_json::Value>(frame).unwrap())
+            .filter(|frame| frame["MessageType"] == "Playstate")
+            .collect()
+    };
+
+    // Paused nine minutes against a ten-minute threshold: nothing.
+    paused_since(&mgr, &session_id, now - chrono::Duration::minutes(9)).await;
+    mgr.check_for_inactive_streams(10, now).await;
+    assert!(playstates(&connection).is_empty());
+
+    // Past it: one `Stop`, at the paused position, from the session's user.
+    paused_since(&mgr, &session_id, now - chrono::Duration::minutes(11)).await;
+    mgr.check_for_inactive_streams(10, now).await;
+    let sent = playstates(&connection);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["Data"]["Command"], "Stop");
+    assert_eq!(sent[0]["Data"]["SeekPositionTicks"], 42);
+    assert_eq!(
+        sent[0]["Data"]["ControllingUserId"],
+        user_id.simple().to_string()
+    );
+}
+
+/// Upstream's idle timer fires every five minutes; the one-minute loop runs
+/// the idle check on every fifth tick.
+#[test]
+fn the_idle_check_runs_every_fifth_minute() {
+    let due: Vec<u64> = (1..=12)
+        .filter(|&minute| super::idle_check_due(minute))
+        .collect();
+    assert_eq!(due, [5, 10]);
 }

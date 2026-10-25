@@ -460,17 +460,21 @@ Building the test data additionally needs `ffmpeg` (with libx264 and libx265), `
 and Python `Pillow`.
 
 ```bash
+export FERROFIN_GATES_DIR=/srv/gates                # the gates' output root: absolute, a local disk, outside the repository
 docker build -t ferrofin:bench .                  # the commit under test
 docker pull jellyfin/jellyfin:10.11.8              # source fixture builder only
 docker pull "$(cat gates/bench/testdata/jellyfin-image.txt)"   # the pinned Jellyfin reference
-gates/bench/testdata/build.sh                           # source fixture, once, ~20 min
+gates/bench/testdata/build.sh                           # source fixture, once, ~20 min → $FERROFIN_GATES_DIR/fixtures/bench-testdata
 gates/bench/testdata/build.sh --prepare-jellyfin          # once per source fixture / pinned image
-gates/bench/run.sh                                      # one full run, ~40 min → gates/bench/runs/<version>/report.md
-python3 gates/bench/report.py gates/bench/runs/A gates/bench/runs/B gates/bench/runs/C   # the full tables: medians, markers, notes
-python3 gates/bench/report.py --readme README.md gates/bench/runs/A gates/bench/runs/B gates/bench/runs/C
+gates/bench/run.sh                                      # one full run, ~40 min → $FERROFIN_GATES_DIR/runs/bench-<version>/report.md
+python3 gates/bench/report.py "$FERROFIN_GATES_DIR"/runs/bench-{A,B,C}   # the full tables: medians, markers, notes
+python3 gates/bench/report.py --readme README.md "$FERROFIN_GATES_DIR"/runs/bench-{A,B,C}
                                                   # rewrites the README "Benchmarks" block (headline table + prose)
-python3 gates/bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/
+python3 gates/bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/ (every gate's runs)
 ```
+
+Every location comes from the output root (the layout is in [`gates/lib.sh`](../lib.sh)); `--testdata`
+and `--out` override it, and with neither the scripts stop and name `FERROFIN_GATES_DIR`.
 
 Jellyfin preparation copies the stopped 10.11.8 config into `testdata/jellyfin/`,
 boots the pinned image, explicitly requests a full library scan, and waits for that
@@ -489,7 +493,7 @@ run also records `/System/Info/Public` in `system-info.json`; all report labels 
 version, falling back to `image.txt` for archived runs. Different Jellyfin versions
 cannot be pooled. Preparation logs and validation evidence stay beside the prepared config.
 
-A run is named for the code it measured: `v0.42.1` on a tag, `v0.42.1-3-7e80268` when
+A run is named `bench-` and the code it measured: `v0.42.1` on a tag, `v0.42.1-3-7e80268` when
 the branch is that many commits past the tag, and `-dirty` appended when the working
 tree had uncommitted changes at the start of the run, so the sha does not identify it
 (what actually ran is recorded in each server's `image.txt` and in `run.json`). Repeats of the same code are counted as `v0.42.1-run2`,
@@ -504,9 +508,13 @@ renamed directory. `--out` overrides the whole thing.
 
 | Tab | Runs come from |
 |---|---|
-| Benchmark | `gates/bench/runs` (or `RUNS_DIR`): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab`, `ramp`, `soak` or `endpoints` session (a directory with a `gate.json`), listed as `<session>/<run>`. A session `gate.py render` has written a `report.html` for is also listed as `<session>`, opening the gate's own report: the only page a `gate.py scan` session has, since its runs hold `scan.json` and are not listed |
-| Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`: every directory under it holding a `report.html` (or `DIR` itself) |
-| Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, the same way |
+| Benchmark | `RUNS_DIR` (default `$FERROFIN_GATES_DIR/runs`, else `gates/bench/runs`, where runs went before the output root): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab`, `ramp`, `soak` or `endpoints` session (a directory with a `gate.json`), listed as `<session>/<run>`. A session `gate.py render` has written a `report.html` for is also listed as `<session>`, opening the gate's own report: the only page a `gate.py scan` session has, since its runs hold `scan.json` and are not listed |
+| Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`, else `$FERROFIN_GATES_DIR/work`: every directory under it holding a `report.html` (or `DIR` itself) |
+| Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, else `$FERROFIN_GATES_DIR/runs`, the same way |
+
+The output root's `runs/` holds every gate's runs, so each tab lists only the directories named for
+its gate (`bench-*`, `parity-*`) and those with no gate prefix, which come from before the root and so
+show in every tab: rename a run moved under the root to `bench-<name>` or `parity-<name>`.
 
 Each run is one self-contained `report.html` (no external assets, so it opens from disk
 and works as a CI artifact). `run.sh` writes the benchmark's beside `report.md`
@@ -572,7 +580,7 @@ unauthenticated probe such as `/System/Ping`.
 `gate.py scan PREVIOUS CANDIDATE` measures library-scan and adoption-migration cost, A/B
 against the previous release in the same window: PREVIOUS CANDIDATE … as interleaved pairs
 (`--pairs`, default 3), each run being `scan.py` on that image ID. It needs the same test data
-as `run.sh` (`--testdata`, default `gates/bench/testdata`), and the server gets `run.sh`'s cores and
+as `run.sh` (`--testdata`, default `$FERROFIN_GATES_DIR/fixtures/bench-testdata`), and the server gets `run.sh`'s cores and
 memory limit after the same idle-core check.
 
 - **Scan wall time**: seconds from `POST /Library/Refresh` to the RefreshLibrary task

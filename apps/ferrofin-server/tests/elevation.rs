@@ -80,8 +80,8 @@ async fn boot() -> Harness {
 
 /// Sends one request, optionally bearing `token`, and returns status + body.
 ///
-/// `device` scopes the `DeviceId`: two callers sharing one `DeviceId` share a
-/// session, so the administrator and the ordinary account must not reuse it.
+/// `device` scopes the `DeviceId`, so the administrator and the ordinary
+/// account each sign in on a device of their own.
 async fn call_as(
     router: &axum::Router,
     method: &str,

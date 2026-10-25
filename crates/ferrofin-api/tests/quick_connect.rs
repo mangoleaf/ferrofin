@@ -204,7 +204,6 @@ impl UserManager for MemUsers {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
-            has_password: Some(user.password.is_some()),
             policy: Some(UserPolicy {
                 is_administrator: is_admin,
                 ..UserPolicy::default()
