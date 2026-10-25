@@ -705,9 +705,10 @@ async fn delete_user(
 }
 
 /// Pushes a `UserUpdated` message carrying the refreshed [`UserDto`] to the
-/// user's sessions, so open clients pick up name/configuration/policy changes
-/// without re-login (port of Jellyfin's `ServerEventNotifier.OnUserUpdated`).
-/// Best-effort: a delivery failure must not fail the mutating request.
+/// user's sessions (port of `UserUpdatedNotifier`, the consumer of the
+/// `UserUpdatedEventArgs` that only `UserManager.RenameUser` and
+/// `UpdatePolicyAsync` publish: a rename and a policy save). Best-effort: a
+/// delivery failure must not fail the mutating request.
 async fn notify_user_updated(state: &AppState, user_id: Uuid) {
     let Ok(user) = load_user(state, user_id).await else {
         return;
@@ -808,6 +809,10 @@ async fn update_user(
             .users
             .rename_user(user_id, &user.username, new_name)
             .await?;
+        // `RenameUser` publishes `UserUpdated` before it raises
+        // `OnUserUpdated` for the device check, ahead of the configuration
+        // save.
+        notify_user_updated(&state, user_id).await;
         refresh_device_access(&state, user_id).await;
     }
     // A body without `Configuration` binds `UserDto`'s constructor default, so
@@ -816,7 +821,6 @@ async fn update_user(
     if let Some(config) = &body.configuration {
         state.users.update_configuration(user_id, config).await?;
     }
-    notify_user_updated(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -976,8 +980,8 @@ async fn update_user_configuration(
     let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
     let user = load_user(&state, user_id).await?;
     assert_can_update_user(&state, &auth, &user).await?;
+    // `UpdateConfigurationAsync` raises no event, so nothing is pushed.
     state.users.update_configuration(user_id, &config).await?;
-    notify_user_updated(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -1798,7 +1798,9 @@ impl FerrofinItemPersistenceService {
     /// ([`crate::item_data::sync_saved_playlist_in`]): the
     /// row the caller saves was read earlier, and its copy of those keys must
     /// not undo a share change committed since, which the next boot's
-    /// re-import from `Data` would make real.
+    /// re-import from `Data` would make real. A scan's save of a playlist
+    /// without a `FerrofinPlaylists` row first imports one from the `Data` it
+    /// wrote ([`crate::item_data::import_playlist_meta_if_missing_in`]).
     async fn upsert_item(
         &self,
         item: &BaseItemEntity,
@@ -1825,6 +1827,13 @@ impl FerrofinItemPersistenceService {
         if let Some(playlist) = playlist {
             let mut tx = self.db.writer().begin().await.map_err(db_err)?;
             query.execute(&mut *tx).await.map_err(db_err)?;
+            if scan {
+                // `PlaylistResolver`'s playlist is saved with its owner and
+                // open access, so a scanned one is never without the row
+                // that holds them: a missing row reads as a legacy playlist
+                // every caller owns. A row already there is kept.
+                crate::item_data::import_playlist_meta_if_missing_in(&mut tx, playlist).await?;
+            }
             crate::item_data::sync_saved_playlist_in(&mut tx, playlist).await?;
             tx.commit().await.map_err(db_err)?;
         } else {
@@ -2610,8 +2619,10 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             let mut tx = self.db.writer().begin().await.map_err(db_err)?;
             // `PlaylistResolver` creates `new Playlist { OpenAccess = true }`:
             // `OwnerUserId` is `Guid.Empty` — a user no caller is, so nobody
-            // owns it, everybody reads it — and `Shares` is empty. A row an
-            // adoption imported, or an earlier scan wrote, is kept.
+            // owns it, everybody reads it — and `Shares` is empty. The scan's
+            // save of the playlist already wrote it (`upsert_item`); this
+            // covers one an older build saved without it. A row an adoption
+            // imported, or an earlier scan wrote, is kept.
             sqlx::query(
                 r#"INSERT INTO "FerrofinPlaylists" ("PlaylistId", "OwnerUserId", "OpenAccess")
                    VALUES (?1, ?2, 1) ON CONFLICT("PlaylistId") DO NOTHING"#,
