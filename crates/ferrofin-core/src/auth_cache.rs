@@ -7,8 +7,9 @@
 //! part that matters at a trust boundary — **revocation-correct**: the
 //! composition root shares ONE instance between the authorization context
 //! (read-through) and the user/device managers, which [`AuthCache::clear`] it
-//! on every auth-relevant mutation (device delete/rename/options, user
-//! update/delete, password/policy/configuration change). Clearing wholesale
+//! on every auth-relevant mutation (device delete or update, user
+//! update/delete, password/policy/configuration change; a device's options,
+//! its custom name, are not cached and clear nothing). Clearing wholesale
 //! instead of per-entry keeps the invalidation story impossible to get wrong;
 //! the price is one 2-query re-read per live token afterwards. The one
 //! exception is a login attempt that does not lock the account out: it writes

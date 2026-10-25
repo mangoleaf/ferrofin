@@ -8,6 +8,17 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — clients are no longer told which accounts have no password
+
+`HasPassword` and `HasConfiguredPassword` now read `true` for every user, as Jellyfin 12
+reports them. Before, an account without a password read `false`, including on the
+login-screen list that `GET /Users/Public` serves to callers who have not signed in.
+
+A client that used the flag to sign a passwordless user in with one click now asks for a
+password instead. Upstream names jellyfin-web's login screen among those clients. Leave the
+password empty: the account still signs in, because sign-in checks the stored password and
+not the flag.
+
 ## Unreleased — abandoned playback is stopped, and paused sessions can be
 
 Ferrofin now runs Jellyfin's two playback checks:

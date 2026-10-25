@@ -707,10 +707,10 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrElevated {
 /// invisible to a parity run whose bench user is an administrator.
 ///
 /// The default handler's other two legs — refusing a remote caller without
-/// `EnableRemoteAccess`, and the parental schedule — belong to the base
-/// `[Authorize]` policy that [`RequireAuth`] stands for and are not ported
-/// here (or in [`RequireAdmin`]); they are open work on the default policy,
-/// not something specific to lyrics.
+/// `EnableRemoteAccess`, and the parental schedule (which administrators skip)
+/// — run for this requirement too upstream, since `UserPermissionRequirement`
+/// derives from `DefaultAuthorizationRequirement`. Here they come from
+/// [`RequireAuth`], which this extractor runs before the permission check.
 #[derive(Debug, Clone)]
 pub struct RequireLyricManagement(pub AuthorizationInfo);
 

@@ -230,9 +230,81 @@ async fn log_session_activity_creates_and_reuses_a_session() {
     assert_eq!(again.application_version.as_deref(), Some("1.1"));
 }
 
+/// The session id is Jellyfin's byte for byte: `GetSessionKey` is
+/// `appName + deviceId + userId.ToString("N")` (v12.2 `SessionManager.cs:481`)
+/// and the id its MD5 as a `Guid` "N". The expected id is the one Jellyfin
+/// 12.2 answered in a parity replay for this user, client and device.
+#[tokio::test]
+async fn the_session_id_is_derived_from_the_client_device_and_user() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::parse_str("8f877f4cfc08426d895fc28d2d871ee4").unwrap();
+    let user = seed_named_user(&db, user_id, "parity-user").await;
+
+    let session = mgr
+        .log_session_activity("parity", "12.2", "parity", "parity", "e", Some(&user))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.id.as_deref(),
+        Some("a870e5be90a2a7581e6e659320003bfe")
+    );
+}
+
+/// Upstream commit b1e3cf1341 (in v12.0-rc7): the client name and device id
+/// come from request headers, not from the token, so a user sending another
+/// user's pair must get a session of their own. Before, the existing session
+/// was re-attributed to the caller, who could then control the victim's
+/// player without `EnableRemoteControlOfOtherUsers`.
+#[tokio::test]
+async fn another_users_client_and_device_does_not_take_over_their_session() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let alice_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    let mallory_id = Uuid::new_v4();
+    let mallory = seed_named_user(&db, mallory_id, "mallory").await;
+
+    let victim = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "e", Some(&alice))
+        .await
+        .unwrap();
+    let intruder = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "e", Some(&mallory))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        victim.id, intruder.id,
+        "each user gets a session of their own"
+    );
+    assert_eq!(intruder.user_id, mallory_id);
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, victim.id);
+    assert_eq!(
+        sessions[0].user_id, alice_id,
+        "the victim's session stays theirs"
+    );
+    let refused = mgr
+        .assert_can_control(
+            intruder.id.as_deref().expect("intruder id"),
+            victim.id.as_deref().expect("victim id"),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(ServiceError::Forbidden(_))),
+        "{refused:?}"
+    );
+}
+
 /// `RequestHelpers.GetSession` logs an API-key caller's activity with no user:
 /// the session's `UserId` is `Guid.Empty`, it has no `UserName`, and it is
-/// keyed like any other (`{appName}{deviceId}`).
+/// keyed like any other, with the empty user id's 32 zeros
+/// (`{appName}{deviceId}{Guid.Empty:N}`).
 #[tokio::test]
 async fn a_session_logged_without_a_user_has_none() {
     let db = test_db().await;
@@ -719,6 +791,106 @@ async fn logout_by_token_ends_the_session() {
         .await
         .unwrap_err();
     assert!(matches!(err, ServiceError::Unauthorized(_)));
+}
+
+/// Signs `user` in on `device_id` (`AuthenticateDirect`), returning the token.
+async fn sign_in(mgr: &FerrofinSessionManager, user_id: Uuid, device_id: &str) -> String {
+    let request = AuthenticationRequest {
+        user_id: Some(user_id),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some(device_id.to_owned()),
+        device_name: Some(device_id.to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    mgr.authenticate_direct(&request)
+        .await
+        .unwrap()
+        .access_token
+        .expose()
+        .to_owned()
+}
+
+/// Every stored device id, sorted, as the device manager lists them.
+async fn device_ids(db: &Database) -> Vec<String> {
+    use ferrofin_traits::devices::{DeviceManager, DeviceQuery};
+    let mut ids: Vec<String> = FerrofinDeviceManager::new(db.clone())
+        .get_devices(&DeviceQuery::default())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|d| d.device_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `SessionManager.RevokeUserTokens(userId, currentAccessToken)`: every device
+/// of the user except the one holding `currentAccessToken` (compared ignoring
+/// case) is logged out (`Logout(Device)`: the device row goes and its sessions
+/// end), and nobody else's device is touched. Password change, user deletion
+/// and disabling a user all rely on it.
+#[tokio::test]
+async fn revoking_a_users_tokens_keeps_only_the_current_device() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let alice_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    let bob_id = Uuid::new_v4();
+    let bob = seed_named_user(&db, bob_id, "bob").await;
+    for user in [&alice, &bob] {
+        set_permission(
+            db.writer(),
+            &user.id,
+            PermissionKind::EnableAllDevices,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+    let current = sign_in(&mgr, alice_id, "alice-phone").await;
+    let other = sign_in(&mgr, alice_id, "alice-tv").await;
+    let bobs = sign_in(&mgr, bob_id, "bob-laptop").await;
+    mgr.log_session_activity("Web", "1.0", "alice-tv", "TV", "e", Some(&alice))
+        .await
+        .unwrap();
+    let on_tv = |sessions: &[SessionInfoDto]| {
+        sessions
+            .iter()
+            .any(|s| s.device_id.as_deref() == Some("alice-tv"))
+    };
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert!(on_tv(&sessions), "the TV has a live session to end");
+
+    mgr.revoke_user_tokens(alice_id, &current.to_uppercase())
+        .await
+        .unwrap();
+
+    assert_eq!(device_ids(&db).await, ["alice-phone", "bob-laptop"]);
+    for (token, device) in [(&current, "alice-phone"), (&bobs, "bob-laptop")] {
+        mgr.get_session_by_authentication_token(token, device, "e")
+            .await
+            .unwrap_or_else(|e| panic!("{device} keeps its token: {e}"));
+    }
+    let err = mgr
+        .get_session_by_authentication_token(&other, "alice-tv", "e")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::Unauthorized(_)), "{err:?}");
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert!(!on_tv(&sessions), "the revoked device's session ended");
+
+    // With no current token, every device of the user goes (user deletion,
+    // and a disable through the policy).
+    mgr.revoke_user_tokens(alice_id, "").await.unwrap();
+    assert_eq!(device_ids(&db).await, ["bob-laptop"]);
 }
 
 #[tokio::test]
