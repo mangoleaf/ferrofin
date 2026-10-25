@@ -72,6 +72,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Every dependency is declared once, in the root `[workspace.dependencies]`, and used: the
   unused `axum-extra`, `argon2`, `insta` and seven dead crate edges are gone, and the backup
   handler's inline zip 2 and ferrofin-util's rand 0.8 move to the workspace's zip and rand 0.10
+- One TLS crypto backend, aws-lc: sqlx no longer builds rustls with ring (SQLite has no network
+  transport), nor its unused `any` and `json` features, and webpki-roots is gone
 
 ### Parity
 - Find the playlists folder by its type when a playlist is created, as Jellyfin's
@@ -833,6 +835,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `.json`, `.json5`, `.yaml`, `.yml`, `.ini` or `.ron` is refused instead of parsed in that format
   (see [docs/UPGRADING.md](docs/UPGRADING.md)), and the server no longer builds those
   parsers
+- OTLP trace export works with an `https://` collector: the exporter now has TLS (aws-lc) and
+  checks the collector against the system trust store. It refused an https endpoint before, and
+  that went unlogged, like every other exporter outcome: the server logged them before its
+  log output was set up. The startup log now says whether traces are exported, or why not
 
 ## [1.0.0] - 2026-09-05
 

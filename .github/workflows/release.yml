@@ -225,7 +225,7 @@ jobs:
           key: ${{ matrix.target }}
           lookup-only: true # release builds never write the cache (poisoning surface)
       # Linux builds use zig as the C toolchain, linked against GLIBC_FLOOR (the
-      # aarch64 cross-build also needs it for bundled SQLite and ring).
+      # aarch64 cross-build also needs it for the C in bundled SQLite and aws-lc-sys).
       - if: contains(matrix.target, 'linux')
         run: |
           pip install cargo-zigbuild

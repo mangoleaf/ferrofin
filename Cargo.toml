@@ -100,7 +100,8 @@ futures-util = "0.3.34"
 notify = "8.2"
 
 # ── persistence: sqlx + SQLite (speed-first; see plan) ─────────────
-sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio", "tls-rustls-ring", "macros", "chrono", "uuid"] }
+# SQLite has no network transport, so no TLS; `macros` stays only because it carries `migrate!`.
+sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate", "chrono", "uuid"] }
 # Direct handle on the SQLite C API, pinned to the exact version sqlx resolves so
 # cargo unifies them to ONE linked copy — a second copy would mean a second,
 # unconfigured SQLite. Used only to call sqlite3_config() before any connection.
@@ -138,7 +139,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
 p12-keystore = "0.4.1"
 # Self-signed certificates for the HTTPS tests (dev-dependency only).
-rcgen = "0.14.10"
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 # ── openapi ────────────────────────────────────────────────────────
 utoipa = "6.0.0"
@@ -150,7 +151,8 @@ utoipa = "6.0.0"
 opentelemetry = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-prometheus = "0.33.0"
-opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "trace"] }
+# TLS for an https collector: aws-lc as everywhere else, roots from the system store.
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "trace", "tls-aws-lc", "tls-roots"] }
 tracing-opentelemetry = "0.34.0"
 # encode-only; ferrofin-metrics ONLY — the 0.32 exporter exposes no render helper,
 # so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).
