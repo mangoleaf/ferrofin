@@ -24,6 +24,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
 
 ### Tooling
+- `gates/parity/filed.toml` records the two differences of the 2026-10-24 replay that have an open
+  issue and no ledger entry (the HLS video segment's timestamps, the live HLS segment names); the
+  run's other groups are accepted by the ledger, gone under the current comparison, fixed since,
+  or came from the replay's older harness
+- The item repository's query translates eleven filter fields it used to ignore (trailer types,
+  chapter images, the provider-id maps, dead parents, box-set library folders and the four "has
+  no track in this language" filters), each with Jellyfin's alternate-version and folder roll-up
+  where it has one; no route sets them yet. A test now fails when a query field is read nowhere
 - The four live checks moved under `gates/`: `bench/` → `gates/bench/`, `adoption/` →
   `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. Every gate
   takes its directories from one output root, `FERROFIN_GATES_DIR` (absolute, on a local
@@ -63,6 +71,22 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- `GET /Items` honours `seriesStatus` (jellyfin-web's TV Status filter), `minOfficialRating`,
+  `maxOfficialRating`, `personTypes`, `isPlaceHolder` and `hasOfficialRating`, and
+  `hasParentalRating=false` returns only the unrated items, as Jellyfin 12.2's `TranslateQuery`
+  does; each used to be ignored. A folder (a series, season or box set) counts as
+  rated, or as a placeholder, when an item below it or linked to it is. `maxOfficialRating` can
+  lower a restricted user's parental limit but never raise it: Jellyfin lets the request replace
+  the limit, and an unrecognized rating clears it there
+- `GET /Items` resolves its `studios`, `artists` and `albums` name filters, which replace
+  `studioIds`, `artistIds` and `albumIds` as in Jellyfin. Unlike Jellyfin, the lookup writes no
+  row; an unknown name matches nothing (Jellyfin answers the whole library for an unknown album)
+- On `GET /Items`, an artist's albums listed with no `sortBy` (`artistIds` or `artists`, with
+  `MusicAlbum` as the only `includeItemTypes`) come newest first, then by name, Jellyfin's default
+  for that request
+- `nameStartsWith` on `/Genres`, `/MusicGenres`, `/Studios`, `/Artists` and
+  `/Artists/AlbumArtists` is a literal prefix of the sort name, as on `/Items`: `%` and `_` match
+  only themselves, and a leading space is kept
 - Port Jellyfin's Screen Grabber (`VideoImageProvider`): a movie, episode, music video or
   home video with no Primary image after the local, remote and embedded providers gets a
   frame from its default video stream, 10 % into its runtime (10 s when the runtime is

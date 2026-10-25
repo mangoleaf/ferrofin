@@ -1607,9 +1607,6 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
      that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
      answers with nothing.",
     UNKNOWN_PARENT_ID_DIVERGENCE,
-    "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
-     (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
-     append_by_name_filters.",
     "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
      user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
      ported.",
@@ -1635,9 +1632,6 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
     "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
      AncestorIds in every case, so a non-folder parent answers with nothing.",
     UNKNOWN_PARENT_ID_DIVERGENCE,
-    "NameStartsWith matches COALESCE(SortName, Name) where v12 matches SortName alone \
-     (Ferrofin leaves by-name SortName NULL) — deliberate, recorded in \
-     append_by_name_filters.",
 ];
 
 /// Included in the divergence lists of the five by-name VERIFIED rows; the

@@ -20177,7 +20177,7 @@ fn apply_nfo(entity: &mut BaseItemEntity, n: &ferrofin_providers::xbmc::item::Nf
 /// The [`SeriesStatus`](ferrofin_model::entities::SeriesStatus) name as
 /// Jellyfin serializes it into the `Data` blob — `Enum.ToString()`, which is
 /// also the `Status` string `DtoService` emits.
-fn series_status_name(status: ferrofin_model::entities::SeriesStatus) -> &'static str {
+pub(crate) fn series_status_name(status: ferrofin_model::entities::SeriesStatus) -> &'static str {
     use ferrofin_model::entities::SeriesStatus;
     match status {
         SeriesStatus::Continuing => "Continuing",

@@ -2296,12 +2296,21 @@ impl LocalizationManager for FakeLocalization {
     fn get_language_display_name(&self, _language: &str) -> Option<String> {
         None
     }
+    /// A fixed slice of the US table (`G` 0, `PG` 10, `PG-13` 13, `R` 17),
+    /// matched case-insensitively; any other rating is unknown.
     fn get_rating_score(
         &self,
-        _rating: &str,
+        rating: &str,
         _country_code: Option<&str>,
     ) -> Option<ParentalRatingScore> {
-        unimplemented!("fake")
+        let score = match rating.to_ascii_uppercase().as_str() {
+            "G" => 0,
+            "PG" => 10,
+            "PG-13" => 13,
+            "R" => 17,
+            _ => return None,
+        };
+        Some(ParentalRatingScore::new(score, None))
     }
 }
 
