@@ -1401,17 +1401,37 @@ pub const VERIFIED: &[Verified] = &[
                policy_validation for the nested Policy's [Required] provider ids; UserDto's \
                serde default for a missing Configuration) → ferrofin-core user_manager.rs \
                rename_user (require_valid_username: ThrowIfInvalidUsername), \
-               update_configuration; handlers/users.rs refresh_device_access \
-               (DeviceAccessHost after a rename)",
+               update_configuration (one writer transaction, as one SaveChangesAsync; \
+               accepted_cast_receiver_id); handlers/users.rs notify_user_updated \
+               (UserUpdatedNotifier) and refresh_device_access (DeviceAccessHost), both after a \
+               rename only",
         date: "2026-10-25",
         divergences: &[
             "\"Configuration\": null skips the configuration save, where upstream dereferences \
          the null in UpdateConfigurationAsync and answers 500. Jellyfin bug not ported.",
-            "Every save pushes UserUpdated to the user's sessions once the configuration is \
-         saved, where upstream pushes it only from a rename (RenameUser raises \
-         UserUpdatedEventArgs; UpdateConfigurationAsync raises nothing). Fix path: gl-864.",
             "The 400 (invalid or taken name), 403 (update not allowed) and 404 (unknown user) \
          bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Users/Configuration",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "UpdateUserConfiguration",
+        ferrofin: "handlers/users.rs update_user_configuration (also behind the hidden \
+               POST /Users/{userId}/Configuration; JsonBody for the [Required] body; \
+               assert_can_update_user: RequestHelpers.AssertCanUpdateUser with \
+               restrictUserPreferences) → ferrofin-core user_manager.rs update_configuration \
+               (UserManager.UpdateConfigurationAsync: the Users columns and the OrderedViews, \
+               GroupedFolders, MyMediaExcludes and LatestItemExcludes preferences in one writer \
+               transaction; accepted_cast_receiver_id: a non-empty id naming a configured \
+               receiver, else the stored one is kept); no UserUpdated push, as \
+               UpdateConfigurationAsync raises no event",
+        date: "2026-10-25",
+        divergences: &[
+            "The 403 (update not allowed) and 404 (unknown user) bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1494,9 +1514,10 @@ pub const VERIFIED: &[Verified] = &[
         path: "/DisplayPreferences/{displayPreferencesId}",
         upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
         upstream_method: "GetDisplayPreferences",
-        ferrofin: "handlers/display_preferences.rs get_display_preferences (effective_user_id: \
-               RequestHelpers.GetUserId; resolve_item_id: Guid.TryParse else GetMD5; \
-               index_by_name, chromecast_name, home_section_name) → ferrofin-core \
+        ferrofin: "handlers/display_preferences.rs get_display_preferences (Query: \
+               ConvertEmptyStringToNull, then [Required] client from query/required.json; \
+               effective_user_id: RequestHelpers.GetUserId; resolve_item_id: Guid.TryParse \
+               else GetMD5; index_by_name, chromecast_name, home_section_name) → ferrofin-core \
                display_preferences_manager.rs (get_display_preferences, \
                get_item_display_preferences, list_custom_item_display_preferences, \
                list_home_sections) → ferrofin-db database.rs home_sections (Order, then Id: \
@@ -1504,18 +1525,11 @@ pub const VERIFIED: &[Verified] = &[
                dto/display_preferences_dto.rs",
         date: "2026-10-25",
         divergences: &[
-            "SortBy, SortOrder, RememberSorting and RememberIndexing come from one shared \
-         empty-GUID ItemDisplayPreferences row per user and client unless the item has its \
-         own row; upstream's GetItemDisplayPreferences reads, or creates, the row under the \
-         item. Fix path: gl-447.",
             "CustomPrefs members are written in hash order, not upstream's insertion order \
          (the home sections, the scalar keys, then the stored preferences); the members and \
          values are the same.",
-            "A whitespace-only client is a client name here (the row is read, or created, \
-         for it); upstream's [Required] string client binds it as null and answers 400. Fix \
-         path: gl-948.",
-            "The 400 for a missing or empty client or an unparsable userId and the 403 for \
-         another user's id without the administrator role are Ferrofin's error shape, not \
+            "The 400 for a missing, empty or whitespace-only client or an unparsable userId \
+         and the 403 for another user's id without the administrator role are Ferrofin's error shape, not \
          upstream's. Fix path: gl-666.",
         ],
         refs: &[],
@@ -1525,8 +1539,9 @@ pub const VERIFIED: &[Verified] = &[
         path: "/DisplayPreferences/{displayPreferencesId}",
         upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
         upstream_method: "UpdateDisplayPreferences",
-        ferrofin: "handlers/display_preferences.rs update_display_preferences (JsonBody \
-               DisplayPreferencesDto, resolve_item_id: Guid.TryParse else GetMD5, \
+        ferrofin: "handlers/display_preferences.rs update_display_preferences (Query: \
+               ConvertEmptyStringToNull, then [Required] client from query/required.json; \
+               JsonBody DisplayPreferencesDto, resolve_item_id: Guid.TryParse else GetMD5, \
                take_pref/take_nullable_pref, enum_try_parse for Enum.TryParse/Enum.Parse, \
                parse_dotnet_int/parse_dotnet_bool for int.Parse/bool.Parse) → ferrofin-core \
                display_preferences_manager.rs (get_display_preferences, \
@@ -1536,11 +1551,6 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-model dto/display_preferences_dto.rs",
         date: "2026-10-25",
         divergences: &[
-            "SortBy, SortOrder, RememberSorting and RememberIndexing are written to one \
-         shared empty-GUID ItemDisplayPreferences row per user and client unless the item \
-         already has its own row; upstream stores them under the item \
-         (GetItemDisplayPreferences creates the row under itemId, and the controller sets \
-         itemPrefs.ItemId = itemId). Fix path: gl-447.",
             "A missing or empty skipBackLength/skipForwardLength stores 10000/30000 ms; \
          upstream's controller stores 15000 for both. Fix path: gl-410.",
             "Values upstream fails on with a 500 take the defaults here: an \
@@ -1557,10 +1567,8 @@ pub const VERIFIED: &[Verified] = &[
          Jellyfin bug not ported.",
             "An invalid landing-* ViewType is logged at warn, as bad client input \
          (docs/conventions/LOGGING.md), where upstream logs it at error.",
-            "A whitespace-only client is a client name here; upstream's [Required] string \
-         client binds it as null and answers 400. Fix path: gl-948.",
-            "The 400 for a missing or empty client, an unparsable userId or a \
-         chromecastVersion Enum.Parse refuses, the 403 for another user's id without the \
+            "The 400 for a missing, empty or whitespace-only client, an unparsable userId or \
+         a chromecastVersion Enum.Parse refuses, the 403 for another user's id without the \
          administrator role, and the error text of a body that does not bind are \
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
@@ -1687,6 +1695,10 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
      Un-defer path: make `ItemWithCounts.counts` an `Option` in ferrofin-traits.",
     "`minCommunityRating`, `person`, `personIds`, `personTypes` are accepted and ignored, \
      exactly as v12 — GetItemValues copies none of them onto either filter.",
+    "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
+     chosen on, and matches CleanName with, the raw lower-cased term rather than the \
+     cleaned one, a whitespace-only term filters nothing (upstream's IsNullOrEmpty applies \
+     it), and there is no OriginalTitle arm. Fix path: gl-957.",
 ];
 
 /// What `/Genres`, `/MusicGenres` and `/Studios` do differently from their v12
@@ -1703,6 +1715,10 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
     "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
      AncestorIds in every case, so a non-folder parent answers with nothing.",
     UNKNOWN_PARENT_ID_DIVERGENCE,
+    "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
+     chosen on, and matches CleanName with, the raw lower-cased term rather than the \
+     cleaned one, a whitespace-only term filters nothing (upstream's IsNullOrEmpty applies \
+     it), and there is no OriginalTitle arm. Fix path: gl-957.",
 ];
 
 /// Included in the divergence lists of the five by-name VERIFIED rows; the

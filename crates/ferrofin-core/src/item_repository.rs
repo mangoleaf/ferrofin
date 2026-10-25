@@ -46,8 +46,9 @@ use crate::item_type_lookup::stored_type_name;
 use crate::item_visibility::ItemVisibility;
 use crate::kinds::is_video;
 use crate::translate_query::{
-    PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_music_albums_query, build_query,
-    media_type_name, non_blank, push_in_list, push_name_starts_with, to_guid_strings,
+    PLACEHOLDER_ID, QueryShape, append_name_ranges, append_predicates,
+    build_latest_music_albums_query, build_query, media_type_name, non_blank, push_in_list,
+    to_guid_strings,
 };
 use crate::user_entity_ext::{guid_preference, has_permission, live_tv_enabled_for};
 use crate::virtual_paths::VirtualPathExpander;
@@ -2515,13 +2516,15 @@ impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
 ///   a term containing a wildcard character goes through `LIKE '%term%'`
 ///   **unescaped** (client wildcards pass through, as upstream intends); a plain
 ///   term is cleaned (`get_clean_value`, as v12's `GetCleanValue`) and matched
-///   as a literal contains on `CleanName`.
-/// - `NameStartsWith` is the literal `SortName` prefix a browse runs
-///   ([`push_name_starts_with`], v12.2 `ApplyNameFilters`). Every by-name row
-///   carries a `SortName`: `ByNameStore` writes one, and boot backfills any a
-///   build before it left NULL (`backfill_missing_sort_names`).
-/// - `NameStartsWithOrGreater`/`NameLessThan` are full-string comparisons of
-///   `SortName` against the lowercased bound, as C# compares them.
+///   as a literal contains on `CleanName`. It still differs from v12.2: the
+///   wildcard branch is chosen on, and matched with, the raw term rather than
+///   the cleaned one, and there is no `OriginalTitle` arm (gl-957).
+/// - `NameStartsWith`, `NameStartsWithOrGreater` and `NameLessThan` are the
+///   browse's v12.2 `ApplyNameFilters` ([`append_name_ranges`]): a literal
+///   `SortName` prefix and full-string comparisons against the lowercased,
+///   untrimmed term. Every by-name row carries a `SortName`: `ByNameStore`
+///   writes one, and boot backfills any a build before it left NULL
+///   (`backfill_missing_sort_names`).
 ///
 /// Everything else in C#'s `outerQueryFilter` (`ByName.cs:177-196`) — played /
 /// favorite / liked / locked state, tags, official ratings, years, referenced
@@ -2533,11 +2536,8 @@ fn append_by_name_filters(
     filter: &InternalItemsQuery,
     outer: &InternalItemsQuery,
 ) {
-    fn non_blank(v: Option<&str>) -> Option<&str> {
-        v.map(str::trim).filter(|s| !s.is_empty())
-    }
     append_predicates(qb, outer);
-    if let Some(term) = non_blank(filter.search_term.as_deref()) {
+    if let Some(term) = non_blank(filter.search_term.as_ref()) {
         let lowered = lower_invariant(term);
         if lowered.contains(SEARCH_WILDCARD_TERMS) {
             let like = format!("%{}%", lowered.trim_matches('%'));
@@ -2551,24 +2551,7 @@ fn append_by_name_filters(
             qb.push(r#" AND bi."CleanName" LIKE "#).push_bind(like);
         }
     }
-    // Untrimmed, as on a browse: a non-blank term is matched byte for byte.
-    if let Some(prefix) = crate::translate_query::non_blank(filter.name_starts_with.as_ref()) {
-        push_name_starts_with(qb, prefix);
-    }
-    // Both bounds are FULL-STRING comparisons against the lowercased parameter,
-    // over `SortName` only (C# `BaseItemRepository.cs:2036-2046`:
-    // `SortName!.CompareTo(param.ToLowerInvariant()) >= 0` / `< 0`). Comparing
-    // only the first character, case-sensitively, made `nameLessThan=Jb` and
-    // `nameStartsWithOrGreater=j` return the wrong page — and `>` instead of
-    // `>=` dropped the boundary row itself.
-    if let Some(boundary) = non_blank(filter.name_starts_with_or_greater.as_deref()) {
-        qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") >= "#)
-            .push_bind(lower_invariant(boundary));
-    }
-    if let Some(boundary) = non_blank(filter.name_less_than.as_deref()) {
-        qb.push(r#" AND ferrofin_lower_invariant(bi."SortName") < "#)
-            .push_bind(lower_invariant(boundary));
-    }
+    append_name_ranges(qb, filter);
 }
 
 /// The C# `outerQueryFilter` (`ByName.cs:208-232` at v12.2) minus the name
@@ -8239,6 +8222,42 @@ mod tests {
             names("R").await.is_empty(),
             "the prefix is on SortName alone, never Name"
         );
+    }
+
+    /// `NameStartsWithOrGreater` and `NameLessThan` on a by-name list are v12.2
+    /// `ApplyNameFilters` too, the browse's: the term is lower-cased, never
+    /// trimmed, so `" b"` sorts before every letter.
+    #[tokio::test]
+    async fn by_name_name_bounds_are_not_trimmed() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA102);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        for genre in ["Abba", "Rock"] {
+            seed_item_genre(&db, movie, genre).await;
+        }
+        let names = async |query: InternalItemsQuery| -> Vec<String> {
+            repository
+                .get_genres(&query)
+                .await
+                .expect("genres")
+                .items
+                .into_iter()
+                .filter_map(|row| row.item.name)
+                .collect()
+        };
+        let or_greater = |bound: &str| InternalItemsQuery {
+            name_starts_with_or_greater: Some(bound.to_owned()),
+            ..Default::default()
+        };
+        let less_than = |bound: &str| InternalItemsQuery {
+            name_less_than: Some(bound.to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(names(or_greater("B")).await, ["Rock"]);
+        assert_eq!(names(or_greater(" b")).await, ["Abba", "Rock"]);
+        assert_eq!(names(less_than("B")).await, ["Abba"]);
+        assert!(names(less_than(" b")).await.is_empty());
     }
 
     /// Gives the named rows a `SortName`/`CleanName` (the lowercased name) and
