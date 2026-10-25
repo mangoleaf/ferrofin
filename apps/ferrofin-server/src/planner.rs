@@ -16,19 +16,20 @@
 //! `ferrofin-core` (`RULES_CODE_REUSE`), so the concrete planner is injected from
 //! above through the trait.
 //!
-//! # First-Light scope
+//! # Scope
 //!
-//! The planner honours the request-declared target codecs and **copies when it
-//! can** (the cheapest correct path): [`EncodingHelper::can_stream_copy_video`] /
+//! The planner honours the target codecs the request declares (the device
+//! profile was negotiated by `PlaybackInfo` before the client built the URL)
+//! and **copies when it can** (the cheapest correct path):
+//! [`EncodingHelper::can_stream_copy_video`] /
 //! [`EncodingHelper::can_stream_copy_audio`] decide per stream, and a copyable
 //! stream becomes a `-c:v copy` / `-c:a copy` remux. When it must re-encode, it
-//! uses **NVENC** hardware encoding (h264/hevc/av1 + NVDEC decode) if the
-//! persisted encoding options select it, else software `libx264`. What it does
-//! *not* do is the full device-profile negotiation, the rest of the
-//! hardware-acceleration matrix (QSV/VAAPI/AMF), or subtitle provider fan-out
-//! (only stored/embedded burn-in). The hardware matrix is the work of
-//! the hardware-transcoding roadmap; the subtitle-provider fan-out is work item 5
-//! in that plan's list.
+//! uses the hardware decoder, filter chain and encoder of the accelerator the
+//! persisted encoding options select, **NVENC, VAAPI or QSV**
+//! (`hardware_path_is_ported`), else the software encoder. AMF, VideoToolbox,
+//! RKMPP and V4L2M2M are not supported (owner decision 2026-08-26): selecting
+//! one runs the software path with a warning. A subtitle delivered as `Encode`
+//! is burned in, on the GPU by the vendor chain on the hardware path.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1585,13 +1586,15 @@ impl FerrofinStreamStatePlanner {
         //   arguments, but the chain still has a software fallback of its own,
         //   and that fallback is the ported one.
         let hw_filters = !copying_video && hw_ported;
-        // Burning a graphical subtitle needs the decoded frames in system memory
-        // for the `overlay` filter, so we can't keep them on the GPU
-        // (`-hwaccel_output_format cuda`); NVENC still uploads the filtered frames.
+        // A graphical subtitle (PGS/DVDSUB) is burned in with `overlay` on the
+        // software path; on the hardware path the vendor chain composites it on
+        // the GPU (`overlay_cuda`, `overlay_vaapi`, `overlay_qsv`), so the
+        // decoded frames stay there.
         let burn_graphical =
             ferrofin_mediaencoding::encoding_helper::helper::burns_graphical_subtitle(state);
-        // Burning a *text* subtitle (the Encode delivery for srt/ass/…) uses the
-        // `subtitles` filter, which likewise needs frames in system memory.
+        // A *text* subtitle (the Encode delivery for srt/ass/…) is rendered by
+        // the `subtitles` filter: into the frames on the software path, onto a
+        // transparent plane the vendor chain overlays on the hardware path.
         let burn_text = burns_text_subtitle(state);
         let burn_sub = burn_graphical || burn_text;
 
@@ -2428,18 +2431,6 @@ impl FerrofinStreamStatePlanner {
     }
 }
 
-/// The output audio channel count for `-ac`, a focused port of
-/// `EncodingHelper.GetAudioChannels`.
-///
-/// Resolves the client-requested channels (`GetRequestedAudioChannels`, which
-/// already prefers an explicit request over `TranscodingMaxAudioChannels`),
-/// clamps to the source stream's channel count, and — when the audio is being
-/// re-encoded — clamps again to `TranscodingMaxAudioChannels` as a hard ceiling.
-/// Returns `None` when no cap applies, leaving the source channels untouched.
-///
-/// The full C# method additionally imposes the encoder's 8-channel ceiling and a
-/// 3/5/7-channel HLS layout fix (adding an LFE channel); those are omitted —
-/// web/TV profiles cap at 2 or 6 channels, where neither branch fires.
 /// The per-encoder transcode channel ceiling. Port of Jellyfin's
 /// `_audioTranscodeChannelLookup`: lossy stereo-only encoders cap at 2, the
 /// surround codecs cap at 6 (5.1), and anything unlisted defaults to 8 to avoid
@@ -2453,6 +2444,16 @@ fn audio_transcode_channel_limit(encoder: &str) -> i32 {
     }
 }
 
+/// The output audio channel count for `-ac`, a port of
+/// `EncodingHelper.GetAudioChannels`.
+///
+/// Resolves the client-requested channels (`GetRequestedAudioChannels`, which
+/// already prefers an explicit request over `TranscodingMaxAudioChannels`) and
+/// clamps them to the source stream's channel count. When the audio is being
+/// re-encoded it clamps again, to the encoder's ceiling
+/// ([`audio_transcode_channel_limit`]) and to `TranscodingMaxAudioChannels`,
+/// then moves a 3/5/7-channel HLS layout to one HLS carries. Returns `None`
+/// when no cap applies, leaving the source channels untouched.
 fn resolve_output_audio_channels(
     state: &EncodingJobInfo,
     output_audio_codec: Option<&str>,

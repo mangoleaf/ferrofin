@@ -70,7 +70,8 @@ impl NotifyFileSystemWatcher {
     ///
     /// The receiver yields the absolute path of each created/modified/removed
     /// file or directory under the watched roots, already filtered through
-    /// [`should_ignore_path`].
+    /// [`should_ignore_path`], and every watched root when the kernel's event
+    /// queue overflowed and changes were lost.
     ///
     /// # Errors
     ///
@@ -83,56 +84,7 @@ impl NotifyFileSystemWatcher {
         let watched_roots = Arc::clone(&root_set);
         let library_roots = Arc::clone(&library_root_set);
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            let event = match res {
-                Ok(event) => event,
-                Err(err) => {
-                    tracing::warn!(%err, "filesystem watch event error");
-                    return;
-                }
-            };
-            // Only content-affecting kinds: create, data/name modify, remove.
-            // Access events (reads, close-no-write) are pure noise for a scan.
-            if !matches!(
-                event.kind,
-                EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-            ) {
-                return;
-            }
-            // A directory's own `Modify` is never about its entries (those
-            // arrive as their own create/remove events): an attribute change
-            // (`IN_ATTRIB`), or its mtime set alone (`IN_MODIFY`).
-            let metadata_only = matches!(
-                event.kind,
-                EventKind::Modify(ModifyKind::Metadata(_) | ModifyKind::Data(_))
-            );
-            // A poisoned set still holds whole entries (each update is one
-            // insert, remove or replacement).
-            let is_library_root = |path: &str| {
-                let key = root_key(path);
-                [&watched_roots, &library_roots].iter().any(|set| {
-                    set.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .contains(&key)
-                })
-            };
-            for path in event.paths {
-                let path = path.to_string_lossy().into_owned();
-                if should_ignore_path(&path) {
-                    continue;
-                }
-                // A library root's own attributes or times changing
-                // (`touch`, `chmod`, `rsync -a` of the root) says nothing
-                // about its contents, but the root is the whole library:
-                // reporting it would rescan the library for a metadata-only
-                // change. A file or folder created or removed in it arrives
-                // with its own path.
-                if metadata_only && is_library_root(&path) {
-                    tracing::trace!(path, "metadata-only change of a library root ignored");
-                    continue;
-                }
-                // Send fails only when the receiver is gone (shutdown) — drop.
-                let _ = tx.send(path);
-            }
+            forward_event(res, &watched_roots, &library_roots, &tx);
         })
         .map_err(|e| ServiceError::backend(format!("failed to create filesystem watcher: {e}")))?;
         Ok((
@@ -143,6 +95,93 @@ impl NotifyFileSystemWatcher {
             },
             rx,
         ))
+    }
+}
+
+/// The watcher's event callback: forwards each changed path of `res` that a
+/// scan would not skip, and every watched root when the event says changes
+/// were lost.
+fn forward_event(
+    res: notify::Result<notify::Event>,
+    watched_roots: &Mutex<HashSet<String>>,
+    library_roots: &Mutex<HashSet<String>>,
+    tx: &mpsc::UnboundedSender<String>,
+) {
+    let event = match res {
+        Ok(event) => event,
+        Err(err) => {
+            tracing::warn!(%err, "filesystem watch event error");
+            return;
+        }
+    };
+    // The kernel's event queue overflowed (`IN_Q_OVERFLOW`, past
+    // `fs.inotify.max_queued_events`): every change in that window is lost,
+    // and notify reports only that a rescan is needed. Upstream's
+    // `OnWatcherError` logs it and stops watching; Ferrofin reports every
+    // watched root instead, so the monitor's settle window turns the storm
+    // into one scan per root and nothing stays missed until the next
+    // scheduled scan (owner decision 2026-10-25).
+    if event.need_rescan() {
+        let mut roots: Vec<String> = watched_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect();
+        roots.sort();
+        tracing::warn!(
+            roots = roots.len(),
+            "filesystem watch queue overflowed, so changes were missed; rescanning the \
+             watched library roots (raise the fs.inotify.max_queued_events sysctl)"
+        );
+        for root in roots {
+            // Send fails only when the receiver is gone (shutdown) — drop.
+            let _ = tx.send(root);
+        }
+        return;
+    }
+    // Only content-affecting kinds: create, data/name modify, remove.
+    // Access events (reads, close-no-write) are pure noise for a scan.
+    if !matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) {
+        return;
+    }
+    // A directory's own `Modify` is never about its entries (those
+    // arrive as their own create/remove events): an attribute change
+    // (`IN_ATTRIB`), or its mtime set alone (`IN_MODIFY`).
+    let metadata_only = matches!(
+        event.kind,
+        EventKind::Modify(ModifyKind::Metadata(_) | ModifyKind::Data(_))
+    );
+    // A poisoned set still holds whole entries (each update is one
+    // insert, remove or replacement).
+    let is_library_root = |path: &str| {
+        let key = root_key(path);
+        [watched_roots, library_roots].iter().any(|set| {
+            set.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&key)
+        })
+    };
+    for path in event.paths {
+        let path = path.to_string_lossy().into_owned();
+        if should_ignore_path(&path) {
+            continue;
+        }
+        // A library root's own attributes or times changing
+        // (`touch`, `chmod`, `rsync -a` of the root) says nothing
+        // about its contents, but the root is the whole library:
+        // reporting it would rescan the library for a metadata-only
+        // change. A file or folder created or removed in it arrives
+        // with its own path.
+        if metadata_only && is_library_root(&path) {
+            tracing::trace!(path, "metadata-only change of a library root ignored");
+            continue;
+        }
+        // Send fails only when the receiver is gone (shutdown) — drop.
+        let _ = tx.send(path);
     }
 }
 
@@ -215,17 +254,28 @@ impl FileSystemWatcher for NotifyFileSystemWatcher {
     }
 
     async fn unwatch_all(&self) -> Result<(), ServiceError> {
-        let roots: Vec<String> = self
-            .watched
-            .lock()
-            .expect("watched set not poisoned")
-            .iter()
-            .cloned()
-            .collect();
-        for root in roots {
-            self.unwatch(&root).await?;
-        }
-        Ok(())
+        // One job under the watcher's lock, which a recursive walk holds
+        // until its root has joined the watched set: a walk already running
+        // when this is called (its `start` cancelled mid-walk, its job
+        // running on) finishes first, and its root is removed with the rest.
+        // A watch job that has not yet taken the lock can still land after.
+        let inner = Arc::clone(&self.inner);
+        let watched = Arc::clone(&self.watched);
+        tokio::task::spawn_blocking(move || {
+            let mut os_watcher = inner.lock().expect("watcher lock not poisoned");
+            let roots: Vec<String> = watched
+                .lock()
+                .expect("watched set not poisoned")
+                .drain()
+                .collect();
+            for root in roots {
+                if let Err(e) = os_watcher.unwatch(Path::new(&root)) {
+                    tracing::debug!(path = root, error = %e, "unwatch skipped");
+                }
+            }
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("unwatch task did not finish: {e}")))
     }
 }
 
@@ -254,6 +304,42 @@ mod tests {
                 _ => return seen,
             }
         }
+    }
+
+    /// A kernel queue overflow arrives as a path-less rescan event. It must
+    /// not be dropped as a non-content kind: every watched root is reported,
+    /// so the monitor scans what the lost events would have reported.
+    #[test]
+    fn a_queue_overflow_reports_every_watched_root() {
+        let watched = Mutex::new(HashSet::from([
+            "/media/tv".to_owned(),
+            "/media/movies".to_owned(),
+        ]));
+        let library_roots = Mutex::new(HashSet::new());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let overflow = notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan);
+
+        forward_event(Ok(overflow), &watched, &library_roots, &tx);
+
+        let mut reported = Vec::new();
+        while let Ok(path) = rx.try_recv() {
+            reported.push(path);
+        }
+        assert_eq!(reported, ["/media/movies", "/media/tv"]);
+    }
+
+    /// Any other non-content event (an access, an `Other` without the rescan
+    /// flag) still reports nothing.
+    #[test]
+    fn a_non_content_event_without_a_rescan_reports_nothing() {
+        let watched = Mutex::new(HashSet::from(["/media/tv".to_owned()]));
+        let library_roots = Mutex::new(HashSet::new());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let other = notify::Event::new(EventKind::Other).add_path("/media/tv/Show".into());
+
+        forward_event(Ok(other), &watched, &library_roots, &tx);
+
+        assert!(rx.try_recv().is_err());
     }
 
     /// Registering a recursive watch (notify walks the whole tree, one
@@ -545,6 +631,33 @@ mod tests {
             got.is_err(),
             "no events expected after unwatch_all: {got:?}"
         );
+    }
+
+    /// `unwatch_all` called while a recursive walk is still running (its
+    /// `start` cancelled, the blocking job running on) waits for the walk and
+    /// removes the root it records, instead of missing it.
+    #[tokio::test]
+    async fn unwatch_all_removes_a_root_whose_walk_was_still_running() {
+        let (watcher, _rx) = NotifyFileSystemWatcher::new().expect("watcher");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        // Stands in for `watch`'s job: it holds the watcher for the walk, then
+        // records the root.
+        let walk = std::thread::spawn({
+            let inner = Arc::clone(&watcher.inner);
+            let roots = Arc::clone(&watcher.watched);
+            move || {
+                let _walking = inner.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                roots.lock().unwrap().insert("/media/movies".to_owned());
+            }
+        });
+        locked_rx.recv().unwrap();
+
+        watcher.unwatch_all().await.expect("unwatch_all");
+
+        walk.join().unwrap();
+        assert!(watcher.watched.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

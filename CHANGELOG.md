@@ -710,6 +710,30 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   keeps the library's database row. It was deleted and created again, which reset the
   library's date added, dropped its images and left its items without the library above
   them until the next scan
+- A transcode whose first segment takes longer than the idle timeout (60 s for HLS, 10 s
+  progressive), such as a cold 4K software encode or a slow tuner, is no longer killed by the
+  idle reaper while it starts. A transcode killed while it starts, by a stop request say, ends
+  its request at once instead of after three minutes
+- Playing a `.strm` shortcut, or an item with no main stream, refreshes it as an item refresh
+  queued with the library scans, as in Jellyfin. It no longer runs a scan of its own beside a
+  library scan, and a shortcut whose file is gone is no longer deleted while it is played
+- Two refreshes of one item's trickplay at once (a scan's and the daily task's, say) generate
+  its tiles once, and one no longer deletes a tile folder the other has just moved in
+- When the kernel's inotify queue overflows during a bulk import, the watched libraries are
+  rescanned, and a warning names the `fs.inotify.max_queued_events` sysctl to raise. The
+  missed changes used to stay out of the library, silently, until the next scheduled scan
+- A library change while the watches are still being set up at boot no longer leaves that
+  setup watching the libraries it had read, a removed one included, until the next restart.
+  An in-process restart stops the setup
+- Closing a stream from a legacy (pre-vchannel) HDHomeRun releases its tuner. Every close left
+  one tuner locked, and after as many closes as the device has tuners every open failed with
+  "No tuners available" until the device dropped the locks
+- An attachment or font extraction cancelled by a disconnecting client stops its ffmpeg, and
+  deletes the half-written files the cache would otherwise have served. A batch font dump,
+  whose files the media names, leaves what it wrote, as in Jellyfin
+- The README said a fresh install logs a generated admin password. It seeds the admin with
+  no password, as Jellyfin does: the setup wizard at `/web` sets it, or
+  `FERROFIN_ADMIN_PASSWORD` seeds one
 
 ## [1.0.0] - 2026-09-05
 

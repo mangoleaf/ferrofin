@@ -534,15 +534,13 @@ fn spawn_pool_sampler(db: &Database) {
 ///   the configuration manager is not built until `build_app_state` — and it is
 ///   mutable at runtime from the dashboard, so a value captured here could go
 ///   stale. [`crate::vaapi_probe`] therefore probes them lazily, once per
-///   device path, at the point of first VAAPI use. **That spawn has landed**;
-///   what is still outstanding is wiring its result into the planner, which
-///   arrives with the VAAPI filter chains in the hardware-transcoding roadmap phase 4b. Until
-///   then `is_vaapi_device_*` and `vaapi_vulkan_*` read `false` on the planning
-///   path — moot for now, since VAAPI is gated out of the hardware path
-///   entirely.
+///   device path, at the point of first VAAPI use, and the planner reads the
+///   result for each VAAPI job (`VaapiProber::capabilities`), so
+///   `is_vaapi_device_*` and `vaapi_vulkan_*` describe the configured device
+///   there.
 /// - The VideoToolbox AV1-decode probe is not an ffmpeg spawn at all: upstream
-///   asks macOS directly through Objective-C. It belongs to the hardware-transcoding roadmap
-///   phase 6, alongside reading the macOS release in [`read_os_version`].
+///   asks macOS directly through Objective-C. VideoToolbox is not a supported
+///   accelerator (owner decision 2026-08-26), so no job reads it.
 ///
 /// `SetFFmpegPath`'s `CheckSupportedRuntimeKey` (the transcode-throttle pause
 /// key) is [`probe_pause_keys`], run in the background after boot because the
