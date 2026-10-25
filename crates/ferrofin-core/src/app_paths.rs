@@ -350,6 +350,10 @@ impl ServerApplicationPaths for FerrofinServerApplicationPaths {
         path_string(&self.internal_metadata_path_buf())
     }
 
+    fn default_internal_metadata_path(&self) -> String {
+        path_string(&self.default_internal_metadata_path)
+    }
+
     fn program_data_path(&self) -> String {
         path_string(&self.program_data_path)
     }

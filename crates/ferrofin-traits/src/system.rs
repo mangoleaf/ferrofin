@@ -56,8 +56,9 @@ pub trait SystemManager: Send + Sync {
     /// step Jellyfin's backup takes through its database provider). `dest` must
     /// not exist beforehand.
     ///
-    /// The default writes nothing — implementations without a database (test
-    /// fakes); the server's implementation snapshots the live SQLite file.
+    /// The default writes nothing, for implementations without a database, so
+    /// a backup that selects the database fails on them; the server's
+    /// implementation snapshots the live SQLite file.
     async fn snapshot_database(&self, dest: &std::path::Path) -> Result<(), ServiceError> {
         let _ = dest;
         Ok(())
@@ -224,6 +225,17 @@ pub trait ServerApplicationPaths: Send + Sync {
 
     /// The internal metadata directory (custom or default).
     fn internal_metadata_path(&self) -> String;
+
+    /// The default internal metadata directory, whatever `MetadataPath` says
+    /// (`DefaultInternalMetadataPath`). A backup with metadata also archives
+    /// it when the configured directory is elsewhere. Defaults to
+    /// `{program-data}/metadata`, the server layout.
+    fn default_internal_metadata_path(&self) -> String {
+        std::path::Path::new(&self.program_data_path())
+            .join("metadata")
+            .to_string_lossy()
+            .into_owned()
+    }
 
     /// The program data directory.
     fn program_data_path(&self) -> String;

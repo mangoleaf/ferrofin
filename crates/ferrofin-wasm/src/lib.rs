@@ -34,6 +34,7 @@ pub const TEST_FIXTURE_WAT: &str = include_str!("test_fixture.wat");
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use tracing::{error, info, warn};
@@ -123,6 +124,11 @@ pub struct WasmSettings {
     /// KNOWN UX DEBT: UUIDs are hard to audit later — accepting plugin
     /// names here too is a planned improvement.
     pub private_http_allow: Vec<String>,
+    /// Ids of the compiled-in plugins (not a knob: the composition root
+    /// fills it). A file declaring one is never loaded — otherwise it would
+    /// run every surface it declares, gated on and fed the compiled-in
+    /// plugin's flag and configuration, while invisible on `/Plugins`.
+    pub reserved_ids: Vec<Uuid>,
 }
 
 impl Default for WasmSettings {
@@ -137,11 +143,20 @@ impl Default for WasmSettings {
             write_content_mb: 2,
             subtitle_extract_mb: 10,
             private_http_allow: Vec::new(),
+            reserved_ids: Vec::new(),
         }
     }
 }
 
 impl WasmSettings {
+    /// Reserves the compiled-in plugins' ids (see
+    /// [`reserved_ids`](Self::reserved_ids)).
+    #[must_use]
+    pub fn with_reserved_ids(mut self, ids: impl IntoIterator<Item = Uuid>) -> Self {
+        self.reserved_ids = ids.into_iter().collect();
+        self
+    }
+
     /// Overrides the per-plugin total state cap
     /// (`FERROFIN_WASM_STATE_LIMIT_MB`; `None`/zero keeps the default).
     #[must_use]
@@ -392,68 +407,68 @@ impl WasmPluginHost {
         paths.sort();
 
         for path in paths {
-            match load_one(&engine, &linker, &path, settings, &http, &collaborators) {
-                Ok(mut loaded) => {
-                    if plugins
-                        .iter()
-                        .any(|p| p.descriptor.id == loaded.descriptor.id)
-                    {
-                        error!(
-                            path = %path.display(),
-                            plugin_id = %loaded.descriptor.id,
-                            "duplicate wasm plugin id; skipping this file"
-                        );
-                        continue;
-                    }
-                    // A declared provider name is what the dashboard lists
-                    // and what the per-library gate matches on
-                    // (case-insensitively) — a collision with a built-in
-                    // fetcher or another plugin would ride that fetcher's
-                    // checkbox/order and be impossible to toggle apart.
-                    // Normalized (trimmed) BEFORE the checks: HTML collapses
-                    // padding, so " TheMovieDb" would render identically to
-                    // the real entry.
-                    if let Some(info) = loaded.provider_info.as_mut() {
-                        if info.name.trim().len() != info.name.len() {
-                            info.name = info.name.trim().to_owned();
-                        }
-                        let taken = plugins.iter().any(|p| {
-                            p.provider_info
-                                .as_ref()
-                                .is_some_and(|i| i.name.eq_ignore_ascii_case(&info.name))
-                        });
-                        let violation = provider_name_violation(&info.name)
-                            .or_else(|| taken.then(|| "is already taken".to_owned()));
-                        if let Some(why) = violation {
-                            error!(
-                                path = %path.display(),
-                                provider = info.name,
-                                why,
-                                "wasm plugin declares an unacceptable provider name; \
-                                 skipping this file"
-                            );
-                            continue;
-                        }
-                    }
-                    info!(
-                        plugin = loaded.descriptor.name,
-                        plugin_id = %loaded.descriptor.id,
-                        version = loaded.descriptor.version,
-                        tasks = loaded.tasks.len(),
-                        path = %path.display(),
-                        "loaded wasm plugin"
-                    );
-                    plugins.push(Arc::new(loaded));
+            let Some(mut loaded) =
+                load_one_guarded(&engine, &linker, &path, settings, &http, &collaborators)
+            else {
+                continue;
+            };
+            if settings.reserved_ids.contains(&loaded.descriptor.id) {
+                error!(
+                    path = %path.display(),
+                    plugin_id = %loaded.descriptor.id,
+                    "wasm plugin id belongs to a compiled-in plugin; skipping this file"
+                );
+                continue;
+            }
+            if plugins
+                .iter()
+                .any(|p| p.descriptor.id == loaded.descriptor.id)
+            {
+                error!(
+                    path = %path.display(),
+                    plugin_id = %loaded.descriptor.id,
+                    "duplicate wasm plugin id; skipping this file"
+                );
+                continue;
+            }
+            // A declared provider name is what the dashboard lists and what
+            // the per-library gate matches on (case-insensitively) — a
+            // collision with a built-in fetcher or another plugin would ride
+            // that fetcher's checkbox/order and be impossible to toggle
+            // apart. Normalized (trimmed) BEFORE the checks: HTML collapses
+            // padding, so " TheMovieDb" would render identically to the real
+            // entry.
+            if let Some(info) = loaded.provider_info.as_mut() {
+                if info.name.trim().len() != info.name.len() {
+                    info.name = info.name.trim().to_owned();
                 }
-                Err(err) => {
+                let taken = plugins.iter().any(|p| {
+                    p.provider_info
+                        .as_ref()
+                        .is_some_and(|i| i.name.eq_ignore_ascii_case(&info.name))
+                });
+                let violation = provider_name_violation(&info.name)
+                    .or_else(|| taken.then(|| "is already taken".to_owned()));
+                if let Some(why) = violation {
                     error!(
                         path = %path.display(),
-                        error = format!("{err:#}"),
-                        "failed to load wasm plugin (expected a ferrofin:plugin@0.5.0 \
-                         component); skipping this file"
+                        provider = info.name,
+                        why,
+                        "wasm plugin declares an unacceptable provider name; \
+                         skipping this file"
                     );
+                    continue;
                 }
             }
+            info!(
+                plugin = loaded.descriptor.name,
+                plugin_id = %loaded.descriptor.id,
+                version = loaded.descriptor.version,
+                tasks = loaded.tasks.len(),
+                path = %path.display(),
+                "loaded wasm plugin"
+            );
+            plugins.push(Arc::new(loaded));
         }
 
         Ok(Self {
@@ -701,16 +716,30 @@ fn has_persisted_segment_output(cache: &Path, plugin_id: Uuid) -> bool {
 /// string; bounded like state keys (an abuse guard, not a tuning knob).
 const PROVIDER_NAME_MAX: usize = 256;
 
+/// Why a guest-declared display name (the plugin's or its provider's) is
+/// unacceptable: blank, oversized, or carrying control characters, which it
+/// would smuggle into the dashboard, the logs and the runtime thread's name.
+/// `None` = acceptable.
+fn display_name_violation(name: &str) -> Option<String> {
+    if name.trim().is_empty() {
+        return Some("is empty".to_owned());
+    }
+    if name.len() > PROVIDER_NAME_MAX {
+        return Some(format!("exceeds {PROVIDER_NAME_MAX} bytes"));
+    }
+    if name.chars().any(char::is_control) {
+        return Some("contains control characters".to_owned());
+    }
+    None
+}
+
 /// Why a (trimmed) declared provider name is unacceptable regardless of
 /// what else is loaded: unnameable, oversized, or impersonating a built-in
 /// fetcher. `None` = acceptable. The "already taken by another plugin" half
 /// lives at the load loop, which is the only place that sees the full set.
 fn provider_name_violation(name: &str) -> Option<String> {
-    if name.is_empty() {
-        return Some("is empty".to_owned());
-    }
-    if name.len() > PROVIDER_NAME_MAX {
-        return Some(format!("exceeds {PROVIDER_NAME_MAX} bytes"));
+    if let Some(why) = display_name_violation(name) {
+        return Some(why);
     }
     if ferrofin_providers::library_options::fetcher_names::ALL
         .iter()
@@ -719,6 +748,104 @@ fn provider_name_violation(name: &str) -> Option<String> {
         return Some("collides with a built-in fetcher".to_owned());
     }
     None
+}
+
+/// What a component says about itself, read by [`interrogate`].
+struct Interrogated {
+    id: Uuid,
+    wire: bindings::types::PluginDescriptor,
+    default_config: String,
+    tasks: Vec<bindings::types::TaskDescriptor>,
+    config_pages: Vec<bindings::types::ConfigPage>,
+    web_transforms: Vec<bindings::types::WebTransform>,
+    scan_targets: Vec<String>,
+    provider_info: Option<bindings::types::ProviderDescriptor>,
+    declared_egress: Vec<String>,
+}
+
+/// Calls every identity export of a fresh instance and refuses what it says
+/// about itself that a load would refuse — the one interrogation the loader
+/// and the install validator share, so an artifact never installs and is
+/// then skipped at boot for its own answers. (The checks against the other
+/// plugins — reserved, duplicate and taken provider names — need the whole
+/// set and stay in the load loop.)
+///
+/// `artifact` is the plugin file when loading: the id-named state file is
+/// armed from the descriptor on (state is local, with no exfil channel).
+/// Validation passes `None` and stays stateless.
+fn interrogate(
+    store: &mut wasmtime::Store<HostState>,
+    instance: &bindings::Plugin,
+    artifact: Option<&Path>,
+) -> Result<Interrogated, wasmtime::Error> {
+    let wire = instance.call_descriptor(&mut *store)?;
+    let id: Uuid = wire.id.parse().map_err(|_| {
+        wasmtime::Error::msg(format!(
+            "plugin descriptor id `{}` is not a valid UUID",
+            wire.id
+        ))
+    })?;
+    if let Some(why) = display_name_violation(&wire.name) {
+        return Err(wasmtime::Error::msg(format!(
+            "plugin descriptor name {:?} {why}",
+            wire.name
+        )));
+    }
+    if let Some(path) = artifact {
+        store.data_mut().state_path = Some(path.with_file_name(format!("{id}.state.json")));
+    }
+    let default_config = instance.call_default_config(&mut *store)?;
+    serde_json::from_str::<serde_json::Value>(&default_config).map_err(|e| {
+        wasmtime::Error::msg(format!("plugin default-config is not valid JSON: {e}"))
+    })?;
+    Ok(Interrogated {
+        id,
+        wire,
+        default_config,
+        tasks: instance.call_tasks(&mut *store)?,
+        config_pages: instance.call_config_pages(&mut *store)?,
+        web_transforms: instance.call_web_transforms(&mut *store)?,
+        scan_targets: instance.call_scan_targets(&mut *store)?,
+        provider_info: instance.call_provider_info(&mut *store)?,
+        declared_egress: instance.call_declared_egress(&mut *store)?,
+    })
+}
+
+/// [`load_one`], logging why a file is skipped. A panic while loading one
+/// file skips that file, never the batch: the runtime thread is spawned
+/// last, so a panic leaves nothing running, and load-time guest calls cannot
+/// fetch or reach the collaborators, so no shared lock is held mid-panic.
+/// (The panic hook logs the panic itself.)
+fn load_one_guarded(
+    engine: &Engine,
+    linker: &Arc<Linker<HostState>>,
+    path: &Path,
+    settings: &WasmSettings,
+    http: &Arc<capabilities::GuestHttp>,
+    collaborators: &Arc<std::sync::OnceLock<capabilities::Collaborators>>,
+) -> Option<LoadedPlugin> {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        load_one(engine, linker, path, settings, http, collaborators)
+    }));
+    match outcome {
+        Ok(Ok(loaded)) => Some(loaded),
+        Ok(Err(err)) => {
+            error!(
+                path = %path.display(),
+                error = format!("{err:#}"),
+                "failed to load wasm plugin (expected a ferrofin:plugin@0.5.0 \
+                 component); skipping this file"
+            );
+            None
+        }
+        Err(_) => {
+            error!(
+                path = %path.display(),
+                "loading this wasm plugin panicked; skipping this file"
+            );
+            None
+        }
+    }
 }
 
 /// Compiles, instantiates and interrogates a single component file.
@@ -756,27 +883,18 @@ fn load_one(
     };
 
     let (mut store, instance) = spec.instantiate(String::from("{}"))?;
-    let wire = instance.call_descriptor(&mut store)?;
-    let id: Uuid = wire.id.parse().map_err(|_| {
-        wasmtime::Error::msg(format!(
-            "plugin descriptor id `{}` is not a valid UUID",
-            wire.id
-        ))
-    })?;
-    // State is available from here on (the plan allows it at load — it is
-    // local, with no exfil channel): the id names the file.
+    let Interrogated {
+        id,
+        wire,
+        default_config,
+        tasks,
+        config_pages,
+        web_transforms,
+        scan_targets,
+        provider_info,
+        declared_egress,
+    } = interrogate(&mut store, &instance, Some(path))?;
     let state_path = path.with_file_name(format!("{id}.state.json"));
-    store.data_mut().state_path = Some(state_path.clone());
-    let default_config = instance.call_default_config(&mut store)?;
-    serde_json::from_str::<serde_json::Value>(&default_config).map_err(|e| {
-        wasmtime::Error::msg(format!("plugin default-config is not valid JSON: {e}"))
-    })?;
-    let tasks = instance.call_tasks(&mut store)?;
-    let config_pages = instance.call_config_pages(&mut store)?;
-    let web_transforms = instance.call_web_transforms(&mut store)?;
-    let scan_targets = instance.call_scan_targets(&mut store)?;
-    let provider_info = instance.call_provider_info(&mut store)?;
-    let declared_egress = instance.call_declared_egress(&mut store)?;
     let egress = Arc::new(capabilities::EgressPolicy::parse(&declared_egress));
     if egress.allow_any {
         warn!(
@@ -1143,26 +1261,19 @@ impl ferrofin_traits::plugins::PluginArtifactValidator for WasmArtifactValidator
                     "artifact does not instantiate as a {PLUGIN_ABI} plugin: {e:#}"
                 ))
             })?;
-            let wire = instance.call_descriptor(&mut store).map_err(|e| {
-                ServiceError::invalid_input(format!("artifact descriptor call failed: {e:#}"))
-            })?;
-            let id = wire.id.parse::<Uuid>().map_err(|_| {
-                ServiceError::invalid_input(format!(
-                    "artifact descriptor id `{}` is not a valid UUID",
-                    wire.id
-                ))
-            })?;
-            let declared_egress = instance.call_declared_egress(&mut store).map_err(|e| {
-                ServiceError::invalid_input(format!("artifact declared-egress call failed: {e:#}"))
+            let Interrogated {
+                id,
+                declared_egress,
+                provider_info,
+                ..
+            } = interrogate(&mut store, &instance, None).map_err(|e| {
+                ServiceError::invalid_input(format!("artifact interrogation failed: {e:#}"))
             })?;
             // Refuse an unacceptable provider name AT INSTALL, not at the
             // next boot — otherwise the admin sees "installed" and then a
             // silently absent provider. (The "taken by another loaded
             // plugin" half can only be checked at load; this covers the
             // reserved/empty/oversized violations.)
-            let provider_info = instance.call_provider_info(&mut store).map_err(|e| {
-                ServiceError::invalid_input(format!("artifact provider-info call failed: {e:#}"))
-            })?;
             if let Some(info) = &provider_info
                 && let Some(why) = provider_name_violation(info.name.trim())
             {
@@ -1398,11 +1509,14 @@ struct LiteralTransform {
     plugins: Arc<dyn PluginManager>,
     search: String,
     replace: String,
+    /// Whether the over-the-cap skip was logged (once per transform: it
+    /// recurs on every serve of the file).
+    warned: AtomicBool,
 }
 
 #[async_trait]
 impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
-    async fn transform(&self, _path: &str, contents: String) -> String {
+    async fn transform(&self, path: &str, contents: String) -> String {
         // Checked per serve, like the host's other surfaces: Disable or
         // uninstall stops the injection at once, and Enable starts it.
         let enabled = self
@@ -1413,6 +1527,29 @@ impl ferrofin_traits::plugins::FileTransformer for LiteralTransform {
             .flatten()
             .is_some_and(|d| d.enabled);
         if !enabled {
+            return contents;
+        }
+        // Output is bounded, not just input: a common `search` with a large
+        // `replace` multiplies the file, recomputed on every anonymous /web
+        // GET. One step may add at most one full-size `replace`, so chained
+        // steps grow the file linearly, never compounding.
+        let growth = self.replace.len().saturating_sub(self.search.len());
+        if growth > 0
+            && contents
+                .matches(self.search.as_str())
+                .count()
+                .saturating_mul(growth)
+                > MAX_TRANSFORM_TEXT
+        {
+            if !self.warned.swap(true, Ordering::Relaxed) {
+                warn!(
+                    plugin = %self.plugin,
+                    path,
+                    max_growth = MAX_TRANSFORM_TEXT,
+                    "wasm plugin web transform would grow the file past the cap; \
+                     serving it unchanged"
+                );
+            }
             return contents;
         }
         contents.replace(&self.search, &self.replace)
@@ -1445,6 +1582,17 @@ impl WasmPluginHost {
                     );
                     continue;
                 }
+                // An empty search matches at every char boundary, so the
+                // replace would land between every byte (the admin-defined
+                // path skips blank text the same way).
+                if transform.search.trim().is_empty() {
+                    warn!(
+                        plugin = %plugin.descriptor.id,
+                        pattern = transform.path_pattern,
+                        "wasm plugin web transform has a blank search; skipping it"
+                    );
+                    continue;
+                }
                 info!(
                     plugin = %plugin.descriptor.id,
                     pattern = transform.path_pattern,
@@ -1459,6 +1607,7 @@ impl WasmPluginHost {
                             plugins: Arc::clone(plugin_manager),
                             search: transform.search.clone(),
                             replace: transform.replace.clone(),
+                            warned: AtomicBool::new(false),
                         }),
                     )
                     .await;
@@ -1960,6 +2109,7 @@ mod tests {
             plugins: Arc::clone(&plugins),
             search: "</head>".to_owned(),
             replace: "<script></script></head>".to_owned(),
+            warned: AtomicBool::new(false),
         };
         let injected = "<script></script></head>";
         let ours = transform(id);
@@ -1984,6 +2134,45 @@ mod tests {
             "</head>",
             "uninstalled (unknown to the manager): served unchanged"
         );
+    }
+
+    #[tokio::test]
+    async fn a_web_transform_that_would_outgrow_the_cap_serves_the_file_unchanged() {
+        use ferrofin_traits::plugins::FileTransformer as _;
+        let dir = tempfile::tempdir().unwrap();
+        let plugins: Arc<dyn PluginManager> =
+            Arc::new(ferrofin_core::plugin_manager::FerrofinPluginManager::new(
+                vec![ferrofin_core::plugin_manager::RegisteredPlugin::new(
+                    descriptor(),
+                    None,
+                )],
+                dir.path().to_path_buf(),
+            ));
+        let transform = |search: &str, replace: String| LiteralTransform {
+            plugin: descriptor().id,
+            plugins: Arc::clone(&plugins),
+            search: search.to_owned(),
+            replace,
+            warned: AtomicBool::new(false),
+        };
+        // A common search amplified by a large replace: 1000 matches × ~1 KiB.
+        let file = "<".repeat(1000);
+        let amplifier = transform("<", "x".repeat(1024));
+        assert_eq!(amplifier.transform("index.html", file.clone()).await, file);
+        assert!(
+            amplifier.warned.load(Ordering::Relaxed),
+            "the skip is logged"
+        );
+        // One full-size insertion is exactly the cap, and still applies.
+        let insert = "y".repeat(MAX_TRANSFORM_TEXT);
+        let injector = transform("</head>", format!("{insert}</head>"));
+        assert_eq!(
+            injector.transform("index.html", "</head>".into()).await,
+            format!("{insert}</head>")
+        );
+        // Shrinking or same-size rewrites are never capped.
+        let shrinker = transform("<", String::new());
+        assert_eq!(shrinker.transform("index.html", file).await, "");
     }
 
     fn descriptor() -> PluginDescriptor {

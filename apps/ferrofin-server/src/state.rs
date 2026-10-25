@@ -614,7 +614,24 @@ pub async fn build_app_state(
         .with_image_download_mb(config.wasm_image_download_mb)
         .with_image_timeout_secs(config.wasm_image_timeout_secs)
         .with_write_content_mb(config.wasm_write_content_mb)
-        .with_subtitle_extract_mb(config.wasm_subtitle_extract_mb);
+        .with_subtitle_extract_mb(config.wasm_subtitle_extract_mb)
+        // A hand-dropped file must never run as a compiled-in plugin (on its
+        // enabled flag, with its configuration): those ids are refused at
+        // load, before any surface is wired. Extensions are reserved even
+        // with `disable_extensions`, so the outcome never depends on it.
+        .with_reserved_ids(
+            std::iter::once(ferrofin_providers::opensubtitles::PLUGIN_ID)
+                .chain(
+                    ferrofin_providers::builtin_plugins::ALL
+                        .iter()
+                        .map(|p| p.id),
+                )
+                .chain(
+                    ferrofin_extensions::builtin_extensions()
+                        .iter()
+                        .map(|extension| extension.id()),
+                ),
+        );
         let wasm_dir = config.data_dir.join("plugins");
         match tokio::task::spawn_blocking(move || {
             ferrofin_wasm::WasmPluginHost::load(&wasm_dir, &wasm_settings)

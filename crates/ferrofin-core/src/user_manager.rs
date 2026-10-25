@@ -47,7 +47,7 @@ use sqlx::{Sqlite, SqliteExecutor};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::UserManager;
+use ferrofin_traits::library::{PolicyGuardState, PolicySaved, UserManager, policy_update_refusal};
 use ferrofin_traits::security::AuthenticationManager;
 
 use crate::auth_providers::{
@@ -540,6 +540,123 @@ impl FerrofinUserManager {
         .fetch_one(executor)
         .await
         .map_err(db_err)
+    }
+
+    /// Port of `UserManager.UpdatePolicyAsync`: the `Users` columns, every
+    /// permission flag, the access schedules (replaced wholesale) and the
+    /// list-valued preferences the policy carries, in one transaction.
+    ///
+    /// With `guarded`, `UserController.UpdateUserPolicy`'s guards
+    /// ([`policy_update_refusal`]) are read inside that transaction first, as
+    /// `delete_user`'s are: they are invariants over every user, and read from
+    /// the pool they were a check-then-act, so two administrators demoting or
+    /// disabling each other at once could both pass and leave the server with
+    /// no administrator or no enabled user. The single writer connection makes
+    /// the in-transaction read unovertakeable. Upstream has the same race.
+    async fn save_policy(
+        &self,
+        user_id: Uuid,
+        policy: &UserPolicy,
+        guarded: bool,
+    ) -> Result<PolicySaved, ServiceError> {
+        let id = guid_to_db(user_id);
+        let login_lock = self.login_lock(&id);
+        let _login_guard = login_lock.lock().await;
+        self.require_user(user_id).await?;
+
+        // "The default number of login attempts is 3, but for some god forsaken
+        // reason it's sent to the server as 0": -1 → unlimited (NULL), 0 → 3.
+        let max_login_attempts: Option<i64> = match policy.login_attempts_before_lockout {
+            -1 => None,
+            0 => Some(3),
+            n => Some(i64::from(n)),
+        };
+
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let was_disabled = has_permission(&mut *tx, &id, PermissionKind::IsDisabled).await?;
+        if guarded {
+            let state = PolicyGuardState {
+                was_administrator: has_permission(&mut *tx, &id, PermissionKind::IsAdministrator)
+                    .await?,
+                was_disabled,
+                administrators: Self::admin_count_on(&mut *tx).await?,
+                enabled_users: user_repository::enabled_count(&mut *tx)
+                    .await
+                    .map_err(db_err)?,
+            };
+            if let Some(refusal) = policy_update_refusal(state, policy) {
+                return Err(ServiceError::Forbidden(refusal.to_owned()));
+            }
+        }
+        sqlx::query(
+            r#"UPDATE "Users" SET
+                "MaxActiveSessions" = ?2, "MaxParentalRatingScore" = ?3,
+                "MaxParentalRatingSubScore" = ?4, "LoginAttemptsBeforeLockout" = ?5,
+                "EnableUserPreferenceAccess" = ?6, "InvalidLoginAttemptCount" = ?7,
+                "RemoteClientBitrateLimit" = ?8, "AuthenticationProviderId" = ?9,
+                "PasswordResetProviderId" = ?10, "SyncPlayAccess" = ?11,
+                "RowVersion" = "RowVersion" + 1
+               WHERE "Id" = ?1"#,
+        )
+        .bind(&id)
+        .bind(i64::from(policy.max_active_sessions))
+        .bind(policy.max_parental_rating.map(i64::from))
+        .bind(policy.max_parental_sub_rating.map(i64::from))
+        .bind(max_login_attempts)
+        .bind(policy.enable_user_preference_access)
+        .bind(i64::from(policy.invalid_login_attempt_count))
+        .bind(i64::from(policy.remote_client_bitrate_limit))
+        .bind(&policy.authentication_provider_id)
+        .bind(&policy.password_reset_provider_id)
+        .bind(policy.sync_play_access.json_value())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        for (kind, value) in policy_permissions(policy) {
+            set_permission_tx(&mut tx, &id, kind, value).await?;
+        }
+
+        crate::access_schedule_repository::replace_tx(&mut tx, &id, &policy.access_schedules)
+            .await?;
+
+        // `policy.BlockUnratedItems ?? Array.Empty<UnratedItem>()` and the six
+        // list preferences; each stored as the delimited value list C# writes.
+        let unrated: Vec<String> = policy
+            .block_unrated_items
+            .iter()
+            .map(|u| u.json_name().into_owned())
+            .collect();
+        let guids = |ids: &[Uuid]| ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for (kind, values) in [
+            (PreferenceKind::BlockUnratedItems, unrated),
+            (PreferenceKind::BlockedTags, policy.blocked_tags.clone()),
+            (PreferenceKind::AllowedTags, policy.allowed_tags.clone()),
+            (
+                PreferenceKind::EnabledChannels,
+                guids(&policy.enabled_channels),
+            ),
+            (
+                PreferenceKind::EnabledDevices,
+                policy.enabled_devices.clone(),
+            ),
+            (
+                PreferenceKind::EnabledFolders,
+                guids(&policy.enabled_folders),
+            ),
+            (
+                PreferenceKind::EnableContentDeletionFromFolders,
+                policy.enable_content_deletion_from_folders.clone(),
+            ),
+        ] {
+            set_preference_tx(&mut tx, &id, kind, &values).await?;
+        }
+        // One `SaveChangesAsync`: all or nothing.
+        tx.commit().await.map_err(db_err)?;
+        self.auth_cache.clear();
+        Ok(PolicySaved {
+            newly_disabled: policy.is_disabled && !was_disabled,
+        })
     }
 
     /// The next legacy `InternalId` (C# `max(InternalId) + 1`), from any
@@ -1223,8 +1340,10 @@ impl UserManager for FerrofinUserManager {
             enable_auto_login: Some(user.enable_auto_login),
             last_login_date: user.last_login_date,
             last_activity_date: user.last_activity_date,
-            has_password: Some(user.password.is_some()),
-            has_configured_password: Some(user.password.is_some()),
+            // `HasPassword`/`HasConfiguredPassword` keep their defaults: Jellyfin
+            // 12 stopped reporting whether a user has a password (PR 14950), as
+            // it told anyone, the anonymous `/Users/Public` caller included,
+            // which accounts have none.
             configuration: Some(configuration),
             policy: Some(policy),
             ..UserDto::default()
@@ -1306,90 +1425,15 @@ impl UserManager for FerrofinUserManager {
     }
 
     async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError> {
-        // Port of `UserManager.UpdatePolicyAsync`: the `Users` columns, every
-        // permission flag, the access schedules (replaced wholesale) and the
-        // list-valued preferences the policy carries.
-        let id = guid_to_db(user_id);
-        let login_lock = self.login_lock(&id);
-        let _login_guard = login_lock.lock().await;
-        self.require_user(user_id).await?;
+        self.save_policy(user_id, policy, false).await.map(|_| ())
+    }
 
-        // "The default number of login attempts is 3, but for some god forsaken
-        // reason it's sent to the server as 0": -1 → unlimited (NULL), 0 → 3.
-        let max_login_attempts: Option<i64> = match policy.login_attempts_before_lockout {
-            -1 => None,
-            0 => Some(3),
-            n => Some(i64::from(n)),
-        };
-
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        sqlx::query(
-            r#"UPDATE "Users" SET
-                "MaxActiveSessions" = ?2, "MaxParentalRatingScore" = ?3,
-                "MaxParentalRatingSubScore" = ?4, "LoginAttemptsBeforeLockout" = ?5,
-                "EnableUserPreferenceAccess" = ?6, "InvalidLoginAttemptCount" = ?7,
-                "RemoteClientBitrateLimit" = ?8, "AuthenticationProviderId" = ?9,
-                "PasswordResetProviderId" = ?10, "SyncPlayAccess" = ?11,
-                "RowVersion" = "RowVersion" + 1
-               WHERE "Id" = ?1"#,
-        )
-        .bind(&id)
-        .bind(i64::from(policy.max_active_sessions))
-        .bind(policy.max_parental_rating.map(i64::from))
-        .bind(policy.max_parental_sub_rating.map(i64::from))
-        .bind(max_login_attempts)
-        .bind(policy.enable_user_preference_access)
-        .bind(i64::from(policy.invalid_login_attempt_count))
-        .bind(i64::from(policy.remote_client_bitrate_limit))
-        .bind(&policy.authentication_provider_id)
-        .bind(&policy.password_reset_provider_id)
-        .bind(policy.sync_play_access.json_value())
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-
-        for (kind, value) in policy_permissions(policy) {
-            set_permission_tx(&mut tx, &id, kind, value).await?;
-        }
-
-        crate::access_schedule_repository::replace_tx(&mut tx, &id, &policy.access_schedules)
-            .await?;
-
-        // `policy.BlockUnratedItems ?? Array.Empty<UnratedItem>()` and the six
-        // list preferences; each stored as the delimited value list C# writes.
-        let unrated: Vec<String> = policy
-            .block_unrated_items
-            .iter()
-            .map(|u| u.json_name().into_owned())
-            .collect();
-        let guids = |ids: &[Uuid]| ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-        for (kind, values) in [
-            (PreferenceKind::BlockUnratedItems, unrated),
-            (PreferenceKind::BlockedTags, policy.blocked_tags.clone()),
-            (PreferenceKind::AllowedTags, policy.allowed_tags.clone()),
-            (
-                PreferenceKind::EnabledChannels,
-                guids(&policy.enabled_channels),
-            ),
-            (
-                PreferenceKind::EnabledDevices,
-                policy.enabled_devices.clone(),
-            ),
-            (
-                PreferenceKind::EnabledFolders,
-                guids(&policy.enabled_folders),
-            ),
-            (
-                PreferenceKind::EnableContentDeletionFromFolders,
-                policy.enable_content_deletion_from_folders.clone(),
-            ),
-        ] {
-            set_preference_tx(&mut tx, &id, kind, &values).await?;
-        }
-        // One `SaveChangesAsync`: all or nothing.
-        tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
-        Ok(())
+    async fn update_policy_guarded(
+        &self,
+        user_id: Uuid,
+        policy: &UserPolicy,
+    ) -> Result<PolicySaved, ServiceError> {
+        self.save_policy(user_id, policy, true).await
     }
 
     async fn save_profile_image(
@@ -2241,6 +2285,225 @@ mod tests {
         assert!(!dto_config.hide_played_in_latest);
         assert_eq!(dto_config.latest_items_excludes, vec![excluded]);
         assert_eq!(dto_config.subtitle_mode, SubtitlePlaybackMode::Always);
+    }
+
+    /// Creates `name` with `policy` saved, returning its id.
+    async fn user_with_policy(mgr: &FerrofinUserManager, name: &str, policy: &UserPolicy) -> Uuid {
+        let user = mgr.create_user(name).await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        mgr.update_policy(id, policy).await.expect("policy");
+        id
+    }
+
+    /// How many users the stored policies make administrators.
+    async fn administrators(mgr: &FerrofinUserManager) -> usize {
+        let mut count = 0;
+        for user in mgr.get_users().await.expect("users") {
+            let dto = mgr.get_user_dto(&user, None).await.expect("dto");
+            count += usize::from(dto.policy.is_some_and(|p| p.is_administrator));
+        }
+        count
+    }
+
+    /// gl-186: the two administrators demote each other at once. The guard
+    /// is read inside the writing transaction, so the second save sees the
+    /// first one's demotion and is refused: one administrator remains. Read
+    /// before the transaction, both saves passed and none was left.
+    #[tokio::test]
+    async fn concurrent_demotions_cannot_remove_the_last_administrator() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let admin = UserPolicy {
+            is_administrator: true,
+            ..UserPolicy::default()
+        };
+        let a = user_with_policy(&mgr, "admin-a", &admin).await;
+        let b = user_with_policy(&mgr, "admin-b", &admin).await;
+        assert_eq!(administrators(&mgr).await, 2);
+
+        let demoted = UserPolicy::default();
+        let (first, second) = tokio::join!(
+            mgr.update_policy_guarded(a, &demoted),
+            mgr.update_policy_guarded(b, &demoted)
+        );
+        let refused: Vec<_> = [&first, &second]
+            .into_iter()
+            .filter_map(|r| r.as_ref().err())
+            .collect();
+        assert_eq!(
+            refused.len(),
+            1,
+            "exactly one demotion goes through: {first:?} {second:?}"
+        );
+        assert!(
+            matches!(refused[0], ServiceError::Forbidden(m)
+                if m == "there must be at least one user in the system with administrative access"),
+            "{refused:?}"
+        );
+        assert_eq!(administrators(&mgr).await, 1);
+    }
+
+    /// The guarded save refuses what `UserController.UpdateUserPolicy`
+    /// refuses, saves nothing then, and reports a disable so the caller can
+    /// revoke the user's tokens.
+    #[tokio::test]
+    async fn the_guarded_policy_save_refuses_like_upstream_and_reports_a_disable() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let admin = user_with_policy(
+            &mgr,
+            "only-admin",
+            &UserPolicy {
+                is_administrator: true,
+                ..UserPolicy::default()
+            },
+        )
+        .await;
+        let viewer = user_with_policy(&mgr, "viewer", &UserPolicy::default()).await;
+
+        let refused = mgr
+            .update_policy_guarded(
+                admin,
+                &UserPolicy {
+                    is_administrator: true,
+                    is_disabled: true,
+                    ..UserPolicy::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(ServiceError::Forbidden(m)) if m == "administrators cannot be disabled"),
+            "{refused:?}"
+        );
+        let refused = mgr
+            .update_policy_guarded(admin, &UserPolicy::default())
+            .await;
+        assert!(
+            matches!(refused, Err(ServiceError::Forbidden(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            administrators(&mgr).await,
+            1,
+            "a refused save writes nothing"
+        );
+
+        let disable = UserPolicy {
+            is_disabled: true,
+            ..UserPolicy::default()
+        };
+        let saved = mgr
+            .update_policy_guarded(viewer, &disable)
+            .await
+            .expect("disable");
+        assert!(saved.newly_disabled);
+        let again = mgr
+            .update_policy_guarded(viewer, &disable)
+            .await
+            .expect("save again");
+        assert!(
+            !again.newly_disabled,
+            "an already disabled user is not disabled again"
+        );
+
+        let missing = mgr.update_policy_guarded(Uuid::new_v4(), &disable).await;
+        assert!(
+            matches!(missing, Err(ServiceError::NotFound(_))),
+            "{missing:?}"
+        );
+    }
+
+    /// The last-enabled-user guard counts, inside the save, the users with no
+    /// `IsDisabled` permission set. Upstream never lets an administrator be
+    /// disabled, so reaching one enabled user takes the unguarded save: here
+    /// the only administrator is disabled, which leaves the viewer.
+    #[tokio::test]
+    async fn the_last_enabled_user_cannot_be_disabled_inside_the_save() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        user_with_policy(
+            &mgr,
+            "disabled-admin",
+            &UserPolicy {
+                is_administrator: true,
+                is_disabled: true,
+                ..UserPolicy::default()
+            },
+        )
+        .await;
+        let viewer = user_with_policy(&mgr, "viewer", &UserPolicy::default()).await;
+
+        let refused = mgr
+            .update_policy_guarded(
+                viewer,
+                &UserPolicy {
+                    is_disabled: true,
+                    ..UserPolicy::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(ServiceError::Forbidden(m))
+                if m == "there must be at least one enabled user in the system"),
+            "{refused:?}"
+        );
+        let viewer = mgr
+            .get_user_by_id(viewer)
+            .await
+            .expect("load")
+            .expect("some");
+        let dto = mgr.get_user_dto(&viewer, None).await.expect("dto");
+        assert!(
+            dto.policy.is_some_and(|p| !p.is_disabled),
+            "nothing was saved"
+        );
+
+        // A second enabled user lifts the guard.
+        user_with_policy(&mgr, "second", &UserPolicy::default()).await;
+        let saved = mgr
+            .update_policy_guarded(
+                Uuid::parse_str(&viewer.id).expect("uuid"),
+                &UserPolicy {
+                    is_disabled: true,
+                    ..UserPolicy::default()
+                },
+            )
+            .await
+            .expect("disable with another enabled user left");
+        assert!(saved.newly_disabled);
+    }
+
+    /// Jellyfin 12 no longer reports a user's password state (PR 14950):
+    /// `UserManager.GetUserDto` assigns neither `HasPassword` nor
+    /// `HasConfiguredPassword`, so every user reads their `[Obsolete]` defaults
+    /// (`true`, `true`, and `false` for the easy password). A passwordless user
+    /// is no longer told apart, not even on the anonymous `/Users/Public` list.
+    #[tokio::test]
+    async fn get_user_dto_does_not_reveal_whether_a_user_has_a_password() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let passwordless = mgr.create_user("nopass").await.expect("create");
+        assert!(
+            passwordless.password.is_none(),
+            "a new user has no password"
+        );
+        let with_password = mgr.create_user("haspass").await.expect("create");
+        let id = Uuid::parse_str(&with_password.id).expect("uuid");
+        mgr.change_password(id, "secret").await.expect("password");
+        let with_password = mgr.get_user_by_id(id).await.expect("reload").expect("some");
+        assert!(with_password.password.is_some());
+
+        for user in [&passwordless, &with_password] {
+            let dto = mgr.get_user_dto(user, None).await.expect("dto");
+            assert_eq!(dto.has_password, Some(true), "{}", user.username);
+            assert_eq!(dto.has_configured_password, Some(true), "{}", user.username);
+            assert_eq!(
+                dto.has_configured_easy_password,
+                Some(false),
+                "{}",
+                user.username
+            );
+        }
     }
 
     #[tokio::test]

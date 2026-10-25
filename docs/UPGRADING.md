@@ -28,6 +28,34 @@ Usually nothing to do. Three changes can show on some Live TV sources:
   server's preferred metadata language, as Jellyfin takes them. A channel with no name or no
   id in the guide is no longer listed.
 
+## Unreleased — creating a backup needs a JSON body
+
+A script that calls `POST /Backup/Create` with no body must now send `{}` with
+`Content-Type: application/json` to get the default backup, as Jellyfin requires. Without a
+body the request fails: `415` with no content type, `400` with an empty or `null` body.
+`POST /Backup/Restore` with no content type is a `415` too, instead of a `400`.
+
+`GET /Backup` lists the archives in the order the backups folder holds them, as Jellyfin
+does, not newest first; a script that takes the first entry as the latest backup should
+sort by `DateCreated`. Files ending in `.ZIP` or another case are no longer listed.
+
+A backup also fails now where it used to leave something out. A file it cannot read
+(wrong ownership after a manual copy, for example) fails the create with a `500`, and the
+server log names the file: fix the file's permissions and create the backup again. A
+backups folder the server cannot read fails `GET /Backup` the same way, where the dashboard
+used to show no backups. A create during a library scan answers `500` instead of `503`.
+
+## Unreleased — clients are no longer told which accounts have no password
+
+`HasPassword` and `HasConfiguredPassword` now read `true` for every user, as Jellyfin 12
+reports them. Before, an account without a password read `false`, including on the
+login-screen list that `GET /Users/Public` serves to callers who have not signed in.
+
+A client that used the flag to sign a passwordless user in with one click now asks for a
+password instead. Upstream names jellyfin-web's login screen among those clients. Leave the
+password empty: the account still signs in, because sign-in checks the stored password and
+not the flag.
+
 ## Unreleased — abandoned playback is stopped, and paused sessions can be
 
 Ferrofin now runs Jellyfin's two playback checks:

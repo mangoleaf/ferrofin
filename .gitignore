@@ -56,7 +56,7 @@ gates/adoption/fixtures/
 **/*.smoke2.txt
 **/*.smoke-scan.txt
 
-# Parity replay run output (gates/parity/run.sh): reports and server logs, never committed.
+# Parity replay output from before the output root (gates/lib.sh): reports and server logs, never committed.
 gates/parity/runs/
 
 # The gates lived at the root until they moved under gates/ (gl-912). An older checkout keeps

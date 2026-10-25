@@ -337,6 +337,7 @@ benchmark-report:
     - python3 -m unittest discover -s gates/bench -p test_report.py
     - python3 -m unittest discover -s gates/bench -p test_ramp.py
     - python3 -m unittest discover -s gates/bench -p test_soak.py
+    - python3 -m unittest discover -s gates/bench -p test_viewer.py
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
@@ -384,7 +385,7 @@ shell-tests:
     # Adoption checks invoke Python and use Pillow to validate preserved artwork.
     - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml
   script:
-    - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh
+    - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh gates/lib.sh gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh
     - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats gates/adoption/tests/adoption.bats
     - bats scripts/tests gates/adoption/tests
     - scripts/ci-config-check.sh check

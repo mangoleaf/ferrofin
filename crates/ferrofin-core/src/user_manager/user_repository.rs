@@ -1,8 +1,29 @@
 //! Persistence operations for accounts: authentication and the profile image.
 
 use ferrofin_db::entities::users::ImageInfoEntity;
+use ferrofin_db::enums::PermissionKind;
 use ferrofin_db::store::datetime_to_db;
 use sqlx::{SqliteExecutor, SqlitePool};
+
+/// The count of users who are not disabled, from any executor (C#
+/// `GetUsers().Count(i => !i.HasPermission(PermissionKind.IsDisabled))`, the
+/// policy guard's). A user with no `IsDisabled` row counts as enabled, as
+/// `has_permission` reads a missing row as `false`.
+pub(super) async fn enabled_count<'e, E>(executor: E) -> Result<i64, sqlx::Error>
+where
+    E: SqliteExecutor<'e>,
+{
+    sqlx::query_scalar::<_, i64>(
+        r#"SELECT COUNT(*) FROM "Users" u
+           WHERE NOT EXISTS (
+               SELECT 1 FROM "Permissions" p
+               WHERE p."UserId" = u."Id" AND p."Kind" = ?1 AND p."Value" = 1
+           )"#,
+    )
+    .bind(i32::from(PermissionKind::IsDisabled))
+    .fetch_one(executor)
+    .await
+}
 
 /// Changes only the selected provider, preserving concurrent preference edits.
 pub(super) async fn set_authentication_provider(
