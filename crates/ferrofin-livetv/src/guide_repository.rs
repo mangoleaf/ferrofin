@@ -586,6 +586,23 @@ pub mod test_support {
     use super::{Database, db_err};
     use ferrofin_traits::error::ServiceError;
 
+    /// Overwrites a configuration row's `Data` with JSON that no longer parses;
+    /// `table` is [`super::TUNER_HOSTS_TABLE`] or
+    /// [`super::LISTING_PROVIDERS_TABLE`].
+    pub async fn corrupt_config_data(
+        db: &Database,
+        table: &'static str,
+        id: &str,
+    ) -> Result<(), ServiceError> {
+        let sql = format!(r#"UPDATE "{table}" SET "Data" = '{{' WHERE "Id" = ?1"#);
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Inserts the minimal `BaseItems` row `UserData`'s FK needs for an item id.
     pub async fn seed_base_item_stub(db: &Database, id_db: &str) -> Result<(), ServiceError> {
         sqlx::query(

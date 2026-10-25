@@ -453,6 +453,9 @@ pub struct FerrofinLiveTvManager {
     /// The stored rows already reported as unparseable, by table — see
     /// [`FerrofinLiveTvManager::parse_stored_row`].
     unparseable_rows: Arc<Mutex<HashMap<&'static str, HashSet<String>>>>,
+    /// The Live TV options file last reported as unusable, by path and
+    /// modification time — see [`FerrofinLiveTvManager::live_tv_options`].
+    options_warned: Arc<Mutex<Option<WarnedFile>>>,
     /// The media encoder, for the encoded recorder's ffmpeg. Absent in tests
     /// and on a server with no ffmpeg, where only the direct recorder runs.
     encoder: Option<Arc<dyn MediaEncoder>>,
@@ -1007,6 +1010,7 @@ impl FerrofinLiveTvManager {
             read_retry_counts: Arc::new(Mutex::new(HashMap::new())),
             firing: Arc::new(Mutex::new(HashSet::new())),
             unparseable_rows: Arc::new(Mutex::new(HashMap::new())),
+            options_warned: Arc::new(Mutex::new(None)),
             encoder: None,
             self_writes: None,
             release_date_format: crate::recording_metadata::default_release_date_format(),
@@ -2574,10 +2578,11 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn get_tuner_hosts(&self) -> Result<Vec<TunerHostInfo>, ServiceError> {
-        let rows = sqlx::query(r#"SELECT "Data" FROM "FerrofinLiveTvTunerHosts" ORDER BY "Id""#)
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
+        let rows =
+            sqlx::query(r#"SELECT "Id", "Data" FROM "FerrofinLiveTvTunerHosts" ORDER BY "Id""#)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
         // Every read refreshes the synchronous flag the "Refresh Guide" task's
         // hidden rule polls (the composition root does one read at boot to seed
         // it). It counts ROWS, not parsed DTOs: one undeserializable `Data`
@@ -2585,7 +2590,13 @@ impl LiveTvManager for FerrofinLiveTvManager {
         self.tuner_flag.store(!rows.is_empty(), Ordering::Relaxed);
         Ok(rows
             .iter()
-            .filter_map(|r| serde_json::from_str(r.get::<String, _>("Data").as_str()).ok())
+            .filter_map(|r| {
+                self.parse_stored_row(
+                    crate::guide_repository::TUNER_HOSTS_TABLE,
+                    r.get::<String, _>("Id").as_str(),
+                    r.get::<String, _>("Data").as_str(),
+                )
+            })
             .collect())
     }
 
@@ -2757,14 +2768,21 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn get_listing_providers(&self) -> Result<Vec<ListingsProviderInfo>, ServiceError> {
-        let rows =
-            sqlx::query(r#"SELECT "Data" FROM "FerrofinLiveTvListingProviders" ORDER BY "Id""#)
-                .fetch_all(self.db.pool())
-                .await
-                .map_err(db_err)?;
+        let rows = sqlx::query(
+            r#"SELECT "Id", "Data" FROM "FerrofinLiveTvListingProviders" ORDER BY "Id""#,
+        )
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
         Ok(rows
             .iter()
-            .filter_map(|r| serde_json::from_str(r.get::<String, _>("Data").as_str()).ok())
+            .filter_map(|r| {
+                self.parse_stored_row(
+                    crate::guide_repository::LISTING_PROVIDERS_TABLE,
+                    r.get::<String, _>("Id").as_str(),
+                    r.get::<String, _>("Data").as_str(),
+                )
+            })
             .collect())
     }
 
@@ -4486,15 +4504,67 @@ impl FerrofinLiveTvManager {
     }
 
     /// The dashboard's Live TV options, or the defaults when nothing has been
-    /// saved (which is also what upstream falls back to on a corrupt store).
+    /// saved.
+    ///
+    /// A file that cannot be read or does not parse reads as the defaults too,
+    /// as upstream's `BaseConfigurationManager.LoadConfiguration` falls back
+    /// ("Error loading configuration file"), and is reported: a `warn` the
+    /// first time it is met as it stands, `debug` while it stays so, since
+    /// this runs per request (LOGGING.md). Upstream lets an `IOException`
+    /// through instead; the readers here have no error to answer with, so a
+    /// read error is reported and defaulted the same way. A missing file is
+    /// a server never configured, and quiet.
     async fn live_tv_options(&self) -> LiveTvOptions {
-        if self.paths.options_file.as_os_str().is_empty() {
+        let path = &self.paths.options_file;
+        if path.as_os_str().is_empty() {
             return LiveTvOptions::default();
         }
-        let Ok(body) = tokio::fs::read_to_string(&self.paths.options_file).await else {
-            return LiveTvOptions::default();
+        let error = match tokio::fs::read_to_string(path).await {
+            Ok(body) => match serde_json::from_str(&body) {
+                Ok(options) => {
+                    *self
+                        .options_warned
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                    return options;
+                }
+                Err(error) => error.to_string(),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Gone is not broken: a file put back broken is news again.
+                *self
+                    .options_warned
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                return LiveTvOptions::default();
+            }
+            Err(error) => error.to_string(),
         };
-        serde_json::from_str(&body).unwrap_or_default()
+        let modified = tokio::fs::metadata(path)
+            .await
+            .and_then(|meta| meta.modified())
+            .ok();
+        let seen = (path.clone(), modified);
+        let first = self
+            .options_warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(seen.clone())
+            != Some(seen);
+        if first {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "live tv: the Live TV options file cannot be used; using the defaults until it is fixed"
+            );
+        } else {
+            tracing::debug!(
+                path = %path.display(),
+                %error,
+                "live tv: the Live TV options file cannot be used; using the defaults"
+            );
+        }
+        LiveTvOptions::default()
     }
 
     /// Every stored timer, whatever its status — C# `TimerManager.GetAll()`,
@@ -4584,10 +4654,13 @@ impl FerrofinLiveTvManager {
     ) -> Result<Option<StoredSeriesTimer>, ServiceError> {
         Ok(crate::dvr_repository::series_timer_row(&self.db, id)
             .await?
-            .map(|(dto, external_id, series_id)| StoredSeriesTimer {
-                dto,
-                external_id,
-                series_id,
+            .and_then(|(data, external_id, series_id)| {
+                self.parse_stored_row("FerrofinLiveTvSeriesTimers", id, &data)
+                    .map(|dto| StoredSeriesTimer {
+                        dto,
+                        external_id,
+                        series_id,
+                    })
             }))
     }
 
@@ -4823,12 +4896,16 @@ impl FerrofinLiveTvManager {
         else {
             return Ok(None);
         };
-        crate::dvr_repository::timer_for_program(
+        // The first match that parses: upstream's list never holds a row that
+        // does not, and one that does not must not hide the next.
+        Ok(crate::dvr_repository::timers_for_program(
             &self.db,
             program_id,
             timer.base.external_program_id.as_deref(),
         )
-        .await
+        .await?
+        .into_iter()
+        .find_map(|(id, data)| self.parse_stored_row("FerrofinLiveTvTimers", &id, &data)))
     }
 
     /// One guide programme by id, or `None` when it is not in the guide.
@@ -6158,6 +6235,10 @@ const DELETE_TIMER_SQL: &str = r#"DELETE FROM "FerrofinLiveTvTimers" WHERE "Id" 
 
 /// Reads one timer's stored `Data` by id.
 const SELECT_TIMER_SQL: &str = r#"SELECT "Data" FROM "FerrofinLiveTvTimers" WHERE "Id" = ?1"#;
+
+/// A file a warning was logged for: its path and its modification time
+/// (`None` when it has none to read).
+type WarnedFile = (PathBuf, Option<std::time::SystemTime>);
 
 /// One stored series timer: the DTO clients see, plus the two server-owned
 /// identity values the wire DTO has no field for.
@@ -13337,6 +13418,225 @@ mod tests {
             assert!(mgr.all_timers().await.expect("list").is_empty());
             drop(guard);
             assert_eq!(logs.lines_at("WARN", &id).len(), 2, "broken again is news");
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// A `livetv.json` that cannot be read or does not parse reads as the
+    /// defaults, as upstream's `LoadConfiguration` falls back, but not
+    /// silently: a `warn` naming the file once per change of it, then `debug`.
+    /// A missing file is the quiet default of a server never configured.
+    #[tokio::test]
+    async fn a_broken_live_tv_options_file_warns_once_per_change() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("livetv.json");
+        let paths = |options_file: std::path::PathBuf| LiveTvPaths {
+            transcode_dir: dir.path().join("transcodes").into(),
+            data_dir: dir.path().join("data"),
+            options_file,
+        };
+        let mgr = manager_with(FakeFetcher(HashMap::new()))
+            .await
+            .with_paths(paths(file.clone()));
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+
+        assert!(mgr.live_tv_options().await.guide_days.is_none());
+        assert!(
+            logs.lines_at("WARN", "livetv.json").is_empty(),
+            "missing is quiet"
+        );
+
+        std::fs::write(&file, "{").expect("write");
+        assert!(mgr.live_tv_options().await.guide_days.is_none());
+        assert!(mgr.live_tv_options().await.guide_days.is_none());
+        assert_eq!(logs.lines_at("WARN", "livetv.json").len(), 1);
+        assert_eq!(logs.lines_at("DEBUG", "livetv.json").len(), 1);
+
+        // Changed and still broken: news again.
+        std::fs::write(&file, "{ ").expect("rewrite");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .expect("mtime");
+        let _ = mgr.live_tv_options().await;
+        assert_eq!(logs.lines_at("WARN", "livetv.json").len(), 2);
+
+        // Fixed, then broken again with the very same modification time: the
+        // fix reset the latch, so it is news. So is a file deleted and put
+        // back broken as it was.
+        let mtime = std::fs::metadata(&file)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        let break_as_it_was = |body: &str| {
+            std::fs::write(&file, body).expect("write");
+            std::fs::File::options()
+                .write(true)
+                .open(&file)
+                .expect("open")
+                .set_modified(mtime)
+                .expect("mtime");
+        };
+        let fixed = ferrofin_model::live_tv::LiveTvOptions {
+            guide_days: Some(3),
+            ..ferrofin_model::live_tv::LiveTvOptions::default()
+        };
+        break_as_it_was(&serde_json::to_string(&fixed).expect("serialize"));
+        assert_eq!(mgr.live_tv_options().await.guide_days, Some(3), "fixed");
+        break_as_it_was("{ ");
+        let _ = mgr.live_tv_options().await;
+        assert_eq!(logs.lines_at("WARN", "livetv.json").len(), 3, "after a fix");
+        std::fs::remove_file(&file).expect("remove");
+        let _ = mgr.live_tv_options().await;
+        break_as_it_was("{ ");
+        let _ = mgr.live_tv_options().await;
+        assert_eq!(
+            logs.lines_at("WARN", "livetv.json").len(),
+            4,
+            "after a removal"
+        );
+
+        // A read error other than a missing file is not quiet either.
+        let unreadable = dir.path().join("dir").join("livetv.json");
+        std::fs::create_dir_all(&unreadable).expect("a directory in its place");
+        let mgr = mgr.with_paths(paths(unreadable));
+        assert!(mgr.live_tv_options().await.guide_days.is_none());
+        drop(guard);
+        assert_eq!(logs.lines_at("WARN", "dir/livetv.json").len(), 1);
+    }
+
+    /// The tuner-host, listing-provider, series-timer and timer-by-programme
+    /// readers skip a row that does not parse the same way: a `warn` naming
+    /// its table and id the first time, `debug` while it stays broken
+    /// (`ItemDataProvider.EnsureLoaded` logs "Error deserializing").
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // four stores seeded, broken and read
+    async fn every_stored_row_reader_reports_a_row_that_does_not_parse() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut sources = HashMap::new();
+            sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+            sources.insert("http://guide/xmltv.xml".to_owned(), dated(XMLTV));
+            let mgr = manager_with(FakeFetcher(sources)).await;
+            let tuner = mgr
+                .save_tuner_host(TunerHostInfo {
+                    type_: Some("m3u".to_owned()),
+                    url: Some("http://tuner/playlist.m3u".to_owned()),
+                    ..TunerHostInfo::default()
+                })
+                .await
+                .expect("tuner")
+                .id
+                .expect("tuner id");
+            let provider = mgr
+                .save_listing_provider(
+                    as_xmltv(ListingsProviderInfo {
+                        path: Some("http://guide/xmltv.xml".to_owned()),
+                        ..ListingsProviderInfo::default()
+                    }),
+                    false,
+                    false,
+                )
+                .await
+                .expect("provider")
+                .id
+                .expect("provider id");
+            let series = Uuid::new_v4().simple().to_string();
+            crate::dvr_repository::upsert_series_timer(
+                &mgr.db,
+                &SeriesTimerInfoDto {
+                    base: BaseTimerInfoDto {
+                        id: Some(series.clone()),
+                        channel_id: Uuid::new_v4(),
+                        ..BaseTimerInfoDto::default()
+                    },
+                    ..SeriesTimerInfoDto::default()
+                },
+                "external",
+                None,
+            )
+            .await
+            .expect("series timer");
+            let (timer_id, mut timer) = stored_fire_test_timer(&mgr).await;
+            timer.base.program_id = Some("programme-1".to_owned());
+            mgr.persist_timer(&timer).await.expect("timer");
+            // A second programme's timers: a broken one stored first, then a
+            // good one, which the broken one must not hide.
+            let (hidden_id, mut hidden) = stored_fire_test_timer(&mgr).await;
+            hidden.base.program_id = Some("programme-2".to_owned());
+            mgr.persist_timer(&hidden).await.expect("broken timer");
+            let (good_id, mut good) = stored_fire_test_timer(&mgr).await;
+            good.base.program_id = Some("programme-2".to_owned());
+            mgr.persist_timer(&good).await.expect("good timer");
+            crate::dvr_repository::test_support::corrupt_timer_data(&mgr.db, &hidden_id)
+                .await
+                .expect("corrupt the first");
+            let found = mgr
+                .timer_for_program(&good)
+                .await
+                .expect("read")
+                .expect("the good timer");
+            assert_eq!(found.base.id.as_deref(), Some(good_id.as_str()));
+
+            let config = crate::guide_repository::test_support::corrupt_config_data;
+            config(&mgr.db, crate::guide_repository::TUNER_HOSTS_TABLE, &tuner)
+                .await
+                .expect("corrupt tuner");
+            config(
+                &mgr.db,
+                crate::guide_repository::LISTING_PROVIDERS_TABLE,
+                &provider,
+            )
+            .await
+            .expect("corrupt provider");
+            crate::dvr_repository::test_support::corrupt_series_timer_data(&mgr.db, &series)
+                .await
+                .expect("corrupt series timer");
+            crate::dvr_repository::test_support::corrupt_timer_data(&mgr.db, &timer_id)
+                .await
+                .expect("corrupt timer");
+
+            let logs = CapturedLogs::default();
+            let guard = logs.install();
+            for _ in 0..2 {
+                assert!(mgr.get_tuner_hosts().await.expect("tuners").is_empty());
+                assert!(
+                    mgr.get_listing_providers()
+                        .await
+                        .expect("providers")
+                        .is_empty()
+                );
+                assert!(
+                    mgr.stored_series_timer(&series)
+                        .await
+                        .expect("series")
+                        .is_none()
+                );
+                assert!(
+                    mgr.timer_for_program(&timer)
+                        .await
+                        .expect("timer")
+                        .is_none()
+                );
+            }
+            drop(guard);
+            for (table, id) in [
+                ("FerrofinLiveTvTunerHosts", &tuner),
+                ("FerrofinLiveTvListingProviders", &provider),
+                ("FerrofinLiveTvSeriesTimers", &series),
+                ("FerrofinLiveTvTimers", &timer_id),
+            ] {
+                let warns = logs.lines_at("WARN", id);
+                assert_eq!(warns.len(), 1, "{table}: {warns:?}");
+                assert!(warns[0].contains(table), "{warns:?}");
+                assert_eq!(
+                    logs.lines_at("DEBUG", id).len(),
+                    1,
+                    "{table} repeats at debug"
+                );
+            }
         })
         .await
         .expect("test timed out");

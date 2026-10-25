@@ -481,6 +481,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   be enabled, disabled and uninstalled from the dashboard; those buttons answered `400`
 
 ### Bug Fixes
+- A Live TV tuner, guide provider, series timer or timer whose stored settings no longer
+  parse is logged (a warning naming its table and id, once) instead of vanishing silently,
+  and a `livetv.json` that cannot be read or parsed logs a warning naming it once per change
+  before the defaults are used; a timer for a programme is found past a broken one
 - A backup no longer reports success with something left out:
   - a file it cannot read, or whose name is not UTF-8, fails the create with a `500`,
     and the server log names the file;
