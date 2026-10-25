@@ -3037,9 +3037,11 @@ async fn library_enabled(path: Option<&str>) -> bool {
     let Some(path) = path else {
         return true;
     };
-    crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(std::path::Path::new(
-        path,
-    ))
+    // Only `Enabled` is read, so the media paths need no expanding.
+    crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(
+        std::path::Path::new(path),
+        &crate::virtual_paths::VirtualPathExpander::identity(),
+    )
     .await
     .enabled
 }

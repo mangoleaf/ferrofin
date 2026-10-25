@@ -448,11 +448,25 @@ pub fn owning_library<'a>(
         return Some(folder);
     }
     let path = path?;
+    // Between libraries holding the path through equally deep locations (one
+    // folder two libraries share), the first by `SortName` wins, as upstream's
+    // `GetCollectionFolders(item).Find(…)` takes the first of the user root's
+    // children, read in `SortName` order; never the listing's order, which is
+    // the file system's.
     folders
         .iter()
         .filter_map(|f| f.location_holding(path).map(|location| (location.len(), f)))
-        .max_by_key(|(len, _)| *len)
+        .max_by(|(a_len, a), (b_len, b)| {
+            a_len
+                .cmp(b_len)
+                .then_with(|| sort_name_of(b).cmp(&sort_name_of(a)))
+        })
         .map(|(_, f)| f)
+}
+
+/// A library's `SortName`, the key upstream orders the user root's children by.
+fn sort_name_of(folder: &VirtualFolderInfo) -> String {
+    ferrofin_util::sort_name::create_sort_name(folder.name.as_deref().unwrap_or_default())
 }
 
 /// Since `BaseItem` and `DTOBaseItem` both have provider ids, this trait helps
@@ -1537,6 +1551,25 @@ mod tests {
             super::libraries_holding(&all, "/media/movies/Kids/Up").len(),
             2
         );
+    }
+
+    /// A folder two libraries share is owned by the first of them by
+    /// `SortName` (case-insensitive: `alpha` before `Zeta`, which an ordinal
+    /// compare would reverse), in whichever order the libraries are listed.
+    #[test]
+    fn a_shared_location_is_owned_by_the_first_library_by_name() {
+        let library = |name: &str| super::VirtualFolderInfo {
+            name: Some(name.to_owned()),
+            locations: vec!["/media/shared".to_owned()],
+            ..super::VirtualFolderInfo::default()
+        };
+        for all in [
+            [library("alpha"), library("Zeta")],
+            [library("Zeta"), library("alpha")],
+        ] {
+            let owner = super::owning_library(&all, None, Some("/media/shared/film.mkv"));
+            assert_eq!(owner.and_then(|f| f.name.as_deref()), Some("alpha"));
+        }
     }
     use super::*;
 
