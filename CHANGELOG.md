@@ -299,6 +299,21 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   the named studios replace `studioIds`, and since an artist carries no studios the list is
   empty, as in Jellyfin. The parameter was dropped and every artist listed. Unlike Jellyfin,
   an unknown name does not create a studio
+- `GET /Library/VirtualFolders` and the libraries of `GET /System/Info/Storage` come in the
+  order the file system lists the libraries folder, as in Jellyfin, instead of sorted by
+  name, and each library's `Locations` are sorted in the request's language, so
+  `/media/kids` comes before `/media/Movies`. A library folder that is a symbolic link to a
+  directory is listed (and scanned) as in Jellyfin; it was skipped. A media path an adopted
+  Jellyfin library stores as `%AppDataPath%/…` or `%MetadataPath%/…` is served and compared as
+  the real path in `LibraryOptions.PathInfos`, so removing that path from the dashboard
+  removes it from the library's options too. A library shortcut (`.mblink`) written with a
+  byte-order mark or in UTF-16 resolves as Jellyfin reads it, and one that cannot be read is
+  logged with its path instead of vanishing silently
+- A media folder two libraries share takes its library options (metadata language and
+  country, saving artwork beside media and the rest) from the first of them by sort name, as
+  in Jellyfin; it took them from the last. The metadata language and country of an item in
+  nested libraries now come from the innermost one, and `GET /Items/{itemId}/Ancestors`
+  names the first library by sort name when two list the same folder
 
 ### Performance
 - `/Persons` with a favourite filter: build the user's favourite-person set once per
@@ -498,6 +513,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   to a share when its owner is deleted announces it as changed and moves its `Etag`, as in
   Jellyfin. Before, a new playlist was announced as changed, so another open jellyfin-web
   session showed it only after a reload, and the other edits were not announced at all
+- Listing the libraries no longer fails when it cannot write a library's database row (a busy,
+  full or read-only database): the failure is logged as a warning and every library is still
+  listed, where `GET /Library/VirtualFolders`, the home screen's views and the scheduled tasks
+  that look libraries up all failed until a later listing succeeded
 
 ## [1.0.0] - 2026-09-05
 
