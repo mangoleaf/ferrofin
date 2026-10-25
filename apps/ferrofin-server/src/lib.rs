@@ -24,6 +24,7 @@ pub mod config;
 mod encoding_options;
 mod existing_database;
 pub mod listen;
+mod log_lines;
 pub mod media_encoding;
 pub mod metrics_wiring;
 pub mod planner;
