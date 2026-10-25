@@ -1675,6 +1675,10 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
      Un-defer path: make `ItemWithCounts.counts` an `Option` in ferrofin-traits.",
     "`minCommunityRating`, `person`, `personIds`, `personTypes` are accepted and ignored, \
      exactly as v12 — GetItemValues copies none of them onto either filter.",
+    "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
+     chosen on, and matches CleanName with, the raw lower-cased term rather than the \
+     cleaned one, a whitespace-only term filters nothing (upstream's IsNullOrEmpty applies \
+     it), and there is no OriginalTitle arm. Fix path: gl-957.",
 ];
 
 /// What `/Genres`, `/MusicGenres` and `/Studios` do differently from their v12
@@ -1691,6 +1695,10 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
     "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
      AncestorIds in every case, so a non-folder parent answers with nothing.",
     UNKNOWN_PARENT_ID_DIVERGENCE,
+    "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
+     chosen on, and matches CleanName with, the raw lower-cased term rather than the \
+     cleaned one, a whitespace-only term filters nothing (upstream's IsNullOrEmpty applies \
+     it), and there is no OriginalTitle arm. Fix path: gl-957.",
 ];
 
 /// Included in the divergence lists of the five by-name VERIFIED rows; the
