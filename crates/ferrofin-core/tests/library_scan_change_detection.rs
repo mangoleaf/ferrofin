@@ -170,7 +170,14 @@ impl MediaEncoder for RecordingProbe {
         _threed_format: Option<Video3DFormat>,
         _offset_ticks: Option<i64>,
     ) -> Result<String, ServiceError> {
-        unreachable!("no frame extraction in a scan")
+        // A first scan grabs a frame for a video with no artwork (the
+        // Screen Grabber); a real ffmpeg delivers one.
+        let frame = std::env::temp_dir().join(format!(
+            "ferrofin-test-frame-{}.jpg",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&frame, b"FRAME").map_err(ServiceError::backend_source)?;
+        Ok(frame.to_string_lossy().into_owned())
     }
     fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
         input_file.to_owned()
@@ -1060,6 +1067,15 @@ async fn a_new_replaced_or_deleted_poster_is_validated_on_an_unchanged_item() {
     std::fs::create_dir_all(file.parent().expect("dir")).expect("mkdir");
     std::fs::write(&file, b"0123").expect("write");
     let (db, scanner) = library(tmp.path(), &media, CollectionTypeOptions::movies, None).await;
+    // No frame grab for the Primary the poster comes and goes in: this is
+    // the local validation alone.
+    let scanner = scanner.with_metadata_options(|| {
+        vec![ferrofin_model::configuration::MetadataOptions {
+            item_type: Some("Movie".to_owned()),
+            disabled_image_fetchers: vec!["Screen Grabber".to_owned()],
+            ..Default::default()
+        }]
+    });
     let images = || async {
         sqlx::query_as::<_, (String, Option<String>)>(
             r#"SELECT "Path", "DateModified" FROM "BaseItemImageInfos" WHERE "ItemId" = ?1"#,
@@ -1317,7 +1333,12 @@ async fn a_locked_item_asks_no_provider_but_discovers_a_new_local_poster() {
         .await
         .expect("images")
     };
-    assert!(images().await.is_empty());
+    // The first scan grabbed a frame for the Primary (the Screen Grabber).
+    let grabbed = images().await;
+    assert!(
+        grabbed.len() == 1 && grabbed[0].ends_with("primary.jpg"),
+        "{grabbed:?}"
+    );
 
     std::fs::write(fx.heat.with_file_name("poster.jpg"), b"\xFF\xD8\xFFposter").expect("poster");
     touch(&fx.heat, 3_600);

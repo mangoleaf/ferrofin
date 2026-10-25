@@ -248,6 +248,7 @@ pub fn default_image_order(kind: &str, name: &str) -> usize {
         (fetcher_names::TMDB | fetcher_names::FANART | fetcher_names::AUDIODB, _) => 1,
         (fetcher_names::OMDB, _) => 90,
         (fetcher_names::EMBEDDED_IMAGES, _) => 99,
+        (fetcher_names::SCREEN_GRABBER, _) => 100,
         _ => 50,
     }
 }
@@ -355,10 +356,9 @@ pub mod fetcher_names {
     /// provider with its own name
     /// (`MediaBrowser.Providers/MediaInfo/AudioImageProvider.cs:51`).
     pub const AUDIO_IMAGES: &str = "Image Extractor";
-    /// Upstream's `VideoImageProvider` (frame grabs), which Ferrofin does
-    /// not register. Its name is on the new-library image allowlist
-    /// (`IsImageFetcherEnabledByDefault`), so it is reserved: a plugin
-    /// calling itself that would start ticked in a new library.
+    /// A frame grabbed from a VIDEO file as its Primary image
+    /// (`MediaBrowser.Providers/MediaInfo/VideoImageProvider.cs:44`). Its name
+    /// is on the new-library image allowlist (`IsImageFetcherEnabledByDefault`).
     pub const SCREEN_GRABBER: &str = "Screen Grabber";
 
     /// Comic archive comments and ComicInfo XML local reader.
@@ -560,10 +560,9 @@ fn default_enabled_for(
             // The allowlist's "Image Extractor" is upstream's AudioImageProvider
             // (`AUDIO_IMAGES`), NOT the video-side "Embedded Image Extractor",
             // which is deliberately absent — a new library does not pre-tick
-            // frame/cover extraction for video. "Screen Grabber" is upstream's
-            // `VideoImageProvider`, which Ferrofin does not register yet; the
-            // name is kept so the arm stays a faithful transliteration (and is
-            // reserved against plugins, `fetcher_names::ALL`).
+            // embedded cover extraction for video. "Screen Grabber" is
+            // upstream's `VideoImageProvider`, the frame grab, which the
+            // allowlist does tick.
             eq(fetcher_names::TVDB)
                 || eq(fetcher_names::SCREEN_GRABBER)
                 || eq(fetcher_names::AUDIODB)
@@ -733,6 +732,15 @@ fn extractor_and_local_providers() -> Vec<Provider> {
             images: Some(embedded_images),
         },
         Provider {
+            name: fetcher_names::SCREEN_GRABBER,
+            caps: &[Cap::ImageFetcher],
+            // `VideoImageProvider.Supports` is `item is Video` too.
+            types: &["Movie", "Episode", "MusicVideo", "Video"],
+            default_enabled: true,
+            compiled: true,
+            images: Some(screen_grabber_images),
+        },
+        Provider {
             name: fetcher_names::AUDIO_IMAGES,
             caps: &[Cap::ImageFetcher],
             types: &["Audio", "AudioBook"],
@@ -874,6 +882,11 @@ fn book_cover_images(_type_name: &str) -> &'static [ImageType] {
     &[ImageType::Primary]
 }
 
+/// `VideoImageProvider.GetSupportedImages` (`VideoImageProvider.cs:51-54`).
+fn screen_grabber_images(_type_name: &str) -> &'static [ImageType] {
+    &[ImageType::Primary]
+}
+
 /// `AudioImageProvider.GetSupportedImages` (v10.11.8
 /// `MediaBrowser.Providers/MediaInfo/AudioImageProvider.cs:54-57`).
 fn audio_extractor_images(_type_name: &str) -> &'static [ImageType] {
@@ -988,7 +1001,8 @@ fn supported_image_types(provs: &[Provider], type_name: &str) -> Vec<ImageType> 
 /// new library's fetchers in this order and saves it as the library's
 /// `MetadataFetcherOrder` (`libraryoptionseditor.js` `getOrderedPlugins`,
 /// `setMetadataFetchersIntoOptions`), so the order a new library is shown is
-/// the order its scans run.
+/// the order its scans run. Its `ImageFetchers` are ordered the same way
+/// ([`ordered_image_fetchers`]).
 #[must_use]
 pub fn library_options_info(
     item_types: &[String],
@@ -1068,26 +1082,21 @@ pub fn library_options_info(
             });
             let metadata_fetchers: Vec<LibraryOptionInfoDto> =
                 keyed.into_iter().map(|(_, info)| info).collect();
-            let mut image_fetchers = per_type(Cap::ImageFetcher);
-            image_fetchers.extend(
+            let image_fetchers = ordered_image_fetchers(
                 dynamic_fetchers
                     .iter()
                     .filter(|(_, kinds)| kinds.iter().any(|k| k == type_name))
-                    .map(|(name, _)| dynamic_info(name, Cap::ImageFetcher, type_name)),
+                    .map(|(name, _)| dynamic_info(name, Cap::ImageFetcher, type_name))
+                    .collect(),
+                per_type(Cap::ImageFetcher),
+                global_metadata_options(global, type_name)
+                    .map_or(&[][..], |g| g.image_fetcher_order.as_slice()),
+                type_name,
             );
-            // C# `LibraryController`: local similarity providers are ticked by
-            // default, remote ones are not. The remote ones come first:
-            // `GetSimilarItemsProviders<T>()` keeps the export order, which
-            // reaches `MediaBrowser.Providers` (TMDb, ListenBrainz) before
-            // `Emby.Server.Implementations` (the local providers).
-            let mut similar_item_providers: Vec<LibraryOptionInfoDto> = per_type(Cap::Similarity)
-                .into_iter()
-                .map(|mut info| {
-                    info.default_enabled = false;
-                    info
-                })
-                .collect();
-            similar_item_providers.extend(per_type(Cap::LocalSimilarity));
+            let similar_item_providers = ordered_similar_item_providers(
+                per_type(Cap::Similarity),
+                per_type(Cap::LocalSimilarity),
+            );
             LibraryTypeOptionsDto {
                 type_: Some(type_name.clone()),
                 metadata_fetchers,
@@ -1110,6 +1119,50 @@ pub fn library_options_info(
         media_segment_providers: flat(Cap::MediaSegment),
         type_options,
     }
+}
+
+/// A type's similarity providers as `GetLibraryOptionsInfo` lists them: the
+/// `remote` ones unticked, the `local` ones ticked (`DefaultEnabled =
+/// i.Type == LocalSimilarityProvider`), and the remote ones first, because
+/// `GetSimilarItemsProviders<T>()` keeps the export order, which reaches
+/// `MediaBrowser.Providers` (TMDb, ListenBrainz) before
+/// `Emby.Server.Implementations` (the local providers).
+fn ordered_similar_item_providers(
+    remote: Vec<LibraryOptionInfoDto>,
+    local: Vec<LibraryOptionInfoDto>,
+) -> Vec<LibraryOptionInfoDto> {
+    remote
+        .into_iter()
+        .map(|mut info| {
+            info.default_enabled = false;
+            info
+        })
+        .chain(local)
+        .collect()
+}
+
+/// A type's image fetchers in the order `GetPluginSummary` lists them
+/// (`GetImageProvidersInternal` over `new LibraryOptions()`,
+/// `ProviderManager.cs:403-411`): the server-wide `ImageFetcherOrder` for the
+/// type (`order`), then each provider's `IHasOrder`
+/// ([`default_image_order`]; a plugin without one is 50), then registration,
+/// the `plugins` before the `built_ins`, as Jellyfin loads plugin assemblies
+/// first. A stable sort, so each group keeps its own order on a full tie.
+fn ordered_image_fetchers(
+    plugins: Vec<LibraryOptionInfoDto>,
+    built_ins: Vec<LibraryOptionInfoDto>,
+    order: &[String],
+    type_name: &str,
+) -> Vec<LibraryOptionInfoDto> {
+    let mut fetchers: Vec<LibraryOptionInfoDto> = plugins.into_iter().chain(built_ins).collect();
+    fetchers.sort_by_key(|info| {
+        let name = info.name.as_deref().unwrap_or_default();
+        (
+            configured_order(order, name),
+            default_image_order(type_name, name),
+        )
+    });
+    fetchers
 }
 
 /// The per-item-type metadata-plugin summaries. A type is included only when at
@@ -1158,6 +1211,7 @@ mod tests {
     #[case("MusicArtist", "TheAudioDB", 1)]
     #[case("Audio", "Image Extractor", 50)]
     #[case("Movie", "Embedded Image Extractor", 99)]
+    #[case("Episode", "Screen Grabber", 100)]
     #[case("Movie", "ArtworkPlugin", 50)]
     #[test]
     fn image_order_is_the_upstream_provider_class_order(
@@ -2110,6 +2164,76 @@ mod tests {
                 .any(|p| p["Name"] == "TheMovieDb" && p["DefaultEnabled"] == false)
         );
         assert!(!choices.iter().any(|p| p["Name"] == "ListenBrainz"));
+    }
+
+    /// `GetPluginSummary` lists a type's image fetchers by the server-wide
+    /// `ImageFetcherOrder`, then `IHasOrder` (`ProviderManager.cs:403-411`):
+    /// "Screen Grabber" (`Order => 100`) last, after a plugin (50), which ties
+    /// with TheTVDB and wins by loading first. A new library ticks the frame
+    /// grab and not the embedded extractor (`IsImageFetcherEnabledByDefault`).
+    #[rstest::rstest]
+    #[case(
+        "Movie",
+        &["TheMovieDb", "FanArt", "ArtworkPlugin", "The Open Movie Database",
+          "Embedded Image Extractor", "Screen Grabber"]
+    )]
+    #[case(
+        "Episode",
+        &["TheMovieDb", "ArtworkPlugin", "TheTVDB", "The Open Movie Database",
+          "Embedded Image Extractor", "Screen Grabber"]
+    )]
+    #[case("Series", &["FanArt", "TheMovieDb", "ArtworkPlugin", "TheTVDB"])]
+    #[case(
+        "MusicVideo",
+        &["ArtworkPlugin", "Embedded Image Extractor", "Screen Grabber"]
+    )]
+    #[case("Video", &["ArtworkPlugin", "Embedded Image Extractor", "Screen Grabber"])]
+    fn image_fetchers_come_in_the_provider_order(#[case] kind: &str, #[case] expected: &[&str]) {
+        let plugins = [("ArtworkPlugin".to_owned(), vec![kind.to_owned()])];
+        let dto = library_options_info(&[kind.to_owned()], true, &plugins, &[]);
+        let fetchers = &dto.type_options[0].image_fetchers;
+        let names: Vec<&str> = fetchers
+            .iter()
+            .map(|f| f.name.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(names, expected, "{kind}");
+        let ticked = |name: &str| {
+            fetchers
+                .iter()
+                .find(|f| f.name.as_deref() == Some(name))
+                .map(|f| f.default_enabled)
+        };
+        if expected.contains(&"Screen Grabber") {
+            assert_eq!(ticked("Screen Grabber"), Some(true), "{kind}");
+            assert_eq!(ticked("Embedded Image Extractor"), Some(false), "{kind}");
+        }
+    }
+
+    /// The server-wide `ImageFetcherOrder` for the type comes before every
+    /// provider's own order, as `GetConfiguredOrder` does.
+    #[test]
+    fn the_server_image_fetcher_order_comes_first() {
+        let global = [ferrofin_model::configuration::MetadataOptions {
+            item_type: Some("Movie".to_owned()),
+            image_fetcher_order: vec!["Screen Grabber".to_owned(), "FanArt".to_owned()],
+            ..Default::default()
+        }];
+        let dto = library_options_info(&["Movie".to_owned()], false, &[], &global);
+        let names: Vec<&str> = dto.type_options[0]
+            .image_fetchers
+            .iter()
+            .map(|f| f.name.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "Screen Grabber",
+                "FanArt",
+                "TheMovieDb",
+                "The Open Movie Database",
+                "Embedded Image Extractor"
+            ]
+        );
     }
 
     /// `GetLibraryOptionsInfo` keeps the plugin summary's order, and the

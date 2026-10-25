@@ -278,8 +278,8 @@ A new library shows its downloaders in exactly this order and saves it, **with e
 plugin unticked**, as Jellyfin starts a plugin's provider: in a new library only
 TheMovieDb (not for seasons, episodes or music videos), TheTVDB, MusicBrainz and
 TheAudioDB are ticked for metadata, and only TheMovieDb (not for series, seasons, episodes
-or music videos), TheTVDB, TheAudioDB and the audio "Image Extractor" for images
-(`LibraryController.IsMetadataFetcherEnabledByDefault` /
+or music videos), TheTVDB, TheAudioDB, the audio "Image Extractor" and the video "Screen
+Grabber" for images (`LibraryController.IsMetadataFetcherEnabledByDefault` /
 `IsImageFetcherEnabledByDefault`). A plugin runs in such a library once the admin ticks it.
 
 **Check where your plugins sit in existing libraries.** jellyfin-web shows a downloader
@@ -310,10 +310,9 @@ unchecked never runs for its items. A plugin without `provider-info` appears in 
 it is asked about every item, ranked like a provider the admin left out of the order.
 A declared provider name that collides with a built-in fetcher or another loaded
 plugin (case-insensitively) is refused at load — it would ride that fetcher's
-checkbox/order and be impossible to toggle apart. So is "Screen Grabber", a name
-Jellyfin's new-library image allowlist ticks though Ferrofin registers no such
-provider: a plugin by that name would start ticked where every other plugin starts
-unticked.
+checkbox/order and be impossible to toggle apart. "Screen Grabber", the built-in frame
+grab, is one of those names; it is also on Jellyfin's new-library image allowlist, so a
+plugin by that name would start ticked where every other plugin starts unticked.
 
 The rank changes what a plugin's answer can do to the data, not what the plugin can do:
 the sandbox is the same (no filesystem, network only through `http-fetch` and the
