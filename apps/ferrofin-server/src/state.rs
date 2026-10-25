@@ -1569,7 +1569,9 @@ pub async fn build_app_state(
         .with_visibility(Arc::clone(&item_visibility))
         // …and its metadata and artwork, through a queued refresh.
         .with_providers(Arc::clone(&providers))
-        .with_self_writes(Arc::clone(&self_writes_guard)),
+        .with_self_writes(Arc::clone(&self_writes_guard))
+        // …and names a new Collections library in the server's language.
+        .with_localization(Arc::clone(&localization)),
     );
     library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);

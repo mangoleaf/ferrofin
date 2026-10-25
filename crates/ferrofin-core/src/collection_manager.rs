@@ -318,16 +318,19 @@ const COLLECTIONS_FOLDER_DATA: &str = r#"{"CollectionType":"boxsets"}"#;
 
 /// The "Collections" library a created box set belongs to, adopting any
 /// orphans a previous version left behind.
+///
+/// `name` is the name a new library takes; an existing one keeps its own.
 async fn collections_folder(
     db: &Database,
     paths: &Arc<dyn ServerApplicationPaths>,
+    name: &str,
 ) -> Result<Option<Uuid>, ServiceError> {
     let path = format!("{}/collections", paths.data_path());
     let (mode, root) = container_identity(db, paths).await?;
     let container = crate::item_persistence_service::ensure_container(
         db,
         BaseItemKind::CollectionFolder,
-        "Collections",
+        name,
         &path,
         &mode,
         root,
@@ -544,6 +547,9 @@ pub struct FerrofinCollectionManager {
     /// Brackets the folder a new box set is made in, as `CollectionManager.CreateCollectionAsync` does
     /// (`ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
     self_writes: Option<Arc<dyn SelfWriteGuard>>,
+    /// Names a new Collections library in the server UI culture
+    /// ([`Self::collections_name`]). `None` in unit tests: "Collections".
+    localization: Option<Arc<dyn ferrofin_traits::localization::LocalizationManager>>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -570,7 +576,30 @@ impl FerrofinCollectionManager {
             visibility: None,
             providers: None,
             self_writes: None,
+            localization: None,
         }
+    }
+
+    /// Names a new Collections library in the server UI culture. Called once
+    /// by the composition root.
+    #[must_use]
+    pub fn with_localization(
+        mut self,
+        localization: Arc<dyn ferrofin_traits::localization::LocalizationManager>,
+    ) -> Self {
+        self.localization = Some(localization);
+        self
+    }
+
+    /// The name a new Collections library takes:
+    /// `GetServerLocalizedString("Collections")` (v12.2
+    /// `CollectionManager.EnsureLibraryFolder`), whatever the requesting
+    /// client's language. Upstream never renames the library afterwards.
+    fn collections_name(&self) -> String {
+        self.localization.as_ref().map_or_else(
+            || "Collections".to_owned(),
+            |localization| localization.get_server_localized_string("Collections"),
+        )
     }
 
     /// Brackets each new box set's folder on `guard`, so the library monitor
@@ -634,7 +663,7 @@ impl CollectionManager for FerrofinCollectionManager {
         &self,
         options: &CollectionCreationOptions,
     ) -> Result<BaseItemEntity, ServiceError> {
-        let parent = collections_folder(&self.db, &self.paths).await?;
+        let parent = collections_folder(&self.db, &self.paths, &self.collections_name()).await?;
         let (mode, _) = container_identity(&self.db, &self.paths).await?;
         // `GetCollectionsFolderPath()`: `{data}/collections`.
         let collections = format!("{}/collections", self.paths.data_path());
@@ -891,7 +920,7 @@ impl CollectionManager for FerrofinCollectionManager {
         // `ensure_container` the create path has been using all along.
         let path = format!("{}/collections", self.paths.data_path());
         let id = if create_if_needed {
-            collections_folder(&self.db, &self.paths).await?
+            collections_folder(&self.db, &self.paths, &self.collections_name()).await?
         } else if let Some(id) =
             crate::item_persistence_service::container_at(&self.db, &path).await?
         {
@@ -2144,6 +2173,33 @@ mod tests {
         assert_eq!(found.id, made.id, "the same row, found by path");
     }
 
+    /// gl-385: a new Collections library is named in the server UI culture,
+    /// whatever the requesting client's language (v12.2
+    /// `CollectionManager.EnsureLibraryFolder`, `GetServerLocalizedString`).
+    #[tokio::test]
+    async fn the_collections_library_takes_the_server_culture() {
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let manager = FerrofinCollectionManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            test_paths_in(tmp.path()),
+        )
+        .with_localization(Arc::new(
+            crate::LocalizationManager::default().with_ui_culture("de"),
+        ));
+        let made = ferrofin_util::current_culture::scope_with_ui(
+            "fr".into(),
+            Some("fr".into()),
+            manager.get_collections_folder(true),
+        )
+        .await
+        .expect("provision")
+        .expect("a row");
+        assert_eq!(made.name.as_deref(), Some("Sammlungen"));
+    }
+
     /// gl-922: the Collections library's id comes from its program-data-relative
     /// path, its stored `Path` from the absolute one, so a data directory that
     /// moved leaves the row at its old path under the same id. Both lookups
@@ -2256,7 +2312,7 @@ mod tests {
                 format!("{root_dir}/cache"),
                 format!("{root_dir}/web"),
             ));
-        let id = collections_folder(&db, &paths)
+        let id = collections_folder(&db, &paths, "Collections")
             .await
             .expect("provision")
             .expect("an id");
