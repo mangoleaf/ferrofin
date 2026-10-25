@@ -475,6 +475,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   the cloud metadata service or the server's own loopback through a gateway, where only the
   IPv4-mapped form was unwrapped. The local-use NAT64 prefix `64:ff9b:1::/48` is refused
   outright
+- WASM plugins: the engine grants a plugin only the WebAssembly features the host needs. A
+  plugin could use shared memory (threads), GC types, exception handling and the async
+  component model, which wasmtime turns on with its default build; a plugin that uses one no
+  longer loads, and none known does. The server also no longer builds wasmtime's profiling,
+  compilation cache, core dump and pooling allocator support, or WASI preview 1 and 3
 
 ### Bug Fixes
 - A backup no longer reports success with something left out:
