@@ -47,7 +47,7 @@ use crate::item_visibility::ItemVisibility;
 use crate::kinds::is_video;
 use crate::translate_query::{
     PLACEHOLDER_ID, QueryShape, append_predicates, build_latest_music_albums_query, build_query,
-    media_type_name, non_blank, push_in_list, to_guid_strings,
+    media_type_name, non_blank, push_in_list, push_name_starts_with, to_guid_strings,
 };
 use crate::user_entity_ext::{guid_preference, has_permission, live_tv_enabled_for};
 use crate::virtual_paths::VirtualPathExpander;
@@ -2516,9 +2516,10 @@ impl<'r> FromRow<'r, sqlx::sqlite::SqliteRow> for PlaylistItemRow {
 ///   **unescaped** (client wildcards pass through, as upstream intends); a plain
 ///   term is cleaned (`get_clean_value`, as v12's `GetCleanValue`) and matched
 ///   as a literal contains on `CleanName`.
-/// - `NameStartsWith` is a prefix on the sort key. Deliberate divergence:
-///   `COALESCE(SortName, Name)` because Ferrofin leaves by-name `SortName` NULL
-///   (C# filters `SortName` alone, which would match nothing here).
+/// - `NameStartsWith` is the literal `SortName` prefix a browse runs
+///   ([`push_name_starts_with`], v12.2 `ApplyNameFilters`). Every by-name row
+///   carries a `SortName`: `ByNameStore` writes one, and boot backfills any a
+///   build before it left NULL (`backfill_missing_sort_names`).
 /// - `NameStartsWithOrGreater`/`NameLessThan` are full-string comparisons of
 ///   `SortName` against the lowercased bound, as C# compares them.
 ///
@@ -2550,9 +2551,9 @@ fn append_by_name_filters(
             qb.push(r#" AND bi."CleanName" LIKE "#).push_bind(like);
         }
     }
-    if let Some(prefix) = non_blank(filter.name_starts_with.as_deref()) {
-        qb.push(r#" AND ferrofin_upper_invariant(COALESCE(bi."SortName", bi."Name")) LIKE "#)
-            .push_bind(format!("{}%", upper_invariant(prefix)));
+    // Untrimmed, as on a browse: a non-blank term is matched byte for byte.
+    if let Some(prefix) = crate::translate_query::non_blank(filter.name_starts_with.as_ref()) {
+        push_name_starts_with(qb, prefix);
     }
     // Both bounds are FULL-STRING comparisons against the lowercased parameter,
     // over `SortName` only (C# `BaseItemRepository.cs:2036-2046`:
@@ -8189,6 +8190,54 @@ mod tests {
         let w = repository.get_genres(&wild).await.expect("wild");
         assert_eq!(w.items.len(), 1);
         assert_eq!(w.items[0].item.name.as_deref(), Some("Drama"));
+    }
+
+    /// `NameStartsWith` on a by-name list is v12.2 `ApplyNameFilters`, the
+    /// same as on a browse: `SortName.ToLower().StartsWith(term)`, which EF
+    /// translates as a literal prefix. `%` and `_` match only themselves, the
+    /// term is not trimmed, and a row with no `SortName` matches nothing.
+    #[tokio::test]
+    async fn by_name_name_starts_with_is_a_literal_prefix() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA101);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        for genre in ["A_Side", "Abba", "Rock"] {
+            seed_item_genre(&db, movie, genre).await;
+        }
+        let names = async |prefix: &str| -> Vec<String> {
+            let query = InternalItemsQuery {
+                name_starts_with: Some(prefix.to_owned()),
+                ..Default::default()
+            };
+            repository
+                .get_genres(&query)
+                .await
+                .expect("genres")
+                .items
+                .into_iter()
+                .filter_map(|row| row.item.name)
+                .collect()
+        };
+        for (prefix, expected) in [
+            ("A_", &["A_Side"][..]),
+            ("a_", &["A_Side"][..]),
+            ("_", &[][..]),
+            ("%", &[][..]),
+            ("A%", &[][..]),
+            ("Ab", &["Abba"][..]),
+            (" Ab", &[][..]),
+        ] {
+            assert_eq!(names(prefix).await, expected, "nameStartsWith={prefix:?}");
+        }
+        sqlx::query(r#"UPDATE "BaseItems" SET "SortName" = NULL WHERE "Name" = 'Rock'"#)
+            .execute(db.writer())
+            .await
+            .expect("clear sort name");
+        assert!(
+            names("R").await.is_empty(),
+            "the prefix is on SortName alone, never Name"
+        );
     }
 
     /// Gives the named rows a `SortName`/`CleanName` (the lowercased name) and

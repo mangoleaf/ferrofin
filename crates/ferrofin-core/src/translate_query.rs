@@ -1452,14 +1452,8 @@ fn append_name_predicates(
 /// The three letter-range filters run on the substituted BoxSet row in a
 /// recursive collapsed query (pinned ApplyGroupingFilter/ApplyNameFilters).
 fn append_name_ranges(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
-    // Pinned EF translates row.ToLower to SQLite lower; the bound uses the
-    // model's ToLowerInvariant. StartsWith is literal, including '%' and '_'.
     if let Some(prefix) = non_blank(filter.name_starts_with.as_ref()) {
-        let prefix = lower_invariant(prefix);
-        qb.push(r#" AND substr(lower(bi."SortName"), 1, length("#)
-            .push_bind(prefix.clone())
-            .push(")) = ")
-            .push_bind(prefix);
+        push_name_starts_with(qb, prefix);
     }
     if let Some(bound) = non_blank(filter.name_starts_with_or_greater.as_ref()) {
         qb.push(r#" AND lower(bi."SortName") >= "#)
@@ -1469,6 +1463,20 @@ fn append_name_ranges(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery
         qb.push(r#" AND lower(bi."SortName") < "#)
             .push_bind(lower_invariant(bound));
     }
+}
+
+/// v12.2 `ApplyNameFilters`' `NameStartsWith` over the `bi` row:
+/// `SortName!.ToLower().StartsWith(term.ToLowerInvariant())`. Pinned EF
+/// translates the row's `ToLower` to SQLite `lower`; the term takes the
+/// model's `ToLowerInvariant`. `StartsWith` is literal, so `%` and `_` match
+/// only themselves. A browse and a by-name list (`GetItemValues`' outer
+/// query) both run it.
+pub(crate) fn push_name_starts_with(qb: &mut QueryBuilder<Sqlite>, prefix: &str) {
+    let prefix = lower_invariant(prefix);
+    qb.push(r#" AND substr(lower(bi."SortName"), 1, length("#)
+        .push_bind(prefix.clone())
+        .push(")) = ")
+        .push_bind(prefix);
 }
 
 /// Keep substitution inside SQL: collapsing precedes sorting, counting and
