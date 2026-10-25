@@ -1642,13 +1642,17 @@ pub async fn build_app_state(
     // feed realtime change detection, which is already blind for the whole of
     // boot, and a change arriving during the walk is picked up by the next
     // scheduled scan exactly as one arriving a moment earlier would be. So it
-    // is spawned and boot continues.
+    // is spawned and boot continues. It is a background task like the event
+    // pump, so an in-process restart's teardown stops the walk rather than
+    // letting the old lifetime keep adding watches (upstream's
+    // `ApplicationStopping` disposes the monitor). Nothing calls `start`
+    // after teardown: the requests have drained and the pump is stopped.
     let monitor_start = Arc::clone(&library_monitor);
-    tokio::spawn(async move {
+    background.push(tokio::spawn(async move {
         if let Err(err) = monitor_start.start().await {
             tracing::warn!(%err, "failed to start library monitor");
         }
-    });
+    }));
     // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
     // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
     // full Library/Maintenance task set is registered below once its backing

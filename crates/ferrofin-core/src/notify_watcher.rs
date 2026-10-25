@@ -254,17 +254,28 @@ impl FileSystemWatcher for NotifyFileSystemWatcher {
     }
 
     async fn unwatch_all(&self) -> Result<(), ServiceError> {
-        let roots: Vec<String> = self
-            .watched
-            .lock()
-            .expect("watched set not poisoned")
-            .iter()
-            .cloned()
-            .collect();
-        for root in roots {
-            self.unwatch(&root).await?;
-        }
-        Ok(())
+        // One job under the watcher's lock, which a recursive walk holds
+        // until its root has joined the watched set: a walk already running
+        // when this is called (its `start` cancelled mid-walk, its job
+        // running on) finishes first, and its root is removed with the rest.
+        // A watch job that has not yet taken the lock can still land after.
+        let inner = Arc::clone(&self.inner);
+        let watched = Arc::clone(&self.watched);
+        tokio::task::spawn_blocking(move || {
+            let mut os_watcher = inner.lock().expect("watcher lock not poisoned");
+            let roots: Vec<String> = watched
+                .lock()
+                .expect("watched set not poisoned")
+                .drain()
+                .collect();
+            for root in roots {
+                if let Err(e) = os_watcher.unwatch(Path::new(&root)) {
+                    tracing::debug!(path = root, error = %e, "unwatch skipped");
+                }
+            }
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("unwatch task did not finish: {e}")))
     }
 }
 
@@ -620,6 +631,33 @@ mod tests {
             got.is_err(),
             "no events expected after unwatch_all: {got:?}"
         );
+    }
+
+    /// `unwatch_all` called while a recursive walk is still running (its
+    /// `start` cancelled, the blocking job running on) waits for the walk and
+    /// removes the root it records, instead of missing it.
+    #[tokio::test]
+    async fn unwatch_all_removes_a_root_whose_walk_was_still_running() {
+        let (watcher, _rx) = NotifyFileSystemWatcher::new().expect("watcher");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        // Stands in for `watch`'s job: it holds the watcher for the walk, then
+        // records the root.
+        let walk = std::thread::spawn({
+            let inner = Arc::clone(&watcher.inner);
+            let roots = Arc::clone(&watcher.watched);
+            move || {
+                let _walking = inner.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                roots.lock().unwrap().insert("/media/movies".to_owned());
+            }
+        });
+        locked_rx.recv().unwrap();
+
+        watcher.unwatch_all().await.expect("unwatch_all");
+
+        walk.join().unwrap();
+        assert!(watcher.watched.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
