@@ -609,7 +609,6 @@ async fn get_items(
     {
         internal.collapse_box_set_items = Some(false);
     }
-    order_search_by_sort_name(&mut internal);
     apply_media_stream_filter_rules(&mut internal);
     // `IsVirtualItem` is driven ONLY by these two parameters on this route
     // (v10.11.8 Jellyfin.Api/Controllers/ItemsController.cs:437-447) — there is
@@ -645,6 +644,10 @@ async fn get_items(
     // these rewrites on the folder that results.
     list_playlists_folder_as_playlists(&mut internal);
     apply_library_browse_defaults(&mut internal, library, query.recursive);
+    // The default order sees the final query: the resolved `artists` names and
+    // the rewritten types. The search order then leads with `SortName`.
+    apply_albums_by_artist_order(&mut internal);
+    order_search_by_sort_name(&mut internal);
     // `|| query.HasFilters` (v12.2 ItemsController.cs:592) with
     // `UserRootFolder.GetItemsInternal` (UserRootFolder.cs:77): at the user
     // root only an unfiltered request is the plain listing of the user's
@@ -768,6 +771,25 @@ fn apply_library_browse_defaults(
     if !internal.include_item_types.is_empty() && requested_recursive.is_none() {
         internal.recursive = true;
         internal.user_root_children = false;
+    }
+}
+
+/// "Apply default sorting if none requested" (v12.2 ItemsController.cs:579-586):
+/// an artist's albums, asked for with no `sortBy`, come newest first, then by
+/// name. `sortBy=Default` is a requested sort and keeps its own order. With an
+/// order set, an explicit-ids page keeps it rather than the requested id order
+/// ([`sort_items_by_request`]), as upstream's `Folder.GetItems` does.
+fn apply_albums_by_artist_order(internal: &mut InternalItemsQuery) {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    if internal.order_by.is_empty()
+        && !internal.artist_ids.is_empty()
+        && internal.include_item_types == [BaseItemKind::MusicAlbum]
+    {
+        internal.order_by = vec![
+            (ItemSortBy::ProductionYear, SortOrder::Descending),
+            (ItemSortBy::SortName, SortOrder::Ascending),
+        ];
     }
 }
 
@@ -2651,6 +2673,43 @@ mod tests {
         let resume: ResumeQuery =
             serde_urlencoded::from_str("excludeActiveSessions=true").expect("parses");
         assert_eq!(resume.exclude_active_sessions, Some(true));
+    }
+
+    /// The albums-by-artist default is a sort, so an explicit-ids page of
+    /// that shape keeps the repository's year order (v12.2 Folder.cs:1072-1080
+    /// reorders by id only with no `OrderBy`).
+    #[test]
+    fn an_albums_by_artist_default_order_keeps_an_ids_page_in_that_order() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        let (a, b) = (Uuid::from_u128(0xA), Uuid::from_u128(0xB));
+        let mut query = InternalItemsQuery {
+            item_ids: vec![a, b],
+            artist_ids: vec![Uuid::from_u128(0xA7)],
+            include_item_types: vec![BaseItemKind::MusicAlbum],
+            ..InternalItemsQuery::default()
+        };
+        apply_albums_by_artist_order(&mut query);
+        assert_eq!(
+            query.order_by,
+            [
+                (ItemSortBy::ProductionYear, SortOrder::Descending),
+                (ItemSortBy::SortName, SortOrder::Ascending),
+            ]
+        );
+        let mut rows: Vec<BaseItemEntity> = [b, a]
+            .into_iter()
+            .map(|id| BaseItemEntity {
+                id: ferrofin_db::store::guid_to_db(id),
+                ..BaseItemEntity::default()
+            })
+            .collect();
+        sort_items_by_request(&query, &mut rows);
+        assert_eq!(
+            rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+            [b, a].map(ferrofin_db::store::guid_to_db),
+            "the repository's year order stands"
+        );
     }
 
     /// `SortItemsByRequest` (v12.2 Folder.cs:1065-1083): an unsorted request

@@ -2060,6 +2060,64 @@ async fn get_items_resolves_the_artist_album_and_studio_names() {
     assert!(blank.artist_ids.is_empty());
 }
 
+/// An artist's albums asked for with no `sortBy` come newest first, then by
+/// name (v12.2 ItemsController.cs:579-586), whether the artist is named by
+/// id or by name. Any requested sort, `Default` included, any other type set
+/// and a request without an artist keep their own order.
+#[tokio::test]
+async fn get_items_orders_an_artists_albums_newest_first_by_default() {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    let artist = Uuid::from_u128(0xC1);
+    let named = vec![(BaseItemKind::MusicArtist, "Test Artist", artist)];
+    let newest_first = [
+        (ItemSortBy::ProductionYear, SortOrder::Descending),
+        (ItemSortBy::SortName, SortOrder::Ascending),
+    ];
+    for params in [
+        format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum"),
+        "recursive=true&artists=Test%20Artist&includeItemTypes=MusicAlbum".to_owned(),
+        // A sort order with no sort key is no requested sort (`GetOrderBy`).
+        format!(
+            "recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum&sortOrder=Ascending"
+        ),
+    ] {
+        let query = items_query_with_named(&params, named.clone()).await;
+        assert_eq!(query.order_by, newest_first, "{params}");
+    }
+    for (params, expected) in [
+        (
+            format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum&sortBy=Default"),
+            vec![(ItemSortBy::Default, SortOrder::Ascending)],
+        ),
+        (
+            format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum,Audio"),
+            Vec::new(),
+        ),
+        (
+            "recursive=true&includeItemTypes=MusicAlbum".to_owned(),
+            Vec::new(),
+        ),
+    ] {
+        let query = items_query_with_named(&params, named.clone()).await;
+        assert_eq!(query.order_by, expected, "{params}");
+    }
+    // A search still leads with SortName, over the default.
+    let searched = items_query_with_named(
+        &format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum&searchTerm=light"),
+        named,
+    )
+    .await;
+    assert_eq!(
+        searched.order_by,
+        [
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            newest_first[0],
+            newest_first[1]
+        ]
+    );
+}
+
 /// jellyfin-web's artist page filters by `AlbumArtistIds` (Albums),
 /// `ContributingArtistIds` (Appears On) and `ExcludeArtistIds` (More Like
 /// This), through both the query- and the path-scoped route. Each id set
