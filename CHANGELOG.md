@@ -363,6 +363,20 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   in Jellyfin; it took them from the last. The metadata language and country of an item in
   nested libraries now come from the innermost one, and `GET /Items/{itemId}/Ancestors`
   names the first library by sort name when two list the same folder
+- Library tiles are drawn as in Jellyfin 12.2. An image at the root of a library's media
+  folder (a `folder.jpg` in `/media/movies`) becomes the library's image, after one in the
+  library's own folder. A music library's collage comes from the artists its tracks credit,
+  not its albums, and every collage samples 8 items that have a Primary image; a library
+  whose items have none keeps the icon tile, where Ferrofin drew from any item. A library's
+  or the root's first refresh at the default mode, or one past the library's automatic
+  refresh interval, redraws the tile or the root's image, and the library and the root now
+  record their last refresh
+- Library renames and media-path removals compare paths as Jellyfin does, ignoring the case
+  of every letter, not only ASCII: on a case-insensitive file system, renaming `élan` to
+  `Élan` works instead of answering `409`, and the users' library preferences follow a
+  library whose stored path differs in a non-ASCII letter's case. Users' library and view
+  preferences are read as .NET parses a GUID: a padded or `(…)` value counts, a
+  `urn:uuid:` one does not
 
 ### Performance
 - `/Persons` with a favourite filter: build the user's favourite-person set once per
@@ -669,6 +683,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - The Merge Versions plugin's bulk merges and splits run one at a time, whether a route or a
   daily task starts them: a merge and a split started together interleaved their version-link
   writes
+- Renaming a library to its own name, or changing only its case while item ids ignore case,
+  keeps the library's database row. It was deleted and created again, which reset the
+  library's date added, dropped its images and left its items without the library above
+  them until the next scan
 
 ## [1.0.0] - 2026-09-05
 
