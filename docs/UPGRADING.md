@@ -17,6 +17,9 @@ major-version upgrade.
   logs a warning and keeps the channels and guide it already has. Configure the plain path
   (`/srv/tv/list.m3u`) instead. (An XMLTV guide's `file://` path was already refused on
   save, and is now not read either.)
+- **An XMLTV guide declared `ISO-8859-9` is decoded as that code page.** Bytes `0x80`-`0x9F`
+  read as control characters, as in Jellyfin, not as the `windows-1254` punctuation (`€`,
+  `‚`, …) they were read as before. Turkish letters are unchanged.
 
 ## Unreleased — Live TV sources are checked and read as Jellyfin reads them
 

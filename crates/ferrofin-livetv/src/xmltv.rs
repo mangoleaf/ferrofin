@@ -168,10 +168,9 @@ pub fn parse_xmltv_where(xml: &str, keep: impl FnMut(&XmltvProgramme) -> bool) -
 /// byte-order mark, else by the `<?xml … encoding="…"?>` declaration, else as
 /// UTF-8. A byte sequence that is not valid in that encoding makes the
 /// document unreadable ([`Xmltv::error`]), as it makes `XmlReader` throw.
-/// `ISO-8859-1` and `US-ASCII` (and their other names) decode as .NET's
-/// `Latin1Encoding` and `ASCIIEncoding` do; any other name is looked up by the
-/// WHATWG rules, which agree with .NET's code pages except for a few legacy
-/// names (`ISO-8859-9` reads as `windows-1254`).
+/// `ISO-8859-1`, `US-ASCII` and `ISO-8859-9` (and their other names) decode
+/// as .NET's `Latin1Encoding`, `ASCIIEncoding` and code page 28599 do; any
+/// other name is looked up by the WHATWG rules.
 ///
 /// `language` is the reader's (`new XmlTvReader(path, language)`). In a run
 /// of sibling `<title>`, `<sub-title>`, `<desc>` or `<display-name>` elements
@@ -235,6 +234,8 @@ enum TextEncoding {
     Whatwg(&'static Encoding),
     /// .NET's `Latin1Encoding`: every byte is the code point of its value.
     Latin1,
+    /// .NET's code page 28599 (`ISO-8859-9`): `Latin1` with six Turkish letters.
+    Latin5,
     /// .NET's `ASCIIEncoding`: a byte above `0x7F` reads as `?`.
     Ascii,
 }
@@ -252,6 +253,22 @@ const LATIN1_LABELS: &[&str] = &[
     "iso_8859-1:1987",
     "l1",
     "latin1",
+];
+
+/// The names .NET gives code page 28599 (`ISO-8859-9`), which the WHATWG
+/// rules read as `windows-1254` instead, so `0x80`-`0x9F` would be printable
+/// characters rather than the C1 controls (`EncodingTable.Data.cs`,
+/// `System.Text.Encoding.CodePages`). `ISO-8859-11` and `TIS-620` need no
+/// such list: .NET names code page 874 by them, which is the WHATWG
+/// `windows-874` too.
+const LATIN5_LABELS: &[&str] = &[
+    "csisolatin5",
+    "iso-8859-9",
+    "iso-ir-148",
+    "iso_8859-9",
+    "iso_8859-9:1989",
+    "l5",
+    "latin5",
 ];
 
 /// The names .NET gives `ASCIIEncoding` (code page 20127), which the WHATWG
@@ -299,9 +316,9 @@ fn document_encoding(head: &[u8]) -> Result<TextEncoding, String> {
     if ASCII_LABELS.contains(&name.as_str()) {
         return Ok(TextEncoding::Ascii);
     }
-    // TODO(gl-936): the WHATWG rules read a few other legacy names (ISO-8859-9,
-    // ISO-8859-11, TIS-620) as a related Windows code page, where .NET's code
-    // pages decode the named one; give them exact tables as `Latin1` has.
+    if LATIN5_LABELS.contains(&name.as_str()) {
+        return Ok(TextEncoding::Latin5);
+    }
     match Encoding::for_label(label) {
         Some(encoding)
             if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE =>
@@ -336,6 +353,20 @@ fn declared_encoding(head: &[u8]) -> Option<&[u8]> {
     Some(&value[..value.iter().position(|&b| b == quote)?])
 }
 
+/// The character `byte` is in `ISO-8859-9`: its Latin-1 character, except for
+/// the six positions that hold Turkish letters.
+fn latin5_char(byte: u8) -> char {
+    match byte {
+        0xD0 => 'Ğ',
+        0xDD => 'İ',
+        0xDE => 'Ş',
+        0xF0 => 'ğ',
+        0xFD => 'ı',
+        0xFE => 'ş',
+        _ => char::from(byte),
+    }
+}
+
 /// How much decoded text [`Decoded`] holds at once.
 const DECODED_BUFFER: usize = 16 * 1024;
 
@@ -365,7 +396,7 @@ impl<R> Decoded<R> {
             source,
             decoder: match encoding {
                 TextEncoding::Whatwg(encoding) => Some(encoding.new_decoder_with_bom_removal()),
-                TextEncoding::Latin1 | TextEncoding::Ascii => None,
+                TextEncoding::Latin1 | TextEncoding::Latin5 | TextEncoding::Ascii => None,
             },
             encoding,
             out: vec![0; DECODED_BUFFER].into_boxed_slice(),
@@ -399,6 +430,7 @@ impl<R: BufRead> BufRead for Decoded<R> {
                 for &byte in &input[..take] {
                     let c = match self.encoding {
                         TextEncoding::Ascii if !byte.is_ascii() => '?',
+                        TextEncoding::Latin5 => latin5_char(byte),
                         _ => char::from(byte),
                     };
                     written += c.encode_utf8(&mut self.out[written..]).len();
@@ -1895,12 +1927,27 @@ mod read_tests {
 
     /// `ISO-8859-1` and `US-ASCII` are .NET's `Latin1Encoding` and
     /// `ASCIIEncoding`, not the WHATWG `windows-1252` both names map to there;
-    /// `windows-1252` itself is `windows-1252`.
+    /// `windows-1252` itself is `windows-1252`. The `ISO-8859-9` names are
+    /// .NET's code page 28599, not the WHATWG `windows-1254`, so `0x80`-`0x9F`
+    /// are the C1 controls; `ISO-8859-11` and `TIS-620` are code page 874 in
+    /// .NET's own name table, which is the WHATWG `windows-874` too.
     #[rstest::rstest]
     #[case::latin1("ISO-8859-1", b'\x80', "\u{80}")]
     #[case::latin1_other_name("latin1", b'\xe9', "é")]
     #[case::ascii("us-ascii", b'\xe9', "?")]
     #[case::windows_1252("windows-1252", b'\x80', "€")]
+    #[case::latin5("ISO-8859-9", b'\x80', "\u{80}")]
+    #[case::latin5_c1_end("iso-8859-9", b'\x9f', "\u{9f}")]
+    #[case::latin5_g_breve("latin5", b'\xd0', "Ğ")]
+    #[case::latin5_dotted_i("l5", b'\xdd', "İ")]
+    #[case::latin5_s_cedilla("csisolatin5", b'\xde', "Ş")]
+    #[case::latin5_small_g_breve("iso-ir-148", b'\xf0', "ğ")]
+    #[case::latin5_dotless_i("iso_8859-9", b'\xfd', "ı")]
+    #[case::latin5_small_s_cedilla("iso_8859-9:1989", b'\xfe', "ş")]
+    #[case::latin5_shared_with_latin1("ISO-8859-9", b'\xe9', "é")]
+    #[case::windows_1254("windows-1254", b'\x80', "€")]
+    #[case::iso_8859_11_is_874("ISO-8859-11", b'\x80', "€")]
+    #[case::tis_620_is_874("TIS-620", b'\x85', "…")]
     fn single_byte_encodings_decode_as_dotnet_does(
         #[case] label: &str,
         #[case] byte: u8,

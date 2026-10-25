@@ -66,6 +66,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Open a local M3U playlist or XMLTV guide exactly as configured, as Jellyfin's
   `AsyncFile.OpenRead` does: a `file://` URL is no longer stripped to the path it names,
   so saving a `file://` M3U tuner is refused with `404`
+- Decode an XMLTV guide declared `ISO-8859-9` (or `latin5`, `l5` and its other .NET names)
+  as .NET's code page 28599 does, with `0x80`-`0x9F` as the C1 controls, not as
+  `windows-1254`
 - Open an M3U tuner's playlist before saving it, as Jellyfin's `M3UTunerHost.Validate`
   does: a missing local playlist is a `404` and a failing playlist URL a `500`, where the
   tuner was saved and only the next guide refresh showed it empty. A Live TV source URL is
