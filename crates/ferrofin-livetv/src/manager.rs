@@ -62,7 +62,8 @@ use crate::projection::{
 };
 use crate::schedules_direct::{SchedulesDirect, SdChannel, SdProgram};
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
-use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, parse_xmltv_where};
+use crate::xmltv::{Xmltv, XmltvChannel, XmltvProgramme, read_xmltv_where};
+use crate::xmltv_cache::XmlTvDocument;
 
 /// SQLite's conservative default bind-parameter limit (`SQLITE_MAX_VARIABLE_NUMBER`
 /// is 999 before 3.32, 32766 after); multi-row inserts chunk to stay under it.
@@ -631,7 +632,7 @@ enum GuideSource {
     /// An XMLTV document and its `<channel>` list; the airings are read in the
     /// write half (`insert_programs`).
     XmlTv {
-        body: String,
+        document: XmlTvDocument,
         channels: Vec<XmltvChannel>,
     },
     /// Schedules Direct: the lineup's stations and the airings of each station
@@ -875,19 +876,27 @@ impl CategoryClasses {
     }
 }
 
-/// Parses an XMLTV document on the blocking pool, keeping the programmes
-/// `keep` accepts, and hands the document back with the result.
+/// Reads an XMLTV document from its file on the blocking pool, keeping the
+/// programmes `keep` accepts, and hands the document back with the result.
 ///
 /// A large IPTV guide is hundreds of megabytes and takes seconds to parse, and
 /// a guide refresh reads each document twice (channels, then the bound
-/// channels' airings), so neither read runs on a runtime worker.
+/// channels' airings), so neither read runs on a runtime worker. The file is
+/// read as a stream, as `XmlTvReader` reads it (Jellyfin.XmlTv
+/// `XmlTvReader.GetChannels`/`GetProgrammes`), so neither read holds it whole.
 async fn parse_guide(
-    body: String,
+    document: XmlTvDocument,
     keep: impl FnMut(&XmltvProgramme) -> bool + Send + 'static,
-) -> Result<(String, Xmltv), ServiceError> {
+) -> Result<(XmlTvDocument, Xmltv), ServiceError> {
     tokio::task::spawn_blocking(move || {
-        let guide = parse_xmltv_where(&body, keep);
-        (body, guide)
+        let guide = match document.reader() {
+            Ok(reader) => read_xmltv_where(reader, keep),
+            Err(e) => Xmltv {
+                error: Some(format!("the XMLTV document could not be read: {e}")),
+                ..Xmltv::default()
+            },
+        };
+        (document, guide)
     })
     .await
     .map_err(|e| ServiceError::Backend(format!("XMLTV parse task failed: {e}")))
@@ -1775,9 +1784,9 @@ impl FerrofinLiveTvManager {
                 .map(sd_epg_channel)
                 .collect());
         }
-        let body = self.xmltv.get_xml(info).await?;
+        let document = self.xmltv.get_xml(info).await?;
         // The channels only: every airing is dropped as soon as it is read.
-        let (_, guide) = parse_guide(body, |_| false).await?;
+        let (_, guide) = parse_guide(document, |_| false).await?;
         // Upstream's `GetChannels` throws on a bad document, so the mapping
         // dialog shows an error instead of "no channels".
         if let Some(e) = guide.error {
@@ -2039,10 +2048,10 @@ impl FerrofinLiveTvManager {
     /// airings inside the window are kept. A large IPTV guide carries
     /// thousands of channels nobody mapped, and parsing them all (upstream
     /// streams its cached file one channel at a time instead) held the whole
-    /// guide in memory. `body` is dropped once its rows are built.
+    /// guide in memory. `document` is dropped once its rows are built.
     async fn insert_programs(
         &self,
-        body: String,
+        document: XmlTvDocument,
         channels: &[XmltvChannel],
         provider: &ListingsProviderInfo,
         window: (DateTime<Utc>, DateTime<Utc>),
@@ -2069,12 +2078,12 @@ impl FerrofinLiveTvManager {
         // `clean_programs` replace the bound channels' airings with a partial
         // set, so the refresh stops before any prune instead.
         let bound: HashSet<String> = by_epg_channel.keys().cloned().collect();
-        let (body, guide) = parse_guide(body, move |prog| {
+        let (document, guide) = parse_guide(document, move |prog| {
             bound.contains(&prog.channel_id)
                 && Self::in_guide_window(prog, window_start, window_end)
         })
         .await?;
-        drop(body);
+        drop(document);
         if let Some(e) = guide.error {
             return Err(ServiceError::Backend(format!(
                 "the guide document became unreadable on its second read: {e}"
@@ -2258,17 +2267,17 @@ impl FerrofinLiveTvManager {
             // an empty download never gets here: `get_xml` treats it as a failed
             // download and answers with the cached copy, if there is one, or the
             // `Err` below.
-            Ok(body) => {
+            Ok(document) => {
                 // The channels and whether the document is readable; every
                 // airing is dropped as it is read.
-                let (body, probe) = parse_guide(body, |_| false).await?;
+                let (document, probe) = parse_guide(document, |_| false).await?;
                 if let Some(e) = &probe.error {
                     tracing::warn!(%path, error = %e, "live tv: guide document unreadable; keeping the stored guide");
                     Ok((None, false))
                 } else {
                     Ok((
                         Some(GuideSource::XmlTv {
-                            body,
+                            document,
                             channels: probe.channels,
                         }),
                         true,
@@ -3212,8 +3221,8 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // rather than living through the item mirror below.
         for (provider, source) in guides {
             kept_programs.extend(match source {
-                GuideSource::XmlTv { body, channels } => {
-                    self.insert_programs(body, &channels, &provider, window)
+                GuideSource::XmlTv { document, channels } => {
+                    self.insert_programs(document, &channels, &provider, window)
                         .await?
                 }
                 GuideSource::SchedulesDirect { channels, programs } => {
@@ -8736,7 +8745,7 @@ mod tests {
             lineups[0].2[0].image_url.clone()
         };
         let xmltv = |channel: XmltvChannel| GuideSource::XmlTv {
-            body: String::new(),
+            document: crate::xmltv_cache::XmlTvDocument::empty_for_test(),
             channels: vec![channel],
         };
         // A provider for another tuner, and one whose channel has no logo.
@@ -12122,8 +12131,22 @@ mod tests {
             .expect("age");
         *fetcher.body.lock().unwrap() = None;
 
-        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("fallback"), XMLTV);
-        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("backoff"), XMLTV);
+        assert_eq!(
+            mgr.xmltv
+                .get_xml(&provider)
+                .await
+                .expect("fallback")
+                .text_for_test(),
+            XMLTV
+        );
+        assert_eq!(
+            mgr.xmltv
+                .get_xml(&provider)
+                .await
+                .expect("backoff")
+                .text_for_test(),
+            XMLTV
+        );
         assert_eq!(fetcher.fetches(), 2, "the failed path is not retried");
 
         // With no cached copy the recent failure is an error, still unfetched.
@@ -12140,7 +12163,14 @@ mod tests {
             .save_listing_provider(as_xmltv(provider), false, false)
             .await
             .expect("resave");
-        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("retried"), XMLTV);
+        assert_eq!(
+            mgr.xmltv
+                .get_xml(&provider)
+                .await
+                .expect("retried")
+                .text_for_test(),
+            XMLTV
+        );
         assert_eq!(fetcher.fetches(), 3);
     }
 
@@ -12163,7 +12193,14 @@ mod tests {
             .expect("age");
 
         *fetcher.body.lock().unwrap() = Some(String::new());
-        assert_eq!(mgr.xmltv.get_xml(&provider).await.expect("fallback"), XMLTV);
+        assert_eq!(
+            mgr.xmltv
+                .get_xml(&provider)
+                .await
+                .expect("fallback")
+                .text_for_test(),
+            XMLTV
+        );
         assert_eq!(std::fs::read_to_string(&cache_file).expect("kept"), XMLTV);
         mgr.xmltv.get_xml(&provider).await.expect("backoff");
         assert_eq!(

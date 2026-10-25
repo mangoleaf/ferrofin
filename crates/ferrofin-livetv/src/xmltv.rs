@@ -18,7 +18,10 @@
 
 use std::borrow::Cow;
 
+use std::io::BufRead;
+
 use chrono::{DateTime, FixedOffset, TimeZone};
+use encoding_rs::{DecoderResult, Encoding};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
@@ -146,22 +149,216 @@ pub fn parse_xmltv(xml: &str) -> Xmltv {
 /// guide. Channels and [`Xmltv::error`] are reported in full, so
 /// `parse_xmltv_where(xml, |_| false)` reads just the channel list and whether
 /// the document is readable.
+///
+/// The text is already decoded, so an encoding the document declares is not
+/// applied again.
 #[must_use]
-#[allow(clippy::too_many_lines)] // one pull-parser state machine
-pub fn parse_xmltv_where(xml: &str, mut keep: impl FnMut(&XmltvProgramme) -> bool) -> Xmltv {
-    if xml.trim().is_empty() {
-        // `XmlTvListingsProvider.UnzipIfNeededAndCopy`: "Downloaded XMLTV file
-        // is empty".
-        return Xmltv {
-            error: Some("the XMLTV document is empty".to_owned()),
-            ..Xmltv::default()
+pub fn parse_xmltv_where(xml: &str, keep: impl FnMut(&XmltvProgramme) -> bool) -> Xmltv {
+    read_events(Reader::from_str(xml), keep)
+}
+
+/// [`parse_xmltv_where`] over a document read as it arrives, from a file or
+/// any other byte source, so the document is never held whole.
+///
+/// The bytes are decoded the way `XmlTvReader`'s `XmlReader` decodes the
+/// cached file (Jellyfin.XmlTv `XmlTvReader.CreateXmlTextReader`): by the
+/// byte-order mark, else by the `<?xml … encoding="…"?>` declaration, else as
+/// UTF-8. A byte sequence that is not valid in that encoding makes the
+/// document unreadable ([`Xmltv::error`]), as it makes `XmlReader` throw. An
+/// encoding name is looked up by the WHATWG rules, so `ISO-8859-1` reads as
+/// `windows-1252`, which differs from .NET's Latin-1 only in the C1 control
+/// range.
+#[must_use]
+pub fn read_xmltv_where<R: BufRead>(
+    mut source: R,
+    keep: impl FnMut(&XmltvProgramme) -> bool,
+) -> Xmltv {
+    // The head, up to the end of its first markup (`?>` for a declaration),
+    // read whatever the source's buffer size, then read again by the parser.
+    let mut head = Vec::new();
+    while head.len() < HEAD_BYTES && !head.contains(&b'>') {
+        let available = match source.fill_buf() {
+            Ok(available) => available,
+            Err(e) => {
+                return Xmltv {
+                    error: Some(format!("the XMLTV document could not be read: {e}")),
+                    ..Xmltv::default()
+                };
+            }
         };
+        if available.is_empty() {
+            break;
+        }
+        let take = available.len().min(HEAD_BYTES - head.len());
+        head.extend_from_slice(&available[..take]);
+        source.consume(take);
     }
-    let mut reader = Reader::from_str(xml);
+    let encoding = document_encoding(&head);
+    let source = std::io::Read::chain(std::io::Cursor::new(head), source);
+    match encoding {
+        Ok(encoding) if encoding == encoding_rs::UTF_8 => {
+            read_events(Reader::from_reader(source), keep)
+        }
+        Ok(encoding) => read_events(Reader::from_reader(Decoded::new(source, encoding)), keep),
+        Err(error) => Xmltv {
+            error: Some(error),
+            ..Xmltv::default()
+        },
+    }
+}
+
+/// How much of a document's start [`read_xmltv_where`] looks at for its
+/// encoding: more than any XML declaration a guide writes.
+const HEAD_BYTES: usize = 1024;
+
+/// The text encoding of a document whose first bytes are `head`, by
+/// `XmlReader`'s rules: a byte-order mark, the UTF-16 shape of `<?`, then the
+/// XML declaration's `encoding`, else UTF-8.
+///
+/// # Errors
+///
+/// The declaration names an encoding that does not exist, or a UTF-16 one in
+/// a document that is not UTF-16 (`XmlReader`'s "There is no Unicode byte
+/// order mark. Cannot switch to Unicode.").
+fn document_encoding(head: &[u8]) -> Result<&'static Encoding, String> {
+    if let Some((encoding, _)) = Encoding::for_bom(head) {
+        return Ok(encoding);
+    }
+    if head.starts_with(&[b'<', 0, b'?', 0]) {
+        return Ok(encoding_rs::UTF_16LE);
+    }
+    if head.starts_with(&[0, b'<', 0, b'?']) {
+        return Ok(encoding_rs::UTF_16BE);
+    }
+    let Some(label) = declared_encoding(head) else {
+        return Ok(encoding_rs::UTF_8);
+    };
+    match Encoding::for_label(label) {
+        Some(encoding)
+            if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE =>
+        {
+            Err(format!(
+                "the XMLTV document declares {} but is not UTF-16",
+                String::from_utf8_lossy(label)
+            ))
+        }
+        Some(encoding) if encoding != encoding_rs::REPLACEMENT => Ok(encoding),
+        _ => Err(format!(
+            "the XMLTV document declares an unsupported encoding: {}",
+            String::from_utf8_lossy(label)
+        )),
+    }
+}
+
+/// The `encoding` pseudo-attribute of the XML declaration `head` starts with,
+/// when it starts with one that has it.
+fn declared_encoding(head: &[u8]) -> Option<&[u8]> {
+    const NAME: &[u8] = b"encoding";
+    let rest = head.strip_prefix(b"<?xml")?;
+    if !rest.first().is_some_and(u8::is_ascii_whitespace) {
+        return None;
+    }
+    let declaration = &rest[..rest.windows(2).position(|w| w == b"?>")?];
+    let at = declaration.windows(NAME.len()).position(|w| w == NAME)?;
+    let value = declaration[at + NAME.len()..].trim_ascii_start();
+    let value = value.strip_prefix(b"=")?.trim_ascii_start();
+    let quote = *value.first().filter(|q| matches!(q, b'"' | b'\''))?;
+    let value = &value[1..];
+    Some(&value[..value.iter().position(|&b| b == quote)?])
+}
+
+/// How much decoded text [`Decoded`] holds at once.
+const DECODED_BUFFER: usize = 16 * 1024;
+
+/// A byte source decoded to UTF-8 as it is read, for a document in another
+/// encoding. A sequence that is not valid in it is an `InvalidData` error.
+struct Decoded<R> {
+    /// The encoded bytes.
+    source: R,
+    /// The decoder; it removes a byte-order mark.
+    decoder: encoding_rs::Decoder,
+    /// Decoded text; `out[at..len]` is not read yet.
+    out: Box<[u8]>,
+    /// Where the unread text starts.
+    at: usize,
+    /// Where the decoded text ends.
+    len: usize,
+    /// Whether the source ended and the decoder was flushed.
+    finished: bool,
+}
+
+impl<R> Decoded<R> {
+    fn new(source: R, encoding: &'static Encoding) -> Self {
+        Self {
+            source,
+            decoder: encoding.new_decoder_with_bom_removal(),
+            out: vec![0; DECODED_BUFFER].into_boxed_slice(),
+            at: 0,
+            len: 0,
+            finished: false,
+        }
+    }
+}
+
+impl<R: BufRead> std::io::Read for Decoded<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.fill_buf()?;
+        let read = available.len().min(buf.len());
+        buf[..read].copy_from_slice(&available[..read]);
+        self.consume(read);
+        Ok(read)
+    }
+}
+
+impl<R: BufRead> BufRead for Decoded<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        while self.at == self.len && !self.finished {
+            let input = self.source.fill_buf()?;
+            let last = input.is_empty();
+            let (result, read, written) =
+                self.decoder
+                    .decode_to_utf8_without_replacement(input, &mut self.out, last);
+            self.source.consume(read);
+            self.at = 0;
+            self.len = written;
+            match result {
+                DecoderResult::Malformed(..) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "a byte sequence is not valid {}",
+                            self.decoder.encoding().name()
+                        ),
+                    ));
+                }
+                DecoderResult::InputEmpty if last => self.finished = true,
+                DecoderResult::InputEmpty | DecoderResult::OutputFull => {}
+            }
+        }
+        Ok(&self.out[self.at..self.len])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.at = (self.at + amount).min(self.len);
+    }
+}
+
+/// Reads the XMLTV document `reader` yields, keeping the programmes `keep`
+/// accepts — see [`parse_xmltv_where`].
+#[allow(clippy::too_many_lines)] // one pull-parser state machine
+fn read_events<R: BufRead>(
+    mut reader: Reader<R>,
+    mut keep: impl FnMut(&XmltvProgramme) -> bool,
+) -> Xmltv {
     let config = reader.config_mut();
     config.check_end_names = false;
     config.trim_text(false);
 
+    // The bytes of the event being read.
+    let mut buf = Vec::new();
+    // Whether anything but white space has been read: a document with none is
+    // empty rather than rootless.
+    let mut saw_content = false;
     let mut out = Xmltv::default();
     // Scratch buffer for the text content of the element currently being read.
     let mut text = String::new();
@@ -179,7 +376,8 @@ pub fn parse_xmltv_where(xml: &str, mut keep: impl FnMut(&XmltvProgramme) -> boo
     let mut root_seen = false;
 
     loop {
-        let event = reader.read_event();
+        buf.clear();
+        let event = reader.read_event_into(&mut buf);
         if !root_seen && let Ok(Event::Start(e) | Event::Empty(e)) = &event {
             root_seen = true;
             // Stricter than .NET's `XmlReader`, which rejects an HTML error
@@ -240,6 +438,7 @@ pub fn parse_xmltv_where(xml: &str, mut keep: impl FnMut(&XmltvProgramme) -> boo
                 );
             }
             Ok(Event::Text(e)) => {
+                saw_content |= !e.trim().is_empty();
                 text.push_str(e.as_ref());
             }
             Ok(Event::GeneralRef(e)) => {
@@ -282,6 +481,10 @@ pub fn parse_xmltv_where(xml: &str, mut keep: impl FnMut(&XmltvProgramme) -> boo
             Ok(Event::Eof) => {
                 if depth > 0 {
                     out.error = Some("the XMLTV document ends inside an open element".to_owned());
+                } else if !root_seen && !saw_content {
+                    // `XmlTvListingsProvider.UnzipIfNeededAndCopy`: "Downloaded
+                    // XMLTV file is empty".
+                    out.error = Some("the XMLTV document is empty".to_owned());
                 } else if !root_seen {
                     out.error = Some("the XMLTV document has no root element".to_owned());
                 }
@@ -291,7 +494,7 @@ pub fn parse_xmltv_where(xml: &str, mut keep: impl FnMut(&XmltvProgramme) -> boo
                 out.error = Some(format!("the XMLTV document is not well-formed: {e}"));
                 break;
             }
-            Ok(_) => {}
+            Ok(_) => saw_content = true,
         }
     }
 
@@ -1377,5 +1580,118 @@ mod programme_child_tests {
              <Icon src=\"http://x/upper.png\"/></channel></tv>",
         );
         assert_eq!(guide.channels[0].icon, None);
+    }
+}
+
+/// [`read_xmltv_where`]: a guide read as it arrives, decoded the way
+/// `XmlReader` decodes the cached file.
+#[cfg(test)]
+mod read_tests {
+    use super::{parse_xmltv, read_xmltv_where};
+
+    const GUIDE: &str = "<?xml version=\"1.0\"?>\n<tv>\
+        <channel id=\"one.tv\"><display-name>Channel One</display-name></channel>\
+        <programme start=\"20260725060000 +0000\" stop=\"20260725070000 +0000\" channel=\"one.tv\">\
+        <title>Morning &amp; News</title><desc><![CDATA[Headlines.]]></desc>\
+        <category>News</category><episode-num system=\"xmltv_ns\">0.5.</episode-num>\
+        <previously-shown/></programme></tv>";
+
+    /// A reader that hands out at most `step` bytes at a time, so every event
+    /// straddles a buffer boundary somewhere.
+    fn trickle(bytes: &[u8], step: usize) -> std::io::BufReader<&[u8]> {
+        std::io::BufReader::with_capacity(step, bytes)
+    }
+
+    /// The same document reads the same from a byte source in any chunking as
+    /// from a string.
+    #[rstest::rstest]
+    #[case(1)]
+    #[case(7)]
+    #[case(8192)]
+    fn a_guide_read_as_it_arrives_reads_as_the_string_does(#[case] step: usize) {
+        let expected = parse_xmltv(GUIDE);
+        let read = read_xmltv_where(trickle(GUIDE.as_bytes(), step), |_| true);
+        assert_eq!(read.error, None);
+        assert_eq!(read.channels, expected.channels);
+        assert_eq!(read.programmes, expected.programmes);
+        assert_eq!(read.programmes[0].title, "Morning & News");
+    }
+
+    /// The `encoding` the declaration names decodes the document, as
+    /// `XmlReader` honours it (Jellyfin.XmlTv's own `MultilanguageData.xml`
+    /// is `ISO-8859-1`).
+    #[test]
+    fn a_guide_in_its_declared_encoding_is_decoded() {
+        const BODY: &[u8] =
+            b"<tv><channel id=\"a\"><display-name>T\xe9l\xe9</display-name></channel></tv>";
+        let latin1 = [
+            &b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n"[..],
+            BODY,
+        ]
+        .concat();
+        let guide = read_xmltv_where(trickle(&latin1, 5), |_| true);
+        assert_eq!(guide.error, None);
+        assert_eq!(guide.channels[0].display_name, "Télé");
+
+        // Single quotes and spacing around `=` are the declaration's too.
+        let latin1 = [&b"<?xml version='1.0' encoding = 'latin1' ?>"[..], BODY].concat();
+        let guide = read_xmltv_where(&latin1[..], |_| true);
+        assert_eq!(guide.error, None);
+        assert_eq!(guide.channels[0].display_name, "Télé");
+    }
+
+    /// A byte-order mark decides, UTF-16 included.
+    #[test]
+    fn a_guide_with_a_byte_order_mark_is_decoded_by_it() {
+        let text = "<tv><channel id=\"a\"><display-name>Ünï</display-name></channel></tv>";
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        let guide = read_xmltv_where(trickle(&utf16, 3), |_| true);
+        assert_eq!(guide.error, None);
+        assert_eq!(guide.channels[0].display_name, "Ünï");
+
+        let mut utf8 = b"\xEF\xBB\xBF".to_vec();
+        utf8.extend_from_slice(text.as_bytes());
+        let guide = read_xmltv_where(&utf8[..], |_| true);
+        assert_eq!(guide.error, None);
+        assert_eq!(guide.channels[0].display_name, "Ünï");
+    }
+
+    /// Bytes that are not valid in the document's encoding, an encoding that
+    /// does not exist and a UTF-16 declaration on a single-byte document make
+    /// it unreadable, as they make `XmlReader` throw; the refresh then keeps
+    /// the stored guide.
+    #[rstest::rstest]
+    #[case::invalid_utf8(&b"<tv><channel id=\"a\"><display-name>T\xe9l\xe9</display-name></channel></tv>"[..])]
+    #[case::unknown_encoding(&b"<?xml version=\"1.0\" encoding=\"klingon\"?><tv></tv>"[..])]
+    #[case::utf16_declared_on_bytes(&b"<?xml version=\"1.0\" encoding=\"utf-16\"?><tv></tv>"[..])]
+    fn a_guide_its_encoding_cannot_read_is_unreadable(#[case] bytes: &[u8]) {
+        assert!(read_xmltv_where(bytes, |_| true).error.is_some());
+    }
+
+    /// A lone surrogate is not UTF-16, even in a well-formed document.
+    #[test]
+    fn a_utf16_guide_with_a_lone_surrogate_is_unreadable() {
+        let utf16 =
+            |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let bytes = [
+            vec![0xFF, 0xFE],
+            utf16("<tv><channel id=\"a\"><display-name>"),
+            vec![0x00, 0xD8],
+            utf16("</display-name></channel></tv>"),
+        ]
+        .concat();
+        assert!(read_xmltv_where(&bytes[..], |_| true).error.is_some());
+    }
+
+    /// An empty or white-space source is an empty document, not a rootless one.
+    #[rstest::rstest]
+    #[case(&b""[..])]
+    #[case(&b" \n\t"[..])]
+    fn an_empty_source_is_an_empty_document(#[case] bytes: &[u8]) {
+        assert_eq!(
+            read_xmltv_where(bytes, |_| true).error.as_deref(),
+            Some("the XMLTV document is empty")
+        );
     }
 }
