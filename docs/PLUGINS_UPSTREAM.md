@@ -128,8 +128,13 @@ Conventions:
   versions here. The linked-child reroute is not ported.
 - Accepted divergences (do NOT "fix" during sync): Upstream's
   `Parallel.ForEach` fire-and-forget async merges (error-dropping) run
-  sequentially in Ferrofin. The episode merge key is scoped to the series
-  *row* (`SeriesPresentationUniqueKey`), not the series name as upstream
+  sequentially in Ferrofin. The four bulk operations (the routes and both
+  daily tasks) also run one at a time: upstream has no lock, so a merge and a
+  split started together interleave their link writes; here a second call
+  waits for the first. The routes keep upstream's plain `[Authorize]` (any
+  signed-in user), unlike core `POST /Videos/MergeVersions`, which requires
+  elevation: owner decision 2026-10-24. The episode merge key is scoped to
+  the series *row* (`SeriesPresentationUniqueKey`), not the series name as upstream
   does: a show present in two libraries (hot/cold tiers) has two series rows
   with one name, and the name-scoped key merged episodes across them —
   hiding each alternate from its own series' list and skewing season counts.
