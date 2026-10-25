@@ -447,6 +447,9 @@ pub struct FerrofinLiveTvManager {
     /// apart from the capture retries in `retry_counts` — see
     /// [`FerrofinLiveTvManager::retry_unread_timer`].
     read_retry_counts: Arc<Mutex<HashMap<String, u32>>>,
+    /// The timers whose fire is checking for, or starting, their capture —
+    /// see [`FiringClaim`].
+    firing: Arc<Mutex<HashSet<String>>>,
     /// The stored rows already reported as unparseable, by table — see
     /// [`FerrofinLiveTvManager::parse_stored_row`].
     unparseable_rows: Arc<Mutex<HashMap<&'static str, HashSet<String>>>>,
@@ -876,6 +879,39 @@ impl CategoryClasses {
     }
 }
 
+/// A fired timer's claim on its capture, held from the in-progress check
+/// until `record_stream` returns, which is after the whole capture (hours,
+/// for a long showing) or its failure. A second fire of the same timer
+/// meanwhile finds the claim taken and stands down. Dropping the claim, a
+/// panic's unwind included, releases the timer.
+struct FiringClaim {
+    firing: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl FiringClaim {
+    /// Claims timer `id`, unless a fire of it already holds the claim.
+    fn take(firing: &Arc<Mutex<HashSet<String>>>, id: &str) -> Option<Self> {
+        firing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.to_owned())
+            .then(|| Self {
+                firing: Arc::clone(firing),
+                id: id.to_owned(),
+            })
+    }
+}
+
+impl Drop for FiringClaim {
+    fn drop(&mut self) {
+        self.firing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
+}
+
 /// Reads an XMLTV document from its file on the blocking pool, keeping the
 /// programmes `keep` accepts, and hands the document back with the result.
 ///
@@ -965,6 +1001,7 @@ impl FerrofinLiveTvManager {
             armed_timers: Arc::new(Mutex::new(HashMap::new())),
             retry_counts: Arc::new(Mutex::new(HashMap::new())),
             read_retry_counts: Arc::new(Mutex::new(HashMap::new())),
+            firing: Arc::new(Mutex::new(HashSet::new())),
             unparseable_rows: Arc::new(Mutex::new(HashMap::new())),
             encoder: None,
             self_writes: None,
@@ -1656,8 +1693,18 @@ impl FerrofinLiveTvManager {
         };
         let before = timer.clone();
         copy_program_into_timer(&program, &mut timer);
-        if timer != before {
+        let changed = timer != before;
+        if changed {
             self.persist_timer(&timer).await?;
+        }
+        // `_timerManager.Update(timer)` → `AddOrUpdateSystemTimer`, for every
+        // live timer whether or not the guide changed it: re-arming is the
+        // backstop for an arm that was lost, and a timer whose showing is under
+        // way fires again at once, which `on_timer_fired` turns away when it is
+        // already recording. An unchanged timer that still has an arm keeps
+        // it: re-arming would aim at the same moment, and it keeps a read
+        // retry's backoff (`retry_unread_timer`) instead of firing at once.
+        if changed || !self.armed_timers_lock().contains_key(id) {
             self.arm_timer(&timer);
         }
         Ok(())
@@ -4984,6 +5031,16 @@ impl FerrofinLiveTvManager {
             }
             return;
         }
+        // `Skipping RecordStream because it's already in progress.` A timer
+        // re-armed while its capture is starting fires again (each guide
+        // refresh re-arms every live timer, `RefreshTimers`), and the capture
+        // registers itself only after several awaits; the claim, held until
+        // `record_stream` returns, makes the check and that registration one
+        // step, so a showing is never captured twice.
+        let Some(_firing) = FiringClaim::take(&self.firing, &timer_id) else {
+            tracing::info!(timer_id, "live tv: that recording is already in progress");
+            return;
+        };
         if self.active_recordings_lock().contains_key(&timer_id) {
             tracing::info!(timer_id, "live tv: that recording is already in progress");
             return;
@@ -10369,6 +10426,45 @@ mod tests {
         );
     }
 
+    /// `RefreshTimers` calls `_timerManager.Update` for every live timer, not
+    /// only one the guide changed, so a timer whose arm was lost is armed again
+    /// by the next guide refresh even when its programme is as it was.
+    #[tokio::test]
+    async fn a_guide_refresh_rearms_a_timer_the_guide_left_unchanged() {
+        let mgr = manager_with_series_guide().await;
+        let airing = refresh_test_airing(&mgr).await;
+        let future = Utc::now() + chrono::Duration::hours(3);
+        let (id, dto) = refresh_test_timer(
+            &airing,
+            "lost arm",
+            RecordingStatus::New,
+            Some(airing.id.clone()),
+            future,
+        );
+        mgr.persist_timer(&dto).await.expect("seed timer");
+        mgr.refresh_guide().await.expect("refresh");
+        let refreshed = timers_by_id(&mgr).await[&id].clone();
+        let arm = Arc::clone(&mgr.armed_timers_lock()[&id]);
+
+        // Unchanged and still armed: the arm stays as it is.
+        mgr.refresh_guide().await.expect("refresh again");
+        assert!(Arc::ptr_eq(&arm, &mgr.armed_timers_lock()[&id]));
+
+        // The arm is lost; the next refresh finds the programme as it was.
+        mgr.disarm_timer(&id);
+        assert!(!mgr.armed_timers_lock().contains_key(&id));
+        mgr.refresh_guide().await.expect("second refresh");
+        assert_eq!(
+            timers_by_id(&mgr).await[&id],
+            refreshed,
+            "the guide changed nothing"
+        );
+        assert!(
+            mgr.armed_timers_lock().contains_key(&id),
+            "the unchanged timer is armed again"
+        );
+    }
+
     /// What `RefreshTimers` must leave alone: `Completed` rows (recordings
     /// reference them; `GetTimersAsync` excludes them), an ended timer whose
     /// capture is still running (`GetActiveRecordingPath`), and a showing
@@ -12697,6 +12793,48 @@ mod tests {
             mgr.on_timer_fired(id.clone()).await;
             assert_eq!(read_retries_of(&mgr, &id), None, "a good read clears it");
             assert_eq!(capture_retries_of(&mgr, &id), Some(1));
+        })
+        .await
+        .expect("test timed out");
+    }
+
+    /// A fire of a timer whose capture another fire is still starting (a guide
+    /// refresh re-arms every live timer, so one under way fires again) stands
+    /// down before it opens anything, as upstream's "already in progress" skip
+    /// does; once that fire is done, the timer captures again.
+    #[tokio::test]
+    async fn a_second_fire_while_the_capture_starts_stands_down() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+            let (id, _) = stored_fire_test_timer(&mgr).await;
+            let starting = super::FiringClaim::take(&mgr.firing, &id).expect("first claim");
+            assert!(
+                super::FiringClaim::take(&mgr.firing, &id).is_none(),
+                "one claim per timer"
+            );
+            let logs = CapturedLogs::default();
+            let guard = logs.install();
+
+            mgr.on_timer_fired(id.clone()).await;
+            drop(guard);
+            assert_eq!(
+                logs.lines_at("INFO", &id)
+                    .iter()
+                    .filter(|line| line.contains("already in progress"))
+                    .count(),
+                1
+            );
+            assert_eq!(capture_retries_of(&mgr, &id), None, "nothing was opened");
+
+            // The first fire is done: the next one tries the capture (which
+            // fails here, the channel being in no lineup).
+            drop(starting);
+            mgr.on_timer_fired(id.clone()).await;
+            assert_eq!(capture_retries_of(&mgr, &id), Some(1));
+            assert!(
+                super::FiringClaim::take(&mgr.firing, &id).is_some(),
+                "a finished fire releases its claim"
+            );
         })
         .await
         .expect("test timed out");
