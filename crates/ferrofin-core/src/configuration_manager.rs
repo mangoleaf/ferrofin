@@ -1779,7 +1779,7 @@ mod tests {
             .expect("write bad branding");
         std::fs::write(&mgr.encoding_file, b"not json").expect("write bad encoding");
 
-        let logs = CapturedLogs::default();
+        let logs = crate::test_support::CapturedLogs::default();
         {
             let _guard = tracing::subscriber::set_default(
                 tracing_subscriber::fmt()
@@ -1852,7 +1852,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().expect("named dir")).expect("named dir");
         std::fs::write(&file, b"{ not json").expect("encoding.json");
 
-        let logs = CapturedLogs::default();
+        let logs = crate::test_support::CapturedLogs::default();
         {
             let _guard = tracing::subscriber::set_default(
                 tracing_subscriber::fmt()
@@ -2373,7 +2373,7 @@ mod tests {
         )
         .expect("metadata.xml");
 
-        let logs = CapturedLogs::default();
+        let logs = crate::test_support::CapturedLogs::default();
         let mgr = {
             let _guard = tracing::subscriber::set_default(
                 tracing_subscriber::fmt()
@@ -3035,32 +3035,5 @@ mod tests {
             error.to_string().contains(&json.display().to_string()),
             "{error}"
         );
-    }
-
-    /// An in-memory log sink for a scoped `fmt` subscriber.
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl CapturedLogs {
-        fn text(&self) -> String {
-            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
-        }
-    }
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log buffer").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
     }
 }

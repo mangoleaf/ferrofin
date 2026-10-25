@@ -81,6 +81,19 @@ fn file_name_without_extension(path: &str) -> &str {
     name.rfind('.').map_or(name, |dot| &name[..dot])
 }
 
+/// Expands every non-empty `PathInfos[].Path` of `options` through `paths`
+/// (`CollectionFolder.LoadLibraryOptions`' `ApplicationHost.ExpandVirtualPath`).
+fn expand_path_infos(
+    options: &mut LibraryOptions,
+    paths: &crate::virtual_paths::VirtualPathExpander,
+) {
+    for info in &mut options.path_infos {
+        if !info.path.is_empty() {
+            info.path = paths.expand(&info.path);
+        }
+    }
+}
+
 /// The directory a caller-supplied library `name` denotes directly under
 /// `parent`, or `None` when the name would land anywhere else.
 ///
@@ -238,6 +251,11 @@ pub struct FerrofinVirtualFolderManager {
     /// (`%AppDataPath%/collections`). Identity until the composition root
     /// sets it.
     virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    /// The `.mblink` shortcuts whose read failure has been logged at error and
+    /// that have not been read since, so a listing repeated on every dashboard
+    /// load names a broken shortcut once instead of on every call. A shortcut
+    /// that reads again is forgotten, so a later failure is logged anew.
+    unreadable_shortcuts: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
     /// The listing per-item and per-request lookups read, shared by every
     /// clone. Upstream keeps each `CollectionFolder`'s options in memory and
     /// refreshes them when they are saved; here every write through this
@@ -291,6 +309,7 @@ impl FerrofinVirtualFolderManager {
             playlists_path: None,
             user_root: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+            unreadable_shortcuts: Arc::default(),
             snapshot: Arc::default(),
             server_configuration: None,
         }
@@ -964,35 +983,58 @@ impl FerrofinVirtualFolderManager {
     /// fetchers and path settings instead of silently reverting to defaults.
     /// The XML is never touched again, and an `options.json` that exists always
     /// wins.
-    async fn load_options(folder_path: &Path) -> LibraryOptions {
+    ///
+    /// Every `PathInfos[].Path` is expanded as `CollectionFolder.LoadLibraryOptions`
+    /// expands it, so a media path Jellyfin stored as `%AppDataPath%/…` or
+    /// `%MetadataPath%/…` is served and compared as the real path, including
+    /// from an `options.json` an earlier adoption persisted with the tokens.
+    async fn load_options(&self, folder_path: &Path) -> LibraryOptions {
         let options_path = folder_path.join(OPTIONS_FILE);
-        match tokio::fs::read(&options_path).await {
+        let mut options = match tokio::fs::read(&options_path).await {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Self::adopt_jellyfin_options(folder_path)
+            Err(_) => Self::adopt_jellyfin_options(folder_path, &self.virtual_paths)
                 .await
                 .unwrap_or_default(),
-        }
+        };
+        expand_path_infos(&mut options, &self.virtual_paths);
+        options
     }
 
     /// Reads options for access checks without writing an adoption sidecar or
     /// provisioning library rows. Missing/unreadable options use upstream defaults.
-    pub(crate) async fn read_options(folder_path: &Path) -> LibraryOptions {
-        if let Ok(bytes) = tokio::fs::read(folder_path.join(OPTIONS_FILE)).await {
-            return serde_json::from_slice(&bytes).unwrap_or_default();
-        }
-        let Ok(xml) = tokio::fs::read_to_string(folder_path.join(JELLYFIN_OPTIONS_FILE)).await
-        else {
-            return LibraryOptions::default();
-        };
-        crate::config_import::import_over(&LibraryOptions::default(), &xml, "LibraryOptions", &[])
+    /// `PathInfos` are expanded through `paths`, as [`Self::load_options`] does.
+    pub(crate) async fn read_options(
+        folder_path: &Path,
+        paths: &crate::virtual_paths::VirtualPathExpander,
+    ) -> LibraryOptions {
+        let mut options = if let Ok(bytes) = tokio::fs::read(folder_path.join(OPTIONS_FILE)).await {
+            serde_json::from_slice(&bytes).unwrap_or_default()
+        } else if let Ok(xml) =
+            tokio::fs::read_to_string(folder_path.join(JELLYFIN_OPTIONS_FILE)).await
+        {
+            crate::config_import::import_over(
+                &LibraryOptions::default(),
+                &xml,
+                "LibraryOptions",
+                &[],
+            )
             .unwrap_or_default()
+        } else {
+            LibraryOptions::default()
+        };
+        expand_path_infos(&mut options, paths);
+        options
     }
 
     /// Imports a Jellyfin `options.xml` beside a missing `options.json` and
-    /// persists the result as `options.json`. `None` when there is no XML; the
-    /// default (and a warning) when the XML cannot be read or converted, so one
-    /// damaged file never blocks listing the library.
-    async fn adopt_jellyfin_options(folder_path: &Path) -> Option<LibraryOptions> {
+    /// persists the result as `options.json`, its `PathInfos` expanded through
+    /// `paths` first so the persisted file holds real paths. `None` when there
+    /// is no XML; the default (and a warning) when the XML cannot be read or
+    /// converted, so one damaged file never blocks listing the library.
+    async fn adopt_jellyfin_options(
+        folder_path: &Path,
+        paths: &crate::virtual_paths::VirtualPathExpander,
+    ) -> Option<LibraryOptions> {
         let xml_path = folder_path.join(JELLYFIN_OPTIONS_FILE);
         let xml = tokio::fs::read_to_string(&xml_path).await.ok()?;
         let imported = match crate::config_import::import_over(
@@ -1001,7 +1043,10 @@ impl FerrofinVirtualFolderManager {
             "LibraryOptions",
             &[],
         ) {
-            Ok(options) => options,
+            Ok(mut options) => {
+                expand_path_infos(&mut options, paths);
+                options
+            }
             Err(err) => {
                 tracing::warn!(
                     path = %xml_path.display(),
@@ -1057,9 +1102,12 @@ impl FerrofinVirtualFolderManager {
             .map_err(|e| Self::io_err("write options.json", &e))
     }
 
-    /// Lists the resolved `.mblink` shortcut targets in a folder, expanded
-    /// and sorted, exactly as `GetVirtualFolderInfo` builds
-    /// `VirtualFolderInfo.Locations`.
+    /// Lists the resolved `.mblink` shortcut targets in a folder, expanded,
+    /// as `GetVirtualFolderInfo` builds `VirtualFolderInfo.Locations`: a
+    /// shortcut that cannot be read is logged and left out. They are sorted
+    /// ordinally here, because this list is also persisted and read by
+    /// background work; [`get_virtual_folders`](VirtualFolderManager::get_virtual_folders)
+    /// re-sorts its response in the request's culture, as upstream's `.Order()` does.
     async fn resolve_locations(&self, folder_path: &Path) -> Result<Vec<String>, ServiceError> {
         let mut locations = Vec::new();
         let mut dir = match tokio::fs::read_dir(folder_path).await {
@@ -1073,20 +1121,68 @@ impl FerrofinVirtualFolderManager {
             .map_err(|e| Self::io_err("iterate folder", &e))?
         {
             let path = entry.path();
-            if is_shortcut(&path)
-                && let Some(target) = Self::resolve_shortcut(&path).await
-            {
-                locations.push(self.virtual_paths.expand(&target));
+            if !is_shortcut(&path) || Self::is_directory(&entry).await {
+                continue;
+            }
+            match Self::resolve_shortcut(&path).await {
+                Ok(target) => {
+                    self.forget_unreadable_shortcut(&path);
+                    if let Some(target) = target {
+                        locations.push(self.virtual_paths.expand(&target));
+                    }
+                }
+                Err(error) => self.report_unreadable_shortcut(&path, &error),
             }
         }
         locations.sort();
         Ok(locations)
     }
 
+    /// Logs a shortcut [`Self::resolve_shortcut`] could not read, as
+    /// `GetVirtualFolderInfo` logs "Error resolving shortcut file": at error
+    /// the first time, at debug while it stays unreadable, since the listing
+    /// runs on every dashboard load.
+    fn report_unreadable_shortcut(&self, shortcut: &Path, error: &std::io::Error) {
+        let first = self
+            .unreadable_shortcuts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(shortcut.to_path_buf());
+        if first {
+            tracing::error!(
+                path = %shortcut.display(),
+                %error,
+                "could not read a library shortcut; its media path is left out of the library"
+            );
+        } else {
+            tracing::debug!(
+                path = %shortcut.display(),
+                %error,
+                "library shortcut still unreadable"
+            );
+        }
+    }
+
+    /// Forgets a shortcut that reads again, so a later failure is logged anew.
+    fn forget_unreadable_shortcut(&self, shortcut: &Path) {
+        self.unreadable_shortcuts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(shortcut);
+    }
+
     /// Resolves one `.mblink` shortcut to its target path (its whole text
     /// content, with a trailing separator trimmed — `MbLinkShortcutHandler.Resolve`).
-    async fn resolve_shortcut(shortcut: &Path) -> Option<String> {
-        let mut content = tokio::fs::read_to_string(shortcut).await.ok()?;
+    ///
+    /// The file is decoded as `File.ReadAllText` decodes it: a UTF-8, UTF-16 or
+    /// UTF-32 byte-order mark selects the encoding and is dropped, and invalid
+    /// UTF-8 becomes U+FFFD. `Ok(None)` for an empty file.
+    ///
+    /// # Errors
+    /// The read's I/O error (a missing or unreadable file).
+    async fn resolve_shortcut(shortcut: &Path) -> std::io::Result<Option<String>> {
+        let bytes = tokio::fs::read(shortcut).await?;
+        let mut content = ferrofin_util::stream_extensions::decode_stream_text(bytes);
         // Path.TrimEndingDirectorySeparator removes one native separator,
         // stopping at the root (including a Windows drive/prefix when present).
         let root_length: usize = Path::new(&content)
@@ -1102,11 +1198,7 @@ impl FerrofinVirtualFolderManager {
         if content.len() > root_length && content.ends_with(std::path::is_separator) {
             content.pop();
         }
-        if content.is_empty() {
-            None
-        } else {
-            Some(content)
-        }
+        Ok((!content.is_empty()).then_some(content))
     }
 
     /// Reads a folder's `<type>.collection` marker, if any (`GetCollectionType`).
@@ -1169,13 +1261,19 @@ impl FerrofinVirtualFolderManager {
             .map_err(|e| Self::io_err("iterate folder", &e))?
         {
             let path = entry.path();
-            if is_shortcut(&path)
-                && Self::resolve_shortcut(&path).await.is_some_and(|found| {
-                    self.virtual_paths
-                        .expand(&found)
-                        .eq_ignore_ascii_case(target)
-                })
-            {
+            if !is_shortcut(&path) || Self::is_directory(&entry).await {
+                continue;
+            }
+            // Upstream's `FirstOrDefault` over `ResolveShortcut` throws on an
+            // unreadable shortcut met before the match.
+            let found = Self::resolve_shortcut(&path)
+                .await
+                .map_err(|e| Self::io_err(&format!("read shortcut {}", path.display()), &e))?;
+            if found.is_some_and(|found| {
+                self.virtual_paths
+                    .expand(&found)
+                    .eq_ignore_ascii_case(target)
+            }) {
                 tokio::fs::remove_file(&path)
                     .await
                     .map_err(|e| Self::io_err("delete shortcut", &e))?;
@@ -1244,8 +1342,10 @@ impl crate::library_monitor::WatchRootsSource for FerrofinVirtualFolderManager {
 }
 
 impl FerrofinVirtualFolderManager {
-    /// Lists every library on disk and in the item store, sorted by name,
-    /// without the live refresh state.
+    /// Lists every library on disk and in the item store, in the order the
+    /// file system enumerates the root (`GetVirtualFolders` maps
+    /// `Directory.EnumerateDirectories` without sorting), without the live
+    /// refresh state.
     async fn list_libraries(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
         let mut dir = match tokio::fs::read_dir(&self.root).await {
             Ok(dir) => dir,
@@ -1259,8 +1359,11 @@ impl FerrofinVirtualFolderManager {
             .map_err(|e| Self::io_err("iterate user-views root", &e))?
         {
             let path = entry.path();
-            let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
-            if !is_dir {
+            // A directory, or a symbolic link to one, as
+            // `Directory.EnumerateDirectories` classifies a link by its target
+            // (a dangling link is not one). The root is read one level deep, so
+            // a link that leads back up needs no loop guard.
+            if !Self::is_directory(&entry).await {
                 continue;
             }
             let name = path.file_name().and_then(|s| s.to_str()).map(str::to_owned);
@@ -1268,8 +1371,18 @@ impl FerrofinVirtualFolderManager {
             // when no row backs it (e.g. a library created before CollectionFolder
             // rows existed). Ensure the row now, so parenting scanned children to it
             // doesn't hit a FOREIGN KEY failure and its ItemId always resolves.
-            if let Some(name) = name.as_deref() {
-                self.ensure_collection_folder(&path, name).await?;
+            // Upstream's listing writes nothing, so a failed write must not fail
+            // it: the library is listed with its projected id, and the next
+            // listing retries the write (the id is not marked parented).
+            if let Some(name) = name.as_deref()
+                && let Err(error) = self.ensure_collection_folder(&path, name).await
+            {
+                tracing::warn!(
+                    library = name,
+                    path = %path.display(),
+                    %error,
+                    "could not heal the library's CollectionFolder row; listing it anyway"
+                );
             }
             let library_id = self.collection_folder_id(&path);
             let locations = self.resolve_locations(&path).await?;
@@ -1291,7 +1404,7 @@ impl FerrofinVirtualFolderManager {
                 name,
                 locations,
                 collection_type: Self::read_collection_type(&path).await,
-                library_options: Some(Self::load_options(&path).await),
+                library_options: Some(self.load_options(&path).await),
                 // `ToString("N")` as `LibraryManager.GetVirtualFolderInfo` does; the
                 // dashboard matches it against `RefreshProgress.ItemId` as a string.
                 item_id: library_id.map(|id| id.simple().to_string()),
@@ -1299,10 +1412,21 @@ impl FerrofinVirtualFolderManager {
                 ..VirtualFolderInfo::default()
             });
         }
-        // Directory enumeration order is unspecified; a stable name sort keeps
-        // the response deterministic (Jellyfin sorts by directory listing too).
-        folders.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(folders)
+    }
+
+    /// Whether a directory entry is a directory or a link to one, as .NET's
+    /// enumeration classifies a link by its target. A library folder's
+    /// shortcuts are its files (`GetFilePaths`), so a directory named
+    /// `*.mblink` is not one.
+    async fn is_directory(entry: &tokio::fs::DirEntry) -> bool {
+        match entry.file_type().await {
+            Ok(kind) if kind.is_symlink() => tokio::fs::metadata(entry.path())
+                .await
+                .is_ok_and(|metadata| metadata.is_dir()),
+            Ok(kind) => kind.is_dir(),
+            Err(_) => false,
+        }
     }
 }
 
@@ -1314,6 +1438,18 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         // The full listing reads everything afresh, so it also refreshes the
         // snapshot: a hand edit shows in lookups once the dashboard lists.
         self.store_libraries(generation, folders.clone().into());
+        // `GetVirtualFolderInfo` sorts `Locations` with `.Order()`, a comparison
+        // in the request's culture. Only the response is re-sorted: the snapshot
+        // above keeps the ordinal order background readers get whatever
+        // request refreshed it.
+        if folders.iter().any(|folder| folder.locations.len() > 1)
+            && let Ok(comparer) =
+                ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture())
+        {
+            for folder in &mut folders {
+                folder.locations.sort_by(|a, b| comparer.compare(a, b));
+            }
+        }
         // Capture once after all filesystem/DB awaits, so every library uses
         // the same scan generation and we build the visible map only once.
         let progress: std::collections::HashMap<_, _> = self
@@ -1375,7 +1511,9 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     /// (BaseItemRepository.QueryBuilding.cs:328-331).
     async fn get_physical_paths(&self) -> Result<Vec<String>, ServiceError> {
         let mut rows: Vec<(String, Vec<String>)> = Vec::new();
-        for folder in self.get_virtual_folders().await? {
+        // Not `get_virtual_folders`: its locations are re-sorted for the request's
+        // culture, and this endpoint needs neither that nor the refresh state.
+        for folder in self.list_libraries().await? {
             let key =
                 ferrofin_util::sort_name::create_sort_name(folder.name.as_deref().unwrap_or(""));
             rows.push((key, folder.locations));
@@ -1600,7 +1738,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         self.create_shortcut(&folder_path, path_info).await?;
         self.remove_content_type_overrides(&path_info.path).await?;
 
-        let mut options = Self::load_options(&folder_path).await;
+        let mut options = self.load_options(&folder_path).await;
         options.path_infos.push(path_info.clone());
         self.sync_options_to_locations(&folder_path, &mut options)
             .await?;
@@ -1616,7 +1754,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     ) -> Result<(), ServiceError> {
         let _snapshot = self.invalidate_on_drop();
         let folder_path = self.require_folder(virtual_folder_name).await?;
-        let mut options = Self::load_options(&folder_path).await;
+        let mut options = self.load_options(&folder_path).await;
         // The pinned UpdateMediaPath synchronizes existing shortcut locations;
         // it does not add or replace the caller's Path. AddMediaPath owns that.
         self.sync_options_to_locations(&folder_path, &mut options)
@@ -1639,7 +1777,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
 
         self.delete_shortcut_for(&folder_path, path).await?;
 
-        let mut options = Self::load_options(&folder_path).await;
+        let mut options = self.load_options(&folder_path).await;
         options.path_infos.retain(|i| i.path != path);
         Self::save_options(&folder_path, &options).await?;
         self.forget_setup(&folder_path);
@@ -1653,7 +1791,7 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
     ) -> Result<(), ServiceError> {
         let _snapshot = self.invalidate_on_drop();
         let folder_path = self.require_folder(virtual_folder_name).await?;
-        let existing = Self::load_options(&folder_path).await;
+        let existing = self.load_options(&folder_path).await;
 
         // Create a shortcut for any newly-referenced media path (C# loops the
         // request's PathInfos and `CreateShortcut`s the ones not already present).
@@ -2365,7 +2503,9 @@ mod tests {
         )
         .expect("virtual");
 
-        let folders = mgr.get_virtual_folders().await.expect("list");
+        let mut folders = mgr.get_virtual_folders().await.expect("list");
+        // Sorted here: the response's order follows the ambient culture.
+        folders[0].locations.sort();
         let data = ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref());
         let mut want = vec![
             format!("{data}/collections"),
@@ -2463,6 +2603,7 @@ mod tests {
             assert_eq!(
                 FerrofinVirtualFolderManager::resolve_shortcut(&shortcut)
                     .await
+                    .expect("read")
                     .as_deref(),
                 expected,
                 "{input:?}"
@@ -2641,6 +2782,400 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(exists, 1, "the CollectionFolder row was re-created");
+    }
+
+    /// An item store whose writes fail while `failing` is set, as a busy, full
+    /// or read-only database's would; otherwise it records the rows saved.
+    #[derive(Default)]
+    struct FlakyStore {
+        failing: std::sync::atomic::AtomicBool,
+        saved: std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>,
+    }
+
+    impl FlakyStore {
+        fn write(&self) -> Result<(), ServiceError> {
+            if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(ServiceError::backend("database or disk is full"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::persistence::ItemPersistenceService for FlakyStore {
+        async fn delete_items(&self, _: &[uuid::Uuid]) -> Result<Vec<uuid::Uuid>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn deletion_closure(
+            &self,
+            _: &[uuid::Uuid],
+        ) -> Result<Vec<ferrofin_db::entities::base_items::BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn save_items(
+            &self,
+            items: &[ferrofin_db::entities::base_items::BaseItemEntity],
+        ) -> Result<(), ServiceError> {
+            self.write()?;
+            let mut saved = self.saved.lock().expect("saved");
+            saved.extend(
+                items
+                    .iter()
+                    .filter_map(|item| uuid::Uuid::parse_str(&item.id).ok()),
+            );
+            Ok(())
+        }
+        async fn set_primary_version_id(
+            &self,
+            _: uuid::Uuid,
+            _: Option<uuid::Uuid>,
+        ) -> Result<(), ServiceError> {
+            self.write()
+        }
+        async fn set_parent_id(&self, _: uuid::Uuid, _: uuid::Uuid) -> Result<(), ServiceError> {
+            self.write()
+        }
+        async fn set_collection_type(&self, _: uuid::Uuid, _: &str) -> Result<(), ServiceError> {
+            self.write()
+        }
+        async fn save_item_values(
+            &self,
+            _: uuid::Uuid,
+            _: &[(i32, String)],
+        ) -> Result<(), ServiceError> {
+            self.write()
+        }
+        async fn item_exists(&self, id: uuid::Uuid) -> Result<bool, ServiceError> {
+            Ok(self.saved.lock().expect("saved").contains(&id))
+        }
+        async fn set_ancestors(&self, _: uuid::Uuid, _: &[uuid::Uuid]) -> Result<(), ServiceError> {
+            self.write()
+        }
+        async fn save_images(
+            &self,
+            _: &ferrofin_db::entities::base_items::BaseItemEntity,
+        ) -> Result<(), ServiceError> {
+            self.write()
+        }
+        async fn reattach_user_data(
+            &self,
+            _: &ferrofin_db::entities::base_items::BaseItemEntity,
+        ) -> Result<(), ServiceError> {
+            self.write()
+        }
+        async fn update_inherited_values(&self) -> Result<(), ServiceError> {
+            self.write()
+        }
+    }
+
+    /// `GetVirtualFolders` writes nothing, so a failed self-heal write must not
+    /// fail the listing: every library is listed with its projected id, the
+    /// failure is logged at warn, and the next listing heals the row once
+    /// writes succeed again.
+    #[tokio::test]
+    async fn a_failed_self_heal_write_still_lists_every_library() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(FlakyStore::default());
+        let mgr = FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+            .with_item_store(Arc::clone(&store) as _);
+        for name in ["Movies", "Shows"] {
+            std::fs::create_dir_all(tmp.path().join("default").join(name)).expect("library");
+        }
+        store
+            .failing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let folders = {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .finish(),
+            );
+            mgr.get_virtual_folders().await.expect("listing survives")
+        };
+        assert_eq!(folders.len(), 2);
+        let ids: Vec<uuid::Uuid> = folders
+            .iter()
+            .map(|f| uuid::Uuid::parse_str(f.item_id.as_deref().expect("ItemId")).expect("uuid"))
+            .collect();
+        assert_eq!(mgr.library_folders().await.expect("snapshot").len(), 2);
+        let text = logs.text();
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains(" WARN ")
+                    && line.contains("could not heal the library's CollectionFolder row"))
+                .count(),
+            2,
+            "one warning per library:\n{text}"
+        );
+
+        store
+            .failing
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        mgr.get_virtual_folders().await.expect("list");
+        let saved = store.saved.lock().expect("saved").clone();
+        for id in ids {
+            assert!(saved.contains(&id), "the next listing heals {id}");
+        }
+    }
+
+    /// `GetVirtualFolders` maps `Directory.EnumerateDirectories` as the file
+    /// system yields it, without sorting by name. The expected order is the
+    /// file system's own; on one that happens to enumerate by name this
+    /// cannot tell a sort apart (tmpfs, ext4 and btrfs do not).
+    #[tokio::test]
+    async fn libraries_list_in_directory_enumeration_order() {
+        let (tmp, mgr) = manager();
+        let root = tmp.path().join("default");
+        for name in ["Shows", "Movies", "Music", "Books"] {
+            std::fs::create_dir_all(root.join(name)).expect("library");
+        }
+        let enumerated: Vec<String> = std::fs::read_dir(&root)
+            .expect("root")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8")
+            })
+            .collect();
+        let listed: Vec<String> = mgr
+            .get_virtual_folders()
+            .await
+            .expect("list")
+            .into_iter()
+            .filter_map(|f| f.name)
+            .collect();
+        assert_eq!(listed, enumerated);
+    }
+
+    /// `GetVirtualFolderInfo` sorts `Locations` with `.Order()`, in the
+    /// request's culture: `/media/kids` before `/media/Movies` under `en-US`,
+    /// where an ordinal sort puts `M` (0x4D) first. The snapshot background
+    /// readers get, and `/Library/PhysicalPaths`, keep the ordinal order.
+    #[tokio::test]
+    async fn locations_sort_in_the_request_culture() {
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("Films");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("Movies.mblink"), "/media/Movies").expect("upper");
+        std::fs::write(folder.join("kids.mblink"), "/media/kids").expect("lower");
+
+        let folders =
+            ferrofin_util::current_culture::scope("en-US".to_owned(), mgr.get_virtual_folders())
+                .await
+                .expect("list");
+        assert_eq!(folders[0].locations, ["/media/kids", "/media/Movies"]);
+        let snapshot = mgr.library_folders().await.expect("snapshot");
+        assert_eq!(snapshot[0].locations, ["/media/Movies", "/media/kids"]);
+        let physical =
+            ferrofin_util::current_culture::scope("en-US".to_owned(), mgr.get_physical_paths())
+                .await
+                .expect("physical paths");
+        assert_eq!(physical, ["/media/Movies", "/media/kids"]);
+    }
+
+    /// `Directory.EnumerateDirectories` classifies a link by its target, so a
+    /// link to a directory under the libraries root is a library (keyed and
+    /// addressed by the link's own path); a dangling link, a file and a link to
+    /// a file are not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_library_directory_is_listed() {
+        let (tmp, mgr) = manager();
+        let root = tmp.path().join("default");
+        std::fs::create_dir_all(&root).expect("root");
+        let target = tmp.path().join("elsewhere").join("Films");
+        std::fs::create_dir_all(&target).expect("target");
+        std::fs::write(target.join("films.mblink"), "/media/films").expect("shortcut");
+        std::os::unix::fs::symlink(&target, root.join("Films")).expect("link");
+        std::os::unix::fs::symlink(tmp.path().join("gone"), root.join("Dangling"))
+            .expect("dangling");
+        std::fs::write(root.join("notes.txt"), "").expect("file");
+        std::os::unix::fs::symlink(root.join("notes.txt"), root.join("FileLink")).expect("link");
+
+        let folders = mgr.get_virtual_folders().await.expect("list");
+        let names: Vec<&str> = folders.iter().filter_map(|f| f.name.as_deref()).collect();
+        assert_eq!(names, ["Films"]);
+        assert_eq!(folders[0].locations, ["/media/films"]);
+        assert_eq!(
+            mgr.require_folder("Films").await.expect("by name"),
+            root.join("Films")
+        );
+    }
+
+    /// `CollectionFolder.LoadLibraryOptions` expands every `PathInfos[].Path`:
+    /// an adopted `options.xml` that stores a media path as `%AppDataPath%/…`
+    /// serves and persists the real path, an `options.json` an earlier
+    /// adoption saved with the `%AppDataPath%` or `%MetadataPath%` token is
+    /// expanded on read, and removing the path the dashboard shows removes the
+    /// options entry too.
+    #[tokio::test]
+    async fn adopted_virtual_media_paths_in_library_options_are_expanded() {
+        let (tmp, mgr) = manager();
+        let paths = Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            tmp.path().join("srv").to_str().expect("utf-8"),
+            "log",
+            "config",
+            "cache",
+            "web",
+        ));
+        let mgr = mgr.with_virtual_paths(crate::virtual_paths::VirtualPathExpander::from_paths(
+            Arc::clone(&paths),
+        ));
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(paths.as_ref());
+        let media = format!("{data}/media");
+        std::fs::create_dir_all(&media).expect("media");
+        let folder = tmp.path().join("default").join("Home");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("media.mblink"), "%AppDataPath%/media").expect("shortcut");
+        std::fs::write(
+            folder.join(super::JELLYFIN_OPTIONS_FILE),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<LibraryOptions>\n  <PathInfos>\n    \
+             <MediaPathInfo>\n      <Path>%AppDataPath%/media</Path>\n    </MediaPathInfo>\n  \
+             </PathInfos>\n</LibraryOptions>\n",
+        )
+        .expect("xml");
+        let path_infos = |folders: &[ferrofin_model::entities_media::VirtualFolderInfo]| {
+            folders[0]
+                .library_options
+                .as_ref()
+                .expect("options")
+                .path_infos
+                .iter()
+                .map(|info| info.path.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let folders = mgr.get_virtual_folders().await.expect("list");
+        assert_eq!(folders[0].locations, std::slice::from_ref(&media));
+        assert_eq!(path_infos(&folders), std::slice::from_ref(&media));
+        let json_path = folder.join(OPTIONS_FILE);
+        let persisted: LibraryOptions =
+            serde_json::from_slice(&std::fs::read(&json_path).expect("json")).expect("parse");
+        assert_eq!(persisted.path_infos[0].path, media, "persisted expanded");
+
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(paths.as_ref());
+        let stored_with_token = opts_with_paths(&[
+            "%AppDataPath%/media".to_owned(),
+            "%MetadataPath%/library".to_owned(),
+        ]);
+        std::fs::write(
+            &json_path,
+            serde_json::to_vec(&stored_with_token).expect("ser"),
+        )
+        .expect("write");
+        let folders = mgr.get_virtual_folders().await.expect("list");
+        assert_eq!(
+            path_infos(&folders),
+            [media.clone(), format!("{metadata}/library")]
+        );
+        assert_eq!(
+            FerrofinVirtualFolderManager::read_options(&folder, &mgr.virtual_paths)
+                .await
+                .path_infos[0]
+                .path,
+            media
+        );
+
+        mgr.remove_media_path("Home", &media).await.expect("remove");
+        let folders = mgr.get_virtual_folders().await.expect("list");
+        assert!(folders[0].locations.is_empty());
+        assert_eq!(
+            path_infos(&folders),
+            [format!("{metadata}/library")],
+            "the options entry went too"
+        );
+    }
+
+    /// `MbLinkShortcutHandler.Resolve` reads with `File.ReadAllText`: a
+    /// UTF-8 or UTF-16 byte-order mark is dropped, so both shortcuts resolve
+    /// and a removal matches them. Only files are shortcuts (`GetFilePaths`),
+    /// so a directory named `*.mblink` is passed over. A shortcut that cannot
+    /// be read is left out and logged at error once, not on every listing;
+    /// once it reads again it is forgotten, so breaking again logs again. A
+    /// removal that meets it before its match fails, as upstream's
+    /// `FirstOrDefault` over `ResolveShortcut` throws.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shortcuts_decode_as_read_all_text_and_an_unreadable_one_is_logged_once() {
+        let (tmp, mgr) = manager();
+        let folder = tmp.path().join("default").join("Mixed");
+        std::fs::create_dir_all(&folder).expect("folder");
+        std::fs::write(folder.join("bom.mblink"), b"\xEF\xBB\xBF/media/bom").expect("bom");
+        let mut wide = vec![0xFF, 0xFE];
+        wide.extend("/media/wide".encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(folder.join("wide.mblink"), wide).expect("utf-16");
+        std::fs::create_dir_all(folder.join("folder.mblink")).expect("not a shortcut");
+        // A link to a missing file: reading it fails, as a file whose
+        // permissions changed would, and it does so even for root.
+        let target = tmp.path().join("target.txt");
+        std::os::unix::fs::symlink(&target, folder.join("broken.mblink")).expect("unreadable");
+
+        let logs = crate::test_support::CapturedLogs::default();
+        let errors = || {
+            let text = logs.text();
+            let count = text
+                .lines()
+                .filter(|line| line.contains(" ERROR ") && line.contains("broken.mblink"))
+                .count();
+            (count, text)
+        };
+        {
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::DEBUG)
+                    .finish(),
+            );
+            for _ in 0..3 {
+                let folders = mgr.get_virtual_folders().await.expect("list");
+                assert_eq!(folders[0].locations, ["/media/bom", "/media/wide"]);
+            }
+            let (count, text) = errors();
+            assert_eq!(count, 1, "one error for the unreadable shortcut:\n{text}");
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.contains(" DEBUG ") && line.contains("broken.mblink"))
+                    .count(),
+                2,
+                "the repeats go to debug:\n{text}"
+            );
+            assert!(!text.contains("folder.mblink"), "{text}");
+            assert!(
+                mgr.remove_media_path("Mixed", "/media/elsewhere")
+                    .await
+                    .is_err(),
+                "a removal meeting an unreadable shortcut fails"
+            );
+
+            std::fs::write(&target, "/media/fixed").expect("readable again");
+            let folders = mgr.get_virtual_folders().await.expect("list");
+            assert_eq!(
+                folders[0].locations,
+                ["/media/bom", "/media/fixed", "/media/wide"]
+            );
+            std::fs::remove_file(&target).expect("unreadable again");
+            mgr.get_virtual_folders().await.expect("list");
+        }
+        let (count, text) = errors();
+        assert_eq!(
+            count, 2,
+            "a shortcut that broke again is logged again:\n{text}"
+        );
+
+        std::fs::remove_file(folder.join("broken.mblink")).expect("drop it");
+        for media in ["/media/bom", "/media/wide"] {
+            mgr.remove_media_path("Mixed", media).await.expect("remove");
+        }
+        assert!(!folder.join("bom.mblink").exists());
+        assert!(!folder.join("wide.mblink").exists());
     }
 
     /// The composition root builds ONE [`UserRootFolderStore`] and shares it,
@@ -2834,11 +3369,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(photos(&mgr.library_folders().await.unwrap()), [false]);
+        // Sorted: the listing comes in the file system's order.
         let names = |folders: &[ferrofin_model::entities_media::VirtualFolderInfo]| {
-            folders
+            let mut names = folders
                 .iter()
                 .map(|f| f.name.clone().unwrap_or_default())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            names.sort();
+            names
         };
         assert_eq!(names(&mgr.library_folders().await.unwrap()), ["Movies"]);
 
@@ -3021,13 +3559,15 @@ mod tests {
             .add_virtual_folder("Lib", None, &opts_with_paths(&[m2]))
             .await
             .unwrap();
-        let folders: Vec<_> = mgr
+        let mut folders: Vec<_> = mgr
             .get_virtual_folders()
             .await
             .unwrap()
             .into_iter()
             .map(|f| (f.name.unwrap(), f.item_id.unwrap()))
             .collect();
+        // Sorted: the listing comes in the file system's order.
+        folders.sort();
         // The returned id is the created library's, never the name-sake it
         // de-duplicated against: the add handler scopes its scan by it.
         assert_eq!(
