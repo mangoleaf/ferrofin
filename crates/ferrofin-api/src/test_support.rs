@@ -1416,8 +1416,8 @@ impl SessionManager for FakeSessions {
 /// contract probe expects them to route, not `404`); `restart` accepts the
 /// request (the backup-restore handler schedules a restart, and its test
 /// asserts the on-disk marker instead); shutdown/storage stay `unimplemented!`.
-/// `snapshot_database` keeps the trait default (writes nothing — no database),
-/// and `free_space_of` reports a disk that never fills.
+/// `snapshot_database` writes a stand-in database file, and `free_space_of`
+/// reports a disk that never fills.
 pub struct FakeSystem;
 
 #[async_trait]
@@ -1439,6 +1439,10 @@ impl SystemManager for FakeSystem {
     }
     async fn get_system_storage_info(&self) -> Result<SystemStorageInfo, ServiceError> {
         unimplemented!("fake")
+    }
+    async fn snapshot_database(&self, dest: &std::path::Path) -> Result<(), ServiceError> {
+        std::fs::write(dest, b"fake database")
+            .map_err(|e| ServiceError::backend(format!("fake snapshot: {e}")))
     }
     async fn free_space_of(&self, _path: &std::path::Path) -> i64 {
         i64::MAX
