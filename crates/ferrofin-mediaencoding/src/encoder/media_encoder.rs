@@ -174,8 +174,9 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
 
     /// Runs one image-extraction ffmpeg, giving up when it outlives the
     /// timeout: `ExtractImageInternal`'s `WaitForExitAsync(timeoutMs)`, then
-    /// `Kill`. Dropping the run kills the child (`kill_on_drop`), and the
-    /// caller's error return then frees its thumbnail-pool permit.
+    /// `Kill`. Dropping the run kills the child (`kill_on_drop`); the caller
+    /// keeps its thumbnail-pool permit for its standard-way attempt, if it has
+    /// one, and frees it when it returns.
     ///
     /// Upstream takes the HDR default when it tone-maps the frame
     /// (`enableHdrExtraction`). These arguments never tone-map (see
@@ -429,6 +430,20 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     }
 }
 
+/// The last 500 characters of ffmpeg's captured output, trimmed: what an
+/// extraction error quotes to say why no image came out.
+fn output_tail(output: &str) -> String {
+    let tail: String = output
+        .chars()
+        .rev()
+        .take(500)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    tail.trim().to_owned()
+}
+
 /// `GetImageResolutionParameter`: fixed output dimensions, including upscaling.
 fn image_resolution_parameter(resolution: ImageResolution) -> &'static str {
     match resolution {
@@ -592,21 +607,13 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             || !std::fs::metadata(&output_path).is_ok_and(|m| m.is_file() && m.len() > 0)
         {
             let _ = std::fs::remove_file(&output_path);
-            let tail: String = output
-                .output
-                .chars()
-                .rev()
-                .take(500)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
+            let tail = output_tail(&output.output);
             return Err(MediaEncodingError::process(format!(
                 "ffmpeg failed to extract audio image from `{path}`: {}",
-                if tail.trim().is_empty() {
+                if tail.is_empty() {
                     "no image produced or unsuccessful exit (no stderr)"
                 } else {
-                    tail.trim()
+                    &tail
                 }
             ))
             .into());
@@ -645,72 +652,87 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
                 temp_dir.display()
             ))
         })?;
-        let output_path = temp_dir
-            .join(format!(
-                "ferrofin-extract-{}.jpg",
-                uuid::Uuid::new_v4().simple()
-            ))
-            .to_string_lossy()
-            .into_owned();
         let input_path = self.get_input_argument(input_file, media_source);
         let image_stream_index = if video_stream.stream_type == MediaStreamType::Video {
             None
         } else {
             Some(video_stream.index)
         };
-        let args = Self::extract_image_arguments(
-            &input_path,
-            container,
-            Some(video_stream),
-            image_stream_index,
-            threed_format,
-            offset_ticks,
-            true,
-            &output_path,
-            self.config.ffmpeg_version,
-            self.config.threads,
-            self.chapter_image_resolution
-                .as_ref()
-                .map_or(ImageResolution::MatchSource, |read| read()),
-        );
         let ffmpeg = self.encoder_path();
+        // One thumbnail-pool slot for both attempts, where upstream locks per
+        // `ExtractImageInternal` run: the standard attempt does not queue
+        // again behind the other extractions.
         let _permit = self
             .image_encoding_pool
             .acquire()
             .await
             .map_err(ServiceError::backend_source)?;
-        let stderr = match self.run_image_extraction(&ffmpeg, &args, input_file).await {
-            Ok(output) => output.into_output(),
-            Err(err) => {
-                let _ = std::fs::remove_file(&output_path);
-                return Err(MediaEncodingError::process(err).into());
-            }
-        };
-        // The process runner mirrors the C# `GetProcessOutput` and ignores the
-        // exit code, so a failed ffmpeg (unreadable input, no frame at the
-        // offset) surfaces only as a missing output file — check it here so
-        // the caller gets the real story instead of an ENOENT from its own
-        // move of a file that never existed.
-        if !std::path::Path::new(&output_path).exists() {
-            let tail: String = stderr
-                .chars()
-                .rev()
-                .take(500)
-                .collect::<Vec<_>>()
-                .iter()
-                .rev()
-                .collect();
-            return Err(MediaEncodingError::process(format!(
-                "ffmpeg produced no frame from `{input_file}`: {}",
-                if tail.trim().is_empty() {
-                    "(no stderr)"
-                } else {
-                    tail.trim()
+        // `ExtractImage`: the I-frame attempt first and, when it fails in any
+        // way (a timeout, an ffmpeg that cannot start or exits non-zero, no
+        // frame written), the standard one, whose failure is the answer.
+        let mut last_error = String::new();
+        for use_iframe in [true, false] {
+            let output_path = temp_dir
+                .join(format!(
+                    "ferrofin-extract-{}.jpg",
+                    uuid::Uuid::new_v4().simple()
+                ))
+                .to_string_lossy()
+                .into_owned();
+            let args = Self::extract_image_arguments(
+                &input_path,
+                container,
+                Some(video_stream),
+                image_stream_index,
+                threed_format,
+                offset_ticks,
+                use_iframe,
+                &output_path,
+                self.config.ffmpeg_version,
+                self.config.threads,
+                self.chapter_image_resolution
+                    .as_ref()
+                    .map_or(ImageResolution::MatchSource, |read| read()),
+            );
+            let output = match self.run_image_extraction(&ffmpeg, &args, input_file).await {
+                Ok(output) => output,
+                Err(err) => {
+                    let _ = std::fs::remove_file(&output_path);
+                    // A hung or unstartable ffmpeg is rare; the routine
+                    // "no frame the quick way" fallback below stays quiet.
+                    if use_iframe {
+                        tracing::warn!(
+                            path = input_file,
+                            error = %err,
+                            "I-frame image extraction failed, retrying the standard way"
+                        );
+                    }
+                    last_error = err;
+                    continue;
                 }
-            ))
-            .into());
+            };
+            // `ExtractImageInternal`'s `ExitCode > 0 || !file.Exists ||
+            // file.Length == 0`. A failed ffmpeg (unreadable input, no frame
+            // at the offset) surfaces as no file and a stderr tail; check it
+            // here so the caller gets the real story instead of an ENOENT from
+            // its own move of a file that never existed.
+            if output.success
+                && std::fs::metadata(&output_path).is_ok_and(|m| m.is_file() && m.len() > 0)
+            {
+                return Ok(output_path);
+            }
+            let _ = std::fs::remove_file(&output_path);
+            let tail = output_tail(&output.output);
+            last_error = format!(
+                "ffmpeg produced no frame from `{input_file}`: {}",
+                match (tail.is_empty(), output.success) {
+                    (false, _) => &tail,
+                    (true, true) => "(no stderr)",
+                    (true, false) => "unsuccessful exit (no stderr)",
+                }
+            );
         }
-        Ok(output_path)
+        Err(MediaEncodingError::process(last_error).into())
     }
 
     async fn extract_image_stream(
@@ -736,6 +758,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
         })?;
         let input_path = self.get_input_argument(input_file, media_source);
         let ffmpeg = self.encoder_path();
+        // One slot for both attempts, as for a video frame above.
         let _permit = self
             .image_encoding_pool
             .acquire()
@@ -771,7 +794,7 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
             // `ExtractImage` falls through to the standard attempt on any
             // failure of the I-frame one, a timed-out run among them.
             let output = match self.run_image_extraction(&ffmpeg, &args, input_file).await {
-                Ok(output) => output.into_output(),
+                Ok(output) => output,
                 Err(err) => {
                     let _ = std::fs::remove_file(&output_path);
                     // A hung or unstartable ffmpeg is rare; the routine
@@ -787,18 +810,18 @@ impl<T: Transcoder> MediaEncoder for MediaEncoderImpl<T> {
                     continue;
                 }
             };
-            if std::fs::metadata(&output_path).is_ok_and(|m| m.is_file() && m.len() > 0) {
+            // `ExtractImageInternal`'s `ExitCode > 0 || !file.Exists ||
+            // file.Length == 0`.
+            if output.success
+                && std::fs::metadata(&output_path).is_ok_and(|m| m.is_file() && m.len() > 0)
+            {
                 return Ok(output_path);
             }
             let _ = std::fs::remove_file(&output_path);
-            last_error = output
-                .chars()
-                .rev()
-                .take(500)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
+            last_error = output_tail(&output.output);
+            if last_error.is_empty() && !output.success {
+                "unsuccessful exit (no stderr)".clone_into(&mut last_error);
+            }
         }
         Err(MediaEncodingError::process(format!(
             "ffmpeg image extraction failed for `{input_file}` stream {stream_index}: {}",
@@ -1369,12 +1392,12 @@ mod tests {
 
     /// `ExtractImageInternal`: an ffmpeg that does not exit within the
     /// timeout (10 s for an SDR frame when `ImageExtractionTimeoutMs` is
-    /// unset) is killed, the extraction fails, and its thumbnail-pool permit
-    /// is free again.
+    /// unset) is killed, and its thumbnail-pool permit is free again. A video
+    /// frame has two attempts (`ExtractImage`), so it fails once both hung.
     #[tokio::test(start_paused = true)]
     async fn a_hung_frame_extraction_is_stopped_at_the_default_timeout() {
         let tmp = tempfile::tempdir().unwrap();
-        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let transcoder = Arc::new(HangingTranscoder::hanging(2));
         let pool = Arc::new(tokio::sync::Semaphore::new(1));
         let enc = hanging_encoder(&transcoder, tmp.path(), &pool);
         let start = tokio::time::Instant::now();
@@ -1394,8 +1417,8 @@ mod tests {
 
         let err = result.expect_err("a hung ffmpeg is a failure");
         assert!(err.to_string().contains("timed out"), "{err}");
-        assert_eq!(start.elapsed(), std::time::Duration::from_secs(10));
-        assert_eq!(transcoder.abandoned(), 1, "the hung run is given up");
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(20));
+        assert_eq!(transcoder.abandoned(), 2, "each hung run is given up");
         assert_eq!(pool.available_permits(), 1);
     }
 
@@ -1410,7 +1433,7 @@ mod tests {
         #[case] expected_ms: u64,
     ) {
         let tmp = tempfile::tempdir().unwrap();
-        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let transcoder = Arc::new(HangingTranscoder::hanging(2));
         let pool = Arc::new(tokio::sync::Semaphore::new(1));
         let enc = hanging_encoder(&transcoder, tmp.path(), &pool)
             .with_image_extraction_timeout(move || configured);
@@ -1427,9 +1450,10 @@ mod tests {
             .await
             .expect_err("a hung ffmpeg is a failure");
 
+        // Each of the two attempts waits the whole timeout.
         assert_eq!(
             start.elapsed(),
-            std::time::Duration::from_millis(expected_ms)
+            std::time::Duration::from_millis(2 * expected_ms)
         );
         assert!(
             err.to_string().contains(&format!("after {expected_ms}ms")),
@@ -1461,6 +1485,37 @@ mod tests {
 
         assert!(std::path::Path::new(&out).exists());
         assert_eq!((transcoder.runs(), transcoder.abandoned()), (2, 1));
+        assert_eq!(pool.available_permits(), 1);
+    }
+
+    /// The same for a video frame: the hung I-frame run is given up at the
+    /// timeout and the standard attempt delivers the frame.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_iframe_frame_grab_falls_back_to_the_standard_way() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(HangingTranscoder::hanging(1));
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let enc = hanging_encoder(&transcoder, tmp.path(), &pool);
+        let start = tokio::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            enc.extract_video_image(
+                "/media/stalled.mkv",
+                "",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                Some(10 * TICKS_PER_SECOND),
+            ),
+        )
+        .await
+        .expect("the extraction gives up on a hung ffmpeg")
+        .expect("the standard attempt extracts the frame");
+
+        assert!(std::path::Path::new(&out).exists());
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(10));
+        assert_eq!((transcoder.runs(), transcoder.abandoned()), (2, 1));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
         assert_eq!(pool.available_permits(), 1);
     }
 
@@ -1522,9 +1577,8 @@ mod tests {
         );
     }
 
-    // The process runner ignores ffmpeg's exit code (C# GetProcessOutput
-    // parity), so a run that produced no file must be surfaced here as a real
-    // error — not deferred to the caller's move of a nonexistent file.
+    // A run that produced no file must be surfaced here as a real error — not
+    // deferred to the caller's move of a nonexistent file.
     #[tokio::test]
     async fn extract_video_image_errors_when_no_frame_was_produced() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1552,6 +1606,254 @@ mod tests {
             err.to_string().contains("produced no frame"),
             "error names the real failure, got: {err}"
         );
+    }
+
+    /// What one scripted run leaves at the output path.
+    #[derive(Debug, Clone, Copy)]
+    enum Wrote {
+        Nothing,
+        EmptyFile,
+        Frame,
+    }
+
+    /// A transcoder that plays one scripted run per call: what it writes to
+    /// the output path and whether it exits with status 0. Runs past the
+    /// script write a frame and succeed.
+    struct ScriptedFrames {
+        script: Vec<(Wrote, bool)>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedFrames {
+        fn new(script: &[(Wrote, bool)]) -> Self {
+            Self {
+                script: script.to_vec(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Transcoder for ScriptedFrames {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            let run = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(arguments.to_owned());
+                calls.len() - 1
+            };
+            let (wrote, success) = self
+                .script
+                .get(run)
+                .copied()
+                .unwrap_or((Wrote::Frame, true));
+            let argv = crate::encoder::split_args(arguments)?;
+            let out = argv.last().expect("the output path is the last argument");
+            match wrote {
+                Wrote::Nothing => {}
+                Wrote::EmptyFile => std::fs::write(out, b"").expect("write empty file"),
+                Wrote::Frame => std::fs::write(out, b"jpg").expect("write frame"),
+            }
+            Ok(ProcessOutput {
+                output: format!("run {run} log tail"),
+                success,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            true
+        }
+    }
+
+    fn scripted_encoder(
+        transcoder: &Arc<ScriptedFrames>,
+        temp: &std::path::Path,
+    ) -> MediaEncoderImpl<ScriptedFrames> {
+        MediaEncoderImpl::new(
+            Arc::clone(transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig {
+                temp_dir: temp.to_path_buf().into(),
+                ..MediaEncoderConfig::default()
+            },
+        )
+    }
+
+    /// `ExtractImage`: a video frame the I-frame attempt (24-frame
+    /// `thumbnail` sampling) did not deliver, because it wrote nothing, wrote
+    /// an empty file or exited non-zero (`ExitCode > 0` fails even a written
+    /// file), is taken the standard way, without the sampling. Only the
+    /// delivered frame is left in the temp dir.
+    #[rstest]
+    #[case::no_frame((Wrote::Nothing, true))]
+    #[case::empty_file((Wrote::EmptyFile, true))]
+    #[case::failed_exit((Wrote::Frame, false))]
+    #[tokio::test]
+    async fn a_video_frame_the_iframe_attempt_missed_is_taken_the_standard_way(
+        #[case] first: (Wrote, bool),
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(ScriptedFrames::new(&[first]));
+        let out = scripted_encoder(&transcoder, tmp.path())
+            .extract_video_image(
+                "/media/recording.ts",
+                "mpegts",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                Some(10 * TICKS_PER_SECOND),
+            )
+            .await
+            .expect("the standard attempt extracts the frame");
+
+        // The quick way samples 24 frames and, seeking MPEG-TS, decodes
+        // keyframes only; the standard way does neither.
+        let calls = transcoder.calls();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(
+            calls[0].contains("-skip_frame nokey ") && calls[0].contains(",thumbnail=n=24"),
+            "{}",
+            calls[0]
+        );
+        assert!(
+            !calls[1].contains("skip_frame") && !calls[1].contains("thumbnail"),
+            "{}",
+            calls[1]
+        );
+        assert!(std::path::Path::new(&out).starts_with(tmp.path()));
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    /// Both attempts failing is the standard attempt's failure, with its
+    /// stderr tail, and leaves nothing behind.
+    #[tokio::test]
+    async fn a_video_frame_neither_attempt_delivers_reports_the_standard_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(ScriptedFrames::new(&[
+            (Wrote::Nothing, true),
+            (Wrote::Frame, false),
+        ]));
+        let err = scripted_encoder(&transcoder, tmp.path())
+            .extract_video_image(
+                "/media/movie.mkv",
+                "mkv",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("no frame either way");
+
+        let err = err.to_string();
+        assert!(
+            err.contains("produced no frame") && err.contains("run 1 log tail"),
+            "{err}"
+        );
+        assert_eq!(transcoder.calls().len(), 2);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    /// An ffmpeg that exits non-zero, writes nothing and says nothing.
+    struct SilentFailure;
+
+    #[async_trait]
+    impl Transcoder for SilentFailure {
+        async fn get_process_output(
+            &self,
+            _path: &str,
+            _arguments: &str,
+            _read_stderr: bool,
+            _test_key: Option<&str>,
+            _env: &[(String, String)],
+        ) -> Result<ProcessOutput, String> {
+            Ok(ProcessOutput {
+                output: String::new(),
+                success: false,
+            })
+        }
+
+        async fn get_process_exit_code(&self, _path: &str, _arguments: &str) -> bool {
+            false
+        }
+    }
+
+    /// With no stderr to quote, the error still says ffmpeg failed.
+    #[tokio::test]
+    async fn a_silent_failed_extraction_says_it_exited_unsuccessfully() {
+        let tmp = tempfile::tempdir().unwrap();
+        let enc = MediaEncoderImpl::new(
+            Arc::new(SilentFailure),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig {
+                temp_dir: tmp.path().to_path_buf().into(),
+                ..MediaEncoderConfig::default()
+            },
+        );
+        let frame = enc
+            .extract_video_image(
+                "/media/movie.mkv",
+                "mkv",
+                &MediaSourceInfo::default(),
+                &video_stream(),
+                None,
+                None,
+            )
+            .await
+            .expect_err("no frame");
+        let picture = enc
+            .extract_image_stream(
+                "/media/movie.mkv",
+                "mkv",
+                &MediaSourceInfo::default(),
+                2,
+                ImageFormat::Jpg,
+            )
+            .await
+            .expect_err("no picture");
+        for err in [frame.to_string(), picture.to_string()] {
+            assert!(err.contains("unsuccessful exit (no stderr)"), "{err}");
+        }
+    }
+
+    /// An embedded picture whose quick attempt exited non-zero or wrote an
+    /// empty file is extracted again the standard way, as
+    /// `ExtractImageInternal` fails that run.
+    #[rstest]
+    #[case::failed_exit((Wrote::Frame, false))]
+    #[case::empty_file((Wrote::EmptyFile, true))]
+    #[tokio::test]
+    async fn an_image_stream_the_quick_attempt_missed_is_extracted_again(
+        #[case] first: (Wrote, bool),
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcoder = Arc::new(ScriptedFrames::new(&[first]));
+        let out = scripted_encoder(&transcoder, tmp.path())
+            .extract_image_stream(
+                "/media/movie.mkv",
+                "mkv",
+                &MediaSourceInfo::default(),
+                2,
+                ImageFormat::Jpg,
+            )
+            .await
+            .expect("the standard attempt extracts the picture");
+
+        assert_eq!(transcoder.calls().len(), 2);
+        assert!(std::path::Path::new(&out).exists());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 1);
     }
 
     // A failed extraction is only ever reported as a missing output file, and
