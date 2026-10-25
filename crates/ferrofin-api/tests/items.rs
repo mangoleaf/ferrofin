@@ -341,7 +341,7 @@ const COLLECTION_FOLDER_ID: Uuid = Uuid::from_u128(0xC0F);
 const USER_ROOT_ID: Uuid = Uuid::from_u128(0x500);
 
 /// The `PlaylistsFolder` `CreateRootFolder` parents to the `AggregateFolder`
-/// and registers as a virtual child (LibraryManager.cs:855-885).
+/// and registers as a virtual child (v12.2 LibraryManager.cs:1101-1150).
 const PLAYLISTS_FOLDER_ID: Uuid = Uuid::from_u128(0x9F1);
 
 /// A playlist inside it — the chain that exercises the plug-in-folder exemption.
@@ -383,7 +383,13 @@ struct OkLibrary {
     /// provider fake that refreshes it, and its images.
     person: SharedRow,
     person_images: Vec<ferrofin_traits::options::ItemImageInfo>,
+    /// When non-empty, the page `query_items` answers with, in this order and
+    /// out of [`PAGE_TOTAL`] rows, instead of the single `item_id` row.
+    rows: Vec<BaseItemEntity>,
 }
+
+/// The total record count `query_items` reports alongside [`OkLibrary::rows`].
+const PAGE_TOTAL: i32 = 9;
 
 /// Holds a fake delete half way, so a test can drop the request meanwhile.
 #[derive(Default)]
@@ -555,6 +561,13 @@ impl LibraryManager for OkLibrary {
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
         *self.last_query.lock().unwrap() = Some(query.clone());
+        if !self.rows.is_empty() {
+            return Ok(QueryResult::new(
+                query.start_index,
+                Some(PAGE_TOTAL),
+                self.rows.clone(),
+            ));
+        }
         Ok(QueryResult::new(
             Some(0),
             Some(1),
@@ -2059,6 +2072,75 @@ async fn filtered_user_root_and_typed_library_browses_run_recursively() {
     let view = query_for(&format!("parentId={TV_VIEW_ID}&includeItemTypes=Episode")).await;
     assert_eq!(view.parent_id, TV_LIBRARY_ID);
     assert!(!view.recursive);
+}
+
+/// Explicit ids without a `sortBy` answer in the order they were asked for:
+/// `ItemsController.GetItems` hands them to `Folder.GetItems`, which reorders
+/// the repository's page with `SortItemsByRequest` when `OrderBy` is empty and
+/// there is more than one id (v12.2 Folder.cs:1065-1083). The legacy
+/// `/Users/{userId}/Items` and `/Trailers` delegate to `GetItems`
+/// (ItemsController.cs:725, TrailersController.cs:216-217). Only the page is
+/// reordered: the start index and the total stay the repository's. Any
+/// `sortBy`, `Default` included, keeps the repository's order, and so does a
+/// search, which is ordered by relevance and `SortName`.
+#[tokio::test]
+async fn explicit_ids_answer_in_the_requested_order_unless_a_sort_is_asked() {
+    let [alpha, bravo, charlie] = [0x852_0001, 0x852_0002, 0x852_0003].map(Uuid::from_u128);
+    let names = |uri: String| async move {
+        let library = OkLibrary {
+            item_id: alpha,
+            // The repository's default (`SortName`) order.
+            rows: vec![
+                item_entity(alpha, "Alpha", BaseItemKind::Movie),
+                item_entity(bravo, "Bravo", BaseItemKind::Movie),
+                item_entity(charlie, "Charlie", BaseItemKind::Movie),
+            ],
+            ..Default::default()
+        };
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body = json_body(response).await;
+        assert_eq!(body["StartIndex"], 2, "{uri}: {body}");
+        assert_eq!(body["TotalRecordCount"], PAGE_TOTAL, "{uri}: {body}");
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let ids = format!("ids={charlie},{alpha},{bravo}&startIndex=2");
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        for path in [
+            "/Items".to_owned(),
+            format!("/Users/{USER_ID}/Items"),
+            "/Trailers".to_owned(),
+        ] {
+            assert_eq!(
+                names(format!("{path}?{ids}")).await,
+                ["Charlie", "Alpha", "Bravo"],
+                "{path}: the requested order"
+            );
+            for kept in ["sortBy=SortName", "sortBy=Default", "searchTerm=a"] {
+                assert_eq!(
+                    names(format!("{path}?{ids}&{kept}")).await,
+                    ["Alpha", "Bravo", "Charlie"],
+                    "{path}?{kept}: the repository's order"
+                );
+            }
+        }
+    })
+    .await
+    .expect("the requests finish");
 }
 
 #[tokio::test]

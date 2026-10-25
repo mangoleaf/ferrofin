@@ -287,6 +287,14 @@ pub struct FerrofinSessionManager {
     /// session and the play session), and a release under either drops BOTH, so
     /// it counts once. A plain set of released ids would count that viewer
     /// twice and close a stream another viewer is still watching.
+    ///
+    /// Entries come only from start and progress reports that name a
+    /// `LiveStreamId`, and the guard lasts only while a stream has one. A
+    /// stream with no entry (no report named it, or its last holder released)
+    /// is closed by any release, as upstream has done since 12.0-rc2: that is
+    /// what frees the tuner of a client whose reports omit the `LiveStreamId`.
+    /// So a release after the last holder's closes again, which costs nothing
+    /// unless an unregistered viewer shares the stream.
     active_live_stream_sessions: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
     /// Serializes the `MaxActiveSessions` admission decision with the session
     /// creation that satisfies it.
@@ -2202,44 +2210,55 @@ impl SessionManager for FerrofinSessionManager {
     ) -> Result<(), ServiceError> {
         // Port of `CloseLiveStreamIfNeededAsync`. A Live TV stream IS shared
         // between viewers (they all get the same `LiveStreamId`) and every
-        // `OpenLiveStream` raised its consumer count, so a release must happen
-        // exactly once per viewer: `MediaSourceManager::close_live_stream` drops
-        // the tuner when that count reaches zero, and one release too many takes
-        // the channel away from someone still watching. The holder map is what
-        // makes "once per viewer" true — see its field docs. A report for a
-        // stream this server never registered releases nothing, as upstream's
-        // missing-mapping branch does.
+        // `OpenLiveStream` raised its consumer count;
+        // `MediaSourceManager::close_live_stream` lowers it and drops the tuner
+        // at zero. The holder map (see its field docs) decides whether this
+        // release closes, in upstream's three cases:
+        // - the caller's id holds the stream: that id and its partner are
+        //   removed and the stream is closed, so the same viewer reporting under
+        //   both its session id and its play-session id, or twice, closes once;
+        // - the stream has holders but not this id (this viewer already
+        //   released, or never held it): nothing is closed, so one release too
+        //   many cannot take the channel from someone still watching;
+        // - the stream has no holder entry at all (no start or progress report
+        //   named it, or its last holder already released): it is closed
+        //   (upstream's `else { liveStreamNeedsToBeClosed = true; }`). That frees
+        //   the tuner of a client whose play-state reports omit the
+        //   `LiveStreamId`; closing a stream that is already closed is a no-op.
         if live_stream_id.is_empty() {
             return Ok(());
         }
-        // One close per VIEWER (C# `CloseLiveStreamIfNeededAsync`): removing the
-        // id the caller used also removes its partner, so the same viewer
-        // reporting under both its session id and its play-session id — or
-        // reporting twice — releases the consumer once.
-        {
+        let needs_close = {
             let mut holders = self.active_live_stream_sessions.lock().await;
-            let Some(mappings) = holders.get_mut(live_stream_id) else {
+            if let Some(mappings) = holders.get_mut(live_stream_id) {
+                let released = if let Some(partner) = mappings.remove(session_or_play_session_id) {
+                    if !partner.is_empty() {
+                        mappings.remove(&partner);
+                    }
+                    true
+                } else {
+                    debug!(
+                        %live_stream_id,
+                        session = %session_or_play_session_id,
+                        "live stream not held by this session; releasing nothing"
+                    );
+                    false
+                };
+                if mappings.is_empty() {
+                    holders.remove(live_stream_id);
+                }
+                released
+            } else {
                 debug!(
                     %live_stream_id,
                     session = %session_or_play_session_id,
-                    "live stream has no registered holder"
+                    "live stream has no registered holder; closing it"
                 );
-                return Ok(());
-            };
-            let Some(partner) = mappings.remove(session_or_play_session_id) else {
-                debug!(
-                    %live_stream_id,
-                    session = %session_or_play_session_id,
-                    "live stream already released by this session"
-                );
-                return Ok(());
-            };
-            if !partner.is_empty() {
-                mappings.remove(&partner);
+                true
             }
-            if mappings.is_empty() {
-                holders.remove(live_stream_id);
-            }
+        };
+        if !needs_close {
+            return Ok(());
         }
         let Some(media_sources) = self.media_sources.as_ref() else {
             return Ok(());

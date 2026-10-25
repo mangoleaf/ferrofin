@@ -372,6 +372,31 @@ pub(crate) fn build_latest_tv_series_query(filter: &InternalItemsQuery) -> Query
     qb
 }
 
+/// v12's movies "latest" (`GetLatestMovieItems`,
+/// `Jellyfin.Server.Implementations/Item/BaseItemRepository.Querying.cs:233-256`):
+/// the rows the caller's filter matches that carry a presentation key, newest
+/// first (`DateCreated DESC, Id DESC`), as `(Id, PresentationUniqueKey)`. The
+/// caller reads it as a stream and stops at `limit` distinct keys, keeping the
+/// first row of each.
+///
+/// No grouping by presentation key and no `LIMIT`: v12's `GetLatestItemList`
+/// builds its base query with `TranslateQuery` alone, and the de-duplication
+/// is what the limit counts. The caller's `order_by` and `start_index` play no
+/// part, as upstream.
+#[must_use]
+pub(crate) fn build_latest_movies_query(filter: &InternalItemsQuery) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT bi."Id" AS "Id", bi."PresentationUniqueKey" AS "PresentationUniqueKey"
+           FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
+    );
+    qb.push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb.push(
+        r#" AND bi."PresentationUniqueKey" IS NOT NULL ORDER BY bi."DateCreated" DESC, bi."Id" DESC"#,
+    );
+    qb
+}
+
 /// Step 2 of `GetLatestTvShowItems` (`Querying.cs:313-325`): the rows of
 /// `series_names` the caller's filter matches, created at or after `cutoff`
 /// when there is one, as the lightweight `(Id, SeriesName, DateCreated,
@@ -779,8 +804,8 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
             // concatenates `LibraryManager.RootFolder.VirtualChildren`).
             //
             // Narrowed to the plug-in-folder types on purpose:
-            // `AddVirtualChild` has exactly ONE call site in 10.11.8
-            // (LibraryManager.cs:883, the playlists folder), and the
+            // `AddVirtualChild` has exactly ONE call site in v12.2
+            // (LibraryManager.cs:1146, the playlists folder), and the
             // aggregate's other children — the physical library folders,
             // `%AppDataPath%/collections`, the recordings folder — must not
             // leak into the user root's children.
@@ -2950,6 +2975,13 @@ fn push_order_expression(
     }
     // `OrderMapper`'s `ItemValues`-correlated keys: the first value of the type
     // by its clean (ordinal) text — `Studio`, `Artist`, `AlbumArtist`.
+    //
+    // `CROSS JOIN` is the join-order pin: the row's own map rows
+    // (`IX_ItemValuesMap_ItemId`), then each value by its primary key, and the
+    // handful sorted per row. Left to choose, SQLite drove the sub-select from
+    // `IX_ItemValues_Type_CleanValue (Type=?)`, which hands it the `ORDER BY`
+    // for free, and probed the map for every value of the type, per row: a
+    // recursive `/Items` page sorted by artist cost 1.1 s on the gl-637 corpus.
     if let Some(value_type) = match by {
         ItemSortBy::Artist => Some(0),
         ItemSortBy::AlbumArtist => Some(1),
@@ -2958,7 +2990,7 @@ fn push_order_expression(
     } {
         qb.push(format!(
             r#"(SELECT iv."CleanValue" FROM "ItemValuesMap" ivm
-                JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
+                CROSS JOIN "ItemValues" iv ON iv."ItemValueId" = ivm."ItemValueId"
                 WHERE ivm."ItemId" = bi."Id" AND iv."Type" = {value_type}
                 ORDER BY iv."CleanValue" LIMIT 1)"#
         ));
@@ -2994,16 +3026,6 @@ fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
         ItemSortBy::VideoBitRate => r#"bi."TotalBitrate""#,
         ItemSortBy::ParentIndexNumber => r#"bi."ParentIndexNumber""#,
         ItemSortBy::IndexNumber => r#"bi."IndexNumber""#,
-        // Aired order: (season, episode). Specials (`ParentIndexNumber = 0`) have
-        // no air-date positioning here, so they sort *after* the regular seasons
-        // (rather than at the very front, where `SortName`/filename order put
-        // them and made "Play"/"Play All" start on a special). Port of
-        // `AiredEpisodeOrderComparer` with the metadata-less special placed last.
-        ItemSortBy::AiredEpisodeOrder => {
-            r#"(CASE WHEN bi."ParentIndexNumber" = 0 THEN 1000000
-                     ELSE COALESCE(bi."ParentIndexNumber", 0) END) * 100000
-               + COALESCE(bi."IndexNumber", 0)"#
-        }
         ItemSortBy::IsFolder => r#"bi."IsFolder""#,
         ItemSortBy::OfficialRating => r#"bi."InheritedParentalRatingValue""#,
         ItemSortBy::SeriesSortName => r#"bi."SeriesName""#,
@@ -3012,6 +3034,9 @@ fn order_column(by: ItemSortBy, _has_user: bool) -> &'static str {
         ItemSortBy::Name => r#"bi."CleanName""#,
         // Everything else falls back to SortName (the join-backed keys
         // `Artist`, `AlbumArtist` and `Studio` are expressions of their own).
+        // That includes `AiredEpisodeOrder`: `OrderMapper` has no arm for it,
+        // and `AiredEpisodeOrderComparer` only runs in upstream's in-memory
+        // sorts (a folder's children, a season's episodes, Next Up).
         _ => r#"bi."SortName""#,
     }
 }
@@ -3115,6 +3140,84 @@ mod tests {
             );
             assert!(!plan.iter().any(|d| d.starts_with("SCAN")), "{plan:?}");
         }
+    }
+
+    /// The movies arm of the grouped Latest (`build_latest_movies_query`), as
+    /// the user-view manager sends it for a movies library and for the unscoped
+    /// home row: the libraries' rows come off an index seek by top parent,
+    /// never a scan of every item.
+    #[tokio::test]
+    async fn latest_movies_rows_seek_the_libraries() {
+        use ferrofin_model::data::MediaType;
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let filter = InternalItemsQuery {
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
+            media_types: vec![MediaType::Video, MediaType::Audio],
+            top_parent_ids: vec![uuid::Uuid::from_u128(0x8691), uuid::Uuid::from_u128(0x8692)],
+            limit: Some(20),
+            ..InternalItemsQuery::default()
+        };
+        let mut builder = super::build_latest_movies_query(&filter);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|d| d.starts_with("SEARCH bi USING ") && d.contains("TopParentId=?")),
+            "{plan:#?}"
+        );
+        assert!(!plan.iter().any(|d| d.starts_with("SCAN bi")), "{plan:#?}");
+    }
+
+    /// The `ItemValues` sort keys (`OrderMapper`'s `Artist`, `AlbumArtist`,
+    /// `Studio`) read each row's own values: the map by the row's item, then
+    /// each value by its id. Left to choose, SQLite drove the per-row
+    /// sub-select from `IX_ItemValues_Type_CleanValue (Type=?)` — the index
+    /// that hands it the inner `ORDER BY` for free — and probed the map for
+    /// every value of the type, per row: a recursive `/Items` page sorted by
+    /// artist cost 1.1 s on the gl-637 corpus.
+    #[rstest::rstest]
+    #[case(ItemSortBy::Artist)]
+    #[case(ItemSortBy::AlbumArtist)]
+    #[case(ItemSortBy::Studio)]
+    #[tokio::test]
+    async fn item_value_sort_keys_read_each_rows_own_values(#[case] by: ItemSortBy) {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let filter = InternalItemsQuery {
+            order_by: vec![(by, SortOrder::Ascending)],
+            limit: Some(20),
+            ..InternalItemsQuery::default()
+        };
+        let mut builder = build_query(&filter, QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        let at = |prefix: &str| {
+            plan.iter()
+                .position(|d| d.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no {prefix}: {plan:#?}"))
+        };
+        let (ivm, iv) = (at("SEARCH ivm "), at("SEARCH iv "));
+        assert!(ivm < iv, "the map drives: {plan:#?}");
+        assert!(plan[ivm].ends_with("(ItemId=?)"), "{plan:#?}");
+        assert!(plan[iv].ends_with("(ItemValueId=?)"), "{plan:#?}");
     }
 
     /// The candidate read behind the Playlists/Collections views
@@ -3730,6 +3833,23 @@ mod tests {
         assert_eq!(
             order_by(&sorted_by(&[(ItemSortBy::AirTime, SortOrder::Ascending)])),
             r#"ORDER BY +bi."SortName" ASC, bi."SortName" ASC"#
+        );
+        // `AiredEpisodeOrder` is one of those keys: `OrderMapper` has no arm
+        // for it, so the query sorts by SortName (the comparer is only for
+        // in-memory sorts), in either direction.
+        assert_eq!(
+            order_by(&sorted_by(&[(
+                ItemSortBy::AiredEpisodeOrder,
+                SortOrder::Ascending
+            )])),
+            r#"ORDER BY +bi."SortName" ASC, bi."SortName" ASC"#
+        );
+        assert_eq!(
+            order_by(&sorted_by(&[(
+                ItemSortBy::AiredEpisodeOrder,
+                SortOrder::Descending
+            )])),
+            r#"ORDER BY +bi."SortName" DESC, bi."SortName" ASC"#
         );
         // A leading key on another column can never be served by the index, so
         // it is left unpinned — and takes no Name tiebreaker.

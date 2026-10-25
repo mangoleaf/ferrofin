@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use ferrofin_core::event_manager::consumer_done;
 use ferrofin_core::file_system::FerrofinFileSystem;
 use ferrofin_core::item_type_lookup::{ItemTypeLookup, derive_item_id};
+use ferrofin_core::library_changed_notifier::LibraryChangedNotifier;
 use ferrofin_core::{
     FerrofinEventManager, FerrofinItemPersistenceService, FerrofinItemRepository,
     FerrofinVirtualFolderManager, LibraryScanner, ScanOutcome,
@@ -23,6 +24,7 @@ use ferrofin_db::Database;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::CollectionTypeOptions;
+use ferrofin_traits::events::EventManager;
 use ferrofin_traits::library::VirtualFolderManager;
 use ferrofin_traits::persistence::ItemRepository;
 
@@ -59,24 +61,54 @@ async fn movie_library(
     (db, persistence, vf)
 }
 
-/// An event manager recording every `LibraryChanged` payload.
-fn recording_events() -> (
-    Arc<FerrofinEventManager>,
-    Arc<Mutex<Vec<serde_json::Value>>>,
-) {
-    let events = FerrofinEventManager::new();
-    let changes: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&changes);
-    events.subscribe(
-        "LibraryChanged",
-        Arc::new(move |payload: &str| {
-            sink.lock()
-                .expect("sink")
-                .push(serde_json::from_str(payload).expect("json"));
-            consumer_done()
-        }),
-    );
-    (Arc::new(events), changes)
+/// An event bus and the scan's change notifier over it, recording every
+/// `LibraryChanged` payload the notifier publishes (with no audience wired it
+/// publishes one payload on the bus).
+struct Recorder {
+    events: Arc<FerrofinEventManager>,
+    notifier: Arc<LibraryChangedNotifier>,
+    changes: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+
+impl Recorder {
+    fn new() -> Self {
+        let events = FerrofinEventManager::new();
+        let changes: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&changes);
+        events.subscribe(
+            "LibraryChanged",
+            Arc::new(move |payload: &str| {
+                sink.lock()
+                    .expect("sink")
+                    .push(serde_json::from_str(payload).expect("json"));
+                consumer_done()
+            }),
+        );
+        let events = Arc::new(events);
+        // Its window never closes on its own: reading flushes it.
+        let notifier = Arc::new(LibraryChangedNotifier::new(
+            Arc::clone(&events) as Arc<dyn EventManager>,
+            std::time::Duration::from_secs(3600),
+        ));
+        Self {
+            events,
+            notifier,
+            changes,
+        }
+    }
+
+    /// Wires `scanner` to this bus and notifier.
+    fn wire(&self, scanner: LibraryScanner) -> LibraryScanner {
+        scanner
+            .with_events(Arc::clone(&self.events) as Arc<dyn EventManager>)
+            .with_change_notifier(Arc::clone(&self.notifier))
+    }
+
+    /// Every id announced as added so far.
+    async fn added(&self) -> Vec<String> {
+        self.notifier.flush().await;
+        added(&self.changes)
+    }
 }
 
 /// Every id announced as added across the recorded pushes.
@@ -120,15 +152,16 @@ async fn an_unreadable_row_leaves_only_itself_unread() {
     std::fs::write(media.join("Alien (1979).mkv"), b"").expect("write");
     std::fs::write(media.join("Heat (1995).mkv"), b"").expect("write");
     let (db, persistence, vf) = movie_library(tmp.path(), &[&media]).await;
-    let (events, changes) = recording_events();
+    let recorder = Recorder::new();
     let items = repository(&db);
-    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
-        .with_items(Arc::clone(&items))
-        .with_events(events);
+    let scanner = recorder.wire(
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(Arc::clone(&items)),
+    );
 
     let first = scanner.scan_all().await.expect("first scan");
     assert_eq!(first.created, 2);
-    assert_eq!(added(&changes).len(), 2);
+    assert_eq!(recorder.added().await.len(), 2);
 
     // A stored value the row decoder rejects. The scan upsert keeps a stored
     // `DateCreated`, so the row stays unreadable scan after scan.
@@ -213,7 +246,9 @@ async fn an_unreadable_row_leaves_only_itself_unread() {
         "then quiet"
     );
     assert_eq!(movie_rows(&db).await, 3, "no row is lost");
-    let announced: Vec<uuid::Uuid> = added(&changes)
+    let announced: Vec<uuid::Uuid> = recorder
+        .added()
+        .await
         .iter()
         .map(|id| uuid::Uuid::parse_str(id).expect("announced id"))
         .collect();
@@ -232,9 +267,12 @@ async fn without_an_item_repository_a_rescan_announces_nothing() {
     std::fs::write(media.join("Alien (1979).mkv"), b"").expect("write");
     std::fs::write(media.join("Heat (1995).mkv"), b"").expect("write");
     let (_db, persistence, vf) = movie_library(tmp.path(), &[&media]).await;
-    let (events, changes) = recording_events();
-    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
-        .with_events(events);
+    let recorder = Recorder::new();
+    let scanner = recorder.wire(LibraryScanner::new(
+        vf,
+        Arc::new(FerrofinFileSystem::new()),
+        persistence,
+    ));
 
     let first = scanner.scan_all().await.expect("first scan");
     assert_eq!(
@@ -244,7 +282,7 @@ async fn without_an_item_repository_a_rescan_announces_nothing() {
             ..ScanOutcome::default()
         }
     );
-    assert_eq!(added(&changes).len(), 2);
+    assert_eq!(recorder.added().await.len(), 2);
 
     let rescan = scanner.scan_all().await.expect("rescan");
     assert_eq!(
@@ -254,7 +292,11 @@ async fn without_an_item_repository_a_rescan_announces_nothing() {
             ..ScanOutcome::default()
         }
     );
-    assert_eq!(added(&changes).len(), 2, "a rescan announces no additions");
+    assert_eq!(
+        recorder.added().await.len(),
+        2,
+        "a rescan announces no additions"
+    );
 }
 
 // The scan's changes also reach in-process consumers (the intro skipper's
@@ -266,10 +308,10 @@ async fn a_scan_announces_its_items_in_process_too() {
     std::fs::create_dir_all(&media).expect("mkdir");
     std::fs::write(media.join("Alien (1979).mkv"), b"").expect("write");
     let (_db, persistence, vf) = movie_library(tmp.path(), &[&media]).await;
-    let (events, changes) = recording_events();
+    let recorder = Recorder::new();
     let in_process: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&in_process);
-    events.subscribe(
+    recorder.events.subscribe(
         ferrofin_core::library_changed_notifier::ITEMS_CHANGED,
         Arc::new(move |payload: &str| {
             sink.lock()
@@ -278,11 +320,14 @@ async fn a_scan_announces_its_items_in_process_too() {
             consumer_done()
         }),
     );
-    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
-        .with_events(events);
+    let scanner = recorder.wire(LibraryScanner::new(
+        vf,
+        Arc::new(FerrofinFileSystem::new()),
+        persistence,
+    ));
     scanner.scan_all().await.expect("scan");
-    assert_eq!(added(&changes).len(), 1);
-    assert_eq!(added(&in_process), added(&changes));
+    assert_eq!(recorder.added().await.len(), 1);
+    assert_eq!(added(&in_process), recorder.added().await);
 }
 
 // Overlapping library locations plan the same kind+path id twice, each copy
@@ -297,10 +342,11 @@ async fn a_repeated_planned_id_is_created_and_announced_once() {
     std::fs::create_dir_all(&nested).expect("mkdir");
     std::fs::write(nested.join("Alien (1979).mkv"), b"").expect("write");
     let (db, persistence, vf) = movie_library(tmp.path(), &[&media, &nested]).await;
-    let (events, changes) = recording_events();
-    let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
-        .with_items(repository(&db))
-        .with_events(events);
+    let recorder = Recorder::new();
+    let scanner = recorder.wire(
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(repository(&db)),
+    );
 
     let first = scanner.scan_all().await.expect("first scan");
     assert_eq!(movie_rows(&db).await, 1, "one row for the one file");
@@ -313,7 +359,7 @@ async fn a_repeated_planned_id_is_created_and_announced_once() {
         },
         "the plan holds the file twice; the superseded copy writes nothing"
     );
-    assert_eq!(added(&changes).len(), 1, "announced once");
+    assert_eq!(recorder.added().await.len(), 1, "announced once");
     let parent = || async {
         sqlx::query_scalar::<_, Option<String>>(
             r#"SELECT "ParentId" FROM "BaseItems" WHERE "Type" LIKE '%Movies.Movie'"#,
@@ -335,5 +381,5 @@ async fn a_repeated_planned_id_is_created_and_announced_once() {
         );
         assert_eq!(parent().await, first_parent, "the ParentId is stable");
     }
-    assert_eq!(added(&changes).len(), 1);
+    assert_eq!(recorder.added().await.len(), 1);
 }

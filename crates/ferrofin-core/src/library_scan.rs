@@ -2889,6 +2889,14 @@ struct Planned {
     generated_names: Vec<String>,
 }
 
+/// What a scan announces when it stops: the items it created, the existing
+/// ones it saved, and the ids it removed under each library.
+type ScanChanges<'a> = (
+    &'a [&'a Planned],
+    &'a [&'a Planned],
+    &'a [(Uuid, Vec<Uuid>)],
+);
+
 /// Which paths a plan pass resolves: every one (a library scan), or the items
 /// at or under some paths plus the items above them (a path-scoped scan).
 ///
@@ -3820,12 +3828,15 @@ pub struct LibraryScanner {
     /// RULES_LOGGING; per-item detail stays at `debug`.
     progress_every: usize,
     /// Optional domain-event seam. When present the scan publishes
-    /// `LibraryChanged` (added/removed items, at scan end) and `RefreshProgress`
-    /// (per-library %, once per second) — the composition root forwards
-    /// both to client sessions over the WebSocket, which is how open clients
-    /// refresh their views after a scan. Absent in unit tests that don't
-    /// exercise events.
+    /// `RefreshProgress` (per-library %, once per second), which the
+    /// composition root forwards to client sessions over the WebSocket.
+    /// Absent in unit tests that don't exercise events.
     events: Option<Arc<dyn ferrofin_traits::events::EventManager>>,
+    /// The per-user `LibraryChanged` push: the scan reports the items it
+    /// added, saved and removed there, as Jellyfin's item events reach
+    /// `LibraryChangedNotifier`, so each user is told only what they may
+    /// see. Absent in unit tests that don't exercise it; nothing is announced.
+    change_notifier: Option<Arc<crate::library_changed_notifier::LibraryChangedNotifier>>,
     /// Expands the `%MetadataPath%`/`%AppDataPath%` tokens adopted Jellyfin
     /// image rows store, for the local image validation's existence check.
     /// Identity until [`with_virtual_paths`](Self::with_virtual_paths).
@@ -4055,6 +4066,7 @@ impl LibraryScanner {
             default_metadata_language: "en".to_owned(),
             progress_every: DEFAULT_SCAN_PROGRESS_EVERY,
             events: None,
+            change_notifier: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             path_manager: None,
             root_folder: None,
@@ -4360,12 +4372,24 @@ impl LibraryScanner {
         self
     }
 
-    /// Attaches the domain-event seam so scans publish `LibraryChanged` and
-    /// `RefreshProgress` (forwarded to client sessions by the composition root).
+    /// Attaches the domain-event seam so scans publish `RefreshProgress`
+    /// (forwarded to client sessions by the composition root).
     #[must_use]
     pub fn with_events(mut self, events: Arc<dyn ferrofin_traits::events::EventManager>) -> Self {
         self.scan_progress.set_events(Arc::clone(&events));
         self.events = Some(events);
+        self
+    }
+
+    /// Reports each scan's added, saved and removed items to `notifier`,
+    /// which pushes them to every user as `LibraryChanged`, filtered to what
+    /// that user may see.
+    #[must_use]
+    pub fn with_change_notifier(
+        mut self,
+        notifier: Arc<crate::library_changed_notifier::LibraryChangedNotifier>,
+    ) -> Self {
+        self.change_notifier = Some(notifier);
         self
     }
 
@@ -4812,7 +4836,7 @@ impl LibraryScanner {
             .unwrap_or_else(|panic| {
                 Err(ServiceError::backend(format!(
                     "item refresh panicked: {}",
-                    panic_message(panic.as_ref())
+                    ferrofin_util::panic::message(panic.as_ref())
                 )))
             });
             // The refresh may have written anywhere under its paths (artwork,
@@ -4947,7 +4971,7 @@ impl LibraryScanner {
         // folder once no library lists the location.
         let orphaned = self.prune_orphan_locations(&all_folders).await;
         if !orphaned.is_empty() {
-            self.publish_library_changed(&[], &orphaned).await;
+            self.announce_changes(&[], &[], &orphaned);
         }
         let tracking = self
             .scan_progress
@@ -6107,13 +6131,16 @@ impl LibraryScanner {
             }
             tracking.planned(totals);
         }
-        // Item ids that did not exist before this scan (→ `ItemsAdded` in the
-        // scan-end `LibraryChanged` push). Only tracked when events are wired.
+        // Items that did not exist before this scan, and the existing ones it
+        // saved (`ItemAdded`/`ItemUpdated`, announced at scan end). Only
+        // tracked when the change notifier is wired.
+        let announce = self.change_notifier.is_some();
         let mut items_added: Vec<&Planned> = Vec::new();
+        let mut items_updated: Vec<&Planned> = Vec::new();
         // A moved item is new to a client under its new id, and its old id
         // is gone.
         let mut moved_away: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
-        if self.events.is_some() && !moved.is_empty() {
+        if announce && !moved.is_empty() {
             let by_id: HashMap<Uuid, &Planned> = planned.iter().map(|p| (p.id, p)).collect();
             for m in &moved {
                 if let Some(&item) = by_id.get(&m.to) {
@@ -6242,11 +6269,11 @@ impl LibraryScanner {
                 self.sync_playlists(&due_playlists, key_folders).await;
                 let stop = self.stop_early(
                     &mut probes,
-                    (&items_added, &moved_away),
+                    (&items_added, &items_updated, &moved_away),
                     outcome,
                     "between items",
                 );
-                return Ok(stop.await);
+                return Ok(stop);
             }
             // An earlier copy of a repeated id: its last copy is the one
             // refreshed (`superseded_copies`). Nothing is written for it.
@@ -6266,7 +6293,7 @@ impl LibraryScanner {
             // A row that cannot be decoded runs nothing (its file facts
             // only), so no music refresh either: its read would fail there.
             let undecodable = matches!(stored, Stored::Undecodable);
-            if is_new && self.events.is_some() {
+            if is_new && announce {
                 items_added.push(item);
             }
             let plan = stored_rows.plan(scanned).unwrap_or_else(|| {
@@ -6444,19 +6471,27 @@ impl LibraryScanner {
             match saved {
                 ItemSaved::Unchanged => outcome.unchanged += 1,
                 ItemSaved::Saved if is_new => outcome.created += 1,
-                ItemSaved::Saved => outcome.updated += 1,
+                ItemSaved::Saved => {
+                    outcome.updated += 1;
+                    if announce {
+                        items_updated.push(item);
+                    }
+                }
                 ItemSaved::Cancelled => {
                     // Nothing of it was written, so it was not added.
-                    if is_new && self.events.is_some() {
+                    if is_new && announce {
                         items_added.pop();
                     }
                     let at = "inside an item, before any write";
                     self.sync_local_version_groups(&[], &released).await;
                     self.copy_to_owned_videos(&owners, false).await;
                     self.sync_playlists(&due_playlists, key_folders).await;
-                    return Ok(self
-                        .stop_early(&mut probes, (&items_added, &moved_away), outcome, at)
-                        .await);
+                    return Ok(self.stop_early(
+                        &mut probes,
+                        (&items_added, &items_updated, &moved_away),
+                        outcome,
+                        at,
+                    ));
                 }
             }
             // A saved owner copies to its owned videos; so does an owner
@@ -6529,11 +6564,11 @@ impl LibraryScanner {
             self.sync_playlists(&due_playlists, key_folders).await;
             let stop = self.stop_early(
                 &mut probes,
-                (&items_added, &moved_away),
+                (&items_added, &items_updated, &moved_away),
                 outcome,
                 "after the last item",
             );
-            return Ok(stop.await);
+            return Ok(stop);
         }
         probes.abort();
         // After every row is saved, so each version is stored, and before
@@ -6582,8 +6617,7 @@ impl LibraryScanner {
         // items. Even a cancelled closing pass announces deletions — the
         // pruned rows and the rows a fold or move took away.
         moved_away.extend(removed);
-        self.publish_library_changed(&items_added, &moved_away)
-            .await;
+        self.announce_changes(&items_added, &items_updated, &moved_away);
         Ok(outcome)
     }
 
@@ -7024,12 +7058,13 @@ impl LibraryScanner {
     }
 
     /// Ends a cancelled scan where it stood: the probes still running are
-    /// aborted (their ffprobe children killed), the items it created are
-    /// announced, and the pruning and closing passes are skipped.
-    async fn stop_early(
+    /// aborted (their ffprobe children killed), the items it created, saved
+    /// and removed so far are announced, and the pruning and closing passes
+    /// are skipped.
+    fn stop_early(
         &self,
         probes: &mut ProbePipeline<'_>,
-        (items_added, removed): (&[&Planned], &[(Uuid, Vec<Uuid>)]),
+        (items_added, items_updated, removed): ScanChanges<'_>,
         mut outcome: ScanOutcome,
         at: &'static str,
     ) -> ScanOutcome {
@@ -7041,7 +7076,7 @@ impl LibraryScanner {
             "library scan cancelled"
         );
         probes.abort();
-        self.publish_library_changed(items_added, removed).await;
+        self.announce_changes(items_added, items_updated, removed);
         outcome.stopped = true;
         outcome
     }
@@ -8930,7 +8965,7 @@ impl LibraryScanner {
             retired = stale.len(),
             "retiring by-name MusicArtist rows superseded by resolved artist folders"
         );
-        self.persistence.delete_items(&stale).await.map(|_| ())
+        self.delete_announced(&stale).await.map(|_| ())
     }
 
     /// The by-name validators' closing sweep: deletes the unlocked `Genre`,
@@ -8967,7 +9002,37 @@ impl LibraryScanner {
         );
         let dead: Vec<Uuid> = genres.into_iter().chain(studios).chain(artists).collect();
         tracing::debug!(ids = ?dead, "dead by-name rows");
-        self.persistence.delete_items(&dead).await.map(|_| ())
+        self.delete_announced(&dead).await.map(|_| ())
+    }
+
+    /// Deletes rows and announces each removal (`ItemRemoved`), returning
+    /// the ids deleted. The rows are read before they go, since the push
+    /// needs them; the notifier passes on only what `FilterItem` admits (of
+    /// by-name rows, the `MusicArtist` ones, which Jellyfin 12's
+    /// `DeleteItemsUnsafeFast` reports since jellyfin/jellyfin#17579).
+    async fn delete_announced(&self, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+        let rows = match (&self.change_notifier, &self.item_repository) {
+            // The delete goes ahead without them: only its announcement is lost.
+            (Some(_), Some(items)) => items.retrieve_items(ids).await.unwrap_or_else(|err| {
+                tracing::warn!(
+                    %err,
+                    count = ids.len(),
+                    "could not read rows before deleting them; their removal is not announced"
+                );
+                Vec::new()
+            }),
+            _ => Vec::new(),
+        };
+        let deleted = self.persistence.delete_items(ids).await?;
+        if let Some(notifier) = &self.change_notifier {
+            let gone: std::collections::HashSet<&Uuid> = deleted.iter().collect();
+            let rows: Vec<BaseItemEntity> = rows
+                .into_iter()
+                .filter(|row| parse_id(&row.id).is_some_and(|id| gone.contains(&id)))
+                .collect();
+            notifier.record_removed(&rows);
+        }
+        Ok(deleted)
     }
 
     /// The dynamic image providers over this scanner's stores, when it has all
@@ -9189,64 +9254,34 @@ impl LibraryScanner {
         Ok(folders)
     }
 
-    /// Publishes the scan's net changes as a `LibraryChanged` event carrying a
-    /// [`LibraryUpdateInfo`] — the payload Jellyfin's `LibraryChangedNotifier`
-    /// pushes so clients refresh home rows and library views. No-op when no
-    /// event seam is wired or nothing changed (an unchanged rescan is silent,
-    /// matching Jellyfin, whose item events only fire on real changes).
-    ///
-    /// `ItemsUpdated` is deliberately left empty: Ferrofin re-saves every planned
-    /// row on every scan, so "saved" is not "changed" — reporting them all
-    /// would announce the entire library on each rescan.
-    /// ponytail: add dirty tracking if per-item update pushes are ever needed.
-    async fn publish_library_changed(&self, added: &[&Planned], removed: &[(Uuid, Vec<Uuid>)]) {
-        let Some(events) = &self.events else {
+    /// Reports the scan's net changes to the per-user `LibraryChanged` push,
+    /// as Jellyfin's `ItemAdded`/`ItemUpdated`/`ItemRemoved` reach its
+    /// `LibraryChangedNotifier`: the items the scan created, the existing ones
+    /// it saved, and the ones it removed under each library (the prune, and
+    /// the old ids of moved items). The notifier filters each user's push to
+    /// what that user may see. An unchanged rescan reports nothing, as
+    /// Jellyfin's item events fire only on saves. No-op without a notifier.
+    fn announce_changes(
+        &self,
+        added: &[&Planned],
+        updated: &[&Planned],
+        removed: &[(Uuid, Vec<Uuid>)],
+    ) {
+        let Some(notifier) = &self.change_notifier else {
             return;
         };
-        let mut folders_added: Vec<Uuid> = added
-            .iter()
-            .filter_map(|p| p.ancestors.first().copied())
-            .collect();
-        folders_added.sort_unstable();
-        folders_added.dedup();
-        let folders_removed: Vec<Uuid> = removed
-            .iter()
-            .filter(|(_, ids)| !ids.is_empty())
-            .map(|(cf, _)| *cf)
-            .collect();
-        let mut collection_folders: Vec<Uuid> = folders_added
-            .iter()
-            .chain(&folders_removed)
-            .copied()
-            .collect();
-        collection_folders.sort_unstable();
-        collection_folders.dedup();
-
-        // Every id as `ToString("N")` (`LibraryChangedNotifier`): jellyfin-web's
-        // itemsrefresher matches these strings against item ids.
-        let n = |id: &Uuid| id.simple().to_string();
-        let mut update = ferrofin_model::entities_media::LibraryUpdateInfo {
-            folders_added_to: folders_added.iter().map(n).collect(),
-            folders_removed_from: folders_removed.iter().map(n).collect(),
-            items_added: added.iter().map(|p| n(&p.id)).collect(),
-            items_removed: removed
-                .iter()
-                .flat_map(|(_, ids)| ids.iter().map(n))
-                .collect(),
-            collection_folders: collection_folders.iter().map(n).collect(),
-            ..ferrofin_model::entities_media::LibraryUpdateInfo::default()
-        };
-        update.is_empty = update.compute_is_empty();
-        if update.is_empty {
-            return;
+        // The notifier needs whole rows; a chunk at a time keeps the copies
+        // small on a first scan of a large library.
+        for chunk in added.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let rows: Vec<BaseItemEntity> = chunk.iter().map(|p| p.entity.clone()).collect();
+            notifier.record_added(&rows);
         }
-        if let Ok(payload) = serde_json::to_string(&update) {
-            let _ = events.publish("LibraryChanged", &payload).await;
-            // The scan's items reach in-process consumers the way the
-            // notifier's do (`ItemAdded`/`ItemRemoved` subscribers).
-            let _ = events
-                .publish(crate::library_changed_notifier::ITEMS_CHANGED, &payload)
-                .await;
+        for chunk in updated.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let rows: Vec<BaseItemEntity> = chunk.iter().map(|p| p.entity.clone()).collect();
+            notifier.record_updated(&rows);
+        }
+        for (library, ids) in removed {
+            notifier.record_removed_from_library(*library, ids);
         }
     }
 
@@ -19242,15 +19277,6 @@ impl<'a> PathRoots<'a> {
                 .ancestors()
                 .any(|dir| dir.to_str().is_some_and(|dir| self.0.contains(dir)))
     }
-}
-
-/// A caught panic's message, for the error its waiters get.
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
-    panic
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("no message")
 }
 
 /// Whether `path` equals `root` or lies underneath it (component-boundary
@@ -37089,14 +37115,26 @@ mod tests {
                 }),
             );
         }
+        let events = Arc::new(events);
+        // The scan's changes reach `LibraryChanged` through the notifier,
+        // which with no audience wired publishes one payload on the bus. Its
+        // window never closes on its own here: each scan is flushed.
+        let notifier = Arc::new(
+            crate::library_changed_notifier::LibraryChangedNotifier::new(
+                Arc::clone(&events) as Arc<dyn ferrofin_traits::events::EventManager>,
+                std::time::Duration::from_secs(3600),
+            ),
+        );
         let scanner =
             LibraryScanner::new(vf.clone(), Arc::new(FerrofinFileSystem::new()), persistence)
                 .with_items(items)
-                .with_events(Arc::new(events));
+                .with_events(events)
+                .with_change_notifier(Arc::clone(&notifier));
 
         // First scan: both movies are new → ItemsAdded, and the library's
         // completion RefreshProgress fires at 100%.
         scanner.scan_all().await.unwrap();
+        notifier.flush().await;
         let first: serde_json::Value = serde_json::from_str(&changes.lock().unwrap()[0]).unwrap();
         assert_eq!(first["ItemsAdded"].as_array().unwrap().len(), 2);
         assert_eq!(first["IsEmpty"], false);
@@ -37104,17 +37142,36 @@ mod tests {
             serde_json::from_str(progress.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(last_progress["Progress"], "100.00");
 
-        // Unchanged rescan: nothing added or removed → no LibraryChanged push.
+        // Unchanged rescan: nothing added, saved or removed → no
+        // LibraryChanged push.
         scanner.scan_all().await.unwrap();
+        notifier.flush().await;
         assert_eq!(
             changes.lock().unwrap().len(),
             1,
             "unchanged rescan is silent"
         );
 
+        // A file whose modification time moved is saved again → the next
+        // scan announces it as updated, and nothing as added (gl-98).
+        std::fs::File::options()
+            .write(true)
+            .open(movies.join("The Matrix (1999).mkv"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(24))
+            .unwrap();
+        scanner.scan_all().await.unwrap();
+        notifier.flush().await;
+        let saved: serde_json::Value =
+            serde_json::from_str(changes.lock().unwrap().last().unwrap()).unwrap();
+        assert_eq!(changes.lock().unwrap().len(), 2, "a save is announced");
+        assert_eq!(saved["ItemsUpdated"].as_array().unwrap().len(), 1);
+        assert!(saved["ItemsAdded"].as_array().unwrap().is_empty());
+
         // Delete a movie → the next scan announces the removal.
         std::fs::remove_file(movies.join("Dune (2021).mkv")).unwrap();
         scanner.scan_all().await.unwrap();
+        notifier.flush().await;
         let third: serde_json::Value =
             serde_json::from_str(changes.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(third["ItemsRemoved"].as_array().unwrap().len(), 1);
@@ -38994,14 +39051,46 @@ mod tests {
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(FerrofinVirtualFolderManager::new(
             std::path::PathBuf::from("/nonexistent"),
         ));
+        // `DeleteItemsUnsafeFast` reports each retired row (`ItemRemoved`), and
+        // a `MusicArtist` passes `FilterItem`: clients drop the twin's card.
+        let events = crate::event_manager::FerrofinEventManager::new();
+        let removed: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let sink = Arc::clone(&removed);
+        events.subscribe(
+            "LibraryChanged",
+            Arc::new(move |payload: &str| {
+                let info: serde_json::Value = serde_json::from_str(payload).unwrap();
+                sink.lock().unwrap().extend(
+                    info["ItemsRemoved"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|id| id.as_str().map(str::to_owned)),
+                );
+                crate::event_manager::consumer_done()
+            }),
+        );
+        let notifier = Arc::new(
+            crate::library_changed_notifier::LibraryChangedNotifier::new(
+                Arc::new(events),
+                std::time::Duration::from_secs(3600),
+            ),
+        );
         let scanner = LibraryScanner::new(
             vf,
             Arc::new(FerrofinFileSystem::new()),
             Arc::clone(&persistence),
         )
-        .with_items(Arc::clone(&items));
+        .with_items(Arc::clone(&items))
+        .with_change_notifier(Arc::clone(&notifier));
 
         scanner.retire_accessed_by_name_artists().await.unwrap();
+        notifier.flush().await;
+        assert_eq!(
+            *removed.lock().unwrap(),
+            vec![superseded.simple().to_string()],
+            "the retired twin is announced as removed"
+        );
 
         assert!(
             items.retrieve_item(resolved).await.unwrap().is_some(),

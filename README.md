@@ -37,7 +37,7 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
   client, so `docker run` gives you the whole server, web UI included.
 - **Drop-in compatible.** Same API contract, same on-disk database format (pinned to
   Jellyfin 12.0), same password hashes. Adopt an existing Jellyfin 10.11.8–10.11.11,
-  12.0.0, 12.1.0 or 12.2.0 library with no re-scan; see [supported and tested versions](adoption/README.md#supported-and-tested-versions).
+  12.0.0, 12.1.0 or 12.2.0 library with no re-scan; see [supported and tested versions](gates/adoption/README.md#supported-and-tested-versions).
 - **Plugins cannot own your server.** Jellyfin loads plugins as full-trust .NET code inside
   the server process. Ferrofin does not, and will not. Third-party plugins run as
   sandboxed WASM with no filesystem or network access of their own. This is the one place
@@ -70,7 +70,7 @@ PRs or plugin development are welcome too if anyone wants to get involved!
 ## Benchmarks
 
 <!-- BEGIN GENERATED BENCHMARKS — do not edit by hand. Regenerate with:
-     python3 bench/report.py --readme README.md bench/runs/v1.3.2-603-d2bb9306 bench/runs/v1.3.2-603-d2bb9306-run2 bench/runs/v1.3.2-603-d2bb9306-run3 -->
+     python3 gates/bench/report.py --readme README.md gates/bench/runs/v1.3.2-603-d2bb9306 gates/bench/runs/v1.3.2-603-d2bb9306-run2 gates/bench/runs/v1.3.2-603-d2bb9306-run3 -->
 Ferrofin `v1.3.2-603-d2bb9306` against **Jellyfin 12.2.0**, measured 2026-10-20 on one machine (AMD Ryzen 9 9950X3D), each server alone in a container pinned to 8 logical CPUs with an 8 GiB limit, over a fixture of 3001 movies, 250 series and 7490 episodes. Published figures are medians across 3 selected runs; incomplete or non-comparable cells are withheld.
 No measured request failed in the recorded load windows (unloaded, loaded, stress).
 
@@ -98,7 +98,7 @@ Among 23 comparable endpoint measurements at this level, Ferrofin is faster on 1
 3. Ferrofin: series: series:similar: ids differs for a request pick
 4. Ferrofin: search: search:artists: ids differs for a request pick
 
-How steady are these numbers? Across the 3 runs, 36 of the 78 medians in the loaded-level tables moved by more than 15 % of their value, against 144 of the 156 p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); the harness and the one-sentence definition of each number are in [`bench/README.md`](bench/README.md). It is a deliberate, local instrument, not a CI job.
+How steady are these numbers? Across the 3 runs, 36 of the 78 medians in the loaded-level tables moved by more than 15 % of their value, against 144 of the 156 p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); the harness and the one-sentence definition of each number are in [`gates/bench/README.md`](gates/bench/README.md). It is a deliberate, local instrument, not a CI job.
 <!-- END GENERATED BENCHMARKS -->
 
 The measured server source is commit `d2bb9306`; the run name above identifies the
@@ -174,7 +174,7 @@ All six 10.11–12.1 releases passed the live adoption suite on 2026-09-16; the 
 passed the synthetic suite on 2026-10-13. Nine fixture paths total, including both
 10.11.8 → 12.1.0 and 10.11.8 → 12.0.0 → 12.1.0 and both 12.2 routes. Checks cover API
 summaries against Jellyfin 12.2, database integrity, and stable responses without repeated
-repairs after restart. See the [support matrix and tested build](adoption/README.md#supported-and-tested-versions).
+repairs after restart. See the [support matrix and tested build](gates/adoption/README.md#supported-and-tested-versions).
 Support is determined by the exact migration history; these version numbers do not imply
 support for every 10.11.x or 12.x release.
 

@@ -34,7 +34,9 @@ At the **outermost layer that still has context** — never also at the origin.
 
 - **Request paths**: the existing `ApiError` boundary
   (`ferrofin-api/src/error.rs`) logs 5xx once. Do **not** add origin logging on request
-  paths — that double-logs.
+  paths — that double-logs. A handler panic is logged once by the panic boundary
+  (`ferrofin-api/src/panic_boundary.rs`) that answers it `500`, beside the panic hook's
+  own line (rule 7).
 - **Background paths** (spawned tasks, samplers, schedulers): at the task's own top
   level, with the span active.
 - `let _ =` / `.ok()` on a fallible call is allowed **only** when failure is truly

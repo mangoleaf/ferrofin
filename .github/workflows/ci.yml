@@ -45,10 +45,10 @@ jobs:
         with:
           persist-credentials: false
       # Reporter correctness only: no containers, media fixture or timing gate.
-      - run: python3 -m unittest discover -s bench -p test_report.py
-      - run: python3 -m unittest discover -s bench -p test_ramp.py
-      - run: python3 -m unittest discover -s bench -p test_soak.py
-      - run: python3 -m unittest discover -s bench -p test_endpoints.py
+      - run: python3 -m unittest discover -s gates/bench -p test_report.py
+      - run: python3 -m unittest discover -s gates/bench -p test_ramp.py
+      - run: python3 -m unittest discover -s gates/bench -p test_soak.py
+      - run: python3 -m unittest discover -s gates/bench -p test_endpoints.py
 
   # fmt and clippy. The workspace tests run beside it in lint-tests; the aggregate `lint`
   # job below is the status check main's branch protection requires.
@@ -121,7 +121,7 @@ jobs:
       - name: disk at start
         run: df -h /
       # NOTE: the benchmark/parity suite (v2) and its CI gates were retired on
-      # 2026-09-02 by owner decision. Suite v3 (bench/) deliberately does NOT run here:
+      # 2026-09-02 by owner decision. Suite v3 (gates/bench/) deliberately does NOT run here:
       # it needs a quiet machine, pinned cores and ~17 GB of generated test data, and a
       # number measured on a shared runner would be worse than no number. It runs
       # before each release — see RELEASE.md.
@@ -186,11 +186,11 @@ jobs:
   shell-tests:
     if: *not-release-pr
     # The shell tooling has its own tests: scripts/version.sh (release versioning),
-    # adoption/ (the Jellyfin-adoption harness — its checks are driven with canned logs and
-    # throwaway SQLite files; the real fixtures never run here), verify/ (the live
+    # gates/adoption/ (the Jellyfin-adoption harness — its checks are driven with canned logs and
+    # throwaway SQLite files; the real fixtures never run here), gates/verify/ (the live
     # scan-behaviour check — its logic is driven with canned /metrics text, its refusals
-    # against a python3 static file server, and whole runs against verify/tests/fake_server.py,
-    # which plays back a scripted server's scans), parity/ (the live parity replay — its runner is
+    # against a python3 static file server, and whole runs against gates/verify/tests/fake_server.py,
+    # which plays back a scripted server's scans), gates/parity/ (the live parity replay — its runner is
     # driven against a fake docker and fake servers, its comparison with fixture response pairs) and
     # scripts/ci-timings.py (CI time medians — its log parsing is driven with canned job logs).
     runs-on: ubuntu-latest
@@ -202,10 +202,10 @@ jobs:
           persist-credentials: false
           fetch-depth: 0   # version.bats reads tags
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bats shellcheck sqlite3 jq curl python3-pil python3-icu python3-yaml
-      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh adoption/lib.sh adoption/run.sh adoption/smoke.sh adoption/build-fixtures.sh parity/lib.sh parity/run.sh parity/reset.sh verify/lib.sh verify/scan-behaviour.sh
-      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats adoption/tests/adoption.bats parity/tests/parity.bats verify/tests/verify.bats
-      - run: bats scripts/tests adoption/tests parity/tests verify/tests
-      - run: python3 -m unittest discover -s parity/tests
+      - run: shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh gates/parity/lib.sh gates/parity/run.sh gates/parity/reset.sh gates/verify/lib.sh gates/verify/scan-behaviour.sh
+      - run: shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats gates/adoption/tests/adoption.bats gates/parity/tests/parity.bats gates/verify/tests/verify.bats
+      - run: bats scripts/tests gates/adoption/tests gates/parity/tests gates/verify/tests
+      - run: python3 -m unittest discover -s gates/parity/tests
       - run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
       - run: scripts/ci-config-check.sh check
 

@@ -44,7 +44,7 @@ Both binaries were built with the pinned Rust 1.98.1 toolchain and
 `cargo build --release -p ferrofin-server --offline`. The baseline binary was
 built before the production change; its SQL does not contain `movie_page`.
 
-The existing `bench/screens.js` exercised all six screens at five screens per
+The existing `gates/bench/screens.js` exercised all six screens at five screens per
 second, using a 30-second discarded warmup and a 120-second measured window.
 Each server ran alone on cores 8–15, with k6 on 16–19. Both used freshly restored
 copies of the same saved `v1.0.0` benchmark database and a disposable copy of its
@@ -57,7 +57,7 @@ Docker access was unavailable, so this uses local processes without the normal
 container memory limit. These are one before/after pair for this change, not a
 replacement for the published three-run Jellyfin comparison.
 
-Local artifacts (gitignored) are in `bench/runs/movie-browse-local/` in this
+Local artifacts (gitignored) are in `gates/bench/runs/movie-browse-local/` in this
 worktree: `method.json` records binary hashes, `run-local.py` records the exact
 runner, and each server's directory contains k6 results, HTTP page snapshots,
 and logs. Validation/build logs are alongside them.

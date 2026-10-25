@@ -982,11 +982,10 @@ pub async fn build_app_state(
     // library's locations).
     // The playlists media folder lives at `{data}/playlists` (stored as
     // `PlaylistsFolder`; `ManualPlaylistsFolder` is only its
-    // `GetClientTypeName()`). Both seams need the path: the user-root store
-    // provisions the folder, and the virtual-folder manager reports it among
-    // the root's physical locations (`LibraryManager.CreateRootFolder` adds it
-    // as a virtual child of the root, so `GET /Library/PhysicalPaths` lists
-    // it).
+    // `GetClientTypeName()`). `aggregate_store.ensure()` above provisioned it;
+    // the virtual-folder manager reports it among the root's physical
+    // locations (`LibraryManager.CreateRootFolder` adds it as a virtual child
+    // of the root, so `GET /Library/PhysicalPaths` lists it).
     let playlists_path = std::path::PathBuf::from(paths.data_path()).join("playlists");
     // The `UserRootFolder` provisioner (`GetUserRootFolder()`): the row
     // `Items/Root` resolves to and the parent of every library's
@@ -1009,7 +1008,7 @@ pub async fn build_app_state(
             .with_physical_root(db.clone(), root_folder_ids.aggregate)
             .with_user_preferences(db.clone(), Arc::clone(&auth_cache))
             .with_id_derivation(id_derivation.clone())
-            .with_playlists_path(playlists_path.clone())
+            .with_playlists_path(playlists_path)
             .with_user_root(user_root_store.clone())
             .with_scan_progress(scan_progress.clone())
             .with_virtual_paths(virtual_paths.clone())
@@ -1211,10 +1210,9 @@ pub async fn build_app_state(
         FerrofinUserViewManager::new(Arc::clone(&item_repository))
             .with_dashboard_configuration(Arc::clone(&config_trait), Arc::clone(&localization))
             .with_visibility(Arc::clone(&item_visibility))
-            .with_playlists_store(Arc::clone(&item_persistence_service), playlists_path)
-            // The provisioned row's parent is the `AggregateFolder`, the way
-            // `CreateRootFolder` parents it.
-            .with_root_folder_path(paths.root_folder_path())
+            // The playlists folder it lists is `aggregate_store.ensure()`'s,
+            // made once above, as `CreateRootFolder` makes it once per process.
+            .with_item_store(Arc::clone(&item_persistence_service))
             // Settles the `UserRootFolder` row on the first
             // `GET /Library/MediaFolders`, memoized by the store.
             .with_user_root(user_root_store.clone())
@@ -1462,20 +1460,15 @@ pub async fn build_app_state(
         }
         scanner = scanner.with_directory_cache_limits(limits);
     }
-    // Scans publish `LibraryChanged` + `RefreshProgress` events; the consumers
-    // registered below (once the session manager exists) forward them to
-    // clients over the WebSocket so open views refresh after a scan.
+    // Scans publish `RefreshProgress` events, which the consumers registered
+    // below (once the session manager exists) forward to clients over the
+    // WebSocket; the items a scan changes go to the `LibraryChanged`
+    // notifier, which tells each user what they may see.
     // The plugins' metadata sources: every loaded WASM plugin is a remote
     // metadata provider the scan folds with the built-in ones at its rank in
     // the library's fetcher order (inert until the collaborators are armed
     // below and while a plugin is disabled).
     scanner = scanner.with_dynamic_providers(wasm_host.metadata_providers());
-    scanner = scanner
-        .with_events(Arc::clone(&event_manager))
-        .with_scan_progress(scan_progress.clone());
-    let library_scanner = Arc::new(scanner);
-    // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
-    // (the `dyn LibraryManager` object does not carry that narrow impl).
     // `ServerConfiguration.LibraryUpdateDuration` — how long a batch of changes
     // waits, from its first change, before the notifier pushes it. Read live as
     // each batch opens; Jellyfin's default covers a failed read.
@@ -1488,6 +1481,13 @@ pub async fn build_app_state(
         )
         .with_config(Arc::clone(&config_trait)),
     );
+    scanner = scanner
+        .with_events(Arc::clone(&event_manager))
+        .with_change_notifier(Arc::clone(&change_notifier))
+        .with_scan_progress(scan_progress.clone());
+    let library_scanner = Arc::new(scanner);
+    // Kept concrete so the library monitor can take it as a `LibraryScanTrigger`
+    // (the `dyn LibraryManager` object does not carry that narrow impl).
     // `IsVisible`/`IsVisibleStandalone`: one evaluator, shared by the library's
     // user-scoped lookups and the media sources' per-user version filter.
     let item_visibility = Arc::new(
@@ -1512,9 +1512,9 @@ pub async fn build_app_state(
         .with_scanner(Arc::clone(&library_scanner))
         .with_scan_progress(&scan_progress)
         // `LibraryChangedNotifier`: item writes through the API (a metadata
-        // edit, a delete) announce themselves after `LibraryUpdateDuration`
-        // seconds of quiet. Without this only scans pushed `LibraryChanged`,
-        // so a client sitting on a library view never saw an edit land.
+        // edit, a delete) announce themselves, as the scanner's changes do,
+        // `LibraryUpdateDuration` seconds after a batch's first change, so a
+        // client sitting on a library view sees an edit land.
         .with_change_notifier(Arc::clone(&change_notifier))
         // Chapter thumbnails are served from the chapter rows, not the item's
         // image rows.
@@ -1980,7 +1980,9 @@ pub async fn build_app_state(
         .with_visibility(Arc::clone(&item_visibility), Arc::clone(&users))
         // The refresh an entry change queues (collage, rating).
         .with_providers(Arc::clone(&providers))
-        .with_self_writes(Arc::clone(&self_writes_guard)),
+        .with_self_writes(Arc::clone(&self_writes_guard))
+        // Each playlist change announced as `ItemAdded`/`ItemUpdated`.
+        .with_item_persistence(Arc::clone(&item_persistence_service)),
     );
 
     // The full Jellyfin dashboard task set (Library + Maintenance categories),
@@ -2205,12 +2207,13 @@ pub async fn build_app_state(
     // The notifier's per-user fan-out, attachable only now that the session
     // manager exists. Until this line the notifier falls back to publishing one
     // payload on the bus; after it, each user gets a payload filtered to the
-    // libraries they can actually see.
+    // libraries they can actually see and, within them, the items they may see.
     change_notifier.set_audience(Arc::new(SessionLibraryAudience {
         sessions: Arc::clone(&sessions),
         users: Arc::clone(&users),
         items: Arc::clone(&item_repository),
         persistence: Arc::clone(&item_persistence_service),
+        visibility: Arc::clone(&item_visibility),
     }));
 
     // Forward domain events to client sessions over the WebSocket — the Rust
@@ -2244,19 +2247,14 @@ pub async fn build_app_state(
                         }
                     });
                     // A client push is best-effort and must never hold up the
-                    // publisher (a scan publishes LibraryChanged/RefreshProgress
-                    // repeatedly), so this one stays spawned.
+                    // publisher (a scan publishes RefreshProgress repeatedly),
+                    // so this one stays spawned.
                     ferrofin_core::event_manager::consumer_done()
                 }),
             );
         };
-        // Library adds/removes → every signed-in client refreshes its views.
-        forward(
-            &event_bus,
-            "LibraryChanged",
-            SessionMessageType::LibraryChanged,
-            false,
-        );
+        // `LibraryChanged` is never forwarded from the bus: the notifier
+        // delivers it to each user's sessions, filtered to what they may see.
         // Scan % + task completion → the admin dashboard's live displays.
         // The scan reporter already runs independently of item processing.
         // Await its delivery here to preserve start/tick/end ordering; spawning
@@ -2777,6 +2775,8 @@ struct SessionLibraryAudience {
     users: Arc<dyn ferrofin_traits::library::UserManager>,
     items: Arc<dyn ferrofin_traits::persistence::ItemRepository>,
     persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService>,
+    /// `IsVisibleStandalone`, for which changed items each user is told about.
+    visibility: Arc<ferrofin_core::item_visibility::ItemVisibility>,
 }
 
 #[async_trait::async_trait]
@@ -2820,6 +2820,28 @@ impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
             }
         }
         Ok(tops)
+    }
+
+    async fn visible_item_ids(
+        &self,
+        user_id: Uuid,
+        ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(user) = self.users.get_user_by_id(user_id).await? else {
+            return Ok(Vec::new());
+        };
+        // An id whose row is gone has nothing to be visible through.
+        let rows = self.items.retrieve_items(ids).await?;
+        let verdicts = self.visibility.visible(&rows, &user, true).await?;
+        Ok(rows
+            .iter()
+            .zip(verdicts)
+            .filter(|(_, visible)| *visible)
+            .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+            .collect())
     }
 
     async fn deliver(

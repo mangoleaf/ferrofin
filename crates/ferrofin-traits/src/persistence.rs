@@ -239,8 +239,10 @@ pub trait ItemRepository: Send + Sync {
     }
 
     /// Sorts an already-filtered child set without grouping or paging. Name
-    /// sorts use the pinned stable ordinal comparison; an empty OrderBy keeps
-    /// input order. Other sorts retain the repository's existing consumer.
+    /// sorts use the pinned stable ordinal comparison and `AiredEpisodeOrder`
+    /// the stable aired-order comparer (non-episodes after the episodes); an
+    /// empty OrderBy keeps input order. Other sorts retain the repository's
+    /// existing consumer.
     async fn sort_folder_children(
         &self,
         rows: Vec<BaseItemEntity>,
@@ -361,10 +363,10 @@ pub trait ItemRepository: Send + Sync {
             .collect())
     }
 
-    /// The "latest media" rows of a **tvshows or music** library — port of C#
-    /// `BaseItemRepository.GetLatestItemList`.
+    /// The "latest media" rows of a **tvshows, music or movies** library — port
+    /// of C# `BaseItemRepository.GetLatestItemList`.
     ///
-    /// The two types answer differently (both v12):
+    /// The three types answer differently (all v12):
     ///
     /// - **tvshows** (`GetLatestTvShowItems`) — ONE row for each of the newest
     ///   `filter.limit` series (by the newest row the filter matches, grouped
@@ -377,13 +379,16 @@ pub trait ItemRepository: Send + Sync {
     ///   top parent ids — which reads no track at all — or, for an
     ///   ancestor-scoped caller, to the albums above a row the filter matches,
     ///   which is the one shape that still runs the caller's track query. The
-    ///   filter's `order_by` is not used, and the rows need no further grouping.
+    ///   filter's `order_by` is not used, and the rows need no further grouping;
+    /// - **movies** (`GetLatestMovieItems`) — the rows the filter matches that
+    ///   carry a presentation key, newest first (`DateCreated DESC, Id DESC`),
+    ///   the first of each key, `filter.limit` of them. The filter's `order_by`
+    ///   and `start_index` play no part, and the caller groups the rows.
     ///
     /// Any other collection type returns an empty list and the caller uses
     /// [`get_item_list`](Self::get_item_list) for it. Note that is wider than
-    /// the C# early exit, which also has `movies` and `unknown` arms — not
-    /// porting those two is an owner-scoped divergence, recorded where the
-    /// branch is taken (`ferrofin-core` `user_view_manager::items_for_latest_items`).
+    /// the C# early exit, which also has an `unknown` arm (a mixed library's
+    /// latest movies and shows): not ported yet, gl-383.
     async fn get_latest_item_list(
         &self,
         filter: &InternalItemsQuery,
@@ -1561,6 +1566,21 @@ pub trait ItemPersistenceService: Send + Sync {
     ///
     /// [`ServiceError::Backend`] on a storage failure.
     async fn touch_item_updated(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let _ = item_id;
+        Ok(false)
+    }
+
+    /// Announces `ItemAdded` for a row created outside
+    /// [`crate::library::LibraryManager::create_items`] (which announces its
+    /// own), as `LibraryManager.CreateItem` raises it for every new item.
+    /// Returns whether the row exists.
+    ///
+    /// The default announces nothing (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn report_item_added(&self, item_id: Uuid) -> Result<bool, ServiceError> {
         let _ = item_id;
         Ok(false)
     }

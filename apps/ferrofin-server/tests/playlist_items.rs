@@ -71,7 +71,7 @@ async fn login(router: &axum::Router, user: &str, password: &str) -> String {
 /// The server, logged in as its admin, with one library.
 #[derive(Clone)]
 struct Fixture {
-    _temp: std::sync::Arc<tempfile::TempDir>,
+    temp: std::sync::Arc<tempfile::TempDir>,
     db: Database,
     router: axum::Router,
     state: ferrofin_api::state::AppState,
@@ -79,26 +79,35 @@ struct Fixture {
     library: Uuid,
 }
 
-async fn fixture() -> Fixture {
-    let temp = tempfile::tempdir().unwrap();
-    let config = Config {
+/// The server's configuration over `root`.
+fn config(root: &std::path::Path) -> Config {
+    Config {
         admin_user: "admin".to_owned(),
         admin_password: "playlist-pw".to_owned(),
-        ..Config::test_stub(temp.path())
-    };
-    std::fs::create_dir_all(&config.data_dir).unwrap();
-    std::fs::create_dir_all(temp.path().join("config")).unwrap();
-    let db = Database::connect(&config.database_url()).await.unwrap();
-    db.run_migrations().await.unwrap();
-    let ffmpeg = ferrofin_server::bootstrap::FfmpegPaths {
+        ..Config::test_stub(root)
+    }
+}
+
+/// An ffmpeg that is never run: nothing here transcodes.
+fn ffmpeg() -> ferrofin_server::bootstrap::FfmpegPaths {
+    ferrofin_server::bootstrap::FfmpegPaths {
         encoder_app_path_display: None,
         ffmpeg: "ffmpeg".into(),
         ffprobe: "ffprobe".into(),
         capabilities: ferrofin_mediaencoding::FfmpegCapabilities::default(),
         chromaprint_muxer: false,
-    };
+    }
+}
+
+async fn fixture() -> Fixture {
+    let temp = tempfile::tempdir().unwrap();
+    let config = config(temp.path());
+    std::fs::create_dir_all(&config.data_dir).unwrap();
+    std::fs::create_dir_all(temp.path().join("config")).unwrap();
+    let db = Database::connect(&config.database_url()).await.unwrap();
+    db.run_migrations().await.unwrap();
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
-    let wired = build_app_state(&db, &config, &ffmpeg, None, shutdown_tx)
+    let wired = build_app_state(&db, &config, &ffmpeg(), None, shutdown_tx)
         .await
         .unwrap();
     ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
@@ -132,7 +141,7 @@ async fn fixture() -> Fixture {
         .parse()
         .unwrap();
     Fixture {
-        _temp: std::sync::Arc::new(temp),
+        temp: std::sync::Arc::new(temp),
         db,
         router,
         state: wired.state,
@@ -142,6 +151,22 @@ async fn fixture() -> Fixture {
 }
 
 impl Fixture {
+    /// The server started again over the same database and directories —
+    /// everything a restart runs before it serves — and its router.
+    async fn restart(&self) -> axum::Router {
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+        let wired = build_app_state(
+            &self.db,
+            &config(self.temp.path()),
+            &ffmpeg(),
+            None,
+            shutdown_tx,
+        )
+        .await
+        .unwrap();
+        ferrofin_api::create_router(wired.state)
+    }
+
     /// Saves `row` under `ancestors` (nearest first) inside the library.
     async fn seed(&self, mut row: BaseItemEntity, ancestors: &[Uuid]) -> Uuid {
         let id = Uuid::new_v4();
@@ -384,6 +409,54 @@ async fn creating_a_playlist_from_an_album_stores_its_tracks() {
     assert!(added.is_some(), "an add stamps DateLastMediaAdded");
 }
 
+/// gl-910: a data directory moved under an existing database leaves the
+/// playlists folder's row at the old path, under the same id. The next start
+/// saves it at the new path, as `CreateRootFolder` does, and a create goes
+/// into it — where it used to insert the folder's id a second time and
+/// answer 500.
+#[tokio::test]
+async fn a_create_after_the_data_directory_moved_goes_into_the_repathed_folder() {
+    let fx = fixture().await;
+    let (folder, current): (String, String) = sqlx::query_as(
+        r#"SELECT "Id", "Path" FROM "BaseItems"
+           WHERE "Type" = 'Emby.Server.Implementations.Playlists.PlaylistsFolder'"#,
+    )
+    .fetch_one(fx.db.pool())
+    .await
+    .unwrap();
+    sqlx::query(r#"UPDATE "BaseItems" SET "Path" = '/moved-from/data/playlists' WHERE "Id" = ?1"#)
+        .bind(&folder)
+        .execute(fx.db.writer())
+        .await
+        .unwrap();
+
+    let router = fx.restart().await;
+    let (status, created) = call(
+        &router,
+        &fx.token,
+        "POST",
+        "/Playlists",
+        Some(json!({"Name": "After the move"})),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let path: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(&folder)
+            .fetch_one(fx.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(path, Some(current), "the start re-paths the folder");
+    let parent: Option<String> =
+        sqlx::query_scalar(r#"SELECT "ParentId" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(created["Id"].as_str().unwrap().parse().unwrap()))
+            .fetch_one(fx.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(parent, Some(folder), "the playlist is in that folder");
+}
+
 /// An id naming no item: upstream's `CreatePlaylist` throws before anything
 /// exists (400, no playlist left behind), and an add drops it.
 #[tokio::test]
@@ -611,7 +684,9 @@ async fn a_created_playlist_takes_its_media_type_from_its_items() {
 }
 
 /// The obsolete query form names the media type too, in any case, and wins
-/// over the body and over inference (`mediaType ?? body.MediaType`).
+/// over the body and over inference (`mediaType ?? body.MediaType`), as its
+/// name wins over the body's. The body still carries the `Name` upstream's
+/// `required` member demands.
 #[tokio::test]
 async fn the_query_form_names_the_media_type() {
     let fx = fixture().await;
@@ -620,7 +695,7 @@ async fn the_query_form_names_the_media_type() {
         .call(
             "POST",
             &format!("/Playlists?name=Typed&mediaType=video&ids={}", music.album),
-            Some(json!({"MediaType": "Audio"})),
+            Some(json!({"Name": "From body", "MediaType": "Audio"})),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{created}");
@@ -628,6 +703,7 @@ async fn the_query_form_names_the_media_type() {
     let (status, item) = fx.call("GET", &format!("/Items/{id}"), None).await;
     assert_eq!(status, StatusCode::OK, "{item}");
     assert_eq!(item["MediaType"], "Video", "{item}");
+    assert_eq!(item["Name"], "Typed", "{item}");
 }
 
 /// A create keeps its media type and its shares side by side in `Data`,

@@ -407,3 +407,37 @@ pub fn status_name(status: RecordingStatus) -> String {
 fn db_err(e: sqlx::Error) -> ServiceError {
     ServiceError::from(ferrofin_db::DbError::from(e))
 }
+
+/// Fault-injection helpers for the manager's timer tests (they live here so
+/// the raw SQL stays inside the repository boundary).
+#[cfg(test)]
+#[allow(clippy::missing_errors_doc)] // test helpers; every error is "the write failed"
+pub mod test_support {
+    use super::{Database, db_err};
+    use ferrofin_traits::error::ServiceError;
+
+    /// Hides (or restores) the timers table by renaming it, so a timer read
+    /// fails with the pool still open.
+    pub async fn set_timers_table_hidden(db: &Database, hidden: bool) -> Result<(), ServiceError> {
+        let sql = if hidden {
+            r#"ALTER TABLE "FerrofinLiveTvTimers" RENAME TO "HiddenTimers""#
+        } else {
+            r#"ALTER TABLE "HiddenTimers" RENAME TO "FerrofinLiveTvTimers""#
+        };
+        sqlx::query(sql)
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Overwrites a stored timer's `Data` with JSON that no longer parses.
+    pub async fn corrupt_timer_data(db: &Database, id: &str) -> Result<(), ServiceError> {
+        sqlx::query(r#"UPDATE "FerrofinLiveTvTimers" SET "Data" = '{' WHERE "Id" = ?1"#)
+            .bind(id)
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+}

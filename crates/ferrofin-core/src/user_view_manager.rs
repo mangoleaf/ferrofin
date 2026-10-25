@@ -26,7 +26,6 @@
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -143,16 +142,13 @@ pub struct FerrofinUserViewManager {
     items: Arc<dyn ItemRepository>,
     configuration: Option<Arc<dyn ServerConfigurationManager>>,
     localization: Option<Arc<dyn LocalizationManager>>,
-    /// The item store, set by the composition root. It provisions the Live TV
-    /// `UserView` row, and — together with a
-    /// [`playlists_path`](Self::playlists_path) — [`get_media_folders`] uses it
-    /// to lazily provision the [`BaseItemKind::PlaylistsFolder`] row on first
-    /// read —
-    /// the same self-healing stance `FerrofinVirtualFolderManager` takes for a
-    /// library's `CollectionFolder`. The store memoizes, so this costs nothing
-    /// after the first call. `None` in unit tests.
-    ///
-    /// [`get_media_folders`]: UserViewManager::get_media_folders
+    /// The item store, set by the composition root, through which the
+    /// `UserView` rows this manager provisions are saved: Live TV, Folders,
+    /// the per-user Playlists views and grouped libraries. The
+    /// [`BaseItemKind::PlaylistsFolder`] row those views hang off is not one
+    /// of them: [`AggregateFolderStore::ensure`](crate::AggregateFolderStore::ensure)
+    /// provisions it once at startup, as upstream's
+    /// `LibraryManager.CreateRootFolder` does. `None` in unit tests.
     persistence: Option<Arc<dyn ItemPersistenceService>>,
     /// The user-root provisioner. [`get_media_folders`] settles it on first
     /// read so the `UserRootFolder` row this endpoint browses exists even on a
@@ -161,16 +157,6 @@ pub struct FerrofinUserViewManager {
     ///
     /// [`get_media_folders`]: UserViewManager::get_media_folders
     user_root: Option<crate::user_root_folder::UserRootFolderStore>,
-    /// The on-disk playlists directory (`{data}/playlists`), the provisioned
-    /// folder's `Path`. Only meaningful alongside [`persistence`](Self::persistence).
-    playlists_path: Option<PathBuf>,
-    /// The physical root directory (`{program data}/root`), whose
-    /// `AggregateFolder` row is the playlists folder's parent
-    /// (`LibraryManager.CreateRootFolder`: `folder.ParentId = rootFolder.Id`).
-    /// `None` in unit tests: the row is then provisioned parentless and the
-    /// startup [`AggregateFolderStore`](crate::AggregateFolderStore) repair
-    /// attaches it.
-    root_folder_path: Option<PathBuf>,
     /// The per-database item-id derivation mode (see
     /// [`item_type_lookup::IdDerivation`]).
     id_derivation: item_type_lookup::IdDerivation,
@@ -279,8 +265,6 @@ impl FerrofinUserViewManager {
             localization: None,
             persistence: None,
             user_root: None,
-            playlists_path: None,
-            root_folder_path: None,
             id_derivation: item_type_lookup::IdDerivation::LegacyLowercase,
             virtual_folders: None,
             db: None,
@@ -320,7 +304,6 @@ impl FerrofinUserViewManager {
         if let Some(root) = &self.user_root {
             root.ensure().await?;
         }
-        self.ensure_playlists_folder().await?;
         let metadata_path = metadata_path.resolve();
         let view_path = crate::user_view_repository::named_view_path(&metadata_path, "folders");
         let Some(id) = crate::user_view_repository::named_view_id(
@@ -459,43 +442,19 @@ impl FerrofinUserViewManager {
         self
     }
 
-    /// Attaches the physical root directory, so a newly provisioned playlists
-    /// folder is parented to the `AggregateFolder` the way
-    /// `LibraryManager.CreateRootFolder` parents it. Called once by the
-    /// composition root.
-    #[must_use]
-    pub fn with_root_folder_path(mut self, root_folder_path: impl Into<PathBuf>) -> Self {
-        self.root_folder_path = Some(root_folder_path.into());
-        self
-    }
-
-    /// Attaches the item store, so the Live TV `UserView` row can be
-    /// provisioned. Called once by the composition root.
+    /// Attaches the item store, so the views this manager provisions (see the
+    /// `persistence` field) can be saved. Called once by the composition root.
     #[must_use]
     pub fn with_item_store(mut self, persistence: Arc<dyn ItemPersistenceService>) -> Self {
         self.persistence = Some(persistence);
         self
     }
 
-    /// Attaches the item store and the playlists directory so
-    /// [`get_media_folders`](UserViewManager::get_media_folders) can lazily
-    /// provision the `PlaylistsFolder` row (and create its directory) on
-    /// first read. Called once by the composition root.
-    #[must_use]
-    pub fn with_playlists_store(
-        mut self,
-        persistence: Arc<dyn ItemPersistenceService>,
-        playlists_path: impl Into<PathBuf>,
-    ) -> Self {
-        self.persistence = Some(persistence);
-        self.playlists_path = Some(playlists_path.into());
-        self
-    }
-
     /// Attaches the user-root provisioner, so
     /// [`get_media_folders`](UserViewManager::get_media_folders) settles the
-    /// root — and with it the playlists plugin folder it must list — on first
-    /// read. Called once by the composition root.
+    /// `UserRootFolder` row on first read. The playlists plugin folder it also
+    /// lists is not this store's: startup provisions it. Called once by the
+    /// composition root.
     #[must_use]
     pub fn with_user_root(mut self, store: crate::user_root_folder::UserRootFolderStore) -> Self {
         self.user_root = Some(store);
@@ -530,77 +489,6 @@ impl FerrofinUserViewManager {
             return Ok(views);
         }
         Ok(views.into_iter().filter(|v| !is_live_tv(v)).collect())
-    }
-
-    /// The deterministic `PlaylistsFolder` item id (`GetNewItemIdInternal` over
-    /// the folder path).
-    ///
-    /// `PlaylistsFolder`, not `ManualPlaylistsFolder`: 10.11.8 has no class of
-    /// the latter name — it is only `PlaylistsFolder.GetClientTypeName()`
-    /// (PlaylistsFolder.cs:52-55) — and `GetNewItemIdInternal` hashes
-    /// `type.FullName + key`, so the fabricated name yields a DIFFERENT id for
-    /// the same directory. Ferrofin used to write it, which meant an adopted
-    /// Jellyfin database grew a second playlists folder beside its own.
-    fn playlists_folder_id(&self, playlists_path: &std::path::Path) -> Option<Uuid> {
-        item_type_lookup::derive_item_id_with(
-            &self.id_derivation,
-            BaseItemKind::PlaylistsFolder,
-            &playlists_path.to_string_lossy(),
-        )
-    }
-
-    /// The `AggregateFolder` row the playlists folder hangs off, when it is
-    /// there. Read on the cold provisioning path only — never on a warm read,
-    /// which returns at the single existence probe above it.
-    async fn aggregate_parent(
-        &self,
-        persistence: &Arc<dyn ItemPersistenceService>,
-    ) -> Result<Option<Uuid>, ServiceError> {
-        let Some(root) = self.root_folder_path.as_deref() else {
-            return Ok(None);
-        };
-        let Some(id) =
-            item_type_lookup::aggregate_folder_id(&self.id_derivation, &root.to_string_lossy())
-        else {
-            return Ok(None);
-        };
-        // `BaseItems.ParentId` is a foreign key: pointing at a row that is not
-        // there would fail the insert outright.
-        Ok(persistence.item_exists(id).await?.then_some(id))
-    }
-
-    /// Upserts the `PlaylistsFolder` row (and its directory) when it is
-    /// missing (idempotent). No-op without an item store + playlists path wired.
-    ///
-    /// Port of `LibraryManager.CreateRootFolder()`'s plug-in-folder step
-    /// (LibraryManager.cs:855-885): the folder is `Name="Playlists"`,
-    /// `Path={data}/playlists`, its `ParentId` is the **`AggregateFolder`**,
-    /// and `rootFolder.AddVirtualChild(folder)` is what still puts it among the
-    /// user root's children (ported as the virtual-children concat in
-    /// `item_repository`/`item_count_service`).
-    async fn ensure_playlists_folder(&self) -> Result<(), ServiceError> {
-        let (Some(persistence), Some(playlists_path)) = (&self.persistence, &self.playlists_path)
-        else {
-            return Ok(());
-        };
-        let Some(id) = self.playlists_folder_id(playlists_path) else {
-            return Ok(());
-        };
-        if persistence.item_exists(id).await? {
-            return Ok(());
-        }
-        let parent = self.aggregate_parent(persistence).await?;
-        // Create the backing directory (C# `PlaylistsFolder` lives on disk).
-        tokio::fs::create_dir_all(playlists_path)
-            .await
-            .map_err(|e| ServiceError::backend(format!("create playlists directory: {e}")))?;
-        let dir = tokio::fs::metadata(playlists_path).await.ok();
-        let entity =
-            crate::aggregate_folder::playlists_folder_row(id, playlists_path, parent, dir.as_ref());
-        persistence
-            .save_items(std::slice::from_ref(&entity))
-            .await?;
-        Ok(())
     }
 
     /// The id of the per-user, per-parent named view — C# `GetNamedView(user,
@@ -1156,14 +1044,14 @@ impl UserViewManager for FerrofinUserViewManager {
         // Jellyfin's LibraryController.GetMediaFolders returns
         // GetUserRootFolder().Children sorted by SortName — the library collection
         // folders plus the playlists plugin folder `CreateRootFolder()` parents
-        // to the `AggregateFolder`. Settle the user root on first read (lazy,
-        // self-healing, memoized by the store) and provision the playlists
-        // folder the same way, then project the user-root child kinds,
-        // name-sorted.
+        // to the `AggregateFolder`. That folder is provisioned once at startup
+        // (`AggregateFolderStore::ensure`), as upstream's `RootFolder` runs
+        // `CreateRootFolder` once per process, so this read never writes it.
+        // Settle the user root on first read (lazy, self-healing, memoized by
+        // the store), then project the user-root child kinds, name-sorted.
         if let Some(root) = &self.user_root {
             root.ensure().await?;
         }
-        self.ensure_playlists_folder().await?;
         let query = InternalItemsQuery {
             // `GetUserRootFolder().Children` holds the libraries and the
             // playlists folder — never a `UserView` (those are derived views,
@@ -1171,8 +1059,10 @@ impl UserViewManager for FerrofinUserViewManager {
             // `item_repository::visible_views` still admits them).
             include_item_types: vec![
                 BaseItemKind::CollectionFolder,
-                // Both spellings of the playlists folder: Ferrofin provisions
-                // one, an adopted database carries the other.
+                // Both kinds of playlists folder: Ferrofin and Jellyfin both
+                // store `PlaylistsFolder`, but a row an earlier Ferrofin
+                // wrote as `ManualPlaylistsFolder` survives when startup
+                // finds the correct row beside it and does not re-key it.
                 BaseItemKind::ManualPlaylistsFolder,
                 BaseItemKind::PlaylistsFolder,
             ],
@@ -1599,8 +1489,9 @@ impl FerrofinUserViewManager {
     /// query that feeds the grouping in
     /// [`get_latest_items`](UserViewManager::get_latest_items) — the plain form,
     /// or, for a grouped request whose first typed parent is a library of one of
-    /// the two short-circuited types, that type's own query (one card per
-    /// newest series for tvshows, the newest albums for music).
+    /// the three short-circuited types, that type's own query (one card per
+    /// newest series for tvshows, the newest albums for music, the newest row
+    /// of each presentation key for movies).
     async fn items_for_latest_items(
         &self,
         query: &LatestItemsQuery,
@@ -1652,43 +1543,40 @@ impl FerrofinUserViewManager {
         }
 
         if query.group_items {
-            // The first typed parent decides (v12 `UserViewManager.cs:371-405`,
-            // `FirstOrDefault(type => type is not null)`): a tvshows or music
-            // library short-circuits into its own per-collection-type query,
-            // with `limit` now capping GROUPS (tvshows) or ALBUMS (music)
-            // rather than rows.
-            //
-            // Following that citation upward also reaches `Limit = limit * 2`
-            // (`:365`), which Ferrofin has NOT adopted — the plain path above
-            // still over-fetches 10.11.8's `limit * 5`
-            // ([`LATEST_OVER_FETCH_FACTOR`]). It cannot affect either
-            // short-circuit, both of which overwrite `limit` on the next line,
-            // so it is a live question only for the plain path: v12 returns
-            // fewer groups from a page of many small containers. Un-adopted,
-            // not decided.
+            // The first typed parent decides (v12 `UserViewManager.cs:396-430`,
+            // `FirstOrDefault(type => type is not null)`): a tvshows, music or
+            // movies library short-circuits into its own per-collection-type
+            // query, with `limit` now capping GROUPS (tvshows), ALBUMS (music)
+            // or presentation keys (movies) rather than rows.
             //
             // "First" is the parents' order, and with no `parentId` the parents
             // are the user's whole view list — so on a server whose first view
-            // by `SortName` is a music library, the UNSCOPED `/Items/Latest`
-            // (the home row) is albums too, not just `ParentId=<music view>`.
-            // That is upstream's behaviour, not an artifact of this port.
+            // by `SortName` is a movies library, the UNSCOPED `/Items/Latest`
+            // (the home row) is the movies arm too: the newest `limit` rows of
+            // EVERY library, one per key, grouped below — a burst of new tracks
+            // can fill it with a few album cards. That is upstream's behaviour
+            // (the owner chose to follow v12 here on 2026-10-24), not an
+            // artifact of this port.
             //
-            // The movies and `null`-collection-type branches v12 added
-            // alongside them (`:394-404`) are deliberately NOT taken here, and
-            // that divergence is an owner decision to leave standing: the
-            // movies arm changes which movies a movies library answers with,
-            // and the `null` arm changes a MIXED library's answer for both
-            // movies and episodes. They are also not the same size of job —
-            // movies needs `GetLatestMovieItems` (`Querying.cs:233-256`) alone,
-            // while `null` (`:134-144`) needs that beside the ported
-            // `GetLatestTvShowItems` (`latest_tv_repository`), then their
-            // concat re-sorted `DateCreated DESC, Id DESC` and cut to `limit`.
-            // Either way the routing is one more arm on the match below.
+            // The `null`-collection-type arm v12 added beside them
+            // (`:425-429`, a MIXED library's latest movies and shows) is not
+            // ported yet — gl-383. Port path: `GetLatestItemList`'s `unknown`
+            // arm (`Querying.cs:134-144`), the movies arm over the rows with no
+            // `SeriesName` concatenated with `latest_tv_repository`, re-sorted
+            // `DateCreated DESC, Id DESC` and cut to `limit`, then one more arm
+            // on the match below.
+            //
+            // The plain path below still over-fetches 10.11.8's `limit * 5`
+            // ([`LATEST_OVER_FETCH_FACTOR`]) where v12 fetches `limit * 2`
+            // (`:390`); the short-circuits overwrite it on the next line.
             let collection_type = parents
                 .iter()
                 .filter(|p| p.is_collection_folder() || p.is_user_view())
                 .find_map(|p| p.collection_type);
-            if let Some(ct @ (CollectionType::tvshows | CollectionType::music)) = collection_type {
+            if let Some(
+                ct @ (CollectionType::tvshows | CollectionType::music | CollectionType::movies),
+            ) = collection_type
+            {
                 internal.limit = Some(limit);
                 return self.items.get_latest_item_list(&internal, ct).await;
             }
@@ -2370,12 +2258,13 @@ mod tests {
         FerrofinUserViewManager::new(Arc::new(FerrofinItemRepository::new(db.clone(), lookup)))
     }
 
-    /// A manager that provisions the playlists folder, plus the user-root store
-    /// `get_media_folders` settles on the way in.
-    fn manager_with_playlists(
+    /// A manager wired for `get_media_folders` as the composition root wires
+    /// it: an item store, plus the user-root store it settles on the way in.
+    /// The playlists folder is not its to make: [`provision_at_startup`] does
+    /// that, as the server's boot does.
+    fn media_folders_manager(
         db: &Database,
-        root_path: impl Into<PathBuf>,
-        playlists_path: impl Into<PathBuf>,
+        root_path: impl Into<std::path::PathBuf>,
     ) -> FerrofinUserViewManager {
         let persistence: Arc<dyn ItemPersistenceService> =
             Arc::new(FerrofinItemPersistenceService::new(db.clone()));
@@ -2385,7 +2274,7 @@ mod tests {
             root_path,
         );
         manager(db)
-            .with_playlists_store(persistence, playlists_path)
+            .with_item_store(persistence)
             .with_user_root(root)
     }
 
@@ -2790,6 +2679,61 @@ mod tests {
         );
     }
 
+    /// A grouped request whose first typed view is a movies library takes v12's
+    /// movies arm (`UserViewManager.cs:419-423`, `GetLatestMovieItems`): the
+    /// newest `limit` rows of every view, one per presentation key, then
+    /// grouped. Two new episodes of one series fill a `limit=2` page, which
+    /// then shows ONE card; the plain path read `limit * 5` rows and filled
+    /// both cards (the series, then the movie).
+    #[tokio::test]
+    async fn latest_with_a_movies_first_view_reads_limit_rows_then_groups() {
+        let db = test_db().await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "Shows").await;
+        let series = Uuid::from_u128(0x251);
+        let (movie, e1, e2) = (
+            Uuid::from_u128(0x351),
+            Uuid::from_u128(0x352),
+            Uuid::from_u128(0x353),
+        );
+        seed(
+            &db,
+            &[
+                Row::new(series, BaseItemKind::Series, "Series 01", day(1), SHOWS),
+                Row::new(movie, BaseItemKind::Movie, "Movie 0001", day(3), MOVIES),
+                Row::new(e1, BaseItemKind::Episode, "S1E1", day(8), SHOWS)
+                    .under(series)
+                    .of_series(series, "Series 01"),
+                Row::new(e2, BaseItemKind::Episode, "S1E2", day(9), SHOWS)
+                    .under(series)
+                    .of_series(series, "Series 01"),
+            ],
+        )
+        .await;
+        let mgr = manager_with_folders(
+            &db,
+            vec![
+                (MOVIES, Some(CollectionTypeOptions::movies)),
+                (SHOWS, Some(CollectionTypeOptions::tvshows)),
+            ],
+        );
+
+        let query = |group_items| LatestItemsQuery {
+            limit: Some(2),
+            group_items,
+            ..LatestItemsQuery::default()
+        };
+        assert_eq!(
+            shape(&latest(&mgr, query(true)).await),
+            vec![(Some(series), vec![e2, e1])]
+        );
+        // Ungrouped requests never short-circuit: the plain path, two rows.
+        assert_eq!(
+            shape(&latest(&mgr, query(false)).await),
+            vec![(None, vec![e2]), (None, vec![e1])]
+        );
+    }
+
     /// Equal `DateCreated` (hard-linked fixtures share one btime) breaks on
     /// `SortName DESC` — Jellyfin's `0500, 0499, …`, not the old `ASC`.
     #[tokio::test]
@@ -3139,11 +3083,11 @@ mod tests {
     }
 
     /// The music branch fires on the parents' collection type and nothing else,
-    /// so a request scoped to a NON-music parent keeps the generic path even on
-    /// a server that does have a music library — and a stray `MusicAlbum` row
-    /// sitting in a movies library is a folder, which the generic query filters
-    /// out. The other half: a music library with no albums answers empty rather
-    /// than widening its top-parent scope.
+    /// so a request scoped to a movies parent takes the movies arm even on a
+    /// server that does have a music library — and a stray `MusicAlbum` row
+    /// sitting in a movies library is a folder, which the movies arm's filter
+    /// (`IsFolder = false`) leaves out. The other half: a music library with
+    /// no albums answers empty rather than widening its top-parent scope.
     #[tokio::test]
     async fn latest_music_branch_needs_a_music_parent() {
         let db = test_db().await;
@@ -3184,7 +3128,7 @@ mod tests {
         assert_eq!(
             shape(&movies),
             vec![(None, vec![movie])],
-            "a movies parent still takes the generic path, folders excluded"
+            "a movies parent takes the movies arm, folders excluded"
         );
 
         let empty = latest(
@@ -3205,9 +3149,11 @@ mod tests {
 
     /// `isPlayed` is a SQL predicate (it needs the user), not a post-filter
     /// over an already-cut page: SIX played movies are newer than the one
-    /// unplayed movie and the request over-fetches `limit * 5 = 5` rows, so a
-    /// post-filter over the page would return nothing while the SQL predicate
-    /// finds the fresh one. A music parent drops the filter entirely.
+    /// unplayed movie, and the plain path (ungrouped) over-fetches
+    /// `limit * 5 = 5` rows while the movies arm (grouped, Movies the first
+    /// view) reads `limit = 1`, so a post-filter over either page would return
+    /// nothing while the SQL predicate finds the fresh one. A music parent
+    /// drops the filter entirely.
     #[tokio::test]
     async fn latest_pushes_is_played_into_sql() {
         let db = test_db().await;
@@ -3237,20 +3183,27 @@ mod tests {
             ],
         );
 
-        let unplayed = latest(
-            &mgr,
-            LatestItemsQuery {
-                user: Some(user.clone()),
-                is_played: Some(false),
-                limit: Some(1),
-                ..LatestItemsQuery::default()
-            },
-        )
-        .await;
-        // The played movies are out; the played TRACK is out too — the views
-        // fallback keeps `isPlayed` (the music exemption is decided on the
-        // explicit parent only, as upstream).
-        assert_eq!(shape(&unplayed), vec![(None, vec![fresh])]);
+        for group_items in [false, true] {
+            let unplayed = latest(
+                &mgr,
+                LatestItemsQuery {
+                    user: Some(user.clone()),
+                    is_played: Some(false),
+                    group_items,
+                    limit: Some(1),
+                    ..LatestItemsQuery::default()
+                },
+            )
+            .await;
+            // The played movies are out; the played TRACK is out too — the
+            // views fallback keeps `isPlayed` (the music exemption is decided
+            // on the explicit parent only, as upstream).
+            assert_eq!(
+                shape(&unplayed),
+                vec![(None, vec![fresh])],
+                "group_items={group_items}"
+            );
+        }
 
         // `GroupItems = false` keeps a music parent on the generic path, which
         // is where `isPlayed` would still be a predicate — and it is not:
@@ -3715,16 +3668,16 @@ mod tests {
         let libraries = 2usize;
         let tmp = tempfile::tempdir().expect("tempdir");
         let playlists_path = tmp.path().join("data").join("playlists");
-        let root_path = tmp.path().join("root").join("default");
-        let mgr = manager_with_playlists(&db, &root_path, &playlists_path);
+        provision_at_startup(&db, tmp.path()).await;
+        let mgr = media_folders_manager(&db, tmp.path().join("root").join("default"));
 
         let folders = mgr
             .get_media_folders(Uuid::from_u128(9))
             .await
             .expect("media folders");
 
-        // The user-root children are the libraries plus the auto-provisioned
-        // Playlists folder (C# GetUserRootFolder().Children).
+        // The user-root children are the libraries plus the Playlists folder
+        // startup provisioned (C# GetUserRootFolder().Children).
         assert_eq!(folders.len(), libraries + 1);
         let playlists = folders
             .iter()
@@ -3749,8 +3702,8 @@ mod tests {
 
         // The id is stored the way Jellyfin stores Guid columns: UPPERCASE
         // hyphenated. `BaseItems."Id"` is plain TEXT with no COLLATE NOCASE, so
-        // a lowercase id is a different row to SQLite — the existence check
-        // below would never match it, and the folder would also come back to
+        // a lowercase id is a different row to SQLite — an existence check by
+        // id would never match it, and the folder would also come back to
         // clients with a lowercase `Id` where Jellyfin sends uppercase.
         assert_eq!(
             playlists.id,
@@ -3759,13 +3712,12 @@ mod tests {
             playlists.id
         );
 
-        // Provisioning is idempotent — and this checks that the second read
-        // does not WRITE, not merely that it does not duplicate. An upsert on
-        // the same id can never duplicate, so a row count proves nothing; the
-        // bug this guards against re-ran the upsert on every single request and
-        // still left exactly one row. Renaming the row out from under the
-        // manager makes a rewrite observable: if provisioning runs again it
-        // stamps `Name` back to "Playlists".
+        // A read never WRITES the folder, not merely never duplicates it. An
+        // upsert on the same id can never duplicate, so a row count proves
+        // nothing; the bug this guards against re-ran the upsert on every
+        // single request and still left exactly one row. Renaming the row out
+        // from under the manager makes a rewrite observable: if a read
+        // provisions it again it stamps `Name` back to "Playlists".
         let persistence = FerrofinItemPersistenceService::new(db.clone());
         let mut renamed_row = playlists.clone();
         renamed_row.name = Some("SENTINEL".to_owned());
@@ -3786,10 +3738,74 @@ mod tests {
         assert_eq!(
             renamed.name.as_deref(),
             Some("SENTINEL"),
-            "a second read re-provisioned the folder — the existence check did \
-             not match the row it wrote, so every request pays a filesystem \
-             call and a write through the single writer connection"
+            "a read re-provisioned the folder, so every request pays a \
+             filesystem call and a write through the single writer connection"
         );
+    }
+
+    /// What the composition root runs once before serving anything
+    /// (`AggregateFolderStore::ensure`, upstream's `CreateRootFolder`): the
+    /// aggregate root at `{tmp}/root` and the playlists folder at
+    /// `{tmp}/data/playlists`.
+    async fn provision_at_startup(db: &Database, tmp: &std::path::Path) {
+        crate::AggregateFolderStore::new(
+            db.clone(),
+            item_type_lookup::IdDerivation::LegacyLowercase,
+            tmp.join("root"),
+            tmp.join("data"),
+        )
+        .ensure()
+        .await
+        .expect("startup provisioning");
+    }
+
+    /// gl-343: startup keeps a playlists folder it finds at the folder's
+    /// path under another id, and the media folders list that one. Nothing
+    /// on the request path provisions a second beside it, so the folder is
+    /// listed once and every playlist stays in it.
+    #[tokio::test]
+    async fn media_folders_keep_a_playlists_folder_found_by_path() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let db = test_db().await;
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let playlists_path = tmp.path().join("data").join("playlists");
+            let foreign = Uuid::from_u128(0xADA);
+            seed_named_item(&db, foreign, BaseItemKind::PlaylistsFolder, "Playlists").await;
+            set_item_path(&db, foreign, &playlists_path.to_string_lossy()).await;
+            provision_at_startup(&db, tmp.path()).await;
+            let mgr = media_folders_manager(&db, tmp.path().join("root").join("default"));
+
+            for _ in 0..2 {
+                let folders = mgr
+                    .get_media_folders(Uuid::from_u128(9))
+                    .await
+                    .expect("media folders");
+                let playlists: Vec<_> = folders
+                    .iter()
+                    .filter(|f| {
+                        matches!(
+                            item_type_lookup::kind_from_type_name(&f.type_),
+                            Some(
+                                BaseItemKind::PlaylistsFolder | BaseItemKind::ManualPlaylistsFolder
+                            )
+                        )
+                    })
+                    .map(|f| f.id.clone())
+                    .collect();
+                assert_eq!(
+                    playlists,
+                    vec![guid_to_db(foreign)],
+                    "one playlists folder, the one already at the path"
+                );
+            }
+            assert_eq!(
+                crate::test_support::items_at_path(&db, &playlists_path.to_string_lossy()).await,
+                1,
+                "no second playlists folder was written at that path"
+            );
+        })
+        .await
+        .expect("the test finishes");
     }
 
     /// The per-user named-view id, pinned against the owner's real 12.0
@@ -3872,10 +3888,7 @@ mod tests {
             }),
         );
         let manager = manager(&db)
-            .with_playlists_store(
-                Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-                tmp.path().join("playlists"),
-            )
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
             .with_metadata_path(tmp.path().join("metadata"))
             .with_database(db.clone())
             .with_dashboard_configuration(config.clone(), localization);
@@ -4069,10 +4082,7 @@ mod tests {
             }),
         );
         let manager = manager(&db)
-            .with_playlists_store(
-                Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-                tmp.path().join("playlists"),
-            )
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
             .with_metadata_path(metadata.clone())
             .with_id_derivation(mode)
             .with_dashboard_configuration(config.clone(), localization);
@@ -4135,10 +4145,7 @@ mod tests {
             .await
             .unwrap();
         let manager = manager(&db)
-            .with_playlists_store(
-                Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-                tmp.path().join("playlists"),
-            )
+            .with_item_store(Arc::new(FerrofinItemPersistenceService::new(db.clone())))
             .with_metadata_path(tmp.path().join("metadata"))
             .with_dashboard_configuration(config, localization);
         let views = manager.get_user_views(user).await.unwrap();

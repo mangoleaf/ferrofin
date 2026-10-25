@@ -120,9 +120,16 @@ async fn create_playlist(
     // user (which would make *them* the playlist owner) requires the
     // administrator role.
     let user_id = effective_user_id(&state, &auth, query.user_id.or(body.user_id)).await?;
+    // C# `Name = name ?? createPlaylistRequest?.Name`: with neither, upstream's
+    // GetValidFilename(null) throws (500). A nameless playlist is refused here.
+    let Some(name) = query.name.or(body.name) else {
+        return Err(ApiError::BadRequest(
+            "The Name field is required.".to_owned(),
+        ));
+    };
 
     let request = PlaylistCreationRequest {
-        name: query.name.or(body.name),
+        name: Some(name),
         item_id_list,
         media_type: query.media_type.or(body.media_type),
         user_id,

@@ -229,6 +229,61 @@ struct ViewRow {
 }
 
 impl FerrofinItemRepository {
+    /// v12's movies arm of `GetLatestItemList` (`GetLatestMovieItems`,
+    /// `Querying.cs:233-256`): stream the caller's rows newest first and keep
+    /// the first of each presentation key until `limit` keys are read
+    /// (`DistinctBy(PresentationUniqueKey).Take(limit)`, lazy, so the read
+    /// stops there), then load those rows newest first (`LoadLatestByIds`,
+    /// `DateCreated DESC, Id DESC`). Stopping early saves reading and decoding
+    /// the rest, not the sort: no index orders the libraries' rows by date, so
+    /// SQLite sorts every matching `(Id, key, date)` before the first row
+    /// streams, as it does for upstream's same `ORDER BY`. The read is a
+    /// `fetch` stream for that reason; dropping it mid-way resets the
+    /// statement.
+    ///
+    /// The newest row of a key stands for it, not the primary version: an
+    /// alternate in the primary's library is already hidden by the caller's
+    /// filter (`ApplyAlternateVersionFiltering`), so this only decides between
+    /// rows the filter kept.
+    async fn latest_movie_items(
+        &self,
+        filter: &InternalItemsQuery,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        use futures_util::TryStreamExt;
+        let limit = filter
+            .limit
+            .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
+        let mut ids: Vec<String> = Vec::new();
+        if limit > 0 {
+            let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut qb = crate::translate_query::build_latest_movies_query(filter);
+            let mut rows = qb
+                .build_query_as::<(String, String)>()
+                .fetch(self.db.pool());
+            while let Some((id, key)) = rows.try_next().await.map_err(db_err)? {
+                if keys.insert(key) {
+                    ids.push(id);
+                    if ids.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids =
+            serde_json::to_string(&ids).map_err(|e| ServiceError::BackendSource(Box::new(e)))?;
+        sqlx::query_as::<_, BaseItemEntity>(
+            r#"SELECT * FROM "BaseItems" WHERE "Id" IN (SELECT value FROM json_each(?1))
+               ORDER BY "DateCreated" DESC, "Id" DESC"#,
+        )
+        .bind(ids)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)
+    }
+
     /// Creates a repository over the given database and kind-lookup tables.
     #[must_use]
     pub fn new(db: Database, item_type_lookup: Arc<dyn ItemTypeLookup>) -> Self {
@@ -440,11 +495,15 @@ impl FerrofinItemRepository {
 
     async fn sort_folder_children_inner(
         &self,
-        mut rows: Vec<BaseItemEntity>,
+        rows: Vec<BaseItemEntity>,
         filter: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        use crate::tv_series_manager::aired_order;
         use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::entities_media::AiredEpisodeOrder;
         use ferrofin_model::live_tv::ItemSortBy;
+        use ferrofin_util::stable_sort::stable_sort_by;
+        type Keyed = (Option<AiredEpisodeOrder>, BaseItemEntity);
         if rows.is_empty() || filter.order_by.is_empty() {
             return Ok(rows);
         }
@@ -453,11 +512,27 @@ impl FerrofinItemRepository {
                 by,
                 ItemSortBy::Name
                     | ItemSortBy::SortName
+                    | ItemSortBy::AiredEpisodeOrder
                     | ItemSortBy::Default
                     | ItemSortBy::Unrecognized(_)
             )
         }) {
-            rows.sort_by(|a, b| {
+            // `AiredEpisodeOrderComparer` positions episodes only, so the aired
+            // fields are read once per episode row; any other row has none.
+            let aired = filter
+                .order_by
+                .iter()
+                .any(|(by, _)| *by == ItemSortBy::AiredEpisodeOrder);
+            let episode = stored_type_name(BaseItemKind::Episode);
+            let mut keyed: Vec<Keyed> = rows
+                .into_iter()
+                .map(|row| {
+                    let key =
+                        (aired && Some(row.type_.as_str()) == episode).then(|| aired_order(&row));
+                    (key, row)
+                })
+                .collect();
+            let compare = |(a_aired, a): &Keyed, (b_aired, b): &Keyed| {
                 for (by, direction) in &filter.order_by {
                     let ordering = match by {
                         ItemSortBy::Name => {
@@ -467,6 +542,14 @@ impl FerrofinItemRepository {
                             Some(&folder_sort_name(a)),
                             Some(&folder_sort_name(b)),
                         ),
+                        // `AiredEpisodeOrderComparer.Compare`: a non-episode
+                        // sorts after every episode and equal to another one.
+                        ItemSortBy::AiredEpisodeOrder => match (a_aired, b_aired) {
+                            (Some(a), Some(b)) => a.compare(b),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        },
                         _ => continue,
                     };
                     let ordering = if *direction == SortOrder::Descending {
@@ -479,8 +562,16 @@ impl FerrofinItemRepository {
                     }
                 }
                 std::cmp::Ordering::Equal
-            });
-            return Ok(rows);
+            };
+            if aired {
+                // `LibraryManager.Sort`'s LINQ `OrderBy`/`ThenBy` is stable, and
+                // the comparer is not a total order, on which `sort_by` may
+                // panic: see `stable_sort_by`.
+                stable_sort_by(&mut keyed, compare);
+            } else {
+                keyed.sort_by(compare);
+            }
+            return Ok(keyed.into_iter().map(|(_, row)| row).collect());
         }
         // Keep the existing consumer for other sort fields. Its broader
         // comparator parity is a separate query review, not this display flag.
@@ -1674,6 +1765,7 @@ impl FerrofinItemRepository {
     /// library, each with an in-scope item count — matching Jellyfin, which scopes
     /// its by-name aggregates to the query. Only values with an in-scope item (and
     /// a materialized by-name row) appear.
+    #[allow(clippy::too_many_lines)] // the C# `GetItemValues` query and its paging, in its order
     async fn item_values_with_counts(
         &self,
         value_types: &[ItemValueType],
@@ -1699,11 +1791,18 @@ impl FerrofinItemRepository {
         // returnType)` selects. The owner-type split lives solely on the
         // *Names* variants (`GetItemValueNames`, ByName.cs:120-141), which
         // `get_genre_names`/`get_music_genre_names` still carry.
-        let content_type_names: Vec<String> = filter
-            .include_item_types
-            .iter()
-            .filter_map(|k| stored_type_name(*k).map(str::to_owned))
-            .collect();
+        //
+        // `None` only when the caller named no kind: a list of kinds none of
+        // which has a stored name (`Program`, `Recording`, …) is `Some(empty)`
+        // and matches nothing, as `TranslateQuery` does (see `push_content_scope`).
+        let content_type_names: Option<Vec<String>> =
+            (!filter.include_item_types.is_empty()).then(|| {
+                filter
+                    .include_item_types
+                    .iter()
+                    .filter_map(|k| stored_type_name(*k).map(str::to_owned))
+                    .collect()
+            });
         let exclude_type_names: Vec<String> = filter
             .exclude_item_types
             .iter()
@@ -1747,7 +1846,7 @@ impl FerrofinItemRepository {
         let scope = ByNameScope {
             filter,
             type_ints: &type_ints,
-            content_type_names: &content_type_names,
+            content_type_names: content_type_names.as_deref(),
             exclude_type_names: &exclude_type_names,
             media_types: &media_types,
             ancestors: &ancestors,
@@ -1963,26 +2062,44 @@ fn push_content_scope(qb: &mut QueryBuilder<Sqlite>, scope: &ByNameScope<'_>, in
         top_parents,
         ..
     } = scope;
+    // The kinds, as `TranslateQuery` filters them (v12.2
+    // `TranslateQuery.cs:282-313`): with kinds included, `WhereOneOrMany` over
+    // their stored names, which matches nothing when none has one
+    // (`push_in_list` writes `1 = 0`), and the excludes are ignored; with none
+    // included, the excludes. The counts' `scopeQuery` carries no included
+    // kinds (`ByName.cs:336-346`), so it always takes the excludes.
+    //
     // `+`: a plan pin, like the one on `TopParentId` below. Unpinned, the
     // planner drives the semijoin from every content row of the kind
     // (`IX_BaseItems_Type_…`, `Type=?`) and probes the value per
     // row — `/Artists?includeItemTypes=MusicAlbum` walks 800 albums per
     // artist: 45 ms; pinned, it walks the artist's own map rows: 4 ms.
-    if inner == InnerScope::Page && !content_type_names.is_empty() {
-        qb.push(" AND ");
-        push_in_list(qb, r#"+ci."Type""#, content_type_names);
-    }
-    if !exclude_type_names.is_empty() {
-        qb.push(r#" AND ci."Type" NOT IN ("#);
-        let mut sep = qb.separated(", ");
-        for name in *exclude_type_names {
-            sep.push_bind(name.clone());
+    match content_type_names {
+        // Page only: the Counts scope falls through to the excludes on purpose,
+        // since `BuildItemCountsByCleanName`'s `scopeQuery` copies
+        // `ExcludeItemTypes` and not `IncludeItemTypes`.
+        Some(names) if inner == InnerScope::Page => {
+            qb.push(" AND ");
+            push_in_list(qb, r#"+ci."Type""#, names);
         }
-        qb.push(")");
+        _ if !exclude_type_names.is_empty() => {
+            qb.push(r#" AND ci."Type" NOT IN ("#);
+            let mut sep = qb.separated(", ");
+            for name in *exclude_type_names {
+                sep.push_bind(name.clone());
+            }
+            qb.push(")");
+        }
+        _ => {}
     }
+    // `+`: a plan pin, like `Type` above. Unpinned, the planner drives the
+    // semijoin from every content row of the media type
+    // (`IX_BaseItems_MediaType_…`, `MediaType=?`) and probes the value per
+    // row — `/Artists?mediaTypes=Video` walked 10k videos per artist: 2.6 s for
+    // an empty page on the gl-637 corpus; pinned, the artist's own map rows.
     if !media_types.is_empty() {
         qb.push(" AND ");
-        push_in_list(qb, r#"ci."MediaType""#, media_types);
+        push_in_list(qb, r#"+ci."MediaType""#, media_types);
     }
     if !ancestors.is_empty() {
         qb.push(r#" AND EXISTS (SELECT 1 FROM "AncestorIds" a WHERE a."ItemId" = ci."Id" AND "#);
@@ -2108,9 +2225,12 @@ struct ByNameScope<'a> {
     type_ints: &'a [i64],
     /// Stored type names of the content items that may contribute — the
     /// caller's `IncludeItemTypes` and nothing else, exactly as C# builds its
-    /// `innerQueryFilter`.
-    content_type_names: &'a [String],
-    /// Stored type names the content items must not be (`ExcludeItemTypes`).
+    /// `innerQueryFilter`. `None` when the caller named no kind; `Some(&[])`
+    /// when it named only kinds without a stored name, which matches nothing.
+    content_type_names: Option<&'a [String]>,
+    /// Stored type names the content items must not be (`ExcludeItemTypes`):
+    /// the page applies them only while `content_type_names` is `None`, the
+    /// per-kind counts always.
     exclude_type_names: &'a [String],
     /// Stored `MediaType` names the content items are restricted to.
     media_types: &'a [String],
@@ -2917,9 +3037,11 @@ async fn library_enabled(path: Option<&str>) -> bool {
     let Some(path) = path else {
         return true;
     };
-    crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(std::path::Path::new(
-        path,
-    ))
+    // Only `Enabled` is read, so the media paths need no expanding.
+    crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(
+        std::path::Path::new(path),
+        &crate::virtual_paths::VirtualPathExpander::identity(),
+    )
     .await
     .enabled
 }
@@ -3469,26 +3591,26 @@ impl ItemRepository for FerrofinItemRepository {
         filter: &InternalItemsQuery,
         collection_type: CollectionType,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // Ferrofin implements two arms of v12's `BaseItemRepository.
-        // GetLatestItemList`: music (`Querying.cs:147-180`) and tvshows
-        // (`GetLatestTvShowItems`, `:282-540`). Every other collection type
+        // Ferrofin implements three arms of v12's `BaseItemRepository.
+        // GetLatestItemList`: music (`Querying.cs:147-180`), tvshows
+        // (`GetLatestTvShowItems`, `:282-540`) and movies
+        // (`GetLatestMovieItems`, `:233-256`). Every other collection type
         // returns empty and the user-view manager sends it through
         // `get_item_list`. That is WIDER than the C# early exit
         // (`Querying.cs:112-116`, which only rejects types outside
-        // `{movies, tvshows, music, unknown}`): v12's `movies` and `unknown`
-        // arms are an owner-scoped divergence, recorded at the branch itself
-        // in `user_view_manager::items_for_latest_items`.
+        // `{movies, tvshows, music, unknown}`): the `unknown` arm (a mixed
+        // library's movies and shows, `:134-144`) is not ported yet — gl-383.
         // Checked BEFORE `resolve_views` so the early exit costs no query.
         if !matches!(
             collection_type,
-            CollectionType::tvshows | CollectionType::music
+            CollectionType::tvshows | CollectionType::music | CollectionType::movies
         ) {
             return Ok(Vec::new());
         }
         // This is the path jellyfin-web's per-library "Latest in …" rows take
-        // (grouping is on by default for tvshows and music), so it needs the
-        // same view translation as every other browse — without it, Latest for
-        // a TV or Music library on an adopted database comes back empty.
+        // (grouping is on by default for tvshows, music and movies), so it needs
+        // the same view translation as every other browse — without it, Latest
+        // for one of those libraries on an adopted database comes back empty.
         let prepared = grouped_by_metadata_key(filter);
         let filter = prepared.as_ref().unwrap_or(filter);
         let resolved = self.resolve_views(filter).await?;
@@ -3499,6 +3621,9 @@ impl ItemRepository for FerrofinItemRepository {
             // is a folder, so the caller lists it on its own; an Episode
             // groups under its series as before.
             return crate::latest_tv_repository::latest_tv_show_items(&self.db, filter).await;
+        }
+        if collection_type == CollectionType::movies {
+            return self.latest_movie_items(filter).await;
         }
         // v12's music arm: the newest `limit` MusicAlbum rows themselves,
         // one statement — which reads no track at all when the caller is
@@ -7800,6 +7925,149 @@ mod tests {
         );
     }
 
+    /// The by-name inner query's type filter is `TranslateQuery`'s (v12.2
+    /// `TranslateQuery.cs:282-313`): named kinds that have no stored type name
+    /// (the Live TV `Program`, `Recording`, `ChannelFolderItem`) still leave a
+    /// `Type IN ()` that matches nothing, and the excluded kinds count only
+    /// while no kind is included. The per-kind counts keep the excludes either
+    /// way: their `scopeQuery` carries `ExcludeItemTypes` and no includes
+    /// (`ByName.cs:336-346`).
+    #[rstest::rstest]
+    #[case::program(BaseItemKind::Program)]
+    #[case::recording(BaseItemKind::Recording)]
+    #[case::channel_folder_item(BaseItemKind::ChannelFolderItem)]
+    #[tokio::test]
+    async fn by_name_type_filter_follows_translate_query(#[case] unmapped: BaseItemKind) {
+        assert_eq!(
+            stored_type_name(unmapped),
+            None,
+            "{unmapped:?} has a stored name"
+        );
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA0D1);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        seed_item_genre(&db, movie, "Drama").await;
+        seed_item_value(&db, movie, ItemValueType::Studios, "Acme").await;
+        let album = Uuid::from_u128(0xA0D2);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+        seed_item_value(&db, album, ItemValueType::Artist, "Band").await;
+        seed_item_value(&db, album, ItemValueType::AlbumArtist, "Band").await;
+
+        let names = |result: QueryResult<ItemWithCounts>| -> (Vec<String>, i32) {
+            let total = result.total_record_count;
+            let names = result
+                .items
+                .into_iter()
+                .filter_map(|i| i.item.name)
+                .collect();
+            (names, total)
+        };
+        let unmapped_only = InternalItemsQuery {
+            include_item_types: vec![unmapped],
+            enable_total_record_count: true,
+            ..Default::default()
+        };
+        // `limit=0` takes the separate total statement (`count_by_name_total`).
+        let probe = InternalItemsQuery {
+            limit: Some(0),
+            ..unmapped_only.clone()
+        };
+        for (route, result) in [
+            ("genres", repository.get_genres(&unmapped_only).await),
+            ("studios", repository.get_studios(&unmapped_only).await),
+            ("artists", repository.get_artists(&unmapped_only).await),
+            (
+                "album artists",
+                repository.get_album_artists(&unmapped_only).await,
+            ),
+            ("genres limit=0", repository.get_genres(&probe).await),
+        ] {
+            assert_eq!(names(result.expect(route)), (vec![], 0), "{route}");
+        }
+        // An unmapped kind beside a mapped one: the mapped one still counts.
+        let mixed = InternalItemsQuery {
+            include_item_types: vec![unmapped, BaseItemKind::Movie],
+            ..unmapped_only.clone()
+        };
+        let mixed = repository.get_genres(&mixed).await.expect("mixed");
+        assert_eq!(names(mixed), (vec!["Drama".to_owned()], 1));
+
+        // Included and excluded at once: the include wins on the page, so the
+        // value is listed, and the counts still drop the excluded kind.
+        let both = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            exclude_item_types: vec![BaseItemKind::Movie],
+            enable_total_record_count: true,
+            ..Default::default()
+        };
+        let genres = repository.get_genres(&both).await.expect("both");
+        assert_eq!(genres.total_record_count, 1);
+        assert_eq!(genres.items.len(), 1);
+        assert_eq!(genres.items[0].item.name.as_deref(), Some("Drama"));
+        assert_eq!(genres.items[0].counts.movie_count, 0);
+        let studios = repository.get_studios(&both).await.expect("studios both");
+        assert_eq!(names(studios), (vec!["Acme".to_owned()], 1));
+        // Excluded alone, the kind is gone from the page too.
+        let excluded = InternalItemsQuery {
+            exclude_item_types: vec![BaseItemKind::Movie],
+            enable_total_record_count: true,
+            ..Default::default()
+        };
+        let excluded = repository.get_genres(&excluded).await.expect("excluded");
+        assert_eq!(names(excluded), (vec![], 0));
+    }
+
+    /// `studioIds` matches through the referenced row's `CleanName` (v12.2
+    /// `WhereReferencedItem`), so an id that names no row, the API's stand-in
+    /// for a `studios` name with no studio, matches nothing, on an item browse
+    /// as on a by-name list. On `/Artists` the filter lands on the artist row
+    /// itself (`ByName.cs:221`), which carries no studios: even a real studio
+    /// empties the list.
+    #[tokio::test]
+    async fn studio_ids_naming_no_row_match_nothing() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA0E1);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "One").await;
+        seed_item_value(&db, movie, ItemValueType::Studios, "Acme").await;
+        let album = Uuid::from_u128(0xA0E2);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+        seed_item_value(&db, album, ItemValueType::Artist, "Band").await;
+        let studios = repository
+            .get_studios(&InternalItemsQuery::default())
+            .await
+            .expect("studios");
+        let acme = Uuid::parse_str(&studios.items[0].item.id).expect("studio id");
+
+        let with_studios = |ids: Vec<Uuid>| InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Movie],
+            studio_ids: ids,
+            ..Default::default()
+        };
+        let movies = |result: QueryResult<BaseItemEntity>| -> Vec<String> {
+            result.items.into_iter().filter_map(|i| i.name).collect()
+        };
+        let real = repository.get_items(&with_studios(vec![acme])).await;
+        assert_eq!(movies(real.expect("real studio")), ["One"]);
+        let unknown = repository.get_items(&with_studios(vec![Uuid::nil()])).await;
+        assert!(movies(unknown.expect("unknown studio")).is_empty());
+
+        let all = repository
+            .get_artists(&InternalItemsQuery::default())
+            .await
+            .expect("artists");
+        assert_eq!(all.items.len(), 1);
+        for ids in [vec![acme], vec![Uuid::nil()], vec![acme, Uuid::nil()]] {
+            let query = InternalItemsQuery {
+                studio_ids: ids.clone(),
+                ..Default::default()
+            };
+            let artists = repository.get_artists(&query).await.expect("artists");
+            assert!(artists.items.is_empty(), "{ids:?}");
+        }
+    }
+
     #[tokio::test]
     async fn by_name_paging_and_filters_push_into_sql() {
         let db = test_db().await;
@@ -8767,7 +9035,7 @@ mod tests {
         let movie = [stored_type_name(BaseItemKind::Movie)
             .expect("stored")
             .to_owned()];
-        for content_type_names in [&movie[..], &[]] {
+        for content_type_names in [Some(&movie[..]), None] {
             let scope = ByNameScope {
                 filter: &filter,
                 type_ints: &type_ints,
@@ -8798,6 +9066,55 @@ mod tests {
             );
             assert!(
                 !plan.iter().any(|d| d.contains("IX_BaseItems_ParentId")),
+                "{plan:#?}"
+            );
+        }
+    }
+
+    /// Plan pin for the by-name semijoin under a media-type filter
+    /// (`/Artists?mediaTypes=Video`): each of the value's map rows reaches its
+    /// item by the item's primary key, with or without the user's libraries.
+    /// Driven from `IX_BaseItems_MediaType_…` instead, every artist walked every
+    /// item of that media type: 2.6 s for an empty page on the gl-637 corpus.
+    #[tokio::test]
+    async fn by_name_semijoin_under_a_media_type_probes_items_by_id() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let filter = InternalItemsQuery::default();
+        let type_ints = [i64::from(i32::from(ItemValueType::Artist))];
+        let media_types = ["Video".to_owned()];
+        let libraries = to_guid_strings(&[Uuid::from_u128(0x8671), Uuid::from_u128(0x8672)]);
+        for top_parents in [&libraries[..], &[]] {
+            let scope = ByNameScope {
+                filter: &filter,
+                type_ints: &type_ints,
+                content_type_names: None,
+                exclude_type_names: &[],
+                media_types: &media_types,
+                ancestors: &[],
+                top_parents,
+            };
+            let mut qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new(r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE bi."Type" = "#);
+            qb.push_bind(stored_type_name(BaseItemKind::MusicArtist).expect("stored"));
+            push_value_exists(&mut qb, &scope, InnerScope::Page);
+            let mut query = qb.build();
+            let args = query.take_arguments().expect("arguments").expect("binds");
+            let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("plan")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect::<Vec<_>>();
+            assert!(
+                plan.iter()
+                    .any(|d| d == "SEARCH ci USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|d| d.contains("IX_BaseItems_MediaType")),
                 "{plan:#?}"
             );
         }
@@ -9049,14 +9366,10 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// Only `tvshows` and `music` take a dedicated path here; everything else
-    /// returns nothing and the user-view manager routes it through
-    /// `get_item_list`. `books` is the C# early exit; `movies` is NOT — v12
-    /// has a movies arm, deliberately not ported (the owner-scoped divergence
-    /// recorded in `user_view_manager::items_for_latest_items`), so this case
-    /// also pins that decision.
+    /// `books` is the C# early exit (`Querying.cs:112-116`): no dedicated
+    /// path, and the user-view manager routes it through `get_item_list`.
     #[tokio::test]
-    async fn latest_item_list_is_empty_for_movies_and_books() {
+    async fn latest_item_list_is_empty_for_books() {
         let db = test_db().await;
         let repository = repo(&db);
         seed_latest_row(
@@ -9069,13 +9382,75 @@ mod tests {
         )
         .await;
 
-        for ct in [CollectionType::movies, CollectionType::books] {
-            let rows = repository
-                .get_latest_item_list(&InternalItemsQuery::default(), ct)
+        let rows = repository
+            .get_latest_item_list(&InternalItemsQuery::default(), CollectionType::books)
+            .await
+            .expect("latest");
+        assert!(rows.is_empty(), "books must early-exit empty");
+    }
+
+    /// v12's movies arm (`GetLatestMovieItems`, `Querying.cs:233-256`): the
+    /// caller's rows newest first (`DateCreated DESC, Id DESC`), the first of
+    /// each presentation key, `limit` of them. The caller's filter runs first,
+    /// so an alternate version whose primary is in the same library stays
+    /// hidden (`ApplyAlternateVersionFiltering`) and its primary stands for the
+    /// film; of two plain rows sharing a key the newer one is listed; a row with
+    /// no key never is; and the higher id wins a date tie.
+    #[tokio::test]
+    async fn latest_movie_items_take_the_newest_row_of_each_key() {
+        let db = test_db().await;
+        let repository = repo(&db);
+        let ids = |n: u128| Uuid::from_u128(0xD100 + n);
+        // (id, name, presentation key, created)
+        let rows: [(Uuid, &str, Option<&str>, u32); 8] = [
+            (ids(1), "Primary", Some("film-a"), 2),
+            (ids(2), "Alternate version", Some("film-a"), 6),
+            (ids(3), "Keyless", None, 9),
+            (ids(4), "Tie low id", Some("film-b"), 5),
+            (ids(5), "Tie high id", Some("film-c"), 5),
+            (ids(6), "Oldest", Some("film-d"), 1),
+            (ids(7), "Shared key, newer", Some("film-e"), 7),
+            (ids(8), "Shared key, older", Some("film-e"), 6),
+        ];
+        for (id, name, key, created) in rows {
+            seed_latest_row(&db, id, BaseItemKind::Movie, name, "", day(created)).await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = ?1 WHERE "Id" = ?2"#)
+                .bind(key)
+                .bind(guid_to_db(id))
+                .execute(db.writer())
                 .await
-                .expect("latest");
-            assert!(rows.is_empty(), "{ct:?} must early-exit empty");
+                .expect("set key");
         }
+        sqlx::query(r#"UPDATE "BaseItems" SET "PrimaryVersionId" = ?1 WHERE "Id" = ?2"#)
+            .bind(guid_to_db(ids(1)))
+            .bind(guid_to_db(ids(2)))
+            .execute(db.writer())
+            .await
+            .expect("mark the alternate");
+
+        let latest = |limit: i32| {
+            let repository = &repository;
+            async move {
+                repository
+                    .get_latest_item_list(
+                        &InternalItemsQuery {
+                            limit: Some(limit),
+                            include_item_types: vec![BaseItemKind::Movie],
+                            ..InternalItemsQuery::default()
+                        },
+                        CollectionType::movies,
+                    )
+                    .await
+                    .expect("latest movies")
+                    .iter()
+                    .filter_map(|r| Uuid::parse_str(&r.id).ok())
+                    .collect::<Vec<Uuid>>()
+            }
+        };
+        assert_eq!(latest(10).await, [ids(7), ids(5), ids(4), ids(1), ids(6)]);
+        // The older `film-e` row sits between the second and third key: the
+        // limit counts keys, so it takes no place.
+        assert_eq!(latest(3).await, [ids(7), ids(5), ids(4)], "limit caps keys");
     }
 
     /// A season's id and its episodes' `(id, DateCreated)`.
@@ -13771,6 +14146,105 @@ mod folder_get_result_tests {
             .unwrap(),
             rows
         );
+    }
+    /// A folder listing sorted by `AiredEpisodeOrder` goes through
+    /// `LibraryManager.Sort` with `AiredEpisodeOrderComparer` upstream (LINQ
+    /// `OrderBy`, stable): episodes in aired order, a special placed by its
+    /// `AirsBeforeSeasonNumber`, and every non-episode after them, equal to
+    /// each other, so only a later key reorders them.
+    #[tokio::test]
+    async fn aired_episode_order_sorts_folder_children_with_the_comparer() {
+        use ferrofin_model::dto::SortOrder;
+        use ferrofin_model::live_tv::ItemSortBy;
+        async fn seed(
+            db: &Database,
+            kind: BaseItemKind,
+            name: &str,
+            sort_name: &str,
+            aired: Option<(i64, i64)>,
+            data: Option<&str>,
+        ) -> Uuid {
+            let id = Uuid::new_v4();
+            seed_named_item(db, id, kind, name).await;
+            let mut row = crate::test_support::fetch_item(db, id).await;
+            row.sort_name = Some(sort_name.to_owned());
+            row.parent_index_number = aired.map(|(season, _)| season);
+            row.index_number = aired.map(|(_, episode)| episode);
+            row.data = data.map(str::to_owned);
+            crate::test_support::save_item(db, &row).await;
+            id
+        }
+        tokio::time::timeout(std::time::Duration::from_mins(1), async {
+            let db = test_db().await;
+            let repo = repository(&db);
+            let mut seeded = Vec::new();
+            for (kind, name, sort_name, aired, data) in [
+                (BaseItemKind::Movie, "M", "m", None, None),
+                (
+                    BaseItemKind::Episode,
+                    "S02E01",
+                    "002 - 0001 - b",
+                    Some((2, 1)),
+                    None,
+                ),
+                (
+                    BaseItemKind::Episode,
+                    "S00E01",
+                    "000 - 0001 - s",
+                    Some((0, 1)),
+                    Some(r#"{"AirsBeforeSeasonNumber":2}"#),
+                ),
+                (
+                    BaseItemKind::Episode,
+                    "S01E03",
+                    "001 - 0003 - c",
+                    Some((1, 3)),
+                    None,
+                ),
+                (BaseItemKind::Folder, "F", "f", None, None),
+            ] {
+                seeded.push(seed(&db, kind, name, sort_name, aired, data).await);
+            }
+            let rows = ordered_rows(&repo, &seeded).await;
+            assert_eq!(
+                rows[2].data.as_deref(),
+                Some(r#"{"AirsBeforeSeasonNumber":2}"#)
+            );
+            let sorted = |order_by: Vec<(ItemSortBy, SortOrder)>| {
+                let repo = &repo;
+                let rows = rows.clone();
+                async move {
+                    let query = InternalItemsQuery {
+                        order_by,
+                        ..Default::default()
+                    };
+                    let sorted = repo.sort_folder_children(rows, &query).await.unwrap();
+                    sorted
+                        .into_iter()
+                        .filter_map(|row| row.name)
+                        .collect::<Vec<_>>()
+                }
+            };
+            assert_eq!(
+                sorted(vec![(ItemSortBy::AiredEpisodeOrder, SortOrder::Ascending)]).await,
+                ["S01E03", "S00E01", "S02E01", "M", "F"]
+            );
+            // OrderByDescending keeps equal rows in input order too.
+            assert_eq!(
+                sorted(vec![(ItemSortBy::AiredEpisodeOrder, SortOrder::Descending)]).await,
+                ["M", "F", "S02E01", "S00E01", "S01E03"]
+            );
+            assert_eq!(
+                sorted(vec![
+                    (ItemSortBy::AiredEpisodeOrder, SortOrder::Ascending),
+                    (ItemSortBy::SortName, SortOrder::Ascending),
+                ])
+                .await,
+                ["S01E03", "S00E01", "S02E01", "F", "M"]
+            );
+        })
+        .await
+        .expect("test timed out");
     }
     #[tokio::test]
     async fn root_folder_preferences_apply_only_to_collection_folders_not_views_or_plugins() {

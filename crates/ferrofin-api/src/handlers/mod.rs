@@ -997,10 +997,11 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Artists",
         upstream_file: "Jellyfin.Api/Controllers/ArtistsController.cs",
         upstream_method: "GetArtists",
-        ferrofin: "handlers/artists.rs get_artists → handlers/by_name.rs (ByNameListQuery, \
-               project_query_result) → ferrofin-core item_repository.rs get_artists \
-               (item_values_with_counts, item_counts_by_clean_name)",
-        date: "2026-10-19",
+        ferrofin: "handlers/artists.rs get_artists → handlers/by_name.rs (ByNameListQuery \
+               artists_query, resolve_by_name_ids, project_query_result) → ferrofin-core \
+               item_repository.rs get_artists (item_values_with_counts, \
+               item_counts_by_clean_name)",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &[],
     },
@@ -1009,9 +1010,10 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Artists/AlbumArtists",
         upstream_file: "Jellyfin.Api/Controllers/ArtistsController.cs",
         upstream_method: "GetAlbumArtists",
-        ferrofin: "handlers/artists.rs get_album_artists → handlers/by_name.rs → ferrofin-core \
-               item_repository.rs get_album_artists (item_values_with_counts)",
-        date: "2026-10-19",
+        ferrofin: "handlers/artists.rs get_album_artists → handlers/by_name.rs (artists_query, \
+               resolve_by_name_ids) → ferrofin-core item_repository.rs get_album_artists \
+               (item_values_with_counts)",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
         refs: &[],
     },
@@ -1023,7 +1025,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/genres.rs get_genres (music/musicvideos library parent → \
                get_music_genres) → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_genres / get_music_genres (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1034,7 +1036,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetMusicGenres",
         ferrofin: "handlers/music_genres.rs get_music_genres → handlers/by_name.rs → \
                ferrofin-core item_repository.rs get_music_genres (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1045,7 +1047,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetStudios",
         ferrofin: "handlers/studios.rs get_studios → handlers/by_name.rs → ferrofin-core \
                item_repository.rs get_studios (item_values_with_counts)",
-        date: "2026-10-19",
+        date: "2026-10-23",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
         refs: &[],
     },
@@ -1380,15 +1382,172 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "get",
+        path: "/Auth/Keys",
+        upstream_file: "Jellyfin.Api/Controllers/ApiKeyController.cs",
+        upstream_method: "GetKeys",
+        ferrofin: "handlers/api_key.rs get_keys (RequireAdmin, Policies.RequiresElevation) → \
+               ferrofin-core api_key_manager.rs get_api_keys and to_authentication_info \
+               (AuthenticationManager.GetApiKeys) → ferrofin-model security.rs \
+               AuthenticationInfo, querying QueryResult::from_items",
+        date: "2026-10-24",
+        divergences: &[
+            "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Library/VirtualFolders",
+        upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",
+        upstream_method: "GetVirtualFolders",
+        ferrofin: "handlers/library_structure.rs get_virtual_folders → ferrofin-core \
+               virtual_folder_manager.rs get_virtual_folders and list_libraries \
+               (LibraryManager.GetVirtualFolders(true) and GetVirtualFolderInfo: \
+               is_directory for Directory.EnumerateDirectories, resolve_locations and \
+               resolve_shortcut for the Locations and their culture sort, \
+               read_collection_type, load_options for CollectionFolder.GetLibraryOptions \
+               and LoadLibraryOptions' ExpandVirtualPath, scan_progress for \
+               RefreshProgress and RefreshStatus) → ferrofin-model entities_media.rs \
+               VirtualFolderInfo, configuration.rs LibraryOptions, TypeOptions, \
+               ImageOption, MediaPathInfo",
+        date: "2026-10-24",
+        divergences: &[
+            "An unreadable shortcut is logged at error the first time a listing meets it and \
+         at debug while it stays unreadable; upstream logs it at error on every listing. \
+         The listing runs on every dashboard load, and docs/conventions/LOGGING.md rule 1 \
+         keeps a level whose volume scales with the request rate out of error.",
+            "A library directory without a CollectionFolder row gets one written by the \
+         listing, so ItemId, LibraryOptions and RefreshStatus are always sent; upstream \
+         leaves the folder members out until its in-memory root folder's children are \
+         revalidated. Ferrofin has no in-memory tree, and the row keeps the library's id \
+         resolvable and a scan clear of the foreign key (owner decision 2026-10-24).",
+            "A failed write of that CollectionFolder row is logged at warn and the library \
+         is listed with its projected ItemId; the next listing retries the write.",
+            "An empty .mblink is dropped; upstream filters only nulls, so it lists an empty \
+         location, which names no folder. Jellyfin bug not ported.",
+            "An options.json that does not parse serves the defaults without a log entry; \
+         upstream also serves the defaults for a bad options.xml but logs it at error. Fix \
+         path: gl-271.",
+            "The 401 and 403 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/DisplayPreferences/{displayPreferencesId}",
+        upstream_file: "Jellyfin.Api/Controllers/DisplayPreferencesController.cs",
+        upstream_method: "UpdateDisplayPreferences",
+        ferrofin: "handlers/display_preferences.rs update_display_preferences (JsonBody \
+               DisplayPreferencesDto, take_pref/take_nullable_pref, enum_try_parse) → \
+               ferrofin-core display_preferences_manager.rs (get_display_preferences, \
+               get_item_display_preferences, set_custom_item_display_preferences, \
+               update_item_display_preferences, update_display_preferences, \
+               set_home_sections) → ferrofin-db database.rs replace_home_sections; \
+               ferrofin-model dto/display_preferences_dto.rs",
+        date: "2026-10-24",
+        divergences: &[
+            "SortBy, SortOrder, RememberSorting and RememberIndexing are written to one \
+         shared empty-GUID ItemDisplayPreferences row per user and client unless the item \
+         already has its own row; upstream stores them under the item \
+         (GetItemDisplayPreferences creates the row under itemId, and the controller sets \
+         itemPrefs.ItemId = itemId). Fix path: gl-447.",
+            "A missing or empty skipBackLength/skipForwardLength stores 10000/30000 ms; \
+         upstream's controller stores 15000 for both. Fix path: gl-410.",
+            "chromecastVersion and IndexBy are read by exact member name only: upstream's \
+         Enum.Parse/Enum.TryParse also take an integer, a comma list and surrounding white \
+         space, and an unknown chromecastVersion is a 400 there (ArgumentException) where \
+         it is stored as Stable here; int.Parse and bool.Parse also ignore surrounding \
+         white space in the skip lengths, the homesection order and \
+         enableNextVideoInfoOverlay. Fix path: gl-880.",
+            "displayPreferencesId is parsed with Uuid::parse_str, not Guid.TryParse, so a \
+         urn:uuid: id is taken as a GUID where upstream MD5-hashes it, and a (…), {0x…} or \
+         padded id is MD5-hashed where upstream parses it. Fix path: gl-881.",
+            "Values upstream fails on with a 500 take the defaults here: an \
+         enableNextVideoInfoOverlay that is not true/false (bool.Parse) is true, a \
+         non-numeric or overflowing skip length (int.Parse) is the fallback, a homesection \
+         key with a non-numeric suffix is dropped, a bare homesection key stays a custom \
+         pref, and a negative order falls back to None instead of indexing defaults[-1]. \
+         Jellyfin bug not ported.",
+            "Every save replaces the row's HomeSection children. Upstream clears the \
+         collection of an entity loaded in a disposed context and attaches it to a new \
+         one, so EF inserts the new sections but never deletes the old rows: they pile up, \
+         and a save without any homesection key leaves the previous layout visible to GET. \
+         Jellyfin bug not ported.",
+            "An invalid landing-* ViewType is logged at warn, as bad client input \
+         (docs/conventions/LOGGING.md), where upstream logs it at error.",
+            "The 400 for a missing or blank client or an unparsable userId, the 403 for \
+         another user's id without the administrator role, and the error text of a body \
+         that does not bind are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Playlists",
+        upstream_file: "Jellyfin.Api/Controllers/PlaylistsController.cs",
+        upstream_method: "CreatePlaylist",
+        ferrofin: "handlers/playlists.rs create_playlist (CreatePlaylistQuery, effective_user_id) \
+               → ferrofin-model playlists.rs CreatePlaylistDto → ferrofin-core \
+               collection_manager.rs FerrofinPlaylistManager::create_playlist \
+               (PlaylistManager.CreatePlaylist: playlists_folder, a lookup like \
+               GetPlaylistsFolder; infer_media_type, require_user, \
+               new_playlist_folder_and_id, then report_item_added for AddChild's \
+               ItemAdded; playlist_items for AddToPlaylistInternal and \
+               Playlist.GetPlaylistItems)",
+        date: "2026-10-24",
+        divergences: &[
+            "A request with neither a body nor a name query is a 400; upstream's \
+         GetValidFilename(null) throws a NullReferenceException (500). Jellyfin bug not \
+         ported.",
+            "An empty-GUID id (`\"Ids\":[null]` or all zeros) with a media type named is \
+         dropped and the playlist is created (200); upstream's GetItemById throws \
+         ArgumentException inside AddToPlaylistInternal after AddChild, so it answers 400 \
+         and leaves an empty playlist behind. Jellyfin bug not ported.",
+            "A folder name taken by a file, or whose derived id an existing row owns, moves on \
+         to the next `1`-suffixed folder; upstream's GetTargetPath checks only \
+         Directory.Exists, so a file makes CreateDirectory throw (500) and a row whose \
+         folder went missing is saved over. Jellyfin bug not ported.",
+            "The playlists folder is found by its path (any row there, whatever its type or \
+         parent), then by the id derived from data\\playlists, not as GetPlaylistsFolder \
+         finds it (the first PlaylistsFolder child of the root, then of the user root, by \
+         type); and the lookup re-parents parentless playlists (adopt_orphans), where \
+         upstream's writes nothing. Fix path: gl-921.",
+            "The first ForceSave refresh writes no playlist.xml into the new folder, where \
+         upstream's PlaylistXmlSaver saves one. Fix path: gl-341.",
+            "With no media type named and a mixed folder as the first deciding id, the type \
+         comes from the folder's first member by name, not upstream's tree-order walk. Fix \
+         path: gl-588.",
+            "A body Ids sent as a comma-delimited string is a 400; upstream's \
+         JsonCommaDelimitedCollectionConverterFactory splits it and drops entries that do \
+         not parse. Fix path: gl-883.",
+            "A malformed id in the ids query is a 400; upstream's \
+         CommaDelimitedCollectionModelBinder drops it, so an all-malformed list falls back \
+         to the body's Ids. Fix path: gl-884.",
+            "A Users entry without CanEdit or UserId is a 400; upstream binds \
+         PlaylistUserPermissions through its constructor, defaulting them to false and the \
+         empty GUID. Fix path: gl-885.",
+            "A user named twice in Users keeps one share, with the last entry's CanEdit; \
+         upstream stores and lists both, and grants edit if either has CanEdit. Fix path: \
+         gl-886.",
+            "The 400 (no name, no playlists folder, an unknown id while the media type is \
+         inferred, an API key that names no user) and 403 (another user's id without the \
+         administrator role) bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
 /// `ArtistsController` + `BaseItemRepository.GetItemValues`.
 const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
-    "`studios` (pipe-delimited names) is not honored: v12 resolves each name through \
-     LibraryManager.GetStudio — which CREATES the studio row on a GET — into StudioIds. \
-     `studioIds` is honored. Un-defer path: a non-creating name → id lookup in the \
-     handler (find_named_item), never the creating one.",
+    "`studios` names resolve without writing: v12's LibraryManager.GetStudio CREATES a row \
+     for an unknown name on this GET; Ferrofin's lookup creates none and gives the name a \
+     no-match id (by_name::resolve_by_name_ids), the same empty answer.",
     "A `parentId` that is not a folder: v12 puts it in ItemIds (the value is carried by \
      that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
      answers with nothing.",
