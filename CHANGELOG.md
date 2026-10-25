@@ -63,6 +63,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Parse `POST /DisplayPreferences/{id}` values as Jellyfin's .NET parsers do: `IndexBy` and
+  `chromecastVersion` also take an integer (an unnamed one is kept and written back as its
+  number by `GET`), a comma list and padding, and a `chromecastVersion` that does not parse
+  is a `400` instead of being stored as stable; the skip lengths, the overlay flag and the
+  `homesection` order ignore the white space and trailing NULs .NET ignores
 - Accept a playlist `Users` entry without `CanEdit` or `UserId` on `POST /Playlists` and
   `POST /Playlists/{id}`, as Jellyfin does: a missing `CanEdit` shares read-only, a missing
   or null `UserId` is the empty GUID; a `null` `CanEdit` is still a `400`

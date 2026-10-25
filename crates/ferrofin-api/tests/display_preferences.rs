@@ -1187,3 +1187,140 @@ async fn display_preferences_id_is_read_as_guid_try_parse_reads_it(
     );
     assert_eq!(*prefs.asked_item.lock().unwrap(), Some(expected));
 }
+
+/// .NET reads the typed display preferences more widely than by exact name
+/// (each case measured on a live Jellyfin 12.2, `POST` then `GET`):
+/// `Enum.TryParse`/`Enum.Parse` take an integer (an unnamed one is kept and
+/// written back as its number), a comma list (OR'd) and padding; `int.Parse`
+/// and `bool.Parse` ignore the white space around a number or a flag and
+/// trailing NULs (`int.Parse` only U+0009–U+000D and U+0020, so a trailing
+/// no-break space is a 500 upstream and the fallback here); the `homesection`
+/// order suffix is an `int.Parse` too.
+#[rstest::rstest]
+#[case::index_by_integer(r#"{"IndexBy":"1"}"#, "/IndexBy", "ProductionYear")]
+#[case::index_by_padded(r#"{"IndexBy":" ProductionYear "}"#, "/IndexBy", "ProductionYear")]
+#[case::index_by_list(
+    r#"{"IndexBy":"PremiereDate,CommunityRating"}"#,
+    "/IndexBy",
+    "CommunityRating"
+)]
+#[case::index_by_unnamed(r#"{"IndexBy":"7"}"#, "/IndexBy", "7")]
+#[case::index_by_negative(r#"{"IndexBy":"-1"}"#, "/IndexBy", "-1")]
+#[case::chromecast_integer(
+    r#"{"CustomPrefs":{"chromecastVersion":"1"}}"#,
+    "/CustomPrefs/chromecastVersion",
+    "unstable"
+)]
+#[case::chromecast_padded(
+    r#"{"CustomPrefs":{"chromecastVersion":" Unstable "}}"#,
+    "/CustomPrefs/chromecastVersion",
+    "unstable"
+)]
+#[case::chromecast_list(
+    r#"{"CustomPrefs":{"chromecastVersion":"stable,unstable"}}"#,
+    "/CustomPrefs/chromecastVersion",
+    "unstable"
+)]
+#[case::chromecast_unnamed(
+    r#"{"CustomPrefs":{"chromecastVersion":"7"}}"#,
+    "/CustomPrefs/chromecastVersion",
+    "7"
+)]
+#[case::skip_back_padded(
+    r#"{"CustomPrefs":{"skipBackLength":" 5000 "}}"#,
+    "/CustomPrefs/skipBackLength",
+    "5000"
+)]
+#[case::skip_forward_control_white_space(
+    r#"{"CustomPrefs":{"skipForwardLength":"\t7000\n"}}"#,
+    "/CustomPrefs/skipForwardLength",
+    "7000"
+)]
+#[case::skip_back_trailing_nul(
+    r#"{"CustomPrefs":{"skipBackLength":"5000\u0000"}}"#,
+    "/CustomPrefs/skipBackLength",
+    "5000"
+)]
+#[case::skip_back_signed(
+    r#"{"CustomPrefs":{"skipBackLength":"+5000"}}"#,
+    "/CustomPrefs/skipBackLength",
+    "5000"
+)]
+#[case::skip_back_no_break_space(
+    r#"{"CustomPrefs":{"skipBackLength":"5000 "}}"#,
+    "/CustomPrefs/skipBackLength",
+    "10000"
+)]
+#[case::overlay_padded(
+    r#"{"CustomPrefs":{"enableNextVideoInfoOverlay":" False "}}"#,
+    "/CustomPrefs/enableNextVideoInfoOverlay",
+    "False"
+)]
+#[case::overlay_trailing_nul(
+    r#"{"CustomPrefs":{"enableNextVideoInfoOverlay":"False\u0000"}}"#,
+    "/CustomPrefs/enableNextVideoInfoOverlay",
+    "False"
+)]
+#[case::overlay_no_break_space(
+    r#"{"CustomPrefs":{"enableNextVideoInfoOverlay":"False "}}"#,
+    "/CustomPrefs/enableNextVideoInfoOverlay",
+    "False"
+)]
+#[case::home_section_padded_order(
+    r#"{"CustomPrefs":{"homesection 1":"resume"}}"#,
+    "/CustomPrefs/homesection1",
+    "resume"
+)]
+#[case::home_section_signed_order(
+    r#"{"CustomPrefs":{"homesection+3":"resume"}}"#,
+    "/CustomPrefs/homesection3",
+    "resume"
+)]
+#[case::home_section_zero_padded_order(
+    r#"{"CustomPrefs":{"homesection04":"nextup"}}"#,
+    "/CustomPrefs/homesection4",
+    "nextup"
+)]
+#[tokio::test]
+async fn display_preferences_parse_as_dotnet_parses(
+    #[case] body: &'static str,
+    #[case] pointer: &str,
+    #[case] expected: &str,
+) {
+    let (v, _) = round_trip(body).await;
+    assert_eq!(
+        v.pointer(pointer),
+        Some(&serde_json::json!(expected)),
+        "{body}"
+    );
+}
+
+/// What `Enum.TryParse` refuses stores no indexing, so `GET` answers none.
+#[rstest::rstest]
+#[case::bogus(r#"{"IndexBy":"bogus"}"#)]
+#[case::trailing_comma(r#"{"IndexBy":"ProductionYear,"}"#)]
+#[tokio::test]
+async fn display_preferences_index_by_that_does_not_parse_is_null(#[case] body: &'static str) {
+    let (v, saved) = round_trip(body).await;
+    assert_eq!(saved.index_by, None, "{body}");
+    assert_eq!(v.get("IndexBy").filter(|i| !i.is_null()), None, "{body}");
+}
+
+/// `Enum.Parse<ChromecastVersion>` throws `ArgumentException` for a value it
+/// cannot read, which Jellyfin answers with a 400 (measured on 12.2), before
+/// anything is saved.
+#[tokio::test]
+async fn display_preferences_refuse_a_chromecast_version_enum_parse_refuses() {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let (status, _) = send(
+        state_with_display_prefs(prefs.clone()),
+        "POST",
+        "/DisplayPreferences/home?client=web",
+        Body::from(r#"{"CustomPrefs":{"chromecastVersion":"bogus"}}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(prefs.row.lock().unwrap().is_none(), "nothing saved");
+    assert!(prefs.custom.lock().unwrap().is_none(), "nothing saved");
+}

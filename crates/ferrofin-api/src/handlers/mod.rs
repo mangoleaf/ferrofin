@@ -1507,9 +1507,6 @@ pub const VERIFIED: &[Verified] = &[
          empty-GUID ItemDisplayPreferences row per user and client unless the item has its \
          own row; upstream's GetItemDisplayPreferences reads, or creates, the row under the \
          item. Fix path: gl-447.",
-            "A stored IndexBy or ChromecastVersion outside the named members is answered as \
-         null and \"stable\"; upstream's Enum.ToString() writes it as its number. Fix path: \
-         gl-880.",
             "CustomPrefs members are written in hash order, not upstream's insertion order \
          (the home sections, the scalar keys, then the stored preferences); the members and \
          values are the same.",
@@ -1529,7 +1526,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UpdateDisplayPreferences",
         ferrofin: "handlers/display_preferences.rs update_display_preferences (JsonBody \
                DisplayPreferencesDto, resolve_item_id: Guid.TryParse else GetMD5, \
-               take_pref/take_nullable_pref, enum_try_parse) → ferrofin-core \
+               take_pref/take_nullable_pref, enum_try_parse for Enum.TryParse/Enum.Parse, \
+               parse_dotnet_int/parse_dotnet_bool for int.Parse/bool.Parse) → ferrofin-core \
                display_preferences_manager.rs (get_display_preferences, \
                get_item_display_preferences, set_custom_item_display_preferences, \
                update_item_display_preferences, update_display_preferences, \
@@ -1544,18 +1542,13 @@ pub const VERIFIED: &[Verified] = &[
          itemPrefs.ItemId = itemId). Fix path: gl-447.",
             "A missing or empty skipBackLength/skipForwardLength stores 10000/30000 ms; \
          upstream's controller stores 15000 for both. Fix path: gl-410.",
-            "chromecastVersion and IndexBy are read by exact member name only: upstream's \
-         Enum.Parse/Enum.TryParse also take an integer, a comma list and surrounding white \
-         space, and an unknown chromecastVersion is a 400 there (ArgumentException) where \
-         it is stored as Stable here; int.Parse and bool.Parse also ignore surrounding \
-         white space in the skip lengths, the homesection order and \
-         enableNextVideoInfoOverlay. Fix path: gl-880.",
             "Values upstream fails on with a 500 take the defaults here: an \
          enableNextVideoInfoOverlay that is not true/false (bool.Parse) is true, a \
          non-numeric or overflowing skip length (int.Parse) is the fallback, a homesection \
          key with a non-numeric suffix is dropped, a bare homesection key stays a custom \
-         pref, and a negative order falls back to None instead of indexing defaults[-1]. \
-         Jellyfin bug not ported.",
+         pref, a negative order falls back to None instead of indexing defaults[-1], and a \
+         chromecastVersion integer outside Int32 is a 400 (Enum.Parse's OverflowException \
+         is a 500 there). Jellyfin bug not ported.",
             "Every save replaces the row's HomeSection children. Upstream clears the \
          collection of an entity loaded in a disposed context and attaches it to a new \
          one, so EF inserts the new sections but never deletes the old rows: they pile up, \
@@ -1565,9 +1558,10 @@ pub const VERIFIED: &[Verified] = &[
          (docs/conventions/LOGGING.md), where upstream logs it at error.",
             "A whitespace-only client is a client name here; upstream's [Required] string \
          client binds it as null and answers 400. Fix path: gl-948.",
-            "The 400 for a missing or empty client or an unparsable userId, the 403 for \
-         another user's id without the administrator role, and the error text of a body \
-         that does not bind are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 400 for a missing or empty client, an unparsable userId or a \
+         chromecastVersion Enum.Parse refuses, the 403 for another user's id without the \
+         administrator role, and the error text of a body that does not bind are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
