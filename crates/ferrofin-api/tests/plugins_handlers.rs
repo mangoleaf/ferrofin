@@ -51,6 +51,13 @@ impl RecordingPlugins {
     fn not_found(id: Uuid) -> ServiceError {
         ServiceError::not_found(format!("plugin {id}"))
     }
+
+    /// One of the [`extra`](Self::extra) plugins, which every per-id call
+    /// resolves like the known one.
+    fn extra_plugin(&self, id: Uuid) -> Option<PluginDescriptor> {
+        let extra = self.extra.lock().expect("extra lock");
+        extra.iter().find(|p| p.id == id).cloned()
+    }
 }
 
 #[async_trait::async_trait]
@@ -61,17 +68,19 @@ impl PluginManager for RecordingPlugins {
         Ok(all)
     }
     async fn get_plugin(&self, id: Uuid) -> Result<Option<PluginDescriptor>, ServiceError> {
-        Ok((id == known_id()).then(Self::descriptor))
+        Ok((id == known_id())
+            .then(Self::descriptor)
+            .or_else(|| self.extra_plugin(id)))
     }
     async fn enable_plugin(&self, id: Uuid) -> Result<(), ServiceError> {
-        if id == known_id() {
+        if id == known_id() || self.extra_plugin(id).is_some() {
             Ok(())
         } else {
             Err(Self::not_found(id))
         }
     }
     async fn disable_plugin(&self, id: Uuid) -> Result<(), ServiceError> {
-        if id == known_id() {
+        if id == known_id() || self.extra_plugin(id).is_some() {
             Ok(())
         } else {
             Err(Self::not_found(id))
@@ -82,6 +91,8 @@ impl PluginManager for RecordingPlugins {
             Err(ServiceError::invalid_input(
                 "cannot uninstall a compiled-in plugin",
             ))
+        } else if self.extra_plugin(id).is_some() {
+            Ok(())
         } else {
             Err(Self::not_found(id))
         }
@@ -300,6 +311,75 @@ async fn versioned_routes_match_the_installed_version() {
         .await
         .expect("resp");
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A WASM plugin's version is semver (the WIT says so), which a .NET
+/// `Version` cannot hold: jellyfin-web sends it back verbatim, and only that
+/// exact string addresses the plugin.
+#[tokio::test]
+async fn a_semver_plugin_version_addresses_only_its_own_plugin() {
+    let prerelease = Uuid::from_u128(0x5E1);
+    let build_tagged = Uuid::from_u128(0x5E2);
+    let fake = Arc::new(RecordingPlugins::default());
+    for (id, version) in [
+        (prerelease, "0.2.0-beta.1"),
+        (build_tagged, "1.0.0+git.abc"),
+    ] {
+        fake.extra
+            .lock()
+            .expect("extra lock")
+            .push(PluginDescriptor {
+                id,
+                version: version.to_owned(),
+                ..RecordingPlugins::descriptor()
+            });
+    }
+    for (method, uri, expect) in [
+        (
+            "POST",
+            format!("/Plugins/{prerelease}/0.2.0-beta.1/Enable"),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "POST",
+            format!("/Plugins/{prerelease}/0.2.0-beta.1/Disable"),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "DELETE",
+            format!("/Plugins/{prerelease}/0.2.0-beta.1"),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "POST",
+            format!("/Plugins/{build_tagged}/1.0.0%2Bgit.abc/Enable"),
+            StatusCode::NO_CONTENT,
+        ),
+        // Another non-.NET string is still a model-binding failure.
+        (
+            "POST",
+            format!("/Plugins/{prerelease}/0.2.0-beta.2/Enable"),
+            StatusCode::BAD_REQUEST,
+        ),
+        // A real `Version` never equals a stored semver string.
+        (
+            "POST",
+            format!("/Plugins/{prerelease}/0.2.0/Enable"),
+            StatusCode::NOT_FOUND,
+        ),
+        // The exact string of ANOTHER plugin addresses nothing here.
+        (
+            "POST",
+            format!("/Plugins/{}/0.2.0-beta.1/Enable", known_id()),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let resp = router(Arc::clone(&fake))
+            .oneshot(authed(method, &uri, Body::empty()))
+            .await
+            .expect("resp");
+        assert_eq!(resp.status(), expect, "{method} {uri}");
+    }
 }
 
 #[tokio::test]

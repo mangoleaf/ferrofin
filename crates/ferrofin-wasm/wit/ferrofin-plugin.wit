@@ -31,7 +31,9 @@ interface types {
         /// Human-readable display name. A blank name, one over 256 bytes,
         /// or one with control characters is rejected at install and load.
         name: string,
-        /// Semantic version string of the plugin itself.
+        /// Semantic version string of the plugin itself. The dashboard's
+        /// versioned routes (`/Plugins/{id}/{version}/…`) address the plugin
+        /// by this exact string when it is not a .NET `Version`.
         version: string,
         /// One-line description shown in the dashboard.
         description: string,

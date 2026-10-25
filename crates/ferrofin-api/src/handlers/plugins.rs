@@ -116,14 +116,27 @@ fn parse_dotnet_version(raw: &str) -> Option<[i64; 4]> {
 /// pair against Jellyfin 10.11.8, `DELETE /Plugins/{omdb}/{version}`:
 /// `10.11.8.0` -> 204 on both; `9.9.9.9` -> J 404 / F 204; `10.11.8` -> J 404 /
 /// F 204; `notaversion` -> J 400 / F 204.
+///
+/// A WASM plugin's version is semver (`0.2.0-beta.1`, `1.0.0+git.abc`), which
+/// no .NET `Version` can hold, and jellyfin-web sends it back verbatim. So a
+/// path version that is not a `Version` still addresses the plugin whose
+/// stored version is exactly that string; any other one stays the binder's
+/// `400`. Upstream manifests are always a `Version`, so no Jellyfin-reachable
+/// request changes answer.
 async fn plugin_at_version(
     state: &AppState,
     plugin_id: Uuid,
     version: &str,
 ) -> Result<PluginDescriptor, ApiError> {
-    let requested = parse_dotnet_version(version)
-        // The model binder's own wording, which is what a client reads.
-        .ok_or_else(|| ApiError::BadRequest(format!("The value '{version}' is not valid.")))?;
+    let Some(requested) = parse_dotnet_version(version) else {
+        return match state.plugins.get_plugin(plugin_id).await? {
+            Some(descriptor) if descriptor.version == version => Ok(descriptor),
+            // The model binder's own wording, which is what a client reads.
+            _ => Err(ApiError::BadRequest(format!(
+                "The value '{version}' is not valid."
+            ))),
+        };
+    };
     let not_found = || ApiError::NotFound(format!("plugin {plugin_id} {version}"));
     let descriptor = state
         .plugins

@@ -301,6 +301,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - WASM plugins: a web transform can no longer make the server run out of memory from anonymous
   `/web` requests. A blank search text is refused (it matched between every character), and a
   transform that would grow a file by more than 256 KiB leaves the file unchanged
+- WASM plugins with a semver prerelease or build version (`0.2.0-beta.1`, `1.0.0+git.abc`) can
+  be enabled, disabled and uninstalled from the dashboard; those buttons answered `400`
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for
