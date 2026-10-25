@@ -478,14 +478,32 @@ impl std::fmt::Debug for FerrofinPluginManager {
 impl FerrofinPluginManager {
     /// Creates a manager over `plugins`, rooting persisted state at `plugins_dir`.
     ///
-    /// Loads `{plugins_dir}/state.json` if present; a missing/corrupt file starts
-    /// from empty state (every plugin at its descriptor default).
+    /// Loads `{plugins_dir}/state.json` if present; a missing, unreadable or
+    /// corrupt file starts from empty state (every plugin at its descriptor
+    /// default). One that exists but cannot be loaded is logged and kept as
+    /// `state.json.corrupt`, since the next save would overwrite the enabled
+    /// overrides and install ledger it holds.
     #[must_use]
     pub fn new(plugins: Vec<RegisteredPlugin>, plugins_dir: PathBuf) -> Self {
-        let state = std::fs::read(plugins_dir.join("state.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PersistedState>(&bytes).ok())
-            .unwrap_or_default();
+        let path = plugins_dir.join("state.json");
+        let state = match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PersistedState::default(),
+            read => read
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+                .unwrap_or_else(|error| {
+                    let aside = plugins_dir.join("state.json.corrupt");
+                    let keep_error = std::fs::rename(&path, &aside).err().map(|e| e.to_string());
+                    tracing::error!(
+                        path = %path.display(),
+                        error,
+                        kept_as = %aside.display(),
+                        keep_error = ?keep_error,
+                        "plugin state file cannot be loaded; starting from defaults"
+                    );
+                    PersistedState::default()
+                }),
+        };
         Self {
             plugins,
             plugins_dir,
@@ -609,21 +627,17 @@ impl FerrofinPluginManager {
         self.plugins_dir.join(id.to_string()).join("config.json")
     }
 
-    /// Writes `bytes` to `path` atomically (temp file + rename), creating parents.
+    /// Writes `bytes` to `path` atomically, creating parents: a uniquely
+    /// named, synced temp file renamed over it, so two writers of one path
+    /// never share a temp file.
     fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ServiceError> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| ServiceError::backend("plugin path has no parent"))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ServiceError::backend(format!("create {}: {e}", parent.display())))?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, bytes)
-            .map_err(|e| ServiceError::backend(format!("write {}: {e}", tmp.display())))?;
-        std::fs::rename(&tmp, path)
-            .map_err(|e| ServiceError::backend(format!("rename {}: {e}", path.display())))
+        ferrofin_util::file_helper::atomic_write(path, bytes)
+            .map_err(|e| ServiceError::backend(format!("write {}: {e}", path.display())))
     }
 
-    /// Persists the in-memory state to `state.json`.
+    /// Persists the in-memory state to `state.json`. Called with the state
+    /// lock held, so writes land in the order the state changed and an older
+    /// snapshot never replaces a newer one.
     fn persist(&self, state: &PersistedState) -> Result<(), ServiceError> {
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|e| ServiceError::backend(format!("serialize plugin state: {e}")))?;
@@ -677,9 +691,7 @@ impl FerrofinPluginManager {
     fn record_installed_egress(&self, guid: Uuid, declared: Vec<String>) {
         let mut state = self.state.lock().expect("plugin state lock poisoned");
         state.installed_egress.insert(guid.to_string(), declared);
-        let snapshot = state.clone();
-        drop(state);
-        let _ = self.persist(&snapshot);
+        let _ = self.persist(&state);
     }
 
     /// Records an installed artifact's digest (best-effort persist — the
@@ -691,9 +703,7 @@ impl FerrofinPluginManager {
             .entry(guid.to_string())
             .or_default()
             .insert(version.to_owned(), digest);
-        let snapshot = state.clone();
-        drop(state);
-        let _ = self.persist(&snapshot);
+        let _ = self.persist(&state);
     }
 
     /// Flips a plugin's enabled flag, persisting the change.
@@ -947,9 +957,7 @@ impl PluginManager for FerrofinPluginManager {
                     let mut state = self.state.lock().expect("plugin state lock poisoned");
                     state.enabled.remove(&id.to_string());
                     state.installed_egress.remove(&id.to_string());
-                    let snapshot = state.clone();
-                    drop(state);
-                    let _ = self.persist(&snapshot);
+                    let _ = self.persist(&state);
                 }
                 if let Some(lifecycle) = &self.lifecycle {
                     lifecycle.mark_restart_required();
@@ -2119,6 +2127,29 @@ mod tests {
             mgr.get_repositories().await.expect("repos"),
             config.repositories()
         );
+    }
+
+    /// A `state.json` that does not parse starts the manager from empty state
+    /// (the boot goes on), but its bytes are kept beside it rather than
+    /// overwritten by the next save: they hold the enabled overrides and the
+    /// version-immutability ledger.
+    #[tokio::test]
+    async fn a_corrupt_state_file_is_kept_aside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("state.json"), b"{\"enabled\":{").unwrap();
+        let id = Uuid::from_u128(7);
+        let mgr = FerrofinPluginManager::new(
+            vec![RegisteredPlugin::new(descriptor(id, "Demo", true), None)],
+            dir.path().to_path_buf(),
+        );
+        mgr.disable_plugin(id).await.expect("disable");
+        assert_eq!(
+            std::fs::read(dir.path().join("state.json.corrupt")).unwrap(),
+            b"{\"enabled\":{"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!(saved["enabled"][id.to_string()], false);
     }
 
     /// A repository an admin added on the old build lived in `state.json`; the

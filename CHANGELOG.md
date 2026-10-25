@@ -679,6 +679,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `*.chunk.js` the plugin interface gave as an example, is refused at load with a warning; it
   matched nothing, silently. The interface now says what a pattern is: an exact path under the
   web root, else a regex matched anywhere in the path
+- Plugins: overlapping installs, updates and uninstalls can no longer lose a recorded entry
+  from the plugin state file (`plugins/state.json`) or tear it, and a plugin update racing a
+  manual install of the same plugin can no longer tear the staged `.wasm`. Every save is made
+  under the state lock and through its own synced temporary file, where three of them wrote an
+  older copy of the state outside the lock and every writer of a path shared one `.tmp` file.
+  These files (the state, plugin settings and staged `.wasm`) are now written owner-only
+  (`0600`). A state file that cannot be read or parsed is kept as `state.json.corrupt` and
+  logged at error level instead of being silently replaced, along with the enabled switches
+  and the record of installed versions it held
 
 ## [1.0.0] - 2026-09-05
 
