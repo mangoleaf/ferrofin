@@ -111,7 +111,14 @@ impl MediaEncoder for Probe {
         _threed_format: Option<Video3DFormat>,
         _offset_ticks: Option<i64>,
     ) -> Result<String, ServiceError> {
-        Err(ServiceError::not_found("no frame extraction in a scan"))
+        // A first scan grabs a frame for a video with no artwork (the
+        // Screen Grabber); a real ffmpeg delivers one.
+        let frame = std::env::temp_dir().join(format!(
+            "ferrofin-test-frame-{}.jpg",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&frame, b"FRAME").map_err(ServiceError::backend_source)?;
+        Ok(frame.to_string_lossy().into_owned())
     }
     fn get_input_argument(&self, input_file: &str, _media_source: &MediaSourceInfo) -> String {
         input_file.to_owned()

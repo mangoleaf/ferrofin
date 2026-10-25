@@ -85,6 +85,7 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 |---|---|---|
 | `FERROFIN_FFMPEG_PATH` | auto-discovered on `$PATH` | Path to `ffmpeg`. Absent ffmpeg only disables transcode. |
 | `FERROFIN_FFPROBE_PATH` | auto-discovered on `$PATH` | Path to `ffprobe` (scan probes). |
+| `FERROFIN_FFMPEG_IMG_EXTRACT_PERF_TRADEOFF` | `false` | Jellyfin's `FFmpeg:imgExtractPerfTradeoff`: trade frame quality for speed when extracting chapter images, video thumbnails and embedded pictures. On, the first attempt decodes keyframes only and takes the first one, instead of picking the most representative of 24 frames; extraction is faster, and the image may be less typical of the scene. The `config.toml` key is `ffmpeg_img_extract_perf_tradeoff`. |
 
 ## Library & database
 
