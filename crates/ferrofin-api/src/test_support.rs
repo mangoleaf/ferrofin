@@ -2841,7 +2841,11 @@ pub fn fake_state_with(
 pub fn authed_state_with_plugins(
     plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
 ) -> AppState {
-    plugin_state(plugins, Arc::new(ApiKeyAuthService))
+    plugin_state(
+        plugins,
+        Arc::new(ApiKeyAuthService),
+        Arc::new(FakeAuthContext),
+    )
 }
 
 /// Like [`authed_state_with_plugins`], but authenticated as a plain user with
@@ -2850,12 +2854,28 @@ pub fn authed_state_with_plugins(
 pub fn user_authed_state_with_plugins(
     plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
 ) -> AppState {
-    plugin_state(plugins, Arc::new(AuthedAuthService))
+    plugin_state(
+        plugins,
+        Arc::new(AuthedAuthService),
+        Arc::new(FakeAuthContext),
+    )
+}
+
+/// Like [`authed_state_with_plugins`], but the auth middleware resolves every
+/// request through `context` — for routes that read the caller's identity
+/// without rejecting anyone (the runtime plugins' URL space).
+#[must_use]
+pub fn plugin_state_with_context(
+    plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
+    context: Arc<dyn AuthorizationContext>,
+) -> AppState {
+    plugin_state(plugins, Arc::new(ApiKeyAuthService), context)
 }
 
 fn plugin_state(
     plugins: Arc<dyn ferrofin_traits::plugins::PluginManager>,
     auth: Arc<dyn AuthService>,
+    context: Arc<dyn AuthorizationContext>,
 ) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
@@ -2872,7 +2892,7 @@ fn plugin_state(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(FakeDto),
-        Arc::new(FakeAuthContext),
+        context,
         auth,
         Arc::new(FakeQuickConnect),
         Arc::new(FakePlaylists),

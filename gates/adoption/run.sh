@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gates/adoption/run.sh --fixtures DIR [--image IMAGE] [--only NAME] [--user USERNAME] [--oracle 12.1|12.2]
+# gates/adoption/run.sh [--fixtures DIR] [--image IMAGE] [--only NAME] [--user USERNAME] [--oracle 12.1|12.2]
 #
 # Adopts every Jellyfin release Ferrofin claims to support, 11 paths: 10.11.8, 10.11.9, 10.11.10,
 # 10.11.11, 12.0, 12.1 via both upgrade routes, 12.2 via all three (from 10.11, 12.0, 12.1), and a
@@ -36,6 +36,9 @@
 # includes two boots and a full scan. Fixtures are synthetic and NOT in the repository:
 # build-fixtures.sh builds DIR (invented media under DIR/media, the only media mounted) — see
 # gates/adoption/README.md. DIR and the work directory must be on a local disk.
+# Without --fixtures (or FERROFIN_ADOPTION_FIXTURES), DIR is the one build-fixtures.sh builds under
+# $FERROFIN_GATES_DIR (fixtures/adoption-<key>). The work directory is ADOPTION_WORK_DIR, else
+# $FERROFIN_GATES_DIR/work/adoption, else DIR/work/run (gates/lib.sh).
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=gates/adoption/lib.sh
@@ -45,11 +48,14 @@ ORACLE_VERSION=${ADOPTION_ORACLE:-12.2}
 while [ $# -gt 0 ]; do case $1 in
   --fixtures) FIXTURES=$2; shift 2;; --image) IMAGE=$2; shift 2;; --only) ONLY=$2; shift 2;; --user) USER_NAME=$2; shift 2;;
   --oracle) ORACLE_VERSION=$2; shift 2;;
-  -h|--help) sed -n 2,38p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
+  -h|--help) sed -n 2,41p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
 case $ORACLE_VERSION in 12.1|12.2) ;; *) echo "run: --oracle must be 12.1 or 12.2, not '$ORACLE_VERSION'" >&2; exit 2;; esac
-[ -n "$FIXTURES" ] || { echo "run: --fixtures DIR (or FERROFIN_ADOPTION_FIXTURES) is required" >&2; exit 2; }
+[ -n "$FIXTURES" ] || FIXTURES=$(adoption_fixtures_dir run) || exit 2
+[ -d "$FIXTURES" ] || { echo "run: $FIXTURES missing — run gates/adoption/build-fixtures.sh first" >&2; exit 2; }
 FIXTURES=$(cd "$FIXTURES" && pwd)
-WORK=${ADOPTION_WORK_DIR:-$FIXTURES/work/run}  # synthetic.py run owns work/<fixture>
+WORK=${ADOPTION_WORK_DIR:-}
+if [ -z "$WORK" ] && [ -n "${FERROFIN_GATES_DIR:-}" ]; then WORK=$(gates_dir run work/adoption) || exit 2; fi
+WORK=${WORK:-$FIXTURES/work/run}  # synthetic.py run owns work/<fixture>
 for t in docker sqlite3 jq curl python3; do command -v $t >/dev/null || { echo "run: $t not installed" >&2; exit 2; }; done
 python3 -c 'from PIL import Image' 2>/dev/null || { echo "run: Python Pillow is required for artwork checks" >&2; exit 2; }
 python3 -c 'import icu' 2>/dev/null || { echo "run: Python PyICU (python3-icu) is required for the CleanValue check" >&2; exit 2; }
@@ -59,7 +65,7 @@ ORACLE=$FIXTURES/oracle/smoke-jellyfin-$ORACLE_VERSION.txt
 # the probes must run as the account the oracle ran as; the builder records it
 [ -n "$USER_NAME" ] || [ ! -f "$FIXTURES/oracle/user.txt" ] || USER_NAME=$(cat "$FIXTURES/oracle/user.txt")
 [ -d "$FIXTURES/media" ] || { echo "run: $FIXTURES/media missing — run gates/adoption/build-fixtures.sh first" >&2; exit 2; }
-adoption_require_local "$FIXTURES" && adoption_require_local "$WORK" || exit 2; mkdir -p "$WORK"
+gates_require_local "$FIXTURES" && gates_require_local "$WORK" || exit 2; mkdir -p "$WORK"
 MEDIA=(-v "$FIXTURES/media:/media:ro")
 # The report: recorded as the run goes, built when it ends. Recording never changes the verdict.
 REPORT_PY="$HERE/adoption_report.py"

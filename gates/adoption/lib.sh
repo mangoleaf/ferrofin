@@ -2,26 +2,26 @@
 # Functions shared by gates/adoption/run.sh and gates/adoption/smoke.sh. Sourced, never executed: nothing
 # here touches docker or the network, which is what lets gates/adoption/tests/*.bats drive every
 # check with canned logs, smoke outputs and throwaway SQLite files.
+# shellcheck source=gates/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/../lib.sh"
 
 # Probe answers that legitimately differ between Ferrofin and Jellyfin, or between two boots.
 ADOPTION_IGNORE='/System/Info|/ScheduledTasks|/Plugins|/Devices|/Library/VirtualFolders|/System/ActivityLog|/Sessions'
 # What a boot repair logs when it did something; a second boot must log none of these.
 ADOPTION_REPAIR_RE='imported playlist|repaired |rewrote |recomputed |merged |backfilled |dropped dead|consolidat|reverted'
 
-# adoption_require_local <dir>: refuse a directory on a network filesystem, judged by its nearest
-# existing parent so nothing is created before the check. Every fixture is copied, booted and
-# scanned several times; that load belongs on a local disk, never a NAS. findmnt names the real
-# type (fuse.sshfs, not just fuse), so local FUSE disks such as ntfs-3g or mergerfs still pass.
-adoption_require_local() {
-  local dir=$1 types fs
-  until [ -e "$dir" ]; do dir=$(dirname "$dir"); done
-  types=$(findmnt -n -o FSTYPE -T "$dir") || { echo "refusing $1: cannot tell its filesystem" >&2; return 1; }
-  for fs in $types; do
-    case $fs in
-      nfs*|cifs|smb*|9p|ceph|afs|glusterfs|davfs|fuse.sshfs|fuse.rclone|fuse.glusterfs|fuse.s3fs|fuse.davfs2)
-        echo "refusing $1: it is on a network filesystem ($fs); use a local disk" >&2; return 1;;
-    esac
-  done
+# adoption_fixtures_dir <who>: the fixtures' directory under the output root (gates/lib.sh), named for
+# what builds the fixtures: the files the synthetic recipe hashes (synthetic.py recipe()), the oracle
+# builders and the messy and scale copies, as CI keys its fixture cache (.github/workflows/adoption.yml,
+# which also adds the Jellyfin image digests). A change to any of them builds into a new directory, so
+# a fixture built by an older version is never picked up. A refusal is one line on stderr, and status 2.
+adoption_fixtures_dir() {
+  local fixtures key
+  fixtures=$(gates_dir "$1" fixtures) || return 2
+  key=$(set -o pipefail; cd "$(dirname "${BASH_SOURCE[0]}")" && cat synthetic.py synthetic_media.py synthetic_fixture.py \
+    preservation.py user_accounts.py smoke.sh build-fixtures.sh messy.py scale.py 2>/dev/null | sha256sum) \
+    || { echo "$1: cannot read the fixture builders in gates/adoption/" >&2; return 2; }
+  printf '%s/adoption-%s\n' "$fixtures" "${key:0:12}"
 }
 
 # adoption_normalise <smoke-file> [skip-re]: the comparable form of a smoke output — item ids

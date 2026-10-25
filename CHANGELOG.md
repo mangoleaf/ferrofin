@@ -25,11 +25,33 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Tooling
 - The four live checks moved under `gates/`: `bench/` → `gates/bench/`, `adoption/` →
-  `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. Each gate
-  behaves as before; run directories default to `gates/bench/runs/` and
-  `gates/parity/runs/`, and the benchmark corpus to `gates/bench/testdata/`, so an existing
-  `bench/testdata/`, `bench/runs/` or `parity/runs/` is moved by hand (the corpus can also be
-  passed with `--testdata`)
+  `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. Every gate
+  takes its directories from one output root, `FERROFIN_GATES_DIR` (absolute, on a local
+  disk, outside the repository): fixtures in `fixtures/` (`adoption-<key>`,
+  `bench-testdata`), scratch in `work/<gate>/`, runs in `runs/<gate>-<name>/`
+  (`gates/lib.sh`). `--fixtures`, `--testdata`, `--out` and `ADOPTION_WORK_DIR` still win;
+  with neither, a gate stops and names the variable. An existing corpus or run directory
+  (`bench/testdata/`, `bench/runs/`, `parity/runs/`) is moved under the root by hand (a run
+  renamed `bench-<name>` or `parity-<name>`), or passed with `--testdata` or `--out`
+- `gates/run <gate|all>` validates one commit with one image (`gates/README.md`). A preflight
+  names every cause that would stop it before any gate starts: a missing tool, an image
+  missing or not built from the checked-out commit (its `org.opencontainers.image.revision`
+  label, set with `docker build --build-arg SOURCE_COMMIT=…`), a fixture not built, another
+  session holding the root's lock, busy cores, or a container another run left. Each gate
+  then writes into one session folder, `runs/<branch>-<YYYYMMDD-HHMM>/`, beside a
+  `session.json` with every gate's status. `gates/verify/run.sh` runs the scan-behaviour
+  check against a fresh server started from an image, and `gates/bench/run.sh` measures
+  `FERROFIN_BENCH_IMAGE` (default `ferrofin:bench`)
+- Every gates session ends with one report, `index.html` and `report.md` in its folder
+  (`gates/report.py`): the commit, images and oracle pin, and each gate's verdict and counts
+  (verify's checks, adoption's rows, parity's new and unfiled differences, bench's phases or
+  gated A/B cells), with links to its own report. Adoption, parity and the A/B gate are judged
+  by their own code. A gate that did not run, or whose result is missing or unreadable, is
+  shown as such. `scan-behaviour.sh --json FILE` writes its rows as data
+- A root `Makefile` for the gates: `make run-gates` runs all four, `make run-verify`,
+  `run-adoption`, `run-parity` and `run-bench` one (`IMAGE=` and `PREVIOUS=` passed to
+  `gates/run`), and `make test-gates-offline` the gates' own shellcheck, bats and Python tests,
+  which CI's shell-tests job now runs through it
 - `gates/adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
   (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0) through an image on fresh
   fixture copies and diffs the answers against Jellyfin 12.2's own; fixtures are derived
@@ -356,6 +378,28 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   and password) and each guide provider's password (the Schedules Direct password hash) come
   back blank for them. Jellyfin serves both to every signed-in user; only the dashboard's admin
   pages read them, so jellyfin-web is unaffected
+- A signed-in user can no longer take over another user's session by sending that user's
+  `Client` and `DeviceId` headers. Sessions are now keyed by client, device and user, as in
+  Jellyfin 12. Before, the other user's session, WebSocket included, was handed to the caller,
+  who could then remote-control that player without `EnableRemoteControlOfOtherUsers`. Session
+  ids now match Jellyfin's byte for byte, so each one changes once on upgrade; they live only
+  in memory and clients take whatever id the server reports
+- A user's details no longer say whether the account has a password. `HasPassword` and
+  `HasConfiguredPassword` are `true` for every user, as Jellyfin 12 reports them, so the
+  anonymous login-screen list (`GET /Users/Public`) no longer tells anyone which accounts have
+  no password. Signing in with an empty password still works for those accounts. See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
+- Taking a device away from a user now signs that device out, as Jellyfin 12.1 does. When a
+  user's policy is saved without "Allow access from all devices" and a device the user is signed
+  in on is not among the allowed ones, its token is revoked at once. Before, it kept working
+  until the device signed in again; only new sign-ins from it were refused. A rename runs the
+  same check. If the check fails, the save still succeeds and the error is logged
+- Behind a proxy listed under **Known proxies**, a client can no longer choose its own address
+  through `X-Forwarded-For`. When the proxy writes a token that is not an address for its client
+  (Squid's `unknown`, for example), the client is now that proxy, as in Jellyfin. Before, the
+  token was skipped and the entry to its left, which the client wrote itself, became the
+  client's address: enough to get past a remote IP filter's allow or block list. Quoted entries
+  are read too, as Jellyfin reads them
 - A library scan's `LibraryChanged` push reaches each signed-in user through the per-user
   filter, as in Jellyfin, instead of one payload sent to every session: a user no longer
   receives the ids of items added to or changed in libraries they cannot open, nor of those
@@ -373,6 +417,32 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
   had already run, and cleared it, so a user with a maximum parental rating saw those episodes
   in lists, counts, Latest, Resume and Next Up until the next full library scan
+- WASM plugins: what a plugin's `/Plugins/{id}/web/…` route answers is served on the server's
+  own origin, where jellyfin-web keeps every user's token, so the server now owns the headers
+  that decide what a browser lets it do. Every answer carries `X-Content-Type-Options: nosniff`
+  and a sandboxing `Content-Security-Policy` (an HTML page the plugin serves runs in an opaque
+  origin and cannot read stored tokens), and the plugin can no longer set cookies or clear the
+  site's storage. The caller's identity reaches the plugin only when Jellyfin's default
+  authorization policy admits them: a disabled administrator was passed on as an
+  administrator, and a remote caller without remote access or a user outside their access
+  schedule as signed in
+- WASM plugins: a `.wasm` dropped into the plugins folder by hand whose id belongs to a
+  compiled-in plugin (OpenSubtitles, TMDb and the other in-tree providers, Intro Skipper, File
+  Transformation, Merge Versions) is no longer loaded. It ran every task, provider and route
+  it declared under the compiled-in plugin's enabled switch and was handed that plugin's
+  settings (the OpenSubtitles user name and password among them), while `/Plugins` listed
+  only the compiled-in one
+- WASM plugins: one plugin file can no longer drop every other plugin for a boot. A name with
+  a NUL byte panicked the loader (the name became the plugin thread's name); names that are
+  blank, longer than 256 bytes or carry control characters are now refused, a panic while
+  loading one file skips only that file, and install checks a plugin the same way the load
+  does, so one that installs is not skipped at the next boot for an invalid default
+  configuration or name
+- WASM plugins: a web transform can no longer make the server run out of memory from anonymous
+  `/web` requests. A blank search text is refused (it matched between every character), and a
+  transform that would grow a file by more than 256 KiB leaves the file unchanged
+- WASM plugins with a semver prerelease or build version (`0.2.0-beta.1`, `1.0.0+git.abc`) can
+  be enabled, disabled and uninstalled from the dashboard; those buttons answered `400`
 
 ### Bug Fixes
 - A backup no longer reports success with something left out:
@@ -487,6 +557,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   instead of on every request. One that exists but cannot be read answers 500 instead of
   reading as the defaults, and so does saving the encoding settings over it, so a save cannot
   replace a document nobody could see (Jellyfin serves the defaults when it lacks permission)
+- Two administrators demoting or disabling each other at the same moment can no longer leave
+  the server without an administrator, or without any enabled user. The checks that
+  `POST /Users/{userId}/Policy` makes now run inside the save itself, as deleting a user's
+  already did, so the second save sees the first. Jellyfin has the same race. A user's tokens
+  are revoked once the save that disables them has gone through, so a refused save signs
+  nobody out
 - The server opens its HTTP port as soon as it starts, before it adopts or migrates the
   database (after a scheduled backup restore), and answers while it does, as Jellyfin's
   startup server does:

@@ -660,8 +660,9 @@ Average cores busy is CPU-seconds divided by observed wall seconds; 1.0 means on
 
 ## Reproduce the reports
 
-Raw evidence stays under ignored `gates/bench/runs/` directories. Role credentials must not be
-published.
+Raw evidence stays outside the repository, under the gates' output root
+(`$FERROFIN_GATES_DIR/runs/`); these runs were made before it existed, in the then-default `gates/bench/runs/`.
+Role credentials must not be published.
 
 ```sh
 python3 gates/bench/report.py \

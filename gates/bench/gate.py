@@ -28,6 +28,9 @@
         rewrite a finished session's report.md and report.html from its run dirs (an A/B
         also rewrites each candidate run's ab-verdicts.json and report.html)
 
+--testdata defaults to $FERROFIN_GATES_DIR/fixtures/bench-testdata and --out to
+$FERROFIN_GATES_DIR/runs/bench-gate-<mode>-<date>-<time> (the output root's layout is in gates/lib.sh).
+
 Before anything starts, `oracle.check` must find the Jellyfin oracle pin (UPSTREAM_TAG) on the
 latest Jellyfin release; a stale pin or a failed lookup refuses the session (decision DO).
 
@@ -66,6 +69,19 @@ import soak
 
 BENCH = os.path.dirname(os.path.abspath(__file__))
 TAG = "ferrofin:bench"
+
+
+def gates_dir(path):
+    """`path` under the output root FERROFIN_GATES_DIR, judged by gates/lib.sh (absolute, outside the
+    repository, on a local disk); when it is refused, its one-line reason is on stderr and this exits 2."""
+    found = subprocess.run(["bash", "-c", '. "$1"; gates_dir gate "$2"', "_",
+                            os.path.join(os.path.dirname(BENCH), "lib.sh"), path],
+                           stdout=subprocess.PIPE, text=True, check=False)
+    if found.returncode:
+        sys.exit(2)
+    return found.stdout.strip()
+
+
 PHASES = {"aa": "shape,unloaded,loaded", "ab": "shape,unloaded,loaded", "ramp": "ramp", "soak": "soak",
           "endpoints": "endpoints"}
 #: The levels whose cells can block a release; `stress` is reported, never gated (B5).
@@ -301,11 +317,17 @@ def image_ref(image):
         return None
 
 
+def stop(signum, frame):
+    """SIGTERM (gates/run stopping its session) ends a session as Ctrl-C does: the running run gets
+    its own cleanup and the tag is put back (run_session's finally)."""
+    raise KeyboardInterrupt
+
+
 def run_sh(cmd):
     """A run (run.sh or scan.py) to completion. On Ctrl-C it gets SIGTERM and time to run
     its own cleanup (stop its container, finish phases.json): a killed run would leave a
     bench-* container behind that refuses the next run."""
-    proc = subprocess.Popen(cmd)
+    proc = subprocess.Popen(cmd, env=dict(os.environ, FERROFIN_BENCH_IMAGE=TAG))   # the tag it retags
     try:
         return proc.wait()
     except KeyboardInterrupt:
@@ -324,9 +346,8 @@ def run_session(session, plan, testdata):
             out = os.path.join(session, name)
             print(f"== {name}: {role} = {image}", flush=True)
             docker("tag", plan["images"][role]["id"], TAG)
-            cmd = ["bash", os.path.join(BENCH, "run.sh"), "--servers", "ferrofin", "--only", PHASES[plan["mode"]], "--out", out]
-            if testdata:
-                cmd += ["--testdata", testdata]
+            cmd = ["bash", os.path.join(BENCH, "run.sh"), "--servers", "ferrofin", "--only", PHASES[plan["mode"]],
+                   "--out", out, "--testdata", testdata]
             rc = run_sh(cmd)
             if rc:
                 sys.exit(f"gate: {name} failed (run.sh exit {rc}); the session stops here, see {out}")
@@ -354,7 +375,7 @@ def scan_session(session, plan, testdata):
         out = os.path.join(session, name)
         print(f"== {name}: {role} = {image}", flush=True)
         rc = run_sh([sys.executable, os.path.join(BENCH, "scan.py"), plan["images"][role]["id"],
-                     testdata or os.path.join(BENCH, "testdata"), out])
+                     testdata, out])
         if rc:
             sys.exit(f"gate: {name} failed (scan.py exit {rc}); the session stops here, see {out}")
         measured = (report.load(os.path.join(out, "scan.json")) or {}).get("image_id")
@@ -662,7 +683,7 @@ def main(argv):
     count = int(count)
     images = {"a": positional[0]} if mode == "aa" else {"a": positional[0], "b": positional[1]}
     stamp = datetime.now(timezone.utc)
-    session = os.path.abspath(opts["--out"] or os.path.join(BENCH, "runs", f"gate-{mode}-{stamp:%Y%m%d-%H%M}"))
+    session = os.path.abspath(opts["--out"] or gates_dir(f"runs/bench-gate-{mode}-{stamp:%Y%m%d-%H%M}"))
     plan = {"mode": mode, "name": os.path.basename(session), "date": stamp.isoformat(timespec="seconds"),
             "schedule": schedule(mode, images, count)}
     print(f"{mode} session {session}:")
@@ -673,6 +694,7 @@ def main(argv):
         return 0
     if os.path.exists(session):
         sys.exit(f"gate: {session} exists — a session directory is never reused")
+    testdata = os.path.abspath(opts["--testdata"] or gates_dir("fixtures/bench-testdata"))
     # A release gate never runs against a Jellyfin pin behind the latest release (DO).
     try:
         plan["oracle"], problem = oracle.check()
@@ -689,7 +711,8 @@ def main(argv):
     os.makedirs(session)
     with open(os.path.join(session, "gate.json"), "w") as f:
         json.dump(plan, f, indent=2)
-    run_session(session, plan, opts["--testdata"])
+    signal.signal(signal.SIGTERM, stop)
+    run_session(session, plan, testdata)
     md, block = render(session)
     print(md)
     print(f"report: {session}/report.html")

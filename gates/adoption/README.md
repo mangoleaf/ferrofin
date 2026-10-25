@@ -320,7 +320,8 @@ successful download refilling lost metadata, and the check does not depend on li
 API keys or quotas. This tests retention during provider failure; provider enrichment
 is covered separately by the server's controlled HTTP scan tests. Its default timeout is
 600 seconds; set `ADOPTION_SCAN_TIMEOUT` for larger libraries. Set
-`ADOPTION_WORK_DIR` to isolate a run from previous artifacts (default: `$FIXTURES/work/run`).
+`ADOPTION_WORK_DIR` to isolate a run from previous artifacts (default: `$FERROFIN_GATES_DIR/work/adoption`,
+or `$FIXTURES/work/run` when no output root is set).
 A timeout, failed scan, failed query, malformed response or inaccessible metadata
 endpoint fails the run.
 
@@ -342,8 +343,9 @@ any change to `crates/ferrofin-db/migrations/`, the adoption gate in
 ## The report
 
 `gates/adoption/run.sh` and `python3 gates/adoption/synthetic.py run` each write a self-contained
-`report.html` in their work directory (`DIR/work/run/` for `run.sh`, `DIR/work/` for the
-preservation matrix; `ADOPTION_WORK_DIR` moves the first). It opens from disk, has no external
+`report.html` in their work directory (`$FERROFIN_GATES_DIR/work/adoption/` for `run.sh`, or
+`DIR/work/run/` without an output root; `DIR/work/` for the preservation matrix; `ADOPTION_WORK_DIR`
+moves the first). It opens from disk, has no external
 asset, and shows:
 
 - the run: image, Jellyfin oracle, duration, how many fixtures passed, failed or were skipped;
@@ -377,7 +379,7 @@ recording adds, and only on a terminal.
 The shared viewer lists it in its Adoption tab and compares two runs side by side:
 
 ```bash
-python3 gates/bench/report.py --serve --adoption-dir DIR/work      # `run`, and the matrix as `work`
+python3 gates/bench/report.py --serve      # run.sh's page as `adoption` ($FERROFIN_GATES_DIR/work); the matrix: --adoption-dir DIR/work
 ```
 
 The `Adoption` workflow uploads the two pages as the `adoption-report` (`run.sh`) and
@@ -554,7 +556,7 @@ $FIXTURES/
   oracle/smoke-jellyfin-12.2-fresh.txt  built: Jellyfin 12.2's answers on the fresh-install library
   oracle/user.txt              built: the account those answers were probed as
   jellyfin-12.2-schema.sql     built: the 12.2 schema the other 12.2 routes are diffed against
-  work/                        scratch: synthetic.py's copies, work/run/ for run.sh's; failures stay here
+  work/                        scratch: synthetic.py's copies (and run.sh's in work/run/ when no output root is set); failures stay here
 ```
 
 The probes run as the synthetic administrator, which has a **Jellyfin Web** session in
@@ -565,17 +567,28 @@ Debian/Ubuntu), PyICU (`python3-icu`, for the `CleanValue` derivation), `sqlite3
 `curl`. Media encoding uses the Jellyfin image's FFmpeg.
 
 ```bash
-gates/adoption/build-fixtures.sh --fixtures /path/to/fixtures     # once; pulls 10.11.8–12.2
-docker build -t ferrofin:bench .                            # the commit under test
-gates/adoption/run.sh --fixtures /path/to/fixtures --image ferrofin:bench
-python3 gates/adoption/synthetic.py run --fixtures /path/to/fixtures --image ferrofin:bench
-gates/adoption/run.sh --fixtures … --only jellyfin-12.1-from-10   # one generation
+export FERROFIN_GATES_DIR=/srv/gates                # the output root: absolute, a local disk, outside the checkout
+gates/adoption/build-fixtures.sh                    # once; pulls 10.11.8–12.2 → $FERROFIN_GATES_DIR/fixtures/adoption-<key>
+docker build -t ferrofin:bench .                    # the commit under test
+gates/adoption/run.sh --image ferrofin:bench        # copies and report → $FERROFIN_GATES_DIR/work/adoption
+python3 gates/adoption/synthetic.py run --image ferrofin:bench
+gates/adoption/run.sh --only jellyfin-12.1-from-10  # one generation
 ```
+
+Every location comes from the output root (the layout is in [`gates/lib.sh`](../lib.sh)). The
+fixture directory is named for a hash of the files that build the fixtures (the synthetic recipe,
+`smoke.sh`, `build-fixtures.sh`, `messy.py` and `scale.py`; `adoption_fixtures_dir` in `lib.sh`), so a
+change to any of them builds into a new directory and a fixture from an older version is never
+picked up. A new Jellyfin image under the same tag is not part of the name: build into a new
+directory (`--fixtures`) after pulling one.
+`--fixtures DIR` (or `FERROFIN_ADOPTION_FIXTURES`) and `ADOPTION_WORK_DIR` override the root; with
+`--fixtures` and no root, the work directory is `DIR/work/run`. With neither, the scripts stop and
+name `FERROFIN_GATES_DIR`.
 
 A build that fails part-way, for example when Jellyfin resets a connection while seeding
 (seen once under heavy host load), is not retried: seeding calls are not idempotent, so a
 retry could change the baseline. The half-built fixture is refused; build into a new
-directory.
+directory (`--fixtures`), or move the half-built `fixtures/adoption-<key>` aside.
 
 Full adoption validation requires **both** `gates/adoption/run.sh` and the
 [synthetic preservation matrix](#running-the-synthetic-matrix), run against the same
@@ -595,8 +608,8 @@ PASS  12.1.0    jellyfin-12.1-from-12
 
 The second column is the generation the gate matched — the id *set*, so 10.11.9 reports
 `10.11.8` and 10.11.10 reports `10.11.11`; `run.sh` knows which is expected for which fixture.
-A `FAIL` line names every check that failed and points at the diff; the copy is kept under
-`work/run/` with `<name>.server.log`, `<name>.smoke.txt`, `<name>.smoke2.txt` (and, for a 10.11
+A `FAIL` line names every check that failed and points at the diff; the copy is kept in the
+work directory (`$FERROFIN_GATES_DIR/work/adoption/`, or `work/run/` with `--fixtures` and no root) with `<name>.server.log`, `<name>.smoke.txt`, `<name>.smoke2.txt` (and, for a 10.11
 path, the post-scan `<name>.smoke-scan.txt`) and the metadata
 presence baseline `<name>.metadata.json` beside it. The per-stage
 `<name>.metadata-after-{adoption,restart,scan}.log` files record the metadata results.
@@ -825,9 +838,9 @@ Use a fresh fixture directory on a local disk, outside the checkout.
 `build-fixtures.sh` runs the build step below and adds the `run.sh` oracles:
 
 ```bash
-gates/adoption/build-fixtures.sh --fixtures /path/to/fixtures   # or: python3 gates/adoption/synthetic.py build --fixtures …
+gates/adoption/build-fixtures.sh            # or: python3 gates/adoption/synthetic.py build; both take --fixtures DIR
 docker build -t ferrofin:bench .
-python3 gates/adoption/synthetic.py run --fixtures /path/to/fixtures --image ferrofin:bench
+python3 gates/adoption/synthetic.py run --image ferrofin:bench
 ```
 
 The ten version/upgrade paths are the ones `run.sh` covers (`VERSIONS` in `synthetic.py`).
