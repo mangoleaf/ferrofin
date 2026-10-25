@@ -546,9 +546,31 @@ impl ReqwestFetcher {
     }
 }
 
-/// Whether `url` names a remote `http(s)://` source (vs. a local path).
-fn is_http(url: &str) -> bool {
-    url.starts_with("http://") || url.starts_with("https://")
+/// Whether `url` names a remote source rather than a local path, by upstream's
+/// rule everywhere it makes that choice: it starts with `http`, ignoring ASCII
+/// case (`StartsWith("http", StringComparison.OrdinalIgnoreCase)`, v12.2
+/// M3uParser.cs:52, XmlTvListingsProvider.cs:76,343).
+pub(crate) fn is_http(url: &str) -> bool {
+    url.get(..4)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
+}
+
+/// `error` as a `404` when it is a local file that does not exist, the way
+/// upstream's middleware answers the `FileNotFoundException` or
+/// `DirectoryNotFoundException` that `AsyncFile.OpenRead` throws
+/// (`ExceptionMiddleware.GetStatusCode`); any other error is returned as it is.
+pub(crate) fn missing_file_is_not_found(error: ServiceError) -> ServiceError {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(current) = cause {
+        if current
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        {
+            return ServiceError::not_found(error.to_string());
+        }
+        cause = current.source();
+    }
+    error
 }
 
 /// Whether a listings source is gzipped, as `UnzipIfNeededAndCopy` decides:
@@ -624,6 +646,15 @@ impl SourceFetcher for ReqwestFetcher {
             let file = tokio::fs::File::open(path)
                 .await
                 .map_err(|e| LiveTvError::io(format!("read {path}"), e))?;
+            // `AsyncFile.OpenRead` refuses a directory (`UnauthorizedAccessException`),
+            // where a Unix `open` succeeds and only the first read fails.
+            if file.metadata().await.is_ok_and(|meta| meta.is_dir()) {
+                return Err(LiveTvError::io(
+                    format!("read {path}"),
+                    std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory"),
+                )
+                .into());
+            }
             Ok(SourceBody {
                 status: 200,
                 body: Box::new(FileBody {
@@ -733,6 +764,23 @@ mod tests {
             .expect("fetch");
         assert_eq!(body, "#EXTM3U\n");
         let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    /// `StartsWith("http", StringComparison.OrdinalIgnoreCase)`: the scheme in
+    /// any case is remote; a path, `file://` and anything shorter are not.
+    #[rstest::rstest]
+    #[case("http://guide/x.xml", true)]
+    #[case("HTTP://guide/x.xml", true)]
+    #[case("Http://guide/x.xml", true)]
+    #[case("https://guide/x.xml", true)]
+    #[case("/srv/guide.xml", false)]
+    #[case("file:///srv/guide.xml", false)]
+    #[case("C:\\guide.xml", false)]
+    #[case("htt", false)]
+    #[case("", false)]
+    #[case("htté://x", false)]
+    fn a_source_is_remote_when_it_starts_with_http(#[case] url: &str, #[case] remote: bool) {
+        assert_eq!(super::is_http(url), remote, "{url}");
     }
 
     #[tokio::test]

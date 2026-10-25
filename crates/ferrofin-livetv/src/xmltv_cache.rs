@@ -97,10 +97,7 @@ impl XmlTvCache {
             return Ok(body);
         }
 
-        let remote = path
-            .get(..4)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"));
-        if remote && self.failed_recently(path) {
+        if crate::fetch::is_http(path) && self.failed_recently(path) {
             return match tokio::fs::read_to_string(&cache_file).await {
                 Ok(body) => Ok(body),
                 Err(_) => Err(ServiceError::Backend(format!(

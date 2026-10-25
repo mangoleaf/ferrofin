@@ -1806,11 +1806,8 @@ impl FerrofinLiveTvManager {
             ));
         }
         self.xmltv.forget_failure(path);
-        let remote = path
-            .get(..4)
-            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"));
         // `File.Exists`: false for a directory, and for anything unreadable.
-        if !remote
+        if !crate::fetch::is_http(path)
             && !tokio::fs::metadata(path)
                 .await
                 .is_ok_and(|meta| meta.is_file())
@@ -6821,7 +6818,11 @@ mod tests {
     async fn info_always_has_emby_service_and_is_enabled() {
         // No tuner host configured: the built-in "Emby" service is still
         // present and IsEnabled is true, mirroring DefaultLiveTvService.
-        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let mgr = manager_with(FakeFetcher(HashMap::from([(
+            "http://tuner/playlist.m3u".to_owned(),
+            M3U.to_owned(),
+        )])))
+        .await;
         let info = mgr.get_live_tv_info().await.expect("info");
         assert!(info.is_enabled);
         assert_eq!(info.services.len(), 1);
@@ -6877,7 +6878,11 @@ mod tests {
 
         let mgr = FerrofinLiveTvManager::new(
             db,
-            Arc::new(FakeFetcher(HashMap::new())),
+            // `M3UTunerHost.Validate` opens the playlist before the save.
+            Arc::new(FakeFetcher(HashMap::from([(
+                "http://tuner/playlist.m3u".to_owned(),
+                M3U.to_owned(),
+            )]))),
             "srv".to_owned(),
             std::env::temp_dir().join("ferrofin-livetv-manager-tests"),
         )
@@ -6906,7 +6911,11 @@ mod tests {
 
     #[tokio::test]
     async fn tuner_host_crud_roundtrips() {
-        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let mgr = manager_with(FakeFetcher(HashMap::from([(
+            "http://tuner/playlist.m3u".to_owned(),
+            M3U.to_owned(),
+        )])))
+        .await;
         // The synchronous flag the "Refresh Guide" task's hidden rule polls
         // tracks the store through every mutation.
         assert!(!mgr.has_tuner_hosts(), "no host configured yet");
@@ -7243,6 +7252,58 @@ mod tests {
         assert_eq!(mgr.get_listing_providers().await.expect("list").len(), 1);
         mgr.delete_listing_provider(&id).await.expect("delete");
         assert!(mgr.get_listing_providers().await.expect("list2").is_empty());
+    }
+
+    /// `XmlTvListingsProvider.Validate` (v12.2 :333-349): a local guide path
+    /// that is not a file is `FileNotFoundException` (`404`) and nothing is
+    /// saved; an existing file and a URL whose scheme is in any case save.
+    #[tokio::test]
+    async fn an_xmltv_provider_must_name_an_existing_file_or_a_url() {
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let provider = |path: &str| {
+            as_xmltv(ListingsProviderInfo {
+                path: Some(path.to_owned()),
+                ..ListingsProviderInfo::default()
+            })
+        };
+
+        let missing = dir.path().join("missing.xml");
+        let err = mgr
+            .save_listing_provider(provider(missing.to_str().expect("utf-8")), false, false)
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+        assert!(mgr.get_listing_providers().await.expect("list").is_empty());
+
+        let guide = dir.path().join("guide.xml");
+        std::fs::write(&guide, XMLTV).expect("write");
+        mgr.save_listing_provider(provider(guide.to_str().expect("utf-8")), false, false)
+            .await
+            .expect("an existing file");
+        mgr.save_listing_provider(provider("HTTP://guide/xmltv.xml"), false, false)
+            .await
+            .expect("a URL");
+        assert_eq!(mgr.get_listing_providers().await.expect("list").len(), 2);
+    }
+
+    /// `TunerHostManager.SaveTunerHost` runs `M3UTunerHost.Validate` first, so
+    /// a tuner whose playlist does not open is refused and never stored.
+    #[tokio::test]
+    async fn an_m3u_tuner_whose_playlist_does_not_open_is_not_saved() {
+        let mgr = manager_with_fetcher(Arc::new(crate::fetch::ReqwestFetcher::new())).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.m3u");
+        let err = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                url: Some(missing.to_str().expect("utf-8").to_owned()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+        assert!(mgr.get_tuner_hosts().await.expect("list").is_empty());
     }
 
     /// `ListingsManager.SaveListingProvider`'s id rule: a posted id matching a
@@ -11651,6 +11712,8 @@ mod tests {
     async fn mapping_manager() -> (FerrofinLiveTvManager, String, String) {
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        // A second playlist, for the tests that save another tuner.
+        sources.insert("http://tuner/other.m3u".to_owned(), M3U.to_owned());
         // `dated`, not the literal fixture: the refresh ingests only
         // `[now - 1h, now - 1h + GuideDays)`, so a fixture pinned to a calendar
         // date silently empties itself once that date rolls past.
@@ -12147,16 +12210,23 @@ mod tests {
         // fetch, even though neither can ever finish.
         let entered = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mgr = manager_with_fetcher(std::sync::Arc::new(HangingFetcher(entered.clone()))).await;
-        mgr.save_tuner_host(TunerHostInfo {
-            // `SaveTunerHost` resolves the host by `Type` first and 404s when nothing
-            // claims it (v10.11.8 TunerHostManager.cs:60-69), so the fixture names the
-            // M3U host this playlist belongs to.
+        // Stored directly: `save_tuner_host` opens the playlist first
+        // (`M3UTunerHost.Validate`), and this source never answers.
+        let tuner = TunerHostInfo {
+            id: Some("wedged".to_owned()),
             type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
             ..TunerHostInfo::default()
-        })
-        .await
-        .expect("tuner");
+        };
+        mgr.db
+            .upsert_live_tv_tuner_host(
+                "wedged",
+                "http://tuner/playlist.m3u",
+                "m3u",
+                &serde_json::to_string(&tuner).expect("json"),
+            )
+            .await
+            .expect("tuner");
 
         let both = async { tokio::join!(mgr.refresh_guide(), mgr.refresh_guide()) };
         assert!(
