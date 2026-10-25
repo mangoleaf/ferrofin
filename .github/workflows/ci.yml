@@ -89,7 +89,7 @@ jobs:
         with:
           save-if: ${{ github.event_name == 'push' }} # PR runs only read (see SCCACHE_GHA_RW_MODE)
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: sccache stats
         if: always()
         run: ${SCCACHE_PATH} --show-stats
@@ -154,9 +154,9 @@ jobs:
       # threads-in-one-process model.
       - env:
           PARTITION: ${{ matrix.partition }}
-        run: FERROFIN_WASM_GUEST_TESTS=1 cargo nextest run --workspace --partition "hash:$PARTITION/3"
+        run: FERROFIN_WASM_GUEST_TESTS=1 cargo nextest run --locked --workspace --partition "hash:$PARTITION/3"
       - if: matrix.partition == 1
-        run: cargo test --workspace --doc # nextest cannot run doctests
+        run: cargo test --locked --workspace --doc # nextest cannot run doctests
       - name: sccache stats
         if: always()
         run: ${SCCACHE_PATH} --show-stats

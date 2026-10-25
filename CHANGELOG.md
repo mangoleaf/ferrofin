@@ -74,6 +74,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   handler's inline zip 2 and ferrofin-util's rand 0.8 move to the workspace's zip and rand 0.10
 - One TLS crypto backend, aws-lc: sqlx no longer builds rustls with ring (SQLite has no network
   transport), nor its unused `any` and `json` features, and webpki-roots is gone
+- Builds use the committed Cargo.lock: every cargo build, test, clippy and llvm-cov run in CI
+  (GitHub and GitLab), the release, the Docker image, the `deb:amd64` task and the WASM-guest
+  test pass `--locked`, so a manifest change without its lockfile fails instead of resolving
+  anew. The release's cargo-zigbuild and ziglang are pinned (0.23.4 and 0.16.0, the pair the
+  v1.3.2 aarch64 build used), and GitLab's `:latest` images to the versions they are today
 
 ### Parity
 - Find the playlists folder by its type when a playlist is created, as Jellyfin's

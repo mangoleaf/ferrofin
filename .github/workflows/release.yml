@@ -252,10 +252,11 @@ jobs:
       # aarch64 cross-build also needs it for the C in bundled SQLite and aws-lc-sys).
       - if: contains(matrix.target, 'linux')
         run: |
-          pip install cargo-zigbuild
-          cargo zigbuild --release -p ferrofin-server --target "${{ matrix.target }}.$GLIBC_FLOOR"
+          # The pair v1.3.2's aarch64 build used; move both together, deliberately.
+          pip install cargo-zigbuild==0.23.4 ziglang==0.16.0
+          cargo zigbuild --locked --release -p ferrofin-server --target "${{ matrix.target }}.$GLIBC_FLOOR"
       - if: ${{ !contains(matrix.target, 'linux') }}
-        run: cargo build --release -p ferrofin-server --target ${{ matrix.target }}
+        run: cargo build --locked --release -p ferrofin-server --target ${{ matrix.target }}
       # The .deb depends on jellyfin-ffmpeg8 + jellyfin-web (the same runtime the
       # image bundles); package metadata and contents live in the server manifest.
       - name: build the Debian package

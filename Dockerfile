@@ -69,7 +69,7 @@ COPY . .
 ARG SERVICE_VERSION=
 ENV FERROFIN_GIT_DESCRIBE=${SERVICE_VERSION}
 # Strip the container binary while leaving local profiling builds unchanged.
-RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release -p ferrofin-server
+RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --locked --release -p ferrofin-server
 
 # ── runtime ─────────────────────────────────────────────────────────────
 FROM ${RUNTIME_IMAGE}

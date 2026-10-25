@@ -37,7 +37,13 @@ fn rss_kib() -> u64 {
 fn build_guest() -> Option<PathBuf> {
     let guest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/wasm-hello");
     let output = Command::new("cargo")
-        .args(["build", "--release", "--target", "wasm32-wasip2"])
+        .args([
+            "build",
+            "--locked",
+            "--release",
+            "--target",
+            "wasm32-wasip2",
+        ])
         .current_dir(&guest_dir)
         // Let the island's own rust-toolchain.toml govern — the test runner's
         // toolchain pin would otherwise leak in and miss the wasm target.

@@ -59,7 +59,7 @@ for crate in "${crates[@]}"; do
   # `-p X` still instruments X's workspace deps, so their (uncovered) source lands in
   # the TOTAL the gate compares against. Exclude every sibling.
   others=$(printf '%s\n' "${all[@]}" | grep -vx "$crate" | paste -sd'|')
-  if ! cargo llvm-cov nextest -p "$crate" --fail-under-lines 80 --summary-only \
+  if ! cargo llvm-cov nextest -p "$crate" --locked --fail-under-lines 80 --summary-only \
     --ignore-filename-regex "(crates/($others)|apps)/"; then
     # GitHub turns this prefix into an annotation; elsewhere it is a plain line.
     echo "::error::Tests or coverage failed for $crate"
