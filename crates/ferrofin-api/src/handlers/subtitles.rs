@@ -27,6 +27,7 @@
 use std::fmt::Write as _;
 
 use axum::extract::{Path, Request, State};
+use axum::handler::Handler;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -41,7 +42,7 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{JsonBody, Query, upload_body_limit};
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::queue_high_priority_refresh;
@@ -788,7 +789,10 @@ fn font_mime(name: &str) -> &'static str {
 /// Registers this controller's real routes onto `router`.
 pub fn register(router: Router<AppState>) -> Router<AppState> {
     router
-        .route("/Videos/{itemId}/Subtitles", post(upload_subtitle))
+        .route(
+            "/Videos/{itemId}/Subtitles",
+            post(upload_subtitle.layer(upload_body_limit())),
+        )
         .route(
             "/Videos/{itemId}/Subtitles/{index}",
             delete(delete_subtitle),

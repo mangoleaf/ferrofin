@@ -45,6 +45,7 @@ use std::borrow::Cow;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
+use axum::handler::Handler;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
@@ -59,7 +60,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{Query, upload_body_limit};
 use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
 use crate::handlers::items::resolve_user;
 use crate::state::AppState;
@@ -1564,14 +1565,14 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/Items/{itemId}/Images/{imageType}",
             get(get_item_image)
                 .head(get_item_image)
-                .post(set_item_image)
+                .post(set_item_image.layer(upload_body_limit()))
                 .delete(delete_item_image),
         )
         .route(
             "/Items/{itemId}/Images/{imageType}/{imageIndex}",
             get(get_item_image_by_index)
                 .head(get_item_image_by_index)
-                .post(set_item_image_by_index)
+                .post(set_item_image_by_index.layer(upload_body_limit()))
                 .delete(delete_item_image_by_index),
         )
         .route(
@@ -1622,21 +1623,21 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
             "/UserImage",
             get(get_user_image)
                 .head(get_user_image)
-                .post(post_user_image)
+                .post(post_user_image.layer(upload_body_limit()))
                 .delete(delete_user_image),
         )
         .route(
             "/Users/{userId}/Images/{imageType}",
             get(get_user_image_legacy)
                 .head(get_user_image_legacy)
-                .post(post_user_image_legacy)
+                .post(post_user_image_legacy.layer(upload_body_limit()))
                 .delete(delete_user_image_legacy),
         )
         .route(
             "/Users/{userId}/Images/{imageType}/{imageIndex}",
             get(get_user_image_by_index_legacy)
                 .head(get_user_image_by_index_legacy)
-                .post(post_user_image_by_index_legacy)
+                .post(post_user_image_by_index_legacy.layer(upload_body_limit()))
                 .delete(delete_user_image_by_index_legacy),
         )
 }

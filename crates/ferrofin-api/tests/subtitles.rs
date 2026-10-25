@@ -355,6 +355,8 @@ type Logins = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 struct CannedSubtitles {
     deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
     logins: Logins,
+    /// The decoded size of each upload that reached the manager.
+    uploads: Arc<Mutex<Vec<usize>>>,
 }
 
 #[async_trait]
@@ -375,8 +377,9 @@ impl SubtitleManager for CannedSubtitles {
     async fn upload_subtitle(
         &self,
         _item_id: Uuid,
-        _response: &SubtitleResponse,
+        response: &SubtitleResponse,
     ) -> Result<(), ServiceError> {
+        self.uploads.lock().unwrap().push(response.content.len());
         Err(ServiceError::invalid_input("no providers"))
     }
     async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
@@ -1082,6 +1085,51 @@ async fn video_only_subtitle_routes_refuse_a_non_video_item() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
     }
+}
+
+/// gl-24: `UploadSubtitle` binds its `[FromBody]` DTO under Kestrel's
+/// 30,000,000-byte default, so a subtitle with embedded fonts past axum's
+/// implicit 2 MiB reaches the manager whole, and a body past the limit is a
+/// `413`, not a `400` claiming the body is required.
+#[tokio::test]
+async fn subtitle_upload_takes_bodies_up_to_kestrels_default_limit() {
+    let subtitles = Arc::new(CannedSubtitles::default());
+    let uploads = subtitles.uploads.clone();
+    let app = remote_search_state(subtitles);
+    let upload = |data: String| {
+        let app = app.clone();
+        async move {
+            let body = format!(
+                r#"{{"Language":"eng","Format":"ass","IsForced":false,"IsHearingImpaired":false,"Data":"{data}"}}"#
+            );
+            let response = create_router(app)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/Videos/{ITEM_ID}/Subtitles"))
+                        .header("X-Emby-Token", "tok")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+
+    let (status, body) = upload("A".repeat(4_000_000)).await;
+    // The canned manager refuses every upload: reaching it is the point.
+    assert_eq!(*uploads.lock().unwrap(), [3_000_000], "{status} {body}");
+
+    let (status, body) = upload("A".repeat(30_000_000)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!body.contains("The body field is required."), "{body}");
+    assert_eq!(uploads.lock().unwrap().len(), 1);
 }
 
 // ---- Graphical subtitles served raw ----------------------------------------

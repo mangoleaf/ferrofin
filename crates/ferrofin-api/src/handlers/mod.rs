@@ -1073,7 +1073,7 @@ pub const VERIFIED: &[Verified] = &[
                (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
                to_extension, decode_base64) → ferrofin-core user_manager.rs \
                save_profile_image",
-        date: "2026-10-20",
+        date: "2026-10-24",
         divergences: &[
             "The body is decoded in full before anything is written, so a body the decoder \
          rejects is a 400 that changes nothing. Upstream clears the old profile image row \
@@ -1088,8 +1088,10 @@ pub const VERIFIED: &[Verified] = &[
          checked, so a body that is not UTF-8 is the extractor's 400 whatever the user or \
          type; upstream resolves the user and checks the type first, and fails such a body \
          with a 500 while decoding. Jellyfin bug not ported.",
-            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
-         Fix path: gl-24.",
+            "A body past Kestrel's 30,000,000-byte default (MAX_UPLOAD_BODY_BYTES, the same \
+         cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
+         Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
+         Jellyfin bug not ported.",
         ],
         refs: &[],
     },
@@ -1129,13 +1131,15 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/lyrics.rs upload_lyrics (upload_format, queue_high_priority_refresh) \
                → ferrofin-core lyric_manager.rs save_lyric (decode_stream_text, save_targets, \
                try_save_to_files)",
-        date: "2026-10-19",
+        date: "2026-10-24",
         divergences: &[
             "An upload with no Content-Length (a chunked body) is read and saved; upstream \
          tests Request.ContentLength and answers every chunked upload 400 \"No lyrics \
          uploaded\". Jellyfin bug not ported.",
-            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
-         Fix path: gl-24.",
+            "A body past Kestrel's 30,000,000-byte default (MAX_UPLOAD_BODY_BYTES, the same \
+         cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
+         Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
+         Jellyfin bug not ported.",
         ],
         refs: &[],
     },
@@ -1206,7 +1210,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/branding.rs upload_splashscreen → handlers/image_upload.rs \
                (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
                to_extension, decode_base64)",
-        date: "2026-10-20",
+        date: "2026-10-24",
         divergences: &[
             "The body is decoded in full before anything is written, and the location is \
          recorded only after the file is: a body the decoder rejects is a 400 that changes \
@@ -1222,8 +1226,10 @@ pub const VERIFIED: &[Verified] = &[
          that is not UTF-8 is the extractor's 400 whatever its type; upstream checks the \
          type first and fails such a body with a 500 while decoding. Jellyfin bug not \
          ported.",
-            "The body is capped by axum's implicit 2 MiB limit, where Kestrel accepts 30 MB. \
-         Fix path: gl-24.",
+            "A body past Kestrel's 30,000,000-byte default (MAX_UPLOAD_BODY_BYTES, the same \
+         cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
+         Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
+         Jellyfin bug not ported.",
         ],
         refs: &[],
     },

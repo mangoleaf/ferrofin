@@ -22,6 +22,7 @@
 use std::path::Path;
 
 use axum::extract::{Request, State};
+use axum::handler::Handler;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -31,7 +32,7 @@ use ferrofin_traits::options::ItemImageInfo;
 
 use crate::auth::{AuthenticatedIdentity, RequireAdmin, is_administrator_identity};
 use crate::error::ApiError;
-use crate::extract::Query;
+use crate::extract::{Query, upload_body_limit};
 use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
 use crate::handlers::images::{ImageQuery, serve_image_file};
 use crate::state::AppState;
@@ -273,7 +274,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/Branding/Splashscreen",
             get(get_splashscreen)
-                .post(upload_splashscreen)
+                .post(upload_splashscreen.layer(upload_body_limit()))
                 .delete(delete_splashscreen),
         )
 }
