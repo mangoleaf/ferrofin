@@ -99,7 +99,35 @@ impl Extension for FileTransformationExtension {
 struct Registration {
     id: Uuid,
     pattern: String,
+    /// `pattern` compiled once at registration (`None`: not a regex, so it
+    /// matches only exactly), instead of on every served `/web` file.
+    regex: Option<regex::Regex>,
     kind: TransformKind,
+}
+
+impl Registration {
+    fn new(id: Uuid, pattern: String, kind: TransformKind) -> Self {
+        let regex = regex::Regex::new(&pattern).ok();
+        Self {
+            id,
+            pattern,
+            regex,
+            kind,
+        }
+    }
+
+    /// Whether this registration applies to `path` ([`pattern_matches`]).
+    fn matches(&self, path: &str) -> bool {
+        pattern_matches(&self.pattern, self.regex.as_ref(), path)
+    }
+}
+
+/// Whether `pattern` matches `path`: exact (case-sensitive, like the
+/// upstream dictionary key) or as `regex`, the pattern compiled (`None`
+/// when it is not a regex). Port of the exact-`ContainsKey`-then-regex match
+/// in `NeedsTransformation`.
+fn pattern_matches(pattern: &str, regex: Option<&regex::Regex>, path: &str) -> bool {
+    pattern == path || regex.is_some_and(|r| r.is_match(path))
 }
 
 /// Hard cap on the number of live registrations — a runaway bound, not a
@@ -269,14 +297,10 @@ impl WebFileTransformationService {
             .unwrap_or_default()
     }
 
-    /// Whether `pattern` matches `path`: exact (case-sensitive, like the
-    /// upstream dictionary key) or as a regex. Port of the
-    /// exact-`ContainsKey`-then-regex match in `NeedsTransformation`.
-    fn pattern_matches(pattern: &str, path: &str) -> bool {
-        if pattern == path {
-            return true;
-        }
-        regex::Regex::new(pattern).is_ok_and(|r| r.is_match(path))
+    /// [`pattern_matches`] for an admin-defined pattern, compiled per call
+    /// (the configuration is read live on every request).
+    fn configured_matches(pattern: &str, path: &str) -> bool {
+        pattern_matches(pattern, regex::Regex::new(pattern).ok().as_ref(), path)
     }
 
     /// Strips the leading `/` (upstream `NormalizePath`).
@@ -356,14 +380,14 @@ impl FileTransformationService for WebFileTransformationService {
             .read()
             .expect("registrations lock poisoned")
             .iter()
-            .any(|r| Self::pattern_matches(&r.pattern, path))
+            .any(|r| r.matches(path))
         {
             return true;
         }
         self.configured_transformations()
             .await
             .iter()
-            .any(|t| Self::pattern_matches(&t.filename_pattern, path))
+            .any(|t| Self::configured_matches(&t.filename_pattern, path))
     }
 
     async fn run_transformation(&self, path: &str, contents: String) -> String {
@@ -381,7 +405,7 @@ impl FileTransformationService for WebFileTransformationService {
                 .read()
                 .expect("registrations lock poisoned");
             regs.iter()
-                .filter(|r| Self::pattern_matches(&r.pattern, &path))
+                .filter(|r| r.matches(&path))
                 .map(|r| {
                     let step = match &r.kind {
                         TransformKind::Builtin(t) => TransformStep::Builtin(Arc::clone(t)),
@@ -410,7 +434,7 @@ impl FileTransformationService for WebFileTransformationService {
         // Admin-defined search/replace (skipped when either side is blank,
         // matching `HandlePluginConfigTransformation`).
         for t in self.configured_transformations().await {
-            if Self::pattern_matches(&t.filename_pattern, &path)
+            if Self::configured_matches(&t.filename_pattern, &path)
                 && !t.search_text.trim().is_empty()
                 && !t.replace_text.trim().is_empty()
             {
@@ -440,11 +464,11 @@ impl FileTransformationService for WebFileTransformationService {
             return;
         }
         tracing::info!(%id, pattern, "registered file transformation");
-        regs.push(Registration {
+        regs.push(Registration::new(
             id,
             pattern,
-            kind: TransformKind::Builtin(transformer),
-        });
+            TransformKind::Builtin(transformer),
+        ));
     }
 
     async fn add_endpoint_transformation(&self, id: Uuid, file_name_pattern: &str, endpoint: &str) {
@@ -460,11 +484,11 @@ impl FileTransformationService for WebFileTransformationService {
             return;
         }
         tracing::info!(%id, pattern, endpoint, "registered endpoint file transformation");
-        regs.push(Registration {
+        regs.push(Registration::new(
             id,
             pattern,
-            kind: TransformKind::Endpoint(endpoint.to_owned()),
-        });
+            TransformKind::Endpoint(endpoint.to_owned()),
+        ));
     }
 
     async fn remove_transformation(&self, id: Uuid) {
@@ -746,6 +770,12 @@ mod tests {
         assert!(svc.needs_transformation("/main.jellyfin.bundle.js").await);
         assert!(svc.needs_transformation("123.chunk.js").await);
         assert!(!svc.needs_transformation("index.html").await);
+        // A pattern that is not a regex still matches its exact path, and
+        // only that.
+        svc.add_transformation(Uuid::from_u128(3), "a+(b.js", Arc::new(Upper))
+            .await;
+        assert!(svc.needs_transformation("a+(b.js").await);
+        assert!(!svc.needs_transformation("aa+(b.js").await);
         assert_eq!(
             svc.run_transformation("main.jellyfin.bundle.js", "abc".to_owned())
                 .await,

@@ -669,6 +669,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - The Merge Versions plugin's bulk merges and splits run one at a time, whether a route or a
   daily task starts them: a merge and a split started together interleaved their version-link
   writes
+- WASM plugins: a web transform whose `path-pattern` is not a valid regex, such as the glob
+  `*.chunk.js` the plugin interface gave as an example, is refused at load with a warning; it
+  matched nothing, silently. The interface now says what a pattern is: an exact path under the
+  web root, else a regex matched anywhere in the path
 
 ## [1.0.0] - 2026-09-05
 

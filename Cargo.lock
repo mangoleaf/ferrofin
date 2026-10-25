@@ -1902,6 +1902,7 @@ dependencies = [
  "ferrofin-model",
  "ferrofin-providers",
  "ferrofin-traits",
+ "regex",
  "reqwest",
  "rstest",
  "serde_json",

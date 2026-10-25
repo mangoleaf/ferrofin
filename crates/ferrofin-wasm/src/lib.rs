@@ -1593,6 +1593,18 @@ impl WasmPluginHost {
                     );
                     continue;
                 }
+                // The pipeline matches an exact path, else a regex. A pattern
+                // that is not a valid regex (a glob such as `*.chunk.js`)
+                // would match nothing, silently.
+                if let Err(e) = regex::Regex::new(&transform.path_pattern) {
+                    warn!(
+                        plugin = %plugin.descriptor.id,
+                        pattern = transform.path_pattern,
+                        error = %e,
+                        "wasm plugin web transform pattern is not a valid regex; skipping it"
+                    );
+                    continue;
+                }
                 info!(
                     plugin = %plugin.descriptor.id,
                     pattern = transform.path_pattern,
