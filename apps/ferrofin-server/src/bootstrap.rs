@@ -22,7 +22,8 @@ use ferrofin_mediaencoding::{
 };
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::WithExportConfig as _;
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+use opentelemetry_otlp::{ExporterBuildError, WithExportConfig as _, WithTonicConfig as _};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -175,15 +176,14 @@ pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
         std::env::var("FERROFIN_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("text"));
     let mut layers = build_fmt_layers(text_mode, file_writer);
 
-    // Compose the OTLP layer in only when export is configured; `None` is a no-op
-    // (`Option<Layer>` implements `Layer`), so tracing stays local-only otherwise.
-    if let Some(otel_layer) = build_tracer_provider().map(|provider| {
+    // Compose the OTLP layer in only when export is configured and its exporter
+    // built, so tracing stays local-only otherwise.
+    let otlp = build_tracer_provider();
+    if let Some(Ok(provider)) = otlp.as_ref().map(|export| &export.provider) {
         let tracer = provider.tracer("ferrofin");
         // Stash the provider so `shutdown_tracing` can flush the batch queue.
-        let _ = TRACER_PROVIDER.set(provider);
-        tracing_opentelemetry::layer().with_tracer(tracer)
-    }) {
-        layers.push(otel_layer.boxed());
+        let _ = TRACER_PROVIDER.set(provider.clone());
+        layers.push(tracing_opentelemetry::layer().with_tracer(tracer).boxed());
     }
 
     // `try_init` returns Err if a subscriber is already set (e.g. in tests); that
@@ -193,6 +193,9 @@ pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
         .with(layers)
         .with(filter)
         .try_init();
+    if let Some(export) = &otlp {
+        export.log();
+    }
 
     guard
 }
@@ -302,29 +305,97 @@ fn install_panic_hook() {
     });
 }
 
+/// The OTLP trace export the environment asks for, built but not yet logged.
+struct OtlpExport {
+    endpoint: String,
+    ratio: f64,
+    /// The tracer provider, or why the exporter could not be built.
+    provider: Result<SdkTracerProvider, ExporterBuildError>,
+}
+
+impl OtlpExport {
+    /// Logs whether spans are exported. `init_tracing` calls it once the
+    /// subscriber is installed: a line logged while it is still being built
+    /// reaches no sink, which left a failed exporter without a word.
+    fn log(&self) {
+        let endpoint = endpoint_for_log(&self.endpoint);
+        match &self.provider {
+            Ok(_) => tracing::info!(
+                %endpoint,
+                ratio = self.ratio,
+                "OTLP trace export enabled"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e.to_string().replace(&self.endpoint, &endpoint),
+                %endpoint,
+                "OTLP exporter init failed; traces disabled"
+            ),
+        }
+    }
+}
+
+/// `endpoint` without the `user:password@` an operator may have put in it: the
+/// exporter ignores it, and a log line must not carry it.
+fn endpoint_for_log(endpoint: &str) -> String {
+    let (scheme, rest) = match endpoint.split_once("://") {
+        Some((scheme, rest)) if !scheme.contains(['/', '?', '#']) => (Some(scheme), rest),
+        _ => (None, endpoint),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let rest = match rest[..authority_end].rfind('@') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
+    match scheme {
+        Some(scheme) => format!("{scheme}://{rest}"),
+        None => rest.to_owned(),
+    }
+}
+
 /// Builds the OTLP tracer provider when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 ///
-/// Returns `None` (tracing stays local-only) when the endpoint env var is unset
-/// or empty, or on any exporter-init error — the server must start regardless,
-/// the same posture as metrics init. Traces are the ONLY signal carried on OTLP;
-/// metrics stay on the Prometheus scrape and logs on stdout/file.
-fn build_tracer_provider() -> Option<SdkTracerProvider> {
+/// Returns `None` when the endpoint env var is unset or empty. An exporter-init
+/// error is carried in the result, not raised: the server must start regardless
+/// (tracing then stays local-only), the same posture as metrics init. Traces are
+/// the ONLY signal carried on OTLP; metrics stay on the Prometheus scrape and logs
+/// on stdout/file.
+fn build_tracer_provider() -> Option<OtlpExport> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .ok()
         .filter(|s| !s.trim().is_empty())?;
     let ratio = sample_ratio(std::env::var("OTEL_TRACES_SAMPLER_ARG").ok().as_deref());
+    let insecure = std::env::var("OTEL_EXPORTER_OTLP_TRACES_INSECURE")
+        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_INSECURE"))
+        .ok();
+    Some(otlp_export(endpoint, ratio, insecure.as_deref()))
+}
 
-    let exporter = match opentelemetry_otlp::SpanExporter::builder()
+/// [`build_tracer_provider`] once the environment is read: exports to
+/// `endpoint`, sampling `ratio` of new roots.
+fn otlp_export(endpoint: String, ratio: f64, insecure: Option<&str>) -> OtlpExport {
+    let provider = tracer_provider_for(&endpoint, ratio, insecure);
+    OtlpExport {
+        endpoint,
+        ratio,
+        provider,
+    }
+}
+
+/// The provider behind [`otlp_export`]: spans batch-exported over gRPC to
+/// `endpoint`.
+fn tracer_provider_for(
+    endpoint: &str,
+    ratio: f64,
+    insecure: Option<&str>,
+) -> Result<SdkTracerProvider, ExporterBuildError> {
+    let mut builder = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
-        .with_endpoint(endpoint.clone())
-        .build()
-    {
-        Ok(exporter) => exporter,
-        Err(e) => {
-            tracing::warn!(error = %e, %endpoint, "OTLP exporter init failed; traces disabled");
-            return None;
-        }
-    };
+        .with_endpoint(endpoint);
+    if let Some(tls) = otlp_tls_config(endpoint, insecure) {
+        builder = builder.with_tls_config(tls);
+    }
+
+    let exporter = builder.build()?;
 
     let resource = Resource::builder()
         .with_service_name("ferrofin")
@@ -341,8 +412,30 @@ fn build_tracer_provider() -> Option<SdkTracerProvider> {
         ))))
         .with_resource(resource)
         .build();
-    tracing::info!(%endpoint, ratio, "OTLP trace export enabled");
-    Some(provider)
+    Ok(provider)
+}
+
+/// The TLS config the OTLP exporter gets for `endpoint`: the system's roots when
+/// it speaks TLS, else none (tonic loads the roots even for a plain endpoint).
+/// The exporter's own config for an https endpoint trusts no root at all, so
+/// every handshake would fail. The system store is the one reqwest verifies
+/// against, and it carries a self-hosted collector's private CA.
+fn otlp_tls_config(endpoint: &str, insecure: Option<&str>) -> Option<ClientTlsConfig> {
+    otlp_uses_tls(endpoint, insecure).then(|| ClientTlsConfig::new().with_native_roots())
+}
+
+/// Whether the OTLP exporter speaks TLS to `endpoint`, by opentelemetry-otlp's
+/// own rule: an explicit scheme decides (in any case, as `http::Uri` reads it),
+/// and a bare `host:port` is https unless `insecure`
+/// (`OTEL_EXPORTER_OTLP_TRACES_INSECURE`, else `OTEL_EXPORTER_OTLP_INSECURE`) is
+/// `true`.
+fn otlp_uses_tls(endpoint: &str, insecure: Option<&str>) -> bool {
+    match endpoint.split_once("://") {
+        Some((scheme, _)) if !scheme.contains(['/', '?', '#']) => {
+            scheme.eq_ignore_ascii_case("https")
+        }
+        _ => !insecure.is_some_and(|v| v.eq_ignore_ascii_case("true")),
+    }
 }
 
 /// Parses `OTEL_TRACES_SAMPLER_ARG` into a sampling ratio in `0.0..=1.0`.
@@ -1411,6 +1504,122 @@ mod tests {
     #[test]
     fn which_on_path_absolute_missing_is_none() {
         assert_eq!(which_on_path("/definitely/not/here/nope"), None);
+    }
+
+    /// An https collector gets an exporter. Without a TLS feature the exporter
+    /// refused the endpoint, and the server ran with no traces.
+    #[tokio::test]
+    async fn https_otlp_endpoint_builds_an_exporter() {
+        let export = otlp_export("https://127.0.0.1:4317".to_owned(), 1.0, None);
+        assert!(
+            export.provider.is_ok(),
+            "an https endpoint must not disable traces: {:?}",
+            export.provider.err()
+        );
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        export.log();
+        let infos = logs.lines_at("INFO");
+        assert_eq!(infos.len(), 1, "{}", logs.text());
+        assert!(
+            infos[0].contains("OTLP trace export enabled") && infos[0].contains("127.0.0.1:4317")
+        );
+    }
+
+    /// The exporter trusts no root on its own, so a TLS endpoint gets the
+    /// system's; a plain one gets no TLS config at all.
+    #[test]
+    fn a_tls_otlp_endpoint_gets_the_system_roots() {
+        for endpoint in [
+            "https://collector:4317",
+            "HTTPS://collector:4317",
+            "collector:4317",
+        ] {
+            let tls = otlp_tls_config(endpoint, None);
+            let tls = tls.unwrap_or_else(|| panic!("{endpoint}: no TLS config"));
+            assert!(
+                format!("{tls:?}").contains("with_native_roots: true"),
+                "{endpoint}: {tls:?}"
+            );
+        }
+        assert!(otlp_tls_config("http://collector:4317", None).is_none());
+        assert!(otlp_tls_config("collector:4317", Some("true")).is_none());
+    }
+
+    /// A failed exporter is reported, with the endpoint and the reason.
+    #[tokio::test]
+    async fn a_failed_otlp_exporter_is_logged() {
+        let export = otlp_export("http://[::1".to_owned(), 1.0, None);
+        assert!(export.provider.is_err());
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        export.log();
+        let warns = logs.lines_at("WARN");
+        assert_eq!(warns.len(), 1, "{}", logs.text());
+        assert!(warns[0].contains("OTLP exporter init failed") && warns[0].contains("[::1"));
+    }
+
+    #[tokio::test]
+    async fn otlp_endpoint_is_logged_without_credentials() {
+        for (endpoint, logged) in [
+            ("https://collector:4317", "https://collector:4317"),
+            (
+                "https://id:token@collector:4317/v1",
+                "https://collector:4317/v1",
+            ),
+            ("id:token@collector:4317", "collector:4317"),
+            ("http://collector:4317/a@b", "http://collector:4317/a@b"),
+            ("https://[::1]:4317", "https://[::1]:4317"),
+            ("https://id:token@[::1]:4317", "https://[::1]:4317"),
+            ("https://@collector:4317", "https://collector:4317"),
+            ("id:token@collector:4317/p://q", "collector:4317/p://q"),
+        ] {
+            assert_eq!(endpoint_for_log(endpoint), logged, "{endpoint}");
+        }
+        // Both log paths: an export that builds, and one whose error text
+        // echoes the endpoint (a bare host:port with the scheme prepended).
+        for (endpoint, level, shown) in [
+            (
+                "https://id:token@127.0.0.1:4317",
+                "INFO",
+                "https://127.0.0.1:4317",
+            ),
+            ("http://id:token@[::1", "WARN", "http://[::1"),
+            ("id:token@[::1", "WARN", "https://[::1"),
+        ] {
+            let export = otlp_export(endpoint.to_owned(), 1.0, None);
+            let logs = CapturedLogs::default();
+            let _guard = logs.install();
+            export.log();
+            let lines = logs.lines_at(level);
+            assert_eq!(lines.len(), 1, "{endpoint}: {}", logs.text());
+            assert!(lines[0].contains(shown), "{endpoint}: {}", lines[0]);
+            assert!(
+                !logs.text().contains("token"),
+                "{endpoint}: {}",
+                logs.text()
+            );
+        }
+    }
+
+    #[test]
+    fn otlp_uses_tls_follows_the_exporters_scheme_rule() {
+        for (endpoint, insecure, tls) in [
+            ("https://collector:4317", None, true),
+            ("https://collector:4317", Some("true"), true),
+            ("HTTPS://collector:4317", None, true),
+            ("http://collector:4317", None, false),
+            ("collector:4317", None, true),
+            ("collector:4317", Some("false"), true),
+            ("collector:4317", Some("TRUE"), false),
+            ("collector:4317/v1?a=b://c", Some("true"), false),
+        ] {
+            assert_eq!(
+                otlp_uses_tls(endpoint, insecure),
+                tls,
+                "{endpoint} insecure={insecure:?}"
+            );
+        }
     }
 
     #[test]

@@ -69,6 +69,16 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   See the [support matrix and tested build](gates/adoption/README.md#supported-and-tested-versions).
   The harness now reports SQLite query failures and detects version promotions when the
   repaired count is zero, with five regression tests; all 40 shell tests passed.
+- Every dependency is declared once, in the root `[workspace.dependencies]`, and used: the
+  unused `axum-extra`, `argon2`, `insta` and seven dead crate edges are gone, and the backup
+  handler's inline zip 2 and ferrofin-util's rand 0.8 move to the workspace's zip and rand 0.10
+- One TLS crypto backend, aws-lc: sqlx no longer builds rustls with ring (SQLite has no network
+  transport), nor its unused `any` and `json` features, and webpki-roots is gone
+- Builds use the committed Cargo.lock: every cargo build, test, clippy and llvm-cov run in CI
+  (GitHub and GitLab), the release, the Docker image, the `deb:amd64` task and the WASM-guest
+  test pass `--locked`, so a manifest change without its lockfile fails instead of resolving
+  anew. The release's cargo-zigbuild and ziglang are pinned (0.23.4 and 0.16.0, the pair the
+  v1.3.2 aarch64 build used), and GitLab's `:latest` images to the versions they are today
 
 ### Parity
 - Find the playlists folder by its type when a playlist is created, as Jellyfin's
@@ -582,6 +592,16 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   endpoint's answer is read no further than that, and a step that would grow the file past it
   (an admin search/replace whose replace text multiplies the file, or another plugin's
   transform) is skipped with one warning, leaving the file as it was before that step
+- Dependencies with published RustSec advisories are upgraded: wasmtime and wasmtime-wasi
+  49.0.0 → 49.0.4 (25 advisories against the WASM plugin host, among them a WASI symlink-rename
+  sandbox escape, an aarch64 Cranelift miscompile and fuel-limit bypasses), zip 8 → 9 (three
+  extraction advisories), h2, tokio, ctutils, event-listener, webpki-root-certs (distrusted CA
+  roots), and quinn-proto, which Cargo.lock records although nothing builds it
+- A supply-chain gate: CI's `dependencies` job runs `cargo deny` (RustSec advisories, licenses
+  compatible with GPL-3.0-only, unused workspace entries, crates.io sources only),
+  `cargo machete` and `scripts/check-workspace-deps.py` (no inline dependency versions) on every
+  push and PR, and a release re-checks the advisories before it is tagged
+  ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
 - A backup no longer reports success with something left out:
@@ -826,6 +846,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - File Transformation: a callback endpoint that fails (an error status, a timeout, a refused
   connection) logs one warning, then logs at debug level until it works again. It logged two
   warnings on every matching `/web` request for as long as it stayed down
+- The config file is read as TOML only: a `--config`/`FERROFIN_CONFIG_FILE` path named
+  `.json`, `.json5`, `.yaml`, `.yml`, `.ini` or `.ron` is refused instead of parsed in that format
+  (see [docs/UPGRADING.md](docs/UPGRADING.md)), and the server no longer builds those
+  parsers
+- OTLP trace export works with an `https://` collector: the exporter now has TLS (aws-lc) and
+  checks the collector against the system trust store. It refused an https endpoint before, and
+  that went unlogged, like every other exporter outcome: the server logged them before its
+  log output was set up. The startup log now says whether traces are exported, or why not
 
 ## [1.0.0] - 2026-09-05
 

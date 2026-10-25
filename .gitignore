@@ -6,8 +6,6 @@
 *.db
 *.db-shm
 *.db-wal
-# insta review leftovers
-*.snap.new
 # agent worktrees (can grow to tens of GB of checkouts + target dirs)
 **/.claude/worktrees/
 # per-machine Claude settings

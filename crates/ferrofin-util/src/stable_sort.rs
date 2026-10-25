@@ -61,7 +61,7 @@ fn merge_sort<T>(mut items: Vec<T>, compare: &mut impl FnMut(&T, &T) -> Ordering
 mod tests {
     use super::*;
     use rand::rngs::StdRng;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt as _, SeedableRng};
     use rstest::rstest;
 
     #[rstest]
@@ -85,7 +85,7 @@ mod tests {
     fn a_total_order_gives_what_the_standard_stable_sort_gives() {
         let mut rng = StdRng::seed_from_u64(905);
         for len in 0..200 {
-            let items: Vec<(u8, usize)> = (0..len).map(|i| (rng.gen_range(0..8), i)).collect();
+            let items: Vec<(u8, usize)> = (0..len).map(|i| (rng.random_range(0..8), i)).collect();
             let mut ours = items.clone();
             let mut std_sorted = items;
             stable_sort_by(&mut ours, |a, b| a.0.cmp(&b.0));
@@ -99,8 +99,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(905);
         for len in 0..200 {
             let mut items: Vec<usize> = (0..len).collect();
-            let mut verdicts = StdRng::seed_from_u64(rng.r#gen());
-            stable_sort_by(&mut items, |_, _| match verdicts.gen_range(0..3) {
+            let mut verdicts = StdRng::seed_from_u64(rng.random());
+            stable_sort_by(&mut items, |_, _| match verdicts.random_range(0..3) {
                 0 => Ordering::Less,
                 1 => Ordering::Equal,
                 _ => Ordering::Greater,

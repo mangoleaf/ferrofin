@@ -1143,7 +1143,7 @@ mod tests {
             let file = std::fs::File::open(&archive).unwrap();
             let mut zip = zip::ZipArchive::new(file).unwrap();
             (0..zip.len())
-                .map(|i| zip.by_index(i).unwrap().name().to_owned())
+                .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
                 .collect()
         };
         assert!(
@@ -2330,7 +2330,7 @@ mod tests {
         let names: Vec<String> = zip::ZipArchive::new(file)
             .unwrap()
             .file_names()
-            .map(str::to_owned)
+            .map(|name| name.unwrap().into_owned())
             .collect();
         assert!(
             names.contains(&"metadata/library/old.jpg".to_owned()),
