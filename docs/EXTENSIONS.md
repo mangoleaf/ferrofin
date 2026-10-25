@@ -109,7 +109,12 @@ source of truth). Install matches Jellyfin's repository flow: an admin adds a pl
 repository URL (Dashboard → Plugins → Repositories), picks the plugin from the catalog,
 and the server downloads, verifies, and stages it into `{data_dir}/plugins/`; a restart
 activates it (`SystemInfo.HasPendingRestart` flips true). Dropping the `.wasm` file into
-`{data_dir}/plugins/` by hand and restarting works identically (the dev/air-gapped path).
+`{data_dir}/plugins/` by hand and restarting works identically (the dev/air-gapped path),
+except that the load, not the repository, refuses a file whose id belongs to a compiled-in
+plugin (OpenSubtitles, the in-tree providers, the built-in extensions). Install and load
+share one check of what a component says about itself (its id, name, default configuration
+and provider name), so an artifact is never installed only to be skipped at boot for one of
+those.
 The repository install pipeline is deliberately strict, in order: the manifest's
 `targetAbi` must equal this server's plugin ABI; the download must be **HTTPS**
 (cleartext-to-loopback allowed only when the *configured repository* is itself loopback —
@@ -215,14 +220,25 @@ plugins like Home Screen Sections possible):
   via plain `<script src>` tags, exactly like upstream `[AllowAnonymous]` plugin
   controllers); the caller's resolved identity (`user-id`, `is-admin`,
   `is-authenticated`) is forwarded — never a token — and the plugin gates its own
-  sensitive paths. Inbound bodies are capped at 1 MiB; a disabled plugin's URL space 404s.
+  sensitive paths. The identity has passed Jellyfin's default authorization policy: a
+  disabled account, a remote caller without remote access, or a user outside their access
+  schedule arrives as anonymous. Inbound bodies are capped at 1 MiB; a disabled plugin's
+  URL space 404s. Responses are served on the server's own origin, so the server owns the
+  headers that decide what a browser lets them do: every response carries
+  `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox allow-scripts
+  allow-forms allow-popups`, and the plugin's own `Set-Cookie`, `Clear-Site-Data`, CSP and
+  `X-Content-Type-Options` headers are dropped. An HTML page a plugin serves there runs in
+  an opaque origin and cannot read the server origin's stored tokens; assets and API
+  answers fetched by a settings page are unaffected.
   Requests never wait for the plugin: together they may hold at most half of its queue
   (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`), queued or running, and past that, or when the
   queue is full, the server answers `503` at once. So a flood of anonymous requests cannot
   starve the scans, tasks and events that share the queue.
 - **`web-transforms`** — declared literal search/replace patches the server applies to
   matching `/web` files while the plugin is enabled (capped: 16 per plugin, 256 KiB per
-  text). This is how a plugin injects its client-side hooks into jellyfin-web.
+  text; a blank search is refused, and a transform that would grow a file by more than
+  256 KiB leaves it unchanged). This is how a plugin injects its client-side hooks into
+  jellyfin-web.
 
 Plugins can also act as **metadata and artwork providers**. A plugin's `metadata-lookup`
 export is a **remote metadata provider folded at its configured rank**, exactly like the

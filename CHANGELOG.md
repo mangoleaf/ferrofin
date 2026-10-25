@@ -406,6 +406,32 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
   had already run, and cleared it, so a user with a maximum parental rating saw those episodes
   in lists, counts, Latest, Resume and Next Up until the next full library scan
+- WASM plugins: what a plugin's `/Plugins/{id}/web/…` route answers is served on the server's
+  own origin, where jellyfin-web keeps every user's token, so the server now owns the headers
+  that decide what a browser lets it do. Every answer carries `X-Content-Type-Options: nosniff`
+  and a sandboxing `Content-Security-Policy` (an HTML page the plugin serves runs in an opaque
+  origin and cannot read stored tokens), and the plugin can no longer set cookies or clear the
+  site's storage. The caller's identity reaches the plugin only when Jellyfin's default
+  authorization policy admits them: a disabled administrator was passed on as an
+  administrator, and a remote caller without remote access or a user outside their access
+  schedule as signed in
+- WASM plugins: a `.wasm` dropped into the plugins folder by hand whose id belongs to a
+  compiled-in plugin (OpenSubtitles, TMDb and the other in-tree providers, Intro Skipper, File
+  Transformation, Merge Versions) is no longer loaded. It ran every task, provider and route
+  it declared under the compiled-in plugin's enabled switch and was handed that plugin's
+  settings (the OpenSubtitles user name and password among them), while `/Plugins` listed
+  only the compiled-in one
+- WASM plugins: one plugin file can no longer drop every other plugin for a boot. A name with
+  a NUL byte panicked the loader (the name became the plugin thread's name); names that are
+  blank, longer than 256 bytes or carry control characters are now refused, a panic while
+  loading one file skips only that file, and install checks a plugin the same way the load
+  does, so one that installs is not skipped at the next boot for an invalid default
+  configuration or name
+- WASM plugins: a web transform can no longer make the server run out of memory from anonymous
+  `/web` requests. A blank search text is refused (it matched between every character), and a
+  transform that would grow a file by more than 256 KiB leaves the file unchanged
+- WASM plugins with a semver prerelease or build version (`0.2.0-beta.1`, `1.0.0+git.abc`) can
+  be enabled, disabled and uninstalled from the dashboard; those buttons answered `400`
 
 ### Bug Fixes
 - "Optimize database" no longer runs while a database backup is copying, and a backup asked for

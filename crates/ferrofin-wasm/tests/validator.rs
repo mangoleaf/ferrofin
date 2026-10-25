@@ -94,3 +94,51 @@ async fn rejects_a_provider_name_colliding_with_a_builtin_at_install() {
         .await
         .expect("a non-colliding named provider validates");
 }
+
+#[tokio::test]
+async fn refuses_at_install_what_loading_would_skip() {
+    let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
+    let fixture = ferrofin_wasm::TEST_FIXTURE_WAT;
+    for (wat, reason) in [
+        (
+            fixture.replace(
+                r#"(data (i32.const 128) "{\"a\":1}")"#,
+                r#"(data (i32.const 128) "notjson")"#,
+            ),
+            "default-config is not valid JSON",
+        ),
+        (
+            fixture.replace(
+                r#"(data (i32.const 64)  "Hello")"#,
+                r#"(data (i32.const 64)  "He\00lo")"#,
+            ),
+            "contains control characters",
+        ),
+        (
+            fixture.replace(
+                r#"(data (i32.const 64)  "Hello")"#,
+                r#"(data (i32.const 64)  "     ")"#,
+            ),
+            "is empty",
+        ),
+        (
+            // 300 bytes in otherwise-unused memory, pointed at by the
+            // descriptor's name slot.
+            fixture
+                .replace(
+                    r#"(data (i32.const 64)  "Hello")"#,
+                    &format!(r#"(data (i32.const 2048) "{}")"#, "n".repeat(300)),
+                )
+                .replace(
+                    "(i32.store (i32.const 520) (i32.const 64))\n      (i32.store (i32.const 524) (i32.const 5))",
+                    "(i32.store (i32.const 520) (i32.const 2048))\n      (i32.store (i32.const 524) (i32.const 300))",
+                ),
+            "exceeds 256 bytes",
+        ),
+    ] {
+        assert_ne!(wat, fixture, "the fixture patch for `{reason}` must apply");
+        let component = wat::parse_str(&wat).unwrap();
+        let err = validator.validate(&component).await.unwrap_err();
+        assert!(err.to_string().contains(reason), "{reason}: {err}");
+    }
+}
