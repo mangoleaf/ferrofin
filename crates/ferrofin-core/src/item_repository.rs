@@ -2574,8 +2574,8 @@ fn append_by_name_filters(
 /// The C# `outerQueryFilter` (`ByName.cs:208-232` at v12.2) minus the name
 /// filters [`append_by_name_filters`] spells itself: the predicates that apply
 /// to the by-name row — favorite state in its own `UserData` row (C# joins
-/// `UserData` on the by-name item id), its tags, ratings, years, referenced
-/// items.
+/// `UserData` on the by-name item id), its images, tags, ratings, years,
+/// referenced items.
 ///
 /// A fresh query rather than the caller's, so that none of the inner-query
 /// fields (`IncludeItemTypes`, `MediaTypes`, `AncestorIds`, paging) reaches
@@ -2597,6 +2597,7 @@ fn by_name_outer_filter(filter: &InternalItemsQuery) -> InternalItemsQuery {
         is_favorite_or_liked: filter.is_favorite_or_liked,
         is_liked: filter.is_liked,
         is_locked: filter.is_locked,
+        image_types: filter.image_types.clone(),
         tags: filter.tags.clone(),
         official_ratings: filter.official_ratings.clone(),
         studio_ids: filter.studio_ids.clone(),
@@ -10399,6 +10400,55 @@ mod tests {
             .expect("listed");
         assert_eq!(news.counts.program_count, 1);
         assert_eq!(news.counts.item_count, 1);
+    }
+
+    /// v12.2 `ByName.cs` forwards `ImageTypes` to its `outerQueryFilter`, so
+    /// an image filter keeps the by-name rows that have such an image of
+    /// their own, whatever the content carrying the value has.
+    #[tokio::test]
+    async fn by_name_image_types_filter_the_by_name_row() {
+        use crate::test_support::{image_info, seed_images};
+        use ferrofin_model::entities::ImageType;
+        let db = test_db().await;
+        let repository = repo(&db);
+        let movie = Uuid::from_u128(0xA511);
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        seed_images(
+            &db,
+            movie,
+            &[image_info(ImageType::Primary, "/art/film.jpg", None)],
+        )
+        .await;
+        for g in ["Action", "Drama"] {
+            seed_item_genre(&db, movie, g).await;
+        }
+        let drama: String = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Name" = 'Drama' AND "Type" = 'MediaBrowser.Controller.Entities.Genre'"#,
+        )
+        .fetch_one(db.pool())
+        .await
+        .expect("genre row");
+        let drama = Uuid::parse_str(&drama).expect("guid");
+        seed_images(
+            &db,
+            drama,
+            &[image_info(ImageType::Primary, "/art/drama.jpg", None)],
+        )
+        .await;
+
+        let with_primary = InternalItemsQuery {
+            image_types: vec![ImageType::Primary],
+            ..Default::default()
+        };
+        let names: Vec<String> = repository
+            .get_genres(&with_primary)
+            .await
+            .expect("genres")
+            .items
+            .into_iter()
+            .filter_map(|genre| genre.item.name)
+            .collect();
+        assert_eq!(names, vec!["Drama"]);
     }
 
     /// C#'s `outerQueryFilter` (`ByName.cs:177-196`) applies to the by-name

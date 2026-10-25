@@ -1777,7 +1777,7 @@ impl UserDataManager for FerrofinUserDataManager {
             .iter()
             .filter(|(src, ..)| *src == 1)
             .flat_map(|(_, _, value)| value.split(','))
-            .filter_map(|id| Uuid::parse_str(id.trim()).ok())
+            .filter_map(ferrofin_util::guid_extensions::parse_dotnet_guid)
             .collect();
         Ok(Some(ContentPermissions {
             is_administrator: has(PermissionKind::IsAdministrator),
@@ -3493,7 +3493,13 @@ mod tests {
                VALUES (6, ?2, ?1, 0), (5, ?3, ?1, 0)"#,
         )
         .bind(ferrofin_db::store::guid_to_db(user))
-        .bind(format!("{},junk,{}", library_a.simple(), library_b))
+        // `GetPreferenceValues<Guid>` parses as `Guid.TryParse` does: the
+        // `(…)` form is a GUID, `urn:uuid:` is not.
+        .bind(format!(
+            " {} ,junk,({library_b}),urn:uuid:{}",
+            library_a.simple(),
+            Uuid::from_u128(0xD)
+        ))
         .bind(Uuid::from_u128(0xC).to_string())
         .execute(db.writer())
         .await
