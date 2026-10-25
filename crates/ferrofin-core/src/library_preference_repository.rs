@@ -12,8 +12,11 @@ use crate::item_type_lookup::stored_type_name;
 use crate::user_entity_ext::{get_preference, set_preference_tx};
 
 /// The stored `CollectionFolder` row whose path is `path`, compared ignoring
-/// case as C# `FindLibrary` does, as `(id, name)`. An exact match wins over a
-/// row that differs only in case.
+/// case as C# `FindLibrary` does (`OrdinalIgnoreCase`), as `(id, name)`. An
+/// exact match wins over a row that differs only in case.
+///
+/// The comparison runs here, not in SQL: SQLite's `NOCASE` folds ASCII only,
+/// and there is one row per library.
 ///
 /// # Errors
 /// Returns [`ServiceError::Db`] if the query fails.
@@ -21,17 +24,26 @@ pub(crate) async fn library_at(
     db: &Database,
     path: &str,
 ) -> Result<Option<(Uuid, Option<String>)>, ServiceError> {
-    let row: Option<(String, Option<String>)> = sqlx::query_as(
-        r#"SELECT "Id", "Name" FROM "BaseItems"
-           WHERE "Type" = ?1 AND "Path" = ?2 COLLATE NOCASE
-           ORDER BY "Path" = ?2 DESC LIMIT 1"#,
-    )
-    .bind(stored_type_name(BaseItemKind::CollectionFolder).unwrap_or_default())
-    .bind(path)
-    .fetch_optional(db.pool())
-    .await
-    .map_err(db_err)?;
-    Ok(row.and_then(|(id, name)| Some((Uuid::parse_str(&id).ok()?, name))))
+    let rows: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as(r#"SELECT "Id", "Name", "Path" FROM "BaseItems" WHERE "Type" = ?1"#)
+            .bind(stored_type_name(BaseItemKind::CollectionFolder).unwrap_or_default())
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+    let at = |exact: bool| {
+        rows.iter().find(|(_, _, stored)| {
+            stored.as_deref().is_some_and(|stored| {
+                if exact {
+                    stored == path
+                } else {
+                    ferrofin_util::string_extensions::equals_ordinal_ignore_case(stored, path)
+                }
+            })
+        })
+    };
+    Ok(at(true)
+        .or_else(|| at(false))
+        .and_then(|(id, name, _)| Some((Uuid::parse_str(id).ok()?, name.clone()))))
 }
 
 /// Offers every user's values for each of `kinds` to `rewrite`, and stores the
@@ -69,4 +81,33 @@ pub(crate) async fn rewrite_preferences(
     }
     tx.commit().await.map_err(db_err)?;
     Ok(rewritten)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{seed_named_item, set_item_path, test_db};
+
+    /// C# `FindLibrary` compares the stored path with `OrdinalIgnoreCase`,
+    /// which folds every letter, not only ASCII; an exact match still wins.
+    #[tokio::test]
+    async fn library_at_folds_case_beyond_ascii() {
+        let db = test_db().await;
+        let (folded, exact) = (Uuid::from_u128(0xE1A1), Uuid::from_u128(0xE1A2));
+        seed_named_item(&db, folded, BaseItemKind::CollectionFolder, "Élan").await;
+        set_item_path(&db, folded, "/root/default/Élan").await;
+        assert_eq!(
+            library_at(&db, "/root/default/élan").await.expect("query"),
+            Some((folded, Some("Élan".to_owned())))
+        );
+        seed_named_item(&db, exact, BaseItemKind::CollectionFolder, "élan").await;
+        set_item_path(&db, exact, "/root/default/élan").await;
+        assert_eq!(
+            library_at(&db, "/root/default/élan")
+                .await
+                .expect("query")
+                .map(|(id, _)| id),
+            Some(exact)
+        );
+    }
 }

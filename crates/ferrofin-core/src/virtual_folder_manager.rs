@@ -1271,9 +1271,10 @@ impl FerrofinVirtualFolderManager {
                 .await
                 .map_err(|e| Self::io_err(&format!("read shortcut {}", path.display()), &e))?;
             if found.is_some_and(|found| {
-                self.virtual_paths
-                    .expand(&found)
-                    .eq_ignore_ascii_case(target)
+                ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+                    &self.virtual_paths.expand(&found),
+                    target,
+                )
             }) {
                 tokio::fs::remove_file(&path)
                     .await
@@ -1648,9 +1649,11 @@ impl VirtualFolderManager for FerrofinVirtualFolderManager {
         })?;
         let current = self.require_folder(name).await?;
 
-        let same_case_insensitive = current
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&target.to_string_lossy());
+        // `OrdinalIgnoreCase`, which folds every letter, not only ASCII.
+        let same_case_insensitive = ferrofin_util::string_extensions::equals_ordinal_ignore_case(
+            &current.to_string_lossy(),
+            &target.to_string_lossy(),
+        );
 
         // Upstream skips the check for a case-only rename. On a case-sensitive
         // filesystem the target's spelling can be another library, which its
@@ -3766,6 +3769,48 @@ mod tests {
             folder.library_options.unwrap().path_infos,
             vec![MediaPathInfo { path: m2 }]
         );
+    }
+
+    /// C# `RemoveMediaPath` matches a shortcut's target with
+    /// `OrdinalIgnoreCase`, which folds every letter, not only ASCII.
+    #[tokio::test]
+    async fn remove_media_path_matches_a_shortcut_ignoring_non_ascii_case() {
+        let (tmp, mgr) = manager();
+        let media = media_dir(&tmp, "Élan");
+        mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&media)))
+            .await
+            .unwrap();
+        mgr.remove_media_path("Lib", &media.replace("Élan", "élan"))
+            .await
+            .unwrap();
+        assert!(
+            mgr.get_virtual_folders().await.unwrap()[0]
+                .locations
+                .is_empty()
+        );
+    }
+
+    /// A case-only rename that differs in a non-ASCII letter is case-only as
+    /// C#'s `OrdinalIgnoreCase` sees it, so a case-insensitive filesystem,
+    /// where the target spelling already exists, is not a conflict. (On a
+    /// case-sensitive one the rename succeeds either way, as with
+    /// `rename_case_only_succeeds`.)
+    #[tokio::test]
+    async fn a_non_ascii_case_only_rename_succeeds() {
+        let (tmp, mgr) = manager();
+        let media = media_dir(&tmp, "m");
+        mgr.add_virtual_folder("élan", None, &opts_with_paths(&[media]))
+            .await
+            .unwrap();
+        mgr.rename_virtual_folder("élan", "Élan").await.unwrap();
+        let names: Vec<_> = mgr
+            .get_virtual_folders()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|f| f.name)
+            .collect();
+        assert_eq!(names, vec!["Élan".to_owned()]);
     }
 
     #[tokio::test]
