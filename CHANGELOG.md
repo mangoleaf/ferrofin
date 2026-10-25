@@ -66,6 +66,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- `POST /LiveTv/TunerHosts` with the id of a configured tuner in another case keeps the id
+  as posted, as Jellyfin's `config.TunerHosts[index] = info` does, renaming the tuner and
+  its channels' link to it (channel ids and their user data do not change); an id padded
+  with spaces no longer matches a tuner, so it adds one
 - Open a local M3U playlist or XMLTV guide exactly as configured, as Jellyfin's
   `AsyncFile.OpenRead` does: a `file://` URL is no longer stripped to the path it names,
   so saving a `file://` M3U tuner is refused with `404`

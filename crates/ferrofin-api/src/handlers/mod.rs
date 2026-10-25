@@ -1321,6 +1321,24 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "post",
+        path: "/LiveTv/TunerHosts",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "AddTunerHost",
+        ferrofin: "handlers/live_tv.rs add_tuner_host → ferrofin-livetv manager.rs \
+               save_tuner_host (tuner_host::find_host, guide_repository::existing_config_id, \
+               TunerHost::validate, guide_repository::store_tuner_host), then \
+               queue_guide_refresh (TunerHostManager.SaveTunerHost, M3UTunerHost.Validate, \
+               HdHomerunHost.Validate)",
+        date: "2026-10-24",
+        divergences: &[
+            "An M3U tuner without a Url, or with a null one, is a 400; upstream's \
+         M3uParser.GetListingsStream dereferences the null Url and answers a \
+         NullReferenceException 500. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "delete",
         path: "/LiveTv/TunerHosts",
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",

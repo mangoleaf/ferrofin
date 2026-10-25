@@ -2614,22 +2614,28 @@ impl LiveTvManager for FerrofinLiveTvManager {
         };
 
         // Then the id: honoured only when it names a host that already exists
-        // (`Array.FindIndex(..., OrdinalIgnoreCase)`); `index == -1 ||
-        // IsNullOrWhiteSpace(info.Id)` mints a fresh
+        // (`Array.FindIndex(..., OrdinalIgnoreCase)`, on the id as posted);
+        // `index == -1 || IsNullOrWhiteSpace(info.Id)` mints a fresh
         // `Guid.NewGuid().ToString("N")` — 32 lowercase hex, no dashes.
         // `guid_to_db`'s uppercase-dashed DB form is a storage detail; these ids
-        // go out over the wire on `GET /System/Configuration/livetv`. The
-        // existing row's stored spelling wins on a case-differing match, because
-        // Ferrofin's channel rows reference it by that string.
-        let id = match info.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(wanted) => crate::guide_repository::existing_config_id(
-                &self.db,
-                crate::guide_repository::TUNER_HOSTS_TABLE,
-                wanted,
-            )
-            .await?
-            .unwrap_or_else(|| Uuid::new_v4().simple().to_string()),
-            None => Uuid::new_v4().simple().to_string(),
+        // go out over the wire on `GET /System/Configuration/livetv`. A match
+        // keeps the posted spelling (`config.TunerHosts[index] = info`): the
+        // stored row and its channels are renamed to it as the host is written.
+        let posted = info.id.clone().filter(|id| !id.trim().is_empty());
+        let stored = match posted.as_deref() {
+            Some(wanted) => {
+                crate::guide_repository::existing_config_id(
+                    &self.db,
+                    crate::guide_repository::TUNER_HOSTS_TABLE,
+                    wanted,
+                )
+                .await?
+            }
+            None => None,
+        };
+        let id = match (posted, &stored) {
+            (Some(wanted), Some(_)) => wanted,
+            _ => Uuid::new_v4().simple().to_string(),
         };
         info.id = Some(id.clone());
         let url = info.url.clone().unwrap_or_default();
@@ -2647,10 +2653,15 @@ impl LiveTvManager for FerrofinLiveTvManager {
 
         let data = serde_json::to_string(&info)
             .map_err(|e| LiveTvError::serialize("serialize tuner host", e))?;
-        self.db
-            .upsert_live_tv_tuner_host(&id, &url, &type_id, &data)
-            .await
-            .map_err(ServiceError::from)?;
+        crate::guide_repository::store_tuner_host(
+            &self.db,
+            stored.as_deref(),
+            &id,
+            &url,
+            &type_id,
+            &data,
+        )
+        .await?;
         self.tuner_flag.store(true, Ordering::Relaxed);
         Ok(info)
     }
@@ -5758,10 +5769,16 @@ impl FerrofinLiveTvManager {
         // A stream whose tuner has already hung up occupies nothing: its
         // buffer is gone and no consumer can join it. Upstream counts those
         // too, and so runs out of tuners it is not using.
+        // `string.Equals(i.TunerHostId, tunerHostId, OrdinalIgnoreCase)`, so a
+        // stream opened before its host was re-posted in another case counts.
         let in_use = open
             .values()
             .filter(|entry| {
-                entry.is_sharing() && entry.tuner_host_id.as_deref() == Some(tuner_host_id)
+                entry.is_sharing()
+                    && entry
+                        .tuner_host_id
+                        .as_deref()
+                        .is_some_and(|id| eq_ordinal_ignore_case(id, tuner_host_id))
             })
             .count();
         if i64::try_from(in_use).unwrap_or(i64::MAX) >= i64::from(tuner_count) {
@@ -7487,6 +7504,77 @@ mod tests {
             .expect("add");
         assert_ne!(added.id.as_deref(), Some(padded.as_str()));
         assert_eq!(mgr.get_listing_providers().await.expect("list").len(), 2);
+    }
+
+    /// `TunerHostManager.SaveTunerHost`: a posted id matching a stored host
+    /// ignoring case replaces it (`config.TunerHosts[index] = info`), so the
+    /// host keeps the posted spelling, and its channels follow it without
+    /// changing their ids. An id `FindIndex` matches nothing with (padded with
+    /// spaces) adds a host under a fresh id.
+    #[tokio::test]
+    async fn a_reposted_tuner_id_replaces_the_host_as_spelled() {
+        let mut sources = HashMap::new();
+        sources.insert("http://tuner/playlist.m3u".to_owned(), M3U.to_owned());
+        let mgr = manager_with(FakeFetcher(sources)).await;
+        let tuner = |id: Option<&str>| TunerHostInfo {
+            id: id.map(str::to_owned),
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        };
+        let id = mgr
+            .save_tuner_host(tuner(None))
+            .await
+            .expect("save")
+            .id
+            .expect("id");
+        mgr.refresh_guide().await.expect("refresh");
+        let channels_before = crate::guide_repository::all_channel_ids(&mgr.db)
+            .await
+            .expect("channels");
+        assert_eq!(channels_before.len(), 2);
+
+        let upper = id.to_uppercase();
+        let replaced = mgr
+            .save_tuner_host(tuner(Some(&upper)))
+            .await
+            .expect("replace");
+        assert_eq!(replaced.id.as_deref(), Some(upper.as_str()));
+        let listed = mgr.get_tuner_hosts().await.expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id.as_deref(), Some(upper.as_str()));
+
+        let mut channels_after = crate::guide_repository::all_channel_ids(&mgr.db)
+            .await
+            .expect("channels");
+        channels_after.sort();
+        let mut expected = channels_before.clone();
+        expected.sort();
+        assert_eq!(channels_after, expected, "channel ids do not move");
+        for channel in &channels_before {
+            let channel = Uuid::parse_str(channel).expect("guid");
+            let (_, host_id) = crate::guide_repository::channel_stream_source(&mgr.db, channel)
+                .await
+                .expect("read")
+                .expect("channel");
+            assert_eq!(host_id, upper, "every channel follows its host");
+            mgr.tuner_host(&host_id).await.expect("the host is found");
+        }
+
+        // The same spelling again changes nothing but the host's settings.
+        mgr.save_tuner_host(tuner(Some(&upper)))
+            .await
+            .expect("same");
+        assert_eq!(mgr.get_tuner_hosts().await.expect("list").len(), 1);
+
+        let padded = format!(" {upper} ");
+        let added = mgr
+            .save_tuner_host(tuner(Some(&padded)))
+            .await
+            .expect("add");
+        assert_ne!(added.id.as_deref(), Some(padded.as_str()));
+        assert_ne!(added.id.as_deref(), Some(upper.as_str()));
+        assert_eq!(mgr.get_tuner_hosts().await.expect("list").len(), 2);
     }
 
     /// A guide with a news airing, a movie, and a series episode (xmltv_ns
@@ -9273,6 +9361,20 @@ mod tests {
             .open_channel_stream(second, second_source.as_deref())
             .await
             .expect_err("the tuner is busy");
+        assert!(
+            matches!(error, ServiceError::Conflict(ref m) if m.contains("simultaneous stream limit")),
+            "{error}"
+        );
+
+        // Re-posted under its id in another case, the tuner is still busy with
+        // the stream opened under the old spelling (`OrdinalIgnoreCase`).
+        let mut tuner = mgr.get_tuner_hosts().await.expect("tuners").remove(0);
+        tuner.id = tuner.id.map(|id| id.to_uppercase());
+        mgr.save_tuner_host(tuner).await.expect("re-post");
+        let error = mgr
+            .open_channel_stream(second, second_source.as_deref())
+            .await
+            .expect_err("the tuner is still busy");
         assert!(
             matches!(error, ServiceError::Conflict(ref m) if m.contains("simultaneous stream limit")),
             "{error}"
