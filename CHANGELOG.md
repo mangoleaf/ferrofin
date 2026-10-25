@@ -63,6 +63,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Bind a `POST /Users` body as Jellyfin does: a body without `Name`, or with a null one, is
+  a `400` (the name is invalid) instead of keeping the name, and the user's `Policy` in the
+  body is validated, so one without both provider ids is a `400` unless it is sent as
+  `null`. A body without `Configuration` still resets the user's settings to the defaults,
+  as on Jellyfin
 - Refuse a `POST /Users/{userId}/Policy` body that leaves out `AuthenticationProviderId` or
   `PasswordResetProviderId`, or sends either blank, with Jellyfin's `400` naming each missing
   member, instead of saving the user's providers as empty strings

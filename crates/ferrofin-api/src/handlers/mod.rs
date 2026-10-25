@@ -1396,15 +1396,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Users",
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "UpdateUser",
-        ferrofin: "handlers/users.rs update_user (also behind the hidden POST /Users/{userId}) → \
-               ferrofin-core user_manager.rs rename_user, update_configuration; \
-               handlers/users.rs refresh_device_access (DeviceAccessHost after a rename)",
-        date: "2026-10-24",
+        ferrofin: "handlers/users.rs update_user (also behind the hidden POST /Users/{userId}; \
+               policy_validation for the nested Policy's [Required] provider ids; UserDto's \
+               serde default for a missing Configuration) → ferrofin-core user_manager.rs \
+               rename_user (require_valid_username: ThrowIfInvalidUsername), \
+               update_configuration; handlers/users.rs refresh_device_access \
+               (DeviceAccessHost after a rename)",
+        date: "2026-10-25",
         divergences: &[
-            "A body without Name, or with a null one, keeps the name and answers 204, \
-         where upstream passes the null to RenameUser and ThrowIfInvalidUsername answers 400; \
-         a body without Configuration keeps the stored settings, where upstream's UserDto \
-         constructor supplies a default configuration that resets them. Fix path: gl-871.",
             "\"Configuration\": null skips the configuration save, where upstream dereferences \
          the null in UpdateConfigurationAsync and answers 500. Jellyfin bug not ported.",
             "Every save pushes UserUpdated to the user's sessions once the configuration is \
