@@ -367,6 +367,24 @@ impl FerrofinUserManager {
             .or_else(|| apps.first().map(|app| app.id.clone()))
     }
 
+    /// The `CastReceiverId` a configuration save stores, `None` to keep the
+    /// stored one. Port of `UpdateConfigurationAsync`: only a non-empty id
+    /// naming a configured receiver application (ordinal) is taken. Without a
+    /// configuration seam there is no list to check, and the id is taken as
+    /// [`Self::resolve_cast_receiver_id`] echoes it.
+    async fn accepted_cast_receiver_id<'a>(&self, sent: Option<&'a str>) -> Option<&'a str> {
+        let sent = sent.filter(|id| !id.is_empty())?;
+        let Some(config) = &self.config else {
+            return Some(sent);
+        };
+        let configured = config.configuration().await.ok()?;
+        configured
+            .cast_receiver_applications
+            .iter()
+            .any(|app| app.id == sent)
+            .then_some(sent)
+    }
+
     /// Attaches the activity-log seam so an account lockout is recorded as a
     /// dashboard Alert.
     #[must_use]
@@ -1362,6 +1380,9 @@ impl UserManager for FerrofinUserManager {
     ) -> Result<(), ServiceError> {
         self.require_user(user_id).await?;
         let id = guid_to_db(user_id);
+        let cast_receiver_id = self
+            .accepted_cast_receiver_id(config.cast_receiver_id.as_deref())
+            .await;
 
         // One writer transaction, as upstream's single `SaveChangesAsync`. It
         // starts with the UPDATE, so it holds the write lock from its first
@@ -1374,7 +1395,8 @@ impl UserManager for FerrofinUserManager {
                 "SubtitleMode" = ?6, "DisplayCollectionsView" = ?7,
                 "EnableLocalPassword" = ?8, "HidePlayedInLatest" = ?9,
                 "RememberAudioSelections" = ?10, "RememberSubtitleSelections" = ?11,
-                "EnableNextEpisodeAutoPlay" = ?12, "CastReceiverId" = ?13,
+                "EnableNextEpisodeAutoPlay" = ?12,
+                "CastReceiverId" = coalesce(?13, "CastReceiverId"),
                 "RowVersion" = "RowVersion" + 1
                WHERE "Id" = ?1"#,
         )
@@ -1390,7 +1412,7 @@ impl UserManager for FerrofinUserManager {
         .bind(config.remember_audio_selections)
         .bind(config.remember_subtitle_selections)
         .bind(config.enable_next_episode_auto_play)
-        .bind(&config.cast_receiver_id)
+        .bind(cast_receiver_id)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -2068,6 +2090,47 @@ mod tests {
         // Without a configuration seam the stored value is echoed unchanged.
         let bare = FerrofinUserManager::new(db);
         assert_eq!(bare.resolve_cast_receiver_id(None).await, None);
+    }
+
+    // v12.2 `UpdateConfigurationAsync`: "Only set cast receiver id if it is
+    // passed in and it exists in the server config", else the stored one stays.
+    #[rstest::rstest]
+    #[case::configured(Some("F007D354"), Some("F007D354"))]
+    #[case::null(None, Some("6F511C87"))]
+    #[case::empty(Some(""), Some("6F511C87"))]
+    #[case::not_configured(Some("GONE"), Some("6F511C87"))]
+    #[case::case_differs(Some("6f511c87"), Some("6F511C87"))]
+    #[tokio::test]
+    async fn a_configuration_save_stores_only_a_configured_cast_receiver(
+        #[case] sent: Option<&str>,
+        #[case] stored: Option<&str>,
+    ) {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager> = Arc::new(
+            crate::configuration_manager::FerrofinServerConfigurationManager::load(
+                crate::app_paths::test_paths(dir.path()),
+            )
+            .await
+            .expect("config"),
+        );
+        let mgr = FerrofinUserManager::new(db).with_configuration(config);
+        let user = mgr.create_user("alice").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("id");
+        let save = |cast_receiver_id: Option<&str>| UserConfiguration {
+            cast_receiver_id: cast_receiver_id.map(str::to_owned),
+            ..UserConfiguration::default()
+        };
+        mgr.update_configuration(id, &save(Some("6F511C87")))
+            .await
+            .expect("pick a receiver");
+
+        mgr.update_configuration(id, &save(sent))
+            .await
+            .expect("save");
+
+        let user = mgr.get_user_by_id(id).await.expect("get").expect("present");
+        assert_eq!(user.cast_receiver_id.as_deref(), stored);
     }
 
     #[tokio::test]
