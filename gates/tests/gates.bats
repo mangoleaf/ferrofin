@@ -6,7 +6,12 @@
 bats_require_minimum_version 1.5.0
 
 setup() {
-  GATES="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
+  # gates/ copied into a repository of its own: gates/lib.sh refuses an output root inside the repository
+  # it runs from, so a root under the test's directory would be refused when TMPDIR itself is inside this
+  # checkout (the pre-push CI mirror keeps scratch files there). From the copy it is beside the repository.
+  mkdir -p "$BATS_TEST_TMPDIR/repo" && cp -r "$BATS_TEST_DIRNAME/.." "$BATS_TEST_TMPDIR/repo/gates"
+  git -C "$BATS_TEST_TMPDIR/repo" init -q
+  GATES="$BATS_TEST_TMPDIR/repo/gates"
   # shellcheck source=gates/lib.sh
   . "$GATES/lib.sh"
   TMP="$BATS_TEST_TMPDIR/work"

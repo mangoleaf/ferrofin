@@ -232,6 +232,20 @@ EOS
 
 # --- run.sh command line -----------------------------------------------------------
 
+# copy_gates: gates/ copied into a repository of its own, its adoption/ in COPY. gates/lib.sh refuses an
+# output root inside the repository it runs from, so a root under the test's directory is refused when
+# TMPDIR itself is inside this checkout (the pre-push CI mirror keeps scratch files there): from the copy
+# it is beside the repository, as it would be on a real host.
+copy_gates() {
+  mkdir -p "$BATS_TEST_TMPDIR/repo" && cp -r "$ADOPTION/.." "$BATS_TEST_TMPDIR/repo/gates" && git -C "$BATS_TEST_TMPDIR/repo" init -q
+  COPY=$BATS_TEST_TMPDIR/repo/gates/adoption
+}
+
+copy_fixtures_dir() { # the copy's adoption_fixtures_dir (the same name: the copy's files are the same)
+  # shellcheck disable=SC2016  # expanded by the inner bash
+  bash -c '. "$1"; adoption_fixtures_dir test' _ "$COPY/lib.sh"
+}
+
 one_row_fixture() { # one_row_fixture <dir>: the smallest fixture run.sh adopts (one messy row)
   mkdir -p "$1/oracle" "$1/media" "$1/jellyfin-12.2-messy/data"
   smoke "$1/oracle/smoke-jellyfin-12.2.txt" 120
@@ -263,11 +277,12 @@ EOS
 }
 
 @test "run.sh: with only FERROFIN_GATES_DIR, the fixtures and the work directory come from the root; --fixtures and ADOPTION_WORK_DIR win" {
+  copy_gates
   export FERROFIN_GATES_DIR="$BATS_TEST_TMPDIR/root"
   before=$(find "$BATS_TEST_TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)
-  dir=$(adoption_fixtures_dir test)
+  dir=$(copy_fixtures_dir)
   [[ "$dir" == "$FERROFIN_GATES_DIR"/fixtures/adoption-???????????? ]]   # named for the recipe
-  run "$ADOPTION/run.sh" --image any
+  run "$COPY/run.sh" --image any
   [ "$status" -eq 2 ]
   [[ "$output" == *"$dir missing — run gates/adoption/build-fixtures.sh first"* ]]
   one_row_fixture "$dir"; one_row_fixture fixtures
@@ -280,7 +295,7 @@ esac
 echo "unexpected docker $*" >&2; exit 99
 EOS
   chmod +x bin/docker; bin_first
-  run "$ADOPTION/run.sh" --image any --only jellyfin-12.2-messy
+  run "$COPY/run.sh" --image any --only jellyfin-12.2-messy
   [ "$status" -eq 1 ]
   [ -f "$FERROFIN_GATES_DIR/work/adoption/report.html" ]
   [ -d "$FERROFIN_GATES_DIR/work/adoption/jellyfin-12.2-messy" ]   # the copy, too
@@ -288,43 +303,45 @@ EOS
   [ "$(find "$BATS_TEST_TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)" -eq $((before + 1)) ]   # nothing new beside the root itself
   # --fixtures names the fixtures; the work directory stays the root's
   rm -rf "$FERROFIN_GATES_DIR/work"
-  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  run "$COPY/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
   [ "$status" -eq 1 ]
   [ -f "$FERROFIN_GATES_DIR/work/adoption/report.html" ]
   [ ! -e fixtures/work ]
   # ADOPTION_WORK_DIR names the work directory
-  ADOPTION_WORK_DIR="$TMP/mine" run "$ADOPTION/run.sh" --image any --only jellyfin-12.2-messy
+  ADOPTION_WORK_DIR="$TMP/mine" run "$COPY/run.sh" --image any --only jellyfin-12.2-messy
   [ "$status" -eq 1 ]
   [ -f mine/report.html ]
   # FERROFIN_ADOPTION_FIXTURES names them as --fixtures does, for synthetic.py too
-  FERROFIN_ADOPTION_FIXTURES="$TMP/elsewhere" run "$ADOPTION/run.sh" --image any
+  FERROFIN_ADOPTION_FIXTURES="$TMP/elsewhere" run "$COPY/run.sh" --image any
   [[ "$output" == *"$TMP/elsewhere missing"* ]]
   unset FERROFIN_GATES_DIR
-  FERROFIN_ADOPTION_FIXTURES="$TMP/elsewhere" run python3 "$ADOPTION/synthetic.py" run --image any
+  FERROFIN_ADOPTION_FIXTURES="$TMP/elsewhere" run python3 "$COPY/synthetic.py" run --image any
   [[ "$output" != *FERROFIN_GATES_DIR* ]]
   [[ "$output" == *"synthetic adoption failed"* ]]
   # without a root, --fixtures keeps its work beside it, as before the root existed
-  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  run "$COPY/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
   [ "$status" -eq 1 ]
   [ -f fixtures/work/run/report.html ]
 }
 
 @test "build-fixtures.sh: with only FERROFIN_GATES_DIR it builds into the root's fixtures; --fixtures wins" {
   mkdir -p bin; printf '#!/usr/bin/env bash\nexit 1\n' > bin/docker; chmod +x bin/docker; bin_first   # stops at the first pull
+  copy_gates
   root="$BATS_TEST_TMPDIR/root"
   before=$(find "$BATS_TEST_TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)
-  FERROFIN_GATES_DIR=$root run "$ADOPTION/build-fixtures.sh"
+  FERROFIN_GATES_DIR=$root run "$COPY/build-fixtures.sh"
   [ "$status" -ne 0 ]
-  [ -d "$(FERROFIN_GATES_DIR=$root adoption_fixtures_dir test)" ]
+  [ -d "$(FERROFIN_GATES_DIR=$root copy_fixtures_dir)" ]
   [ "$(find "$BATS_TEST_TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)" -eq $((before + 1)) ]   # nothing beside the root
   rm -r "$root"
-  FERROFIN_GATES_DIR=$root run "$ADOPTION/build-fixtures.sh" --fixtures mine
+  FERROFIN_GATES_DIR=$root run "$COPY/build-fixtures.sh" --fixtures mine
   [ -d mine ]
   [ ! -e "$root" ]
 }
 
 @test "adoption_fixtures_dir: the name follows every file that builds the fixtures, as CI's fixture cache key does" {
   mkdir -p tree/gates && cp -r "$ADOPTION" tree/gates/adoption && cp "$ADOPTION/../lib.sh" tree/gates/
+  git -C tree init -q   # a repository of its own: the root beside it is outside it, wherever TMPDIR is
   # shellcheck disable=SC2016  # expanded by the inner bash
   key() { FERROFIN_GATES_DIR="$BATS_TEST_TMPDIR/root" bash -c '. "$1"; adoption_fixtures_dir test' _ tree/gates/adoption/lib.sh; }
   first=$(key)
