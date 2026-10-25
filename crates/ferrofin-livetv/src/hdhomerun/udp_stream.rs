@@ -139,9 +139,11 @@ pub async fn open_legacy_udp_stream(
 
     let alive = Arc::new(AtomicBool::new(true));
     let (first_packet_tx, first_packet_rx) = tokio::sync::oneshot::channel();
+    // The claim is made before the task exists, so an abort before its first
+    // poll still releases the tuner.
     let task = tokio::spawn(copy_datagrams_to_temp_file(
         socket,
-        session,
+        TunerClaim(Some(session)),
         temp_path.clone(),
         first_packet_tx,
         Arc::clone(&alive),
@@ -170,11 +172,47 @@ pub async fn open_legacy_udp_stream(
     }
 }
 
+/// The tuner a copy task has claimed, released however the task ends.
+///
+/// The loop releases it itself ([`Self::release`]) when the stream ends. An
+/// aborted task (`LiveStreamHandle::close`, the first-packet timeout) is
+/// dropped at an await instead, and the drop spawns the release: upstream's
+/// `using (hdHomerunManager)` releases the lock key when the cancelled copy
+/// unwinds, on the streaming task, which `LiveStream.Close` does not wait for.
+/// So, as upstream, an open right after a close can still find that tuner
+/// locked and take the next one.
+struct TunerClaim(Option<HdHomerunSession>);
+
+impl TunerClaim {
+    /// Releases the tuner now (`HdHomerunManager.Dispose`).
+    async fn release(mut self) {
+        if let Some(session) = self.0.take() {
+            session.stop_streaming().await;
+        }
+    }
+}
+
+impl Drop for TunerClaim {
+    fn drop(&mut self) {
+        let Some(session) = self.0.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(session.stop_streaming());
+        } else {
+            tracing::warn!(
+                "live tv: no runtime to release the hdhomerun tuner on; it stays locked until \
+                 the device frees it"
+            );
+        }
+    }
+}
+
 /// The receive loop: strip each datagram's RTP header, append the payload, and
 /// release the device's tuner when it ends.
 async fn copy_datagrams_to_temp_file(
     socket: UdpSocket,
-    session: HdHomerunSession,
+    claim: TunerClaim,
     temp_path: PathBuf,
     first_packet: tokio::sync::oneshot::Sender<bool>,
     alive: Arc<AtomicBool>,
@@ -189,7 +227,7 @@ async fn copy_datagrams_to_temp_file(
             }
             // The tuner was claimed before this ran, so it must be released
             // even though not one byte was written.
-            session.stop_streaming().await;
+            claim.release().await;
             return;
         }
     };
@@ -228,7 +266,7 @@ async fn copy_datagrams_to_temp_file(
         let _ = tx.send(false);
     }
     let _ = file.flush().await;
-    session.stop_streaming().await;
+    claim.release().await;
     let _ = tokio::fs::remove_file(&temp_path).await;
 }
 
@@ -355,6 +393,54 @@ mod tests {
         }
         opened.task.abort();
         panic!("the buffer never filled");
+    }
+
+    /// Closing a legacy stream aborts its copy task (`LiveStreamHandle::close`,
+    /// and the first-packet timeout does the same). The tuner must still be
+    /// released, target then lock key set to `none` under the session's key,
+    /// as upstream's `using (hdHomerunManager)` releases it when the cancelled
+    /// copy unwinds; otherwise every close leaves one tuner locked to a closed
+    /// port until the device frees it.
+    #[tokio::test]
+    async fn an_aborted_stream_still_releases_its_tuner() {
+        let device = crate::hdhomerun::fake::FakeDevice::start(2).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plan = LegacyUdpPlan {
+            device: device.addr,
+            num_tuners: 2,
+            commands: vec![("channel".to_owned(), "4".to_owned())],
+        };
+        let opened = open_legacy_udp_stream(&plan, dir.path(), 0x1234_5678)
+            .await
+            .expect("the device started sending");
+
+        opened.task.abort();
+        assert!(opened.task.await.unwrap_err().is_cancelled());
+
+        let released = |seen: &[(String, String, Option<u32>)]| {
+            seen.iter()
+                .any(|(name, value, _)| name == "lockkey" && value == "none")
+        };
+        for _ in 0..200 {
+            if released(&device.commands()) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let seen = device.commands();
+        let release: Vec<_> = seen
+            .iter()
+            .skip_while(|(name, value, _)| !(name == "target" && value == "none"))
+            .map(|(name, value, key)| (name.as_str(), value.as_str(), *key))
+            .collect();
+        assert_eq!(
+            release,
+            [
+                ("target", "none", Some(0x1234_5678)),
+                ("lockkey", "none", Some(0x1234_5678)),
+            ],
+            "the tuner was never released: {seen:?}"
+        );
     }
 
     /// Every tuner busy is upstream's `LiveTvConflictException("No tuners
