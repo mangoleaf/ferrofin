@@ -290,6 +290,16 @@ struct ItemsQuery {
     /// Comma-delimited album ids.
     #[serde(default)]
     album_ids: Option<String>,
+    /// Pipe-delimited album names. The first album of each name replaces
+    /// `albumIds`.
+    #[serde(default)]
+    albums: Option<String>,
+    /// Pipe-delimited artist names. Their artists replace `artistIds`.
+    #[serde(default)]
+    artists: Option<String>,
+    /// Pipe-delimited studio names. Their studios replace `studioIds`.
+    #[serde(default)]
+    studios: Option<String>,
     /// Restrict to favourited items.
     #[serde(default)]
     is_favorite: Option<bool>,
@@ -582,6 +592,7 @@ async fn get_items(
         official_rating_score(&state, query.min_official_rating.as_deref());
     internal.max_parental_rating =
         official_rating_score(&state, query.max_official_rating.as_deref());
+    resolve_name_filters(&state, &query, &mut internal).await?;
     // C# `ItemsController.GetItems` (ItemsController.cs:307, 525-529) answers a
     // non-recursive, id-less request whose parent resolves to the
     // `UserRootFolder` with `folder.GetChildren(user, true)` — not with a query.
@@ -806,6 +817,32 @@ pub(crate) fn sort_items_by_request(query: &InternalItemsQuery, items: &mut [Bas
             .ok()
             .and_then(|id| ferrofin_util::read_only_list_extension::index_of(&query.item_ids, &id))
     });
+}
+
+/// The name filters replace their id lists (v12.2 ItemsController.cs:527-577):
+/// `artists` replaces `artistIds`, `albums` replaces `albumIds` and `studios`
+/// replaces `studioIds`. They resolve without writing a row, so an unknown name
+/// matches nothing; an absent or blank list leaves the id list as it is.
+async fn resolve_name_filters(
+    state: &AppState,
+    query: &ItemsQuery,
+    internal: &mut InternalItemsQuery,
+) -> Result<(), ApiError> {
+    use super::by_name::{resolve_album_ids, resolve_by_name_ids};
+    if let Some(ids) =
+        resolve_by_name_ids(state, BaseItemKind::MusicArtist, query.artists.as_deref()).await?
+    {
+        internal.artist_ids = ids;
+    }
+    if let Some(ids) = resolve_album_ids(state, query.albums.as_deref()).await? {
+        internal.album_ids = ids;
+    }
+    if let Some(ids) =
+        resolve_by_name_ids(state, BaseItemKind::Studio, query.studios.as_deref()).await?
+    {
+        internal.studio_ids = ids;
+    }
+    Ok(())
 }
 
 /// An official rating parameter as a parental-rating score:
@@ -2210,6 +2247,9 @@ crate::query::query_parameters! {
         "subtitleLanguages" => ',',
         "seriesStatus" => ',',
         "personTypes" => ',',
+        "albums" => '|',
+        "artists" => '|',
+        "studios" => '|',
     } => [("get", "/Items")];
     ItemQuery {} => [("get", "/Items/{itemId}")];
     DeleteItemsQuery {
@@ -2332,7 +2372,7 @@ mod tests {
     /// does not bind yet. Each is an open port from `ItemsController.GetItems`
     /// — bind it, honour it, and delete it here; the guard below fails on a
     /// stale entry, so this list can only shrink.
-    const UNBOUND_ITEMS_PARAMETERS: &[&str] = &["albums", "artists", "studios"];
+    const UNBOUND_ITEMS_PARAMETERS: &[&str] = &[];
 
     /// Every `GET /Items` parameter in the vendored contracts — 10.11.8, the
     /// route gate's pin, and 12.1.0, the newest vendored Jellyfin spec (whose additions,

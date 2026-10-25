@@ -229,14 +229,6 @@ kind = "value"
 issue = 827
 reason = "The page follows the difference gl-827 tracks."
 
-# The page follows the difference gl-810 tracks.
-[[entry]]
-request = "GetItems.studios.found-studio"
-path = "Items[].Id"
-kind = "value"
-issue = 810
-reason = "The page follows the difference gl-810 tracks."
-
 # The page follows the difference gl-225 tracks.
 [[entry]]
 request = "GetItems.videoTypes.videofile"
@@ -1221,20 +1213,6 @@ issue = 66
 reason = "The Collections library is created as a bare row, with another id."
 
 # ── filed from the first sweep with the edge cases (formerly filed.toml) ──
-[[entry]]
-request = "GetItems.studios.*"
-path = "TotalRecordCount"
-kind = "value"
-issue = 810
-reason = "Ferrofin does not bind the studios name filter."
-
-[[entry]]
-request = "GetItems.studios.*"
-path = "Items"
-kind = "length"
-issue = 810
-reason = "Ferrofin does not bind the studios name filter."
-
 [[entry]]
 request = "GetItems.videoTypes.*"
 path = "TotalRecordCount"

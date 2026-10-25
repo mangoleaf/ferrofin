@@ -386,6 +386,31 @@ struct OkLibrary {
     /// When non-empty, the page `query_items` answers with, in this order and
     /// out of [`PAGE_TOTAL`] rows, instead of the single `item_id` row.
     rows: Vec<BaseItemEntity>,
+    /// The rows a `Name` + one-kind lookup (`get_item_list` / `get_item_ids`)
+    /// finds, matched ignoring case.
+    named: Vec<(BaseItemKind, &'static str, Uuid)>,
+}
+
+impl OkLibrary {
+    /// The ids of the [`OkLibrary::named`] rows `query` names.
+    fn named_ids(&self, query: &InternalItemsQuery) -> Vec<Uuid> {
+        let Some(name) = query.name.as_deref() else {
+            return Vec::new();
+        };
+        let ids = self
+            .named
+            .iter()
+            .filter(|(kind, row, _)| {
+                query.include_item_types.contains(kind) && row.eq_ignore_ascii_case(name.trim())
+            })
+            .map(|&(_, _, id)| id);
+        ids.take(
+            query
+                .limit
+                .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(0)),
+        )
+        .collect()
+    }
 }
 
 /// The total record count `query_items` reports alongside [`OkLibrary::rows`].
@@ -574,14 +599,18 @@ impl LibraryManager for OkLibrary {
             vec![base_item_entity(self.item_id)],
         ))
     }
-    async fn get_item_ids(&self, _query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
+    async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(self.named_ids(query))
     }
     async fn get_item_list(
         &self,
-        _query: &InternalItemsQuery,
+        query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
+        Ok(self
+            .named_ids(query)
+            .into_iter()
+            .map(base_item_entity)
+            .collect())
     }
     async fn get_latest_item_list(
         &self,
@@ -1950,6 +1979,85 @@ async fn get_items_forwards_the_rating_status_and_placeholder_filters() {
     }
     let (status, _) = items_query("recursive=true&isPlaceHolder=maybe").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// The query `GET /Items?{params}` hands the library when `named` are the
+/// by-name rows and albums its lookups can find.
+async fn items_query_with_named(
+    params: &str,
+    named: Vec<(BaseItemKind, &'static str, Uuid)>,
+) -> InternalItemsQuery {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        named,
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items?{params}"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{params}");
+    seen.lock().unwrap().take().expect("query_items ran")
+}
+
+/// `artists`, `albums` and `studios` name the items whose ids replace
+/// `artistIds`, `albumIds` and `studioIds` (v12.2 ItemsController.cs:527-577).
+/// A name nothing has takes the no-match id instead of a minted row, so it
+/// matches nothing; an absent or blank list leaves the id filter as it was.
+#[tokio::test]
+async fn get_items_resolves_the_artist_album_and_studio_names() {
+    let (artist, album, studio, kept) = (
+        Uuid::from_u128(0xC1),
+        Uuid::from_u128(0xC2),
+        Uuid::from_u128(0xC3),
+        Uuid::from_u128(0xC4),
+    );
+    let named = vec![
+        (BaseItemKind::MusicArtist, "Test Artist", artist),
+        (BaseItemKind::MusicAlbum, "Middle Years", album),
+        (BaseItemKind::Studio, "Acme Pictures", studio),
+    ];
+    let query = items_query_with_named(
+        &format!(
+            "recursive=true&artistIds={kept}&artists=test%20artist|Nobody\
+             &albumIds={kept}&albums=Middle%20Years&studioIds={kept}&studios=Acme%20Pictures|Nope"
+        ),
+        named.clone(),
+    )
+    .await;
+    assert_eq!(query.artist_ids, [artist, Uuid::nil()]);
+    assert_eq!(query.album_ids, [album]);
+    assert_eq!(query.studio_ids, [studio, Uuid::nil()]);
+
+    // A repeated key joins with the declared pipe delimiter.
+    let repeated = items_query_with_named(
+        "recursive=true&studios=Acme%20Pictures&studios=Nope",
+        named.clone(),
+    )
+    .await;
+    assert_eq!(repeated.studio_ids, [studio, Uuid::nil()]);
+
+    let unknown = items_query_with_named("recursive=true&albums=Nope", named.clone()).await;
+    assert_eq!(
+        unknown.album_ids,
+        [Uuid::nil()],
+        "an unknown album matches nothing"
+    );
+
+    let blank = items_query_with_named(
+        &format!("recursive=true&studioIds={kept}&studios=&artists=%20"),
+        named,
+    )
+    .await;
+    assert_eq!(blank.studio_ids, [kept]);
+    assert!(blank.artist_ids.is_empty());
 }
 
 /// jellyfin-web's artist page filters by `AlbumArtistIds` (Albums),
