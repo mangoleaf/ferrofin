@@ -115,6 +115,38 @@ async fn home_sections_are_replaced_wholesale_per_display_preferences_row() {
     assert!(db.home_sections(mine).await.expect("cleared").is_empty());
 }
 
+/// A Jellyfin database keeps every save's `HomeSection` rows (its controller
+/// clears a detached collection, so EF never deletes the old ones). Upstream
+/// loads them in `Id` order and keys them by `Order`, so the newest row of an
+/// `Order` wins; it must come last here too. Measured on a live Jellyfin 12.2.
+#[tokio::test]
+async fn duplicate_home_sections_read_back_oldest_first_within_an_order() {
+    let db = memory_db().await;
+    let prefs = display_preferences_row(&db, 1, "00000000-0000-0000-0000-0000000000A1").await;
+    // Three saves, as Jellyfin left them: Ids 6-10, two orders, newest last.
+    for (id, order, type_) in [(10, 0, 3), (6, 0, 4), (9, 1, 8), (7, 1, 6), (8, 0, 7)] {
+        sqlx::query(
+            r#"INSERT INTO "HomeSection" ("Id", "DisplayPreferencesId", "Order", "Type")
+               VALUES (?1, ?2, ?3, ?4)"#,
+        )
+        .bind(id)
+        .bind(prefs)
+        .bind(order)
+        .bind(type_)
+        .execute(db.writer())
+        .await
+        .expect("insert home section");
+    }
+    let rows: Vec<(i32, i32)> = db
+        .home_sections(prefs)
+        .await
+        .expect("read")
+        .iter()
+        .map(|s| (s.order, s.type_))
+        .collect();
+    assert_eq!(rows, vec![(0, 4), (0, 7), (0, 3), (1, 6), (1, 8)]);
+}
+
 #[tokio::test]
 async fn snapshot_is_a_complete_copy_and_refuses_an_existing_destination() {
     let dir = tempfile::tempdir().expect("tempdir");

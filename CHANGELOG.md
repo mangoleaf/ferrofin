@@ -63,6 +63,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   repaired count is zero, with five regression tests; all 40 shell tests passed.
 
 ### Parity
+- Pin the order a display-preferences row's home sections are read in to `Order`, then `Id`:
+  on a database adopted from Jellyfin, which keeps every save's rows, `GET /DisplayPreferences`
+  answers the newest section of each order, as Jellyfin does. SQLite already returned them in
+  that order, but nothing guaranteed it
 - Read a display-preferences id as Jellyfin's `Guid.TryParse` reads it: a `(…)`, `{0x…}` or
   space-padded GUID addresses that GUID's preferences, and an `urn:uuid:` id is hashed like
   any other name

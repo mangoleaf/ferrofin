@@ -1498,7 +1498,8 @@ pub const VERIFIED: &[Verified] = &[
                index_by_name, chromecast_name, home_section_name) → ferrofin-core \
                display_preferences_manager.rs (get_display_preferences, \
                get_item_display_preferences, list_custom_item_display_preferences, \
-               list_home_sections) → ferrofin-db database.rs home_sections; ferrofin-model \
+               list_home_sections) → ferrofin-db database.rs home_sections (Order, then Id: \
+               the Include(HomeSections) load order); ferrofin-model \
                dto/display_preferences_dto.rs",
         date: "2026-10-25",
         divergences: &[
@@ -1509,9 +1510,6 @@ pub const VERIFIED: &[Verified] = &[
             "A stored IndexBy or ChromecastVersion outside the named members is answered as \
          null and \"stable\"; upstream's Enum.ToString() writes it as its number. Fix path: \
          gl-880.",
-            "Among several HomeSection rows with one Order (an adopted Jellyfin database, \
-         whose saves never delete the old rows) the one answered is unspecified; upstream \
-         loads them in Id order, so the newest wins. Fix path: gl-882.",
             "CustomPrefs members are written in hash order, not upstream's insertion order \
          (the home sections, the scalar keys, then the stored preferences); the members and \
          values are the same.",
