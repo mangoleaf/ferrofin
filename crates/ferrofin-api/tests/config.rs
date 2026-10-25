@@ -1378,6 +1378,39 @@ async fn a_committed_check_answers_every_named_save_after_it_is_kept() {
     );
 }
 
+/// gl-29: a `KnownProxies` host name saved with the network configuration is
+/// resolved (`AddProxyAddresses`' `TryParseHost` branch) with the manager's
+/// resolver and trusted at once, where it used to be dropped.
+#[tokio::test]
+async fn a_saved_known_proxy_host_name_is_resolved_into_the_live_policy() {
+    use ferrofin_networking::{NetworkConfiguration, NetworkManager};
+    fn resolve(host: &str) -> Option<Vec<std::net::IpAddr>> {
+        (host == "proxy.example.test").then(|| vec!["10.1.0.9".parse().unwrap()])
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(std::sync::RwLock::new(
+        NetworkManager::with_defaults(NetworkConfiguration::default(), "").with_resolver(resolve),
+    ));
+    let state = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    })
+    .with_network(Arc::clone(&network));
+    let proxy = "10.1.0.9".parse().unwrap();
+    assert!(!network.read().unwrap().is_known_proxy(proxy));
+
+    assert_eq!(
+        post(
+            state,
+            "/System/Configuration/network",
+            &serde_json::json!({"KnownProxies": ["proxy.example.test"]}),
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(network.read().unwrap().is_known_proxy(proxy));
+}
+
 /// `StartupController.SetRemoteAccess` saves through `SaveConfiguration`, so
 /// the network manager re-reads its settings at once: the wizard's choice
 /// applies to the next request, not after a restart.

@@ -859,13 +859,37 @@ impl AppState {
     /// Re-reads the network configuration into the policy after an admin saves
     /// it, so a changed `LocalNetworkSubnets` / `RemoteIPFilter` takes effect
     /// without a restart (C# `NetworkManager` subscribes to the config event).
-    pub fn update_network_settings(&self, config: &ferrofin_networking::NetworkConfiguration) {
-        if let Some(network) = self.inner.network.as_ref() {
-            match network.write() {
-                Ok(mut n) => n.update_settings(config),
-                Err(poisoned) => poisoned.into_inner().update_settings(config),
-            }
-        }
+    ///
+    /// `KnownProxies` host names are resolved first, on a blocking thread and
+    /// outside the manager's lock: every request reads that lock, so a DNS
+    /// lookup under it would stall them all.
+    pub async fn update_network_settings(
+        &self,
+        config: &ferrofin_networking::NetworkConfiguration,
+    ) {
+        let Some(network) = self.inner.network.as_ref() else {
+            return;
+        };
+        let resolver = network
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolver();
+        let owned = config.clone();
+        let proxies = tokio::task::spawn_blocking(move || {
+            ferrofin_networking::KnownProxies::resolve(&owned, resolver)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            // The lookup thread panicked or was cancelled. Keep the saved
+            // settings, with the addresses and subnets parsed and no host name
+            // looked up: a lookup under the lock is what this avoids.
+            tracing::warn!(%error, "KnownProxies host-name lookup failed; host names left unresolved");
+            ferrofin_networking::KnownProxies::resolve(config, |_| None)
+        });
+        network
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .update_settings_with_known_proxies(config, proxies);
     }
 
     /// Wires the web-file transformation pipeline (the File Transformation
