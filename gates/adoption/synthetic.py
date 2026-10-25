@@ -170,7 +170,8 @@ def build(root, only, port):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("build", "run", "upgrade"))
-    parser.add_argument("--fixtures", required=True, type=Path)
+    parser.add_argument("--fixtures", type=Path,
+                        help="default: FERROFIN_ADOPTION_FIXTURES, else the fixtures build-fixtures.sh builds under FERROFIN_GATES_DIR")
     parser.add_argument("--only", choices=[row[0] for row in VERSIONS])
     parser.add_argument("--port", type=int, default=18120)
     parser.add_argument("--image", default="ferrofin:bench")
@@ -178,11 +179,19 @@ def main(argv=None):
                         help="upgrade: an earlier Ferrofin release image to start from (repeatable)")
     args = parser.parse_args(argv)
     os.umask(0o077)
+    lib = str(Path(__file__).with_name("lib.sh"))
+    if args.fixtures is None and os.environ.get("FERROFIN_ADOPTION_FIXTURES"):  # as run.sh reads it
+        args.fixtures = Path(os.environ["FERROFIN_ADOPTION_FIXTURES"])
+    if args.fixtures is None:  # the output root's fixtures (gates/lib.sh); the refusal is on stderr
+        found = subprocess.run(["bash", "-c", '. "$1"; adoption_fixtures_dir synthetic', "_", lib],
+                               stdout=subprocess.PIPE, text=True, check=False)
+        if found.returncode:
+            return 2
+        args.fixtures = Path(found.stdout.strip())
     root = args.fixtures.resolve()
     try:
         # Never on a network share: every fixture is booted, scanned and copied repeatedly.
-        subprocess.run(["bash", "-c", '. "$1"; adoption_require_local "$2"', "_",
-                        str(Path(__file__).with_name("lib.sh")), str(root)], check=True)
+        subprocess.run(["bash", "-c", '. "$1"; gates_require_local "$2"', "_", lib, str(root)], check=True)
         if args.mode == "build":
             build(root, args.only, args.port)
         elif args.mode == "upgrade":

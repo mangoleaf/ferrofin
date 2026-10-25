@@ -14,9 +14,11 @@ data/
 # the compile; none of these feed the server build.
 .rcg/
 brain/
-# benchmark test data and run output (gates/bench/ code itself is tiny)
+# Gate data from before the output root (FERROFIN_GATES_DIR, gates/lib.sh, which refuses a root inside
+# the repository): an older checkout may still hold the benchmark corpus and run output here.
 gates/bench/testdata/
 gates/bench/runs/
+gates/parity/runs/
 # The gates' old roots (moved under gates/ by gl-912): an older checkout's data may linger there.
 bench/
 adoption/

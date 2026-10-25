@@ -31,6 +31,7 @@ ledger and the filing of new differences as issues extend this same path in late
 
 ```bash
 # needs docker, python3 (3.11+), jq, curl, timeout, taskset; the benchmark corpus, prepared for Jellyfin
+export FERROFIN_GATES_DIR=/srv/gates          # the output root (gates/lib.sh): the corpus and every run go under it
 gates/bench/testdata/build.sh                       # once: the corpus (see gates/bench/README.md)
 gates/bench/testdata/build.sh --prepare-jellyfin    # once: the corpus upgraded and scanned by the pinned Jellyfin
 docker build -t ferrofin:parity .             # the commit under test: REBUILD IT
@@ -38,7 +39,7 @@ gates/parity/run.sh --oracle "$(cat gates/bench/testdata/jellyfin-image.txt)" --
 gates/parity/run.sh --oracle "$(cat gates/bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity --requests gates/parity/requests/writes.jsonl
 gates/parity/run.sh --oracle "$(cat gates/bench/testdata/jellyfin-image.txt)" --ferrofin ferrofin:parity \
   --requests gates/parity/requests/sweep --requests gates/parity/requests/edge                                  # the release run
-python3 gates/bench/report.py --serve --parity-dir gates/parity/runs      # list and compare runs
+python3 gates/bench/report.py --serve 8097 "$FERROFIN_GATES_DIR/runs" --parity-dir "$FERROFIN_GATES_DIR/runs"   # list and compare runs
 ```
 
 `--gate` makes it a release-gate run: a stale oracle pin, or an `--oracle` that is not the pin, is refused
@@ -206,7 +207,7 @@ kind and both values, both bodies **as the comparison saw them** (`<opaque>` whe
 `<key N>` for opaque keys, unordered arrays sorted), the rules that changed them, and the issue a difference
 was filed as. The harness never talks to GitLab: filing is a step a person or an agent takes after the run.
 
-1. `python3 gates/parity/diff.py findings --out gates/parity/runs/<run>` prints the differences not filed yet as Markdown,
+1. `python3 gates/parity/diff.py findings --out "$FERROFIN_GATES_DIR"/runs/parity-<run>` prints the differences not filed yet as Markdown,
    one section per field path and kind (with the requests that show it and the first one's bodies), largest
    group first.
 2. File them through the project's issue-filing workflow (agents: the issue-filing skill), which dedupes

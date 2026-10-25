@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gates/adoption/build-fixtures.sh --fixtures DIR
+# gates/adoption/build-fixtures.sh [--fixtures DIR]
 #
 # Builds every fixture gates/adoption/run.sh needs from synthetic data only — no real library, no
 # media server, no network share. synthetic.py generates invented media under DIR/media and has
@@ -26,14 +26,16 @@
 # build into a new DIR after changing it. DIR must be on a local disk. An interrupted oracle build
 # can leave a copy under DIR/work/oracle-* (or messy-oracle-*); work/ is scratch and may be deleted
 # between runs. A failed messy or scale build removes its own derived copy, so only that step is repeated.
+# Without --fixtures (or FERROFIN_ADOPTION_FIXTURES), DIR is $FERROFIN_GATES_DIR/fixtures/adoption-<key>,
+# named for the files that build it, so changing one builds into a new directory by itself (lib.sh).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=gates/adoption/lib.sh
 . "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}
-while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,28p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
-[ -n "$FIXTURES" ] || { echo "--fixtures DIR is required" >&2; exit 2; }
-adoption_require_local "$FIXTURES" || exit 2
+while [ $# -gt 0 ]; do case $1 in --fixtures) FIXTURES=$2; shift 2;; -h|--help) sed -n 2,30p "$0"; exit 0;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
+[ -n "$FIXTURES" ] || FIXTURES=$(adoption_fixtures_dir build-fixtures) || exit 2
+gates_require_local "$FIXTURES" || exit 2
 mkdir -p "$FIXTURES"; FIXTURES=$(cd "$FIXTURES" && pwd)
 # Pull the release of every fixture still to build (and 10.11.8, whose FFmpeg encodes the
 # media): a stale local tag would otherwise build a different release without complaint.

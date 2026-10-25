@@ -58,6 +58,7 @@ from.
    only; Jellyfin is not part of it.
 
    ```bash
+   export FERROFIN_GATES_DIR=/srv/gates                    # the gates' output root: the corpus and every session (gates/lib.sh)
    docker build -t ferrofin:vX.Y.Z-rc .                    # the frozen release commit
    docker pull ghcr.io/mangoleaf/ferrofin:vPREV            # the previous release
    python3 gates/bench/gate.py ab ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc
@@ -82,10 +83,10 @@ from.
      needs the server and client cores 90 % idle (`run.sh` refuses otherwise), so plan for a
      quiet hour. TODO: replace this estimate with the
      measured time of the first gate session (`time python3 gates/bench/gate.py ab …`).
-   - **Output.** `gates/bench/runs/gate-ab-<date>-<time>/` holds `verdict.json`, `report.md` and a
+   - **Output.** `$FERROFIN_GATES_DIR/runs/bench-gate-ab-<date>-<time>/` holds `verdict.json`, `report.md` and a
      self-contained `report.html` that opens from disk. Each candidate run's own `report.html`
-     also lists the gated cells' verdicts, and `python3 gates/bench/report.py --serve` shows the
-     session's runs on its Benchmark tab as `gate-ab-<date>-<time>/01-a` … `06-b`.
+     also lists the gated cells' verdicts, and `python3 gates/bench/report.py --serve 8097 "$FERROFIN_GATES_DIR/runs"`
+     shows the session's runs on its Benchmark tab as `bench-gate-ab-<date>-<time>/01-a` … `06-b`.
      `gate.py ab` exits `1` when the gate blocks.
    - **Scan and migration.** `gate.py scan` runs the same six-run order with
      `gates/bench/scan.py` in place of `run.sh`: a full library scan of the bench corpus on an
@@ -94,7 +95,7 @@ from.
      needs the same idle cores and the same test data (at least 10,000 items), and refuses
      a stale oracle pin the same way, although it never boots Jellyfin. A self-A/B
      of v1.3.2 took 20 minutes from start to report on the shared host. Output goes to
-     `gates/bench/runs/gate-scan-<date>-<time>/` with the same session files (`verdict.json`,
+     `$FERROFIN_GATES_DIR/runs/bench-gate-scan-<date>-<time>/` with the same session files (`verdict.json`,
      `report.md`, `report.html`), and it exits `1` when it blocks. Its runs hold `scan.json`
      and no `run.json`, so `report.py --serve` does not list them: open the session's
      `report.html` from disk.
@@ -132,7 +133,7 @@ from.
    the per-endpoint pass.
 
    **Throughput ceiling.** Measure it in the same window as the gate. It is a separate
-   session (output in `gates/bench/runs/gate-ramp-<date>-<time>/`, with the same oracle-pin
+   session (output in `$FERROFIN_GATES_DIR/runs/bench-gate-ramp-<date>-<time>/`, with the same oracle-pin
    refusal and the same rule that a failed run stops the session):
    `python3 gates/bench/gate.py ramp ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc`
    ([`gates/bench/README.md`](gates/bench/README.md#throughput-ceiling-the-saturation-ramp)). Each run is
@@ -169,7 +170,7 @@ from.
    one that cannot be judged because its answers differ between runs. Every other endpoint is
    reported; file a regression there as an issue. The oracle-pin refusal and the rule that a
    failed run stops the session are the same as the A/B's. Output goes to
-   `gates/bench/runs/gate-endpoints-<date>-<time>/`. **Wall time:** one
+   `$FERROFIN_GATES_DIR/runs/bench-gate-endpoints-<date>-<time>/`. **Wall time:** one
    Ferrofin run measured on the shared host took 77 minutes (a 50 s warm-up, then 4,551 s
    measuring, after the scan every Ferrofin boot does), so the six runs take about eight hours.
    Nearly all of it is the 1,836 parameter combinations of `gates/parity/requests/sweep/combos.jsonl`

@@ -25,11 +25,33 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Tooling
 - The four live checks moved under `gates/`: `bench/` → `gates/bench/`, `adoption/` →
-  `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. Each gate
-  behaves as before; run directories default to `gates/bench/runs/` and
-  `gates/parity/runs/`, and the benchmark corpus to `gates/bench/testdata/`, so an existing
-  `bench/testdata/`, `bench/runs/` or `parity/runs/` is moved by hand (the corpus can also be
-  passed with `--testdata`)
+  `gates/adoption/`, `parity/` → `gates/parity/`, `verify/` → `gates/verify/`. Every gate
+  takes its directories from one output root, `FERROFIN_GATES_DIR` (absolute, on a local
+  disk, outside the repository): fixtures in `fixtures/` (`adoption-<key>`,
+  `bench-testdata`), scratch in `work/<gate>/`, runs in `runs/<gate>-<name>/`
+  (`gates/lib.sh`). `--fixtures`, `--testdata`, `--out` and `ADOPTION_WORK_DIR` still win;
+  with neither, a gate stops and names the variable. An existing corpus or run directory
+  (`bench/testdata/`, `bench/runs/`, `parity/runs/`) is moved under the root by hand (a run
+  renamed `bench-<name>` or `parity-<name>`), or passed with `--testdata` or `--out`
+- `gates/run <gate|all>` validates one commit with one image (`gates/README.md`). A preflight
+  names every cause that would stop it before any gate starts: a missing tool, an image
+  missing or not built from the checked-out commit (its `org.opencontainers.image.revision`
+  label, set with `docker build --build-arg SOURCE_COMMIT=…`), a fixture not built, another
+  session holding the root's lock, busy cores, or a container another run left. Each gate
+  then writes into one session folder, `runs/<branch>-<YYYYMMDD-HHMM>/`, beside a
+  `session.json` with every gate's status. `gates/verify/run.sh` runs the scan-behaviour
+  check against a fresh server started from an image, and `gates/bench/run.sh` measures
+  `FERROFIN_BENCH_IMAGE` (default `ferrofin:bench`)
+- Every gates session ends with one report, `index.html` and `report.md` in its folder
+  (`gates/report.py`): the commit, images and oracle pin, and each gate's verdict and counts
+  (verify's checks, adoption's rows, parity's new and unfiled differences, bench's phases or
+  gated A/B cells), with links to its own report. Adoption, parity and the A/B gate are judged
+  by their own code. A gate that did not run, or whose result is missing or unreadable, is
+  shown as such. `scan-behaviour.sh --json FILE` writes its rows as data
+- A root `Makefile` for the gates: `make run-gates` runs all four, `make run-verify`,
+  `run-adoption`, `run-parity` and `run-bench` one (`IMAGE=` and `PREVIOUS=` passed to
+  `gates/run`), and `make test-gates-offline` the gates' own shellcheck, bats and Python tests,
+  which CI's shell-tests job now runs through it
 - `gates/adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
   (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0) through an image on fresh
   fixture copies and diffs the answers against Jellyfin 12.2's own; fixtures are derived
