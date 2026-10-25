@@ -29,7 +29,7 @@ use ferrofin_model::providers::RemoteSubtitleInfo;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::PluginManager;
 use ferrofin_traits::subtitles::{
-    SubtitleMediaType, SubtitleProvider, SubtitleResponse, SubtitleSearchRequest,
+    ProviderLogin, SubtitleMediaType, SubtitleProvider, SubtitleResponse, SubtitleSearchRequest,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -100,6 +100,46 @@ struct LoginRequest<'a> {
 #[derive(Deserialize)]
 struct LoginResponse {
     token: String,
+    /// The account the token belongs to (upstream's `LoginInfo.User`).
+    #[serde(default)]
+    user: Option<LoginUser>,
+}
+
+/// The account block of a login reply (upstream's `UserInfo`).
+#[derive(Deserialize)]
+struct LoginUser {
+    /// The account's allowed downloads per day.
+    #[serde(default)]
+    allowed_downloads: Option<i32>,
+}
+
+/// An error reply's `{"message": …}` (upstream's `ErrorResponse`).
+#[derive(Deserialize)]
+struct ErrorReply {
+    message: Option<String>,
+}
+
+/// Why a login produced no token.
+enum LoginFailure {
+    /// OpenSubtitles answered with a failure status and this body.
+    Rejected {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    /// The request itself failed.
+    Request(ServiceError),
+}
+
+impl LoginFailure {
+    /// The failure as the download path reports it.
+    fn into_service_error(self) -> ServiceError {
+        match self {
+            Self::Rejected { status, .. } => {
+                ServiceError::unauthorized(format!("OpenSubtitles login failed: HTTP {status}"))
+            }
+            Self::Request(error) => error,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -466,6 +506,14 @@ impl OpenSubtitlesProvider {
 
     /// Exchanges the account credentials for a bearer token.
     async fn login(&self, cfg: &OpenSubtitlesConfig) -> Result<String, ServiceError> {
+        self.login_reply(cfg)
+            .await
+            .map(|reply| reply.token)
+            .map_err(LoginFailure::into_service_error)
+    }
+
+    /// `OpenSubtitlesApi.LogInAsync`: the login reply, or why there is none.
+    async fn login_reply(&self, cfg: &OpenSubtitlesConfig) -> Result<LoginResponse, LoginFailure> {
         let resp = self
             .http
             .post(format!("{}/login", self.base_url))
@@ -478,15 +526,36 @@ impl OpenSubtitlesProvider {
             })
             .send_limited(&self.limiter)
             .await
-            .map_err(request_err)?;
-        if !resp.status().is_success() {
-            return Err(ServiceError::unauthorized(format!(
-                "OpenSubtitles login failed: HTTP {}",
-                resp.status()
-            )));
+            .map_err(|e| LoginFailure::Request(request_err(e)))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.counted_text().await.unwrap_or_default();
+            return Err(LoginFailure::Rejected { status, body });
         }
-        let body: LoginResponse = resp.counted_json().await.map_err(net_err)?;
-        Ok(body.token)
+        resp.counted_json()
+            .await
+            .map_err(|e| LoginFailure::Request(net_err(e)))
+    }
+
+    /// `OpenSubtitlesApi.LogOutAsync`: ends the session `token` opened. Best
+    /// effort: the login it follows already answered the question.
+    async fn logout(&self, cfg: &OpenSubtitlesConfig, token: &str) {
+        let result = self
+            .http
+            .delete(format!("{}/logout", self.base_url))
+            .header("Api-Key", cfg.effective_api_key())
+            .header(reqwest::header::USER_AGENT, USER_AGENT)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .bearer_auth(token)
+            .send_limited(&self.limiter)
+            .await;
+        match result {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => tracing::debug!(status = %resp.status(), "OpenSubtitles logout refused"),
+            Err(error) => {
+                tracing::debug!(error = %request_err(error), "OpenSubtitles logout failed");
+            }
+        }
     }
 
     /// The session's token for `cfg`, logging in when there is none for that
@@ -612,19 +681,74 @@ impl OpenSubtitlesProvider {
         Err(download_limit_reached())
     }
 
-    /// Validates the supplied credentials by attempting a login. Returns `Ok(())`
-    /// on success.
+    /// Validates the supplied credentials by attempting a login, then logs the
+    /// session it opened out again and reports the account's allowed downloads
+    /// (the plugin's `ValidateLoginInfo`).
     ///
     /// # Errors
-    /// Returns [`ServiceError::Unauthorized`] if the credentials are rejected or
-    /// [`ServiceError::Backend`] on a transport error.
-    pub async fn validate_config(&self, cfg: &OpenSubtitlesConfig) -> Result<(), ServiceError> {
+    /// Returns [`ServiceError::Unauthorized`] with upstream's message if the
+    /// credentials are rejected, or [`ServiceError::Backend`] on a transport
+    /// error.
+    pub async fn validate_config(
+        &self,
+        cfg: &OpenSubtitlesConfig,
+    ) -> Result<ProviderLogin, ServiceError> {
         if !cfg.is_configured() {
             return Err(ServiceError::invalid_input(
                 "OpenSubtitles account or API key is not configured",
             ));
         }
-        self.login(cfg).await.map(|_| ())
+        match self.login_reply(cfg).await {
+            Ok(reply) => {
+                self.logout(cfg, &reply.token).await;
+                Ok(ProviderLogin {
+                    allowed_downloads: reply
+                        .user
+                        .and_then(|user| user.allowed_downloads)
+                        .unwrap_or(0),
+                })
+            }
+            Err(LoginFailure::Rejected { status, body }) => Err(ServiceError::unauthorized(
+                rejected_login_message(status, &body),
+            )),
+            Err(LoginFailure::Request(error)) => Err(error),
+        }
+    }
+}
+
+/// `ValidateLoginInfo`'s message for a rejected login: the status and, under
+/// 150 characters, the body; or the body's own `message`, with the shared
+/// key's refusal reworded.
+///
+/// The status is named by its reason phrase run together, which is how
+/// .NET's `HttpStatusCode` prints the codes `/login` answers with (400, 401,
+/// 403, 429, 5xx); a few rarer ones differ (`PayloadTooLarge` against
+/// `RequestEntityTooLarge`, say).
+///
+/// Upstream deserializes any body containing `message":` and fails the
+/// request (a 500) when it is not JSON after all, or answers
+/// `{"Message": null}` when the JSON has no `message`; both keep the status
+/// message here.
+fn rejected_login_message(status: reqwest::StatusCode, body: &str) -> String {
+    if body.contains("message\":")
+        && let Ok(ErrorReply {
+            message: Some(message),
+        }) = serde_json::from_str(body)
+    {
+        return if message == "You cannot consume this service" {
+            "Invalid API key provided".to_owned()
+        } else {
+            message
+        };
+    }
+    let code = status.canonical_reason().map_or_else(
+        || status.as_u16().to_string(),
+        |reason| reason.replace([' ', '-', '\''], ""),
+    );
+    if body.encode_utf16().count() < 150 {
+        format!("{code} - {body}")
+    } else {
+        code
     }
 }
 
@@ -795,7 +919,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
         Ok(results)
     }
 
-    async fn validate_login(&self, config_json: &[u8]) -> Result<(), ServiceError> {
+    async fn validate_login(&self, config_json: &[u8]) -> Result<ProviderLogin, ServiceError> {
         let cfg: OpenSubtitlesConfig = serde_json::from_slice(config_json)
             .map_err(|_| ServiceError::invalid_input("invalid OpenSubtitles configuration"))?;
         self.validate_config(&cfg).await
@@ -1039,6 +1163,84 @@ mod tests {
                     .any(|line| line.eq_ignore_ascii_case(&format!("api-key: {expected}")))
             );
         }
+    }
+
+    /// gl-25: `ValidateLoginInfo` reports the account's allowed downloads and
+    /// logs the session it opened out again (`LogOutAsync`); a refused login
+    /// is never logged out.
+    #[tokio::test]
+    async fn validating_an_account_reports_its_downloads_and_logs_out() {
+        let mock = ApiMock::start(|_| {
+            vec![
+                (
+                    "/login",
+                    vec![(
+                        200,
+                        format!(
+                            r#"{{"token":"{}","user":{{"allowed_downloads":100}}}}"#,
+                            token(FUTURE_PAYLOAD)
+                        ),
+                    )],
+                ),
+                ("/logout", vec![(200, "{}".to_owned())]),
+            ]
+        });
+        let mock = mock.await;
+        let (provider, _) = account_provider(&mock, "user");
+        let login = provider
+            .validate_login(br#"{"Username":"user","Password":"secret"}"#)
+            .await
+            .expect("valid account");
+        assert_eq!(login.allowed_downloads, 100);
+        assert_eq!(mock.count("POST /login"), 1);
+        assert_eq!(mock.count("DELETE /logout"), 1);
+
+        let refusing = ApiMock::start(|_| {
+            vec![(
+                "/login",
+                vec![(
+                    401,
+                    r#"{"message":"Error, invalid username/password"}"#.to_owned(),
+                )],
+            )]
+        })
+        .await;
+        let (provider, _) = account_provider(&refusing, "user");
+        let error = provider
+            .validate_login(br#"{"Username":"user","Password":"wrong"}"#)
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(&error, ServiceError::Unauthorized(m) if m == "Error, invalid username/password"),
+            "{error:?}"
+        );
+        assert_eq!(refusing.count("DELETE /logout"), 0);
+    }
+
+    /// `ValidateLoginInfo`'s message: `"{response.Code} - {body}"` for a body
+    /// under 150 characters, the bare code otherwise, and the body's own
+    /// `message` when it has one, the shared key's refusal reworded.
+    #[rstest::rstest]
+    #[case(
+        401,
+        r#"{"message":"You cannot consume this service"}"#,
+        "Invalid API key provided"
+    )]
+    #[case(
+        401,
+        r#"{"message":"Error, invalid username/password","status":401}"#,
+        "Error, invalid username/password"
+    )]
+    #[case(403, "nope", "Forbidden - nope")]
+    #[case(429, r#"x"message":y"#, "TooManyRequests - x\"message\":y")]
+    #[case(502, &"z".repeat(150), "BadGateway")]
+    fn a_rejected_login_is_explained_as_upstream_does(
+        #[case] status: u16,
+        #[case] body: &str,
+        #[case] expected: &str,
+    ) {
+        let status = reqwest::StatusCode::from_u16(status).unwrap();
+        assert_eq!(rejected_login_message(status, body), expected);
     }
 
     /// A mocked OpenSubtitles API. Each route (a path substring) answers its

@@ -46,7 +46,9 @@ use ferrofin_traits::library::{LibraryManager, MediaSourceManager};
 use ferrofin_traits::media_encoding::SubtitleEncoder;
 use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use ferrofin_traits::persistence::ItemWithCounts;
-use ferrofin_traits::subtitles::{SubtitleManager, SubtitleResponse, SubtitleSearchRequest};
+use ferrofin_traits::subtitles::{
+    ProviderLogin, SubtitleManager, SubtitleResponse, SubtitleSearchRequest,
+};
 use ferrofin_traits::system::ServerApplicationPaths;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -395,16 +397,23 @@ impl SubtitleManager for CannedSubtitles {
     ) -> Result<Vec<ferrofin_model::providers::SubtitleProviderInfo>, ServiceError> {
         Ok(Vec::new())
     }
+    /// Accepts every account but `bad`, whose login OpenSubtitles refuses.
     async fn validate_provider_login(
         &self,
         provider_name: &str,
         config_json: &[u8],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<ProviderLogin, ServiceError> {
         self.logins
             .lock()
             .unwrap()
             .push((provider_name.to_owned(), config_json.to_vec()));
-        Ok(())
+        let config: serde_json::Value = serde_json::from_slice(config_json).unwrap();
+        if config["Username"] == "bad" {
+            return Err(ServiceError::Unauthorized("Unauthorized - nope".to_owned()));
+        }
+        Ok(ProviderLogin {
+            allowed_downloads: 20,
+        })
     }
 }
 
@@ -812,6 +821,14 @@ async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // gl-25: `Ok(new { Downloads = …AllowedDownloads ?? 0 })`.
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"Downloads": 20})
+    );
     let logins = subtitles.logins.lock().unwrap().clone();
     assert_eq!(logins.len(), 1);
     assert_eq!(logins[0].0, "opensubtitles");
@@ -825,6 +842,22 @@ async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
     let response = post(None, r#"{"Username":"u"}"#).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(subtitles.logins.lock().unwrap().len(), 1);
+
+    // gl-25: a refused login is `Unauthorized(new { Message = msg })`.
+    let response = post(
+        Some("application/json"),
+        r#"{"Username":"bad","Password":"p"}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"Message": "Unauthorized - nope"})
+    );
 }
 
 // ---- FallbackFont ----------------------------------------------------------
@@ -1012,6 +1045,14 @@ async fn subtitle_management_gates_every_operation_but_deletion_requires_admin()
                 format!("/Videos/{ITEM_ID}/Subtitles/1"),
                 "",
                 StatusCode::NO_CONTENT,
+            ),
+            // gl-25: the plugin controller is `[Authorize(Policy =
+            // Policies.SubtitleManagement)]`, as the contract records.
+            (
+                "POST",
+                "/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo".to_owned(),
+                r#"{"Username":"u","Password":"p"}"#,
+                StatusCode::OK,
             ),
         ] {
             let permitted = admin || api_key || (enabled && method != "DELETE");

@@ -828,26 +828,55 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 /// `POST /Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo` — validate the
 /// OpenSubtitles credentials the dashboard is about to save.
 ///
-/// Ports the OpenSubtitles plugin's login-check action: the posted
-/// `{ApiKey,Username,Password}` body is validated by attempting a real login via
-/// the provider. `200` means the credentials work; a rejected login is `401`, a
-/// missing account and API key override `400`. The API key is optional when
-/// account credentials are provided (Jellyfin's shared key is used).
+/// Ports the OpenSubtitles plugin's login-check action
+/// (`OpenSubtitlesController.ValidateLoginInfo`, plugin v25), which the
+/// controller's `[Authorize(Policy = Policies.SubtitleManagement)]` gates: the
+/// posted `{ApiKey,Username,Password}` body is validated by attempting a real
+/// login via the provider, which logs the session out again. `200
+/// {"Downloads": n}` means the credentials work (the account's allowed
+/// downloads); a rejected login is `401 {"Message": …}`, a missing account and
+/// API key override `400`. The API key is optional when account credentials
+/// are provided (Jellyfin's shared key is used).
 ///
 /// The body binds like every MVC body (member names ignoring case), then
 /// reaches the provider in its canonical PascalCase.
 async fn validate_open_subtitles_login(
-    RequireAuth(_auth): RequireAuth,
+    RequireSubtitleManagement(_auth): RequireSubtitleManagement,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<LoginInfoBody>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let canonical =
         serde_json::to_vec(&body).map_err(|e| ApiError::BadRequest(format!("login info: {e}")))?;
-    state
+    match state
         .subtitles
         .validate_provider_login("opensubtitles", &canonical)
-        .await?;
-    Ok(StatusCode::OK)
+        .await
+    {
+        Ok(login) => Ok(Json(ValidatedLogin {
+            downloads: login.allowed_downloads,
+        })
+        .into_response()),
+        Err(ferrofin_traits::error::ServiceError::Unauthorized(message)) => {
+            Ok((StatusCode::UNAUTHORIZED, Json(RejectedLogin { message })).into_response())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// `ValidateLoginInfo`'s success body, `Ok(new { Downloads })`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct ValidatedLogin {
+    /// The account's allowed downloads per day.
+    downloads: i32,
+}
+
+/// `ValidateLoginInfo`'s rejection body, `Unauthorized(new { Message })`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct RejectedLogin {
+    /// Why OpenSubtitles refused the login.
+    message: String,
 }
 
 /// The `ValidateLoginInfo` body: upstream's `LoginInfoInput`

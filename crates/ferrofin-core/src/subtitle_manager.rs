@@ -32,7 +32,8 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, SelfWrite, SelfWriteGuard, VirtualFolderManager};
 use ferrofin_traits::persistence::{MediaStreamQuery, MediaStreamRepository};
 use ferrofin_traits::subtitles::{
-    SubtitleManager, SubtitleMediaType, SubtitleProvider, SubtitleResponse, SubtitleSearchRequest,
+    ProviderLogin, SubtitleManager, SubtitleMediaType, SubtitleProvider, SubtitleResponse,
+    SubtitleSearchRequest,
 };
 
 use crate::db_error::{db_err, media_stream_type_disc};
@@ -573,7 +574,7 @@ impl SubtitleManager for FerrofinSubtitleManager {
         &self,
         provider_name: &str,
         config_json: &[u8],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<ProviderLogin, ServiceError> {
         let provider = self
             .providers
             .iter()
