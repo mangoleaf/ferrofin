@@ -20,9 +20,10 @@ fake_findmnt() { # fake_findmnt <fstype[,fstype…]> — every path reports thes
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" %s\n' "${1//,/ }" > bin/findmnt; chmod +x bin/findmnt
 }
 
-fake_tools() { # docker and taskset that do nothing, so a script gets as far as its inputs
+fake_tools() { # docker and taskset that do nothing, first on PATH, so a script gets as far as its inputs
   printf '#!/usr/bin/env bash\nexit 0\n' > bin/docker; printf '#!/usr/bin/env bash\nexit 0\n' > bin/taskset
   chmod +x bin/docker bin/taskset
+  PATH="$TMP/bin:$PATH"
 }
 
 @test "gates_require_local: network filesystems are refused, local ones (FUSE included) accepted" {
@@ -168,7 +169,7 @@ fake_tools() { # docker and taskset that do nothing, so a script gets as far as 
 }
 
 @test "parity/run.sh: the corpus comes from --testdata, else the root; the flags win; with neither, one line naming FERROFIN_GATES_DIR" {
-  fake_tools; PATH="$TMP/bin:$PATH"
+  fake_tools
   run "$GATES/parity/run.sh" --oracle o --ferrofin f
   [ "$status" -eq 2 ]
   [ "$output" = "parity: set FERROFIN_GATES_DIR to the gates' output root, or pass the directory explicitly" ]
@@ -182,5 +183,25 @@ fake_tools() { # docker and taskset that do nothing, so a script gets as far as 
   mkdir taken
   FERROFIN_GATES_DIR=$ROOT run "$GATES/parity/run.sh" --oracle o --ferrofin f --out taken
   [[ "$output" == *"$TMP/taken exists: a run directory is never reused"* ]]
+  [ ! -e "$ROOT" ]
+}
+
+@test "verify/run.sh: the run directory comes from --out, else the root; a missing image is refused before anything starts" {
+  fake_tools
+  run "$GATES/verify/run.sh" --image any
+  [ "$status" -eq 2 ]
+  [ "$output" = "verify: set FERROFIN_GATES_DIR to the gates' output root, or pass the directory explicitly" ]
+  printf '#!/usr/bin/env bash\nexit 1\n' > bin/docker   # no image
+  FERROFIN_GATES_DIR=$ROOT run "$GATES/verify/run.sh" --image any
+  [ "$status" -eq 2 ]
+  [ "$output" = "verify: image any missing" ]
+  for bad in 0 65536 abc; do
+    VERIFY_PORT=$bad run "$GATES/verify/run.sh" --image any --out out
+    [ "$status" -eq 2 ]
+    [[ "$output" == "verify: VERIFY_PORT "* ]]
+  done
+  mkdir taken
+  FERROFIN_GATES_DIR=$ROOT run "$GATES/verify/run.sh" --image any --out taken
+  [ "$output" = "verify: $TMP/taken exists: a run directory is never reused" ]
   [ ! -e "$ROOT" ]
 }

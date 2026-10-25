@@ -45,9 +45,9 @@ PARITY_CAP_S=${PARITY_CAP_S:-7200}
 PARITY_REQUEST_TIMEOUT=${PARITY_REQUEST_TIMEOUT:-30}
 PARITY_CONCURRENCY=${PARITY_CONCURRENCY:-4}   # reads in flight per server; writes are serial (decision D4)
 DRAIN_TIMEOUT_S=${DRAIN_TIMEOUT_S:-300}   # this and the settings below are gates/bench/run.sh's
-CORE_IDLE_MIN=${CORE_IDLE_MIN:-0.90}   # the server and client cores must be this idle before a run starts
-SERVER_CPUS=${SERVER_CPUS:-8-15}       # the benchmark's server cpuset: each server gets half of it
-CLIENT_CPUS=${CLIENT_CPUS:-16-19}
+CORE_IDLE_MIN=${CORE_IDLE_MIN:-$GATES_CORE_IDLE_MIN}   # the server and client cores must be this idle before a run starts
+SERVER_CPUS=${SERVER_CPUS:-$GATES_SERVER_CPUS}         # the benchmark's server cpuset: each server gets half of it
+CLIENT_CPUS=${CLIENT_CPUS:-$GATES_CLIENT_CPUS}
 MEMORY=${MEMORY:-8g}                   # per server, swap disabled
 PIN=${PARITY_PIN:-1}
 ORACLE_PORT=${PARITY_ORACLE_PORT:-18111}    # beside the benchmark's 18101 and 18103
@@ -135,9 +135,7 @@ if [ "$PIN" = 1 ]; then
   (( (hi - lo + 1) % 2 == 0 && hi > lo )) || die "SERVER_CPUS needs an even number of cpus to give each server half"
   half=$(( (hi - lo + 1) / 2 ))
   ORACLE_CPUS=$lo-$((lo + half - 1)); FERROFIN_CPUS=$((lo + half))-$hi
-  topology=$(python3 gates/bench/mem_sample.py --topology "$SERVER_CPUS" "$CLIENT_CPUS") || die "invalid CPU allocation"
-  idle=$(python3 gates/bench/mem_sample.py --check "$(jq -r '.checked_cpus|map(tostring)|join(",")' <<<"$topology")")
-  awk -v i="$idle" -v m="$CORE_IDLE_MIN" -v c="$SERVER_CPUS,$CLIENT_CPUS" 'BEGIN { if (i < m) { printf "cores %s are only %.0f%% idle (need %.0f%%): something else is using them\n", c, i*100, m*100; exit 1 } }' || exit 2
+  gates_idle_check "$SERVER_CPUS" "$CLIENT_CPUS" "$CORE_IDLE_MIN" || exit 2
 fi
 
 # ── the run ───────────────────────────────────────────────────────────────────────────────────

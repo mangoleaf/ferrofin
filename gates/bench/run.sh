@@ -23,8 +23,8 @@
 # --testdata defaults to $FERROFIN_GATES_DIR/fixtures/bench-testdata and --out to
 # $FERROFIN_GATES_DIR/runs/bench-<name> (the output root's layout is in gates/lib.sh).
 #
-# Requires: docker, k6, python3, jq; the pinned Jellyfin image
-# and ferrofin:bench (docker build -t ferrofin:bench .).
+# Requires: docker, k6, python3, jq; the pinned Jellyfin image and the Ferrofin image under test,
+# FERROFIN_BENCH_IMAGE (default ferrofin:bench: docker build -t ferrofin:bench .).
 set -euo pipefail
 CALLER=$PWD
 cd "$(dirname "$0")/../.."
@@ -54,7 +54,7 @@ export CLEANUP_TIMEOUT_S=${CLEANUP_TIMEOUT_S:-30}
 export COLDSTART_ATTEMPT_TIMEOUT_MS=${COLDSTART_ATTEMPT_TIMEOUT_MS:-100}  # one cold-start readiness attempt
 SAMPLE_BRACKET_INTERVALS=${SAMPLE_BRACKET_INTERVALS:-2}
 SAMPLE_GAP_INTERVALS=${SAMPLE_GAP_INTERVALS:-5}
-CORE_IDLE_MIN=${CORE_IDLE_MIN:-0.90}  # the server/client cores must be this idle before a run starts
+CORE_IDLE_MIN=${CORE_IDLE_MIN:-$GATES_CORE_IDLE_MIN}  # the server/client cores must be this idle before a run starts
 RATE_UNLOADED=${RATE_UNLOADED:-1}   # screens per second
 RATE_LOADED=${RATE_LOADED:-5}
 #: The third level exists to push the servers past a comfortable browse: 25 screens/s
@@ -97,9 +97,10 @@ SOAK_SKIP_S=${SOAK_SKIP_S:-600}
 ENDPOINT_COUNT=${ENDPOINT_COUNT:-200}
 ENDPOINT_MAX_S=${ENDPOINT_MAX_S:-10}
 ENDPOINT_SETS=${ENDPOINT_SETS:-gates/parity/requests/sweep,gates/parity/requests/edge}
-export SERVER_CPUS=${SERVER_CPUS:-8-15}    # cpuset for the server under test
-export CLIENT_CPUS=${CLIENT_CPUS:-16-19}   # cpuset for k6 / the python clients / the sampler
+export SERVER_CPUS=${SERVER_CPUS:-$GATES_SERVER_CPUS}   # cpuset for the server under test (gates/lib.sh)
+export CLIENT_CPUS=${CLIENT_CPUS:-$GATES_CLIENT_CPUS}   # cpuset for k6 / the python clients / the sampler
 MEMORY=${MEMORY:-8g}                # cgroup limit, swap disabled (part of the memory number's definition)
+FERROFIN_BENCH_IMAGE=${FERROFIN_BENCH_IMAGE:-ferrofin:bench}   # the Ferrofin image measured (gates/run names it)
 
 TESTDATA=""; SERVERS=jellyfin,ferrofin; ONLY=""; OUT=""
 while [ $# -gt 0 ]; do case "$1" in
@@ -170,7 +171,7 @@ for p in "$TESTDATA" "$OUT"; do case "$p" in /mnt/mangonas*|/mnt/nvme0/k3s*) ech
 
 docker_cmd() { timeout --kill-after=2 "$HTTP_TIMEOUT_S" docker "$@"; }
 die() { echo "run: $*" >&2; exit 1; }
-image_of() { case "$1" in jellyfin) cat gates/bench/testdata/jellyfin-image.txt;; ferrofin) echo ferrofin:bench;; *) die "unknown server $1";; esac; }
+image_of() { case "$1" in jellyfin) cat gates/bench/testdata/jellyfin-image.txt;; ferrofin) echo "$FERROFIN_BENCH_IMAGE";; *) die "unknown server $1";; esac; }
 port_of() { case "$1" in jellyfin) echo 18101;; ferrofin) echo 18103;; esac; }
 want() { [ -z "$ONLY" ] || [[ ",$ONLY," == *",$1,"* ]]; }
 explicit() { [[ ",$ONLY," == *",$1,"* ]]; }   # opt-in phases never run by default
@@ -199,19 +200,21 @@ if [[ ",$SERVERS," == *,jellyfin,* ]]; then
 fi
 echo "servers: $SERVERS; selected phases: ${ONLY:-all}; warm-up ${WARMUP_S}s; windows ${WINDOW_S}s"
 [ -z "$(docker_cmd ps -aq --filter name=^bench-)" ] || die "a bench-* container exists (docker rm -f it first)"
-topology=$(python3 gates/bench/mem_sample.py --topology "$SERVER_CPUS" "$CLIENT_CPUS") || die "invalid CPU allocation"
-checked_cpus=$(jq -r '.checked_cpus|map(tostring)|join(",")' <<<"$topology")
-idle=$(python3 gates/bench/mem_sample.py --check "$checked_cpus")
-awk -v i="$idle" -v m="$CORE_IDLE_MIN" -v c="$SERVER_CPUS,$CLIENT_CPUS" 'BEGIN { if (i < m) { printf "cores %s are only %.0f%% idle (need %.0f%%) — something else is using them\n", c, i*100, m*100; exit 1 } }' || exit 1
+gates_idle_check "$SERVER_CPUS" "$CLIENT_CPUS" "$CORE_IDLE_MIN" || exit 1
+topology=$GATES_TOPOLOGY idle=$GATES_IDLE
 mkdir -p "$OUT"
 IDS=$TESTDATA/ids.json; U=$(jq -r .user "$IDS"); TOK=$(jq -r .token "$IDS")
+# The run's name in run.json (and the published tables): its directory without the bench- prefix, or
+# for a gates/run session's bench/ folder, the session's name.
+RUN_NAME=${OUT##*/}; RUN_NAME=${RUN_NAME#bench-}
+[ "$RUN_NAME" != bench ] || RUN_NAME=$(basename "$(dirname "$OUT")")
 AUTH="Authorization: MediaBrowser Client=\"bench\", Device=\"bench\", DeviceId=\"bench-run\", Version=\"3\", Token=\"$TOK\""
 # The Jellyfin oracle pin; behind the latest Jellyfin release it only warns here (gate.py refuses).
 ORACLE=$(python3 gates/bench/oracle.py check) || die "cannot read the Jellyfin oracle pin"
 # The image ID measured, so a run can never be credited to the wrong build (gate.py retags).
-FERROFIN_IMAGE=$([[ ",$SERVERS," != *,ferrofin,* ]] || docker_cmd image inspect -f '{{.Id}}' ferrofin:bench)
+FERROFIN_IMAGE=$([[ ",$SERVERS," != *,ferrofin,* ]] || docker_cmd image inspect -f '{{.Id}}' "$FERROFIN_BENCH_IMAGE")
 DIRTY=$([ -z "$(git status --porcelain 2>/dev/null)" ] && echo false || echo true)
-jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$(basename "$OUT" | sed 's/^bench-//')" --argjson dirty "$DIRTY" --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)" \
+jq -n --arg sha "$SHA" --arg ferrofin_image "$FERROFIN_IMAGE" --arg name "$RUN_NAME" --argjson dirty "$DIRTY" --arg host "$(uname -srm)" --arg cpu "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)" \
   --arg browse_user "$U" --arg playback_user "$(jq -r .viewer "$IDS")" --arg mem "$MEMORY" --arg cpus "$SERVER_CPUS" --arg k6 "$(k6 version | head -1)" --arg testdata "$(jq -c .counts "$IDS")" \
   --argjson rate_unloaded "$RATE_UNLOADED" --argjson rate_loaded "$RATE_LOADED" --argjson rate_stress "$RATE_STRESS" \
   --argjson idle "$idle" --argjson idle_min "$CORE_IDLE_MIN" --argjson topology "$topology" --argjson bracket "$SAMPLE_BRACKET_INTERVALS" --argjson gap "$SAMPLE_GAP_INTERVALS" \

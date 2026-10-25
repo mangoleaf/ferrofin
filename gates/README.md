@@ -1,0 +1,54 @@
+# Gates
+
+The live checks that validate a Ferrofin build, one folder each. Each answers one question, and its
+own README defines its numbers:
+
+| Gate | Answers | Needs |
+|---|---|---|
+| [`verify/`](verify/README.md) | Does a library scan reprocess only what changed? | the image; `ffmpeg` for the scratch clips |
+| [`adoption/`](adoption/README.md) | Does every supported Jellyfin database adopt, intact? | the synthetic fixtures (`adoption/build-fixtures.sh`) |
+| [`parity/`](parity/README.md) | Do Jellyfin and Ferrofin answer jellyfin-web's requests alike? | the benchmark corpus, prepared for Jellyfin |
+| [`bench/`](bench/README.md) | How fast, and how much memory, against Jellyfin or the previous release? | the benchmark corpus; idle cores |
+
+## The output root
+
+Everything a gate creates goes under one directory, `FERROFIN_GATES_DIR`: an absolute path on a local
+disk, outside the repository (a root inside it would reach `docker build .`). Nothing is passed by hand:
+
+```
+$FERROFIN_GATES_DIR/
+  fixtures/      inputs built once: adoption-<key> (adoption/build-fixtures.sh), bench-testdata (bench/testdata/build.sh)
+  work/<gate>/   a gate's scratch, reused by its next run
+  runs/          one directory per run, never reused: a gates/run session, or <gate>-<name> for a gate run on its own
+  gates.lock     held by the gates/run session in progress
+```
+
+[`lib.sh`](lib.sh) resolves and checks it. A directory passed to a gate explicitly (`--fixtures`,
+`--testdata`, `--out`, `ADOPTION_WORK_DIR`) wins over it.
+
+## Running them
+
+`gates/run` validates one commit with one image, all four gates or the ones named:
+
+```bash
+export FERROFIN_GATES_DIR=/srv/gates
+gates/run all --dry-run          # the preflight and every gate's command; nothing starts
+docker build --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t IMAGE .   # the image the preflight names
+gates/run all                    # verify, adoption, parity, bench, in that order
+gates/run adoption               # one gate: a session all the same
+gates/run bench --previous ghcr.io/mangoleaf/ferrofin:vPREV   # bench as the release A/B gate
+```
+
+The image defaults to `ferrofin:<the commit, as git describe names it>`, and must carry the checked-out
+commit in its revision label (the `--build-arg` above). Before any gate starts, a preflight names
+every cause that would stop it: a missing tool, an image that is missing or built from another commit,
+a fixture not built yet, another session holding `gates.lock`, cores that are not idle, or a container
+another run left behind (never removed: it is not this session's). One session runs per output root,
+holding its `gates.lock`; sessions under two roots on one host are kept apart only by those container
+and idle-core checks, so keep one root per host.
+
+Each run is a session folder, `runs/<branch>-<YYYYMMDD-HHMM>/` (a rerun in the same minute gets
+`-run2`): `session.json` records the branch, commit, images, the Jellyfin oracle pin and each gate's
+status, times and exit status, beside each gate's own run directory and its `<gate>.log`. A gate that
+fails does not stop the next; `gates/run` exits 1 when one failed and 2 when the preflight refused.
+Each gate's own script still runs on its own; its README says how.

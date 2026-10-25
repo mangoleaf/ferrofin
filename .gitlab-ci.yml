@@ -337,6 +337,7 @@ benchmark-report:
     - python3 -m unittest discover -s gates/bench -p test_report.py
     - python3 -m unittest discover -s gates/bench -p test_ramp.py
     - python3 -m unittest discover -s gates/bench -p test_soak.py
+    - python3 -m unittest discover -s gates/bench -p test_viewer.py
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

@@ -1897,13 +1897,19 @@ def other_gate(harness, name):
 def list_runs(runs_dir):
     """Run dirs under runs_dir (anything with a run.json), newest first by the run's own date.
     A `gate.py` session (a directory holding `gate.json`) is searched one level down, and the
-    runs found there are named `<session>/<run>`; a scan session's runs have no run.json.
+    runs found there are named `<session>/<run>`; a scan session's runs have no run.json. A
+    gates/run session is read through its `bench/` folder, named `<session>/bench`.
     A session `gate.py render` wrote a report.html for is listed too, as `<session>`: the
     gate's own page, which is the only one a scan session has."""
     out = []
-    for session in os.listdir(runs_dir):
-        if other_gate("benchmark", session):
+    for entry in os.listdir(runs_dir):
+        # a gates/run session (gates/session.py) holds its benchmark in bench/: a run, or a gate.py session
+        if os.path.isfile(os.path.join(runs_dir, entry, "session.json")):
+            session = f"{entry}/bench"
+        elif other_gate("benchmark", entry):
             continue
+        else:
+            session = entry
         top = os.path.join(runs_dir, session)
         nested = os.path.isfile(os.path.join(top, "gate.json"))
         if nested and os.path.isfile(os.path.join(top, "report.html")):
@@ -1966,7 +1972,9 @@ def discover(harness, root):
         return list_runs(root)
     out, seen = [], set()
     for name in sorted(os.listdir(root)) + [os.path.basename(os.path.abspath(root))]:
-        if other_gate(harness, name):
+        if os.path.isfile(os.path.join(root, name, "session.json")):   # a gates/run session: its gate's folder
+            name = f"{name}/{harness}"
+        elif other_gate(harness, name):
             continue
         d = run_dir(root, name)
         page = d and os.path.join(d, "report.html")

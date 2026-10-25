@@ -317,11 +317,17 @@ def image_ref(image):
         return None
 
 
+def stop(signum, frame):
+    """SIGTERM (gates/run stopping its session) ends a session as Ctrl-C does: the running run gets
+    its own cleanup and the tag is put back (run_session's finally)."""
+    raise KeyboardInterrupt
+
+
 def run_sh(cmd):
     """A run (run.sh or scan.py) to completion. On Ctrl-C it gets SIGTERM and time to run
     its own cleanup (stop its container, finish phases.json): a killed run would leave a
     bench-* container behind that refuses the next run."""
-    proc = subprocess.Popen(cmd)
+    proc = subprocess.Popen(cmd, env=dict(os.environ, FERROFIN_BENCH_IMAGE=TAG))   # the tag it retags
     try:
         return proc.wait()
     except KeyboardInterrupt:
@@ -705,6 +711,7 @@ def main(argv):
     os.makedirs(session)
     with open(os.path.join(session, "gate.json"), "w") as f:
         json.dump(plan, f, indent=2)
+    signal.signal(signal.SIGTERM, stop)
     run_session(session, plan, testdata)
     md, block = render(session)
     print(md)

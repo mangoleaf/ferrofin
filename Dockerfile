@@ -91,6 +91,10 @@ RUN useradd --uid 1000 --user-group --home-dir /data --no-create-home \
       --shell /usr/sbin/nologin ferrofin \
  && mkdir -p /data && chown ferrofin:ferrofin /data
 USER ferrofin
+# The commit the image was built from, for gates/run to check before it measures anything:
+# docker build --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t <image> .
+ARG SOURCE_COMMIT=
+LABEL org.opencontainers.image.revision=$SOURCE_COMMIT
 VOLUME /data
 EXPOSE 8096 8920 7359/udp
 ENTRYPOINT ["ferrofin-server"]

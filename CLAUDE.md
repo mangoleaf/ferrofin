@@ -283,6 +283,9 @@ gates/bench/run.sh                                     # ~40 min → $FERROFIN_G
 python3 gates/bench/report.py --serve                  # compare runs at 127.0.0.1:8097
 ```
 
+`gates/run all` runs verify, adoption, parity and bench against one image as one session, after one
+preflight ([`gates/README.md`](gates/README.md)); each gate's own script still runs alone.
+
 Things that will otherwise cost you a run: the harness only ever *inspects* the
 `ferrofin:bench` image, so a stale image silently measures old code under a run name that
 claims the current commit. `run.sh` refuses to start unless the server/client cores are

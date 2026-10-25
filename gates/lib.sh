@@ -7,7 +7,8 @@
 #   fixtures/<kind>-<name>/  inputs built once and then reused (fixtures/adoption-<recipe>,
 #                            fixtures/bench-testdata)
 #   work/<gate>/             a gate's scratch, reused by its next run
-#   runs/<gate>-<name>/      one run's output, never reused
+#   runs/<session>/          a gates/run session: session.json and one folder per gate
+#   runs/<gate>-<name>/      a gate run on its own; every run directory is new, never reused
 # A directory passed explicitly (--fixtures, --testdata, --out, ADOPTION_WORK_DIR) wins over the
 # root. With neither, a gate stops with one line naming FERROFIN_GATES_DIR: there is no default.
 
@@ -28,6 +29,21 @@ gates_require_local() {
         echo "refusing $1: it is on a network filesystem ($fs); use a local disk" >&2; return 1;;
     esac
   done
+}
+
+# The cores the measuring gates (bench, parity) run on by default, and how idle they must be first.
+# shellcheck disable=SC2034  # read by the scripts that source this library
+GATES_SERVER_CPUS=8-15 GATES_CLIENT_CPUS=16-19 GATES_CORE_IDLE_MIN=0.90
+
+# gates_idle_check <server cpus> <client cpus> <minimum idle fraction>: whether those cores, their SMT
+# siblings included (gates/bench/mem_sample.py), are idle enough to measure on. Sets GATES_TOPOLOGY and
+# GATES_IDLE for the caller's record; a refusal is one line on stderr, and status 1.
+gates_idle_check() {
+  local sample=$GATES_LIB_DIR/bench/mem_sample.py
+  GATES_TOPOLOGY=$(python3 "$sample" --topology "$1" "$2") || { echo "invalid CPU allocation: $1 and $2" >&2; return 1; }
+  GATES_IDLE=$(python3 "$sample" --check "$(jq -r '.checked_cpus|map(tostring)|join(",")' <<<"$GATES_TOPOLOGY")") || return 1
+  awk -v i="$GATES_IDLE" -v m="$3" -v c="$1,$2" 'BEGIN { if (i < m) {
+    printf "cores %s are only %.0f%% idle (need %.0f%%): something else is using them\n", c, i*100, m*100; exit 1 } }' >&2
 }
 
 # gates_root <who>: the output root, absolute and physical (symlinks resolved); nothing is created.

@@ -20,6 +20,14 @@ It is one of three ways to see that scans behave:
 
 ## Running it
 
+Against a server of its own, started from an image: `gates/verify/run.sh --image IMAGE` boots a fresh
+Ferrofin (a new data directory, one movie and one TV library, `/metrics` on, real-time monitoring and
+every metadata fetcher off, outbound HTTP to an unreachable proxy), runs the check on each library and
+removes the container. Its rows and the server's log land in `$FERROFIN_GATES_DIR/runs/verify-<date>/`
+(or `--out DIR`); `gates/run verify` runs it as part of a gates session ([`gates/README.md`](../README.md)).
+
+Against any running Ferrofin:
+
 ```bash
 FERROFIN_TOKEN=… gates/verify/scan-behaviour.sh BASE_URL LIBRARY_ID SCRATCH_DIR [SERVER_SCRATCH_DIR]
 ```

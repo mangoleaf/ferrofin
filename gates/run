@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# gates/run <verify|adoption|parity|bench|all>[,<gate>…] [--image IMAGE] [--previous IMAGE] [--out ROOT] [--dry-run]
+#
+# One validation of one commit: a preflight of the host, then each chosen gate against one Ferrofin
+# image, all of it in one session folder under the output root (gates/lib.sh):
+#   runs/<branch>-<YYYYMMDD-HHMM>/      a rerun in the same minute gets -run2, -run3 …
+#     session.json                      branch, commit, dirty tree, images, oracle pin, and each gate's
+#                                       status, start, end and exit status (gates/session.py)
+#     <gate>/  <gate>.log               each gate's own run directory, and what it printed
+# The gates run in the order verify, adoption, parity, bench; one that fails does not stop the next.
+# Each gate's own script keeps working on its own.
+#
+#   --image IMAGE     the Ferrofin image under test; default ferrofin:<the commit as git describe names
+#                     it>. It must carry the checked-out commit in its revision label:
+#                       docker build --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t IMAGE .
+#   --previous IMAGE  the previous release's image: bench runs the release A/B gate against it
+#                     (gates/bench/gate.py ab) instead of the comparison with Jellyfin (run.sh)
+#   --out ROOT        the output root, in place of FERROFIN_GATES_DIR (one of the two is required)
+#   --dry-run         the preflight and the commands; nothing is started or created
+#
+# The preflight names every cause before any gate starts: a missing tool, an image that is missing
+# or was built from another commit, a fixture not built yet, a session already running under the
+# root (it holds gates.lock for its whole run), cores that are not idle (bench and parity), or a
+# container another run left behind. It never stops or removes anything of another run's.
+# Exit: 0 every gate passed; 1 a gate failed; 2 refused by the preflight; 129/130/143 interrupted.
+set -uo pipefail
+CALLER=$PWD
+SELF=$(cd "$(dirname "$0")" && pwd)/${0##*/}   # for usage, after the cd below
+cd "$(dirname "$0")/.." || exit 2
+# shellcheck source=gates/adoption/lib.sh
+. gates/adoption/lib.sh   # gates/lib.sh, and where the adoption fixtures are
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; }
+ORDER=(verify adoption parity bench)
+SELECTION=; IMAGE=; PREVIOUS=; DRY_RUN=false
+while [ $# -gt 0 ]; do
+  case $1 in
+    --image|--previous|--out) [ $# -ge 2 ] || { echo "run: $1 needs a value" >&2; exit 2; };;
+  esac
+  case $1 in
+    --image) IMAGE=$2; shift 2;;
+    --previous) PREVIOUS=$2; shift 2;;
+    --out) case $2 in /*) FERROFIN_GATES_DIR=$2;; *) FERROFIN_GATES_DIR=$CALLER/${2#./};; esac; export FERROFIN_GATES_DIR; shift 2;;
+    --dry-run) DRY_RUN=true; shift;;
+    -h|--help) usage; exit 0;;
+    -*) echo "run: unknown option $1" >&2; exit 2;;
+    *) [ -z "$SELECTION" ] || { echo "run: one gate list, comma-separated" >&2; exit 2; }; SELECTION=$1; shift;;
+  esac
+done
+[ -n "$SELECTION" ] || { usage >&2; exit 2; }
+GATES=()
+for gate in "${ORDER[@]}"; do
+  [[ ",$SELECTION," == *",$gate,"* || ",$SELECTION," == *,all,* ]] && GATES+=("$gate")
+done
+for gate in ${SELECTION//,/ }; do
+  [[ " all ${ORDER[*]} " == *" $gate "* ]] || { echo "run: unknown gate $gate: choose from all, ${ORDER[*]}" >&2; exit 2; }
+done
+(( ${#GATES[@]} )) || { usage >&2; exit 2; }
+ROOT=$(gates_root run) || exit 2
+export FERROFIN_GATES_DIR=$ROOT
+wants() { [[ " ${GATES[*]} " == *" $1 "* ]]; }
+
+COMMIT=$(git rev-parse HEAD) || exit 2
+BRANCH=$(git rev-parse --abbrev-ref HEAD)
+[ "$BRANCH" != HEAD ] || BRANCH="detached-${COMMIT:0:12}"
+DIRTY=$([ -z "$(git status --porcelain)" ] && echo false || echo true)
+if [ -z "$IMAGE" ]; then   # the commit as gates/bench/run.sh names its runs
+  if ! tag=$(git describe --tags --exact-match 2>/dev/null); then
+    tag=$(git describe --tags --long 2>/dev/null | sed -E 's/-([0-9]+)-g([0-9a-f]+)$/-\1-\2/') || tag=
+    [ -n "$tag" ] || tag=${COMMIT:0:12}
+  fi
+  ! $DIRTY || tag=$tag-dirty
+  IMAGE=ferrofin:$tag
+fi
+ORACLE_IMAGE=$(cat gates/bench/testdata/jellyfin-image.txt)
+TESTDATA=$ROOT/fixtures/bench-testdata
+ADOPTION_FIXTURES=$(adoption_fixtures_dir run) || exit 2
+
+# ── preflight ────────────────────────────────────────────────────────────────────────────────
+PROBLEMS=()
+problem() { PROBLEMS+=("$*"); }
+need() { # need <gate> <tool…>
+  local gate=$1 tool; shift
+  for tool; do command -v "$tool" >/dev/null || problem "$tool is not installed ($gate needs it)"; done
+}
+need run docker git jq python3 flock setsid
+! wants verify || need verify curl ffmpeg
+if wants adoption; then
+  need adoption sqlite3 curl
+  python3 -c 'from PIL import Image' 2>/dev/null || problem "Python Pillow is not installed (adoption needs it)"
+  python3 -c 'import icu' 2>/dev/null || problem "Python PyICU (python3-icu) is not installed (adoption needs it)"
+fi
+! wants parity || need parity curl timeout taskset
+! wants bench || need bench k6 taskset curl sha256sum timeout ffprobe
+[ -z "$PREVIOUS" ] || wants bench || problem "--previous is for the bench gate, which is not selected"
+image_id() { docker image inspect -f '{{.Id}}' "$1" 2>/dev/null; }
+IMAGE_ID='' PREVIOUS_ID=''
+if ! docker info >/dev/null 2>&1; then
+  problem "docker does not answer: is its daemon running, and may $(id -un) use it?"
+else
+  build_hint="docker build --build-arg SOURCE_COMMIT=$COMMIT -t $IMAGE ."
+  if ! IMAGE_ID=$(image_id "$IMAGE"); then
+    problem "image $IMAGE is missing: $build_hint"
+  else
+    revision=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" 2>/dev/null)
+    case $revision in "<no value>") revision=;; esac
+    [ "$revision" = "$COMMIT" ] || problem "image $IMAGE was built from ${revision:-an unrecorded commit}, not the checked-out $COMMIT: $build_hint"
+  fi
+  [ -z "$PREVIOUS" ] || PREVIOUS_ID=$(image_id "$PREVIOUS") || problem "image $PREVIOUS (--previous) is missing"
+  if wants parity || { wants bench && [ -z "$PREVIOUS" ]; }; then   # the Jellyfin both compare against
+    image_id "$ORACLE_IMAGE" >/dev/null || problem "the Jellyfin oracle image is missing: docker pull $ORACLE_IMAGE"
+  fi
+  declare -A PREFIX=([verify]=gates-verify [adoption]=adopt- [parity]=parity- [bench]=bench-)
+  for gate in "${GATES[@]}"; do
+    [ -z "$(docker ps -aq --filter "name=^${PREFIX[$gate]}")" ] \
+      || problem "a ${PREFIX[$gate]}* container is left from another run; it is not this session's to remove"
+  done
+fi
+if wants adoption; then
+  for input in "oracle/smoke-jellyfin-${ADOPTION_ORACLE:-12.2}.txt" media; do   # what gates/adoption/run.sh opens first
+    [ -e "$ADOPTION_FIXTURES/$input" ] \
+      || { problem "the adoption fixtures are not built in $ADOPTION_FIXTURES (no $input): gates/adoption/build-fixtures.sh"; break; }
+  done
+fi
+if wants parity || wants bench; then
+  [ -f "$TESTDATA/ids.json" ] || problem "the benchmark corpus is not built in $TESTDATA: gates/bench/testdata/build.sh"
+  if wants parity || [ -z "$PREVIOUS" ]; then   # Jellyfin boots a prepared copy of it
+    [ -f "$TESTDATA/jellyfin/preparation.json" ] || problem "the corpus is not prepared for Jellyfin: gates/bench/testdata/build.sh --prepare-jellyfin"
+  fi
+  # The pin, once for the session: behind the latest Jellyfin release it warns, as an ad-hoc run
+  # does, unless bench runs the release A/B gate, which refuses it (gates/bench/gate.py).
+  oracle=(check); [ -z "$PREVIOUS" ] || oracle+=(--gate)
+  python3 gates/bench/oracle.py "${oracle[@]}" >/dev/null || problem "the Jellyfin oracle pin was refused (see above)"
+  # One idle check for the session (gates/lib.sh); parity alone skips it with PARITY_PIN=0, as it does.
+  if wants bench || [ "${PARITY_PIN:-1}" != 0 ]; then
+    busy=$(gates_idle_check "${SERVER_CPUS:-$GATES_SERVER_CPUS}" "${CLIENT_CPUS:-$GATES_CLIENT_CPUS}" \
+      "${CORE_IDLE_MIN:-$GATES_CORE_IDLE_MIN}" 2>&1) || problem "$busy"
+  fi
+fi
+if $DRY_RUN; then
+  [ ! -e "$ROOT/gates.lock" ] || flock -n "$ROOT/gates.lock" true || problem "another gates session is running under $ROOT (it holds gates.lock)"
+else
+  mkdir -p "$ROOT" && exec 9>>"$ROOT/gates.lock" || exit 2
+  flock -n 9 || problem "another gates session is running under $ROOT (it holds gates.lock)"
+fi
+! $DIRTY || echo "run: warning: the working tree has uncommitted changes, so the commit does not identify the code" >&2
+
+# ── the gates ────────────────────────────────────────────────────────────────────────────────
+S=   # the session directory, once made
+set_command() { # set_command <gate>: CMD, the gate's own command, writing into $S/<gate>
+  case $1 in
+    verify) CMD=(gates/verify/run.sh --image "$IMAGE" --out "$S/verify");;
+    adoption) CMD=(env ADOPTION_WORK_DIR="$S/adoption" gates/adoption/run.sh --fixtures "$ADOPTION_FIXTURES" --image "$IMAGE");;
+    parity) CMD=(gates/parity/run.sh --oracle "$ORACLE_IMAGE" --ferrofin "$IMAGE" --out "$S/parity"
+                 --requests gates/parity/requests/sweep --requests gates/parity/requests/edge);;
+    bench) if [ -n "$PREVIOUS" ]; then CMD=(python3 gates/bench/gate.py ab "$PREVIOUS" "$IMAGE" --out "$S/bench")
+           else CMD=(env FERROFIN_BENCH_IMAGE="$IMAGE" gates/bench/run.sh --out "$S/bench"); fi;;
+  esac
+}
+if (( ${#PROBLEMS[@]} )); then
+  printf 'run: %s\n' "${PROBLEMS[@]}" >&2
+  echo "run: refused before any gate started" >&2
+  exit 2
+fi
+if $DRY_RUN; then
+  # shellcheck disable=SC2016  # printed as written: the session is named when it starts
+  S='$FERROFIN_GATES_DIR/runs/<session>'
+  echo "preflight: passed; image $IMAGE ($IMAGE_ID), commit $COMMIT${PREVIOUS:+, previous $PREVIOUS}"
+  for gate in "${GATES[@]}"; do set_command "$gate"; echo "$gate: ${CMD[*]}"; done
+  exit 0
+fi
+
+S=$(python3 gates/session.py new "$ROOT/runs" --gates "$(IFS=,; echo "${GATES[*]}")" --branch "$BRANCH" \
+  --commit "$COMMIT" --dirty "$DIRTY" --image "$IMAGE" --image-id "$IMAGE_ID" --oracle-image "$ORACLE_IMAGE" \
+  ${PREVIOUS:+--previous "$PREVIOUS" --previous-id "$PREVIOUS_ID"}) || exit 2
+echo "session: $S"
+GATE_PID=; TAIL_PID=; CURRENT=
+finish() { # finish <exit status>: the session's end, and the exit
+  python3 gates/session.py end "$S"
+  for gate in "${GATES[@]}"; do mkdir -p "$S/$gate"; done   # a folder per requested gate, run or not
+  exit "$1"
+}
+# shellcheck disable=SC2329  # invoked by the traps below
+interrupted() { # interrupted <exit status>: stop the running gate (its own cleanup runs), then finish
+  trap '' INT TERM HUP
+  if [ -n "$GATE_PID" ]; then kill -TERM -- "-$GATE_PID" 2>/dev/null; wait "$GATE_PID"; fi
+  [ -z "$TAIL_PID" ] || wait "$TAIL_PID"
+  [ -z "$CURRENT" ] || python3 gates/session.py gate "$S" "$CURRENT" failed --exit "$1" --note interrupted
+  finish "$1"
+}
+trap 'interrupted 130' INT
+trap 'interrupted 143' TERM
+trap 'interrupted 129' HUP
+failed=0
+for gate in "${GATES[@]}"; do
+  set_command "$gate"
+  # The gates run the images by their tags, hours apart: one retagged meanwhile is not what the
+  # preflight checked (and session.json records).
+  moved=
+  [ "$(image_id "$IMAGE")" = "$IMAGE_ID" ] || moved="the image $IMAGE moved off $IMAGE_ID"
+  [ "$gate" != bench ] || [ -z "$PREVIOUS" ] || [ "$(image_id "$PREVIOUS")" = "$PREVIOUS_ID" ] \
+    || moved="the image $PREVIOUS (--previous) moved off $PREVIOUS_ID"
+  if [ -n "$moved" ]; then
+    python3 gates/session.py gate "$S" "$gate" failed --note "$moved"
+    echo "== $gate: not started: $moved" >&2
+    failed=1; continue
+  fi
+  echo "== $gate: ${CMD[*]}"
+  CURRENT=$gate
+  python3 gates/session.py gate "$S" "$gate" running
+  # Its own session and process group, so a signal stops it whole (and its cleanup runs); the lock
+  # stays with this script. What it prints goes to <gate>.log, and from there to the terminal.
+  : > "$S/$gate.log"   # before tail opens it
+  setsid "${CMD[@]}" 9>&- > "$S/$gate.log" 2>&1 &
+  GATE_PID=$!
+  tail -n +1 -f --pid="$GATE_PID" "$S/$gate.log" 9>&- &
+  TAIL_PID=$!
+  wait "$GATE_PID"; rc=$?
+  wait "$TAIL_PID"
+  GATE_PID=; TAIL_PID=
+  if [ "$rc" = 0 ]; then status=passed; else status=failed; failed=1; fi
+  python3 gates/session.py gate "$S" "$gate" "$status" --exit "$rc"
+  CURRENT=
+  echo "== $gate: $status (exit $rc)"
+done
+finish "$failed"

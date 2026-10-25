@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1309,6 +1310,31 @@ class GateTests(unittest.TestCase):
                          [('tag', 'sha256:old', 'ferrofin:bench'), ('tag', 'sha256:new', 'ferrofin:bench'),
                           ('tag', 'sha256:orig', 'ferrofin:bench')])
         self.assertFalse((self.root / '03-a').exists())
+
+    def test_a_terminated_session_puts_the_tag_back(self):
+        plan = {'mode': 'ab', 'schedule': gate.schedule('ab', {'a': 'old', 'b': 'new'}, 1),
+                'images': {'a': {'id': 'sha256:old'}, 'b': {'id': 'sha256:new'}}}
+        calls = []
+
+        def docker(*args):
+            calls.append(args)
+            return 'sha256:orig' if args[:2] == ('image', 'inspect') else ''
+
+        def run(cmd):  # gates/run stops its session (SIGTERM to the process group) during the first run
+            gate.stop(signal.SIGTERM, None)
+
+        with patch.object(gate, 'docker', docker), patch.object(gate, 'run_sh', run):
+            with self.assertRaises(KeyboardInterrupt):
+                gate.run_session(str(self.root), plan, None)
+        self.assertEqual([c for c in calls if c[0] == 'tag'][-1], ('tag', 'sha256:orig', 'ferrofin:bench'))
+        # and a session installs that handler before its first run
+        before = signal.getsignal(signal.SIGTERM)
+        self.addCleanup(signal.signal, signal.SIGTERM, before)
+        with patch.object(gate.oracle, 'check', return_value=({'tag': 'v12.2', 'image': 'jf@sha256:x'}, None)), \
+                patch.object(gate, 'image_ref', return_value='sha256:img'), \
+                patch.object(gate, 'run_session'), patch.object(gate, 'render', return_value=('', [])):
+            gate.main(['ab', 'old', 'new', '--out', str(self.root / 'session'), '--testdata', str(self.root / 'td')])
+        self.assertIs(signal.getsignal(signal.SIGTERM), gate.stop)
 
     def test_a_run_that_cannot_start_stops_the_session_with_its_own_exit(self):
         plan = {'mode': 'aa', 'schedule': gate.schedule('aa', {'a': 'x'}, 2), 'images': {'a': {'id': 'sha256:x'}}}

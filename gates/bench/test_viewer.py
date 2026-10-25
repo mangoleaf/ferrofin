@@ -62,6 +62,21 @@ class ViewerTests(unittest.TestCase):
                                   'parity': {'parity-20261024-1200-abc', 'old-unprefixed'},
                                   'adoption': {'old-unprefixed'}})
 
+    def test_a_gates_run_session_lists_its_benchmark_run_or_its_ab_gate_runs(self):
+        runs = self.root / 'runs'
+        for session, files in (('s1', ['bench/run.json']), ('s2', ['bench/gate.json', 'bench/report.html', 'bench/01-a/run.json'])):
+            (runs / session).mkdir(parents=True)
+            (runs / session / 'session.json').write_text('{}')
+            for f in files:
+                (runs / session / f).parent.mkdir(parents=True, exist_ok=True)
+                (runs / session / f).write_text('{"date": "2026-10-24T12:00:00", "mode": "ab"}')
+        self.assertEqual({n for n, _ in report.discover('benchmark', str(runs))}, {'s1/bench', 's2/bench', 's2/bench/01-a'})
+        self.report_html(runs / 'parity-x-20261024-1200', 'parity', '<p>a session of a branch named parity-x</p>')
+        (runs / 'parity-x-20261024-1200' / 'session.json').write_text('{}')
+        self.assertEqual({n for n, _ in report.discover('parity', str(runs))}, {'parity-x-20261024-1200/parity'})
+        status, _, body = self.get('/report/parity/parity-x-20261024-1200/parity', {**self.roots, 'parity': str(runs)})
+        self.assertEqual((status, body), (200, '<p>a session of a branch named parity-x</p>'))
+
     def test_discovery_without_a_directory_is_empty(self):
         self.assertEqual(report.discover('parity', None), [])
         self.assertEqual(report.discover('parity', str(self.root / 'missing')), [])
