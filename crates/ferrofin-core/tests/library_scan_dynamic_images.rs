@@ -1190,3 +1190,41 @@ async fn a_librarys_media_root_image_is_read_after_its_own_folder(
         want
     );
 }
+
+/// gl-788: the media locations are read without their subfolders
+/// (`GetFiles(path, …, recursive: false)`), so a poster inside a media
+/// subfolder never becomes the library's image; the tile stays its collage.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_media_subfolder_image_is_not_the_librarys() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    std::fs::write(lib.album_dir.join("poster.png"), png(BLUE)).expect("subfolder image");
+
+    lib.scanner.scan_all().await.expect("rescan");
+
+    let library =
+        uuid::Uuid::parse_str(&lib.row(BaseItemKind::CollectionFolder, "Photos").await.id)
+            .expect("id");
+    let primary = primary_of(&lib.items, library).await.path;
+    assert!(
+        primary.ends_with("primary.png") && !primary.contains("Trip"),
+        "the library keeps its collage: {primary}"
+    );
+}
+
+/// gl-788: the media-location read names the library's own files as
+/// upstream's `PopulatePrimaryImages` does, after the library folder
+/// (`FileNameWithoutExtension`): a `Photos.png` at the media root of the
+/// "Photos" library is its image.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_media_root_image_named_after_the_library_is_read() {
+    let lib = PhotoLibrary::scanned(RED).await;
+    std::fs::write(lib.tmp.path().join("photos/Photos.png"), png(BLUE)).expect("named image");
+
+    lib.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(
+        lib.primary_colour(BaseItemKind::CollectionFolder, "Photos")
+            .await,
+        BLUE
+    );
+}

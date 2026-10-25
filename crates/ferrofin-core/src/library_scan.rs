@@ -12935,13 +12935,15 @@ impl LibraryScanner {
         };
         let dir = FsDirectoryService::new();
         let mut found = discover_local_images(&row, &dir);
-        // Its own folder is the first of upstream's `PhysicalLocations`, and
-        // already read above.
-        let mut library_item = ImageItem::new(ImageItemKind::CollectionFolder);
-        library_item.physical_locations = locations.to_vec();
-        found.extend(local_image_infos(
-            ferrofin_providers::CollectionFolderLocalImageProvider::get_images(&library_item, &dir),
-        ));
+        if let Some(mut library) = local_image_item(&row) {
+            // Its own folder is the first of upstream's `PhysicalLocations`,
+            // and already read above.
+            library.kind = ImageItemKind::CollectionFolder;
+            library.physical_locations = locations.to_vec();
+            found.extend(local_image_infos(
+                ferrofin_providers::CollectionFolderLocalImageProvider::get_images(&library, &dir),
+            ));
+        }
         if found.is_empty() {
             return Ok(false);
         }
@@ -22730,9 +22732,23 @@ fn discover_local_images<D: ferrofin_providers::DirectoryService>(
     entity: &BaseItemEntity,
     dir: &D,
 ) -> Vec<ItemImageInfo> {
-    let Some(path) = entity.path.as_deref() else {
+    let Some(item) = local_image_item(entity) else {
         return Vec::new();
     };
+    local_image_infos(if item.kind == ImageItemKind::Episode {
+        EpisodeLocalImageProvider::get_images(&item, dir)
+    } else if LocalImageProvider::supports(&item) {
+        LocalImageProvider::get_images(&item, dir)
+    } else {
+        Vec::new()
+    })
+}
+
+/// The item as the local image providers see it: its kind, name, path,
+/// `FileNameWithoutExtension` and `ContainingFolderPath`. `None` for an item
+/// with no path.
+fn local_image_item(entity: &BaseItemEntity) -> Option<ImageItem> {
+    let path = entity.path.as_deref()?;
     let kind = image_item_kind(&entity.type_);
 
     // `ContainingFolderPath`: a folder's own path, a disc rip's too, a
@@ -22753,14 +22769,7 @@ fn discover_local_images<D: ferrofin_providers::DirectoryService>(
         file_stem(path)
     });
     item.containing_folder_path = containing;
-
-    local_image_infos(if kind == ImageItemKind::Episode {
-        EpisodeLocalImageProvider::get_images(&item, dir)
-    } else if LocalImageProvider::supports(&item) {
-        LocalImageProvider::get_images(&item, dir)
-    } else {
-        Vec::new()
-    })
+    Some(item)
 }
 
 /// Image rows for images a local provider found, dated by their files.
