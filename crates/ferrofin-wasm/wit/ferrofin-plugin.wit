@@ -71,6 +71,9 @@ interface types {
     /// (plugin assets are loaded via plain `<script src>` tags), so
     /// `handle-request` is an anonymous attack surface. Check
     /// `is-authenticated` / `is-admin` before doing anything sensitive.
+    /// The identity has passed Jellyfin's default authorization policy: a
+    /// disabled account, a remote caller without remote access, or a user
+    /// outside their access schedule arrives as anonymous.
     record plugin-request {
         /// The HTTP method (`GET`, `POST`, …).
         method: string,
@@ -95,7 +98,13 @@ interface types {
     record plugin-response {
         /// The HTTP status code.
         status: u16,
-        /// Response headers as (name, value) pairs.
+        /// Response headers as (name, value) pairs. Served on the server's
+        /// own origin, so the host owns some: framing headers, `set-cookie`,
+        /// `clear-site-data`, `content-security-policy` and
+        /// `x-content-type-options` are dropped, and every response is sent
+        /// with `nosniff` and `content-security-policy: sandbox allow-scripts
+        /// allow-forms allow-popups` (a served HTML page runs in an opaque
+        /// origin, without the server origin's stored tokens).
         headers: list<tuple<string, string>>,
         /// The response body bytes.
         body: list<u8>,

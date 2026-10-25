@@ -149,7 +149,7 @@ impl FromRequestParts<AppState> for AuthenticatedIdentity {
 /// Applies DefaultAuthorizationHandler in upstream order. Production contexts
 /// carry a shared policy from the token cache; alternate injected auth services
 /// can resolve it through UserManager once here.
-async fn default_authorization(
+pub(crate) async fn default_authorization(
     mut info: AuthorizationInfo,
     parts: &Parts,
     state: &AppState,

@@ -220,7 +220,16 @@ plugins like Home Screen Sections possible):
   via plain `<script src>` tags, exactly like upstream `[AllowAnonymous]` plugin
   controllers); the caller's resolved identity (`user-id`, `is-admin`,
   `is-authenticated`) is forwarded — never a token — and the plugin gates its own
-  sensitive paths. Inbound bodies are capped at 1 MiB; a disabled plugin's URL space 404s.
+  sensitive paths. The identity has passed Jellyfin's default authorization policy: a
+  disabled account, a remote caller without remote access, or a user outside their access
+  schedule arrives as anonymous. Inbound bodies are capped at 1 MiB; a disabled plugin's
+  URL space 404s. Responses are served on the server's own origin, so the server owns the
+  headers that decide what a browser lets them do: every response carries
+  `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox allow-scripts
+  allow-forms allow-popups`, and the plugin's own `Set-Cookie`, `Clear-Site-Data`, CSP and
+  `X-Content-Type-Options` headers are dropped. An HTML page a plugin serves there runs in
+  an opaque origin and cannot read the server origin's stored tokens; assets and API
+  answers fetched by a settings page are unaffected.
   Requests never wait for the plugin: together they may hold at most half of its queue
   (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`), queued or running, and past that, or when the
   queue is full, the server answers `503` at once. So a flood of anonymous requests cannot

@@ -286,6 +286,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   carry from their series. The first boot re-ran Jellyfin's rating-level migration, which 12.2
   had already run, and cleared it, so a user with a maximum parental rating saw those episodes
   in lists, counts, Latest, Resume and Next Up until the next full library scan
+- WASM plugins: what a plugin's `/Plugins/{id}/web/…` route answers is served on the server's
+  own origin, where jellyfin-web keeps every user's token, so the server now owns the headers
+  that decide what a browser lets it do. Every answer carries `X-Content-Type-Options: nosniff`
+  and a sandboxing `Content-Security-Policy` (an HTML page the plugin serves runs in an opaque
+  origin and cannot read stored tokens), and the plugin can no longer set cookies or clear the
+  site's storage. The caller's identity reaches the plugin only when Jellyfin's default
+  authorization policy admits them: a disabled administrator was passed on as an
+  administrator, and a remote caller without remote access or a user outside their access
+  schedule as signed in
 - WASM plugins: a `.wasm` dropped into the plugins folder by hand whose id belongs to a
   compiled-in plugin (OpenSubtitles, TMDb and the other in-tree providers, Intro Skipper, File
   Transformation, Merge Versions) is no longer loaded. It ran every task, provider and route
