@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Functions shared by gates/verify/scan-behaviour.sh. Sourced, never executed: nothing here talks to a
-# server or touches media, which is what lets gates/verify/tests/*.bats drive every piece of logic
-# with canned /metrics text and throwaway files.
+# Functions shared by gates/verify/scan-behaviour.sh and gates/verify/run.sh. Sourced, never executed:
+# nothing here talks to a server or touches media (verify_combine writes verify.json in the run's folder
+# and removes the rows files it gathers),
+# which is what lets gates/verify/tests/*.bats drive every piece of logic with canned /metrics text and
+# throwaway files.
 
 # The item names every scratch item carries (from its NFO), so the script finds its own items
 # and nothing else.
@@ -113,4 +115,18 @@ verify_expect_str() {
 # verify_row_line <row> <result> <scenario> <detail>: one line of the PASS/FAIL table.
 verify_row_line() {
   printf '%4s  %-4s  %-46s  %s\n' "$1" "$2" "$3" "$4"
+}
+
+# verify_combine <dir> <exit status> <library kind…>: DIR/verify.json, what gates/report.py reads: the
+# exit status and, per library, the rows scan-behaviour.sh --json wrote to DIR/rows-<kind>.json (null
+# when that file is missing or unreadable: the check ended before its rows), which it then removes.
+verify_combine() {
+  local dir=$1 rc=$2 kind rows libraries='{}'
+  shift 2
+  for kind; do
+    rows=$(jq -c . "$dir/rows-$kind.json" 2>/dev/null) && [ -n "$rows" ] || rows=null
+    libraries=$(jq -c --arg kind "$kind" --argjson rows "$rows" '. + {($kind): $rows}' <<<"$libraries")
+    rm -f -- "$dir/rows-$kind.json"
+  done
+  jq -n --argjson exit "$rc" --argjson libraries "$libraries" '{exit: $exit, libraries: $libraries}' > "$dir/verify.json"
 }

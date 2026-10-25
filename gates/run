@@ -7,6 +7,8 @@
 #     session.json                      branch, commit, dirty tree, images, oracle pin, and each gate's
 #                                       status, start, end and exit status (gates/session.py)
 #     <gate>/  <gate>.log               each gate's own run directory, and what it printed
+#     index.html  report.md             the session's report: every gate's verdict and counts, with
+#                                       links to its own report (gates/report.py), however it ended
 # The gates run in the order verify, adoption, parity, bench; one that fails does not stop the next.
 # Each gate's own script keeps working on its own.
 #
@@ -175,9 +177,11 @@ S=$(python3 gates/session.py new "$ROOT/runs" --gates "$(IFS=,; echo "${GATES[*]
   ${PREVIOUS:+--previous "$PREVIOUS" --previous-id "$PREVIOUS_ID"}) || exit 2
 echo "session: $S"
 GATE_PID=; TAIL_PID=; CURRENT=
-finish() { # finish <exit status>: the session's end, and the exit
+finish() { # finish <exit status>: the session's end, its report (gates/report.py), and the exit
   python3 gates/session.py end "$S"
   for gate in "${GATES[@]}"; do mkdir -p "$S/$gate"; done   # a folder per requested gate, run or not
+  if python3 gates/report.py "$S" >/dev/null; then echo "report: $S/index.html"
+  else echo "run: the session report could not be written (gates/report.py $S)" >&2; fi
   exit "$1"
 }
 # shellcheck disable=SC2329  # invoked by the traps below

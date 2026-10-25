@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""The record of one gates session, `session.json` (stdlib only), which gates/run writes.
+"""The record of one gates session, `session.json` (stdlib only): gates/run writes it, and
+gates/report.py reads it.
 
     session.py new RUNS --gates G[,G…] --branch B --commit C --dirty true|false --image I --image-id ID
                    --oracle-image O [--previous P --previous-id ID]

@@ -51,6 +51,9 @@ FERROFIN_TOKEN=… gates/verify/scan-behaviour.sh BASE_URL LIBRARY_ID SCRATCH_DI
   script generates a one-second clip with `ffmpeg`. With neither, it skips every row (exit
   3), because a file the server cannot probe is re-probed on every scan.
 - `--timeout SECONDS` sets how long one scan may take (default 300).
+- `--json FILE` also writes the rows, when they end, to `FILE` as data: each row's number,
+  scenario, result and detail, and the PASS/FAIL/SKIP counts. `run.sh` gathers them into its
+  `verify.json`, which the gates' session report reads.
 - `--nfo-wait SECONDS` sets how long row 4 waits, after the scratch items were saved,
   before it rewrites an NFO (default 62). The server re-reads an NFO only once the NFO is
   more than a minute newer than the item's last save, and it compares the file's mtime

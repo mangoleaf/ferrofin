@@ -42,6 +42,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `session.json` with every gate's status. `gates/verify/run.sh` runs the scan-behaviour
   check against a fresh server started from an image, and `gates/bench/run.sh` measures
   `FERROFIN_BENCH_IMAGE` (default `ferrofin:bench`)
+- Every gates session ends with one report, `index.html` and `report.md` in its folder
+  (`gates/report.py`): the commit, images and oracle pin, and each gate's verdict and counts
+  (verify's checks, adoption's rows, parity's new and unfiled differences, bench's phases or
+  gated A/B cells), with links to its own report. Adoption, parity and the A/B gate are judged
+  by their own code. A gate that did not run, or whose result is missing or unreadable, is
+  shown as such. `scan-behaviour.sh --json FILE` writes its rows as data
 - `gates/adoption/`: an adoption smoke harness that runs every supported Jellyfin generation
   (10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0) through an image on fresh
   fixture copies and diffs the answers against Jellyfin 12.2's own; fixtures are derived

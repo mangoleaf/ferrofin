@@ -1,0 +1,217 @@
+"""gates/report.py: the combined page of a gates session, built from gate folders in the shapes the gates
+write them (adoption's own recorder, bench's phase states, gate.py's gated cells) (stdlib)."""
+
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+
+GATES = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(GATES))
+import session  # noqa: E402
+
+spec = importlib.util.spec_from_file_location("gates_report", GATES / "report.py")
+report = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(report)
+adoption_report = report.gate_module("adoption/adoption_report.py")
+TAG = "0123456789abcdef0123456789abcdef"   # an image tag, as a key in an item's ImageBlurHashes
+
+
+class SessionReportTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def session(self, gates, statuses, previous=None):
+        s = Path(session.new(os.path.join(self.tmp.name, "runs"), list(gates), "release/v9", "c0ffee1234567890", False,
+                             "ferrofin:v9", "sha256:" + "a" * 64, "jellyfin/jellyfin@sha256:pin", previous,
+                             previous and "sha256:" + "b" * 64, when=datetime(2026, 10, 24, 12, 0)))
+        for gate, (status, code) in statuses.items():
+            session.gate(str(s), gate, "running")
+            session.gate(str(s), gate, status, code)
+            (s / f"{gate}.log").write_text("what it printed\n")
+        return s
+
+    def write(self, path, data):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+
+    def adoption_run(self, d, rows, unfinished=()):
+        """What gates/adoption/run.sh records: a begin per fixture, its checks, then its row."""
+        recorder = adoption_report.Recorder(str(d))
+        recorder.start("gates/adoption/run.sh", "ferrofin:v9", "12.2")
+        for fixture, verdict, failed_check in rows:
+            recorder.begin(fixture, "path", "12.2.0")
+            recorder.check(fixture, "after adoption", "boot", "FAIL" if failed_check else "PASS")
+            recorder.row(fixture, "path", "12.2.0", verdict)
+        for fixture in unfinished:   # killed while on it
+            recorder.begin(fixture, "path", "12.2.0")
+
+    def every_gate(self, s):
+        self.write(s / "verify/verify.json", {"exit": 1, "libraries": {
+            "movies": {"rows": [{"row": 1, "result": "PASS"}, {"row": 2, "result": "PASS"}, {"row": 13, "result": "SKIP"}]},
+            "tvshows": {"rows": [{"row": 1, "result": "FAIL"}]}}})
+        self.write(s / "verify/scan-behaviour-movies.txt", "rows\n")
+        self.adoption_run(s / "adoption", [("a", "PASS", False), ("b", "PASS", False), ("c", "SKIP", False)])
+        self.write(s / "adoption/report.html", "<p>adoption</p>")
+        self.write(s / "parity/results.json", {"verdict": "new differences", "reason": "2 requests differ", "planned": 40,
+                                               "requests": [{}] * 38})
+        self.write(s / "parity/new-differences.json", {"requests": [
+            {"differences": [{"path": f"ImageBlurHashes.Primary.{TAG}", "kind": "value", "filed": None},
+                             {"path": "B", "kind": "missing", "filed": None}]},
+            {"differences": [{"path": f"ImageBlurHashes.Primary.{'f' * 32}", "kind": "value", "filed": None},
+                             {"path": "C", "kind": "value", "filed": "gl-1"}]}]})
+        self.write(s / "parity/report.html", "<p>parity</p>")
+        self.write(s / "bench/run.json", {"date": "2026-10-24T12:00:00"})
+        self.write(s / "bench/ferrofin/phases.json", {"counts": {"status": "completed"}, "loaded": {"status": "failed"},
+                                                      "ttfs": {"status": "skipped"}})
+        self.write(s / "bench/jellyfin/phases.json", {})
+        self.write(s / "bench/report.html", "<p>bench</p>")
+
+    def rows(self, s):
+        return {r["gate"]: r for r in report.summarise(str(s))[1]}
+
+    def test_a_session_of_every_gate_lists_each_with_its_counts_and_the_build_it_judged(self):
+        s = self.session(report.GATES, {"verify": ("failed", 1), "adoption": ("passed", 0),
+                                        "parity": ("failed", 1), "bench": ("failed", 1)})
+        self.every_gate(s)
+        rows = self.rows(s)
+        self.assertEqual(rows["verify"]["counts"], [("checks passed", 2), ("failed", 1), ("skipped", 1)])
+        self.assertEqual((rows["adoption"]["verdict"], rows["adoption"]["counts"]),
+                         ("passed", [("rows passed", 2), ("failed", 0), ("unfinished", 0), ("skipped", 1)]))
+        self.assertEqual(rows["parity"]["verdict"], "new differences: 2 requests differ")
+        # two image tags of one field are one group, as `diff.py findings` files them
+        self.assertEqual(rows["parity"]["counts"], [("new differences", 4), ("groups not filed", 2),
+                                                    ("requests sent", 38), ("planned", 40)])
+        self.assertEqual((rows["bench"]["verdict"], rows["bench"]["counts"]),
+                         ("1 phase failed", [("phases completed", 1), ("failed", 1), ("unfinished", 0), ("skipped", 1)]))
+        self.assertEqual({g: r["problem"] for g, r in rows.items()}, dict.fromkeys(report.GATES))
+        page = Path(report.write(str(s))).read_text(encoding="utf-8")
+        for text in ("Gates session release-v9-20261024-1200", "c0ffee123456", "ferrofin:v9 (sha256:aaaaaaaaaaaa)",
+                     "jellyfin/jellyfin@sha256:pin",
+                     "<a href='adoption/report.html'>adoption report</a>", "<a href='verify.log'>log</a>",
+                     "<a href='verify/scan-behaviour-movies.txt'>movies rows</a>"):
+            self.assertIn(text, page)
+        self.assertNotIn(self.tmp.name, page)   # every link is relative: the page opens from anywhere
+        self.assertIn("| parity | failed (exit 1) | new differences: 2 requests differ | new differences 4, groups not filed 2, "
+                      "requests sent 38, planned 40 |", (s / "report.md").read_text(encoding="utf-8"))
+
+    def test_a_single_gate_session_shows_the_others_as_not_run(self):
+        s = self.session(["adoption"], {"adoption": ("passed", 0)})
+        self.adoption_run(s / "adoption", [("a", "PASS", False)])
+        self.write(s / "adoption/report.html", "<p>adoption</p>")
+        rows = self.rows(s)
+        self.assertEqual(list(rows), list(report.GATES))
+        self.assertEqual({g: r["verdict"] for g, r in rows.items()},
+                         {"verify": "not run", "adoption": "passed", "parity": "not run", "bench": "not run"})
+        self.assertIn("not requested", Path(report.write(str(s))).read_text(encoding="utf-8"))
+
+    def test_adoption_is_judged_by_its_own_rules_a_killed_fixture_and_a_failed_check_fail_it(self):
+        s = self.session(["adoption"], {"adoption": ("failed", 143)})
+        self.adoption_run(s / "adoption", [("a", "PASS", False), ("b", "PASS", True)], unfinished=["c"])
+        with open(s / "adoption/results.jsonl", "a") as f:
+            f.write('{"event": "row", "fixt')   # the line a kill cut short
+        row = self.rows(s)["adoption"]
+        self.assertEqual((row["verdict"], row["counts"]),
+                         ("failed", [("rows passed", 1), ("failed", 1), ("unfinished", 1), ("skipped", 0)]))
+        self.assertEqual(row["problem"], "1 unreadable line in results.jsonl skipped; "
+                                         "no report.html: the gate ended before writing its report")
+
+    def test_bench_counts_only_completed_phases_and_a_run_cut_short_is_incomplete(self):
+        s = self.session(["bench"], {"bench": ("failed", 143)})
+        self.write(s / "bench/run.json", {})
+        self.write(s / "bench/ferrofin/phases.json", {"counts": {"status": "completed"}, "loaded": {"status": "running"},
+                                                      "stress": {"status": "pending"}, "ttfs": {"status": "pending"}})
+        row = self.rows(s)["bench"]
+        self.assertEqual((row["verdict"], row["counts"]),
+                         ("incomplete", [("phases completed", 1), ("failed", 0), ("unfinished", 3), ("skipped", 0)]))
+        # the Jellyfin half never started: no phases of it at all
+        self.assertEqual(row["problem"], "no phases recorded for jellyfin: its run never started; "
+                                         "no report.html: the gate ended before writing its report")
+
+    def test_an_ab_gate_session_counts_its_gated_cells_and_what_blocks(self):
+        s = self.session(["bench"], {"bench": ("failed", 1)}, previous="ferrofin:v8")
+        self.assertEqual(self.rows(s)["bench"]["problem"], "no gate.json: the A/B gate ended before it started; "
+                                                           "no report.html: the gate ended before writing its report")
+        self.write(s / "bench/gate.json", {"mode": "ab"})
+        self.write(s / "bench/verdict.json", {"verdicts": {
+            "x": {"verdict": "regressed", "gated": True}, "y": {"verdict": "within noise", "gated": True},
+            "z": {"verdict": "regressed", "gated": False}}, "blocking": ["x"]})
+        self.write(s / "bench/report.html", "<p>gate</p>")
+        row = self.rows(s)["bench"]
+        self.assertEqual((row["verdict"], row["links"]), ("blocked by 1 cell", [("A/B gate report", "bench/report.html"),
+                                                                              ("log", "bench.log")]))
+        self.assertIn("<dt>previous release</dt><dd>ferrofin:v8</dd>", Path(report.write(str(s))).read_text(encoding="utf-8"))
+        self.assertEqual(row["counts"], [("gated cells regressed", 1), ("not comparable", 0), ("improved", 0), ("within noise", 1)])
+
+    def test_missing_corrupt_and_misshapen_results_are_shown_as_such(self):
+        s = self.session(report.GATES, {g: ("failed", 1) for g in report.GATES})
+        self.write(s / "parity/results.json", "{not json")
+        self.write(s / "verify/verify.json", {"exit": 3, "libraries": {"movies": None, "tvshows": None}})
+        self.write(s / "bench/run.json", {})
+        self.write(s / "bench/ferrofin/phases.json", ["not", "a", "map"])
+        rows = self.rows(s)
+        self.assertEqual((rows["verify"]["verdict"], rows["verify"]["problem"]),
+                         ("nothing verified", "no rows from the movies and tvshows libraries: the check ended before them "
+                                              "(the run's exit 3, see the log)"))
+        self.assertEqual(rows["adoption"]["problem"], "no results.jsonl: the gate ended before it recorded anything; "
+                                                      "no report.html: the gate ended before writing its report")
+        self.assertIn("results.json cannot be read", rows["parity"]["problem"])
+        self.assertIn("its result is not shaped as expected (AttributeError", rows["bench"]["problem"])
+        self.write(s / "parity/results.json", {"verdict": "pass", "planned": 1, "requests": [{}]})
+        self.assertEqual(self.rows(s)["parity"]["problem"],
+                         "no new-differences.json: its counts are unknown; no report.html: the gate ended before writing its report")
+
+    def test_a_running_gate_one_not_reached_and_one_never_started_are_shown(self):
+        s = self.session(["verify", "adoption", "bench"], {})
+        session.gate(str(s), "verify", "running")
+        session.gate(str(s), "adoption", "failed", note="the image ferrofin:v9 moved off sha256:aaa")
+        rows = self.rows(s)
+        self.assertEqual({g: r["verdict"] for g, r in rows.items() if g != "parity"},
+                         {"verify": "running", "adoption": "not started", "bench": "not run"})
+        self.assertEqual((report.status_word(rows["adoption"]), rows["adoption"]["problem"]),
+                         ("failed, the image ferrofin:v9 moved off sha256:aaa", None))
+        session.end(str(s))
+        rows = self.rows(s)
+        self.assertEqual(report.status_word(rows["verify"]), "failed, interrupted")
+        self.assertEqual(rows["verify"]["problem"], "no verify.json: the gate ended before its check finished")
+
+    def test_a_verify_run_stopped_during_its_second_library_is_incomplete(self):
+        s = self.session(["verify"], {"verify": ("failed", 143)})
+        self.write(s / "verify/verify.json", {"exit": 143, "libraries": {
+            "movies": {"rows": [{"row": 1, "result": "PASS"}]}, "tvshows": None}})
+        row = self.rows(s)["verify"]
+        self.assertEqual((row["verdict"], row["problem"], row["bad"]),
+                         ("incomplete", "no rows from the tvshows library: the check ended before them "
+                                        "(the run's exit 143, see the log)", True))
+
+    def test_a_page_on_disk_is_linked_even_when_the_result_beside_it_cannot_be_read(self):
+        s = self.session(["parity"], {"parity": ("failed", 1)})
+        self.write(s / "parity/results.json", "{cut")
+        self.write(s / "parity/report.html", "<p>parity</p>")
+        row = self.rows(s)["parity"]
+        self.assertEqual(row["links"], [("parity report", "parity/report.html"), ("log", "parity.log")])
+
+    def test_a_gate_that_exited_0_but_whose_result_failed_is_coloured_bad(self):
+        s = self.session(["adoption"], {"adoption": ("passed", 0)})
+        self.adoption_run(s / "adoption", [("a", "PASS", True)])   # a failed check under a PASS row
+        self.write(s / "adoption/report.html", "<p>adoption</p>")
+        self.assertEqual(self.rows(s)["adoption"]["verdict"], "failed")
+        self.assertIn("<tr class='bad'><th>adoption</th>", Path(report.write(str(s))).read_text(encoding="utf-8"))
+
+    def test_free_text_is_escaped_in_the_page_and_kept_in_its_markdown_cell(self):
+        s = self.session(["parity"], {"parity": ("failed", 1)})
+        self.write(s / "parity/results.json", {"verdict": "run failed", "reason": "<b>a | b\nc</b>", "planned": 0})
+        self.write(s / "parity/new-differences.json", {"requests": []})
+        self.write(s / "parity/report.html", "<p>parity</p>")
+        page = Path(report.write(str(s))).read_text(encoding="utf-8")
+        self.assertIn("run failed: &lt;b&gt;a | b\nc&lt;/b&gt;", page)
+        self.assertIn("| run failed: <b>a \\| b c</b> |", (s / "report.md").read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()

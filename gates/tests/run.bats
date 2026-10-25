@@ -164,6 +164,9 @@ session() { # the one session directory made under the root
   [ "$(jq -r '.gates | to_entries | map("\(.key)=\(.value.status)/\(.value.exit)") | join(" ")' "$s/session.json")" = \
     "verify=passed/0 adoption=passed/0" ]
   grep -qx "the fake verify ran" "$s/verify.log"
+  [[ "$output" == *"report: $s/index.html"* ]]   # the session's report, with every gate in it
+  grep -q "<th>verify</th>" "$s/index.html"
+  grep -q "| bench | not requested | not run |" "$s/report.md"
 }
 
 @test "gates/run: a failed gate does not stop the next one, and the run exits 1" {
@@ -186,6 +189,7 @@ session() { # the one session directory made under the root
   [ "$(jq -r '.gates | to_entries | map("\(.key)=\(.value.status)/\(.value.note // "")") | join(" ")' "$s/session.json")" = \
     "verify=failed/interrupted adoption=skipped/not reached" ]
   [ "$(jq -r '.ended != null' "$s/session.json")" = true ]
+  grep -q "| verify | failed (exit 143), interrupted |" "$s/report.md"   # an interrupted session is reported too
   run ! kill -0 "$(cat "$FAKE_CALLS.pids")"   # the gate was stopped, not left running
   run ! grep -q '^adoption ' "$FAKE_CALLS"
 }

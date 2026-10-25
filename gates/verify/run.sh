@@ -8,6 +8,8 @@
 # The check runs on each library in turn. DIR defaults to
 # $FERROFIN_GATES_DIR/runs/verify-<YYYYMMDD-HHMM> (gates/lib.sh) and is never reused. It ends with
 #   DIR/scan-behaviour-movies.txt, DIR/scan-behaviour-tvshows.txt   the check's rows on each
+#   DIR/verify.json      the same rows as data, per library (null when the check ended before them),
+#                        and the exit status: what gates/report.py reads
 #   DIR/server.log                                                  the server's log
 # and the container (gates-verify) removed, however the run ends. --clip is passed to the check.
 # Settings (environment): VERIFY_PORT, the loopback port the server answers on (default 18131);
@@ -21,6 +23,8 @@ SELF=$(cd "$(dirname "$0")" && pwd)/${0##*/}   # for usage, after the cd below
 cd "$(dirname "$0")/../.." || exit 2
 # shellcheck source=gates/lib.sh
 . gates/lib.sh
+# shellcheck source=gates/verify/lib.sh
+. gates/verify/lib.sh   # verify_combine
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; }
 die() { echo "verify: $*" >&2; exit 2; }
@@ -119,9 +123,11 @@ for kind in movies tvshows; do
     tvshows) id=$SHOWS scratch="tv/Ferrofin Verify Show";;   # the scratch series, named as the check requires
   esac
   echo "== the $kind library"
-  FERROFIN_TOKEN=$TOKEN gates/verify/scan-behaviour.sh "${CLIP[@]}" "$URL" "$id" "$OUT/library/$scratch" "/media/$scratch" \
+  FERROFIN_TOKEN=$TOKEN gates/verify/scan-behaviour.sh "${CLIP[@]}" --json "$OUT/rows-$kind.json" \
+    "$URL" "$id" "$OUT/library/$scratch" "/media/$scratch" \
     | tee "$OUT/scan-behaviour-$kind.txt"
   this=${PIPESTATUS[0]}
   if [ "$this" = 1 ] || [ "$rc" = 0 ]; then rc=$this; fi   # a failed row outranks anything else
 done
+verify_combine "$OUT" "$rc" movies tvshows
 exit "$rc"

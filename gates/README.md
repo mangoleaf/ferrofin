@@ -52,3 +52,20 @@ Each run is a session folder, `runs/<branch>-<YYYYMMDD-HHMM>/` (a rerun in the s
 status, times and exit status, beside each gate's own run directory and its `<gate>.log`. A gate that
 fails does not stop the next; `gates/run` exits 1 when one failed and 2 when the preflight refused.
 Each gate's own script still runs on its own; its README says how.
+
+## The session report
+
+However a session ends, `gates/run` writes its report, `index.html` and the same as `report.md`
+([`report.py`](report.py), which writes it again for any session: `python3 gates/report.py SESSION`).
+It shows the commit, images and oracle pin, and one row per gate, every gate included:
+
+| Gate | Counts | Links to |
+|---|---|---|
+| verify | checks passed, failed and skipped, over both libraries | each library's rows |
+| adoption | fixture rows passed, failed, unfinished and skipped, by the adoption report's own rules | the adoption report |
+| parity | new differences, the groups of them not filed yet, requests sent and planned; the verdict and its reason | the parity report |
+| bench | phases completed, failed, unfinished and skipped; for the A/B gate (`--previous`), the gated cells regressed, not comparable, improved and within noise, and whether anything blocks | the benchmark or A/B gate report |
+
+A gate the session did not ask for, did not reach, is still running, ended before writing its result,
+or left a result that cannot be read is shown as such, never left out. The page opens from disk (every
+link is relative) and replaces none of the gates' own reports.

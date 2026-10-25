@@ -162,6 +162,14 @@ api_files() {
 EOJ
 }
 
+@test "combine: verify.json holds each library's rows, null for one never reached or unreadable, and the exit" {
+  printf '{"rows": [{"row": 1, "result": "PASS"}], "summary": {"pass": 1, "fail": 0, "skip": 0}}' > rows-movies.json
+  printf '{"rows": [' > rows-tvshows.json   # cut short
+  verify_combine . 1 movies tvshows music
+  [ "$(jq -c . verify.json)" = '{"exit":1,"libraries":{"movies":{"rows":[{"row":1,"result":"PASS"}],"summary":{"pass":1,"fail":0,"skip":0}},"tvshows":null,"music":null}}' ]
+  [ ! -e rows-movies.json ] && [ ! -e rows-tvshows.json ]
+}
+
 @test "script: missing arguments, an unknown option and a bad number are usage errors" {
   run "$VERIFY/scan-behaviour.sh"
   [ "$status" -eq 2 ]
@@ -451,10 +459,14 @@ LIB_ID=f137a2dd21bbc1b99aa5c0f6bf02a805
   real_item
   movies_scenario '.[2].updated = 1'
   fake
-  whole_run "$BASE" "$LIB_ID" "$TMP/lib/scratch"
+  whole_run --json "$TMP/rows.json" "$BASE" "$LIB_ID" "$TMP/lib/scratch"
   [ "$status" -eq 1 ]
   [[ "$output" == *"   2  FAIL  rescan, nothing changed"*"updated 1 (want = 0)"* ]]
   [[ "$output" == *"summary: 11 PASS, 1 FAIL, 1 SKIP"* ]]
+  # --json: the same rows as data
+  [ "$(jq -c .summary rows.json)" = '{"pass":11,"fail":1,"skip":1}' ]
+  [ "$(jq -r '.rows[] | select(.row == 2) | [.result, .scenario] | join(" ")' rows.json)" = "FAIL rescan, nothing changed" ]
+  jq -e '.rows[] | select(.row == 2) | .detail | contains("updated 1 (want = 0)")' rows.json >/dev/null
   [ "$(find lib/scratch -type f)" = "lib/scratch/Ferrofin Verify Beta (2002)/movie.nfo" ]
   real_item_untouched
 }
