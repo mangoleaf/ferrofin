@@ -244,6 +244,8 @@ struct StubDisplayPreferences {
     item: Mutex<Option<ItemDisplayPreferencesEntity>>,
     custom: Mutex<Option<std::collections::HashMap<String, Option<String>>>>,
     sections: Mutex<Option<Vec<(i32, i32)>>>,
+    /// The item id the last `get_display_preferences` asked for.
+    asked_item: Mutex<Option<Uuid>>,
 }
 
 fn canned_prefs() -> DisplayPreferencesEntity {
@@ -286,9 +288,10 @@ impl ferrofin_traits::configuration::DisplayPreferencesManager for StubDisplayPr
     async fn get_display_preferences(
         &self,
         _user_id: Uuid,
-        _item_id: Uuid,
+        item_id: Uuid,
         _client: &str,
     ) -> Result<DisplayPreferencesEntity, ServiceError> {
+        *self.asked_item.lock().unwrap() = Some(item_id);
         Ok(canned_prefs())
     }
     async fn get_item_display_preferences(
@@ -1129,4 +1132,195 @@ async fn display_preferences_self_as_non_admin_is_allowed() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(prefs.row.lock().unwrap().is_some());
+}
+
+/// `displayPreferencesId` is a GUID when .NET's `Guid.TryParse` reads it, and
+/// is MD5-hashed otherwise. Measured on a live Jellyfin 12.2: the `(…)`, `{…}`,
+/// `{0x…}` and padded spellings address the GUID's row, and `urn:uuid:` is
+/// hashed (`Uuid::parse_str` would take it as the GUID).
+#[rstest::rstest]
+#[case::n_form(
+    "0123456789abcdef0123456789abcdef",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::d_form(
+    "01234567-89ab-cdef-0123-456789abcdef",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::p_form(
+    "(01234567-89ab-cdef-0123-456789abcdef)",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::b_form(
+    "%7B01234567-89ab-cdef-0123-456789abcdef%7D",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::x_form(
+    "%7B0x01234567,0x89ab,0xcdef,%7B0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef%7D%7D",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::padded(
+    "%200123456789abcdef0123456789abcdef%20",
+    Some("0123456789abcdef0123456789abcdef")
+)]
+#[case::urn("urn:uuid:01234567-89ab-cdef-0123-456789abcdef", None)]
+#[case::name("usersettings", None)]
+#[tokio::test]
+async fn display_preferences_id_is_read_as_guid_try_parse_reads_it(
+    #[case] raw: &str,
+    #[case] guid: Option<&str>,
+) {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let (status, _) = get(
+        state_with_display_prefs(prefs.clone()),
+        &format!("/DisplayPreferences/{raw}?client=web"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let decoded = raw
+        .replace("%7B", "{")
+        .replace("%7D", "}")
+        .replace("%20", " ");
+    let expected = guid.map_or_else(
+        || ferrofin_common::extensions::get_md5(&decoded),
+        |g| Uuid::parse_str(g).unwrap(),
+    );
+    assert_eq!(*prefs.asked_item.lock().unwrap(), Some(expected));
+}
+
+/// .NET reads the typed display preferences more widely than by exact name
+/// (each case measured on a live Jellyfin 12.2, `POST` then `GET`):
+/// `Enum.TryParse`/`Enum.Parse` take an integer (an unnamed one is kept and
+/// written back as its number), a comma list (OR'd) and padding; `int.Parse`
+/// and `bool.Parse` ignore the white space around a number or a flag and
+/// trailing NULs (`int.Parse` only U+0009–U+000D and U+0020, so a trailing
+/// no-break space is a 500 upstream and the fallback here); the `homesection`
+/// order suffix is an `int.Parse` too.
+#[rstest::rstest]
+#[case::index_by_integer(r#"{"IndexBy":"1"}"#, "/IndexBy", "ProductionYear")]
+#[case::index_by_padded(r#"{"IndexBy":" ProductionYear "}"#, "/IndexBy", "ProductionYear")]
+#[case::index_by_list(
+    r#"{"IndexBy":"PremiereDate,CommunityRating"}"#,
+    "/IndexBy",
+    "CommunityRating"
+)]
+#[case::index_by_unnamed(r#"{"IndexBy":"7"}"#, "/IndexBy", "7")]
+#[case::index_by_negative(r#"{"IndexBy":"-1"}"#, "/IndexBy", "-1")]
+#[case::chromecast_integer(
+    r#"{"CustomPrefs":{"chromecastVersion":"1"}}"#,
+    "/CustomPrefs/chromecastVersion",
+    "unstable"
+)]
+#[case::chromecast_padded(
+    r#"{"CustomPrefs":{"chromecastVersion":" Unstable "}}"#,
+    "/CustomPrefs/chromecastVersion",
+    "unstable"
+)]
+#[case::chromecast_list(
+    r#"{"CustomPrefs":{"chromecastVersion":"stable,unstable"}}"#,
+    "/CustomPrefs/chromecastVersion",
+    "unstable"
+)]
+#[case::chromecast_unnamed(
+    r#"{"CustomPrefs":{"chromecastVersion":"7"}}"#,
+    "/CustomPrefs/chromecastVersion",
+    "7"
+)]
+#[case::skip_back_padded(
+    r#"{"CustomPrefs":{"skipBackLength":" 5000 "}}"#,
+    "/CustomPrefs/skipBackLength",
+    "5000"
+)]
+#[case::skip_forward_control_white_space(
+    r#"{"CustomPrefs":{"skipForwardLength":"\t7000\n"}}"#,
+    "/CustomPrefs/skipForwardLength",
+    "7000"
+)]
+#[case::skip_back_trailing_nul(
+    r#"{"CustomPrefs":{"skipBackLength":"5000\u0000"}}"#,
+    "/CustomPrefs/skipBackLength",
+    "5000"
+)]
+#[case::skip_back_signed(
+    r#"{"CustomPrefs":{"skipBackLength":"+5000"}}"#,
+    "/CustomPrefs/skipBackLength",
+    "5000"
+)]
+#[case::skip_back_no_break_space(
+    r#"{"CustomPrefs":{"skipBackLength":"5000 "}}"#,
+    "/CustomPrefs/skipBackLength",
+    "10000"
+)]
+#[case::overlay_padded(
+    r#"{"CustomPrefs":{"enableNextVideoInfoOverlay":" False "}}"#,
+    "/CustomPrefs/enableNextVideoInfoOverlay",
+    "False"
+)]
+#[case::overlay_trailing_nul(
+    r#"{"CustomPrefs":{"enableNextVideoInfoOverlay":"False\u0000"}}"#,
+    "/CustomPrefs/enableNextVideoInfoOverlay",
+    "False"
+)]
+#[case::overlay_no_break_space(
+    r#"{"CustomPrefs":{"enableNextVideoInfoOverlay":"False "}}"#,
+    "/CustomPrefs/enableNextVideoInfoOverlay",
+    "False"
+)]
+#[case::home_section_padded_order(
+    r#"{"CustomPrefs":{"homesection 1":"resume"}}"#,
+    "/CustomPrefs/homesection1",
+    "resume"
+)]
+#[case::home_section_signed_order(
+    r#"{"CustomPrefs":{"homesection+3":"resume"}}"#,
+    "/CustomPrefs/homesection3",
+    "resume"
+)]
+#[case::home_section_zero_padded_order(
+    r#"{"CustomPrefs":{"homesection04":"nextup"}}"#,
+    "/CustomPrefs/homesection4",
+    "nextup"
+)]
+#[tokio::test]
+async fn display_preferences_parse_as_dotnet_parses(
+    #[case] body: &'static str,
+    #[case] pointer: &str,
+    #[case] expected: &str,
+) {
+    let (v, _) = round_trip(body).await;
+    assert_eq!(
+        v.pointer(pointer),
+        Some(&serde_json::json!(expected)),
+        "{body}"
+    );
+}
+
+/// What `Enum.TryParse` refuses stores no indexing, so `GET` answers none.
+#[rstest::rstest]
+#[case::bogus(r#"{"IndexBy":"bogus"}"#)]
+#[case::trailing_comma(r#"{"IndexBy":"ProductionYear,"}"#)]
+#[tokio::test]
+async fn display_preferences_index_by_that_does_not_parse_is_null(#[case] body: &'static str) {
+    let (v, saved) = round_trip(body).await;
+    assert_eq!(saved.index_by, None, "{body}");
+    assert_eq!(v.get("IndexBy").filter(|i| !i.is_null()), None, "{body}");
+}
+
+/// `Enum.Parse<ChromecastVersion>` throws `ArgumentException` for a value it
+/// cannot read, which Jellyfin answers with a 400 (measured on 12.2), before
+/// anything is saved.
+#[tokio::test]
+async fn display_preferences_refuse_a_chromecast_version_enum_parse_refuses() {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let (status, _) = send(
+        state_with_display_prefs(prefs.clone()),
+        "POST",
+        "/DisplayPreferences/home?client=web",
+        Body::from(r#"{"CustomPrefs":{"chromecastVersion":"bogus"}}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(prefs.row.lock().unwrap().is_none(), "nothing saved");
+    assert!(prefs.custom.lock().unwrap().is_none(), "nothing saved");
 }

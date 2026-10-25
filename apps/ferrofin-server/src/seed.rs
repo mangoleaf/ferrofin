@@ -22,7 +22,8 @@ use uuid::Uuid;
 use crate::config::Config;
 
 /// The outcome of a [`seed_default_admin`] call, so the composition root can log
-/// exactly what happened (and surface a generated password once).
+/// exactly what happened (and warn about an administrator seeded without a
+/// password).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeedOutcome {
     /// Users already existed; nothing was seeded.
@@ -60,7 +61,7 @@ pub enum SeedOutcome {
 ///    password, so a passwordless admin is valid until the wizard sets one).
 ///
 /// Returns the [`SeedOutcome`] so the caller can log the result and, for a
-/// generated password, surface it to the operator exactly once.
+/// passwordless administrator, warn the operator to finish setup.
 ///
 /// # Errors
 ///

@@ -386,6 +386,31 @@ struct OkLibrary {
     /// When non-empty, the page `query_items` answers with, in this order and
     /// out of [`PAGE_TOTAL`] rows, instead of the single `item_id` row.
     rows: Vec<BaseItemEntity>,
+    /// The rows a `Name` + one-kind lookup (`get_item_list` / `get_item_ids`)
+    /// finds, matched ignoring case.
+    named: Vec<(BaseItemKind, &'static str, Uuid)>,
+}
+
+impl OkLibrary {
+    /// The ids of the [`OkLibrary::named`] rows `query` names.
+    fn named_ids(&self, query: &InternalItemsQuery) -> Vec<Uuid> {
+        let Some(name) = query.name.as_deref() else {
+            return Vec::new();
+        };
+        let ids = self
+            .named
+            .iter()
+            .filter(|(kind, row, _)| {
+                query.include_item_types.contains(kind) && row.eq_ignore_ascii_case(name.trim())
+            })
+            .map(|&(_, _, id)| id);
+        ids.take(
+            query
+                .limit
+                .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(0)),
+        )
+        .collect()
+    }
 }
 
 /// The total record count `query_items` reports alongside [`OkLibrary::rows`].
@@ -574,14 +599,18 @@ impl LibraryManager for OkLibrary {
             vec![base_item_entity(self.item_id)],
         ))
     }
-    async fn get_item_ids(&self, _query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
+    async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(self.named_ids(query))
     }
     async fn get_item_list(
         &self,
-        _query: &InternalItemsQuery,
+        query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
+        Ok(self
+            .named_ids(query)
+            .into_iter()
+            .map(base_item_entity)
+            .collect())
     }
     async fn get_latest_item_list(
         &self,
@@ -1881,6 +1910,212 @@ async fn get_items_with_filters_returns_query_result() {
     let json = json_body(response).await;
     assert_eq!(json["TotalRecordCount"], 1);
     assert_eq!(json["Items"][0]["Id"], item_id.simple().to_string());
+}
+
+/// The query `GET /Items?{params}` hands the library, and the status it
+/// answered with.
+async fn items_query(params: &str) -> (StatusCode, Option<InternalItemsQuery>) {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items?{params}"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let query = seen.lock().unwrap().take();
+    (response.status(), query)
+}
+
+/// The filters v12.2 `GetItems` copies straight onto the query
+/// (ItemsController.cs:396-430, 491-525): `seriesStatus` (jellyfin-web's TV
+/// Status filter), `personTypes`, `isPlaceHolder` and `hasOfficialRating`, and
+/// the two official ratings as `GetRatingScore` scores. A blank or unknown
+/// rating sets no bound.
+#[tokio::test]
+async fn get_items_forwards_the_rating_status_and_placeholder_filters() {
+    use ferrofin_model::entities::SeriesStatus;
+    use ferrofin_model::entities_media::ParentalRatingScore;
+    let (status, query) = items_query(
+        "recursive=true&seriesStatus=Continuing,ended&minOfficialRating=PG\
+         &maxOfficialRating=pg-13&personTypes=Actor,Director&isPlaceHolder=true\
+         &hasOfficialRating=false",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query = query.expect("query_items ran");
+    assert_eq!(
+        query.series_statuses,
+        [SeriesStatus::Continuing, SeriesStatus::Ended]
+    );
+    assert_eq!(
+        query.min_parental_rating,
+        Some(ParentalRatingScore::new(10, None))
+    );
+    assert_eq!(
+        query.max_parental_rating,
+        Some(ParentalRatingScore::new(13, None))
+    );
+    assert_eq!(query.person_types, ["Actor", "Director"]);
+    assert_eq!(query.is_place_holder, Some(true));
+    assert_eq!(query.has_official_rating, Some(false));
+
+    for params in [
+        "minOfficialRating=%20&maxOfficialRating=",
+        "minOfficialRating=Unrated-Nonsense&maxOfficialRating=XYZ",
+    ] {
+        let (status, query) = items_query(&format!("recursive=true&{params}")).await;
+        assert_eq!(status, StatusCode::OK, "{params}");
+        let query = query.expect("query_items ran");
+        assert_eq!(query.min_parental_rating, None, "{params}");
+        assert_eq!(query.max_parental_rating, None, "{params}");
+    }
+    let (status, _) = items_query("recursive=true&isPlaceHolder=maybe").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// The query `GET /Items?{params}` hands the library when `named` are the
+/// by-name rows and albums its lookups can find.
+async fn items_query_with_named(
+    params: &str,
+    named: Vec<(BaseItemKind, &'static str, Uuid)>,
+) -> InternalItemsQuery {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        named,
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items?{params}"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{params}");
+    seen.lock().unwrap().take().expect("query_items ran")
+}
+
+/// `artists`, `albums` and `studios` name the items whose ids replace
+/// `artistIds`, `albumIds` and `studioIds` (v12.2 ItemsController.cs:527-577).
+/// A name nothing has takes the no-match id instead of a minted row, so it
+/// matches nothing; an absent or blank list leaves the id filter as it was.
+#[tokio::test]
+async fn get_items_resolves_the_artist_album_and_studio_names() {
+    let (artist, album, studio, kept) = (
+        Uuid::from_u128(0xC1),
+        Uuid::from_u128(0xC2),
+        Uuid::from_u128(0xC3),
+        Uuid::from_u128(0xC4),
+    );
+    let named = vec![
+        (BaseItemKind::MusicArtist, "Test Artist", artist),
+        (BaseItemKind::MusicAlbum, "Middle Years", album),
+        (BaseItemKind::Studio, "Acme Pictures", studio),
+    ];
+    let query = items_query_with_named(
+        &format!(
+            "recursive=true&artistIds={kept}&artists=test%20artist|Nobody\
+             &albumIds={kept}&albums=Middle%20Years&studioIds={kept}&studios=Acme%20Pictures|Nope"
+        ),
+        named.clone(),
+    )
+    .await;
+    assert_eq!(query.artist_ids, [artist, Uuid::nil()]);
+    assert_eq!(query.album_ids, [album]);
+    assert_eq!(query.studio_ids, [studio, Uuid::nil()]);
+
+    // A repeated key joins with the declared pipe delimiter.
+    let repeated = items_query_with_named(
+        "recursive=true&studios=Acme%20Pictures&studios=Nope",
+        named.clone(),
+    )
+    .await;
+    assert_eq!(repeated.studio_ids, [studio, Uuid::nil()]);
+
+    let unknown = items_query_with_named("recursive=true&albums=Nope", named.clone()).await;
+    assert_eq!(
+        unknown.album_ids,
+        [Uuid::nil()],
+        "an unknown album matches nothing"
+    );
+
+    let blank = items_query_with_named(
+        &format!("recursive=true&studioIds={kept}&studios=&artists=%20"),
+        named,
+    )
+    .await;
+    assert_eq!(blank.studio_ids, [kept]);
+    assert!(blank.artist_ids.is_empty());
+}
+
+/// An artist's albums asked for with no `sortBy` come newest first, then by
+/// name (v12.2 ItemsController.cs:579-586), whether the artist is named by
+/// id or by name. Any requested sort, `Default` included, any other type set
+/// and a request without an artist keep their own order.
+#[tokio::test]
+async fn get_items_orders_an_artists_albums_newest_first_by_default() {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    let artist = Uuid::from_u128(0xC1);
+    let named = vec![(BaseItemKind::MusicArtist, "Test Artist", artist)];
+    let newest_first = [
+        (ItemSortBy::ProductionYear, SortOrder::Descending),
+        (ItemSortBy::SortName, SortOrder::Ascending),
+    ];
+    for params in [
+        format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum"),
+        "recursive=true&artists=Test%20Artist&includeItemTypes=MusicAlbum".to_owned(),
+        // A sort order with no sort key is no requested sort (`GetOrderBy`).
+        format!(
+            "recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum&sortOrder=Ascending"
+        ),
+    ] {
+        let query = items_query_with_named(&params, named.clone()).await;
+        assert_eq!(query.order_by, newest_first, "{params}");
+    }
+    for (params, expected) in [
+        (
+            format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum&sortBy=Default"),
+            vec![(ItemSortBy::Default, SortOrder::Ascending)],
+        ),
+        (
+            format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum,Audio"),
+            Vec::new(),
+        ),
+        (
+            "recursive=true&includeItemTypes=MusicAlbum".to_owned(),
+            Vec::new(),
+        ),
+    ] {
+        let query = items_query_with_named(&params, named.clone()).await;
+        assert_eq!(query.order_by, expected, "{params}");
+    }
+    // A search still leads with SortName, over the default.
+    let searched = items_query_with_named(
+        &format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum&searchTerm=light"),
+        named,
+    )
+    .await;
+    assert_eq!(
+        searched.order_by,
+        [
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            newest_first[0],
+            newest_first[1]
+        ]
+    );
 }
 
 /// jellyfin-web's artist page filters by `AlbumArtistIds` (Albums),

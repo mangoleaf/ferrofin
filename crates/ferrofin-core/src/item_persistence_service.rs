@@ -744,6 +744,41 @@ pub(crate) async fn row_exists(db: &Database, id: Uuid) -> Result<bool, ServiceE
     Ok(found.is_some())
 }
 
+/// The playlists folder as `PlaylistManager.GetPlaylistsFolder` finds it
+/// (v12.2 PlaylistManager.cs:566-572): the first child of type
+/// `PlaylistsFolder` of the aggregate root (`RootFolder.Children`), else of
+/// the user root (`GetUserRootFolder().Children`), wherever it is stored.
+/// Children come in row order, as the repository loads them by `ParentId`.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the query fails or the row's id is unusable.
+pub(crate) async fn playlists_folder_by_type(
+    db: &Database,
+    aggregate: Option<Uuid>,
+    user_root: Option<Uuid>,
+) -> Result<Option<Uuid>, ServiceError> {
+    let Some(type_name) = stored_type_name(BaseItemKind::PlaylistsFolder) else {
+        return Ok(None);
+    };
+    for parent in [aggregate, user_root].into_iter().flatten() {
+        let found: Option<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "ParentId" = ?1 AND "Type" = ?2
+               ORDER BY rowid LIMIT 1"#,
+        )
+        .bind(guid_to_db(parent))
+        .bind(type_name)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(db_err)?;
+        if let Some(id) = found {
+            return Uuid::parse_str(&id).map(Some).map_err(|e| {
+                ServiceError::backend(format!("playlists folder {id} has an unusable id: {e}"))
+            });
+        }
+    }
+    Ok(None)
+}
+
 /// Inserts one of the two root folders (`AggregateFolder`/`UserRootFolder`) —
 /// a parentless, top-parentless folder row at a fixed path.
 ///
@@ -868,6 +903,39 @@ pub(crate) async fn reparent_virtual_child(
     .await
     .map_err(db_err)?;
     Ok(())
+}
+
+/// Stores row `id`, when it is a `from`, as a `to`, keeping its id: for a
+/// container whose id is not derived from its type (one an earlier Ferrofin
+/// saved under an id of its own), so retyping it orphans nothing. A row of
+/// any other type is left alone.
+///
+/// Returns whether the row is a `to` afterwards.
+pub(crate) async fn retype_container(
+    db: &Database,
+    id: Uuid,
+    from: BaseItemKind,
+    to: BaseItemKind,
+) -> Result<bool, ServiceError> {
+    let name = |kind: BaseItemKind| {
+        stored_type_name(kind)
+            .ok_or_else(|| ServiceError::backend(format!("no stored type name for {kind:?}")))
+    };
+    let (from, to) = (name(from)?, name(to)?);
+    sqlx::query(r#"UPDATE "BaseItems" SET "Type" = ?3 WHERE "Id" = ?1 AND "Type" = ?2"#)
+        .bind(guid_to_db(id))
+        .bind(from)
+        .bind(to)
+        .execute(db.writer())
+        .await
+        .map_err(db_err)?;
+    let stored: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Type" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(id))
+            .fetch_optional(db.pool())
+            .await
+            .map_err(db_err)?;
+    Ok(stored.as_deref() == Some(to))
 }
 
 /// Saves a plug-in folder at `path`, under `parent` (the `AggregateFolder`)

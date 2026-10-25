@@ -41,6 +41,7 @@ use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::{LibraryOptions, TrickplayOptions};
 use ferrofin_model::entities::{MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
+use ferrofin_util::keyed_locks::KeyedLocks;
 use uuid::Uuid;
 
 use ferrofin_traits::configuration::ServerConfigurationManager;
@@ -82,6 +83,11 @@ pub struct FerrofinTrickplayManager {
     /// Upstream holds a lock of 1 (`TrickplayManager._resourcePool`); Ferrofin
     /// sizes it from `FERROFIN_TRICKPLAY_CONCURRENCY` instead.
     generation_slots: Arc<tokio::sync::Semaphore>,
+    /// One refresh or move of an item's trickplay at a time, keyed by item id.
+    /// Upstream's lock of 1 also gave this: a second refresh of the item waits,
+    /// then finds the first one's tiles and row and skips them, and one
+    /// refresh's prune never removes a folder the other has just moved in.
+    item_locks: Arc<KeyedLocks>,
 }
 
 impl std::fmt::Debug for FerrofinTrickplayManager {
@@ -194,6 +200,7 @@ impl FerrofinTrickplayManager {
             generation_slots: Arc::new(tokio::sync::Semaphore::new(
                 tokio::sync::Semaphore::MAX_PERMITS,
             )),
+            item_locks: Arc::new(KeyedLocks::new()),
         }
     }
 
@@ -820,6 +827,8 @@ impl FerrofinTrickplayManager {
         item_id: Uuid,
         library_only: bool,
     ) -> Result<(), ServiceError> {
+        let lock = self.item_locks.get(&item_id.to_string());
+        let _item = lock.lock().await;
         let Some(entity) = self.items.retrieve_item(item_id).await? else {
             return Ok(());
         };
@@ -893,6 +902,11 @@ impl FerrofinTrickplayManager {
         replace: bool,
         library_options: &LibraryOptions,
     ) -> Result<(), ServiceError> {
+        // Held across discovery, the existing-tiles checks, generation and
+        // the prune, as upstream's `_resourcePool` is held across the first
+        // three; the generation slots below bound only the ffmpeg work.
+        let lock = self.item_locks.get(&item_id.to_string());
+        let _item = lock.lock().await;
         let has_streams = !media_streams.is_empty();
         let video_stream = media_streams
             .iter()
@@ -2933,6 +2947,96 @@ mod tests {
         a.await.unwrap().expect("first refresh");
         b.await.unwrap().expect("second refresh");
         assert_eq!(r.extractor.calls(), 2);
+    }
+
+    /// Two refreshes of one item at once (a scan's spawned trickplay job and
+    /// the daily task, or a manual refresh) generate its tiles once: upstream
+    /// takes `_resourcePool` before the existing-tiles check, so the second
+    /// waits, then finds the first one's tiles and row and skips. Ferrofin's
+    /// generation slots are not that lock (unbounded by default), so an item
+    /// lock is.
+    #[tokio::test]
+    async fn concurrent_refreshes_of_one_item_generate_its_tiles_once() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut extractor = FakeExtractor::new(2, 180);
+        extractor.hold = Some((entered.clone(), release.clone()));
+        let db = test_db().await;
+        let item = Uuid::new_v4();
+        let r = rig(&db, options_2x2(&[320]), extractor);
+        seed_video(&db, &r, item, Some(HOUR_TICKS), None).await;
+        let refresh = || {
+            let manager = r.mgr.clone();
+            tokio::spawn(async move {
+                manager
+                    .refresh_trickplay_data(item, false, &extraction_on())
+                    .await
+            })
+        };
+        let first = refresh();
+        entered.notified().await;
+        let second = refresh();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), entered.notified())
+                .await
+                .is_err(),
+            "the second refresh of the item waits for the first"
+        );
+
+        release.notify_one();
+        first.await.unwrap().expect("first refresh");
+        second.await.unwrap().expect("second refresh");
+        assert_eq!(r.extractor.calls(), 1, "the second refresh found the tiles");
+        assert_eq!(
+            r.mgr.get_trickplay_resolutions(item).await.unwrap().len(),
+            1
+        );
+    }
+
+    /// The item lock serialises one item only: two items still generate side
+    /// by side when the generation slots allow it.
+    #[tokio::test]
+    async fn refreshes_of_two_items_still_run_side_by_side() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut extractor = FakeExtractor::new(2, 180);
+        extractor.hold = Some((entered.clone(), release.clone()));
+        let db = test_db().await;
+        let (one, two) = (Uuid::new_v4(), Uuid::new_v4());
+        let r = rig(&db, options_2x2(&[320]), extractor);
+        seed_video(&db, &r, one, Some(HOUR_TICKS), None).await;
+        seed_video(&db, &r, two, Some(HOUR_TICKS), None).await;
+        let refresh = |item| {
+            let manager = r.mgr.clone();
+            tokio::spawn(async move {
+                manager
+                    .refresh_trickplay_data(item, false, &extraction_on())
+                    .await
+            })
+        };
+        let (a, b) = (refresh(one), refresh(two));
+        // Neither extraction returns until released, so two calls means both
+        // are extracting at once.
+        let both_started = async {
+            while r.extractor.calls() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), both_started)
+            .await
+            .expect("both items are extracting");
+
+        let mut both = Box::pin(async { (a.await, b.await) });
+        let (a, b) = loop {
+            release.notify_waiters();
+            if let Ok(done) =
+                tokio::time::timeout(std::time::Duration::from_millis(10), &mut both).await
+            {
+                break done;
+            }
+        };
+        a.unwrap().expect("first item");
+        b.unwrap().expect("second item");
     }
 
     #[tokio::test]

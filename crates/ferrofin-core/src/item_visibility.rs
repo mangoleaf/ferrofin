@@ -614,22 +614,23 @@ impl Context<'_> {
                 PermissionKind::EnableAllFolders,
             )
         };
-        let blocked = self.preference(blocked);
-        if !blocked.is_empty() {
-            return !blocked
+        // `GetPreferenceValues<Guid>`: each value parsed as .NET parses a GUID,
+        // and the ones that do not parse dropped, so a blocked list of only
+        // those counts as empty.
+        let parsed = |kind| {
+            self.preference(kind)
                 .iter()
-                .filter_map(|v| uuid(Some(v)))
-                .any(|v| v == id);
+                .filter_map(|v| ferrofin_util::guid_extensions::parse_dotnet_guid(v))
+        };
+        let mut blocked = parsed(blocked).peekable();
+        if blocked.peek().is_some() {
+            return !blocked.any(|v| v == id);
         }
         self.permissions
             .get(&i32::from(all))
             .copied()
             .unwrap_or(false)
-            || self
-                .preference(enabled)
-                .iter()
-                .filter_map(|v| uuid(Some(v)))
-                .any(|v| v == id)
+            || parsed(enabled).any(|v| v == id)
     }
 
     fn chain<'a>(
@@ -1308,6 +1309,22 @@ mod tests {
         f.pref(PreferenceKind::EnabledFolders, &[&allowed.id]).await;
         assert!(!f.visible(&movie).await);
         assert!(!f.visible(&extra).await);
+        // `GetPreferenceValues<Guid>` parses as .NET does: a padded or
+        // parenthesized id counts, a `urn:uuid:` one does not.
+        let hidden_id = Uuid::parse_str(&hidden.id).expect("id").hyphenated();
+        let urn = format!("urn:uuid:{hidden_id}");
+        f.pref(PreferenceKind::EnabledFolders, &[&urn]).await;
+        assert!(!f.visible(&movie).await);
+        let parenthesized = format!(" ({hidden_id}) ");
+        f.pref(PreferenceKind::EnabledFolders, &[&parenthesized])
+            .await;
+        assert!(f.visible(&movie).await);
+        // A blocked list whose values all fail to parse counts as empty, so
+        // the allow-list still decides.
+        f.pref(PreferenceKind::BlockedMediaFolders, &[&urn]).await;
+        assert!(f.visible(&movie).await);
+        f.pref(PreferenceKind::BlockedMediaFolders, &[]).await;
+        f.pref(PreferenceKind::EnabledFolders, &[&allowed.id]).await;
         // Blocked folders replace the allow-list, even when EnableAllFolders is false.
         f.pref(PreferenceKind::BlockedMediaFolders, &[&allowed.id])
             .await;

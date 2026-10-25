@@ -1,11 +1,12 @@
 //! [`KeyedLocks`] — the port of Jellyfin's `AsyncKeyedLocker<string>`.
 //!
-//! Several ffmpeg paths must serialize work that shares a key — an output cache
-//! path, a subtitle conversion stream key, an attachment folder, an HLS playlist
-//! — so two callers never race two ffmpeg processes onto the same output files.
-//! The C# does this with `AsyncKeyedLocker<string>`, whose defining property is
-//! that it is **reference-counted**: the entry for a key exists only while some
-//! caller holds it, and disappears when the last holder releases.
+//! Several paths must serialize work that shares a key — an output cache path,
+//! a subtitle conversion stream key, an attachment folder, an HLS playlist, an
+//! item's trickplay tiles — so two callers never race two ffmpeg processes onto
+//! the same output files. The C# does this with `AsyncKeyedLocker<string>`,
+//! whose defining property is that it is **reference-counted**: the entry for a
+//! key exists only while some caller holds it, and disappears when the last
+//! holder releases.
 //!
 //! That property is the reason this type exists rather than a bare
 //! `Mutex<HashMap<String, Arc<Mutex<()>>>>`. The keys here are per-session output

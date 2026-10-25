@@ -1588,7 +1588,7 @@ fn pref(map: &HashMap<i32, String>, kind: PreferenceKind) -> Vec<String> {
 fn guid_pref(map: &HashMap<i32, String>, kind: PreferenceKind) -> Vec<Uuid> {
     pref(map, kind)
         .iter()
-        .filter_map(|v| Uuid::parse_str(v).ok())
+        .filter_map(|v| ferrofin_util::guid_extensions::parse_dotnet_guid(v))
         .collect()
 }
 
@@ -1792,6 +1792,19 @@ mod tests {
     use super::*;
     use crate::test_support::test_db;
     use ferrofin_common::cryptography::PasswordHash;
+
+    /// `GetPreferenceValues<Guid>` trims each value and parses it as .NET
+    /// parses a GUID: the padded and `(…)` forms count, `urn:uuid:` and junk
+    /// do not.
+    #[test]
+    fn guid_preferences_parse_as_dotnet_does() {
+        let id = Uuid::from_u128(0x785);
+        let map = HashMap::from([(
+            i32::from(PreferenceKind::OrderedViews),
+            format!(" {id} ,({id}),urn:uuid:{id},junk"),
+        )]);
+        assert_eq!(guid_pref(&map, PreferenceKind::OrderedViews), vec![id, id]);
+    }
 
     /// Session activity's stamp never moves `LastActivityDate` back (an
     /// earlier stamp writes nothing, `RowVersion` included), and a full save

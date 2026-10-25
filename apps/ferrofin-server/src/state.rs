@@ -1642,13 +1642,17 @@ pub async fn build_app_state(
     // feed realtime change detection, which is already blind for the whole of
     // boot, and a change arriving during the walk is picked up by the next
     // scheduled scan exactly as one arriving a moment earlier would be. So it
-    // is spawned and boot continues.
+    // is spawned and boot continues. It is a background task like the event
+    // pump, so an in-process restart's teardown stops the walk rather than
+    // letting the old lifetime keep adding watches (upstream's
+    // `ApplicationStopping` disposes the monitor). Nothing calls `start`
+    // after teardown: the requests have drained and the pump is stopped.
     let monitor_start = Arc::clone(&library_monitor);
-    tokio::spawn(async move {
+    background.push(tokio::spawn(async move {
         if let Err(err) = monitor_start.start().await {
             tracing::warn!(%err, "failed to start library monitor");
         }
-    });
+    }));
     // Scheduled tasks: the registry + trigger scheduler behind the dashboard's
     // "Scheduled Tasks" page. Trigger overrides persist across restarts; the
     // full Library/Maintenance task set is registered below once its backing
@@ -1693,21 +1697,13 @@ pub async fn build_app_state(
         // `GetPlaybackMediaSources`' forced probe of a `.strm` shortcut or an
         // item with no main stream: a full refresh of that file with the
         // remote content probe on, awaited before the sources are read again.
-        .with_remote_probe({
-            let scanner = Arc::clone(&library_scanner);
-            Arc::new(move |path: String| {
-                let scanner = Arc::clone(&scanner);
-                Box::pin(async move {
-                    let options = ferrofin_traits::providers::MetadataRefreshOptions {
-                        metadata_refresh_mode:
-                            ferrofin_traits::providers::MetadataRefreshMode::FullRefresh,
-                        enable_remote_content_probe: true,
-                        ..Default::default()
-                    };
-                    scanner.scan_paths_with(&[path], &options).await.map(|_| ())
-                })
-            })
-        })
+        // It is the library manager's item refresh, never a scan of its own:
+        // the scan queue keeps it from running beside a library scan.
+        .with_remote_probe(
+            ferrofin_core::media_source_manager::item_refresh_remote_probe(Arc::downgrade(
+                &library,
+            )),
+        )
         // `GetPlaybackMediaSources`' per-user overwrite of
         // `SupportsTranscoding`/`SupportsDirectStream` reads the requesting
         // user's policy; without it the overwrite cannot run at all.

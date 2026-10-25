@@ -8,6 +8,37 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — user and policy saves need a complete body
+
+Usually nothing to do: the web client posts back the user it read. A script that calls
+`POST /Users` or `POST /Users/{userId}/Policy` must now send the policy's
+`AuthenticationProviderId` and `PasswordResetProviderId` (or, for `POST /Users`, the whole
+`Policy` or `"Policy": null`) and, for `POST /Users`, the user's `Name`; each is a `400`
+otherwise, as in Jellyfin.
+
+An earlier Ferrofin saved a partial policy body with empty provider ids. A user saved that
+way cannot have their profile or policy saved from the dashboard until both are set again:
+a sign-in restores `AuthenticationProviderId`; set `PasswordResetProviderId` (normally
+`Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider`) with a
+`POST /Users/{userId}/Policy` that carries the user's full policy.
+
+## Unreleased — library tiles are drawn as Jellyfin 12.2 draws them
+
+Nothing to do. Some "My Media" tiles change on their next refresh:
+- **A library with artwork at the root of its media folder shows it.** A `folder.jpg`,
+  `poster.jpg` or similar in, say, `/media/movies` replaces the generated collage, as in
+  Jellyfin. Only the media folder's root is read, not its subfolders. An image in the
+  library's own folder (where an upload is saved) still wins.
+  Remove the file from the media folder to get the collage back.
+- **Music tiles come from artists.** A music library's collage samples the artists its
+  tracks credit that have an image, not its albums.
+- **Collages sample items that have a Primary image.** A library whose items have no
+  Primary image keeps the icon tile, where Ferrofin used to draw from any item's artwork.
+- **Each library tile and the root's image are redrawn once.** A library or root row
+  written by an earlier Ferrofin has never recorded a refresh, so its next refresh at the
+  default mode counts as its first and redraws the image past the 7-day gate, as Jellyfin
+  does for an item's first refresh.
+
 ## Unreleased — the Screen Grabber, and HDR chapter images
 
 Usually nothing to do. Three changes can show:

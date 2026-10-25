@@ -177,6 +177,25 @@ impl ProblemDetails {
         }
     }
 
+    /// [`Self::member_validation`] for every `(member, message)` that failed,
+    /// as ASP.NET reports all of a body's failing members in one `400`;
+    /// `None` when there are none.
+    #[must_use]
+    pub fn members_validation(
+        failures: impl IntoIterator<Item = (String, String)>,
+    ) -> Option<Self> {
+        let errors: BTreeMap<String, Vec<String>> = failures
+            .into_iter()
+            .map(|(member, message)| (member, vec![message]))
+            .collect();
+        (!errors.is_empty()).then(|| Self {
+            type_: VALIDATION_TYPE,
+            title: VALIDATION_TITLE,
+            status: StatusCode::BAD_REQUEST.as_u16(),
+            errors: Some(errors),
+        })
+    }
+
     /// The rejection for an absent, blank or `null` body.
     #[must_use]
     fn empty_body() -> Self {
