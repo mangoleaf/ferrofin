@@ -49,7 +49,10 @@ and idle-core checks, so keep one root per host.
 
 Each run is a session folder, `runs/<branch>-<YYYYMMDD-HHMM>/` (a rerun in the same minute gets
 `-run2`): `session.json` records the branch, commit, images, the Jellyfin oracle pin and each gate's
-status, times and exit status, beside each gate's own run directory and its `<gate>.log`. A gate that
+status, times and exit status, beside each gate's own run directory and its `<gate>.log`. Every gate,
+the release A/B gate included, runs against the Jellyfin release the branch pins: when a newer one is
+out, the preflight notes it and `session.json` records the note with the pin, and nothing is refused
+for it ([`bench/oracle.py`](bench/oracle.py)). A gate that
 fails does not stop the next; `gates/run` exits 1 when one failed and 2 when the preflight refused.
 Each gate's own script still runs on its own; its README says how.
 
@@ -67,7 +70,8 @@ would read as the cargo tests.
 
 However a session ends, `gates/run` writes its report, `index.html` and the same as `report.md`
 ([`report.py`](report.py), which writes it again for any session: `python3 gates/report.py SESSION`).
-It shows the commit, images and oracle pin, and one row per gate, every gate included:
+It shows the commit, images and oracle pin (with its note on a newer release), and one row per gate,
+every gate included:
 
 | Gate | Counts | Links to |
 |---|---|---|

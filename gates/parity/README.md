@@ -42,15 +42,16 @@ gates/parity/run.sh --oracle "$(cat gates/bench/testdata/jellyfin-image.txt)" --
 python3 gates/bench/report.py --serve 8097 "$FERROFIN_GATES_DIR/runs" --parity-dir "$FERROFIN_GATES_DIR/runs"   # list and compare runs
 ```
 
-`--gate` makes it a release-gate run: a stale oracle pin, or an `--oracle` that is not the pin, is refused
-instead of warned about. The oracle is the same pinned image and the same stale-pin check as the benchmark
-(`gates/bench/oracle.py`).
+`--gate` makes it a release-gate run: an `--oracle` that is not the pin is refused instead of warned about,
+and the cores must be pinned. The oracle is the same pinned image and the same check as the benchmark
+(`gates/bench/oracle.py`): a run is measured against the Jellyfin release its branch pins, so a newer
+release is noted and recorded with the oracle in `run.json`, never refused, on `--gate` too.
 
 ## What a run does
 
 1. **Preflight.** Nothing is booted and no run directory is made if an input is refused (exit 2): the
    request sets, `normalise.toml` and `ledger.toml` must be valid, the corpus must be prepared for this
-   oracle image, the oracle pin must be current (`--gate`), and the cores must be idle.
+   oracle image, the oracle pin must be readable, and the cores must be idle.
 2. **Boot.** Both servers boot at once, each on its own disposable copy of the **same** configuration (the one the
    pinned Jellyfin upgraded and scanned, `jellyfin/config`; the benchmark boots Ferrofin on the 10.11.8 source
    instead, and a replay on that would compare two different scans, not two servers), media read-only, each on
@@ -88,7 +89,7 @@ isolation snapshots): remove the directory when you are done with the run.
 |---|---|
 | 0 | no new difference (ledgered differences and oracle failures do not fail it, unless the oracle failed on every request: nothing was compared) |
 | 1 | a new difference, or the run failed (a server did not boot, the cap passed, a reset before a write failed, the comparison crashed) |
-| 2 | refused before anything started: bad arguments, an invalid input file, a stale pin on `--gate`, busy cores |
+| 2 | refused before anything started: bad arguments, an invalid input file, an unreadable pin, an `--oracle` other than the pin on `--gate`, busy cores |
 | 129, 130, 143 | interrupted (SIGHUP, SIGINT, SIGTERM); the containers are removed and a failure report is written |
 
 ## Files

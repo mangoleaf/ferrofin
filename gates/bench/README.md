@@ -34,15 +34,19 @@ The owner withdrew the fixed 15% spread gate on 2026-09-04: tail variation was n
 reliable pass/fail test. Reports retain ranges for review instead.
 
 The benchmark reference is the Jellyfin release named by the C# source-parity pin
-(`UPSTREAM_TAG` in `handlers/mod.rs`, always the latest Jellyfin release), pinned by digest
-in `testdata/jellyfin-image.txt`. `oracle.py check` compares that tag with the latest
-Jellyfin release tag (release candidates excluded). When the pin is behind or the lookup
-fails, a release-gate session (`gate.py aa|ab|scan|ramp|soak|endpoints`) refuses to start and `run.sh` warns and
-continues. Each run records the oracle in `run.json`, and its `report.html` names the tag
-and digest. A run that boots Jellyfin also stops unless the pinned image reports the
-`UPSTREAM_TAG` release (`oracle.py matches`), so the digest cannot drift from the tag.
-Moving the pin means moving `UPSTREAM_TAG`, pinning that release's image and preparing the
-corpus again.
+(`UPSTREAM_TAG` in `handlers/mod.rs`), pinned by digest in `testdata/jellyfin-image.txt`.
+The pin is the latest Jellyfin release when a release branch is cut, and the branch keeps it:
+a release is measured against the Jellyfin release its branch pins, and the next release
+branch moves to the newest one (owner decision 2026-10-25). `oracle.py check` compares the tag
+with the latest Jellyfin release tag (release candidates excluded). When the pin is behind or
+the lookup fails, it notes so ("measured against Jellyfin v12.2, the release this branch pins;
+v12.3 is out") and nothing is refused: neither `run.sh` nor a release-gate session
+(`gate.py aa|ab|scan|ramp|soak|endpoints`). Only a pin it cannot read is refused. Each run records
+the oracle, note included, in `run.json`, and its `report.html` names the tag, digest and note;
+a gate session records them in `gate.json` and its verdict JSON, and names them in its report.
+A run that boots Jellyfin also stops unless the pinned image reports the `UPSTREAM_TAG` release
+(`oracle.py matches`), so the digest cannot drift from the tag. Moving the pin means moving
+`UPSTREAM_TAG`, pinning that release's image and preparing the corpus again.
 The owner requested plugin checks and background scan suppression; the isolation
 policy below implements that request on disposable configurations.
 
@@ -118,8 +122,8 @@ warm-up at the same rate (different picks) that is discarded, and a window in wh
   iteration, found by the `ramp` phase.
 - **Parity** — `N / 412 operations deep-verified against <UPSTREAM_TAG>, plus M compared
   against an earlier release`: the number of contract operations whose Ferrofin
-  implementation was compared against the upstream Jellyfin C# (`UPSTREAM_TAG`, the latest
-  Jellyfin release; M counts rows in `VERIFIED_AGAINST_EARLIER_PIN`, compared against an
+  implementation was compared against the upstream Jellyfin C# (`UPSTREAM_TAG`, the release
+  this branch pins; M counts rows in `VERIFIED_AGAINST_EARLIER_PIN`, compared against an
   earlier pin and owed a re-check) for behavioral equivalence, recorded as rows of
   `handlers::VERIFIED` in
   `crates/ferrofin-api/src/handlers/mod.rs` and printed by
