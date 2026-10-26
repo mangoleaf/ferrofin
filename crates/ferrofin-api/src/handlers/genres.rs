@@ -14,6 +14,7 @@
 use axum::extract::{Path, State};
 use axum::routing::get;
 use axum::{Json, Router};
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
@@ -25,7 +26,7 @@ use crate::extract::Query;
 use crate::handlers::by_name::{
     ByNameItemQuery, ByNameListQuery, project_query_result, resolve_by_name_or_slug,
 };
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::resolve_user_or_api_key;
 use crate::state::AppState;
 
 /// `GET /Genres` — the library's genres.
@@ -45,9 +46,10 @@ async fn get_genres(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
-    let internal = query.base_query(Some(user.clone()))?;
-    let result = if is_music_collection_folder(&state, query.parent_id).await? {
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
+    let parent = query.parent(&state).await?;
+    let internal = query.base_query(user.clone())?;
+    let result = if is_music_collection_folder(parent.as_ref()) {
         state.library.get_music_genres(&internal).await?
     } else {
         state.library.get_genres(&internal).await?
@@ -62,7 +64,7 @@ async fn get_genres(
         result,
         &options,
         query.should_include_item_types(),
-        Some(&user),
+        user.as_ref(),
     )
     .await?;
     Ok(Json(projected))
@@ -72,33 +74,25 @@ async fn get_genres(
 /// `musicvideos` (`GenresController.cs:141-150`).
 ///
 /// A library's collection type is stored in its row's `Data` blob, the same
-/// field its DTO's `CollectionType` comes from. Another kind of parent, or no
-/// stored type, keeps the plain genres answer. So does a `parentId` naming no
-/// item, where upstream answers 400 (recorded as `UNKNOWN_PARENT_ID_DIVERGENCE`).
-async fn is_music_collection_folder(
-    state: &AppState,
-    parent_id: Option<uuid::Uuid>,
-) -> Result<bool, ApiError> {
-    let Some(parent_id) = parent_id else {
-        return Ok(false);
-    };
-    let Some(parent) = state.library.get_item_by_id(parent_id).await? else {
-        return Ok(false);
+/// field its DTO's `CollectionType` comes from. Another kind of parent, no
+/// stored type, or no parent keeps the plain genres answer.
+fn is_music_collection_folder(parent: Option<&BaseItemEntity>) -> bool {
+    let Some(parent) = parent else {
+        return false;
     };
     if parent.type_.rsplit('.').next() != Some("CollectionFolder") {
-        return Ok(false);
+        return false;
     }
     let data: serde_json::Value = parent
         .data
         .as_deref()
         .and_then(|data| serde_json::from_str(data).ok())
         .unwrap_or_default();
-    Ok(data
-        .get("CollectionType")
+    data.get("CollectionType")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|kind| {
             kind.eq_ignore_ascii_case("music") || kind.eq_ignore_ascii_case("musicvideos")
-        }))
+        })
 }
 
 /// `GET /Genres/{genreName}` — a single genre by name.
@@ -127,7 +121,7 @@ async fn get_genre(
     Path(genre_name): Path<String>,
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `item ??= new Genre()`: upstream serializes a default-constructed
     // entity rather than 404ing, so this route has no not-found arm at all.
     let item = match resolve_by_name_or_slug(&state, BaseItemKind::Genre, &genre_name).await? {
@@ -137,7 +131,7 @@ async fn get_genre(
     let options = DtoOptions::default();
     let dto = state
         .dto
-        .get_base_item_dto(&item, &options, Some(&user), None)
+        .get_base_item_dto(&item, &options, user.as_ref(), None)
         .await?;
     Ok(Json(dto))
 }

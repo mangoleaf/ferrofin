@@ -31,8 +31,11 @@
 --testdata defaults to $FERROFIN_GATES_DIR/fixtures/bench-testdata and --out to
 $FERROFIN_GATES_DIR/runs/bench-gate-<mode>-<date>-<time> (the output root's layout is in gates/lib.sh).
 
-Before anything starts, `oracle.check` must find the Jellyfin oracle pin (UPSTREAM_TAG) on the
-latest Jellyfin release; a stale pin or a failed lookup refuses the session (decision DO).
+Before anything starts, `oracle.check` reads the Jellyfin oracle pin (UPSTREAM_TAG and its
+digest); a pin it cannot read refuses the session. A release is measured against the Jellyfin
+release its branch pins (owner decision 2026-10-25, which replaced the earlier refusal of a pin
+behind the latest release): a newer release is noted with the oracle in gate.json, the verdict
+JSON and the report, never refused.
 
 Each run is `run.sh --servers ferrofin --only PHASES[mode]` (below; `scan` runs `scan.py`
 instead) into SESSION_DIR/NN-a or
@@ -414,17 +417,43 @@ def judge_candidate_runs(session, plan, rows):
         report.write_html(run)
 
 
+VERDICT_COUNTS = ("regressed", "not comparable", "improved", "within noise")
+
+
+def session_result(session, plan, result, block):
+    """The session's result envelope (gates/result.py): blocked or passed (an A/A, which judges
+    nothing, measured), the gated cells counted by verdict, and every verdict cell (`a_median`,
+    `b_median`, `pct`, `verdict`, `gated`…) as the session judged it, from the candidate's side."""
+    role = "b" if any(r == "b" for _, r, _ in plan["schedule"]) else "a"   # an A/A runs one image
+    first = next(name for name, r, _ in plan["schedule"] if r == role)
+    meta = report.load(os.path.join(session, first, "run.json")) or {}
+    image = plan["images"][role]
+    verdicts = json.loads(json.dumps(result.get("verdicts") or {}, default=str))
+    gated = [v for v in verdicts.values() if v.get("gated")]
+    source = {"commit": meta.get("sha"), "image": image["ref"], "image_digest": image["id"],
+              "oracle": (plan.get("oracle") or {}).get("image"), "host_class": report.gate_result().host_class(),
+              "fixture": meta.get("ids_sha256")}
+    detail = {"mode": plan["mode"], "name": plan["name"], "images": plan["images"], "verdicts": verdicts,
+              "blocking": block}
+    verdict = "measured" if plan["mode"] == "aa" else "blocked" if block else "passed"
+    counts = {v: sum(1 for c in gated if c.get("verdict") == v) for v in VERDICT_COUNTS}
+    return report.gate_result().envelope("bench", verdict, counts, source, plan["date"], None, detail)   # its runs record their own ends
+
+
 def render(session):
-    """Compute the session's tables, write report.md, report.html and the machine-readable
-    noise.json (A/A) or verdict.json (A/B); returns the blocking cells. An A/B, ramp or soak
+    """Compute the session's tables; write report.md, report.html, the machine-readable
+    noise.json (A/A) or verdict.json (A/B), and the session's result.json. Returns the
+    blocking cells. An A/B, ramp or soak
     gate also gives its candidate runs the gated verdicts ([`judge_candidate_runs`]); the
     session's own report.html is listed in the viewer too (`report.list_runs`)."""
     plan = report.load(os.path.join(session, "gate.json"))
     if not plan:
         raise ValueError(f"{session} has no gate.json")
     gate = report.load_gate()
+    # What the session was measured against, with any newer Jellyfin release noted (oracle.check).
+    pinned = {"oracle": plan["oracle"]} if plan.get("oracle") else {}
     if plan["mode"] == "soak":
-        result = soak_session(session, plan, gate)
+        result = soak_session(session, plan, gate) | pinned
         with open(os.path.join(session, "verdict.json"), "w") as f:
             json.dump(result, f, indent=2, default=str)
         md = soak.render_md(header(plan), result)
@@ -432,6 +461,7 @@ def render(session):
             f.write(md)
         with open(os.path.join(session, "report.html"), "w") as f:
             f.write(soak.render_html(header(plan), result, report.CSS))
+        report.gate_result().write(session, session_result(session, plan, result, result["blocking"]))
         judge_candidate_runs(session, plan, result["verdicts"])
         return md, result["blocking"]
     if plan["mode"] == "endpoints":
@@ -468,6 +498,7 @@ def render(session):
         result = {"verdicts": verdicts(built["a"], built["b"], gate)}
         name, block = "verdict.json", blocking(result["verdicts"])
     result["blocking"] = block
+    result |= pinned
     with open(os.path.join(session, name), "w") as f:
         json.dump(result, f, indent=2, default=str)
     md = render_md(plan, result)
@@ -475,6 +506,7 @@ def render(session):
         f.write(md)
     with open(os.path.join(session, "report.html"), "w") as f:
         f.write(render_html(plan, result))
+    report.gate_result().write(session, session_result(session, plan, result, block))
     if plan["mode"] in ("ab", "ramp", "endpoints"):
         judge_candidate_runs(session, plan, result["verdicts"])
     return md, block
@@ -563,8 +595,9 @@ def md_table(head, rows):
 
 def header(plan):
     imgs = "; ".join(f"{role} = {i['ref']} ({i['id'][:19]})" for role, i in plan["images"].items())
-    o = plan.get("oracle")
-    pin = f"; Jellyfin oracle {o['tag']} ({o['image']})" if o else ""
+    o, pin = plan.get("oracle"), ""
+    if o:
+        pin = f"; Jellyfin oracle {o['tag']} ({o['image']})" + (f" — {o['note']}" if o.get("note") else "")
     return f"{plan['mode'].upper()} session {plan['name']}, {len(plan['schedule'])} runs, {plan['date']}: {imgs}{pin}"
 
 
@@ -695,13 +728,14 @@ def main(argv):
     if os.path.exists(session):
         sys.exit(f"gate: {session} exists — a session directory is never reused")
     testdata = os.path.abspath(opts["--testdata"] or gates_dir("fixtures/bench-testdata"))
-    # A release gate never runs against a Jellyfin pin behind the latest release (DO).
+    # The Jellyfin release this branch pins, whatever has shipped since (owner decision
+    # 2026-10-25): a newer release is noted with it, and only a pin that cannot be read refuses.
     try:
-        plan["oracle"], problem = oracle.check()
+        plan["oracle"] = oracle.check()
     except (OSError, ValueError) as err:
-        problem = f"cannot read the Jellyfin oracle pin ({err})"
-    if problem:
-        sys.exit(f"gate: refusing: {problem}")
+        sys.exit(f"gate: refusing: cannot read the Jellyfin oracle pin ({err})")
+    if "note" in plan["oracle"]:
+        print(f"  oracle: {plan['oracle']['note']}")
     plan["images"] = {}
     for role, image in images.items():
         ref = image_ref(image)

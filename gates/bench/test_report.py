@@ -88,11 +88,14 @@ class ReportTests(unittest.TestCase):
         return dict(model['levels']['loaded']['screens'])['home'][server]
 
     def readme(self, model=None):
+        """What the README publishes from `model`: its result.json detail (gates/publish.py reads it)."""
         model = model or self.build()
-        return report.render_readme(model, model['runs'])
+        return report.run_result(model)['detail']
 
-    def row(self, text, label='home'):
-        return next(line for line in text.splitlines() if line.startswith(f'| **{label}**'))
+    def row(self, detail, label='home', group=None):
+        """A loaded-level screen row of `detail`, or the row of `group` (ttfs, memory) whose name starts so."""
+        rows = detail[group] if group else detail['levels']['loaded']['screens']
+        return next(r for r in rows if r['name'].startswith(label))
 
     def test_report_evidence_is_tabular_and_preserves_failures_and_missing_values(self):
         model = self.build(self.a, self.b)
@@ -158,6 +161,81 @@ class ReportTests(unittest.TestCase):
         rows = dict(dict(report.cpu_tables(model))['CPU per screen comparison (validated workloads only)'])
         self.assertEqual(rows[key]['ferrofin'], 'withheld — validation flags')
 
+    def test_result_json_holds_the_numbers_report_md_prints(self):
+        page = report.write_html(str(self.a))
+        self.assertTrue(Path(page).is_file())
+        doc = report.gate_result().read(str(self.a), 'bench')   # a valid envelope, the benchmark's
+        self.assertEqual((doc['verdict'], doc['source']['commit'], doc['source']['image'], doc['source']['image_digest']),
+                         ('measured', 'abc', 'ferrofin:bench', 'sha256:ferrofin'))
+        self.assertEqual(set(doc['source']['host_class']), {'cores', 'memory_gib'})
+        self.assertIsNone(doc['ended'])   # the fixture records no phases: when it ended is unknown, not "now"
+        self.write(self.a / 'ferrofin/phases.json', {'loaded': {'status': 'completed', 'start': 1792915910, 'end': 1792916735.8}})
+        self.assertEqual(report.run_result(self.build())['ended'], '2026-10-25T08:25:35+00:00')
+        md = report.render_md(self.build()).splitlines()
+        line = lambda label: next(l for l in md if l.startswith(f'| {label} |'))
+        loaded = doc['detail']['levels']['loaded']
+        self.assertEqual([r['name'] for r in loaded['screens']], report.SCREENS)
+        for r in loaded['screens']:
+            for server in ('jellyfin', 'ferrofin'):
+                c = r['servers'][server]
+                self.assertIn(f"{report.n0(c['median'])} / {report.n0(c['p95'])} / {report.n0(c['p99'])}", line(r['name']))
+            self.assertEqual(r['ratio'], 2.0)
+            self.assertIn('2.0× faster', line(r['name']))
+            self.assertIsNone(r['withheld'])
+        for group, fmt in (('ttfs', report.ms), ('memory', report.mib)):
+            for r in doc['detail'][group]:
+                self.assertIn(fmt(r['servers']['ferrofin']['median']), line(r['name']))
+        self.assertEqual([r['name'] for r in doc['detail']['memory']], list(report.MEMORY_ROWS))
+        self.assertEqual(doc['detail']['oracle_label'], 'Jellyfin 12.2')
+
+    def test_result_json_withholds_a_cell_the_servers_answered_differently(self):
+        path = self.a / 'ferrofin/shape.log'
+        records = [json.loads(json.loads(line)['msg']) for line in path.read_text().splitlines()]
+        next(r for r in records if r['shape'] == 'home:items')['count'] = 2
+        self.shapes(path.parent, records)
+        doc = report.run_result(self.build())
+        home = next(r for r in doc['detail']['levels']['loaded']['screens'] if r['name'] == 'home')
+        self.assertIsNone(home['ratio'])
+        self.assertTrue(home['withheld'].startswith('Ferrofin: '))
+        self.assertIsNotNone(home['servers']['ferrofin']['flag'])
+        self.assertTrue(self.row(self.readme())['withheld'])   # the README withholds the same cell
+        movies = next(r for r in doc['detail']['levels']['loaded']['screens'] if r['name'] == 'movies')
+        self.assertEqual((movies['ratio'], movies['withheld']), (2.0, None))
+
+    def test_result_json_has_cpu_per_screen_where_the_work_matched(self):
+        model = self.build()
+        for server, _ in model['servers']:
+            model['resources'][server] = [{'loaded': {'cpu_seconds': 24 if server == 'jellyfin' else 12,
+                                                      'observed_start': 1000, 'observed_end': 1120, 'samples': 1202}}]
+        cpu = report.run_result(model)['detail']['cpu_per_screen']
+        self.assertEqual([r['name'] for r in cpu], ['loaded'])
+        self.assertEqual((cpu[0]['servers']['jellyfin']['median'], cpu[0]['servers']['ferrofin']['median'], cpu[0]['ratio']),
+                         (40.0, 20.0, 2.0))   # ms per completed screen, as the CPU table prints it
+        model['levels']['loaded']['screens'][0][1]['ferrofin'].flag = 'different work'
+        cpu = report.run_result(model)['detail']['cpu_per_screen']
+        self.assertEqual((cpu[0]['ratio'], cpu[0]['withheld']), (None, 'Ferrofin: different work'))
+
+    def test_phase_states_give_the_result_its_verdict(self):
+        for phases, verdict in (({'loaded': {'status': 'completed'}}, 'measured'),
+                                ({'loaded': {'status': 'completed'}, 'stress': {'status': 'failed'}}, 'failed'),
+                                ({'loaded': {'status': 'running'}}, 'incomplete')):
+            with self.subTest(verdict):
+                self.assertEqual(report.phase_verdict({'phases': {'ferrofin': [phases]}, 'meta': {}})[0], verdict)
+        self.assertEqual(report.phase_verdict({'phases': {'ferrofin': [{'a': {'status': 'skipped'}}]}, 'meta': {}}),
+                         ('measured', {'completed': 0, 'failed': 0, 'unfinished': 0, 'skipped': 1}))
+        # a server whose run recorded no phases.json at all did not finish either, unless the run predates them
+        unrecorded = {'phases': {'ferrofin': [{'a': {'status': 'completed'}}], 'jellyfin': [None]}}
+        self.assertEqual(report.phase_verdict({**unrecorded, 'meta': {'phase_schema': 1}})[0], 'incomplete')
+        self.assertEqual(report.phase_verdict({**unrecorded, 'meta': {}})[0], 'measured')
+
+    def test_result_json_of_a_ferrofin_only_run_compares_with_nothing(self):
+        shutil.rmtree(self.a / 'jellyfin')
+        doc = report.run_result(self.build())
+        self.assertEqual((list(doc['detail']['servers']), doc['detail']['oracle_label'], doc['source']['oracle']),
+                         (['ferrofin'], None, None))
+        home = doc['detail']['levels']['loaded']['screens'][0]
+        self.assertEqual((home['servers']['ferrofin']['median'], home['ratio']), (10, None))
+
     def test_cpu_table_retains_failed_sampler_and_escapes_reason(self):
         model = self.build()
         model['resources']['ferrofin'] = [{'loaded': {'cpu_seconds': 0.0, 'samples': 2}}]
@@ -178,11 +256,11 @@ class ReportTests(unittest.TestCase):
     def test_clean_report_and_optional_servers(self):
         m = self.build(self.a, self.b)
         self.assertIsNone(self.home(m).flag)
-        self.assertIn('faster on 7', self.readme(m))
-        self.assertIn('3 logical CPUs', self.readme(m))
+        endpoints = self.readme(m)['levels']['loaded']['endpoints']
+        self.assertEqual(sum(r['ratio'] > 1 for r in endpoints if r['ratio']), 7)
+        self.assertEqual(self.readme(m)['conditions']['server_cpus'], '0,2-3')
         self.assertIn('12.2', report.render_md(m))
-        self.assertIn('No measured request failed', self.readme(m))
-        self.assertNotIn('full runs', self.readme(m))
+        self.assertEqual(self.readme(m)['load_problems'], [])
         self.assertIn('<html', report.render_html(m))
 
     def test_later_missing_shape_and_selection_order(self):
@@ -190,14 +268,14 @@ class ReportTests(unittest.TestCase):
         forward, reverse = self.build(self.a, self.b), self.build(self.b, self.a)
         self.assertIn('no shape pass', self.home(forward).flag)
         self.assertEqual(self.home(forward).flag, self.home(reverse).flag)
-        self.assertNotIn('faster', self.row(self.readme(forward)))
+        self.assertIsNone(self.row(self.readme(forward))['ratio'])
 
     def test_http_failures_invalidate_measured_window(self):
         self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].update(ok=0.5))
         m = self.build()
         self.assertIn('failed', self.home(m).flag)
-        self.assertNotIn('No measured request failed', self.readme(m))
-        self.assertNotIn('faster', self.row(self.readme(m)))
+        self.assertTrue(self.readme(m)['load_problems'])
+        self.assertIsNone(self.row(self.readme(m))['ratio'])
 
     def test_oracle_http_failure_invalidates_comparison(self):
         self.edit(self.b / 'jellyfin/k6-loaded.json', lambda x: x['endpoints']['home:items'].update(ok=0))
@@ -206,15 +284,15 @@ class ReportTests(unittest.TestCase):
         self.assertIn('failed', self.home(m, 'jellyfin').flag)
 
     def test_slower_and_tied_candidates_do_not_claim_wins(self):
-        for latency, sentence in [(20, 'about the same on 7'), (25, 'slower on 7')]:
+        for latency, ratio in [(20, 1.0), (25, 0.8)]:
             with self.subTest(latency=latency):
                 def update(x):
                     for group in ('screens', 'endpoints'):
                         for v in x[group].values():
                             v['p50'] = latency
                 self.edit(self.a / 'ferrofin/k6-loaded.json', update)
-                self.assertIn(sentence, self.readme())
-                self.assertNotIn('faster on 7', self.readme())
+                endpoints = self.readme()['levels']['loaded']['endpoints']
+                self.assertEqual({r['ratio'] for r in endpoints}, {ratio})
 
     def test_mixed_conditions_and_images_are_rejected(self):
         original = json.loads((self.b / 'run.json').read_text())
@@ -350,7 +428,7 @@ class ReportTests(unittest.TestCase):
     def test_known_nondefault_repetition_count(self):
         self.edit(self.a / 'run.json', lambda x: x.update(restarts=1))
         self.edit(self.a / 'ferrofin/coldstart.json', lambda x: x.update(runs=x['runs'][:1]))
-        self.assertIsNone(dict(self.build()['ttfs'])[report.README_TTFS[0]]['ferrofin'].flag)
+        self.assertIsNone(self.build()['ttfs'][0][1]['ferrofin'].flag)   # cold start
 
     def test_cold_start_attempt_bound_separates_run_sets(self):
         self.assertFalse(report.incompatible([str(self.a), str(self.b)]))
@@ -375,7 +453,7 @@ class ReportTests(unittest.TestCase):
             self.shapes(path.parent, records)
         m = self.build()
         self.assertIsNone(dict(m['levels']['loaded']['endpoints'])['image']['ferrofin'].flag)
-        self.assertIn('faster', self.row(self.readme(m)))
+        self.assertIsNotNone(self.row(self.readme(m))['ratio'])
 
     def test_inventory_differences_remain_diagnostic_across_repetitions(self):
         self.edit(self.b / 'ferrofin/counts.json', lambda x: x.update(movies=1, persons=5000))
@@ -386,7 +464,7 @@ class ReportTests(unittest.TestCase):
                 self.assertIsNone(cells['ferrofin'].flag)
         self.assertTrue(any('count movies' in x for x in m['work']['ferrofin']))
         self.assertTrue(any('count persons' in x for x in m['work']['ferrofin']))
-        self.assertIn('faster', self.row(self.readme(m)))
+        self.assertIsNotNone(self.row(self.readme(m))['ratio'])
 
     def test_missing_inventory_stays_visible_without_flagging_latency(self):
         for server in ('ferrofin', 'jellyfin'):
@@ -404,7 +482,7 @@ class ReportTests(unittest.TestCase):
         m = self.build(self.a, self.b)
         self.assertIsNotNone(self.home(m).flag)
         self.assertIsNone(dict(m['levels']['loaded']['screens'])['movies']['ferrofin'].flag)
-        self.assertIn('— ⚠', self.row(self.readme(m)))
+        self.assertTrue(self.row(self.readme(m))['withheld'])
 
     def test_transport_failure_in_oracle_shape(self):
         self.shapes(self.a / 'jellyfin', [{'shape': 'home:items', 'url': '/home:items', 'status': 0}])
@@ -414,41 +492,42 @@ class ReportTests(unittest.TestCase):
         self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].update(p50=float('nan')))
         m = self.build()
         self.assertIsNotNone(self.home(m).flag)
-        self.assertNotIn('nan', self.row(self.readme(m)))
+        home = self.row(self.readme(m))
+        self.assertEqual((home['ratio'], home['servers']['ferrofin']['values']), (None, []))   # no NaN reaches result.json
+        json.dumps(home, allow_nan=False)
 
     def test_missing_timing_file_is_flagged(self):
         (self.b / 'ferrofin/coldstart.json').unlink()
-        c = dict(self.build(self.a, self.b)['ttfs'])[report.README_TTFS[0]]['ferrofin']
+        c = self.build(self.a, self.b)['ttfs'][0][1]['ferrofin']   # cold start
         self.assertIsNotNone(c.flag)
         self.assertEqual(c.runs, 2)
         self.assertEqual(len(c.vals), 1)
 
     def test_single_server_render(self):
         shutil.rmtree(self.a / 'jellyfin')
-        text = self.readme()
-        self.assertIn('no Jellyfin reference selected', text)
-        self.assertNotIn('faster', self.row(text))
+        detail = self.readme()
+        self.assertIsNone(detail['oracle_label'])
+        self.assertIsNone(self.row(detail)['ratio'])
 
     def test_dropped_work_withholds_resource_comparisons(self):
         self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x.update({'dropped_iterations': 1}))
         m = self.build()
         self.assertIsNotNone(self.home(m).flag)
         for name, cells in m['memory']:
-            if name in report.README_MEMORY:
+            if name in report.MEMORY_ROWS:
                 self.assertIsNotNone(cells['ferrofin'].flag)
 
     def test_missing_window_is_incomplete_not_zero_errors(self):
         (self.b / 'ferrofin/k6-loaded.json').unlink()
         m = self.build(self.a, self.b)
         self.assertIn('missing load window', self.home(m).flag)
-        self.assertNotIn('No measured request failed', self.readme(m))
+        self.assertTrue(self.readme(m)['load_problems'])
 
     def test_later_oracle_timing_failure_withholds_ratio(self):
         self.edit(self.b / 'jellyfin/coldstart.json', lambda x: x['runs'][0].update(home_ms=None))
-        text = self.readme(self.build(self.a, self.b))
-        line = next(x for x in text.splitlines() if x.startswith('| cold start'))
-        self.assertIn('— ⚠', line)
-        self.assertNotIn('faster', line)
+        cold = self.row(self.readme(self.build(self.a, self.b)), 'cold start', 'ttfs')
+        self.assertTrue(cold['withheld'])
+        self.assertIsNone(cold['ratio'])
 
     def test_empty_image_is_not_accepted(self):
         for server in ('ferrofin', 'jellyfin'):
@@ -466,14 +545,13 @@ class ReportTests(unittest.TestCase):
 
     def test_missing_tail_withholds_entire_headline_cell(self):
         self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].pop('p99'))
-        self.assertNotIn('faster', self.row(self.readme()))
+        self.assertIsNone(self.row(self.readme())['ratio'])
 
     def test_version_labels_follow_each_run_in_every_renderer(self):
         old = self.build(self.a)
         self.write(self.b / 'jellyfin/system-info.json', {'Version': '12.2.0'})
         new = self.build(self.b)
-        for render in (report.render_md, report.render_html,
-                       lambda m: report.render_readme(m, m['runs'])):
+        for render in (report.render_md, report.render_html, lambda m: json.dumps(report.run_result(m)['detail'])):
             with self.subTest(renderer=render):
                 self.assertIn('Jellyfin 12.2.0', render(new))
                 self.assertNotIn('Jellyfin 12.2.0', render(old))
@@ -510,7 +588,7 @@ class ReportTests(unittest.TestCase):
         self.shapes(d, records)
         model = self.build()
         self.assertIn('empty', self.home(model).flag)
-        self.assertNotIn('faster', self.row(self.readme(model)))
+        self.assertIsNone(self.row(self.readme(model))['ratio'])
 
     def test_workload_hashes_and_seeds_cannot_be_mixed(self):
         for field in ('workload', 'ids_sha256', 'screens_sha256', 'seed', 'warmup_seed', 'slots', 'pools', 'user_isolation', 'actors'):
@@ -555,10 +633,10 @@ class ReportTests(unittest.TestCase):
         self.assertIn('parameters differ',cell.flag)
 
     def test_hls_headlines_the_readme_unless_its_transcode_differs(self):
-        row = lambda: next(line for line in self.readme().splitlines() if line.startswith('| HLS first segment'))
-        self.assertNotIn('⚠', row())
+        row = lambda: self.row(self.readme(), 'HLS first segment', 'ttfs')
+        self.assertIsNone(row()['withheld'])
         self.edit(self.a/'ferrofin/ttfs.json', lambda t: t['hls'][1].update(transcoding_url='/master.m3u8?VideoCodec=hevc'))
-        self.assertIn('— ⚠', row())
+        self.assertTrue(row()['withheld'])
 
     def test_stream_probe_failure_in_later_run_is_not_ignored(self):
         self.edit(self.b/'run.json', lambda m:m.update(streaming_validation=1))
@@ -571,7 +649,7 @@ class ReportTests(unittest.TestCase):
         (self.b / 'ferrofin/mem.csv').unlink()
         m = self.build(self.a, self.b)
         for name, cells in m['memory']:
-            if name in report.README_MEMORY:
+            if name in report.MEMORY_ROWS:
                 self.assertIsNotNone(cells['ferrofin'].flag)
 
 
@@ -1371,6 +1449,12 @@ class GateTests(unittest.TestCase):
         page = (out / 'report.html').read_text()
         self.assertIn("class='delta bad'>regressed", page)
         self.assertEqual(json.loads((out / 'verdict.json').read_text())['blocking'], block)
+        result = report.gate_result().read(str(out), 'bench')   # the session's result.json, a valid envelope
+        self.assertEqual((result['verdict'], result['detail']['mode'], result['detail']['blocking'], result['source']['image']),
+                         ('blocked', 'ab', block, 'new'))
+        home = result['detail']['verdicts']['loaded/screens/home']
+        self.assertEqual((home['a_median'], home['b_median'], home['verdict'], home['gated']), (10, 20, 'regressed', True))
+        self.assertGreaterEqual(result['counts']['regressed'], 1)
         aa = self.session('aa', [10, 10, 10, 10, 10, 10])
         md, block = gate.render(str(aa))
         self.assertEqual(block, [])
@@ -1378,6 +1462,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(noise['proposed_cells'], {})
         self.assertEqual({r['verdict'] for r in noise['false_alarms'].values()}, {'within noise'})
         self.assertIn('Noise per cell', (aa / 'report.html').read_text())
+        self.assertEqual(report.gate_result().read(str(aa), 'bench')['verdict'], 'measured')
 
     def viewer(self, target):
         status, _, body = report.handle(target, {'benchmark': str(self.root), 'adoption': None, 'parity': None})
@@ -1575,33 +1660,47 @@ class GateTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r"fewer items.*'episodes': '7489 \(fixture 7490\)'"):
             scan.counts(api, 'u', summary)
 
-    def test_a_gate_run_refuses_a_stale_oracle_pin_before_anything_starts(self):
+    def test_a_gate_run_refuses_an_unreadable_oracle_pin_before_anything_starts(self):
         out = self.root / 'session'
-        with patch.object(gate.oracle, 'check', return_value=({'tag': 'v12.2', 'image': 'jf@sha256:x'},
-                                                              'Jellyfin v12.3 is out; the oracle pin is v12.2')), \
+        with patch.object(gate.oracle, 'check', side_effect=ValueError('UPSTREAM_TAG v12.3-rc1 is not a release')), \
                 patch.object(gate, 'image_ref', side_effect=AssertionError('docker touched')):
-            with self.assertRaisesRegex(SystemExit, 'v12.3 is out'):
+            with self.assertRaisesRegex(SystemExit, 'cannot read the Jellyfin oracle pin.*v12.3-rc1'):
                 gate.main(['ab', 'old', 'new', '--out', str(out), '--testdata', str(self.root / 'td')])
         self.assertFalse(out.exists())
 
-    def test_a_gate_run_records_the_oracle_it_checked_in_gate_json(self):
-        out = self.root / 'session'
-        pin = {'tag': 'v12.2', 'image': 'jf@sha256:x'}
-        with patch.object(gate.oracle, 'check', return_value=(pin, None)), \
-                patch.object(gate, 'image_ref', return_value='sha256:img'), \
-                patch.object(gate, 'run_session'), patch.object(gate, 'render', return_value=('', [])):
-            self.assertEqual(gate.main(['ab', 'old', 'new', '--out', str(out), '--testdata', str(self.root / 'td')]), 0)
-        self.assertEqual(json.loads((out / 'gate.json').read_text())['oracle'], pin)
+    def test_a_gate_run_measures_against_the_branch_pin_and_records_a_newer_release(self):
+        # A release is measured against the Jellyfin release its branch pins (owner decision
+        # 2026-10-25): a newer release is recorded with the oracle, never a refusal.
+        for pin in ({'tag': 'v12.2', 'image': 'jf@sha256:x'},
+                    {'tag': 'v12.2', 'image': 'jf@sha256:x',
+                     'note': 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'}):
+            out = self.root / f'session-{len(pin)}'
+            with self.subTest(pin), patch.object(gate.oracle, 'check', return_value=pin), \
+                    patch.object(gate, 'image_ref', return_value='sha256:img'), \
+                    patch.object(gate, 'run_session') as ran, patch.object(gate, 'render', return_value=('', [])), \
+                    patch('sys.stdout', new_callable=io.StringIO) as printed:
+                self.assertEqual(gate.main(['ab', 'old', 'new', '--out', str(out), '--testdata', str(self.root / 'td')]), 0)
+            ran.assert_called_once()
+            self.assertEqual(json.loads((out / 'gate.json').read_text())['oracle'], pin)
+            self.assertEqual('v12.3 is out' in printed.getvalue(), 'note' in pin)
 
-    def test_the_session_report_names_the_oracle(self):
+    def test_the_session_report_and_verdict_name_the_oracle_and_a_newer_release(self):
+        note = 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'
         out = self.session('ab', [10, 10, 10, 10, 10, 10])
         self.edit(out / 'gate.json', lambda p: p.update(oracle={'tag': 'v12.2', 'image': 'jf@sha256:abc'}))
         gate.render(str(out))
         self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc)', (out / 'report.html').read_text())
+        self.assertNotIn('is out', (out / 'report.html').read_text())
+        self.edit(out / 'gate.json', lambda p: p['oracle'].update(note=note))
+        gate.render(str(out))
+        for page in ('report.html', 'report.md'):
+            self.assertIn(f'Jellyfin oracle v12.2 (jf@sha256:abc) — {note}', (out / page).read_text())
+        self.assertEqual(json.loads((out / 'verdict.json').read_text())['oracle'],
+                         {'tag': 'v12.2', 'image': 'jf@sha256:abc', 'note': note})
 
 
 class OracleTests(unittest.TestCase):
-    """The Jellyfin oracle pin (oracle.py): release-tag parsing, the stale-pin check, and where it shows."""
+    """The Jellyfin oracle pin (oracle.py): release-tag parsing, the note on a newer release, and where it shows."""
     write, make_run, shapes = ReportTests.write, ReportTests.make_run, ReportTests.shapes
     LS_REMOTE = '\n'.join(f'{"0" * 40}\trefs/tags/{t}' for t in (
         'v10.11.8', 'v10.11.11', 'v12.0-rc7', 'v12.0', 'v12.0^{}', 'v12.1', 'v12.2', 'v12.3-rc1', 'nightly'))
@@ -1622,15 +1721,15 @@ class OracleTests(unittest.TestCase):
                 patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
             return oracle.check(ls_remote=lambda: listing)
 
-    def test_a_pin_behind_the_latest_release_is_a_problem_and_equal_or_newer_is_not(self):
-        info, problem = self.check('v12.2', 'v12.1', 'v12.2', 'v12.3')
-        self.assertEqual(info, {'tag': 'v12.2', 'image': 'jf@sha256:abc'})
-        self.assertIn('Jellyfin v12.3 is out', problem)
-        self.assertIsNone(self.check('v12.2', 'v12.1', 'v12.2', 'v12.3-rc1')[1])
-        self.assertIsNone(self.check('v12.2.0', 'v12.2')[1])
-        self.assertIsNone(self.check('v12.3', 'v12.2')[1])
+    def test_a_pin_behind_the_latest_release_is_noted_and_equal_or_newer_is_not(self):
+        self.assertEqual(self.check('v12.2', 'v12.1', 'v12.2', 'v12.3'), {
+            'tag': 'v12.2', 'image': 'jf@sha256:abc',
+            'note': 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'})
+        self.assertEqual(self.check('v12.2', 'v12.1', 'v12.2', 'v12.3-rc1'), {'tag': 'v12.2', 'image': 'jf@sha256:abc'})
+        self.assertNotIn('note', self.check('v12.2.0', 'v12.2'))
+        self.assertNotIn('note', self.check('v12.3', 'v12.2'))
 
-    def test_a_failed_or_empty_lookup_is_a_problem(self):
+    def test_a_failed_or_empty_lookup_is_noted(self):
         failures = (OSError('network unreachable'), subprocess.TimeoutExpired(['git'], 10),
                     subprocess.CalledProcessError(128, ['git'], stderr='fatal: unable to access\n'))
 
@@ -1639,10 +1738,27 @@ class OracleTests(unittest.TestCase):
                 raise failure
             with self.subTest(reason), patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
                     patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
-                self.assertIn(reason, oracle.check(ls_remote=lookup)[1])
+                note = oracle.check(ls_remote=lookup)['note']
+            self.assertIn('measured against Jellyfin v12.2, the release this branch pins', note)
+            self.assertIn(reason, note)
+        # a timeout setting that is not a number is a lookup problem too, never an unreadable pin
+        with patch.dict(os.environ, {'HTTP_TIMEOUT_S': 'ten'}), patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
+                patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
+            note = oracle.check()['note']   # the real lookup: float('ten') fails before git is run
+        self.assertIn('the latest Jellyfin release could not be looked up (could not convert', note)
         with patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
                 patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
-            self.assertIn('no Jellyfin release tags', oracle.check(ls_remote=lambda: '')[1])
+            self.assertIn('no Jellyfin release tags', oracle.check(ls_remote=lambda: '')['note'])
+
+    def test_a_pin_that_is_not_a_release_or_is_empty_cannot_be_read(self):
+        def lookup():
+            raise AssertionError('the network was asked about a pin that cannot be read')
+        for tag, image, error in (('v12.3-rc1', 'jf@sha256:abc', 'UPSTREAM_TAG v12.3-rc1 .* not a Jellyfin release'),
+                                  ('v12.2', '', 'jellyfin-image.txt is empty')):
+            with self.subTest(tag=tag, image=image), patch.object(oracle, 'upstream_tag', return_value=tag), \
+                    patch.object(oracle, 'pinned_image', return_value=image):
+                with self.assertRaisesRegex(ValueError, error):
+                    oracle.check(ls_remote=lookup)
 
     def test_matches_accepts_only_the_oracle_release_the_pinned_image_reports(self):
         with patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
@@ -1652,16 +1768,26 @@ class OracleTests(unittest.TestCase):
             self.assertEqual(oracle.main(['matches', '12.2.0-beta']), 1)
         self.assertIn('reports Jellyfin 12.1.0, not the oracle v12.2', err.getvalue())
 
-    def test_gate_refuses_and_an_ad_hoc_run_warns_and_continues(self):
-        stale = ({'tag': 'v12.2', 'image': 'jf@sha256:abc'}, 'Jellyfin v12.3 is out')
-        for flags, code in (([], 0), (['--gate'], 1)):
-            with self.subTest(flags), patch.object(oracle, 'check', return_value=stale), \
+    def test_check_prints_a_newer_release_as_a_note_and_never_refuses_it(self):
+        # Every run, the release gate's included, is measured against the release its branch pins.
+        behind = {'tag': 'v12.2', 'image': 'jf@sha256:abc',
+                  'note': 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'}
+        with patch.object(oracle, 'check', return_value=behind), \
+                patch('sys.stdout', new_callable=io.StringIO) as out, \
+                patch('sys.stderr', new_callable=io.StringIO) as err:
+            self.assertEqual(oracle.main(['check']), 0)
+        self.assertEqual(json.loads(out.getvalue()), behind)
+        self.assertEqual(err.getvalue(), f'oracle: {behind["note"]}\n')
+
+    def test_check_refuses_a_pin_it_cannot_read(self):
+        for failure in (ValueError('UPSTREAM_TAG v12.3-rc1 is not a Jellyfin release tag'),
+                        FileNotFoundError(2, 'No such file or directory')):
+            with self.subTest(failure), patch.object(oracle, 'check', side_effect=failure), \
                     patch('sys.stdout', new_callable=io.StringIO) as out, \
                     patch('sys.stderr', new_callable=io.StringIO) as err:
-                self.assertEqual(oracle.main(['check', *flags]), code)
-            self.assertEqual(json.loads(out.getvalue()), stale[0])
-            self.assertIn('v12.3 is out', err.getvalue())
-            self.assertIn('refusing' if code else 'warning', err.getvalue())
+                self.assertEqual(oracle.main(['check']), 2)
+            self.assertEqual(out.getvalue(), '')
+            self.assertIn('oracle: cannot read the pin', err.getvalue())
 
     def test_upstream_tag_is_read_from_the_rust_source_and_fails_clearly_without_it(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1683,7 +1809,13 @@ class OracleTests(unittest.TestCase):
         meta = json.loads((run / 'run.json').read_text())
         meta['oracle'] = {'tag': 'v12.2', 'image': 'jf@sha256:abc'}
         (run / 'run.json').write_text(json.dumps(meta))
-        self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc)', report.render_html(report.build([str(run)])))
+        page = report.render_html(report.build([str(run)]))
+        self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc)', page)
+        self.assertNotIn('is out', page)
+        meta['oracle']['note'] = 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'
+        (run / 'run.json').write_text(json.dumps(meta))
+        self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc) — measured against Jellyfin v12.2, the release this '
+                      'branch pins; v12.3 is out', report.render_html(report.build([str(run)])))
 
 
 if __name__ == '__main__':

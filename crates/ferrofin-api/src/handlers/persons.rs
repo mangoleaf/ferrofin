@@ -22,7 +22,7 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::by_name::{ByNameItemQuery, additional_dto_options, project_item_rows};
-use crate::handlers::items::{resolve_user, user_uuid};
+use crate::handlers::items::{resolve_user_or_api_key, user_uuid};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
@@ -128,8 +128,8 @@ async fn get_persons(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<PersonsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_id = user_uuid(&user)?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
+    let user_id = user.as_ref().map(user_uuid).transpose()?;
     // C# folds `filters ∋ IsFavorite` onto the tri-state when `isFavorite` is
     // absent (PersonsController: `!isFavorite.HasValue && isFavoriteInFilters`).
     let filters = parse_csv_enums_lenient::<ItemFilter>(query.filters.as_deref());
@@ -147,11 +147,15 @@ async fn get_persons(
         name_starts_with: query.name_starts_with.clone(),
         name_less_than: query.name_less_than.clone(),
         name_starts_with_or_greater: query.name_starts_with_or_greater.clone(),
-        user_id: Some(user_id),
+        user_id,
         is_favorite,
         // People belong to no library: what a restricted user may see follows
-        // from the items they are credited on.
-        access_filter: state.library.build_access_filter(&user).await?,
+        // from the items they are credited on. With no user (an API key)
+        // nothing is filtered (`BuildAccessFilter(null)`).
+        access_filter: match &user {
+            Some(user) => state.library.build_access_filter(user).await?,
+            None => None,
+        },
         ..InternalPeopleQuery::default()
     };
     let result = state.library.get_people_items(&people_query).await?;
@@ -163,7 +167,7 @@ async fn get_persons(
         query.enable_image_types.as_deref(),
     );
     // People carry no aggregated counts (Jellyfin passes none here).
-    let projected = project_item_rows(&state, result, &options, Some(&user)).await?;
+    let projected = project_item_rows(&state, result, &options, user.as_ref()).await?;
     Ok(Json(projected))
 }
 
@@ -187,7 +191,7 @@ async fn get_person(
     Path(name): Path<String>,
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     let item = state
         .library
         .get_named_item(BaseItemKind::Person, &name)
@@ -196,7 +200,7 @@ async fn get_person(
     let options = DtoOptions::default();
     let dto = state
         .dto
-        .get_base_item_dto(&item, &options, Some(&user), None)
+        .get_base_item_dto(&item, &options, user.as_ref(), None)
         .await?;
     Ok(Json(dto))
 }

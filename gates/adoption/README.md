@@ -8,6 +8,10 @@ real installation.
 
 ## Supported and tested versions
 
+The status every release's gates session found, per version and upgrade route, is published with
+that release in the root README's [Results](../../README.md#adopting-an-existing-jellyfin-database).
+The record below is the per-version history.
+
 The 10.11 and 12.0–12.1 fixture paths below **passed** the live suite on **2026-09-16
 (US/Mountain)**, against fixtures derived from a real library. The suite no longer uses real
 libraries: since 2026-10-14 every fixture is [synthetic](#the-fixtures-are-synthetic). All ten
@@ -381,10 +385,16 @@ recorder's own messages go to `/dev/null` there, so they never change what a run
 stdout is a terminal, `run.sh` also prints the page's path at the end: the one line of stdout
 recording adds, and only on a terminal.
 
+`result.json` is written beside the page from the same reading of the run, in the envelope every gate
+shares ([`gates/result.py`](../result.py)): the verdict, the rows counted (passed, failed, unfinished,
+skipped), and per fixture its kind, expected generation, verdict, reason, every check and the scale
+measurements. The table differences and the messy shapes stay in the page. The gates session page and
+the release summary (`gates/publish.py`, the README's adoption grid) read it.
+
 The shared viewer lists it in its Adoption tab and compares two runs side by side:
 
 ```bash
-python3 gates/bench/report.py --serve      # run.sh's page as `adoption` ($FERROFIN_GATES_DIR/work); the matrix: --adoption-dir DIR/work
+python3 gates/bench/report.py --serve      # run.sh's page as `adoption` ($FERROFIN_GATES_DIR/work) and every session's; the matrix: --adoption-dir DIR/work
 ```
 
 The `Adoption` workflow uploads the two pages as the `adoption-report` (`run.sh`) and

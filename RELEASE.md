@@ -73,11 +73,16 @@ from.
      `ferrofin:bench` before each run, checks that the run measured the intended image, and
      restores the tag at the end. A failed run stops the session. It is never retried: start
      a new session.
-   - **Oracle pin.** Before the first run, the session checks that `UPSTREAM_TAG` (the
-     Jellyfin oracle, pinned by digest in `gates/bench/testdata/jellyfin-image.txt`) is the latest
-     Jellyfin release. It refuses to start when a newer release exists or the lookup fails
-     (it needs network access to GitHub). Moving the pin is then a work item: move
-     `UPSTREAM_TAG`, pin that release's image and prepare the corpus again.
+   - **Oracle pin.** A release is measured against the Jellyfin release its branch pins:
+     `UPSTREAM_TAG`, the Jellyfin oracle, pinned by digest in
+     `gates/bench/testdata/jellyfin-image.txt`. The pin is the latest Jellyfin release when the
+     release branch is cut, and the branch keeps it to its release; the next release branch
+     moves to the newest release (owner decision 2026-10-25). Before the first run the session
+     reads the pin and refuses to start only when it cannot read it. It also looks up the latest
+     Jellyfin release (network access to GitHub): a newer one, or a lookup that failed, is
+     noted, never refused. The note is recorded with the oracle in `gate.json`,
+     `verdict.json` and the report ("measured against Jellyfin v12.2, the release this branch
+     pins; v12.3 is out").
    - **Wall time.** Not yet measured on the shared host. The fixed waits alone add up to
      8 minutes per run: four 30 s settles (after startup and before each window and the
      steady phase), two 30 s warm-ups with 120 s windows, and the 60 s steady window. Six
@@ -94,8 +99,8 @@ from.
      `gates/bench/scan.py` in place of `run.sh`: a full library scan of the bench corpus on an
      empty data dir, and the adoption boot of a fresh copy of its Jellyfin 10.11.8 database,
      each timed with its peak anon memory (`gates/bench/README.md`, "Scan and migration"). It
-     needs the same idle cores and the same test data (at least 10,000 items), and refuses
-     a stale oracle pin the same way, although it never boots Jellyfin. A self-A/B
+     needs the same idle cores and the same test data (at least 10,000 items), and reads and
+     records the oracle pin the same way, although it never boots Jellyfin. A self-A/B
      of v1.3.2 took 20 minutes from start to report on the shared host. Output goes to
      `$FERROFIN_GATES_DIR/runs/bench-gate-scan-<date>-<time>/` with the same session files (`verdict.json`,
      `report.md`, `report.html`), and it exits `1` when it blocks. Its runs hold `scan.json`
@@ -136,7 +141,7 @@ from.
 
    **Throughput ceiling.** Measure it in the same window as the gate. It is a separate
    session (output in `$FERROFIN_GATES_DIR/runs/bench-gate-ramp-<date>-<time>/`, with the same oracle-pin
-   refusal and the same rule that a failed run stops the session):
+   record and the same rule that a failed run stops the session):
    `python3 gates/bench/gate.py ramp ghcr.io/mangoleaf/ferrofin:vPREV ferrofin:vX.Y.Z-rc`
    ([`gates/bench/README.md`](gates/bench/README.md#throughput-ceiling-the-saturation-ramp)). Each run is
    `gates/bench/run.sh --servers ferrofin --only ramp`, which steps the loaded mix up from 25
@@ -170,7 +175,7 @@ from.
    Each endpoint's p50 is judged by the `endpoints` row on the same rule as the other cells.
    Only the `gates/bench/screens.js` shapes and the parity edge-case GETs block: a regressed one, or
    one that cannot be judged because its answers differ between runs. Every other endpoint is
-   reported; file a regression there as an issue. The oracle-pin refusal and the rule that a
+   reported; file a regression there as an issue. The oracle-pin record and the rule that a
    failed run stops the session are the same as the A/B's. Output goes to
    `$FERROFIN_GATES_DIR/runs/bench-gate-endpoints-<date>-<time>/`. **Wall time:** one
    Ferrofin run measured on the shared host took 77 minutes (a 50 s warm-up, then 4,551 s
@@ -181,10 +186,13 @@ from.
    leaves the combinations out. Whether the release session does that is still open: the
    owner decides.
 
-   **The Jellyfin comparison is publication only.** The three-server `gates/bench/run.sh` runs
-   (Ferrofin and both Jellyfins, three runs, median) produce the published tables in the root
-   README and `docs/BENCHMARKS.md`. Run them when those numbers are refreshed. They never
-   decide a release.
+   **Run the publication inputs.** Every release publishes its results in the root README
+   (step 6) from local runs of the release candidate's image, all of one commit: one full gates
+   session, `make run-gates IMAGE=<candidate>` without `PREVIOUS=` (its adoption and parity gates give the README's
+   adoption status and parity overview, and its benchmark is the first Jellyfin comparison), then
+   two more `make run-bench IMAGE=<candidate>` sessions for the second and third comparison. They
+   are publication inputs only: their numbers never decide a release, and parity is not a gate
+   here. Keep the three session folders for step 6.
 
    **Validate adoption.** The evidence is a green run of the `Adoption` workflow
    (`.github/workflows/adoption.yml`) on the frozen release commit. It builds the image from
@@ -212,6 +220,22 @@ from.
    `Adoption` run from step 2.
    After a patch release from `main`, merge `main` into the open release branch so the fix
    is carried forward.
+6. **Publish the results**, also after the tag ([`gates/README.md`](gates/README.md#publishing-the-results)).
+   Choose the release's local results from step 2 (nothing is picked for you) and run
+
+   ```bash
+   make publish-results VERSION=vX.Y.Z SESSION=$FERROFIN_GATES_DIR/runs/<full session> \
+     BENCH="$FERROFIN_GATES_DIR/runs/<full session>/bench $FERROFIN_GATES_DIR/runs/<bench session 2>/bench $FERROFIN_GATES_DIR/runs/<bench session 3>/bench"
+   ```
+
+   It writes `docs/results/vX.Y.Z/summary.json`, the graphs beside it and the README's Results
+   block, and refuses runs of different commits, images, hosts or fixtures. Regenerate
+   `docs/BENCHMARKS.md` from the same three runs: `python3 gates/bench/report.py <run> <run> <run>`
+   prints the tables, which replace everything between the file's two rules; update the date,
+   commit and run notes above the first rule to match. Commit all of it to the release PR
+   (release branch → `main`), or to `main` for a patch release. CI's `benchmark-report` job fails
+   when the block or the graphs differ from what the committed summary files give, so never edit
+   them by hand.
 
 The workflow needs the repository secret `RELEASE_TOKEN`: a fine-grained personal
 access token for this repository with **Contents: read and write**. Tags pushed with the

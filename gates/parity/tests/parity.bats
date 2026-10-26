@@ -226,19 +226,20 @@ containers_gone() { # no container left in the fake docker, no server process le
   [[ "$output" == *"prepare Jellyfin first"* ]]
 }
 
-@test "run.sh: a gate run refuses a stale oracle pin and an oracle that is not the pin; an ad-hoc run only warns" {
-  PARITY_PIN=1 FAKE_LATEST_TAG=v99.0 run parity --gate
-  [ "$status" -eq 2 ]
-  [[ "$output" == *"refusing"* ]]
-  [ ! -e out ]
+@test "run.sh: a newer Jellyfin release is noted and recorded, never refused; a gate run refuses an oracle that is not the pin" {
+  local note="measured against Jellyfin $FAKE_LATEST_TAG, the release this branch pins; v99.0 is out"
   FAKE_LATEST_TAG=v99.0 run parity
   [ "$status" -eq 0 ]
-  [[ "$output" == *"warning"* ]]
+  [[ "$output" == *"oracle: $note"* ]]
+  [ "$(jq -r .oracle.note out/run.json)" = "$note" ]
   rm -rf out
   testdata td other:oracle
-  PARITY_PIN=1 run "$PARITY/run.sh" --testdata td --out out --oracle other:oracle --ferrofin ferrofin:ok --gate
+  # A release-gate run gets past a newer release to the pin's own check, which it refuses.
+  PARITY_PIN=1 FAKE_LATEST_TAG=v99.0 run "$PARITY/run.sh" --testdata td --out out --oracle other:oracle --ferrofin ferrofin:ok --gate
   [ "$status" -eq 2 ]
+  [[ "$output" == *"oracle: $note"* ]]
   [[ "$output" == *"is not the pinned oracle"* ]]
+  [ ! -e out ]
 }
 
 @test "run.sh: a release-gate run is pinned, and refused before the network is asked anything" {

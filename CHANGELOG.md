@@ -94,8 +94,31 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   test pass `--locked`, so a manifest change without its lockfile fails instead of resolving
   anew. The release's cargo-zigbuild and ziglang are pinned (0.23.4 and 0.16.0, the pair the
   v1.3.2 aarch64 build used), and GitLab's `:latest` images to the versions they are today
+- A release is measured against the Jellyfin release its branch pins (`UPSTREAM_TAG`, the
+  latest release when the branch was cut): a newer Jellyfin release no longer refuses the
+  release A/B gate (`gate.py`, `gates/run --previous`) or `gates/parity/run.sh --gate`. It is
+  noted ("measured against Jellyfin v12.2, the release this branch pins; v12.3 is out") and
+  recorded with the oracle in `session.json`, `gate.json`, the verdict JSON, each run's
+  `run.json` and the reports. A pin that cannot be read (an `UPSTREAM_TAG` that is not a release
+  tag, an empty image pin) is still refused, and so is a pinned image that reports another
+  release (`oracle.py matches`). `oracle.py check` no longer takes `--gate`
 
 ### Parity
+- A single genre, studio, person, year, music genre or artist (`GET /Genres/{genreName}` and its
+  siblings, and by-name rows with `fields=ItemCounts`) counts only what its viewer may open, as
+  Jellyfin 12.2 does: the viewer's libraries, and no alternate version, local version or stacked
+  part, whoever asks. A studio or genre also counts the episodes of the series it is written on,
+  as the list already did (`/Genres/Action` read `EpisodeCount` 0 where Jellyfin reads 366)
+- A server API key with no `userId` is served with no user on `GET /Items`, the by-name lists and
+  single routes (`/Genres`, `/MusicGenres`, `/Studios`, `/Artists`, `/Artists/AlbumArtists`,
+  `/Persons`, `/Years`) and `GET /Library/MediaFolders`, as Jellyfin does; they answered 400
+- A `parentId` naming no item (the zero id included) answers 400 on the by-name lists, `/Years`
+  and `/Items/Filters`, as Jellyfin's `GetParentItem` does; they answered an empty 200.
+  `/Items/Filters` with a lone `Trailer` or `Program` type answers empty filters, and
+  `/Items/Filters2` refuses the zero id
+- The server root's (`AggregateFolder`) `RecursiveItemCount` and unplayed count cover the leaves
+  in its libraries only, reached through the ancestor closure as Jellyfin does; they counted the
+  placeholder row and every person, genre, studio and year row as well
 - Find the playlists folder by its type when a playlist is created, as Jellyfin's
   `GetPlaylistsFolder` does, instead of by its path or derived id, and write nothing during
   the lookup. Startup now makes a playlists folder kept at the folder's directory under an id

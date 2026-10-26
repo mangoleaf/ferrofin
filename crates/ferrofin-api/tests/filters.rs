@@ -1229,3 +1229,99 @@ async fn items_filters2_trailer_type_skips_the_parent(
     assert_eq!(query.parent_id, Uuid::nil());
     assert!(!query.physical_children_only);
 }
+
+/// v12.2 `FilterController.GetQueryFiltersLegacy` (`FilterController.cs:66-77`)
+/// resolves the parent through `LibraryManager.GetParentItem`, which throws
+/// `ArgumentException("Invalid parent id: …")` for an id naming no item;
+/// `ExceptionMiddleware` answers it `400`. A parent that exists is the scope.
+#[tokio::test]
+async fn items_filters_refuses_an_unknown_parent() {
+    for unknown in [Uuid::from_u128(0xBAD0), Uuid::nil()] {
+        let library = Arc::new(StubLibrary::default());
+        let (status, body) = get_with(
+            Arc::clone(&library),
+            &format!("/Items/Filters?includeItemTypes=Movie&parentId={unknown}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{unknown}");
+        // `GetItemById` throws "Guid can't be empty" for the zero id.
+        let message = if unknown.is_nil() {
+            "Guid can't be empty"
+        } else {
+            "Invalid parent id"
+        };
+        assert!(
+            String::from_utf8_lossy(&body).contains(message),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            library.last_legacy_query.lock().expect("lock").is_none(),
+            "{unknown}: nothing is aggregated for an unknown parent"
+        );
+    }
+
+    let parent = Uuid::from_u128(0xF00D);
+    let library = Arc::new(StubLibrary {
+        parent: Some((parent, BaseItemKind::Folder)),
+        ..StubLibrary::default()
+    });
+    let (status, _) = get_with(
+        Arc::clone(&library),
+        &format!("/Items/Filters?includeItemTypes=Movie&parentId={parent}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query = library
+        .last_legacy_query
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("aggregated");
+    assert_eq!(query.ancestor_ids, vec![parent]);
+}
+
+/// A lone `Trailer` or `Program` type leaves `GetQueryFiltersLegacy`'s item
+/// null (`FilterController.cs:66-72`), which is no `Folder`, so upstream
+/// answers empty filters whatever `parentId` says, an unknown one included.
+#[rstest]
+#[case::trailer("Trailer")]
+#[case::program("Program")]
+#[tokio::test]
+async fn items_filters_for_a_lone_trailer_or_program_type_are_empty(#[case] kind: &str) {
+    for parent in ["", "&parentId=0000000000000000000000000000bad0"] {
+        let library = Arc::new(StubLibrary::default());
+        let (status, body) = get_with(
+            Arc::clone(&library),
+            &format!("/Items/Filters?includeItemTypes={kind}{parent}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kind}{parent}");
+        let filters: QueryFiltersLegacy = serde_json::from_slice(&body).expect("legacy filters");
+        assert_eq!(filters, QueryFiltersLegacy::default(), "{kind}{parent}");
+        assert!(
+            library.last_legacy_query.lock().expect("lock").is_none(),
+            "{kind}{parent}: nothing is aggregated"
+        );
+    }
+}
+
+/// `/Items/Filters2` reads its parent through `GetItemById<BaseItem>`, which
+/// answers null for an id naming no item (no scope) but throws for the zero
+/// id ("Guid can't be empty"), which `ExceptionMiddleware` answers `400`
+/// (v12.2 `FilterController.cs:138-141`, `LibraryManager.cs:1689-1694`).
+#[tokio::test]
+async fn items_filters2_refuses_the_zero_parent_id() {
+    let (status, _) = get(&format!(
+        "/Items/Filters2?includeItemTypes=Movie&parentId={}",
+        Uuid::nil()
+    ))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get(&format!(
+        "/Items/Filters2?includeItemTypes=Movie&parentId={}",
+        Uuid::from_u128(0xBAD0)
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "an unknown id is no scope");
+}

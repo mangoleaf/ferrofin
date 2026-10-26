@@ -31,7 +31,8 @@
 # Every check's verdict is recorded as it runs, and WORK/report.html (gates/adoption/adoption_report.py) is built from
 # those however the run ends: per fixture and stage, every check, the table-digest differences, the
 # messy shapes against Jellyfin 12.2 and the scale measurements. It opens from disk, and the shared
-# viewer lists it (python3 gates/bench/report.py --serve --adoption-dir WORK/..).
+# viewer lists it (python3 gates/bench/report.py --serve). WORK/result.json beside it holds the same rows
+# in every gate's envelope (gates/result.py): what the gates session page and the release summary read.
 # One PASS/FAIL line per fixture; exit status is non-zero if any failed. Each fixture
 # includes two boots and a full scan. Fixtures are synthetic and NOT in the repository:
 # build-fixtures.sh builds DIR (invented media under DIR/media, the only media mounted) — see
@@ -85,6 +86,9 @@ record_detail() { local detail=${!#}; set -- "${@:1:$#-1}"; printf '%s' "$detail
 if [ -z "${ADOPTION_RUN_WORKER:-}" ]; then
   command -v setsid >/dev/null || { echo "run: setsid (util-linux) is required" >&2; exit 2; }
   worker='' spawned=''
+  # the build the report names; read before the traps below, so no $( … ) runs while they are set
+  IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)
+  IMAGE_COMMIT=$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" 2>/dev/null)
   # shellcheck disable=SC2317,SC2329  # invoked by the EXIT trap (SC2317 is the code before shellcheck 0.11)
   finish() {
     trap '' INT TERM HUP QUIT   # a second signal must not cut the report short
@@ -100,7 +104,8 @@ if [ -z "${ADOPTION_RUN_WORKER:-}" ]; then
   trap 'exit 143' TERM
   trap 'exit 129' HUP
   trap 'exit 131' QUIT   # the worker ignores it (an asynchronous command): Ctrl-\ stops the run here
-  record start "$WORK" --title "gates/adoption/run.sh" --image "$IMAGE" --oracle "$ORACLE_VERSION"
+  record start "$WORK" --title "gates/adoption/run.sh" --image "$IMAGE" --oracle "$ORACLE_VERSION" \
+    --image-id "$IMAGE_ID" --commit "$IMAGE_COMMIT"
   # <&0: an asynchronous command's stdin would otherwise be /dev/null. Without job control the background
   # job leads no process group, so setsid makes the session in place and $! is its leader and group.
   spawned=1

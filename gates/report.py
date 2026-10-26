@@ -17,7 +17,6 @@ import importlib.util
 import json
 import os
 import sys
-from collections import Counter
 
 GATES = ("verify", "adoption", "parity", "bench")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -72,91 +71,93 @@ def plural(n, word):
     return f"{n} {word}{'' if n == 1 else 's'}"
 
 
+def gate_result(d, gate):
+    """The gate's result.json (gates/result.py), None when there is none; Unreadable when it is invalid."""
+    try:
+        return gate_module("result.py").read(d, gate)
+    except ValueError as error:
+        raise Unreadable(str(error)) from error
+
+
 def verify(d, record):
-    result = read_json(os.path.join(d, "verify.json"))
+    result = gate_result(d, "verify")
+    if result is None and os.path.exists(os.path.join(d, "verify.json")):
+        return found(problems=["no result.json: a run from before verify wrote one (python3 gates/verify/verify_report.py "
+                               "DIR --image IMAGE writes it from verify.json)"], bad=True)
     if result is None:
-        return found(problems=["no verify.json: the gate ended before its check finished"], bad=True)
-    counts, missing = Counter(), []
-    for kind, rows in (result.get("libraries") or {}).items():
-        if rows is None:
-            missing.append(kind)
-        for row in (rows or {}).get("rows", []):
-            counts[row.get("result")] += 1
-    ran = counts["PASS"] + counts["FAIL"] + counts["SKIP"]
-    verdict = (f"{counts['FAIL']} failed" if counts["FAIL"] else "nothing verified" if not ran
-               else "incomplete" if missing else "passed")
+        return found(problems=["no result.json: the gate ended before writing its result"], bad=True)
+    counts, detail = result["counts"], result["detail"]
+    missing = [kind for kind, rows in (detail.get("libraries") or {}).items() if rows is None]
     problem = None
     if missing:
         libraries = " and ".join(missing) + (" libraries" if len(missing) > 1 else " library")
-        problem = f"no rows from the {libraries}: the check ended before them (the run's exit {result.get('exit')}, see the log)"
-    return found(verdict, [("checks passed", counts["PASS"]), ("failed", counts["FAIL"]), ("skipped", counts["SKIP"])],
-                 [problem], bad=verdict != "passed")
+        problem = f"no rows from the {libraries}: the check ended before them (the run's exit {detail.get('exit')}, see the log)"
+    verdict = f"{counts.get('fail', 0)} failed" if result["verdict"] == "failed" else result["verdict"]
+    return found(verdict, [("checks passed", counts.get("pass", 0)), ("failed", counts.get("fail", 0)),
+                           ("skipped", counts.get("skip", 0))], [problem], bad=result["verdict"] != "passed")
 
 
 def adoption(d, record):
-    if not os.path.exists(os.path.join(d, "results.jsonl")):
-        return found(problems=["no results.jsonl: the gate ended before it recorded anything"], bad=True)
-    module = gate_module("adoption/adoption_report.py")
-    _, rows, skipped = module.load(d)   # adoption's own reading: a fixture begun but never finished is INCOMPLETE
-    verdicts = Counter(module.row_verdict(row) for row in rows)
-    overall = module.overall(rows)
-    return found({"PASS": "passed", "FAIL": "failed"}.get(overall, "nothing ran"),
-                 [("rows passed", verdicts["PASS"]), ("failed", verdicts["FAIL"]), ("unfinished", verdicts["INCOMPLETE"]),
-                  ("skipped", verdicts["SKIP"])],
-                 [skipped and f"{plural(skipped, 'unreadable line')} in results.jsonl skipped"], bad=overall != "PASS")
+    result = gate_result(d, "adoption")   # adoption's own reading: a fixture begun but never finished is INCOMPLETE
+    if result is None and os.path.exists(os.path.join(d, "results.jsonl")):
+        return found(problems=["no result.json: a run from before adoption wrote one (python3 "
+                               "gates/adoption/adoption_report.py build DIR writes it)"], bad=True)
+    if result is None:
+        return found(problems=["no result.json: the gate ended before it recorded anything"], bad=True)
+    counts, skipped = result["counts"], result["detail"].get("skipped_lines", 0)
+    return found(result["verdict"], [("rows passed", counts.get("pass", 0)), ("failed", counts.get("fail", 0)),
+                                     ("unfinished", counts.get("incomplete", 0)), ("skipped", counts.get("skip", 0))],
+                 [skipped and f"{plural(skipped, 'unreadable line')} in results.jsonl skipped"],
+                 bad=result["verdict"] != "passed")
 
 
 def parity(d, record):
-    results = read_json(os.path.join(d, "results.json"))
-    if results is None:
-        return found(problems=["no results.json: the gate ended before its comparison finished"], bad=True)
-    new = read_json(os.path.join(d, "new-differences.json"))
-    differences = [diff for r in (new or {}).get("requests", []) for diff in r.get("differences", [])]
-    tag_path = gate_module("parity/diff.py").tag_path   # the groups `diff.py findings` files issues by
-    unfiled = {(tag_path(diff.get("path", "")), diff.get("kind")) for diff in differences if not diff.get("filed")}
-    verdict = results.get("verdict", "?")
-    return found(verdict + (f": {results['reason']}" if results.get("reason") else ""),
-                 [("new differences", len(differences)), ("groups not filed", len(unfiled)),
-                  ("requests sent", len(results.get("requests") or [])), ("planned", results.get("planned", 0))],
-                 [new is None and "no new-differences.json: its counts are unknown"], bad=verdict != "pass")
+    result = gate_result(d, "parity")
+    if result is None and os.path.exists(os.path.join(d, "results.json")):
+        return found(problems=["no result.json: a run from before parity wrote one (python3 gates/parity/diff.py "
+                               "result --out DIR writes it)"], bad=True)
+    if result is None:
+        return found(problems=["no result.json: the gate ended before its comparison finished"], bad=True)
+    detail = result["detail"]
+    return found(result["verdict"] + (f": {detail['reason']}" if detail.get("reason") else ""),
+                 [("new differences", detail.get("new_differences", 0)), ("groups not filed", detail.get("unfiled_groups", 0)),
+                  ("requests sent", detail.get("sent", 0)), ("planned", detail.get("planned", 0))],
+                 bad=result["verdict"] != "pass")
 
 
 def bench(d, record):
+    result = gate_result(d, "bench")
+    if result is None and os.path.exists(os.path.join(d, "verdict.json" if record.get("previous") else "report.md")):
+        how = "gates/bench/gate.py render DIR" if record.get("previous") else "gates/bench/report.py --html DIR"
+        return found(problems=[f"no result.json: a run from before the benchmark wrote one (python3 {how} writes it)"],
+                     bad=True)
     if record.get("previous"):   # the release A/B gate (gates/run --previous): a gate.py session
-        if not os.path.exists(os.path.join(d, "gate.json")):
-            return found(problems=["no gate.json: the A/B gate ended before it started"], bad=True)
-        result = read_json(os.path.join(d, "verdict.json"))
         if result is None:
-            return found(problems=["no verdict.json: the A/B gate ended before it judged its runs"], bad=True)
-        verdicts = result.get("verdicts") or {}
-        gated = [v for v in (verdicts.values() if isinstance(verdicts, dict) else verdicts) if v.get("gated")]
-        cells = Counter(v.get("verdict") for v in gated)
-        blocking = result.get("blocking") or []
+            return found(problems=["no result.json: the A/B gate ended before it judged its runs"], bad=True)
+        counts, blocking = result["counts"], result["detail"].get("blocking") or []
         return found(f"blocked by {plural(len(blocking), 'cell')}" if blocking else "nothing blocks",
-                     [("gated cells regressed", cells["regressed"]), ("not comparable", cells["not comparable"]),
-                      ("improved", cells["improved"]), ("within noise", cells["within noise"])], bad=bool(blocking))
-    if read_json(os.path.join(d, "run.json")) is None:
-        return found(problems=["no run.json: the run ended before it started measuring"], bad=True)
-    phases, absent = Counter(), []
-    for server in ("ferrofin", "jellyfin"):   # gates/run runs both; state() writes pending, running, completed, failed, skipped
-        recorded = read_json(os.path.join(d, server, "phases.json"))
-        if recorded is None:
-            absent.append(server)
-        for phase in (recorded or {}).values():
-            status = phase.get("status")
-            phases[status if status in ("completed", "failed", "skipped") else "unfinished"] += 1
-    verdict = (f"{plural(phases['failed'], 'phase')} failed" if phases["failed"]
-               else "incomplete" if phases["unfinished"] or absent else "measured")
-    return found(verdict, [("phases completed", phases["completed"]), ("failed", phases["failed"]),
-                           ("unfinished", phases["unfinished"]), ("skipped", phases["skipped"])],
-                 [absent and f"no phases recorded for {' or '.join(absent)}: its run never started"],
+                     [("gated cells regressed", counts.get("regressed", 0)), ("not comparable", counts.get("not comparable", 0)),
+                      ("improved", counts.get("improved", 0)), ("within noise", counts.get("within noise", 0))],
+                     bad=bool(blocking))
+    if result is None:
+        return found(problems=["no result.json: the run ended before writing its report and result"], bad=True)
+    counts = result["counts"]
+    # gates/run measures both servers: one with no results at all never started
+    absent = [s for s in ("ferrofin", "jellyfin") if s not in (result["detail"].get("servers") or {})]
+    verdict = (f"{plural(counts.get('failed', 0), 'phase')} failed" if result["verdict"] == "failed"
+               else "incomplete" if result["verdict"] == "incomplete" or absent else result["verdict"])
+    return found(verdict, [("phases completed", counts.get("completed", 0)), ("failed", counts.get("failed", 0)),
+                           ("unfinished", counts.get("unfinished", 0)), ("skipped", counts.get("skipped", 0))],
+                 [absent and f"no results for {' or '.join(absent)}: its run never started"],
                  bad=verdict != "measured")
 
 
 READERS = {"verify": verify, "adoption": adoption, "parity": parity, "bench": bench}
 #: Each gate's own pages in its folder, linked whenever they exist, whatever its result says. The first
-#: page of adoption, parity and bench is its report: a gate that ended without one says so.
-OWN_PAGES = {"verify": (("scan-behaviour-movies.txt", "movies rows"), ("scan-behaviour-tvshows.txt", "tvshows rows")),
+#: page is the gate's report: a gate that ended without one says so. The rest are its raw files.
+OWN_PAGES = {"verify": (("report.html", "verify report"), ("scan-behaviour-movies.txt", "movies rows"),
+                        ("scan-behaviour-tvshows.txt", "tvshows rows"), ("result.json", "result.json"),
+                        ("verify.json", "verify.json"), ("server.log", "server log")),
              "adoption": (("report.html", "adoption report"),),
              "parity": (("report.html", "parity report"),),
              "bench": (("report.html", "benchmark report"),)}
@@ -192,7 +193,7 @@ def summarise(session):
             except Exception as error:  # noqa: BLE001 — a result shaped unlike the reader expects
                 row["problem"] = f"its result is not shaped as expected ({type(error).__name__}: {error})"
             pages = OWN_PAGES[gate]
-            if gate != "verify" and not os.path.exists(os.path.join(d, pages[0][0])):
+            if not os.path.exists(os.path.join(d, pages[0][0])):
                 row["problem"] = "; ".join(filter(None, [row["problem"],
                                                           f"no {pages[0][0]}: the gate ended before writing its report"]))
         label = {"bench": "A/B gate report"} if record.get("previous") else {}
@@ -211,12 +212,24 @@ def short_id(image_id):
     return f"{algorithm}:{digest[:12]}" if digest else algorithm
 
 
+def oracle_line(oracle):
+    """The Jellyfin oracle: the release the branch pins and its digest, and the note on a newer
+    release (gates/bench/oracle.py). A session that never checked the pin (verify or adoption
+    alone, or one made before the record carried the tag) shows the digest only."""
+    line = oracle.get("image")
+    if oracle.get("tag"):
+        line = f"{oracle['tag']} ({line})"
+    if oracle.get("note"):
+        line = f"{line} — {oracle['note']}"
+    return line
+
+
 def facts(record):
     image = record.get("image") or {}
     lines = [("branch", record.get("branch")),
              ("commit", (record.get("commit") or "")[:12] + (" (uncommitted changes)" if record.get("dirty") else "")),
              ("image", f"{image.get('ref')} ({short_id(image.get('id'))})"),
-             ("Jellyfin oracle", (record.get("oracle") or {}).get("image")),
+             ("Jellyfin oracle", oracle_line(record.get("oracle") or {})),
              ("started", record.get("started")), ("ended", record.get("ended") or "still running")]
     if record.get("previous"):
         lines.insert(3, ("previous release", record["previous"].get("ref")))
@@ -261,7 +274,55 @@ def css():
         return FALLBACK_CSS
 
 
-def render_html(record, rows):
+def summary_graphs(session, record):
+    """The README's graphs for this session's results (gates/publish.py), inline: its adoption status, its
+    parity overview and its benchmark run's speed and memory."""
+    return adoption_graph(session, record) + parity_graph(session, record) + bench_graphs(session, record)
+
+
+def parity_graph(session, record):
+    """The README's parity overview for the session's parity result; empty when parity did not run or
+    left no result, a note when it cannot be drawn."""
+    if (record.get("gates", {}).get("parity") or {}).get("status") in (None, "pending", "skipped") \
+            or not os.path.isfile(os.path.join(session, "parity", "result.json")):
+        return ""
+    try:
+        graph = gate_module("publish.py").session_parity_graph(session, record.get("commit") or "")
+    except Exception as error:  # noqa: BLE001 — the page is written whatever the result holds
+        return f"<p class='problem'>The parity overview could not be drawn ({html.escape(type(error).__name__)}: {html.escape(str(error))}).</p>"
+    return f"<h2>Parity</h2>{graph}" if graph else ""
+
+
+def adoption_graph(session, record):
+    """The README's adoption grid for the session's adoption result; empty when adoption did not run or
+    left no result, a note when it cannot be drawn."""
+    if (record.get("gates", {}).get("adoption") or {}).get("status") in (None, "pending", "skipped") \
+            or not os.path.isfile(os.path.join(session, "adoption", "result.json")):
+        return ""
+    try:
+        graph = gate_module("publish.py").session_adoption_graph(session)
+    except Exception as error:  # noqa: BLE001 — the page is written whatever the result holds
+        return f"<p class='problem'>The adoption grid could not be drawn ({html.escape(type(error).__name__)}: {html.escape(str(error))}).</p>"
+    return f"<h2>Adoption</h2>{graph}"
+
+
+def bench_graphs(session, record):
+    """The README's graphs for the session's benchmark run (gates/publish.py), inline; an empty string
+    for an A/B gate session or a run with no comparable result, and a note when they cannot be drawn."""
+    if record.get("previous") or (record.get("gates", {}).get("bench") or {}).get("status") in (None, "pending", "skipped"):
+        return ""
+    try:
+        doc = gate_result(os.path.join(session, "bench"), "bench")
+        if not doc or "jellyfin" not in (doc["detail"].get("servers") or {}):
+            return ""
+        graphs = gate_module("publish.py").session_graphs(doc)
+    except Exception as error:  # noqa: BLE001 — the page is written whatever the result holds
+        return f"<p class='problem'>The benchmark graphs could not be drawn ({html.escape(type(error).__name__)}: {html.escape(str(error))}).</p>"
+    return ("<h2>Benchmark against Jellyfin</h2><p class='lede'>The README's graphs for this session's one run "
+            f"(the published ones are the median of three).</p>{graphs}") if graphs else ""
+
+
+def render_html(record, rows, graphs=""):
     e = html.escape
     name = e(str(record.get("name")))
     head = "".join(f"<dt>{e(k)}</dt><dd>{e(str(v))}</dd>" for k, v in facts(record))
@@ -270,23 +331,31 @@ def render_html(record, rows):
         tone = "bad" if r["status"] == "failed" or r["problem"] or r["bad"] else "good" if r["status"] == "passed" else ""
         verdict = e(r["verdict"] or "no result") + (f"<br><span class='problem'>{e(r['problem'])}</span>" if r["problem"] else "")
         counts = "<br>".join(f"{e(label)}: {n}" for label, n in r["counts"])
-        links = " · ".join(f"<a href='{e(href)}'>{e(label)}</a>" for label, href in r["links"])
+        anchors = [f"<a href='{e(href)}'>{e(label)}</a>" for label, href in r["links"]]
+        if r["links"] and r["links"][0][1].endswith("/report.html"):   # the gate's report leads, its files follow
+            anchors[0] = f"<b>{anchors[0]}</b>" + ("<br><span class='meta'>" if len(anchors) > 1 else "")
+            links = anchors[0] + " · ".join(anchors[1:]) + ("</span>" if len(anchors) > 1 else "")
+        else:
+            links = " · ".join(anchors)
         body.append(f"<tr class='{tone}'><th>{e(r['gate'])}</th><td>{e(status_word(r))}</td><td>{verdict}</td>"
                     f"<td>{counts}</td><td>{links}</td></tr>")
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width, initial-scale=1'><title>Gates {name}</title>"
             f"<style>{css()}dl.facts{{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}}"
             f"dl.facts dt{{color:var(--muted)}}dl.facts dd{{margin:0}}tr.bad th,.problem{{color:var(--bad)}}"
-            f"tr.good th{{color:var(--good)}}table.gates td,table.gates th{{text-align:left;vertical-align:top;"
-            f"padding:6px 12px}}</style></head><body><main>"
+            f"tr.good th{{color:var(--good)}}a{{color:var(--accent-ink)}}table.gates td,table.gates th{{text-align:left;vertical-align:top;"
+            f"padding:6px 12px}}.graph svg{{max-width:100%;height:auto;margin:14px 0}}.graph.dark{{display:none}}"
+            f"@media (prefers-color-scheme:dark){{.graph.light{{display:none}}.graph.dark{{display:block}}}}"
+            f"</style></head><body><main>"
             f"<h1>Gates session {name}</h1><dl class='facts'>{head}</dl>"
             f"<table class='gates'><thead><tr><th>Gate</th><th>Status</th><th>Verdict</th><th>Counts</th>"
-            f"<th>Report</th></tr></thead><tbody>{''.join(body)}</tbody></table></main></body></html>")
+            f"<th>Report</th></tr></thead><tbody>{''.join(body)}</tbody></table>{graphs}</main></body></html>")
 
 
 def write(session):
     record, rows = summarise(session)
-    for name, text in (("index.html", render_html(record, rows)), ("report.md", render_md(record, rows))):
+    for name, text in (("index.html", render_html(record, rows, summary_graphs(session, record))),
+                       ("report.md", render_md(record, rows))):
         path = os.path.join(session, name)
         with open(path + ".tmp", "w", encoding="utf-8") as f:
             f.write(text)
