@@ -15,6 +15,48 @@ Usually nothing to do: `{data_dir}/config.toml` reads as before. A `--config` or
 `.ini`, `.ron`) used to be read in that format; it now stops the server with "is not of a
 supported file format". Rewrite the file as TOML under a `.toml` name.
 
+## Unreleased — every upgrade copies the database first, and copies are written whole
+
+Usually nothing to do. A boot that applies migrations now holds a copy of the database, as
+large as the database, until its migrations have passed: keep that much disk free when you
+upgrade.
+
+- **A copy before every migration.** A boot that applies any migration first copies the
+  database to `<database>.pre-NNNN`, named after the first migration it runs (or after the
+  first table-rebuilding migration, `0007`, `0032` or `0044`, when one of them is pending),
+  as Jellyfin does before its own migrations. Once the migrations and the foreign-key check
+  have passed, that copy is deleted, except the ones taken before `0007`, `0032` and
+  `0044`, which are kept for good under the same names as before. A boot that fails keeps
+  its copy: it is the database as it was before that upgrade. Delete it by hand once you no
+  longer need it; a later boot that passes leaves it alone. If the copy cannot be written
+  (a full disk), the server logs a warning and migrates without it. The copies before
+  `0007`, `0032` and `0044`, and the adoption copy `jellyfin.db.pre-ferrofin`, still stop
+  the boot when they cannot be written.
+- **No cut-short copies.** Every copy (`jellyfin.db.pre-ferrofin`, `.pre-NNNN`, and the boot
+  repairs' `.pre-rehome`, `.pre-season-ids`, `.pre-playlist-folders` and `.pre-harmonize`)
+  is written to `<name>.partial`, flushed to disk and only then renamed. A full disk or a
+  killed server therefore never leaves a partial file under the real name. The next attempt
+  at that copy deletes a leftover `.partial`; you can also delete one yourself while the
+  server is stopped.
+- **The first copy is kept.** An existing copy is never overwritten: a retried upgrade keeps
+  the one its first attempt took, before anything changed, and the log says so ("kept the
+  database snapshot an earlier boot took"). Ferrofin goes by the file names, so before you
+  move a different database into the data folder, move the old database's `.pre-*` and
+  `.pre-*.partial` files aside, or the new one gets no copies of its own.
+- **Copies while another program uses the database.** If another program is reading or
+  writing the database when Ferrofin copies it before migrating or adopting (Jellyfin still
+  running on it, a database browser in the middle of a query, the previous pod of a rolling
+  update), the write-ahead log cannot be folded into the file first. After waiting up to 30
+  seconds, Ferrofin then takes the copy with SQLite's `VACUUM INTO`, which still holds every
+  committed change, and logs a warning that names the cause. Before, such a copy missed what
+  was still in the write-ahead log, and could be unreadable. Stop the other program before
+  you upgrade anyway, and always before you adopt: the migrations run with it attached, and
+  adopting a database Jellyfin is still using is not safe even with a good copy.
+
+Adoption stays one-way: going back to Jellyfin means restoring `jellyfin.db.pre-ferrofin`.
+The `.pre-NNNN` copies are for recovering from a failed Ferrofin upgrade, not a way back to
+Jellyfin.
+
 ## Unreleased — user and policy saves need a complete body
 
 Usually nothing to do: the web client posts back the user it read. A script that calls

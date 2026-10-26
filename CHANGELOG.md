@@ -22,8 +22,23 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   where the database already owns `NormalizedUsername`; an atomic adoption record drives the
   one-shot membership import)
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
+- Snapshot the database before any pending migration, as Jellyfin does: a boot that migrates
+  copies the file to `<db>.pre-NNNN` first and deletes the copy once its migrations and the
+  foreign-key check have passed; a failed boot keeps it, and a copy that cannot be written
+  only warns (Jellyfin stops its startup). The copies before `0007`, `0032` and `0044` are
+  kept for good, as before
+- Write every database snapshot (`.pre-ferrofin`, `.pre-NNNN`, the boot repairs' copies) to
+  `<name>.partial` and rename it only once it is complete and on disk, so a full disk or a
+  kill never leaves a cut-short copy under the real name; the first snapshot taken is kept
+  on a retry instead of being replaced
+- Take the copies made before migrating or adopting with `VACUUM INTO` when another process
+  is reading or writing the database, instead of a file copy that missed what was still in
+  the write-ahead log
 
 ### Tooling
+- `gates/adoption/run.sh` stops at once when terminated, under bash 5.2 too (a TERM was
+  sometimes lost and the run waited out its deadlines); GitHub's shell-tests job gets a
+  15-minute timeout
 - `gates/parity/filed.toml` records the two differences of the 2026-10-24 replay that have an open
   issue and no ledger entry (the HLS video segment's timestamps, the live HLS segment names); the
   run's other groups are accepted by the ledger, gone under the current comparison, fixed since,
