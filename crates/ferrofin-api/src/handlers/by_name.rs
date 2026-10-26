@@ -266,6 +266,18 @@ impl ByNameListQuery {
         Ok(query)
     }
 
+    /// The item `parentId` names, through [`resolve_parent`].
+    ///
+    /// # Errors
+    ///
+    /// `400` for an id naming no item.
+    pub(crate) async fn parent(
+        &self,
+        state: &AppState,
+    ) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
+        resolve_parent(state, self.parent_id).await
+    }
+
     /// [`Self::base_query`] for `GET /Artists` and `GET /Artists/AlbumArtists`,
     /// which also take `studios`: v12.2 `ArtistsController.cs:182-195`
     /// (`:336-349` for album artists) sets `query.StudioIds` to the names'
@@ -318,6 +330,33 @@ impl ByNameListQuery {
             fields.push(ferrofin_model::querying::ItemFields::ItemCounts);
         }
         fields
+    }
+}
+
+/// v12.2 `LibraryManager.GetParentItem` (`LibraryManager.cs:3276-3289`) for a
+/// `parentId` the request sent: the item it names, or `ArgumentException`
+/// ("Invalid parent id: …", or `GetItemById`'s "Guid can't be empty" for the
+/// zero id), which `ExceptionMiddleware` answers `400`. No `parentId` is
+/// [`None`]; the caller decides what stands for the root.
+///
+/// # Errors
+///
+/// `400` for an id naming no item, the zero id included.
+pub(crate) async fn resolve_parent(
+    state: &AppState,
+    parent_id: Option<uuid::Uuid>,
+) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
+    let Some(parent_id) = parent_id else {
+        return Ok(None);
+    };
+    if parent_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
+    match state.library.get_item_by_id(parent_id).await? {
+        Some(parent) => Ok(Some(parent)),
+        None => Err(ApiError::BadRequest(format!(
+            "Invalid parent id: {parent_id}"
+        ))),
     }
 }
 
