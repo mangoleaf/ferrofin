@@ -61,9 +61,7 @@ use sqlx::{QueryBuilder, Sqlite};
 use crate::db_error::db_err;
 use crate::item_repository::library_top_parents_by_view;
 use crate::item_type_lookup::stored_type_name;
-use crate::translate_query::{
-    ALTERNATE_VERSION_HIDDEN, NO_OWNER, PLACEHOLDER_ID, append_parental_restrictions,
-};
+use crate::translate_query::{PLACEHOLDER_ID, TopParentTerm, push_access_filter};
 
 /// The concrete next-up service.
 #[derive(Clone)]
@@ -646,28 +644,10 @@ struct Access<'a> {
     top_parents: &'a [Uuid],
 }
 
-/// Pushes C# `ApplyAccessFiltering` (v12.2 `QueryBuilding.cs:455-483`) on
-/// `bi`, each term opening with ` AND `: the requested libraries
-/// (`ApplyTopParentFiltering`), the user's parental restrictions, and —
-/// unless the query includes owned items — a version only while its primary
-/// is not in the same library, and no owned non-extra (`NO_OWNER` accepts the
-/// zero GUID a Jellyfin database stores on every unowned row).
+/// Pushes C# `ApplyAccessFiltering` on `bi` for the batch's scope
+/// ([`push_access_filter`]); its libraries may drive the pools' seeks.
 fn push_access(qb: &mut QueryBuilder<Sqlite>, access: &Access<'_>) {
-    if !access.top_parents.is_empty() {
-        qb.push(r#" AND bi."TopParentId" IN ("#);
-        let mut ids = qb.separated(", ");
-        for id in access.top_parents {
-            ids.push_bind(guid_to_db(*id));
-        }
-        qb.push(")");
-    }
-    append_parental_restrictions(qb, access.filter, "bi");
-    if !access.filter.include_owned_items {
-        qb.push(ALTERNATE_VERSION_HIDDEN)
-            .push(" AND (")
-            .push(NO_OWNER)
-            .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
-    }
+    push_access_filter(qb, access.filter, access.top_parents, TopParentTerm::Seek);
 }
 
 /// Pushes ` AND bi."SeriesPresentationUniqueKey" IN (…)` (`NULL` when empty).
