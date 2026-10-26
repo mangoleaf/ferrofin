@@ -171,6 +171,21 @@ class SessionReportTests(unittest.TestCase):
         self.write(s / "bench/verdict.json", {"verdicts": {}})
         self.assertIn("(python3 gates/bench/gate.py render DIR writes it)", self.rows(s)["bench"]["problem"])
 
+    def test_a_bench_session_shows_the_readme_graphs_of_its_run(self):
+        from test_publish import bench_result   # a Jellyfin-comparison run's result.json
+        s = self.session(["bench"], {"bench": ("passed", 0)})
+        (s / "bench").mkdir()
+        bench_report.gate_result().write(str(s / "bench"), bench_result())
+        page = Path(report.write(str(s))).read_text(encoding="utf-8")
+        self.assertIn("<h2>Benchmark against Jellyfin</h2>", page)
+        self.assertEqual(page.count("<div class='graph light'><svg"), page.count("<div class='graph dark'><svg"))
+        self.assertIn("@media (prefers-color-scheme:dark){.graph.light{display:none}", page)
+        self.assertNotIn("<img", page)   # inline: the page stays self-contained
+        doc = json.loads((s / "bench/result.json").read_text())
+        del doc["detail"]["servers"]["jellyfin"]   # a Ferrofin-only run has nothing to graph against
+        self.write(s / "bench/result.json", doc)
+        self.assertNotIn("Benchmark against Jellyfin", Path(report.write(str(s))).read_text(encoding="utf-8"))
+
     def test_an_ab_gate_session_counts_its_gated_cells_and_what_blocks(self):
         s = self.session(["bench"], {"bench": ("failed", 1)}, previous="ferrofin:v8")
         self.assertEqual(self.rows(s)["bench"]["problem"], "no result.json: the A/B gate ended before it judged its runs; "

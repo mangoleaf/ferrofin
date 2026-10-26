@@ -1,0 +1,1422 @@
+{
+ "bench": {
+  "cpu_per_screen": [
+   {
+    "ferrofin": {
+     "max": 31.1207,
+     "median": 30.9899,
+     "min": 29.9577
+    },
+    "jellyfin": {
+     "max": 128.7208,
+     "median": 127.7154,
+     "min": 127.1961
+    },
+    "name": "unloaded",
+    "ratio": null,
+    "unit": "ms",
+    "withheld": "Ferrofin: search:artists: ids differs for a request pick"
+   },
+   {
+    "ferrofin": {
+     "max": 30.1671,
+     "median": 29.9608,
+     "min": 29.927
+    },
+    "jellyfin": {
+     "max": 114.6856,
+     "median": 113.8248,
+     "min": 113.6937
+    },
+    "name": "loaded",
+    "ratio": null,
+    "unit": "ms",
+    "withheld": "Ferrofin: search:artists: ids differs for a request pick"
+   },
+   {
+    "ferrofin": {
+     "max": 29.1046,
+     "median": 28.9029,
+     "min": 28.8644
+    },
+    "jellyfin": {
+     "max": 111.874,
+     "median": 111.8386,
+     "min": 110.8849
+    },
+    "name": "stress",
+    "ratio": null,
+    "unit": "ms",
+    "withheld": "Ferrofin: search:artists: ids differs for a request pick"
+   }
+  ],
+  "levels": {
+   "loaded": {
+    "endpoints": [
+     {
+      "ferrofin": {
+       "max": 0.7123,
+       "median": 0.6953,
+       "min": 0.6832
+      },
+      "jellyfin": {
+       "max": 4.7882,
+       "median": 4.7547,
+       "min": 4.7428
+      },
+      "name": "home:image",
+      "ratio": 6.7857,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 5.1779,
+       "median": 5.0993,
+       "min": 5.025
+      },
+      "jellyfin": {
+       "max": 11.4589,
+       "median": 11.4233,
+       "min": 11.2759
+      },
+      "name": "home:latest-movies",
+      "ratio": 2.2353,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 3.0313,
+       "median": 2.9531,
+       "min": 2.9522
+      },
+      "jellyfin": {
+       "max": 7.2555,
+       "median": 7.1776,
+       "min": 7.0683
+      },
+      "name": "home:latest-music",
+      "ratio": 2.4339,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 10.0663,
+       "median": 10.0436,
+       "min": 9.9277
+      },
+      "jellyfin": {
+       "max": 22.1768,
+       "median": 22.1115,
+       "min": 21.9021
+      },
+      "name": "home:latest-shows",
+      "ratio": 2.21,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 11.1352,
+       "median": 11.0941,
+       "min": 11.0674
+      },
+      "jellyfin": {
+       "max": 25.6107,
+       "median": 25.5417,
+       "min": 25.4159
+      },
+      "name": "home:nextup",
+      "ratio": 2.2973,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 6.1125,
+       "median": 6.0575,
+       "min": 6.0531
+      },
+      "jellyfin": {
+       "max": 19.4558,
+       "median": 19.3016,
+       "min": 19.1363
+      },
+      "name": "home:resume-audio",
+      "ratio": 3.1848,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.7704,
+       "median": 1.7156,
+       "min": 1.7119
+      },
+      "jellyfin": {
+       "max": 19.405,
+       "median": 19.2829,
+       "min": 19.1832
+      },
+      "name": "home:resume-book",
+      "ratio": 11.2209,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 7.4561,
+       "median": 7.401,
+       "min": 7.3933
+      },
+      "jellyfin": {
+       "max": 21.5336,
+       "median": 21.3228,
+       "min": 21.3213
+      },
+      "name": "home:resume-video",
+      "ratio": 2.8784,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.5554,
+       "median": 4.1578,
+       "min": 4.1088
+      },
+      "jellyfin": {
+       "max": 20.5166,
+       "median": 20.4399,
+       "min": 20.2189
+      },
+      "name": "home:views",
+      "ratio": 4.9038,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.7732,
+       "median": 0.7516,
+       "min": 0.7428
+      },
+      "jellyfin": {
+       "max": 4.8927,
+       "median": 4.873,
+       "min": 4.778
+      },
+      "name": "movies:image",
+      "ratio": 6.4933,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 12.9451,
+       "median": 12.8788,
+       "min": 12.5447
+      },
+      "jellyfin": {
+       "max": 24.925,
+       "median": 24.7572,
+       "min": 24.6092
+      },
+      "name": "movies:items",
+      "ratio": 1.9225,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.6625,
+       "median": 0.6555,
+       "min": 0.6497
+      },
+      "jellyfin": {
+       "max": 4.703,
+       "median": 4.6638,
+       "min": 4.6325
+      },
+      "name": "detail:image",
+      "ratio": 7.0606,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 2.5519,
+       "median": 2.4698,
+       "min": 2.4681
+      },
+      "jellyfin": {
+       "max": 11.5518,
+       "median": 11.4071,
+       "min": 10.951
+      },
+      "name": "detail:item",
+      "ratio": 4.6154,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.4001,
+       "median": 1.339,
+       "min": 1.3152
+      },
+      "jellyfin": {
+       "max": 7.6272,
+       "median": 7.5467,
+       "min": 7.1545
+      },
+      "name": "detail:local-trailers",
+      "ratio": 5.6343,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 5.5887,
+       "median": 5.3728,
+       "min": 5.3373
+      },
+      "jellyfin": {
+       "max": 21.8727,
+       "median": 21.5682,
+       "min": 21.2822
+      },
+      "name": "detail:similar",
+      "ratio": 4.0223,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.4059,
+       "median": 1.3389,
+       "min": 1.3332
+      },
+      "jellyfin": {
+       "max": 7.7312,
+       "median": 7.5827,
+       "min": 7.179
+      },
+      "name": "detail:special-features",
+      "ratio": 5.6567,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.6833,
+       "median": 1.652,
+       "min": 1.4989
+      },
+      "jellyfin": {
+       "max": 6.1749,
+       "median": 6.1609,
+       "min": 6.1594
+      },
+      "name": "series:episodes",
+      "ratio": 3.7333,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.6335,
+       "median": 0.6334,
+       "min": 0.553
+      },
+      "jellyfin": {
+       "max": 3.7692,
+       "median": 3.7194,
+       "min": 3.6729
+      },
+      "name": "series:image",
+      "ratio": 5.9048,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.1996,
+       "median": 3.9264,
+       "min": 3.7044
+      },
+      "jellyfin": {
+       "max": 11.027,
+       "median": 10.9222,
+       "min": 10.7814
+      },
+      "name": "series:item",
+      "ratio": 2.7735,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 2.2675,
+       "median": 2.1009,
+       "min": 2.065
+      },
+      "jellyfin": {
+       "max": 7.9825,
+       "median": 7.9533,
+       "min": 7.9353
+      },
+      "name": "series:seasons",
+      "ratio": 3.7857,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.438,
+       "median": 4.2376,
+       "min": 4.0541
+      },
+      "jellyfin": {
+       "max": 14.1555,
+       "median": 13.9836,
+       "min": 13.9599
+      },
+      "name": "series:similar",
+      "ratio": 3.3019,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 2.0233,
+       "median": 1.9201,
+       "min": 1.9004
+      },
+      "jellyfin": {
+       "max": 10.8654,
+       "median": 10.8019,
+       "min": 10.7748
+      },
+      "name": "search:artists",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:artists: ids differs for a request pick"
+     },
+     {
+      "ferrofin": {
+       "max": 0.8658,
+       "median": 0.7858,
+       "min": 0.7851
+      },
+      "jellyfin": {
+       "max": 4.9543,
+       "median": 4.8919,
+       "min": 4.8733
+      },
+      "name": "search:image",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:image: request picks differ"
+     },
+     {
+      "ferrofin": {
+       "max": 24.5494,
+       "median": 23.2078,
+       "min": 23.0343
+      },
+      "jellyfin": {
+       "max": 42.5127,
+       "median": 42.484,
+       "min": 42.4201
+      },
+      "name": "search:items",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:items: ids differs for a request pick"
+     },
+     {
+      "ferrofin": {
+       "max": 2.3847,
+       "median": 2.2787,
+       "min": 2.2739
+      },
+      "jellyfin": {
+       "max": 17.3235,
+       "median": 17.14,
+       "min": 17.0811
+      },
+      "name": "search:persons",
+      "ratio": 7.5,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.626,
+       "median": 1.5064,
+       "min": 1.458
+      },
+      "jellyfin": {
+       "max": 14.7307,
+       "median": 14.6204,
+       "min": 14.6121
+      },
+      "name": "search:programs",
+      "ratio": 9.6689,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 6.1151,
+       "median": 5.9751,
+       "min": 5.9249
+      },
+      "jellyfin": {
+       "max": 32.8628,
+       "median": 32.657,
+       "min": 32.3537
+      },
+      "name": "search:videos",
+      "ratio": 5.4682,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.1368,
+       "median": 4.0579,
+       "min": 4.0157
+      },
+      "jellyfin": {
+       "max": 4.8682,
+       "median": 4.8574,
+       "min": 4.8472
+      },
+      "name": "playback:intros",
+      "ratio": 1.197,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 2.0636,
+       "median": 1.9867,
+       "min": 1.9463
+      },
+      "jellyfin": {
+       "max": 7.8374,
+       "median": 7.8225,
+       "min": 7.7391
+      },
+      "name": "playback:playbackinfo",
+      "ratio": 3.9296,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.8316,
+       "median": 0.8302,
+       "min": 0.8108
+      },
+      "jellyfin": {
+       "max": 8.6298,
+       "median": 8.5549,
+       "min": 8.5031
+      },
+      "name": "playback:playing",
+      "ratio": 10.3012,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.1754,
+       "median": 4.1192,
+       "min": 4.08
+      },
+      "jellyfin": {
+       "max": 4.9389,
+       "median": 4.9007,
+       "min": 4.8843
+      },
+      "name": "playback:segments",
+      "ratio": 1.1893,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.7694,
+       "median": 0.7508,
+       "min": 0.7404
+      },
+      "jellyfin": {
+       "max": 6.6243,
+       "median": 6.5766,
+       "min": 6.5699
+      },
+      "name": "playback:stopped",
+      "ratio": 8.7733,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.6938,
+       "median": 0.687,
+       "min": 0.6853
+      },
+      "jellyfin": {
+       "max": 4.7769,
+       "median": 4.7629,
+       "min": 4.731
+      },
+      "name": "image",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: image: request picks differ"
+     }
+    ],
+    "rate": 5,
+    "screens": [
+     {
+      "ferrofin": {
+       "max": 15,
+       "median": 15,
+       "min": 15
+      },
+      "jellyfin": {
+       "max": 46,
+       "median": 45,
+       "min": 45
+      },
+      "name": "home",
+      "ratio": 3.0,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 16,
+       "median": 16,
+       "min": 15.5
+      },
+      "jellyfin": {
+       "max": 36,
+       "median": 36,
+       "min": 36
+      },
+      "name": "movies",
+      "ratio": 2.25,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 8,
+       "median": 8,
+       "min": 8
+      },
+      "jellyfin": {
+       "max": 33,
+       "median": 33,
+       "min": 33
+      },
+      "name": "detail",
+      "ratio": 4.125,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 8,
+       "median": 7,
+       "min": 7
+      },
+      "jellyfin": {
+       "max": 25,
+       "median": 25,
+       "min": 25
+      },
+      "name": "series",
+      "ratio": 3.5714,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 29.5,
+       "median": 28,
+       "min": 28
+      },
+      "jellyfin": {
+       "max": 56,
+       "median": 56,
+       "min": 55
+      },
+      "name": "search",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:artists: ids differs for a request pick"
+     },
+     {
+      "ferrofin": {
+       "max": 9,
+       "median": 8,
+       "min": 8
+      },
+      "jellyfin": {
+       "max": 29,
+       "median": 29,
+       "min": 29
+      },
+      "name": "playback",
+      "ratio": 3.625,
+      "unit": "ms",
+      "withheld": null
+     }
+    ]
+   },
+   "stress": {
+    "endpoints": [
+     {
+      "ferrofin": {
+       "max": 0.6897,
+       "median": 0.6681,
+       "min": 0.6657
+      },
+      "jellyfin": {
+       "max": 4.8992,
+       "median": 4.8855,
+       "min": 4.8226
+      },
+      "name": "home:image",
+      "ratio": 7.2985,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 5.1526,
+       "median": 5.0834,
+       "min": 5.0662
+      },
+      "jellyfin": {
+       "max": 10.7567,
+       "median": 10.7563,
+       "min": 10.6655
+      },
+      "name": "home:latest-movies",
+      "ratio": 2.126,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 3.0009,
+       "median": 2.9573,
+       "min": 2.9159
+      },
+      "jellyfin": {
+       "max": 7.4003,
+       "median": 7.37,
+       "min": 7.3046
+      },
+      "name": "home:latest-music",
+      "ratio": 2.4899,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 10.0518,
+       "median": 10.0418,
+       "min": 9.9825
+      },
+      "jellyfin": {
+       "max": 22.3413,
+       "median": 22.3286,
+       "min": 22.1469
+      },
+      "name": "home:latest-shows",
+      "ratio": 2.23,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 11.0085,
+       "median": 10.9944,
+       "min": 10.958
+      },
+      "jellyfin": {
+       "max": 25.0455,
+       "median": 24.8779,
+       "min": 24.7877
+      },
+      "name": "home:nextup",
+      "ratio": 2.2636,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 5.8859,
+       "median": 5.8752,
+       "min": 5.8707
+      },
+      "jellyfin": {
+       "max": 18.5811,
+       "median": 18.5067,
+       "min": 18.3143
+      },
+      "name": "home:resume-audio",
+      "ratio": 3.1463,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.6427,
+       "median": 1.6259,
+       "min": 1.6186
+      },
+      "jellyfin": {
+       "max": 18.5748,
+       "median": 18.4981,
+       "min": 18.3292
+      },
+      "name": "home:resume-book",
+      "ratio": 11.3497,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 7.2692,
+       "median": 7.2195,
+       "min": 7.2187
+      },
+      "jellyfin": {
+       "max": 20.5879,
+       "median": 20.4599,
+       "min": 20.224
+      },
+      "name": "home:resume-video",
+      "ratio": 2.8393,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.7249,
+       "median": 4.6216,
+       "min": 4.6185
+      },
+      "jellyfin": {
+       "max": 19.6297,
+       "median": 19.5094,
+       "min": 19.368
+      },
+      "name": "home:views",
+      "ratio": 4.2208,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.6817,
+       "median": 0.6744,
+       "min": 0.6672
+      },
+      "jellyfin": {
+       "max": 4.8289,
+       "median": 4.8068,
+       "min": 4.7618
+      },
+      "name": "movies:image",
+      "ratio": 7.1791,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 12.1163,
+       "median": 12.0446,
+       "min": 11.9567
+      },
+      "jellyfin": {
+       "max": 25.5954,
+       "median": 25.4214,
+       "min": 25.1284
+      },
+      "name": "movies:items",
+      "ratio": 2.1167,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.6024,
+       "median": 0.5966,
+       "min": 0.596
+      },
+      "jellyfin": {
+       "max": 4.7733,
+       "median": 4.7262,
+       "min": 4.7159
+      },
+      "name": "detail:image",
+      "ratio": 7.8833,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 2.2134,
+       "median": 2.1994,
+       "min": 2.0846
+      },
+      "jellyfin": {
+       "max": 10.4864,
+       "median": 10.4599,
+       "min": 10.3654
+      },
+      "name": "detail:item",
+      "ratio": 4.7727,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.105,
+       "median": 1.1043,
+       "min": 1.0323
+      },
+      "jellyfin": {
+       "max": 6.3624,
+       "median": 6.3455,
+       "min": 6.3394
+      },
+      "name": "detail:local-trailers",
+      "ratio": 5.7727,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.9773,
+       "median": 4.9471,
+       "min": 4.8602
+      },
+      "jellyfin": {
+       "max": 21.0514,
+       "median": 21.0302,
+       "min": 20.9988
+      },
+      "name": "detail:similar",
+      "ratio": 4.2424,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.1229,
+       "median": 1.1165,
+       "min": 1.0495
+      },
+      "jellyfin": {
+       "max": 6.3399,
+       "median": 6.3383,
+       "min": 6.3198
+      },
+      "name": "detail:special-features",
+      "ratio": 5.6607,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.5217,
+       "median": 1.5067,
+       "min": 1.5063
+      },
+      "jellyfin": {
+       "max": 6.1643,
+       "median": 6.1573,
+       "min": 6.0927
+      },
+      "name": "series:episodes",
+      "ratio": 4.0795,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.5647,
+       "median": 0.5602,
+       "min": 0.5547
+      },
+      "jellyfin": {
+       "max": 3.7017,
+       "median": 3.6699,
+       "min": 3.6547
+      },
+      "name": "series:image",
+      "ratio": 6.5536,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 3.5019,
+       "median": 3.4793,
+       "min": 3.4359
+      },
+      "jellyfin": {
+       "max": 12.0129,
+       "median": 11.7813,
+       "min": 11.4587
+      },
+      "name": "series:item",
+      "ratio": 3.3908,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.7797,
+       "median": 1.733,
+       "min": 1.7279
+      },
+      "jellyfin": {
+       "max": 9.0017,
+       "median": 8.8432,
+       "min": 8.5479
+      },
+      "name": "series:seasons",
+      "ratio": 5.1098,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 3.8844,
+       "median": 3.8523,
+       "min": 3.8086
+      },
+      "jellyfin": {
+       "max": 15.4398,
+       "median": 15.2812,
+       "min": 14.9057
+      },
+      "name": "series:similar",
+      "ratio": 3.974,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.7839,
+       "median": 1.7436,
+       "min": 1.736
+      },
+      "jellyfin": {
+       "max": 10.7255,
+       "median": 10.6096,
+       "min": 10.4788
+      },
+      "name": "search:artists",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:artists: ids differs for a request pick"
+     },
+     {
+      "ferrofin": {
+       "max": 0.8393,
+       "median": 0.7852,
+       "min": 0.7838
+      },
+      "jellyfin": {
+       "max": 5.1556,
+       "median": 5.1405,
+       "min": 5.1099
+      },
+      "name": "search:image",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:image: request picks differ"
+     },
+     {
+      "ferrofin": {
+       "max": 23.6472,
+       "median": 23.3883,
+       "min": 22.9846
+      },
+      "jellyfin": {
+       "max": 42.9097,
+       "median": 42.7172,
+       "min": 42.7159
+      },
+      "name": "search:items",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:items: ids differs for a request pick"
+     },
+     {
+      "ferrofin": {
+       "max": 2.1389,
+       "median": 2.1339,
+       "min": 2.1071
+      },
+      "jellyfin": {
+       "max": 17.1583,
+       "median": 17.0232,
+       "min": 17.0047
+      },
+      "name": "search:persons",
+      "ratio": 7.9812,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.3847,
+       "median": 1.3587,
+       "min": 1.3494
+      },
+      "jellyfin": {
+       "max": 14.7143,
+       "median": 14.5758,
+       "min": 14.462
+      },
+      "name": "search:programs",
+      "ratio": 10.7353,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 5.8587,
+       "median": 5.8473,
+       "min": 5.8212
+      },
+      "jellyfin": {
+       "max": 33.2851,
+       "median": 33.061,
+       "min": 32.9579
+      },
+      "name": "search:videos",
+      "ratio": 5.6581,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.0644,
+       "median": 4.0426,
+       "min": 3.9485
+      },
+      "jellyfin": {
+       "max": 6.2027,
+       "median": 6.0898,
+       "min": 6.0128
+      },
+      "name": "playback:intros",
+      "ratio": 1.5074,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 1.4385,
+       "median": 1.3597,
+       "min": 1.3506
+      },
+      "jellyfin": {
+       "max": 8.1338,
+       "median": 8.121,
+       "min": 8.0478
+      },
+      "name": "playback:playbackinfo",
+      "ratio": 5.9706,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.7897,
+       "median": 0.7828,
+       "min": 0.7766
+      },
+      "jellyfin": {
+       "max": 9.0133,
+       "median": 8.953,
+       "min": 8.8763
+      },
+      "name": "playback:playing",
+      "ratio": 11.4744,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 4.1311,
+       "median": 4.1166,
+       "min": 4.0409
+      },
+      "jellyfin": {
+       "max": 6.2078,
+       "median": 6.1786,
+       "min": 6.0188
+      },
+      "name": "playback:segments",
+      "ratio": 1.5,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.752,
+       "median": 0.7477,
+       "min": 0.7342
+      },
+      "jellyfin": {
+       "max": 6.7311,
+       "median": 6.7217,
+       "min": 6.7047
+      },
+      "name": "playback:stopped",
+      "ratio": 8.96,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 0.6631,
+       "median": 0.6488,
+       "min": 0.6471
+      },
+      "jellyfin": {
+       "max": 4.8583,
+       "median": 4.8506,
+       "min": 4.7991
+      },
+      "name": "image",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: image: request picks differ"
+     }
+    ],
+    "rate": 25,
+    "screens": [
+     {
+      "ferrofin": {
+       "max": 15,
+       "median": 15,
+       "min": 15
+      },
+      "jellyfin": {
+       "max": 45,
+       "median": 45,
+       "min": 45
+      },
+      "name": "home",
+      "ratio": 3.0,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 15,
+       "median": 15,
+       "min": 15
+      },
+      "jellyfin": {
+       "max": 37,
+       "median": 37,
+       "min": 37
+      },
+      "name": "movies",
+      "ratio": 2.4667,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 7,
+       "median": 7,
+       "min": 7
+      },
+      "jellyfin": {
+       "max": 33,
+       "median": 32,
+       "min": 32
+      },
+      "name": "detail",
+      "ratio": 4.5714,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 7,
+       "median": 7,
+       "min": 6
+      },
+      "jellyfin": {
+       "max": 26,
+       "median": 26,
+       "min": 26
+      },
+      "name": "series",
+      "ratio": 3.7143,
+      "unit": "ms",
+      "withheld": null
+     },
+     {
+      "ferrofin": {
+       "max": 28,
+       "median": 28,
+       "min": 28
+      },
+      "jellyfin": {
+       "max": 57,
+       "median": 57,
+       "min": 57
+      },
+      "name": "search",
+      "ratio": null,
+      "unit": "ms",
+      "withheld": "Ferrofin: search:artists: ids differs for a request pick"
+     },
+     {
+      "ferrofin": {
+       "max": 8,
+       "median": 7,
+       "min": 7
+      },
+      "jellyfin": {
+       "max": 32,
+       "median": 32,
+       "min": 32
+      },
+      "name": "playback",
+      "ratio": 4.5714,
+      "unit": "ms",
+      "withheld": null
+     }
+    ]
+   }
+  },
+  "memory": [
+   {
+    "ferrofin": {
+     "max": 209.2109,
+     "median": 205.8789,
+     "min": 204.1133
+    },
+    "jellyfin": {
+     "max": 566.625,
+     "median": 544.3984,
+     "min": 531.0195
+    },
+    "name": "peak under load",
+    "ratio": 2.6408,
+    "unit": "MiB",
+    "withheld": null
+   },
+   {
+    "ferrofin": {
+     "max": 161.2266,
+     "median": 153.7773,
+     "min": 149.5977
+    },
+    "jellyfin": {
+     "max": 404.8164,
+     "median": 393.4766,
+     "min": 368.8359
+    },
+    "name": "steady idle",
+    "ratio": 2.5519,
+    "unit": "MiB",
+    "withheld": null
+   }
+  ],
+  "source": {
+   "commit": "5112240e",
+   "date": "2026-10-26",
+   "fixture": "4b217db66afc05ac4533e38b6b347018151493f64e4979e549355a9f586d4e04",
+   "host_class": {
+    "cores": 32,
+    "memory_gib": 125
+   },
+   "image_digest": "sha256:673a122ff7175de381c72fda7faeec69d1e3f0073f22c73bd9eea043f381bd07",
+   "oracle": "Jellyfin 12.2.0",
+   "oracle_image": "jellyfin/jellyfin@sha256:357724bf0ae27a672c7cbaa899db2d9abeb13dbd8657ccce750258a4c059d037",
+   "run_count": 3,
+   "runs": [
+    "detached-5112240e1923-20261026-0101/bench",
+    "detached-5112240e1923-20261026-0151/bench",
+    "detached-5112240e1923-20261026-0219/bench"
+   ]
+  },
+  "ttfs": [
+   {
+    "ferrofin": {
+     "max": 284.1487,
+     "median": 275.2948,
+     "min": 269.1612
+    },
+    "jellyfin": {
+     "max": 3342.5963,
+     "median": 3333.1108,
+     "min": 3323.8826
+    },
+    "name": "cold start (restart → authenticated views; host caches retained)",
+    "ratio": 12.12,
+    "unit": "ms",
+    "withheld": null
+   },
+   {
+    "ferrofin": {
+     "max": 397.1362,
+     "median": 183.5744,
+     "min": 178.4556
+    },
+    "jellyfin": {
+     "max": 529.6015,
+     "median": 430.7279,
+     "min": 430.3552
+    },
+    "name": "HLS first segment (forced transcode)",
+    "ratio": 2.3424,
+    "unit": "ms",
+    "withheld": null
+   },
+   {
+    "ferrofin": {
+     "max": 0.6797,
+     "median": 0.6406,
+     "min": 0.5798
+    },
+    "jellyfin": {
+     "max": 4.209,
+     "median": 4.1163,
+     "min": 3.9609
+    },
+    "name": "direct-play TTFB (1 MiB range)",
+    "ratio": 6.4375,
+    "unit": "ms",
+    "withheld": null
+   }
+  ]
+ },
+ "schema": 1,
+ "version": "v1.4.0"
+}

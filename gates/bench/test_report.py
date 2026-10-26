@@ -88,11 +88,14 @@ class ReportTests(unittest.TestCase):
         return dict(model['levels']['loaded']['screens'])['home'][server]
 
     def readme(self, model=None):
+        """What the README publishes from `model`: its result.json detail (gates/publish.py reads it)."""
         model = model or self.build()
-        return report.render_readme(model, model['runs'])
+        return report.run_result(model)['detail']
 
-    def row(self, text, label='home'):
-        return next(line for line in text.splitlines() if line.startswith(f'| **{label}**'))
+    def row(self, detail, label='home', group=None):
+        """A loaded-level screen row of `detail`, or the row of `group` (ttfs, memory) whose name starts so."""
+        rows = detail[group] if group else detail['levels']['loaded']['screens']
+        return next(r for r in rows if r['name'].startswith(label))
 
     def test_report_evidence_is_tabular_and_preserves_failures_and_missing_values(self):
         model = self.build(self.a, self.b)
@@ -182,7 +185,7 @@ class ReportTests(unittest.TestCase):
         for group, fmt in (('ttfs', report.ms), ('memory', report.mib)):
             for r in doc['detail'][group]:
                 self.assertIn(fmt(r['servers']['ferrofin']['median']), line(r['name']))
-        self.assertEqual([r['name'] for r in doc['detail']['memory']], list(report.README_MEMORY))
+        self.assertEqual([r['name'] for r in doc['detail']['memory']], list(report.MEMORY_ROWS))
         self.assertEqual(doc['detail']['oracle_label'], 'Jellyfin 12.2')
 
     def test_result_json_withholds_a_cell_the_servers_answered_differently(self):
@@ -195,7 +198,7 @@ class ReportTests(unittest.TestCase):
         self.assertIsNone(home['ratio'])
         self.assertTrue(home['withheld'].startswith('Ferrofin: '))
         self.assertIsNotNone(home['servers']['ferrofin']['flag'])
-        self.assertIn('— ⚠', self.row(self.readme()))   # the README withholds the same cell
+        self.assertTrue(self.row(self.readme())['withheld'])   # the README withholds the same cell
         movies = next(r for r in doc['detail']['levels']['loaded']['screens'] if r['name'] == 'movies')
         self.assertEqual((movies['ratio'], movies['withheld']), (2.0, None))
 
@@ -253,11 +256,11 @@ class ReportTests(unittest.TestCase):
     def test_clean_report_and_optional_servers(self):
         m = self.build(self.a, self.b)
         self.assertIsNone(self.home(m).flag)
-        self.assertIn('faster on 7', self.readme(m))
-        self.assertIn('3 logical CPUs', self.readme(m))
+        endpoints = self.readme(m)['levels']['loaded']['endpoints']
+        self.assertEqual(sum(r['ratio'] > 1 for r in endpoints if r['ratio']), 7)
+        self.assertEqual(self.readme(m)['conditions']['server_cpus'], '0,2-3')
         self.assertIn('12.2', report.render_md(m))
-        self.assertIn('No measured request failed', self.readme(m))
-        self.assertNotIn('full runs', self.readme(m))
+        self.assertEqual(self.readme(m)['load_problems'], [])
         self.assertIn('<html', report.render_html(m))
 
     def test_later_missing_shape_and_selection_order(self):
@@ -265,14 +268,14 @@ class ReportTests(unittest.TestCase):
         forward, reverse = self.build(self.a, self.b), self.build(self.b, self.a)
         self.assertIn('no shape pass', self.home(forward).flag)
         self.assertEqual(self.home(forward).flag, self.home(reverse).flag)
-        self.assertNotIn('faster', self.row(self.readme(forward)))
+        self.assertIsNone(self.row(self.readme(forward))['ratio'])
 
     def test_http_failures_invalidate_measured_window(self):
         self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].update(ok=0.5))
         m = self.build()
         self.assertIn('failed', self.home(m).flag)
-        self.assertNotIn('No measured request failed', self.readme(m))
-        self.assertNotIn('faster', self.row(self.readme(m)))
+        self.assertTrue(self.readme(m)['load_problems'])
+        self.assertIsNone(self.row(self.readme(m))['ratio'])
 
     def test_oracle_http_failure_invalidates_comparison(self):
         self.edit(self.b / 'jellyfin/k6-loaded.json', lambda x: x['endpoints']['home:items'].update(ok=0))
@@ -281,15 +284,15 @@ class ReportTests(unittest.TestCase):
         self.assertIn('failed', self.home(m, 'jellyfin').flag)
 
     def test_slower_and_tied_candidates_do_not_claim_wins(self):
-        for latency, sentence in [(20, 'about the same on 7'), (25, 'slower on 7')]:
+        for latency, ratio in [(20, 1.0), (25, 0.8)]:
             with self.subTest(latency=latency):
                 def update(x):
                     for group in ('screens', 'endpoints'):
                         for v in x[group].values():
                             v['p50'] = latency
                 self.edit(self.a / 'ferrofin/k6-loaded.json', update)
-                self.assertIn(sentence, self.readme())
-                self.assertNotIn('faster on 7', self.readme())
+                endpoints = self.readme()['levels']['loaded']['endpoints']
+                self.assertEqual({r['ratio'] for r in endpoints}, {ratio})
 
     def test_mixed_conditions_and_images_are_rejected(self):
         original = json.loads((self.b / 'run.json').read_text())
@@ -425,7 +428,7 @@ class ReportTests(unittest.TestCase):
     def test_known_nondefault_repetition_count(self):
         self.edit(self.a / 'run.json', lambda x: x.update(restarts=1))
         self.edit(self.a / 'ferrofin/coldstart.json', lambda x: x.update(runs=x['runs'][:1]))
-        self.assertIsNone(dict(self.build()['ttfs'])[report.README_TTFS[0]]['ferrofin'].flag)
+        self.assertIsNone(self.build()['ttfs'][0][1]['ferrofin'].flag)   # cold start
 
     def test_cold_start_attempt_bound_separates_run_sets(self):
         self.assertFalse(report.incompatible([str(self.a), str(self.b)]))
@@ -450,7 +453,7 @@ class ReportTests(unittest.TestCase):
             self.shapes(path.parent, records)
         m = self.build()
         self.assertIsNone(dict(m['levels']['loaded']['endpoints'])['image']['ferrofin'].flag)
-        self.assertIn('faster', self.row(self.readme(m)))
+        self.assertIsNotNone(self.row(self.readme(m))['ratio'])
 
     def test_inventory_differences_remain_diagnostic_across_repetitions(self):
         self.edit(self.b / 'ferrofin/counts.json', lambda x: x.update(movies=1, persons=5000))
@@ -461,7 +464,7 @@ class ReportTests(unittest.TestCase):
                 self.assertIsNone(cells['ferrofin'].flag)
         self.assertTrue(any('count movies' in x for x in m['work']['ferrofin']))
         self.assertTrue(any('count persons' in x for x in m['work']['ferrofin']))
-        self.assertIn('faster', self.row(self.readme(m)))
+        self.assertIsNotNone(self.row(self.readme(m))['ratio'])
 
     def test_missing_inventory_stays_visible_without_flagging_latency(self):
         for server in ('ferrofin', 'jellyfin'):
@@ -479,7 +482,7 @@ class ReportTests(unittest.TestCase):
         m = self.build(self.a, self.b)
         self.assertIsNotNone(self.home(m).flag)
         self.assertIsNone(dict(m['levels']['loaded']['screens'])['movies']['ferrofin'].flag)
-        self.assertIn('— ⚠', self.row(self.readme(m)))
+        self.assertTrue(self.row(self.readme(m))['withheld'])
 
     def test_transport_failure_in_oracle_shape(self):
         self.shapes(self.a / 'jellyfin', [{'shape': 'home:items', 'url': '/home:items', 'status': 0}])
@@ -489,41 +492,42 @@ class ReportTests(unittest.TestCase):
         self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].update(p50=float('nan')))
         m = self.build()
         self.assertIsNotNone(self.home(m).flag)
-        self.assertNotIn('nan', self.row(self.readme(m)))
+        home = self.row(self.readme(m))
+        self.assertEqual((home['ratio'], home['servers']['ferrofin']['values']), (None, []))   # no NaN reaches result.json
+        json.dumps(home, allow_nan=False)
 
     def test_missing_timing_file_is_flagged(self):
         (self.b / 'ferrofin/coldstart.json').unlink()
-        c = dict(self.build(self.a, self.b)['ttfs'])[report.README_TTFS[0]]['ferrofin']
+        c = self.build(self.a, self.b)['ttfs'][0][1]['ferrofin']   # cold start
         self.assertIsNotNone(c.flag)
         self.assertEqual(c.runs, 2)
         self.assertEqual(len(c.vals), 1)
 
     def test_single_server_render(self):
         shutil.rmtree(self.a / 'jellyfin')
-        text = self.readme()
-        self.assertIn('no Jellyfin reference selected', text)
-        self.assertNotIn('faster', self.row(text))
+        detail = self.readme()
+        self.assertIsNone(detail['oracle_label'])
+        self.assertIsNone(self.row(detail)['ratio'])
 
     def test_dropped_work_withholds_resource_comparisons(self):
         self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x.update({'dropped_iterations': 1}))
         m = self.build()
         self.assertIsNotNone(self.home(m).flag)
         for name, cells in m['memory']:
-            if name in report.README_MEMORY:
+            if name in report.MEMORY_ROWS:
                 self.assertIsNotNone(cells['ferrofin'].flag)
 
     def test_missing_window_is_incomplete_not_zero_errors(self):
         (self.b / 'ferrofin/k6-loaded.json').unlink()
         m = self.build(self.a, self.b)
         self.assertIn('missing load window', self.home(m).flag)
-        self.assertNotIn('No measured request failed', self.readme(m))
+        self.assertTrue(self.readme(m)['load_problems'])
 
     def test_later_oracle_timing_failure_withholds_ratio(self):
         self.edit(self.b / 'jellyfin/coldstart.json', lambda x: x['runs'][0].update(home_ms=None))
-        text = self.readme(self.build(self.a, self.b))
-        line = next(x for x in text.splitlines() if x.startswith('| cold start'))
-        self.assertIn('— ⚠', line)
-        self.assertNotIn('faster', line)
+        cold = self.row(self.readme(self.build(self.a, self.b)), 'cold start', 'ttfs')
+        self.assertTrue(cold['withheld'])
+        self.assertIsNone(cold['ratio'])
 
     def test_empty_image_is_not_accepted(self):
         for server in ('ferrofin', 'jellyfin'):
@@ -541,14 +545,13 @@ class ReportTests(unittest.TestCase):
 
     def test_missing_tail_withholds_entire_headline_cell(self):
         self.edit(self.a / 'ferrofin/k6-loaded.json', lambda x: x['screens']['home'].pop('p99'))
-        self.assertNotIn('faster', self.row(self.readme()))
+        self.assertIsNone(self.row(self.readme())['ratio'])
 
     def test_version_labels_follow_each_run_in_every_renderer(self):
         old = self.build(self.a)
         self.write(self.b / 'jellyfin/system-info.json', {'Version': '12.2.0'})
         new = self.build(self.b)
-        for render in (report.render_md, report.render_html,
-                       lambda m: report.render_readme(m, m['runs'])):
+        for render in (report.render_md, report.render_html, lambda m: json.dumps(report.run_result(m)['detail'])):
             with self.subTest(renderer=render):
                 self.assertIn('Jellyfin 12.2.0', render(new))
                 self.assertNotIn('Jellyfin 12.2.0', render(old))
@@ -585,7 +588,7 @@ class ReportTests(unittest.TestCase):
         self.shapes(d, records)
         model = self.build()
         self.assertIn('empty', self.home(model).flag)
-        self.assertNotIn('faster', self.row(self.readme(model)))
+        self.assertIsNone(self.row(self.readme(model))['ratio'])
 
     def test_workload_hashes_and_seeds_cannot_be_mixed(self):
         for field in ('workload', 'ids_sha256', 'screens_sha256', 'seed', 'warmup_seed', 'slots', 'pools', 'user_isolation', 'actors'):
@@ -630,10 +633,10 @@ class ReportTests(unittest.TestCase):
         self.assertIn('parameters differ',cell.flag)
 
     def test_hls_headlines_the_readme_unless_its_transcode_differs(self):
-        row = lambda: next(line for line in self.readme().splitlines() if line.startswith('| HLS first segment'))
-        self.assertNotIn('⚠', row())
+        row = lambda: self.row(self.readme(), 'HLS first segment', 'ttfs')
+        self.assertIsNone(row()['withheld'])
         self.edit(self.a/'ferrofin/ttfs.json', lambda t: t['hls'][1].update(transcoding_url='/master.m3u8?VideoCodec=hevc'))
-        self.assertIn('— ⚠', row())
+        self.assertTrue(row()['withheld'])
 
     def test_stream_probe_failure_in_later_run_is_not_ignored(self):
         self.edit(self.b/'run.json', lambda m:m.update(streaming_validation=1))
@@ -646,7 +649,7 @@ class ReportTests(unittest.TestCase):
         (self.b / 'ferrofin/mem.csv').unlink()
         m = self.build(self.a, self.b)
         for name, cells in m['memory']:
-            if name in report.README_MEMORY:
+            if name in report.MEMORY_ROWS:
                 self.assertIsNotNone(cells['ferrofin'].flag)
 
 

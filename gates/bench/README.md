@@ -472,8 +472,8 @@ gates/bench/testdata/build.sh                           # source fixture, once, 
 gates/bench/testdata/build.sh --prepare-jellyfin          # once per source fixture / pinned image
 gates/bench/run.sh                                      # one full run, ~40 min → $FERROFIN_GATES_DIR/runs/bench-<version>/report.md
 python3 gates/bench/report.py "$FERROFIN_GATES_DIR"/runs/bench-{A,B,C}   # the full tables: medians, markers, notes
-python3 gates/bench/report.py --readme README.md "$FERROFIN_GATES_DIR"/runs/bench-{A,B,C}
-                                                  # rewrites the README "Benchmarks" block (headline table + prose)
+make publish-results VERSION=vX.Y.Z BENCH="$FERROFIN_GATES_DIR/runs/bench-A …"
+                                                  # the release's summary, the README Results block and its graphs (gates/README.md)
 python3 gates/bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/ (every gate's runs)
 ```
 

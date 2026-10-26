@@ -90,3 +90,35 @@ Every gate is moving to one structured result, `<run>/result.json`, in the envel
 (`commit`, `image`, `image_digest`, `oracle`, `host_class` (cores and memory, never a host name),
 `fixture`), `started`, `ended`, and `detail`, the gate's own data. Its HTML report, this page and the
 viewer read that file, never the gate's internal files. verify and bench write one today.
+
+For a Jellyfin-comparison benchmark the page also shows the README's graphs for that one run
+([`publish.py`](publish.py), inline, in the reader's light or dark theme).
+
+## Publishing the results
+
+The README's Results section shows each release's numbers against Jellyfin, drawn from one small file per
+release that stays in the repository, `docs/results/<version>/summary.json`. The release operator chooses the
+local runs it is made from; nothing is picked automatically, and nothing here runs a gate:
+
+```bash
+make publish-results VERSION=v1.4.0 BENCH="$FERROFIN_GATES_DIR/runs/<session>/bench …"   # three or more runs
+```
+
+That runs [`publish.py`](publish.py) twice:
+- `summarise` reads each named run's `result.json` and writes the summary. It holds only the numbers
+  the README shows, each with its source: the run folders, commit, image digest, Jellyfin version, run
+  count, host class (cores and memory) and fixture hash. It refuses fewer than three Jellyfin-comparison
+  runs, and runs of different images, hosts or fixtures.
+- `readme` draws every graph of the newest summary into `docs/results/<version>/`, a light and a dark SVG
+  each, and replaces the block between the `BEGIN`/`END GENERATED RESULTS` markers in `README.md`. The same
+  summary files give byte-identical output, and `publish.py readme --check` exits 1 when the block or the
+  images differ from what they give.
+
+Every graph follows one style: Ferrofin in blue and Jellyfin in grey. Ferrofin's bar turns amber where it is
+slower. Each bar carries its value, each axis its unit, and each graph a caption naming its source. Every
+comparable cell is drawn, the biggest speed-up first. A cell the servers answered differently, or whose
+evidence is incomplete, is withheld and listed with its reason under the graphs. The graphs are:
+- p50 per screen and endpoint at the loaded and stress levels;
+- time to first screen;
+- peak and idle memory;
+- CPU per completed screen, where the work matched.
