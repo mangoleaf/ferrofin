@@ -2136,9 +2136,6 @@ pub async fn build_app_state(
         ));
     }
     let tasks: Arc<dyn ferrofin_traits::tasks::TaskManager> = Arc::new(task_manager.clone());
-    // The trigger scheduler: fires startup triggers now, then evaluates
-    // daily/weekly/interval triggers for the life of this host.
-    background.push(task_manager.start_scheduler());
     // Every item delete removes the deleted rows' extracted data
     // (`LibraryManager.DeleteItem` → `DeleteExternalItemFiles`); the library
     // manager is built before the chapter and segment managers this needs.
@@ -2151,6 +2148,22 @@ pub async fn build_app_state(
             Arc::clone(&chapters),
         ));
     library_impl.set_external_data(external_data);
+    // Jellyfin 12.0's sweeps of a 10.11 database's items whose library or
+    // file is gone delete through the library manager, so they run once it
+    // removes extracted data too, and before a startup trigger can scan.
+    ferrofin_core::adoption_repairs::run_sweep_missing_items(
+        db,
+        library.as_ref(),
+        virtual_folders.as_ref(),
+        &virtual_paths,
+        &paths.internal_metadata_path(),
+        &paths.default_user_views_path(),
+    )
+    .await
+    .context("failed to remove items whose library or file is gone")?;
+    // The trigger scheduler: fires startup triggers now, then evaluates
+    // daily/weekly/interval triggers for the life of this host.
+    background.push(task_manager.start_scheduler());
 
     // ---- dto (consumes many of the above) ---------------------------------
     let dto_impl = Arc::new(

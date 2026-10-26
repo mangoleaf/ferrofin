@@ -84,6 +84,29 @@ Adoption stays one-way: going back to Jellyfin means restoring `jellyfin.db.pre-
 The `.pre-NNNN` copies are for recovering from a failed Ferrofin upgrade, not a way back to
 Jellyfin.
 
+## Unreleased — a Jellyfin 10.11 database loses items whose file or library is gone, once
+
+Mount your media before the first boot on an adopted Jellyfin 10.11 database. When Jellyfin
+12 upgrades a 10.11 database, it removes items whose files are gone, and items whose library
+was removed. Ferrofin now does the same, once, on the first boot of a database adopted from
+10.11, including one that Ferrofin 1.2.0 or later adopted:
+- an item whose file or folder is no longer at its path, under a media folder that exists
+  and is not empty;
+- an item outside every media folder, but only when there is at least one media folder and
+  every one exists and is not empty, and never one in a library whose definition folder
+  (`root/default/<library>`) is missing;
+- an item whose top-level library item no longer exists and whose library is not defined.
+
+A root, a library's own folder, a view or a by-name item is never removed this way: it is
+kept, with a warning in the boot log.
+
+Items under a media folder that is missing or empty are kept: that looks the same as storage
+that did not mount. Play state recorded for a removed item moves to the placeholder item, as
+in Jellyfin. No media file is touched. The boot log counts what it removed, and lists each
+item at debug level. Before the first removal it snapshots the database to
+`jellyfin.db.pre-missing-items`, unless that file is already there from an interrupted
+earlier boot. Before this release, these items stayed until a library scan removed them.
+
 ## Unreleased — user and policy saves need a complete body
 
 Usually nothing to do: the web client posts back the user it read. A script that calls

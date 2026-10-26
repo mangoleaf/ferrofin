@@ -480,14 +480,12 @@ one (0045), and recomputes every user's normalised name; and on both lineages it
 
 ### The stale-file sweep
 
-`gone_file_userdata` is the one shape whose difference from Jellyfin 12.2 is neither written down nor
-decided. Jellyfin's upgrade routine `MigrateLinkedChildren` deletes the non-folder, non-virtual items
-whose file no longer exists under a library location that is readable (with guards for an empty or
-missing location), and keeps their play state; Ferrofin's 10.11 adoption has no counterpart and keeps
-the item until a scan. The `jellyfin-10.11.11-messy` row therefore **fails** on this shape, naming both
-states, until the decision recorded in the open issue gl-521 is made: port the sweep (the row then
-passes unchanged), or record it as intentionally replaced by the first scan (a written divergence for
-`("gone_file_userdata", "10.11")`, and the row passes).
+Jellyfin's upgrade routine `MigrateLinkedChildren` deletes the non-folder, non-virtual items whose file
+no longer exists under a library location that is readable (with guards for an empty or missing
+location), and the items whose `TopParentId` names no item, and keeps their play state. Ferrofin's 10.11
+adoption ports both sweeps as a one-shot boot repair (`adoption_repairs::sweep_missing_items`, the
+owner's decision on gl-521), so `gone_file_userdata` ends on the 10.11 lineage as Jellyfin 12.2 left it:
+the item gone, its play state on the placeholder item by its key.
 
 ## Scale fixture
 
