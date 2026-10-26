@@ -189,9 +189,12 @@ session() { # the one session directory made under the root
 @test "gates/run: a terminated run stops the running gate, records it as interrupted and the rest as skipped" {
   FAKE_SLEEP=30 repo/gates/run verify,adoption --image ferrofin:test > out.txt 2>&1 & pid=$!
   for _ in $(seq 1 100); do grep -q '^verify ' "$FAKE_CALLS" 2>/dev/null && break; sleep 0.1; done
+  worker=$(pgrep -P "$pid")   # the run goes to a worker in a session of its own (gates_supervise)
+  [ -n "$worker" ]
   kill -TERM "$pid"
   wait "$pid" && status=0 || status=$?
   [ "$status" -eq 143 ]
+  [ -z "$(pgrep -s "$worker")" ]
   s=$(session)
   [ "$(jq -r '.gates | to_entries | map("\(.key)=\(.value.status)/\(.value.note // "")") | join(" ")' "$s/session.json")" = \
     "verify=failed/interrupted adoption=skipped/not reached" ]
@@ -199,6 +202,19 @@ session() { # the one session directory made under the root
   grep -q "| verify | failed (exit 143), interrupted |" "$s/report.md"   # an interrupted session is reported too
   run ! kill -0 "$(cat "$FAKE_CALLS.pids")"   # the gate was stopped, not left running
   run ! grep -q '^adoption ' "$FAKE_CALLS"
+}
+
+@test "gates/run: a TERM to its process group stops the gate and leaves nothing of the run's own session" {
+  FAKE_SLEEP=30 setsid repo/gates/run verify,adoption --image ferrofin:test > out.txt 2>&1 & pid=$!
+  for _ in $(seq 1 100); do grep -q '^verify ' "$FAKE_CALLS" 2>/dev/null && break; sleep 0.1; done
+  worker=$(pgrep -P "$pid")   # the run goes to a worker in a session of its own (gates_supervise)
+  [ -n "$worker" ]
+  kill -TERM -- "-$pid"
+  wait "$pid" && status=0 || status=$?
+  [ "$status" -eq 143 ]
+  [ "$(jq -r '.gates.verify.note' "$(session)/session.json")" = interrupted ]
+  run ! kill -0 "$(cat "$FAKE_CALLS.pids")"
+  [ -z "$(pgrep -s "$worker")" ]
 }
 
 @test "gates/run: -h prints the usage from any directory; no gate is the usage and status 2" {

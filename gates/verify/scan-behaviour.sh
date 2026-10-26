@@ -45,8 +45,11 @@
 # or a row fails that did nothing wrong.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=gates/lib.sh
+. "$HERE/../lib.sh"
 # shellcheck source=gates/verify/lib.sh
 . "$HERE/lib.sh"
+gates_supervise "$PWD" "$0" "$@"   # the check itself goes to a worker (gates/lib.sh, gl-968)
 
 # usage: the header above, without its comment markers.
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
@@ -135,6 +138,7 @@ remove_work() {
 cleanup() {
   local status=$? i before
   trap - EXIT
+  gates_ack
   # A second Ctrl-C (or a TERM) during the cleanup's own waits still removes the token.
   trap 'remove_work; exit 130' INT
   trap 'remove_work; exit 143' TERM
