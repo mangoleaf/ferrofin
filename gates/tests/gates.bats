@@ -213,7 +213,9 @@ fake_tools() { # docker and taskset that do nothing, first on PATH, so a script 
 
 # looper: a gate-shaped script under gates_supervise, in $TMP/looper.sh: a teardown on its EXIT trap that
 # records the status it ended with, and a loop that parses a $( … ) as fast as it can, the shape that loses
-# a trapped TERM under bash 5.2 (gl-968). It writes its worker's PID to out/worker once it loops.
+# a trapped TERM under bash 5.2 (gl-968). It writes its worker's PID to out/worker once it loops. The loop
+# never ends by itself: a dropped signal can break the parse of the $( … ) it landed in too, and a loop that
+# tested the result (or ran under set -e) would then end with its own status instead of the TERM's.
 looper() {
   mkdir -p "$TMP/out"
   cat > "$TMP/looper.sh" <<'SH'
@@ -228,7 +230,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
 echo "$BASHPID" > "$OUT/worker"
-while :; do [ "$(echo true)" = true ] || exit 1; done
+while :; do x=$(echo true) || :; done
 SH
 }
 
@@ -289,7 +291,7 @@ run_server() {
   trap cleanup EXIT
   trap 'exit 143' TERM
   echo "$BASHPID" > "$OUT/server"
-  while :; do x=$(echo true); done
+  while :; do x=$(echo true) || :; done   # never ends by itself, set -e or not (looper)
 }
 SERVER_PID=
 interrupt_run() { gates_ack; trap - INT TERM; [ -z "$SERVER_PID" ] || gates_stop "$SERVER_PID"; exit 130; }
