@@ -571,7 +571,7 @@ def parity_section(parity, version, rel, results_dir):
     title = f"Answering jellyfin-web like {src['oracle']}"
     compared = parity["sent"] - c["oracle_failed"]
     alt = (f"{title}: of {parity['sent']} requests, " + ", ".join(f"{c[k]} {PARITY_OUTCOMES[k]}" for k in PARITY_OUTCOMES) + ".")
-    cap = (f"Ferrofin {version} (commit {src['commit'][:8]}) against {src['oracle']}, gates session {src['session']}, "
+    cap = (f"{ferrofin(version)} (commit {src['commit'][:8]}) against {src['oracle']}, gates session {src['session']}, "
            f"{src['date']}. How differences are judged: gates/parity/README.md")
     files = {os.path.join(results_dir, version, f"parity{'' if theme == 'light' else '-dark'}.svg"):
              parity_graph(title, parity, cap, theme, alt) for theme in STYLE}
@@ -801,7 +801,7 @@ def session_graphs(bench_result, version=""):
     return "".join(out)
 
 
-def session_parity_graph(session, commit, version="this session"):
+def session_parity_graph(session, commit, version=""):
     """The README's parity overview graph, inline, for a gates session's parity result (the session page)."""
     parity = parity_summary(session, commit, publishing=False)
     if parity is None:   # a run that compared nothing: its row on the page already says why
