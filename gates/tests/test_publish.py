@@ -20,6 +20,8 @@ import session  # noqa: E402
 
 sys.path.insert(0, str(GATES / "adoption"))
 import adoption_report  # noqa: E402
+sys.path.insert(0, str(GATES / "parity"))
+import diff as parity_diff  # noqa: E402
 
 README = "# Ferrofin\n\nIntro.\n\n## Results\n\n<!-- BEGIN GENERATED RESULTS -->\nold\n<!-- END GENERATED RESULTS -->\n\n## After\n"
 
@@ -52,9 +54,20 @@ def bench_result(scale=1.0, digest="sha256:img", search_withheld=None, started=N
     return result.envelope("bench", "measured", {"completed": 76}, source, started, None, detail)
 
 
-def adoption_session(root, rows, commit="5112240e1923cdc9", dirty=False):
+def parity_requests():
+    """A parity run's requests as diff.py records them: two areas, each outcome at least once."""
+    new = lambda path, filed=None, ledger=None: {"path": path, "kind": "value", "ledger": ledger, "filed": filed}
+    return ([{"target": "/Items/1", "state": "match", "differences": []}] * 6
+            + [{"target": "/Items/2?Fields=x", "state": "ledgered", "differences": [new("A", ledger="ledger.toml#1")]}] * 3
+            + [{"target": "/Sessions", "state": "differences", "differences": [new("B")]},
+               {"target": "/Videos/1", "state": "differences", "differences": [new("C", filed=832)]},
+               {"target": "/Intros", "state": "oracle failed", "differences": []}])
+
+
+def adoption_session(root, rows, commit="5112240e1923cdc9", dirty=False, parity=True):
     """A gates session whose adoption gate recorded `rows` ([(fixture, kind, expected, verdict, detail)]) and wrote
-    its result.json, as gates/run and gates/adoption/run.sh leave them."""
+    its result.json, and (with `parity`) whose parity run wrote its own, as gates/run, gates/adoption/run.sh and
+    gates/parity/diff.py leave them."""
     from datetime import datetime
     s = Path(session.new(str(root / "sessions"), ["adoption"], "release/v1.4.0", commit, dirty, "ferrofin:x",
                          "sha256:img", "jellyfin/jellyfin@sha256:pin", when=datetime(2026, 10, 26, 1, 0)))
@@ -63,6 +76,11 @@ def adoption_session(root, rows, commit="5112240e1923cdc9", dirty=False):
     for fixture, kind, expected, verdict, detail in rows:
         recorder.row(fixture, kind, expected, verdict, detail)
     adoption_report.gate_result().write(str(s / "adoption"), adoption_report.result_doc(*adoption_report.load(s / "adoption")))
+    if parity:
+        summary = {"verdict": "new differences", "reason": "1 new difference(s) in 2 request(s)", "planned": 12,
+                   "requests": parity_requests(), "run": {"oracle": {"version": "12.2.0", "image": "jellyfin@pin"}, "sha": commit[:8]}}
+        (s / "parity").mkdir()
+        parity_diff.gate_result().write(str(s / "parity"), parity_diff.result_doc(summary))
     return s
 
 
@@ -166,6 +184,13 @@ class PublishTests(unittest.TestCase):
     def test_summary_problems_name_what_is_wrong(self):
         doc = self.summary()
         self.assertEqual(publish.summary_problems({**doc, "schema": 2})[0], "schema is 2, not 1")
+        doc["parity"] = {"source": {"session": "s", "commit": "c", "oracle": "Jellyfin 12.2.0", "date": "d"}, "sent": 2,
+                         "counts": {"identical": 2}, "areas": [{"area": "/Items", "requests": 2, "identical": 2}]}
+        self.assertEqual(publish.summary_problems(doc), [])
+        broken = copy.deepcopy(doc)
+        broken["parity"]["areas"][0]["identical"] = 1
+        self.assertTrue(any("parity area is not shaped" in p for p in publish.summary_problems(broken)))
+        del doc["parity"]
         for change, problem in ((lambda d: d["bench"].pop("ttfs"), "bench.ttfs is not a list"),
                                 (lambda d: d["bench"]["memory"][0].update(ratio=0), "has a ratio but not two positive medians"),
                                 (lambda d: d["bench"]["memory"][0].update(ratio=None), "neither a ratio nor a reason"),
@@ -312,6 +337,60 @@ class PublishTests(unittest.TestCase):
                      'srcset="docs/results/v1.4.0/adoption-dark.svg"', "| jellyfin-12.1-from-12 | path | 12.1.0 | skipped | fixture not built |"):
             self.assertIn(text, readme)
         self.assertLess(readme.index("### Speed and memory against Jellyfin"), readme.index("### Adopting an existing"))
+
+    def test_the_parity_overview_comes_from_the_named_session(self):
+        s = adoption_session(self.root, ADOPTION)
+        doc = publish.summarise("v1.4.0", self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)]), str(s))
+        parity = doc["parity"]
+        self.assertEqual(publish.summary_problems(doc), [])
+        self.assertEqual((parity["sent"], parity["counts"], parity["filed_issues"], parity["source"]["oracle"]),
+                         (12, {"identical": 6, "accepted": 3, "filed": 1, "new": 1, "oracle_failed": 1}, [832], "Jellyfin 12.2.0"))
+        self.assertEqual([a["area"] for a in parity["areas"]], ["/Items", "/Intros", "/Sessions", "/Videos"])
+        files, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        graph = files[next(p for p in files if p.endswith("/parity.svg"))]
+        ET.fromstring(graph)
+        for text in ("/Items", "9  ·  100% alike", "/Intros", "not compared", f"fill='{publish.STYLE['light']['new']}'",
+                     "against Jellyfin 12.2.0, gates session"):
+            self.assertIn(text, graph)
+        for text in ("### Answering like Jellyfin", "replays the **12** requests", "**6 are identical**",
+                     "**3 differ in accepted ways**", "**1 is filed as an issue** and **1 is new**",
+                     "1 was not compared because Jellyfin itself failed it", "| /Items | 9 | 6 | 3 | 0 | 0 | 0 |",
+                     "Filed as issues: gl-832.", 'srcset="docs/results/v1.4.0/parity-dark.svg"'):
+            self.assertIn(text, readme)
+        self.assertLess(readme.index("### Adopting an existing"), readme.index("### Answering like Jellyfin"))
+
+    def test_the_parity_graph_sums_the_quiet_areas_into_one_bar(self):
+        areas = [{"area": f"/A{i:02d}", "requests": 30 - i, "identical": 30 - i, "accepted": 0, "filed": 0, "new": 0,
+                  "oracle_failed": 0} for i in range(publish.PARITY_AREAS + 3)]
+        rows = publish.parity_rows(areas)
+        self.assertEqual(len(rows), publish.PARITY_AREAS + 1)
+        self.assertEqual((rows[-1]["area"], rows[-1]["requests"]), ("3 other areas", 18 + 17 + 16))
+
+    def test_an_area_reads_100_percent_alike_only_when_every_compared_request_is(self):
+        parity = {"areas": [{"area": "/Items", "requests": 490, "identical": 151, "accepted": 333, "filed": 0, "new": 1,
+                             "oracle_failed": 5}]}
+        self.assertIn("490  ·  99.7% alike", publish.parity_graph("t", parity, "c", "light"))
+
+    def test_a_session_without_a_parity_result_or_one_that_compared_nothing_is_refused(self):
+        runs = self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)])
+        bare = adoption_session(self.root / "bare", ADOPTION, parity=False)
+        with self.assertRaisesRegex(publish.Refused, "parity has no result.json .*diff.py result --out"):
+            publish.summarise("v1.4.0", runs, str(bare))
+        failed = adoption_session(self.root / "failed", ADOPTION, parity=False)
+        (failed / "parity").mkdir()
+        parity_diff.gate_result().write(str(failed / "parity"), parity_diff.result_doc(
+            {"verdict": "run failed", "reason": "ferrofin did not start", "planned": 0, "requests": []}))
+        with self.assertRaisesRegex(publish.Refused, "did not finish .ferrofin did not start; 0 of 0 requests sent."):
+            publish.summarise("v1.4.0", runs, str(failed))
+        for change, refusal in ((lambda d: d["detail"].update(sent=10), "did not finish .* 10 of 12 requests sent"),
+                                (lambda d: d["source"].update(commit="deadbeef"), "measured deadbeef, the benchmark runs 5112240e"),
+                                (lambda d: d["detail"].update(oracle_version=None), "records no Jellyfin version")):
+            s = adoption_session(self.root / refusal[:6].replace(" ", ""), ADOPTION)
+            doc = json.loads((s / "parity" / "result.json").read_text())
+            change(doc)
+            (s / "parity" / "result.json").write_text(json.dumps(doc))
+            with self.subTest(refusal), self.assertRaisesRegex(publish.Refused, refusal):
+                publish.summarise("v1.4.0", runs, str(s))
 
     def test_an_adoption_session_of_other_or_uncommitted_code_is_refused(self):
         runs = self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)])

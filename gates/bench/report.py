@@ -1832,7 +1832,7 @@ HARNESSES = (("benchmark", "Benchmark", None, None),
 HTML = "text/html; charset=utf-8"
 #: The files that make a directory one of a harness's runs: its report, or (for a gate whose report the
 #: viewer renders on demand) the result.json it is rendered from (gates/result.py).
-RUN_FILES = {"verify": ("report.html", "result.json")}
+RUN_FILES = {"verify": ("report.html", "result.json"), "parity": ("report.html", "result.json")}
 
 
 def run_page(d, harness):
@@ -1878,7 +1878,8 @@ def discover(harness, root):
     A benchmark run is a directory with a `run.json` (it has a `report.html` only once
     `--html` or `run.sh` wrote one; the viewer renders it otherwise). An adoption or parity
     run is a directory holding a `report.html`, a verify run one holding a `report.html` or a
-    `result.json`; `root` itself counts as a run when it holds one, because a harness writes
+    `result.json` (parity too, though its report.html is written with it); `root` itself counts as a
+    run when it holds one, because a harness writes
     its report into its work directory. `root` may be a list of directories (`found_runs`)."""
     if harness == "benchmark":
         return list_runs(root) if root and os.path.isdir(root) else []
@@ -2030,6 +2031,32 @@ def verify_report(run, name):
         return (400 if isinstance(ex, ValueError) else 500), error_html(name, ex)
 
 
+def parity_overview(run, name):
+    """A parity run's overview rendered now from its result.json alone (the full report.html is written
+    with results.json): each outcome counted overall and by API area."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        spec = importlib.util.spec_from_file_location("gates_publish", os.path.join(here, "..", "publish.py"))
+        publish = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(publish)
+        doc = publish.result.read(run, "parity")
+        if doc is None:
+            raise ValueError("result.json is gone")
+        d, e = doc["detail"], html.escape
+        rows = "".join(f"<tr><th>{e(a['area'])}</th><td class='num'>{a['requests']}</td>"
+                       + "".join(f"<td class='num'>{a.get(k, 0)}</td>" for k in publish.PARITY_OUTCOMES) + "</tr>"
+                       for a in d.get("areas", []))
+        counts = " · ".join(f"{doc['counts'].get(k, 0)} {e(label)}" for k, label in publish.PARITY_OUTCOMES.items())
+        body = (f"<h1>Parity {e(name)}</h1><p class='lede'>{e(doc['verdict'])}: {e(d.get('reason', ''))} — {d.get('sent', 0)} of "
+                f"{d.get('planned', 0)} requests against Jellyfin {e(str(d.get('oracle_version') or 'of an unrecorded version'))}: {counts}. Rendered from "
+                "result.json; the full report is written with results.json.</p><div class='scroll'><table><thead><tr><th>Area</th>"
+                "<th>Requests</th><th>Identical</th><th>Accepted</th><th>Filed</th><th>New</th><th>Not compared</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table></div>")
+        return 200, page_html(f"Parity {name}", body)
+    except Exception as ex:
+        return (400 if isinstance(ex, ValueError) else 500), error_html(name, ex)
+
+
 def handle(target, roots):
     """`(status, content type, body bytes)` for a request path and query.
 
@@ -2055,7 +2082,8 @@ def handle(target, roots):
             return reply(404, page_html("Not found", "<h1>No such run</h1>"))
         page = run_page(d, harness)
         if page.endswith("result.json"):
-            return reply(*verify_report(os.path.dirname(page), name))
+            render = verify_report if harness == "verify" else parity_overview
+            return reply(*render(os.path.dirname(page), name))
         with open(page, "rb") as f:
             return 200, HTML, f.read()
     harness = "benchmark" if path == "/" else parts[0]

@@ -21,6 +21,7 @@ adoption_report = report.gate_module("adoption/adoption_report.py")
 verify_report = report.gate_module("verify/verify_report.py")
 bench_report = report.gate_module("bench/report.py")
 bench_gate = report.gate_module("bench/gate.py")
+parity_diff = report.gate_module("parity/diff.py")
 TAG = "0123456789abcdef0123456789abcdef"   # an image tag, as a key in an item's ImageBlurHashes
 
 
@@ -61,6 +62,11 @@ class SessionReportTests(unittest.TestCase):
             "bench", verdict, counts, {"image": "ferrofin:v9"}, None, "2026-10-24T13:00:00+00:00",
             {"servers": {k: k.title() for k in phases}}))
 
+    def parity_run(self, d, summary):
+        """What gates/parity/diff.py writes for a run's results.json `summary`: results.json and its result.json."""
+        self.write(d / "results.json", summary)
+        parity_diff.gate_result().write(str(d), parity_diff.result_doc(summary))
+
     def ab_session(self, d, verdicts, blocking):
         """What gate.py ab leaves: the session's result.json, from gate.py's own session_result."""
         plan = {"mode": "ab", "name": "gate", "date": "2026-10-24T12:00:00+00:00",
@@ -92,13 +98,13 @@ class SessionReportTests(unittest.TestCase):
         self.write(s / "verify/scan-behaviour-movies.txt", "rows\n")
         self.adoption_run(s / "adoption", [("a", "PASS", False), ("b", "PASS", False), ("c", "SKIP", False)])
         self.write(s / "adoption/report.html", "<p>adoption</p>")
-        self.write(s / "parity/results.json", {"verdict": "new differences", "reason": "2 requests differ", "planned": 40,
-                                               "requests": [{}] * 38})
-        self.write(s / "parity/new-differences.json", {"requests": [
-            {"differences": [{"path": f"ImageBlurHashes.Primary.{TAG}", "kind": "value", "filed": None},
-                             {"path": "B", "kind": "missing", "filed": None}]},
-            {"differences": [{"path": f"ImageBlurHashes.Primary.{'f' * 32}", "kind": "value", "filed": None},
-                             {"path": "C", "kind": "value", "filed": "gl-1"}]}]})
+        new = lambda path, kind, filed=None: {"path": path, "kind": kind, "ledger": None, "filed": filed}
+        self.parity_run(s / "parity", {"verdict": "new differences", "reason": "2 requests differ", "planned": 40, "requests": [
+            {"target": "/Items/1", "state": "differences",
+             "differences": [new(f"ImageBlurHashes.Primary.{TAG}", "value"), new("B", "missing")]},
+            {"target": "/Items/2", "state": "differences",
+             "differences": [new(f"ImageBlurHashes.Primary.{'f' * 32}", "value"), new("C", "value", "gl-1")]},
+            *[{"target": "/Users/x", "state": "match", "differences": []}] * 36]})
         self.write(s / "parity/report.html", "<p>parity</p>")
         self.bench_run(s / "bench", {"ferrofin": {"counts": {"status": "completed"}, "loaded": {"status": "failed"},
                                                   "ttfs": {"status": "skipped"}}, "jellyfin": {}})
@@ -199,6 +205,21 @@ class SessionReportTests(unittest.TestCase):
         self.write(s / "bench/result.json", doc)
         self.assertNotIn("Benchmark against Jellyfin", Path(report.write(str(s))).read_text(encoding="utf-8"))
 
+    def test_a_parity_session_shows_the_readme_parity_overview(self):
+        from test_publish import parity_requests
+        s = self.session(["parity"], {"parity": ("failed", 1)})
+        self.parity_run(s / "parity", {"verdict": "new differences", "reason": "1 new", "planned": 12,
+                                       "requests": parity_requests(), "run": {"oracle": {"version": "12.2.0"}}})
+        page = Path(report.write(str(s))).read_text(encoding="utf-8")
+        self.assertIn("<h2>Parity</h2>", page)
+        self.assertEqual(page.count("<div class='graph light'><svg"), 1)
+        self.assertIn("Answering jellyfin-web like Jellyfin 12.2.0", page)
+        self.assertIn("Ferrofin (commit c0ffee12) against Jellyfin 12.2.0", page)
+        self.parity_run(s / "parity", {"verdict": "run failed", "reason": "ferrofin did not start", "planned": 0, "requests": []})
+        page = Path(report.write(str(s))).read_text(encoding="utf-8")
+        self.assertNotIn("<h2>Parity</h2>", page)   # nothing compared: the gate's row says why, no graph and no error
+        self.assertNotIn("could not be drawn", page)
+
     def test_an_adoption_session_shows_the_readme_adoption_grid(self):
         s = self.session(["adoption"], {"adoption": ("failed", 1)})
         self.adoption_run(s / "adoption", [("jellyfin-12.2-fresh", "PASS", False), ("jellyfin-10.11.11-messy", "PASS", True)])
@@ -236,7 +257,7 @@ class SessionReportTests(unittest.TestCase):
 
     def test_missing_corrupt_and_misshapen_results_are_shown_as_such(self):
         s = self.session(report.GATES, {g: ("failed", 1) for g in report.GATES})
-        self.write(s / "parity/results.json", "{not json")
+        self.write(s / "parity/result.json", "{not json")
         self.verify_run(s / "verify", {"exit": 3, "libraries": {"movies": None, "tvshows": None}})
         self.bench_run(s / "bench", {})
         doc = json.loads((s / "bench/result.json").read_text())
@@ -247,11 +268,13 @@ class SessionReportTests(unittest.TestCase):
                                               "(the run's exit 3, see the log)"))
         self.assertEqual(rows["adoption"]["problem"], "no result.json: the gate ended before it recorded anything; "
                                                       "no report.html: the gate ended before writing its report")
-        self.assertIn("results.json cannot be read", rows["parity"]["problem"])
+        self.assertIn("result.json cannot be read", rows["parity"]["problem"])
         self.assertIn("its result is not shaped as expected (TypeError", rows["bench"]["problem"])
-        self.write(s / "parity/results.json", {"verdict": "pass", "planned": 1, "requests": [{}]})
+        (s / "parity/result.json").unlink()
+        self.write(s / "parity/results.json", {"verdict": "pass", "planned": 1, "requests": []})
         self.assertEqual(self.rows(s)["parity"]["problem"],
-                         "no new-differences.json: its counts are unknown; no report.html: the gate ended before writing its report")
+                         "no result.json: a run from before parity wrote one (python3 gates/parity/diff.py result --out DIR "
+                         "writes it); no report.html: the gate ended before writing its report")
 
     def test_a_running_gate_one_not_reached_and_one_never_started_are_shown(self):
         s = self.session(["verify", "adoption", "bench"], {})
@@ -307,7 +330,7 @@ class SessionReportTests(unittest.TestCase):
 
     def test_a_page_on_disk_is_linked_even_when_the_result_beside_it_cannot_be_read(self):
         s = self.session(["parity"], {"parity": ("failed", 1)})
-        self.write(s / "parity/results.json", "{cut")
+        self.write(s / "parity/result.json", "{cut")
         self.write(s / "parity/report.html", "<p>parity</p>")
         row = self.rows(s)["parity"]
         self.assertEqual(row["links"], [("parity report", "parity/report.html"), ("log", "parity.log")])
@@ -321,8 +344,7 @@ class SessionReportTests(unittest.TestCase):
 
     def test_free_text_is_escaped_in_the_page_and_kept_in_its_markdown_cell(self):
         s = self.session(["parity"], {"parity": ("failed", 1)})
-        self.write(s / "parity/results.json", {"verdict": "run failed", "reason": "<b>a | b\nc</b>", "planned": 0})
-        self.write(s / "parity/new-differences.json", {"requests": []})
+        self.parity_run(s / "parity", {"verdict": "run failed", "reason": "<b>a | b\nc</b>", "planned": 0, "requests": []})
         self.write(s / "parity/report.html", "<p>parity</p>")
         page = Path(report.write(str(s))).read_text(encoding="utf-8")
         self.assertIn("run failed: &lt;b&gt;a | b\nc&lt;/b&gt;", page)

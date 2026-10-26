@@ -112,18 +112,17 @@ def adoption(d, record):
 
 
 def parity(d, record):
-    results = read_json(os.path.join(d, "results.json"))
-    if results is None:
-        return found(problems=["no results.json: the gate ended before its comparison finished"], bad=True)
-    new = read_json(os.path.join(d, "new-differences.json"))
-    differences = [diff for r in (new or {}).get("requests", []) for diff in r.get("differences", [])]
-    tag_path = gate_module("parity/diff.py").tag_path   # the groups `diff.py findings` files issues by
-    unfiled = {(tag_path(diff.get("path", "")), diff.get("kind")) for diff in differences if not diff.get("filed")}
-    verdict = results.get("verdict", "?")
-    return found(verdict + (f": {results['reason']}" if results.get("reason") else ""),
-                 [("new differences", len(differences)), ("groups not filed", len(unfiled)),
-                  ("requests sent", len(results.get("requests") or [])), ("planned", results.get("planned", 0))],
-                 [new is None and "no new-differences.json: its counts are unknown"], bad=verdict != "pass")
+    result = gate_result(d, "parity")
+    if result is None and os.path.exists(os.path.join(d, "results.json")):
+        return found(problems=["no result.json: a run from before parity wrote one (python3 gates/parity/diff.py "
+                               "result --out DIR writes it)"], bad=True)
+    if result is None:
+        return found(problems=["no result.json: the gate ended before its comparison finished"], bad=True)
+    detail = result["detail"]
+    return found(result["verdict"] + (f": {detail['reason']}" if detail.get("reason") else ""),
+                 [("new differences", detail.get("new_differences", 0)), ("groups not filed", detail.get("unfiled_groups", 0)),
+                  ("requests sent", detail.get("sent", 0)), ("planned", detail.get("planned", 0))],
+                 bad=result["verdict"] != "pass")
 
 
 def bench(d, record):
@@ -276,9 +275,22 @@ def css():
 
 
 def summary_graphs(session, record):
-    """The README's graphs for this session's results (gates/publish.py), inline: its adoption status and
-    its benchmark run's speed and memory."""
-    return adoption_graph(session, record) + bench_graphs(session, record)
+    """The README's graphs for this session's results (gates/publish.py), inline: its adoption status, its
+    parity overview and its benchmark run's speed and memory."""
+    return adoption_graph(session, record) + parity_graph(session, record) + bench_graphs(session, record)
+
+
+def parity_graph(session, record):
+    """The README's parity overview for the session's parity result; empty when parity did not run or
+    left no result, a note when it cannot be drawn."""
+    if (record.get("gates", {}).get("parity") or {}).get("status") in (None, "pending", "skipped") \
+            or not os.path.isfile(os.path.join(session, "parity", "result.json")):
+        return ""
+    try:
+        graph = gate_module("publish.py").session_parity_graph(session, record.get("commit") or "")
+    except Exception as error:  # noqa: BLE001 — the page is written whatever the result holds
+        return f"<p class='problem'>The parity overview could not be drawn ({html.escape(type(error).__name__)}: {html.escape(str(error))}).</p>"
+    return f"<h2>Parity</h2>{graph}" if graph else ""
 
 
 def adoption_graph(session, record):

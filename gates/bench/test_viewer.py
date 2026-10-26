@@ -120,6 +120,22 @@ class ViewerTests(unittest.TestCase):
         (self.verify / 'verify-1' / 'report.html').write_text('<p>static</p>')
         self.assertEqual(self.get('/report/verify/verify-1')[2], '<p>static</p>')
 
+    def test_a_parity_run_with_only_its_result_is_listed_and_shows_its_overview(self):
+        run = self.parity / 'parity-20261026-0107'
+        run.mkdir(parents=True)
+        (run / 'result.json').write_text(json.dumps(report.gate_result().envelope(
+            'parity', 'new differences', {'identical': 5, 'accepted': 1, 'filed': 0, 'new': 1, 'oracle_failed': 0},
+            {'image': 'ferrofin:x'}, None, None,
+            {'reason': '1 new difference', 'planned': 7, 'sent': 7, 'oracle_version': '12.2.0',
+             'areas': [{'area': '/Items', 'requests': 7, 'identical': 5, 'accepted': 1, 'filed': 0, 'new': 1, 'oracle_failed': 0}]})))
+        self.assertIn('parity-20261026-0107', {n for n, _ in report.discover('parity', str(self.parity))})
+        status, _, page = self.get('/report/parity/parity-20261026-0107')
+        self.assertEqual(status, 200)
+        for text in ('Parity parity-20261026-0107', '5 identical', 'against Jellyfin 12.2.0', '<th>/Items</th>'):
+            self.assertIn(text, page)
+        (run / 'report.html').write_text('<p>the full report</p>')   # the full page wins when it is there
+        self.assertEqual(self.get('/report/parity/parity-20261026-0107')[2], '<p>the full report</p>')
+
     def test_an_invalid_verify_result_is_a_readable_error(self):
         (self.verify / 'verify-1').mkdir(parents=True)
         (self.verify / 'verify-1' / 'result.json').write_text('{"schema": 1}')

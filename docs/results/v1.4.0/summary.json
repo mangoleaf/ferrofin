@@ -1527,6 +1527,580 @@
    }
   ]
  },
+ "parity": {
+  "areas": [
+   {
+    "accepted": 333,
+    "area": "/Items",
+    "filed": 0,
+    "identical": 151,
+    "new": 1,
+    "oracle_failed": 5,
+    "requests": 490
+   },
+   {
+    "accepted": 1,
+    "area": "/Artists",
+    "filed": 0,
+    "identical": 407,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 408
+   },
+   {
+    "accepted": 249,
+    "area": "/Shows",
+    "filed": 0,
+    "identical": 76,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 325
+   },
+   {
+    "accepted": 132,
+    "area": "/Genres",
+    "filed": 0,
+    "identical": 55,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 187
+   },
+   {
+    "accepted": 127,
+    "area": "/MusicGenres",
+    "filed": 0,
+    "identical": 60,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 187
+   },
+   {
+    "accepted": 115,
+    "area": "/UserItems",
+    "filed": 0,
+    "identical": 42,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 157
+   },
+   {
+    "accepted": 5,
+    "area": "/Studios",
+    "filed": 0,
+    "identical": 150,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 155
+   },
+   {
+    "accepted": 5,
+    "area": "/Persons",
+    "filed": 0,
+    "identical": 80,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 85
+   },
+   {
+    "accepted": 16,
+    "area": "/LiveTv",
+    "filed": 0,
+    "identical": 19,
+    "new": 0,
+    "oracle_failed": 6,
+    "requests": 41
+   },
+   {
+    "accepted": 12,
+    "area": "/Users",
+    "filed": 0,
+    "identical": 20,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 32
+   },
+   {
+    "accepted": 0,
+    "area": "/Sessions",
+    "filed": 0,
+    "identical": 20,
+    "new": 11,
+    "oracle_failed": 0,
+    "requests": 31
+   },
+   {
+    "accepted": 5,
+    "area": "/Videos",
+    "filed": 2,
+    "identical": 12,
+    "new": 0,
+    "oracle_failed": 4,
+    "requests": 23
+   },
+   {
+    "accepted": 1,
+    "area": "/SyncPlay",
+    "filed": 0,
+    "identical": 21,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 22
+   },
+   {
+    "accepted": 1,
+    "area": "/Playlists",
+    "filed": 0,
+    "identical": 18,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 19
+   },
+   {
+    "accepted": 4,
+    "area": "/Audio",
+    "filed": 0,
+    "identical": 10,
+    "new": 0,
+    "oracle_failed": 3,
+    "requests": 17
+   },
+   {
+    "accepted": 2,
+    "area": "/Library",
+    "filed": 0,
+    "identical": 15,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 17
+   },
+   {
+    "accepted": 5,
+    "area": "/System",
+    "filed": 0,
+    "identical": 12,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 17
+   },
+   {
+    "accepted": 9,
+    "area": "/Plugins",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 9
+   },
+   {
+    "accepted": 0,
+    "area": "/Intros",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 8,
+    "requests": 8
+   },
+   {
+    "accepted": 0,
+    "area": "/Auth",
+    "filed": 0,
+    "identical": 7,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 7
+   },
+   {
+    "accepted": 1,
+    "area": "/Startup",
+    "filed": 0,
+    "identical": 6,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 7
+   },
+   {
+    "accepted": 1,
+    "area": "/Branding",
+    "filed": 0,
+    "identical": 5,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 6
+   },
+   {
+    "accepted": 0,
+    "area": "/Collections",
+    "filed": 0,
+    "identical": 6,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 6
+   },
+   {
+    "accepted": 0,
+    "area": "/Environment",
+    "filed": 0,
+    "identical": 5,
+    "new": 0,
+    "oracle_failed": 1,
+    "requests": 6
+   },
+   {
+    "accepted": 1,
+    "area": "/ScheduledTasks",
+    "filed": 0,
+    "identical": 4,
+    "new": 0,
+    "oracle_failed": 1,
+    "requests": 6
+   },
+   {
+    "accepted": 2,
+    "area": "/Channels",
+    "filed": 0,
+    "identical": 3,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 5
+   },
+   {
+    "accepted": 1,
+    "area": "/Devices",
+    "filed": 0,
+    "identical": 4,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 5
+   },
+   {
+    "accepted": 3,
+    "area": "/Backup",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 0,
+    "area": "/Localization",
+    "filed": 0,
+    "identical": 4,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 0,
+    "area": "/MergeVersions",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 4,
+    "requests": 4
+   },
+   {
+    "accepted": 3,
+    "area": "/Packages",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 2,
+    "area": "/QuickConnect",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 2,
+    "area": "/UserImage",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 4
+   },
+   {
+    "accepted": 0,
+    "area": "/Episode",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 3,
+    "requests": 3
+   },
+   {
+    "accepted": 0,
+    "area": "/MediaSegmentsApi",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 3,
+    "requests": 3
+   },
+   {
+    "accepted": 0,
+    "area": "/PlayingItems",
+    "filed": 0,
+    "identical": 3,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 3
+   },
+   {
+    "accepted": 2,
+    "area": "/UserViews",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 3
+   },
+   {
+    "accepted": 0,
+    "area": "/Albums",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/DisplayPreferences",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/FallbackFont",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/IntroSkipper",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 2,
+    "requests": 2
+   },
+   {
+    "accepted": 1,
+    "area": "/LiveStreams",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/MediaSegments",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 1,
+    "area": "/Movies",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 1,
+    "area": "/Providers",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 1,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/Repositories",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/SkipButtonCss",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 2,
+    "requests": 2
+   },
+   {
+    "accepted": 1,
+    "area": "/Trailers",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 1,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/UserFavoriteItems",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/UserPlayedItems",
+    "filed": 0,
+    "identical": 2,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 2,
+    "area": "/Years",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 2,
+    "area": "/web",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 2
+   },
+   {
+    "accepted": 0,
+    "area": "/ClientLog",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/FileTransformation",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 1,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/GetUtcTime",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/Jellyfin.Plugin.OpenSubtitles",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 1,
+    "requests": 1
+   },
+   {
+    "accepted": 1,
+    "area": "/Libraries",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 1,
+    "area": "/Playback",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 1,
+    "area": "/Search",
+    "filed": 0,
+    "identical": 0,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/Songs",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 1
+   },
+   {
+    "accepted": 0,
+    "area": "/Tmdb",
+    "filed": 0,
+    "identical": 1,
+    "new": 0,
+    "oracle_failed": 0,
+    "requests": 1
+   }
+  ],
+  "counts": {
+   "accepted": 1051,
+   "filed": 2,
+   "identical": 1242,
+   "new": 12,
+   "oracle_failed": 46
+  },
+  "filed_issues": [
+   832,
+   860
+  ],
+  "new_differences": 60,
+  "planned": 2353,
+  "sent": 2353,
+  "source": {
+   "commit": "5112240e",
+   "date": "2026-10-26",
+   "oracle": "Jellyfin 12.2.0",
+   "session": "detached-5112240e1923-20261026-0101"
+  },
+  "verdict": "new differences"
+ },
  "schema": 1,
  "version": "v1.4.0"
 }

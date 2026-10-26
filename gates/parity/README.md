@@ -69,9 +69,18 @@ release is noted and recorded with the oracle in `run.json`, never refused, on `
    then the write to both, compares the answers, then sends the write's read-backs and compares them like any
    read. A server that does not come back fails the run, naming it (`<server>/reset.log` keeps what docker said). The report
    shows each write's reset time, and the resets count against the cap like everything else.
-4. **Report and tear down.** `report.html`, `results.json` and `new-differences.json` are written, both containers are removed and
-   their logs saved. **A run that ends any way at all leaves a report**: a server that did not boot, the cap,
-   a signal.
+4. **Report and tear down.** `report.html`, `results.json`, `new-differences.json` and `result.json` are written, both
+   containers are removed and their logs saved. **A run that ends any way at all leaves a report**: a server that did not
+   boot, the cap, a signal.
+
+`result.json` is the run's overview in the envelope every gate shares ([`gates/result.py`](../result.py)): each
+request's outcome counted overall and by API area (the path's first segment: `/Items`, `/Users`, `/Shows` …):
+**identical**, **accepted** (every difference is in the ledger), **filed** (every difference the ledger does not
+accept is filed as an issue), **new**, or **oracle failed** (Jellyfin did not answer as expected, so nothing was
+compared, and it is never counted identical). It also holds the new differences, the groups of them not filed yet,
+the issues filed and the Jellyfin version. The gates session page, the viewer and the README's parity overview
+(`gates/publish.py`) read it. `python3 gates/parity/diff.py result --out DIR` writes it again for a run from before
+it existed.
 
 The run is bounded by `PARITY_CAP_S` (at most 7200, two hours, the owner's limit and the default), counted from
 the start, boot included. Each boot step has its own short bound (`READY_TIMEOUT_S`, `DRAIN_TIMEOUT_S`, ...), the cap
