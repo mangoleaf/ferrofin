@@ -158,6 +158,81 @@ class ReportTests(unittest.TestCase):
         rows = dict(dict(report.cpu_tables(model))['CPU per screen comparison (validated workloads only)'])
         self.assertEqual(rows[key]['ferrofin'], 'withheld — validation flags')
 
+    def test_result_json_holds_the_numbers_report_md_prints(self):
+        page = report.write_html(str(self.a))
+        self.assertTrue(Path(page).is_file())
+        doc = report.gate_result().read(str(self.a), 'bench')   # a valid envelope, the benchmark's
+        self.assertEqual((doc['verdict'], doc['source']['commit'], doc['source']['image'], doc['source']['image_digest']),
+                         ('measured', 'abc', 'ferrofin:bench', 'sha256:ferrofin'))
+        self.assertEqual(set(doc['source']['host_class']), {'cores', 'memory_gib'})
+        self.assertIsNone(doc['ended'])   # the fixture records no phases: when it ended is unknown, not "now"
+        self.write(self.a / 'ferrofin/phases.json', {'loaded': {'status': 'completed', 'start': 1792915910, 'end': 1792916735.8}})
+        self.assertEqual(report.run_result(self.build())['ended'], '2026-10-25T08:25:35+00:00')
+        md = report.render_md(self.build()).splitlines()
+        line = lambda label: next(l for l in md if l.startswith(f'| {label} |'))
+        loaded = doc['detail']['levels']['loaded']
+        self.assertEqual([r['name'] for r in loaded['screens']], report.SCREENS)
+        for r in loaded['screens']:
+            for server in ('jellyfin', 'ferrofin'):
+                c = r['servers'][server]
+                self.assertIn(f"{report.n0(c['median'])} / {report.n0(c['p95'])} / {report.n0(c['p99'])}", line(r['name']))
+            self.assertEqual(r['ratio'], 2.0)
+            self.assertIn('2.0× faster', line(r['name']))
+            self.assertIsNone(r['withheld'])
+        for group, fmt in (('ttfs', report.ms), ('memory', report.mib)):
+            for r in doc['detail'][group]:
+                self.assertIn(fmt(r['servers']['ferrofin']['median']), line(r['name']))
+        self.assertEqual([r['name'] for r in doc['detail']['memory']], list(report.README_MEMORY))
+        self.assertEqual(doc['detail']['oracle_label'], 'Jellyfin 12.2')
+
+    def test_result_json_withholds_a_cell_the_servers_answered_differently(self):
+        path = self.a / 'ferrofin/shape.log'
+        records = [json.loads(json.loads(line)['msg']) for line in path.read_text().splitlines()]
+        next(r for r in records if r['shape'] == 'home:items')['count'] = 2
+        self.shapes(path.parent, records)
+        doc = report.run_result(self.build())
+        home = next(r for r in doc['detail']['levels']['loaded']['screens'] if r['name'] == 'home')
+        self.assertIsNone(home['ratio'])
+        self.assertTrue(home['withheld'].startswith('Ferrofin: '))
+        self.assertIsNotNone(home['servers']['ferrofin']['flag'])
+        self.assertIn('— ⚠', self.row(self.readme()))   # the README withholds the same cell
+        movies = next(r for r in doc['detail']['levels']['loaded']['screens'] if r['name'] == 'movies')
+        self.assertEqual((movies['ratio'], movies['withheld']), (2.0, None))
+
+    def test_result_json_has_cpu_per_screen_where_the_work_matched(self):
+        model = self.build()
+        for server, _ in model['servers']:
+            model['resources'][server] = [{'loaded': {'cpu_seconds': 24 if server == 'jellyfin' else 12,
+                                                      'observed_start': 1000, 'observed_end': 1120, 'samples': 1202}}]
+        cpu = report.run_result(model)['detail']['cpu_per_screen']
+        self.assertEqual([r['name'] for r in cpu], ['loaded'])
+        self.assertEqual((cpu[0]['servers']['jellyfin']['median'], cpu[0]['servers']['ferrofin']['median'], cpu[0]['ratio']),
+                         (40.0, 20.0, 2.0))   # ms per completed screen, as the CPU table prints it
+        model['levels']['loaded']['screens'][0][1]['ferrofin'].flag = 'different work'
+        cpu = report.run_result(model)['detail']['cpu_per_screen']
+        self.assertEqual((cpu[0]['ratio'], cpu[0]['withheld']), (None, 'Ferrofin: different work'))
+
+    def test_phase_states_give_the_result_its_verdict(self):
+        for phases, verdict in (({'loaded': {'status': 'completed'}}, 'measured'),
+                                ({'loaded': {'status': 'completed'}, 'stress': {'status': 'failed'}}, 'failed'),
+                                ({'loaded': {'status': 'running'}}, 'incomplete')):
+            with self.subTest(verdict):
+                self.assertEqual(report.phase_verdict({'phases': {'ferrofin': [phases]}, 'meta': {}})[0], verdict)
+        self.assertEqual(report.phase_verdict({'phases': {'ferrofin': [{'a': {'status': 'skipped'}}]}, 'meta': {}}),
+                         ('measured', {'completed': 0, 'failed': 0, 'unfinished': 0, 'skipped': 1}))
+        # a server whose run recorded no phases.json at all did not finish either, unless the run predates them
+        unrecorded = {'phases': {'ferrofin': [{'a': {'status': 'completed'}}], 'jellyfin': [None]}}
+        self.assertEqual(report.phase_verdict({**unrecorded, 'meta': {'phase_schema': 1}})[0], 'incomplete')
+        self.assertEqual(report.phase_verdict({**unrecorded, 'meta': {}})[0], 'measured')
+
+    def test_result_json_of_a_ferrofin_only_run_compares_with_nothing(self):
+        shutil.rmtree(self.a / 'jellyfin')
+        doc = report.run_result(self.build())
+        self.assertEqual((list(doc['detail']['servers']), doc['detail']['oracle_label'], doc['source']['oracle']),
+                         (['ferrofin'], None, None))
+        home = doc['detail']['levels']['loaded']['screens'][0]
+        self.assertEqual((home['servers']['ferrofin']['median'], home['ratio']), (10, None))
+
     def test_cpu_table_retains_failed_sampler_and_escapes_reason(self):
         model = self.build()
         model['resources']['ferrofin'] = [{'loaded': {'cpu_seconds': 0.0, 'samples': 2}}]
@@ -1371,6 +1446,12 @@ class GateTests(unittest.TestCase):
         page = (out / 'report.html').read_text()
         self.assertIn("class='delta bad'>regressed", page)
         self.assertEqual(json.loads((out / 'verdict.json').read_text())['blocking'], block)
+        result = report.gate_result().read(str(out), 'bench')   # the session's result.json, a valid envelope
+        self.assertEqual((result['verdict'], result['detail']['mode'], result['detail']['blocking'], result['source']['image']),
+                         ('blocked', 'ab', block, 'new'))
+        home = result['detail']['verdicts']['loaded/screens/home']
+        self.assertEqual((home['a_median'], home['b_median'], home['verdict'], home['gated']), (10, 20, 'regressed', True))
+        self.assertGreaterEqual(result['counts']['regressed'], 1)
         aa = self.session('aa', [10, 10, 10, 10, 10, 10])
         md, block = gate.render(str(aa))
         self.assertEqual(block, [])
@@ -1378,6 +1459,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(noise['proposed_cells'], {})
         self.assertEqual({r['verdict'] for r in noise['false_alarms'].values()}, {'within noise'})
         self.assertIn('Noise per cell', (aa / 'report.html').read_text())
+        self.assertEqual(report.gate_result().read(str(aa), 'bench')['verdict'], 'measured')
 
     def viewer(self, target):
         status, _, body = report.handle(target, {'benchmark': str(self.root), 'adoption': None, 'parity': None})

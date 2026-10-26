@@ -188,6 +188,42 @@ class ViewerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn('Ferrofin vs Jellyfin', page)
 
+    def test_a_benchmark_run_with_a_result_is_labelled_and_rendered_from_it(self):
+        report.gate_result().write(str(self.bench / 'a'), report.run_result(report.build([str(self.bench / 'a')])))
+        doc = json.loads((self.bench / 'a' / 'result.json').read_text())
+        doc['source']['commit'] = 'f00dfeed'   # the label follows result.json, not run.json's sha
+        (self.bench / 'a' / 'result.json').write_text(json.dumps(doc))
+        labels = dict(report.discover('benchmark', str(self.bench)))
+        self.assertIn('f00dfeed', labels['a'])
+        self.assertIn('abc', labels['b'])   # a run with no result.json keeps its run.json label
+        status, _, page = self.get('/report/benchmark/a')
+        self.assertEqual(status, 200)
+        for text in ('rendered from result.json', 'loaded · screens', 'home', '2.0×', 'Time to first screen', 'Memory',
+                     'CPU per completed screen', 'Jellyfin 12.2'):
+            self.assertIn(text, page)
+        self.assertNotRegex(page, r"(src|href)=['\"]https?://")
+        (self.bench / 'a' / 'result.json').write_text('{"schema": 1}')   # an invalid one: rendered from the run instead
+        self.assertIn('Ferrofin vs Jellyfin', self.get('/report/benchmark/a')[2])
+
+    def test_a_gate_session_result_lists_its_verdict_and_renders_its_cells(self):
+        session = self.bench / 'gate-ab'
+        session.mkdir()
+        (session / 'gate.json').write_text(json.dumps({'mode': 'ab', 'date': '2026-10-24T12:00:00+00:00'}))
+        (session / 'report.html').write_text('<p>gate</p>')
+        doc = report.gate_result().envelope('bench', 'blocked', {'regressed': 1}, {'image': 'new', 'commit': 'abc'},
+                                            '2026-10-24T12:00:00+00:00', None,
+                                            {'mode': 'ab', 'verdicts': {'loaded/screens/home': {
+                                                'verdict': 'regressed', 'a_median': 10, 'b_median': 20, 'pct': 100.0, 'gated': True}},
+                                             'blocking': ['loaded/screens/home']})
+        report.gate_result().write(str(session), doc)
+        self.assertIn('gate ab  ·  blocked', dict(report.discover('benchmark', str(self.bench)))['gate-ab'])
+        self.assertIn('+100.0%', report.result_page(doc, 'gate-ab'))
+        aa = {**doc, 'detail': {'mode': 'aa', 'verdicts': {}, 'blocking': []}}
+        self.assertIn('No verdict cells: a aa session judges none', report.result_page(aa, 'gate-aa'))
+        broken = {**doc, 'detail': {**doc['detail'], 'verdicts': {'x': {'verdict': 'improved', 'pct': 'n/a', 'a_median': 'x'}}}}
+        self.assertIn('<td class=\'num\'>—</td>', report.result_page(broken, 'gate-ab'))   # a hand-edited value, not a 500
+        self.assertIn("class='verdict regressed'", report.result_page(doc, 'gate-ab'))
+
     def test_benchmark_static_report_wins_over_rendering(self):
         self.report_html(self.bench, 'a', '<p>static a</p>')
         self.assertEqual(self.get('/report/benchmark/a')[2], '<p>static a</p>')

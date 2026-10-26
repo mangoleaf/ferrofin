@@ -74,7 +74,7 @@ It shows the commit, images and oracle pin, and one row per gate, every gate inc
 | verify | checks passed, failed and skipped, over both libraries, from its `result.json` | the verify report; each library's rows, `result.json`, `verify.json` and the server log |
 | adoption | fixture rows passed, failed, unfinished and skipped, by the adoption report's own rules | the adoption report |
 | parity | new differences, the groups of them not filed yet, requests sent and planned; the verdict and its reason | the parity report |
-| bench | phases completed, failed, unfinished and skipped; for the A/B gate (`--previous`), the gated cells regressed, not comparable, improved and within noise, and whether anything blocks | the benchmark or A/B gate report |
+| bench | from its `result.json`: phases completed, failed, unfinished and skipped; for the A/B gate (`--previous`), the gated cells regressed, not comparable, improved and within noise, and whether anything blocks | the benchmark or A/B gate report |
 
 A gate the session did not ask for, did not reach, is still running, ended before writing its result,
 or left a result that cannot be read is shown as such, never left out. Each gate's own report is its
@@ -85,4 +85,4 @@ Every gate is moving to one structured result, `<run>/result.json`, in the envel
 [`result.py`](result.py) defines and validates: `schema`, `gate`, `verdict`, `counts`, `source`
 (`commit`, `image`, `image_digest`, `oracle`, `host_class` (cores and memory, never a host name),
 `fixture`), `started`, `ended`, and `detail`, the gate's own data. Its HTML report, this page and the
-viewer read that file, never the gate's internal files. verify writes one today.
+viewer read that file, never the gate's internal files. verify and bench write one today.
