@@ -376,10 +376,16 @@ recorder's own messages go to `/dev/null` there, so they never change what a run
 stdout is a terminal, `run.sh` also prints the page's path at the end: the one line of stdout
 recording adds, and only on a terminal.
 
+`result.json` is written beside the page from the same reading of the run, in the envelope every gate
+shares ([`gates/result.py`](../result.py)): the verdict, the rows counted (passed, failed, unfinished,
+skipped), and per fixture its kind, expected generation, verdict, reason, every check and the scale
+measurements. The table differences and the messy shapes stay in the page. The gates session page and
+the release summary (`gates/publish.py`, the README's adoption grid) read it.
+
 The shared viewer lists it in its Adoption tab and compares two runs side by side:
 
 ```bash
-python3 gates/bench/report.py --serve      # run.sh's page as `adoption` ($FERROFIN_GATES_DIR/work); the matrix: --adoption-dir DIR/work
+python3 gates/bench/report.py --serve      # run.sh's page as `adoption` ($FERROFIN_GATES_DIR/work) and every session's; the matrix: --adoption-dir DIR/work
 ```
 
 The `Adoption` workflow uploads the two pages as the `adoption-report` (`run.sh`) and

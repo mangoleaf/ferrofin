@@ -2,10 +2,11 @@
 """The published results (stdlib only): one summary file per release, and the README Results section
 and its graphs drawn from those files alone.
 
-    publish.py summarise --version vX.Y.Z --bench RUN RUN RUN [--out DIR]
+    publish.py summarise --version vX.Y.Z --bench RUN RUN RUN [--session DIR] [--out DIR]
         DIR/<version>/summary.json (DIR defaults to docs/results) from the result.json of three or more
-        Jellyfin-comparison benchmark runs the operator names: only the numbers the README shows, each
-        with its source. Nothing is picked automatically, and every input is a local run.
+        Jellyfin-comparison benchmark runs the operator names and, with --session, the adoption result of
+        that gates session: only the numbers the README shows, each with its source. Nothing is picked
+        automatically, and every input is a local run.
     publish.py readme [--check] [--results DIR] [--readme README.md]
         draw every graph of the newest DIR/*/summary.json into DIR/<version>/ (a light and a dark SVG
         each) and replace the generated Results block of README.md. The same files give byte-identical
@@ -46,9 +47,11 @@ END = "<!-- END GENERATED RESULTS -->"
 #: neutral grey; a cell where Ferrofin is slower is amber, never hidden.
 STYLE = {
     "light": {"ink": "#1A1E24", "muted": "#5B636E", "grid": "#E1E5EA", "ferrofin": "#2E6E8E",
-              "jellyfin": "#A3ACB7", "slower": "#B7791F", "on_bar": "#FFFFFF"},
+              "jellyfin": "#A3ACB7", "slower": "#B7791F", "on_bar": "#FFFFFF",
+              "PASS": "#2E7D4F", "FAIL": "#A83A2E", "SKIP": "#8A939E", "INCOMPLETE": "#B7791F"},
     "dark": {"ink": "#E7EAEE", "muted": "#9AA3AE", "grid": "#2B323C", "ferrofin": "#6FB3D2",
-             "jellyfin": "#5B636E", "slower": "#E0B25A", "on_bar": "#13161B"},
+             "jellyfin": "#5B636E", "slower": "#E0B25A", "on_bar": "#13161B",
+             "PASS": "#6CC08B", "FAIL": "#E07A6E", "SKIP": "#6B7480", "INCOMPLETE": "#E0B25A"},
 }
 FONT = "system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif"
 WIDTH = 760
@@ -175,7 +178,45 @@ def bench_summary(docs, names, min_runs=MIN_RUNS):
             "cpu_per_screen": combine_rows(docs, lambda d: d["cpu_per_screen"], False)}
 
 
-def summarise(version, bench_runs):
+#: How long a failed adoption row's reason may be in the summary: the full one is in the session's report.
+REASON_CHARS = 200
+ADOPTION_VERDICTS = ("PASS", "FAIL", "SKIP", "INCOMPLETE")
+#: How an adoption verdict reads in the README and its grid.
+VERDICT_WORDS = {"PASS": "passed", "FAIL": "failed", "SKIP": "skipped", "INCOMPLETE": "unfinished"}
+
+
+def adoption_summary(session, bench_commit=None, publishing=True):
+    """The adoption status of a gates session (D4: the release's local session, not CI): every row's
+    fixture, kind, expected generation and verdict (a skipped row stays skipped), the first part of a
+    failure's reason, and the session's commit, image and date. When `publishing`, refused for a session
+    of uncommitted code, or one that measured another commit than the benchmark runs."""
+    record = load(os.path.join(session, "session.json")) if os.path.isfile(os.path.join(session, "session.json")) else None
+    if not isinstance(record, dict):
+        raise Refused(f"{session} is not a gates session (no session.json)")
+    if publishing and record.get("dirty"):
+        raise Refused(f"{session} ran with uncommitted changes: the commit does not identify the code")
+    commit = record.get("commit") or ""
+    if bench_commit and not commit.startswith(str(bench_commit)):
+        raise Refused(f"{session} measured {commit[:12]}, the benchmark runs {bench_commit}")
+    try:
+        doc = result.read(os.path.join(session, "adoption"), "adoption")
+    except ValueError as error:
+        raise Refused(f"{session}/adoption: {error}") from error
+    if doc is None:
+        raise Refused(f"{session}/adoption has no result.json (python3 gates/adoption/adoption_report.py build "
+                      f"{session}/adoption writes it)")
+    if publishing and doc["verdict"] == "nothing ran":
+        raise Refused(f"{session}/adoption ran nothing (every row skipped, or none recorded): there is no status to publish")
+    rows = [{"fixture": r["fixture"], "kind": r["kind"], "expected": r["expected"], "verdict": r["verdict"],
+             "reason": "" if r["verdict"] == "PASS" else str(r.get("detail") or "")[:REASON_CHARS]}
+            for r in doc["detail"]["rows"]]
+    source = {"session": os.path.basename(os.path.normpath(session)), "commit": commit,
+              "image_digest": (record.get("image") or {}).get("id"), "oracle": doc["source"]["oracle"],
+              "date": (record.get("started") or "")[:10] or None}
+    return {"source": source, "verdict": doc["verdict"], "rows": rows}
+
+
+def summarise(version, bench_runs, session=None):
     """The summary file of release `version`."""
     if not re.fullmatch(r"v\d+\.\d+\.\d+", version):
         raise Refused(f"{version!r} is not a release version (vX.Y.Z)")
@@ -184,7 +225,10 @@ def summarise(version, bench_runs):
     docs = bench_results(bench_runs)
     names = [os.path.basename(os.path.normpath(r)) if os.path.basename(os.path.normpath(r)) != "bench"
              else os.path.basename(os.path.dirname(os.path.normpath(r))) + "/bench" for r in bench_runs]
-    return {"schema": SCHEMA, "version": version, "bench": bench_summary(docs, names)}
+    out = {"schema": SCHEMA, "version": version, "bench": bench_summary(docs, names)}
+    if session:
+        out["adoption"] = adoption_summary(session, out["bench"]["source"]["commit"])
+    return out
 
 
 def summary_problems(doc):
@@ -231,6 +275,15 @@ def summary_problems(doc):
                 out.append(f"bench row {r['name']} has a ratio but not two positive medians and a positive ratio")
             elif r["ratio"] is None and not r["withheld"]:
                 out.append(f"bench row {r['name']} has neither a ratio nor a reason it is withheld")
+    if "adoption" in doc:
+        adoption = doc["adoption"]
+        if not isinstance(adoption, dict) or not isinstance(adoption.get("source"), dict) or not isinstance(adoption.get("rows"), list):
+            out.append("adoption is not an object with a source and rows")
+        else:
+            out += [f"adoption.source has no {k}" for k in ("session", "commit", "date") if not adoption["source"].get(k)]
+            for r in adoption["rows"]:
+                if not isinstance(r, dict) or r.get("verdict") not in ADOPTION_VERDICTS or not r.get("fixture"):
+                    out.append(f"an adoption row is not shaped as expected: {str(r)[:80]}")
     return out
 
 
@@ -376,6 +429,57 @@ def speedup_graph(title, rows, caption, theme_name, oracle, measure="p50", alt="
     return frame(title, end + 76, "".join(body), theme_name, (("ferrofin", "Ferrofin faster"), ("slower", "Ferrofin slower")), alt)
 
 
+def status_graph(title, rows, caption, theme_name, alt=""):
+    """One line per adoption row: the fixture, what kind of copy it is and the generation it is checked
+    at, and its verdict as a coloured chip (a skipped row is grey, never green)."""
+    t = STYLE[theme_name]
+    names = [r["fixture"].removeprefix("jellyfin-") for r in rows]
+    left = label_width(names) + 14
+    row_h, y0 = 24, 62
+    end = y0 + row_h * len(rows)
+    body = [text(0, y0 - 10, "Jellyfin database", 11, "muted", theme=t), text(left + 10, y0 - 10, "kind", 11, "muted", theme=t),
+            text(left + 90, y0 - 10, "checked at schema of", 11, "muted", theme=t), text(WIDTH - 4, y0 - 10, "result", 11, "muted", "end", theme=t)]
+    for n, (name, r) in enumerate(zip(names, rows)):
+        y = y0 + n * row_h
+        body.append(f"<line x1='0' y1='{y - 4:.1f}' x2='{WIDTH}' y2='{y - 4:.1f}' stroke='{t['grid']}' stroke-width='1'/>")
+        body.append(text(left - 10, y + 12, name, 12, anchor="end", theme=t))
+        body.append(text(left + 10, y + 12, r["kind"], 12, "muted", theme=t))
+        body.append(text(left + 90, y + 12, f"Jellyfin {r['expected']}", 12, "muted", theme=t))
+        word = VERDICT_WORDS[r["verdict"]]
+        body.append(f"<rect x='{WIDTH - 84}' y='{y:.1f}' width='80' height='16' rx='8' fill='{t[r['verdict']]}'/>")
+        body.append(text(WIDTH - 44, y + 12, word, 11, "on_bar", "middle", "600", theme=t))
+    body.append(caption_lines(caption, end + 22, t))
+    return frame(title, end + 44, "".join(body), theme_name, (("PASS", "passed"), ("FAIL", "failed"), ("SKIP", "skipped")), alt)
+
+
+def adoption_section(adoption, version, rel, results_dir):
+    """`(files, README lines)` of the adoption status."""
+    src, rows = adoption["source"], adoption["rows"]
+    passed = sum(r["verdict"] == "PASS" for r in rows)
+    skipped = sum(r["verdict"] == "SKIP" for r in rows)
+    title = "Adopting an existing Jellyfin database: every supported version and route"
+    alt = (f"{title}: {passed} of {len(rows)} passed"
+           + "".join(f"; {r['fixture']} {VERDICT_WORDS[r['verdict']]}" for r in rows if r["verdict"] != "PASS") + ".")
+    cap = (f"Ferrofin {version} (commit {src['commit'][:8]}), gates session {src['session']}, {src['date']}. "
+           "What each row checks: gates/adoption/README.md")
+    files = {os.path.join(results_dir, version, f"adoption{'' if theme == 'light' else '-dark'}.svg"):
+             status_graph(title, rows, cap, theme, alt) for theme in STYLE}
+    lines = ["### Adopting an existing Jellyfin database\n",
+             f"Each supported Jellyfin version and upgrade route, adopted in place by Ferrofin **{version}** "
+             f"(commit `{src['commit'][:12]}`) in a local gates session on {src['date']}: "
+             f"**{passed} of {len(rows)} passed**" + (f" ({skipped} skipped: their fixtures were not built)" if skipped else "")
+             + ". Adoption is one-way; see "
+             "[Migrating from Jellyfin](#migrating-from-jellyfin).\n",
+             f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel}/adoption-dark.svg">\n'
+             f'  <img alt="{html.escape(alt)}" src="{rel}/adoption.svg">\n</picture>\n',
+             "<details><summary>Adoption: every row</summary>\n",
+             "| Jellyfin database | Kind | Checked at | Result | Why |", "|---|---|---|---|---|"]
+    lines += [f"| {md(r['fixture'])} | {md(r['kind'])} | {md(r['expected'])} | {VERDICT_WORDS[r['verdict']]} | {md(r['reason'])} |"
+              for r in rows]
+    lines += ["\n</details>\n"]
+    return files, lines
+
+
 def ranked(rows):
     """The comparable rows, the biggest speed-up first (ties by name, so the order is stable)."""
     return sorted((r for r in rows if r["ratio"] is not None), key=lambda r: (-r["ratio"], r["name"]))
@@ -497,6 +601,7 @@ def render(results_dir, readme_text, readme_dir=ROOT):
     files, block = {}, []
     src = bench["source"]
     block.append(f"{BEGIN} — do not edit by hand. Regenerate with: make publish-results (gates/publish.py) -->")
+    block.append("### Speed and memory against Jellyfin\n")
     block.append(f"Ferrofin **{version}** against **{src['oracle']}**: the median of {src['run_count']} runs on one host "
                  f"({host_text(src['host_class'])}), each server alone in its container, over the same library, "
                  f"{src['date']}. Every comparable cell is drawn, the biggest speed-up first.\n")
@@ -517,7 +622,11 @@ def render(results_dir, readme_text, readme_dir=ROOT):
         block.append("")
     block.append(f"Source: {md(', '.join(src['runs']))}; commit `{src['commit']}`, image `{str(src['image_digest'])[:19]}`, "
                  f"fixture `{str(src['fixture'])[:12]}`. The full tables are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); "
-                 "what each number means is in [`gates/bench/README.md`](gates/bench/README.md).")
+                 "what each number means is in [`gates/bench/README.md`](gates/bench/README.md).\n")
+    if "adoption" in latest:
+        more, lines = adoption_section(latest["adoption"], version, rel, results_dir)
+        files.update(more)
+        block += lines
     block.append(END)
     section = "\n".join(block) + "\n"
     i, j = readme_text.find(BEGIN), readme_text.find(END)
@@ -540,12 +649,21 @@ def session_graphs(bench_result, version="this session"):
     return "".join(out)
 
 
+def session_adoption_graph(session, version="this session"):
+    """The README's adoption grid, inline, for a gates session's adoption result (the session page)."""
+    adoption = adoption_summary(session, publishing=False)
+    files, _ = adoption_section(adoption, version, ".", session)
+    return "".join(f"<div class='graph {theme}'>{svg}</div>"
+                   for theme, svg in zip(STYLE, (files[p] for p in sorted(files, key=lambda p: p.endswith("-dark.svg")))))
+
+
 def main(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     s = sub.add_parser("summarise")
     s.add_argument("--version", required=True)
     s.add_argument("--bench", nargs="+", required=True, metavar="RUN")
+    s.add_argument("--session", metavar="DIR", help="the release's gates session: its adoption status")
     s.add_argument("--out", default=os.path.join(ROOT, "docs", "results"))
     r = sub.add_parser("readme")
     r.add_argument("--check", action="store_true")
@@ -554,7 +672,7 @@ def main(argv):
     args = parser.parse_args(argv)
     try:
         if args.command == "summarise":
-            doc = summarise(args.version, args.bench)
+            doc = summarise(args.version, args.bench, args.session)
             path = os.path.join(args.out, args.version, "summary.json")
             write_json(path, doc)
             print(path)

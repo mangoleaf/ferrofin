@@ -16,6 +16,10 @@ GATES = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(GATES))
 import publish  # noqa: E402
 import result  # noqa: E402
+import session  # noqa: E402
+
+sys.path.insert(0, str(GATES / "adoption"))
+import adoption_report  # noqa: E402
 
 README = "# Ferrofin\n\nIntro.\n\n## Results\n\n<!-- BEGIN GENERATED RESULTS -->\nold\n<!-- END GENERATED RESULTS -->\n\n## After\n"
 
@@ -46,6 +50,25 @@ def bench_result(scale=1.0, digest="sha256:img", search_withheld=None, started=N
               "host_class": {"cores": 32, "memory_gib": 125}, "fixture": "4b217db66afc0000"}
     started = started or f"2026-10-26T01:{int(scale * 100) % 60:02d}:00Z"   # each run its own start
     return result.envelope("bench", "measured", {"completed": 76}, source, started, None, detail)
+
+
+def adoption_session(root, rows, commit="5112240e1923cdc9", dirty=False):
+    """A gates session whose adoption gate recorded `rows` ([(fixture, kind, expected, verdict, detail)]) and wrote
+    its result.json, as gates/run and gates/adoption/run.sh leave them."""
+    from datetime import datetime
+    s = Path(session.new(str(root / "sessions"), ["adoption"], "release/v1.4.0", commit, dirty, "ferrofin:x",
+                         "sha256:img", "jellyfin/jellyfin@sha256:pin", when=datetime(2026, 10, 26, 1, 0)))
+    recorder = adoption_report.Recorder(s / "adoption")
+    recorder.start("gates/adoption/run.sh", image="ferrofin:x", oracle="12.2")
+    for fixture, kind, expected, verdict, detail in rows:
+        recorder.row(fixture, kind, expected, verdict, detail)
+    adoption_report.gate_result().write(str(s / "adoption"), adoption_report.result_doc(*adoption_report.load(s / "adoption")))
+    return s
+
+
+ADOPTION = [("jellyfin-10.11.8", "path", "10.11.8", "PASS", ""), ("jellyfin-12.2-from-10", "path", "12.2.0", "PASS", ""),
+            ("jellyfin-10.11.11-messy", "messy", "10.11.11", "FAIL", "messy: gone_file_userdata " + "x" * 400),
+            ("jellyfin-12.1-from-12", "path", "12.1.0", "SKIP", "fixture not built")]
 
 
 class PublishTests(unittest.TestCase):
@@ -266,6 +289,45 @@ class PublishTests(unittest.TestCase):
         self.assertFalse(leftover.exists())
         with self.assertRaisesRegex(SystemExit, "publish: no .*missing: run summarise first"):
             publish.main(["readme", "--results", str(self.root / "missing"), "--readme", str(readme)])
+
+    def test_the_adoption_status_comes_from_the_named_session(self):
+        s = adoption_session(self.root, ADOPTION)
+        doc = publish.summarise("v1.4.0", self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)]), str(s))
+        self.assertEqual(publish.summary_problems(doc), [])
+        adoption = doc["adoption"]
+        self.assertEqual(adoption["source"], {"session": s.name, "commit": "5112240e1923cdc9", "image_digest": "sha256:img",
+                                              "oracle": "12.2", "date": "2026-10-26"})
+        self.assertEqual([(r["fixture"], r["verdict"]) for r in adoption["rows"]],
+                         [(f, v) for f, _, _, v, _ in ADOPTION])
+        self.assertEqual(len(adoption["rows"][2]["reason"]), publish.REASON_CHARS)   # the full reason is in the session's report
+        self.assertEqual(adoption["rows"][0]["reason"], "")
+        files, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        grid = files[next(p for p in files if p.endswith("/adoption.svg"))]
+        ET.fromstring(grid)
+        for text in ("10.11.11-messy", ">failed<", ">skipped<", ">passed<", f"fill='{publish.STYLE['light']['SKIP']}'",
+                     "gates session " + s.name):
+            self.assertIn(text, grid)
+        for text in ("### Adopting an existing Jellyfin database", "**2 of 4 passed** (1 skipped: their fixtures were not built)",
+                     "(commit `5112240e1923`)",
+                     'srcset="docs/results/v1.4.0/adoption-dark.svg"', "| jellyfin-12.1-from-12 | path | 12.1.0 | skipped | fixture not built |"):
+            self.assertIn(text, readme)
+        self.assertLess(readme.index("### Speed and memory against Jellyfin"), readme.index("### Adopting an existing"))
+
+    def test_an_adoption_session_of_other_or_uncommitted_code_is_refused(self):
+        runs = self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)])
+        for kwargs, refusal in (({"commit": "deadbeef0000"}, "measured deadbeef0000, the benchmark runs 5112240e"),
+                                ({"dirty": True}, "ran with uncommitted changes")):
+            with self.subTest(refusal), self.assertRaisesRegex(publish.Refused, refusal):
+                publish.summarise("v1.4.0", runs, str(adoption_session(self.root / refusal[:4], ADOPTION, **kwargs)))
+        skipped = adoption_session(self.root / "skipped", [("jellyfin-12.2-fresh", "path", "12.2.0", "SKIP", "fixture not built")])
+        with self.assertRaisesRegex(publish.Refused, "ran nothing"):
+            publish.summarise("v1.4.0", runs, str(skipped))
+        with self.assertRaisesRegex(publish.Refused, "is not a gates session"):
+            publish.summarise("v1.4.0", runs, str(self.root))
+        bare = adoption_session(self.root / "bare", ADOPTION)
+        (bare / "adoption" / "result.json").unlink()
+        with self.assertRaisesRegex(publish.Refused, "has no result.json .*adoption_report.py build"):
+            publish.summarise("v1.4.0", runs, str(bare))
 
     def test_summarise_writes_the_release_file(self):
         out = self.root / "out"

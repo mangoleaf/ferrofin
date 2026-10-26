@@ -79,6 +79,11 @@ class SessionReportTests(unittest.TestCase):
             recorder.row(fixture, "path", "12.2.0", verdict)
         for fixture in unfinished:   # killed while on it
             recorder.begin(fixture, "path", "12.2.0")
+        self.adoption_result(d)
+
+    def adoption_result(self, d):
+        """The result.json adoption's own build writes from what was recorded (its page is left to each test)."""
+        adoption_report.gate_result().write(str(d), adoption_report.result_doc(*adoption_report.load(str(d))))
 
     def every_gate(self, s):
         self.verify_run(s / "verify", {"exit": 1, "libraries": {
@@ -143,6 +148,7 @@ class SessionReportTests(unittest.TestCase):
         self.adoption_run(s / "adoption", [("a", "PASS", False), ("b", "PASS", True)], unfinished=["c"])
         with open(s / "adoption/results.jsonl", "a") as f:
             f.write('{"event": "row", "fixt')   # the line a kill cut short
+        self.adoption_result(s / "adoption")
         row = self.rows(s)["adoption"]
         self.assertEqual((row["verdict"], row["counts"]),
                          ("failed", [("rows passed", 1), ("failed", 1), ("unfinished", 1), ("skipped", 0)]))
@@ -161,6 +167,13 @@ class SessionReportTests(unittest.TestCase):
         # the Jellyfin half never started: no results of it at all
         self.assertEqual(row["problem"], "no results for jellyfin: its run never started; "
                                          "no report.html: the gate ended before writing its report")
+
+    def test_an_adoption_run_from_before_result_json_says_how_to_add_one(self):
+        s = self.session(["adoption"], {"adoption": ("passed", 0)})
+        self.adoption_run(s / "adoption", [("a", "PASS", False)])
+        (s / "adoption/result.json").unlink()
+        self.assertIn("a run from before adoption wrote one (python3 gates/adoption/adoption_report.py build DIR",
+                      self.rows(s)["adoption"]["problem"])
 
     def test_a_bench_run_from_before_result_json_says_how_to_add_one(self):
         s = self.session(["bench"], {"bench": ("passed", 0)})
@@ -186,6 +199,15 @@ class SessionReportTests(unittest.TestCase):
         self.write(s / "bench/result.json", doc)
         self.assertNotIn("Benchmark against Jellyfin", Path(report.write(str(s))).read_text(encoding="utf-8"))
 
+    def test_an_adoption_session_shows_the_readme_adoption_grid(self):
+        s = self.session(["adoption"], {"adoption": ("failed", 1)})
+        self.adoption_run(s / "adoption", [("jellyfin-12.2-fresh", "PASS", False), ("jellyfin-10.11.11-messy", "PASS", True)])
+        page = Path(report.write(str(s))).read_text(encoding="utf-8")
+        self.assertIn("<h2>Adoption</h2>", page)
+        self.assertEqual(page.count("<div class='graph light'><svg"), 1)
+        self.assertIn(">failed<", page)
+        self.assertIn("12.2-fresh", page)
+
     def test_an_ab_gate_session_counts_its_gated_cells_and_what_blocks(self):
         s = self.session(["bench"], {"bench": ("failed", 1)}, previous="ferrofin:v8")
         self.assertEqual(self.rows(s)["bench"]["problem"], "no result.json: the A/B gate ended before it judged its runs; "
@@ -210,7 +232,7 @@ class SessionReportTests(unittest.TestCase):
         self.assertEqual((rows["verify"]["verdict"], rows["verify"]["problem"]),
                          ("nothing verified", "no rows from the movies and tvshows libraries: the check ended before them "
                                               "(the run's exit 3, see the log)"))
-        self.assertEqual(rows["adoption"]["problem"], "no results.jsonl: the gate ended before it recorded anything; "
+        self.assertEqual(rows["adoption"]["problem"], "no result.json: the gate ended before it recorded anything; "
                                                       "no report.html: the gate ended before writing its report")
         self.assertIn("results.json cannot be read", rows["parity"]["problem"])
         self.assertIn("its result is not shaped as expected (TypeError", rows["bench"]["problem"])

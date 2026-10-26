@@ -17,7 +17,6 @@ import importlib.util
 import json
 import os
 import sys
-from collections import Counter
 
 GATES = ("verify", "adoption", "parity", "bench")
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -99,16 +98,17 @@ def verify(d, record):
 
 
 def adoption(d, record):
-    if not os.path.exists(os.path.join(d, "results.jsonl")):
-        return found(problems=["no results.jsonl: the gate ended before it recorded anything"], bad=True)
-    module = gate_module("adoption/adoption_report.py")
-    _, rows, skipped = module.load(d)   # adoption's own reading: a fixture begun but never finished is INCOMPLETE
-    verdicts = Counter(module.row_verdict(row) for row in rows)
-    overall = module.overall(rows)
-    return found({"PASS": "passed", "FAIL": "failed"}.get(overall, "nothing ran"),
-                 [("rows passed", verdicts["PASS"]), ("failed", verdicts["FAIL"]), ("unfinished", verdicts["INCOMPLETE"]),
-                  ("skipped", verdicts["SKIP"])],
-                 [skipped and f"{plural(skipped, 'unreadable line')} in results.jsonl skipped"], bad=overall != "PASS")
+    result = gate_result(d, "adoption")   # adoption's own reading: a fixture begun but never finished is INCOMPLETE
+    if result is None and os.path.exists(os.path.join(d, "results.jsonl")):
+        return found(problems=["no result.json: a run from before adoption wrote one (python3 "
+                               "gates/adoption/adoption_report.py build DIR writes it)"], bad=True)
+    if result is None:
+        return found(problems=["no result.json: the gate ended before it recorded anything"], bad=True)
+    counts, skipped = result["counts"], result["detail"].get("skipped_lines", 0)
+    return found(result["verdict"], [("rows passed", counts.get("pass", 0)), ("failed", counts.get("fail", 0)),
+                                     ("unfinished", counts.get("incomplete", 0)), ("skipped", counts.get("skip", 0))],
+                 [skipped and f"{plural(skipped, 'unreadable line')} in results.jsonl skipped"],
+                 bad=result["verdict"] != "passed")
 
 
 def parity(d, record):
@@ -263,6 +263,25 @@ def css():
         return FALLBACK_CSS
 
 
+def summary_graphs(session, record):
+    """The README's graphs for this session's results (gates/publish.py), inline: its adoption status and
+    its benchmark run's speed and memory."""
+    return adoption_graph(session, record) + bench_graphs(session, record)
+
+
+def adoption_graph(session, record):
+    """The README's adoption grid for the session's adoption result; empty when adoption did not run or
+    left no result, a note when it cannot be drawn."""
+    if (record.get("gates", {}).get("adoption") or {}).get("status") in (None, "pending", "skipped") \
+            or not os.path.isfile(os.path.join(session, "adoption", "result.json")):
+        return ""
+    try:
+        graph = gate_module("publish.py").session_adoption_graph(session)
+    except Exception as error:  # noqa: BLE001 — the page is written whatever the result holds
+        return f"<p class='problem'>The adoption grid could not be drawn ({html.escape(type(error).__name__)}: {html.escape(str(error))}).</p>"
+    return f"<h2>Adoption</h2>{graph}"
+
+
 def bench_graphs(session, record):
     """The README's graphs for the session's benchmark run (gates/publish.py), inline; an empty string
     for an A/B gate session or a run with no comparable result, and a note when they cannot be drawn."""
@@ -311,7 +330,7 @@ def render_html(record, rows, graphs=""):
 
 def write(session):
     record, rows = summarise(session)
-    for name, text in (("index.html", render_html(record, rows, bench_graphs(session, record))),
+    for name, text in (("index.html", render_html(record, rows, summary_graphs(session, record))),
                        ("report.md", render_md(record, rows))):
         path = os.path.join(session, name)
         with open(path + ".tmp", "w", encoding="utf-8") as f:

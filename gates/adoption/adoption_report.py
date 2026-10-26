@@ -6,13 +6,14 @@ WORK/results.jsonl, and build WORK/report.html from it when they end (however th
 run leaves its partial results). The page opens from disk, is uploaded as the CI artifact, and is
 listed in the Adoption tab of the shared viewer (`gates/bench/report.py --serve --adoption-dir DIR`).
 
-    adoption_report.py start  WORK --title T [--image I] [--oracle O]    begin a run (forgets the previous one)
+    adoption_report.py start  WORK --title T [--image I] [--oracle O] [--image-id ID] [--commit SHA]
+                                                                         begin a run (forgets the previous one)
     adoption_report.py begin  WORK FIXTURE KIND EXPECTED                 a fixture has started (unfinished if no row follows)
     adoption_report.py check  WORK FIXTURE STAGE CHECK PASS|FAIL [--detail D | --detail-stdin]
     adoption_report.py row    WORK FIXTURE KIND EXPECTED PASS|FAIL|SKIP [--detail D | --detail-stdin]
     adoption_report.py attach WORK FIXTURE KEY FILE [--text]             data for the page: JSON (shapes,
                                                                          scale) or text (table differences)
-    adoption_report.py build  WORK                                       write WORK/report.html
+    adoption_report.py build  WORK                                       write WORK/report.html and WORK/result.json
 
 Recording never changes a run's verdict: nothing here raises into a caller for an I/O or rendering
 problem (it says so on stderr and goes on; run.sh sends that to /dev/null and notes a missing page
@@ -21,13 +22,16 @@ itself), and callers ignore this script's exit status. Stdlib only.
 
 import argparse
 import html
+import importlib.util
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 RESULTS = "results.jsonl"
 REPORT = "report.html"
+RESULT = "result.json"
 VERDICTS = ("PASS", "FAIL", "SKIP")
 #: What a fixture row is: an upgrade path, a messy copy, the scale copy, or a preservation-matrix path.
 KINDS = ("path", "messy", "scale", "matrix")
@@ -77,15 +81,17 @@ class Recorder:
                 self._warned = True
                 warn(f"cannot record ({error}); the run goes on without its report")
 
-    def start(self, title, image="", oracle=""):
+    def start(self, title, image="", oracle="", image_id="", commit=""):
         try:
             self.work.mkdir(parents=True, exist_ok=True)
             self.path.write_text("", encoding="utf-8")
             (self.work / REPORT).unlink(missing_ok=True)
+            (self.work / RESULT).unlink(missing_ok=True)
         except OSError as error:
             warn(f"cannot start a report ({error}); the run goes on without one")
         self.started = True
-        self._write({"event": "run", "title": title, "image": image, "oracle": oracle, "started": time.time()})
+        self._write({"event": "run", "title": title, "image": image, "oracle": oracle, "image_id": image_id,
+                     "commit": commit, "started": time.time()})
 
     def begin(self, fixture, kind, expected):
         """A fixture has started: if the run ends before its row, the report shows it unfinished."""
@@ -306,11 +312,48 @@ def render(run, rows, skipped=0, finished=None):
             f"<title>{esc(title)}</title><style>{CSS}</style></head><body><main>{''.join(out)}</main></body></html>")
 
 
+def gate_result():
+    """gates/result.py, the envelope every gate's result.json is written in, loaded by its path."""
+    if "gates_result" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("gates_result", Path(__file__).resolve().parents[1] / "result.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules["gates_result"] = module
+    return sys.modules["gates_result"]
+
+
+def stamp(seconds):
+    return datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="seconds") if seconds else None
+
+
+def result_doc(run, rows, skipped=0, finished=None):
+    """The run's result envelope: its verdict and the rows' verdicts counted, as the page shows them, and
+    per fixture its kind, expected generation, verdict, reason, every check and its scale measurements.
+    The table differences and shapes stay in the page (they can be megabytes)."""
+    verdict = overall(rows)
+    counts = {v.lower(): sum(1 for r in rows if row_verdict(r) == v) for v in ("PASS", "FAIL", "INCOMPLETE", "SKIP")}
+    detail = {"title": run.get("title") or "Adoption run", "skipped_lines": skipped, "rows": [
+        {"fixture": r["fixture"], "kind": r["kind"], "expected": r["expected"], "verdict": row_verdict(r),
+         "detail": r["detail"],
+         "checks": [{k: c.get(k, "") for k in ("stage", "check", "verdict", "detail")} for c in r["checks"]],
+         **({"scale": r["attachments"]["scale"]} if isinstance(r["attachments"].get("scale"), dict) else {})}
+        for r in rows]}
+    source = {"commit": run.get("commit") or None, "image": run.get("image") or None,
+              "image_digest": run.get("image_id") or None, "oracle": run.get("oracle") or None,
+              "host_class": gate_result().host_class(), "fixture": None}
+    return gate_result().envelope("adoption", {"PASS": "passed", "FAIL": "failed"}.get(verdict, "nothing ran"), counts,
+                                  source, stamp(run.get("started")), stamp(finished), detail)
+
+
 def build(work):
+    """WORK/report.html and WORK/result.json, from one reading of the run."""
     run, rows, skipped = load(work)
-    page = render(run, rows, skipped, finished=time.time())
+    finished = time.time()
+    page = render(run, rows, skipped, finished=finished)
+    doc = result_doc(run, rows, skipped, finished)
     path = Path(work) / REPORT
     path.write_text(page, encoding="utf-8")
+    gate_result().write(str(work), doc)
     return path
 
 
@@ -328,6 +371,8 @@ def main(argv=None):
     start.add_argument("--title", required=True)
     start.add_argument("--image", default="")
     start.add_argument("--oracle", default="")
+    start.add_argument("--image-id", default="")
+    start.add_argument("--commit", default="")
     begin = sub.add_parser("begin")
     begin.add_argument("work", type=Path)
     for name in ("fixture", "kind", "expected"):
@@ -355,7 +400,7 @@ def main(argv=None):
         why = (sys.stdin.buffer.read().decode("utf-8", "replace") if getattr(args, "detail_stdin", False)
                else printable(getattr(args, "detail", "")))
         if args.mode == "start":
-            recorder.start(args.title, args.image, args.oracle)
+            recorder.start(args.title, args.image, args.oracle, args.image_id, args.commit)
         elif args.mode == "begin":
             recorder.begin(args.fixture, args.kind, args.expected)
         elif args.mode == "check":
