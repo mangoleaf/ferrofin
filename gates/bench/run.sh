@@ -209,7 +209,8 @@ IDS=$TESTDATA/ids.json; U=$(jq -r .user "$IDS"); TOK=$(jq -r .token "$IDS")
 RUN_NAME=${OUT##*/}; RUN_NAME=${RUN_NAME#bench-}
 [ "$RUN_NAME" != bench ] || RUN_NAME=$(basename "$(dirname "$OUT")")
 AUTH="Authorization: MediaBrowser Client=\"bench\", Device=\"bench\", DeviceId=\"bench-run\", Version=\"3\", Token=\"$TOK\""
-# The Jellyfin oracle pin; behind the latest Jellyfin release it only warns here (gate.py refuses).
+# The Jellyfin oracle pin, recorded in run.json with its note when a newer Jellyfin release is out
+# (gates/bench/oracle.py); a newer release never refuses a run.
 ORACLE=$(python3 gates/bench/oracle.py check) || die "cannot read the Jellyfin oracle pin"
 # The image ID measured, so a run can never be credited to the wrong build (gate.py retags).
 FERROFIN_IMAGE=$([[ ",$SERVERS," != *,ferrofin,* ]] || docker_cmd image inspect -f '{{.Id}}' "$FERROFIN_BENCH_IMAGE")
