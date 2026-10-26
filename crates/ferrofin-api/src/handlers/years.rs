@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
-use crate::handlers::by_name::{additional_dto_options, project_item_rows};
+use crate::handlers::by_name::{additional_dto_options, project_item_rows, resolve_parent};
 use crate::handlers::items::{parse_order_by, resolve_user_or_api_key};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
@@ -112,7 +112,11 @@ async fn get_years(
     // With no user (an API key) upstream walks the `AggregateFolder`'s
     // children instead, the library folders again, and answers the same
     // nothing.
-    let parent_id = match query.parent_id.filter(|p| !p.is_nil()) {
+    //
+    // A `parentId` naming no item, the zero id included, is `GetParentItem`'s
+    // `ArgumentException`: a 400.
+    resolve_parent(&state, query.parent_id).await?;
+    let parent_id = match query.parent_id {
         Some(parent) => parent,
         None if !recursive => state
             .library

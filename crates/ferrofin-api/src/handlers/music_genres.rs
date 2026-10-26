@@ -42,6 +42,8 @@ async fn get_music_genres(
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
+    // `GetParentItem`: an id naming no item is a 400.
+    query.parent(&state).await?;
     let internal = query.base_query(user.clone())?;
     let result = state.library.get_music_genres(&internal).await?;
     // C# `MusicGenresController` builds its options as

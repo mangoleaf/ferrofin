@@ -1687,8 +1687,7 @@ const BY_NAME_DIVERGENCES_ARTISTS: &[&str] = &[
      no-match id (by_name::resolve_by_name_ids), the same empty answer.",
     "A `parentId` that is not a folder: v12 puts it in ItemIds (the value is carried by \
      that one item); Ferrofin scopes by AncestorIds in every case, so a non-folder parent \
-     answers with nothing.",
-    UNKNOWN_PARENT_ID_DIVERGENCE,
+     answers with nothing. Fix path: gl-971.",
     NO_USER_USER_DATA_FILTER_DIVERGENCE,
     "A `userId` naming no user: v12's GetUserById returns null and the query runs with no \
      user — unscoped, every library on the server; Ferrofin answers 404. Jellyfin bug not \
@@ -1717,8 +1716,8 @@ const BY_NAME_DIVERGENCES_GENRES_STUDIOS: &[&str] = &[
      which these v12 controllers do not declare (ASP.NET ignores them). A client sending \
      one gets a narrowed or re-ordered list here and the full SortName-ordered list there.",
     "A `parentId` that is not a folder: v12 puts it in ItemIds; Ferrofin scopes by \
-     AncestorIds in every case, so a non-folder parent answers with nothing.",
-    UNKNOWN_PARENT_ID_DIVERGENCE,
+     AncestorIds in every case, so a non-folder parent answers with nothing. Fix path: \
+     gl-971.",
     NO_USER_USER_DATA_FILTER_DIVERGENCE,
     "`searchTerm` is not v12.2 TranslateQuery's search branch: the wildcard branch is \
      chosen on, and matches CleanName with, the raw lower-cased term rather than the \
@@ -1733,15 +1732,6 @@ const NO_USER_USER_DATA_FILTER_DIVERGENCE: &str = "A user-data filter (`isFavori
      IsPlayed, IsUnplayed) with no user (an API key without userId) is ignored and the list is \
      unfiltered (200); upstream's TranslateQuery dereferences the null User for the user-data \
      subqueries and fails (500). Jellyfin bug not ported.";
-
-/// Included in the divergence lists of the five by-name VERIFIED rows; the
-/// text also names `/Years` and `/Items/Filters`, which have no row to carry it.
-const UNKNOWN_PARENT_ID_DIVERGENCE: &str = "A `parentId` naming no item: v12's GetParentItem \
-     throws ArgumentException (400 via ExceptionMiddleware); Ferrofin answers 200 with an \
-     empty list. The same holds on /Genres, /MusicGenres, /Studios, /Artists, \
-     /Artists/AlbumArtists, /Years, and /Items/Filters unless includeItemTypes is a lone \
-     Trailer/Program (there the answer is empty filters). Fix path: answer \
-     ApiError::BadRequest(\"Invalid parent id: …\") as items.rs does.";
 
 /// What `/UserItems/Resume` — and its legacy twin `/Users/{userId}/Items/Resume`,
 /// the same handler with the user from the route, which is hidden from the

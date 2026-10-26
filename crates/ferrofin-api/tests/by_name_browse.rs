@@ -736,16 +736,11 @@ async fn genres_list_folds_counts_when_include_item_types_set() {
 /// is a music or music-videos collection folder (`GenresController.cs:141-150`);
 /// any other parent, or none, keeps the `Genre` rows. The fake serves "Jazz"
 /// from `get_music_genres` and "Drama" from `get_genres`.
-///
-/// `unknown_parent` pins a recorded divergence, not parity: upstream answers
-/// 400 there (`UNKNOWN_PARENT_ID_DIVERGENCE` in `handlers/mod.rs`). Porting the
-/// 400 flips that case.
 #[rstest::rstest]
 #[case::music_library(Some(MUSIC_LIBRARY_ID), MUSIC_GENRE_ID, "Jazz")]
 #[case::music_videos_library(Some(MUSIC_VIDEOS_LIBRARY_ID), MUSIC_GENRE_ID, "Jazz")]
 #[case::movies_library(Some(MOVIES_LIBRARY_ID), GENRE_ID, "Drama")]
 #[case::plain_folder_claiming_music(Some(MUSIC_FOLDER_ID), GENRE_ID, "Drama")]
-#[case::unknown_parent(Some(Uuid::from_u128(0xBBFF)), GENRE_ID, "Drama")]
 #[case::no_parent(None, GENRE_ID, "Drama")]
 #[tokio::test]
 async fn genres_list_switches_to_music_genres_under_a_music_library(
@@ -1334,4 +1329,70 @@ async fn an_api_key_reads_a_by_name_item_with_no_user(#[case] uri: &str, #[case]
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK, "{uri}");
     assert_eq!(json_body(response).await["Name"], name, "{uri}");
+}
+
+/// v12.2 `LibraryManager.GetParentItem` (`LibraryManager.cs:3276-3289`), which
+/// every by-name list calls, throws `ArgumentException("Invalid parent id: …")`
+/// for a `parentId` naming no item, the zero id included (`GetItemById`), and
+/// `ExceptionMiddleware` answers it `400`; nothing is listed. A parent that
+/// exists still scopes the list.
+#[rstest::rstest]
+#[case::genres("/Genres")]
+#[case::music_genres("/MusicGenres")]
+#[case::studios("/Studios")]
+#[case::artists("/Artists")]
+#[case::album_artists("/Artists/AlbumArtists")]
+#[case::years("/Years")]
+#[tokio::test]
+async fn a_by_name_list_refuses_a_parent_naming_no_item(#[case] route: &str) {
+    for parent in [
+        Uuid::from_u128(0xBBFF).simple().to_string(),
+        Uuid::nil().to_string(),
+    ] {
+        let library = ByNameLibrary::default();
+        let response = create_router(by_name_state_with_library(library.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{route}?parentId={parent}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{route} {parent}"
+        );
+        assert!(
+            library.seen.lock().expect("lock").is_empty(),
+            "{route} {parent}: nothing is listed"
+        );
+    }
+
+    let library = ByNameLibrary::default();
+    let response = create_router(by_name_state_with_library(library.clone()))
+        .oneshot(
+            Request::builder()
+                .uri(format!("{route}?parentId={}", MOVIES_LIBRARY_ID.simple()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{route} under a library");
+    let seen = library.seen.lock().expect("lock");
+    let query = seen.last().expect("the list ran");
+    if route == "/Years" {
+        assert_eq!(
+            query.parent_id, MOVIES_LIBRARY_ID,
+            "{route} scoped by its parent"
+        );
+    } else {
+        assert_eq!(
+            query.ancestor_ids,
+            [MOVIES_LIBRARY_ID],
+            "{route} scoped by its parent"
+        );
+    }
 }
