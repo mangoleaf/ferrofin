@@ -46,6 +46,7 @@ test-gates-offline:
 	shellcheck -x -s bash $(wildcard $(addsuffix /*.bats,$(GATE_TESTS)))
 	bats $(GATE_TESTS)
 	python3 -m unittest discover -s gates/tests
+	python3 -m unittest discover -s gates/verify/tests
 	python3 -m unittest discover -s gates/adoption/tests
 	python3 -m unittest discover -s gates/parity/tests
 	python3 -m unittest discover -s gates/bench -p 'test_*.py'

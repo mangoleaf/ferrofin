@@ -7,13 +7,14 @@
                                              with a README path, replaces the block between the
                                              BEGIN/END GENERATED BENCHMARKS markers in place
     report.py --html RUN_DIR                 write RUN_DIR/report.html (self-contained; run.sh does this)
-    report.py --serve [PORT] [RUNS_DIR] [--adoption-dir DIR] [--parity-dir DIR]
+    report.py --serve [PORT] [RUNS_DIR] [--adoption-dir DIR] [--parity-dir DIR] [--verify-dir DIR]
                                              the viewer on http://127.0.0.1:PORT (default 8097; RUNS_DIR defaults
                                              to $FERROFIN_GATES_DIR/runs, else gates/bench/runs):
-                                             Benchmark, Adoption and Parity tabs, each listing that harness's
-                                             runs (a report.html each) and comparing two side by side. The
-                                             directories also come from FERROFIN_ADOPTION_RUNS / FERROFIN_PARITY_RUNS,
-                                             else from the output root ($FERROFIN_GATES_DIR/work, /runs).
+                                             Benchmark, Adoption, Parity and Verify tabs, each listing that
+                                             harness's runs (a report.html each; verify's, or its result.json)
+                                             and comparing two side by side. The directories also come from
+                                             FERROFIN_ADOPTION_RUNS / FERROFIN_PARITY_RUNS / FERROFIN_VERIFY_RUNS,
+                                             else from the output root ($FERROFIN_GATES_DIR/work, /runs, /runs).
 
 One run dir: the numbers of that run. Several: each cell is the median across runs, and
 where the runs disagreed at the precision published, the range they spanned; a cell that
@@ -41,6 +42,7 @@ comparison, never the change against the baseline. Missing phases are named.
 
 import csv
 import html
+import importlib.util
 import http.server
 import json
 import math
@@ -1941,20 +1943,29 @@ nav.tabs a.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:600
 
 #: The viewer's tabs, in order: the harness key, its tab label, the flag and the
 #: environment variable that name the directory holding its runs. The benchmark's runs
-#: are the `--serve` argument (default `$FERROFIN_GATES_DIR/runs`, else `gates/bench/runs`); the other two harnesses decide where
+#: are the `--serve` argument (default `$FERROFIN_GATES_DIR/runs`, else `gates/bench/runs`); the other harnesses decide where
 #: their runs go, so the viewer is told.
 HARNESSES = (("benchmark", "Benchmark", None, None),
              ("adoption", "Adoption", "--adoption-dir", "FERROFIN_ADOPTION_RUNS"),
-             ("parity", "Parity", "--parity-dir", "FERROFIN_PARITY_RUNS"))
+             ("parity", "Parity", "--parity-dir", "FERROFIN_PARITY_RUNS"),
+             ("verify", "Verify", "--verify-dir", "FERROFIN_VERIFY_RUNS"))
 HTML = "text/html; charset=utf-8"
+#: The files that make a directory one of a harness's runs: its report, or (for a gate whose report the
+#: viewer renders on demand) the result.json it is rendered from (gates/result.py).
+RUN_FILES = {"verify": ("report.html", "result.json")}
 
 
-def run_dir(root, name):
-    """The directory of adoption/parity run `name`, or None: a subdirectory of `root`
-    holding a `report.html`, else `root` itself when `name` is its own name (a harness
-    writes its report into its work directory)."""
+def run_page(d, harness):
+    """The first of the harness's run files present in `d`, or None."""
+    return next((os.path.join(d, f) for f in RUN_FILES.get(harness, ("report.html",)) if os.path.isfile(os.path.join(d, f))), None)
+
+
+def run_dir(root, name, harness=None):
+    """The directory of adoption/parity/verify run `name`, or None: a subdirectory of `root`
+    holding a `report.html` (or verify's `result.json`), else `root` itself when `name` is its own
+    name (a harness writes its report into its work directory)."""
     sub = os.path.join(root, name)
-    if os.path.isfile(os.path.join(sub, "report.html")):
+    if run_page(sub, harness):
         return sub
     return root if name == os.path.basename(os.path.abspath(root)) else None
 
@@ -1964,8 +1975,9 @@ def discover(harness, root):
 
     A benchmark run is a directory with a `run.json` (it has a `report.html` only once
     `--html` or `run.sh` wrote one; the viewer renders it otherwise). An adoption or parity
-    run is a directory holding a `report.html`; `root` itself counts as a run when it holds
-    one, because a harness writes its report into its work directory."""
+    run is a directory holding a `report.html`, a verify run one holding a `report.html` or a
+    `result.json`; `root` itself counts as a run when it holds one, because a harness writes
+    its report into its work directory."""
     if not root or not os.path.isdir(root):
         return []
     if harness == "benchmark":
@@ -1976,9 +1988,9 @@ def discover(harness, root):
             name = f"{name}/{harness}"
         elif other_gate(harness, name):
             continue
-        d = run_dir(root, name)
-        page = d and os.path.join(d, "report.html")
-        if name not in seen and page and os.path.isfile(page):
+        d = run_dir(root, name, harness)
+        page = d and run_page(d, harness)
+        if name not in seen and page:
             seen.add(name)
             when = datetime.fromtimestamp(os.path.getmtime(page)).strftime("%Y-%m-%d %H:%M")
             out.append((os.path.getmtime(page), name, f"{name}  ·  {when}"))
@@ -2053,6 +2065,22 @@ def benchmark_report(root, name):
         return (400 if isinstance(ex, ValueError) else 500), error_html(name, ex)
 
 
+def verify_report(run, name):
+    """A verify run's page rendered now from its result.json (gates/verify/verify_report.py)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        spec = importlib.util.spec_from_file_location("gates_verify_report", os.path.join(here, "..", "verify", "verify_report.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        doc = module.result.read(run, "verify")
+        if doc is None:
+            raise ValueError("result.json is gone")
+        # no log link: the viewer serves the page alone, so a relative server.log would not resolve
+        return 200, module.render(doc, log=False, style=CSS)
+    except Exception as ex:
+        return (400 if isinstance(ex, ValueError) else 500), error_html(name, ex)
+
+
 def handle(target, roots):
     """`(status, content type, body bytes)` for a request path and query.
 
@@ -2073,7 +2101,10 @@ def handle(target, roots):
             return reply(404, page_html("Not found", "<h1>No such run</h1>"))
         if harness == "benchmark":
             return reply(*benchmark_report(roots["benchmark"], name))
-        with open(os.path.join(run_dir(roots[harness], name), "report.html"), "rb") as f:
+        page = run_page(run_dir(roots[harness], name, harness), harness)
+        if page.endswith("result.json"):
+            return reply(*verify_report(os.path.dirname(page), name))
+        with open(page, "rb") as f:
             return 200, HTML, f.read()
     harness = "benchmark" if path == "/" else parts[0]
     if len(parts) != 1 or harness not in keys:
@@ -2182,7 +2213,7 @@ def main():
         roots = {}
         # Under the output root (gates/lib.sh) each tab has a default: runs/, and adoption's work/.
         gates = os.environ.get("FERROFIN_GATES_DIR")
-        under_root = {"adoption": "work", "parity": "runs"}
+        under_root = {"adoption": "work", "parity": "runs", "verify": "runs"}
         for key, _, flag, env in HARNESSES[1:]:
             if flag in rest:
                 i = rest.index(flag)

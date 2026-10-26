@@ -71,11 +71,18 @@ It shows the commit, images and oracle pin, and one row per gate, every gate inc
 
 | Gate | Counts | Links to |
 |---|---|---|
-| verify | checks passed, failed and skipped, over both libraries | each library's rows |
+| verify | checks passed, failed and skipped, over both libraries, from its `result.json` | the verify report; each library's rows, `result.json`, `verify.json` and the server log |
 | adoption | fixture rows passed, failed, unfinished and skipped, by the adoption report's own rules | the adoption report |
 | parity | new differences, the groups of them not filed yet, requests sent and planned; the verdict and its reason | the parity report |
 | bench | phases completed, failed, unfinished and skipped; for the A/B gate (`--previous`), the gated cells regressed, not comparable, improved and within noise, and whether anything blocks | the benchmark or A/B gate report |
 
 A gate the session did not ask for, did not reach, is still running, ended before writing its result,
-or left a result that cannot be read is shown as such, never left out. The page opens from disk (every
+or left a result that cannot be read is shown as such, never left out. Each gate's own report is its
+main link; its raw files and the log follow it. The page opens from disk (every
 link is relative) and replaces none of the gates' own reports.
+
+Every gate is moving to one structured result, `<run>/result.json`, in the envelope
+[`result.py`](result.py) defines and validates: `schema`, `gate`, `verdict`, `counts`, `source`
+(`commit`, `image`, `image_digest`, `oracle`, `host_class` (cores and memory, never a host name),
+`fixture`), `started`, `ended`, and `detail`, the gate's own data. Its HTML report, this page and the
+viewer read that file, never the gate's internal files. verify writes one today.

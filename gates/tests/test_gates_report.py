@@ -18,6 +18,7 @@ spec = importlib.util.spec_from_file_location("gates_report", GATES / "report.py
 report = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(report)
 adoption_report = report.gate_module("adoption/adoption_report.py")
+verify_report = report.gate_module("verify/verify_report.py")
 TAG = "0123456789abcdef0123456789abcdef"   # an image tag, as a key in an item's ImageBlurHashes
 
 
@@ -40,6 +41,15 @@ class SessionReportTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(data if isinstance(data, str) else json.dumps(data))
 
+    def verify_run(self, d, raw, log=True):
+        """What gates/verify/run.sh leaves: verify.json, then result.json and report.html from verify's own code."""
+        self.write(d / "verify.json", raw)
+        if log:
+            self.write(d / "server.log", "the server's log\n")
+        doc = verify_report.build(str(d), "ferrofin:v9", "sha256:" + "a" * 64, "c0ffee1234567890", "2026-10-24T12:00:00+00:00")
+        verify_report.result.write(str(d), doc)
+        verify_report.write_report(str(d), doc)
+
     def adoption_run(self, d, rows, unfinished=()):
         """What gates/adoption/run.sh records: a begin per fixture, its checks, then its row."""
         recorder = adoption_report.Recorder(str(d))
@@ -52,7 +62,7 @@ class SessionReportTests(unittest.TestCase):
             recorder.begin(fixture, "path", "12.2.0")
 
     def every_gate(self, s):
-        self.write(s / "verify/verify.json", {"exit": 1, "libraries": {
+        self.verify_run(s / "verify", {"exit": 1, "libraries": {
             "movies": {"rows": [{"row": 1, "result": "PASS"}, {"row": 2, "result": "PASS"}, {"row": 13, "result": "SKIP"}]},
             "tvshows": {"rows": [{"row": 1, "result": "FAIL"}]}}})
         self.write(s / "verify/scan-behaviour-movies.txt", "rows\n")
@@ -94,7 +104,8 @@ class SessionReportTests(unittest.TestCase):
         for text in ("Gates session release-v9-20261024-1200", "c0ffee123456", "ferrofin:v9 (sha256:aaaaaaaaaaaa)",
                      "jellyfin/jellyfin@sha256:pin",
                      "<a href='adoption/report.html'>adoption report</a>", "<a href='verify.log'>log</a>",
-                     "<a href='verify/scan-behaviour-movies.txt'>movies rows</a>"):
+                     "<b><a href='verify/report.html'>verify report</a></b><br><span class='meta'>"
+                     "<a href='verify/scan-behaviour-movies.txt'>movies rows</a> · "):
             self.assertIn(text, page)
         self.assertNotIn(self.tmp.name, page)   # every link is relative: the page opens from anywhere
         self.assertIn("| parity | failed (exit 1) | new differences: 2 requests differ | new differences 4, groups not filed 2, "
@@ -151,7 +162,7 @@ class SessionReportTests(unittest.TestCase):
     def test_missing_corrupt_and_misshapen_results_are_shown_as_such(self):
         s = self.session(report.GATES, {g: ("failed", 1) for g in report.GATES})
         self.write(s / "parity/results.json", "{not json")
-        self.write(s / "verify/verify.json", {"exit": 3, "libraries": {"movies": None, "tvshows": None}})
+        self.verify_run(s / "verify", {"exit": 3, "libraries": {"movies": None, "tvshows": None}})
         self.write(s / "bench/run.json", {})
         self.write(s / "bench/ferrofin/phases.json", ["not", "a", "map"])
         rows = self.rows(s)
@@ -178,16 +189,45 @@ class SessionReportTests(unittest.TestCase):
         session.end(str(s))
         rows = self.rows(s)
         self.assertEqual(report.status_word(rows["verify"]), "failed, interrupted")
-        self.assertEqual(rows["verify"]["problem"], "no verify.json: the gate ended before its check finished")
+        self.assertEqual(rows["verify"]["problem"], "no result.json: the gate ended before writing its result; "
+                                                    "no report.html: the gate ended before writing its report")
 
     def test_a_verify_run_stopped_during_its_second_library_is_incomplete(self):
         s = self.session(["verify"], {"verify": ("failed", 143)})
-        self.write(s / "verify/verify.json", {"exit": 143, "libraries": {
+        self.verify_run(s / "verify", {"exit": 143, "libraries": {
             "movies": {"rows": [{"row": 1, "result": "PASS"}]}, "tvshows": None}})
         row = self.rows(s)["verify"]
         self.assertEqual((row["verdict"], row["problem"], row["bad"]),
                          ("incomplete", "no rows from the tvshows library: the check ended before them "
                                         "(the run's exit 143, see the log)", True))
+
+    def test_verify_links_its_report_first_then_its_raw_files_and_log(self):
+        s = self.session(["verify"], {"verify": ("passed", 0)})
+        self.verify_run(s / "verify", {"exit": 0, "libraries": {"movies": {"rows": [{"row": 1, "result": "PASS"}]},
+                                                                "tvshows": {"rows": [{"row": 1, "result": "PASS"}]}}})
+        self.write(s / "verify/scan-behaviour-movies.txt", "rows\n")
+        row = self.rows(s)["verify"]
+        self.assertEqual((row["verdict"], row["problem"]), ("passed", None))
+        self.assertEqual(row["links"], [("verify report", "verify/report.html"), ("movies rows", "verify/scan-behaviour-movies.txt"),
+                                        ("result.json", "verify/result.json"), ("verify.json", "verify/verify.json"),
+                                        ("server log", "verify/server.log"), ("log", "verify.log")])
+
+    def test_a_verify_run_from_before_result_json_says_how_to_add_one(self):
+        s = self.session(["verify"], {"verify": ("passed", 0)})
+        self.write(s / "verify/verify.json", {"exit": 0, "libraries": {"movies": None, "tvshows": None}})
+        self.assertIn("no result.json: a run from before verify wrote one (python3 gates/verify/verify_report.py",
+                      self.rows(s)["verify"]["problem"])
+
+    def test_a_verify_result_that_is_not_a_valid_envelope_is_unreadable(self):
+        s = self.session(["verify"], {"verify": ("failed", 1)})
+        self.write(s / "verify/result.json", {"schema": 1, "gate": "verify"})
+        self.assertIn("result.json is not a valid result: missing", self.rows(s)["verify"]["problem"])
+        self.verify_run(s / "verify", {"exit": 0, "libraries": {"movies": None, "tvshows": None}})
+        other = {**json.loads((s / "verify/result.json").read_text()), "gate": "parity"}
+        self.write(s / "verify/result.json", other)
+        self.assertEqual(self.rows(s)["verify"]["problem"], "result.json is parity's result, not verify's")
+        self.write(s / "verify/result.json", "{cut")
+        self.assertIn("result.json cannot be read", self.rows(s)["verify"]["problem"])
 
     def test_a_page_on_disk_is_linked_even_when_the_result_beside_it_cannot_be_read(self):
         s = self.session(["parity"], {"parity": ("failed", 1)})
