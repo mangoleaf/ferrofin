@@ -3,10 +3,12 @@
 gates/report.py reads it.
 
     session.py new RUNS --gates G[,G…] --branch B --commit C --dirty true|false --image I --image-id ID
-                   --oracle-image O [--previous P --previous-id ID]
+                   --oracle-image O [--oracle-pin JSON] [--previous P --previous-id ID]
         make RUNS/<branch>-<YYYYMMDD-HHMM> (slashes and other characters a directory name should not
         hold become dashes; a rerun in the same minute gets -run2, -run3 …), write its session.json
-        with every gate pending, and print the directory
+        with every gate pending, and print the directory. --oracle-pin is what
+        `gates/bench/oracle.py check` printed: its tag, and its note on a newer Jellyfin release,
+        join the oracle image in the record
     session.py gate SESSION GATE STATUS [--exit N] [--note TEXT]
         record a gate's status: running stamps its start; passed, failed and skipped its end, with
         the exit status and a note (interrupted, say) when given
@@ -42,8 +44,9 @@ def save(session, record):
 
 
 def new(runs, gates, branch, commit, dirty, image, image_id, oracle_image, previous=None, previous_id=None,
-        when=None):
-    """The new session's directory, made with os.mkdir so two sessions never share one."""
+        when=None, oracle_pin=None):
+    """The new session's directory, made with os.mkdir so two sessions never share one.
+    `oracle_pin` is `oracle.check()`'s result, when the session checked the pin."""
     unknown = [g for g in gates if g not in GATES]
     if not gates or unknown:
         raise ValueError(f"unknown gate {', '.join(unknown) or '(none)'}: choose from {', '.join(GATES)}")
@@ -57,8 +60,9 @@ def new(runs, gates, branch, commit, dirty, image, image_id, oracle_image, previ
             break
         except FileExistsError:
             n += 1
+    oracle = {"image": oracle_image} | {k: v for k, v in (oracle_pin or {}).items() if k in ("tag", "note")}
     record = {"name": os.path.basename(session), "branch": branch, "commit": commit, "dirty": dirty,
-              "image": {"ref": image, "id": image_id}, "oracle": {"image": oracle_image},
+              "image": {"ref": image, "id": image_id}, "oracle": oracle,
               "started": now(), "ended": None,
               "gates": {g: {"status": "pending", "started": None, "ended": None, "exit": None} for g in gates}}
     if previous:
@@ -108,7 +112,8 @@ def main(argv):
         if args[:1] == ["new"] and len(args) == 2:
             print(new(args[1], opts.get("gates", "").split(","), opts["branch"], opts["commit"],
                       opts["dirty"] == "true", opts["image"], opts["image-id"], opts["oracle-image"],
-                      opts.get("previous"), opts.get("previous-id")))
+                      opts.get("previous"), opts.get("previous-id"),
+                      oracle_pin=json.loads(opts["oracle-pin"]) if "oracle-pin" in opts else None))
         elif args[:1] == ["gate"] and len(args) == 4:
             gate(args[1], args[2], args[3], int(opts["exit"]) if "exit" in opts else None, opts.get("note"))
         elif args[:1] == ["end"] and len(args) == 2:

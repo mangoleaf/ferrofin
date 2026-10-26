@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """The Jellyfin oracle pin, shared by the benchmark and the parity harness (stdlib only).
 
-    oracle.py check [--gate]
-        print the oracle as JSON ({"tag", "image"}) and check it against the latest Jellyfin
-        release. A pin behind it, or a lookup that failed, warns on stderr; with --gate (a
-        release-gate run) it refuses instead and exits 1. Exits 2 when the pin cannot be read.
+    oracle.py check
+        print the oracle as JSON ({"tag", "image"}, and "note" when a newer Jellyfin release is
+        out or the latest cannot be looked up; the note is also printed on stderr). A newer
+        release never refuses a run, a release gate's included. Exits 2 when the pin cannot be
+        read: no UPSTREAM_TAG, one that is not a release tag, or no pinned image.
     oracle.py matches VERSION
         exit 1 unless VERSION (what the pinned image's Jellyfin reports) is UPSTREAM_TAG's release
 
-The oracle is the Jellyfin release named by `UPSTREAM_TAG` in the Rust source (always the latest
-Jellyfin release), pinned by digest in `testdata/jellyfin-image.txt`. When a newer release is
-out, the pin is stale: moving it means moving `UPSTREAM_TAG`, pinning that release's image and
-preparing the corpus again (`testdata/build.sh --prepare-jellyfin`).
+The oracle is the Jellyfin release named by `UPSTREAM_TAG` in the Rust source, pinned by digest
+in `testdata/jellyfin-image.txt`. It is the latest Jellyfin release when a release branch is cut,
+and the branch keeps it: a release is measured against the Jellyfin release its branch pins, and
+the next release branch moves to the newest one (owner decision 2026-10-25). So a newer release
+is noted, and recorded wherever the oracle is, never refused. Moving the pin means moving
+`UPSTREAM_TAG`, pinning that release's image and preparing the corpus again
+(`testdata/build.sh --prepare-jellyfin`).
 """
 
 import json
@@ -67,20 +71,29 @@ def ls_remote():
 
 
 def check(root=ROOT, ls_remote=ls_remote):
-    """`(oracle, problem)`: the pinned oracle, and why it cannot be trusted to be the latest
-    Jellyfin release (None when it is)."""
-    info = {"tag": upstream_tag(root), "image": pinned_image(root)}
-    try:
+    """The pinned oracle, `{"tag", "image"}`, with a `note` when a newer Jellyfin release is out
+    or the latest cannot be looked up: what a run records beside the oracle it was measured
+    against, never a reason to refuse it. Raises OSError or ValueError when the pin cannot be
+    read, before anything is looked up."""
+    tag, image = upstream_tag(root), pinned_image(root)
+    if not RELEASE.fullmatch(tag):
+        raise ValueError(f"UPSTREAM_TAG {tag} in {UPSTREAM_SOURCE} is not a Jellyfin release tag")
+    if not image:
+        raise ValueError(f"{PIN} is empty")
+    info = {"tag": tag, "image": image}
+    pinned = f"measured against Jellyfin {tag}, the release this branch pins"
+    try:   # ValueError: an HTTP_TIMEOUT_S that is not a number, a lookup problem like the others
         newest = latest(release_tags(ls_remote()))
-    except (OSError, subprocess.SubprocessError) as err:
+    except (OSError, ValueError, subprocess.SubprocessError) as err:
         detail = (getattr(err, "stderr", None) or "").strip()
-        return info, f"cannot look up the latest Jellyfin release ({err}{': ' + detail if detail else ''})"
+        info["note"] = (f"{pinned}; the latest Jellyfin release could not be looked up "
+                        f"({err}{': ' + detail if detail else ''})")
+        return info
     if newest is None:
-        return info, f"no Jellyfin release tags found at {REPO}"
-    if version(newest) > version(info["tag"]):
-        return info, (f"Jellyfin {newest} is out; the oracle pin is {info['tag']}. Move UPSTREAM_TAG, "
-                      f"pin {newest}'s image in {PIN} and prepare the corpus again")
-    return info, None
+        info["note"] = f"{pinned}; no Jellyfin release tags found at {REPO}"
+    elif version(newest) > version(tag):
+        info["note"] = f"{pinned}; {newest} is out"
+    return info
 
 
 def main(argv):
@@ -92,18 +105,16 @@ def main(argv):
         print(f"oracle: the pinned image {pinned_image()} reports Jellyfin {argv[1]}, not the oracle "
               f"{tag}: pin {tag}'s image in {PIN} and prepare the corpus again", file=sys.stderr)
         return 1
-    if not argv or argv[0] != "check" or set(argv[1:]) - {"--gate"}:
+    if argv != ["check"]:
         sys.exit(__doc__)
-    gate = "--gate" in argv
     try:
-        info, problem = check()
+        info = check()
     except (OSError, ValueError) as err:
-        print(f"oracle: {err}", file=sys.stderr)
+        print(f"oracle: cannot read the pin: {err}", file=sys.stderr)
         return 2
     print(json.dumps(info))
-    if problem:
-        print(f"oracle: {'refusing' if gate else 'warning'}: {problem}", file=sys.stderr)
-        return 1 if gate else 0
+    if "note" in info:
+        print(f"oracle: {info['note']}", file=sys.stderr)
     return 0
 
 

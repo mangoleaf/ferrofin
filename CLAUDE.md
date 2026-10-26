@@ -170,10 +170,11 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
   (`create_router`, `AppState`, `error.rs` with `IntoResponse`, a `utoipa` `ApiDoc`).
 - **Port faithfully.** When implementing behavior that mirrors Jellyfin, port it faithfully
   from the upstream C# (github.com/jellyfin/jellyfin) at `UPSTREAM_TAG` — including regex tables
-  copied verbatim. That tag is always the **latest Jellyfin release** (owner decision
-  2026-10-16), never a release candidate or an older tag. If
+  copied verbatim. That tag is the **latest Jellyfin release when a release branch is cut**
+  (owner decisions 2026-10-16 and 2026-10-25), never a release candidate. The release branch
+  keeps it until its release, and the next release branch moves to the newest release. If
   `git ls-remote --tags https://github.com/jellyfin/jellyfin` shows a newer release, say so: the
-  pin is stale and moving it is a work item (see `UPSTREAM_TAG` in `handlers/mod.rs`).
+  next release branch moves to it (see `UPSTREAM_TAG` in `handlers/mod.rs`).
   Where Jellyfin ships xUnit tests, transliterate the `[Theory]/[InlineData]` cases directly
   into `rstest` `#[case]` tests: the C# expected values are the oracle.
 - **Metrics** (`/metrics`, `ferrofin-metrics`): all metric work follows
@@ -333,8 +334,9 @@ keeps day-to-day work fast:
 The fast stdlib reporter correctness tests (`gates/bench/test_report.py`) do run in CI and gate
 releases; they start no servers and impose no performance thresholds. The benchmark
 reference is the Jellyfin release named by `UPSTREAM_TAG` (below), pinned by digest in
-`gates/bench/testdata/jellyfin-image.txt`; `gates/bench/oracle.py` refuses a release-gate run while a
-newer Jellyfin release exists, and an ad-hoc run warns.
+`gates/bench/testdata/jellyfin-image.txt`. A release is measured against the Jellyfin release its
+branch pins: when a newer one is out, `gates/bench/oracle.py` notes it and every run records the
+note with the oracle; no run refuses it, a release gate's included. Only a pin it cannot read is refused.
 
 Parity in the project's sense, implementation compared against the upstream C# and recorded
 in `handlers::VERIFIED`, is still done per change. Only measurement moved.
@@ -392,8 +394,8 @@ which is a different pin from the C# release named below, deliberately. The cont
 API real clients speak, and Jellyfin 12's own surface is smaller (12.0-rc7 and 12.1.0: 364 operations to 10.11.8's 412 — it drops the
 DynamicHls family, `/MusicGenres`, `/CriticReviews` and more), so satisfying it would break
 clients. See `contracts/README.md`. The Jellyfin C# release each `VERIFIED` row was compared
-*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.2`, the latest
-Jellyfin release; rows compared against an earlier pin are listed in
+*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.2`, the release
+this branch pins; rows compared against an earlier pin are listed in
 `VERIFIED_AGAINST_EARLIER_PIN` until they are re-checked.
 Owner's standing definition: **"deep verified" means the
 Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral

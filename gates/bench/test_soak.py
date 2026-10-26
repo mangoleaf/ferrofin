@@ -183,6 +183,16 @@ class SessionTests(unittest.TestCase):
         self.assertIn("A/B gate — 1 regressed", (out / "02-b" / "report.html").read_text())
         self.assertIsNone(report.load_verdicts([str(out / "01-a")]))  # the previous release is not judged
 
+    def test_the_soak_verdict_and_report_carry_the_oracle_and_a_newer_release(self):
+        pin = {"tag": "v12.2", "image": "jf@sha256:abc",
+               "note": "measured against Jellyfin v12.2, the release this branch pins; v12.3 is out"}
+        out = self.session([2.0, 2.5])
+        plan = json.loads((out / "gate.json").read_text())
+        (out / "gate.json").write_text(json.dumps(plan | {"oracle": pin}))
+        md, _ = gate.render(str(out))
+        self.assertEqual(json.loads((out / "verdict.json").read_text())["oracle"], pin)
+        self.assertIn(f"Jellyfin oracle v12.2 (jf@sha256:abc) — {pin['note']}", md)
+
     def test_an_unmeasured_soak_blocks_because_it_cannot_be_judged(self):
         out = self.session([2.0, None])
         md, got = gate.render(str(out))
