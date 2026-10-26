@@ -1850,6 +1850,28 @@ def run_dir(root, name, harness=None):
     return root if name == os.path.basename(os.path.abspath(root)) else None
 
 
+def found_runs(harness, root):
+    """`[(mtime, run name, label, directory)]` of the adoption, parity or verify runs under `root`, one
+    directory or a list of them (adoption's default is both the output root's work/ and runs/); a name
+    found twice is the first directory's."""
+    out, seen = [], set()
+    for base in (root if isinstance(root, (list, tuple)) else [root]):
+        if not base or not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)) + [os.path.basename(os.path.abspath(base))]:
+            if os.path.isfile(os.path.join(base, name, "session.json")):   # a gates/run session: its gate's folder
+                name = f"{name}/{harness}"
+            elif other_gate(harness, name):
+                continue
+            d = run_dir(base, name, harness)
+            page = d and run_page(d, harness)
+            if name not in seen and page:
+                seen.add(name)
+                when = datetime.fromtimestamp(os.path.getmtime(page)).strftime("%Y-%m-%d %H:%M")
+                out.append((os.path.getmtime(page), name, f"{name}  ·  {when}", d))
+    return out
+
+
 def discover(harness, root):
     """`[(run name, label)]`, newest first, for the runs of `harness` under `root`.
 
@@ -1857,24 +1879,10 @@ def discover(harness, root):
     `--html` or `run.sh` wrote one; the viewer renders it otherwise). An adoption or parity
     run is a directory holding a `report.html`, a verify run one holding a `report.html` or a
     `result.json`; `root` itself counts as a run when it holds one, because a harness writes
-    its report into its work directory."""
-    if not root or not os.path.isdir(root):
-        return []
+    its report into its work directory. `root` may be a list of directories (`found_runs`)."""
     if harness == "benchmark":
-        return list_runs(root)
-    out, seen = [], set()
-    for name in sorted(os.listdir(root)) + [os.path.basename(os.path.abspath(root))]:
-        if os.path.isfile(os.path.join(root, name, "session.json")):   # a gates/run session: its gate's folder
-            name = f"{name}/{harness}"
-        elif other_gate(harness, name):
-            continue
-        d = run_dir(root, name, harness)
-        page = d and run_page(d, harness)
-        if name not in seen and page:
-            seen.add(name)
-            when = datetime.fromtimestamp(os.path.getmtime(page)).strftime("%Y-%m-%d %H:%M")
-            out.append((os.path.getmtime(page), name, f"{name}  ·  {when}"))
-    return [(n, lbl) for _, n, lbl in sorted(out, reverse=True)]
+        return list_runs(root) if root and os.path.isdir(root) else []
+    return [(n, lbl) for _, n, lbl, _ in sorted(found_runs(harness, root), reverse=True)]
 
 
 def tabs_html(active):
@@ -2042,7 +2050,10 @@ def handle(target, roots):
             return reply(404, page_html("Not found", "<h1>No such run</h1>"))
         if harness == "benchmark":
             return reply(*benchmark_report(roots["benchmark"], name))
-        page = run_page(run_dir(roots[harness], name, harness), harness)
+        d = next((d for _, n, _, d in found_runs(harness, roots[harness]) if n == name), None)
+        if d is None:   # removed since it was listed
+            return reply(404, page_html("Not found", "<h1>No such run</h1>"))
+        page = run_page(d, harness)
         if page.endswith("result.json"):
             return reply(*verify_report(os.path.dirname(page), name))
         with open(page, "rb") as f:
@@ -2249,9 +2260,9 @@ def main():
     if args and args[0] == "--serve":
         rest = args[1:]
         roots = {}
-        # Under the output root (gates/lib.sh) each tab has a default: runs/, and adoption's work/.
+        # Under the output root (gates/lib.sh) each tab has a default: runs/, and for adoption work/ as well.
         gates = os.environ.get("FERROFIN_GATES_DIR")
-        under_root = {"adoption": "work", "parity": "runs", "verify": "runs"}
+        under_root = {"parity": "runs", "verify": "runs"}
         for key, _, flag, env in HARNESSES[1:]:
             if flag in rest:
                 i = rest.index(flag)
@@ -2261,6 +2272,11 @@ def main():
                 del rest[i:i + 2]
                 if not os.path.isdir(roots[key]):
                     sys.exit(f"{roots[key]} is not a directory")
+            elif key == "adoption" and gates and not os.environ.get(env):   # standalone runs, and sessions'
+                roots[key] = [d for d in (os.path.join(gates, "work"), os.path.join(gates, "runs")) if os.path.isdir(d)] or None
+                if not roots[key]:
+                    sys.stderr.write(f"neither {gates}/work nor {gates}/runs (from FERROFIN_GATES_DIR) is a directory: "
+                                     "the adoption tab stays empty\n")
             else:  # a variable may be set for every shell: a missing directory is an empty tab
                 source = env if os.environ.get(env) else "FERROFIN_GATES_DIR" if gates else None
                 roots[key] = os.environ.get(env) or (gates and os.path.join(gates, under_root[key])) or None

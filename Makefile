@@ -17,7 +17,7 @@ help:
 	@echo "make run-verify|run-adoption|run-parity|run-bench   one gate, as a session"
 	@echo "    IMAGE=<image>  the image under test; PREVIOUS=<image>  bench as the release A/B gate"
 	@echo "make test-gates-offline        the gates' own tests: no docker, server or fixtures"
-	@echo "make publish-results VERSION=vX.Y.Z BENCH=\"RUN RUN RUN\"   the release's summary, README Results and graphs"
+	@echo "make publish-results VERSION=vX.Y.Z SESSION=DIR BENCH=\"RUN RUN RUN\"   the release's summary, README Results and graphs"
 
 run-gates:
 	$(GATES_RUN) all
@@ -35,12 +35,14 @@ run-bench:
 	$(GATES_RUN) bench
 
 # A release's published results (gates/README.md, "Publishing the results"): docs/results/<VERSION>/summary.json
-# from the local runs named (three or more Jellyfin-comparison benchmark runs), then the README Results block
-# and its graphs from every summary file. Both are taken from the command line only.
+# from the local results named (the release's gates session, and three or more Jellyfin-comparison benchmark
+# runs), then the README Results block and its graphs from every summary file. All are taken from the command
+# line only.
 publish-results:
 	$(if $(call cli,VERSION),,$(error VERSION=vX.Y.Z is required))
+	$(if $(call cli,SESSION),,$(error SESSION=DIR is required: the release's gates session, for its adoption status))
 	$(if $(call cli,BENCH),,$(error BENCH="RUN RUN RUN" is required: three or more Jellyfin-comparison runs))
-	python3 gates/publish.py summarise --version '$(VERSION)' --bench $(BENCH)
+	python3 gates/publish.py summarise --version '$(VERSION)' --session '$(SESSION)' --bench $(BENCH)
 	python3 gates/publish.py readme
 
 # The gates' own tests, which need no docker, server or fixtures: shellcheck, the bats tests and the

@@ -76,7 +76,7 @@ every gate included:
 | Gate | Counts | Links to |
 |---|---|---|
 | verify | checks passed, failed and skipped, over both libraries, from its `result.json` | the verify report; each library's rows, `result.json`, `verify.json` and the server log |
-| adoption | fixture rows passed, failed, unfinished and skipped, by the adoption report's own rules | the adoption report |
+| adoption | from its `result.json`: fixture rows passed, failed, unfinished and skipped, by the adoption report's own rules | the adoption report |
 | parity | new differences, the groups of them not filed yet, requests sent and planned; the verdict and its reason | the parity report |
 | bench | from its `result.json`: phases completed, failed, unfinished and skipped; for the A/B gate (`--previous`), the gated cells regressed, not comparable, improved and within noise, and whether anything blocks | the benchmark or A/B gate report |
 
@@ -89,10 +89,11 @@ Every gate is moving to one structured result, `<run>/result.json`, in the envel
 [`result.py`](result.py) defines and validates: `schema`, `gate`, `verdict`, `counts`, `source`
 (`commit`, `image`, `image_digest`, `oracle`, `host_class` (cores and memory, never a host name),
 `fixture`), `started`, `ended`, and `detail`, the gate's own data. Its HTML report, this page and the
-viewer read that file, never the gate's internal files. verify and bench write one today.
+viewer read that file, never the gate's internal files. verify, adoption and bench write one today.
 
-For a Jellyfin-comparison benchmark the page also shows the README's graphs for that one run
-([`publish.py`](publish.py), inline, in the reader's light or dark theme).
+The page also shows the README's graphs for the session's own results ([`publish.py`](publish.py), inline,
+in the reader's light or dark theme): the adoption grid, and for a Jellyfin-comparison benchmark the speed
+and memory graphs of that one run.
 
 ## Publishing the results
 
@@ -101,14 +102,16 @@ release that stays in the repository, `docs/results/<version>/summary.json`. The
 local runs it is made from; nothing is picked automatically, and nothing here runs a gate:
 
 ```bash
-make publish-results VERSION=v1.4.0 BENCH="$FERROFIN_GATES_DIR/runs/<session>/bench …"   # three or more runs
+make publish-results VERSION=v1.4.0 SESSION="$FERROFIN_GATES_DIR/runs/<session>" BENCH="<run> <run> <run>"
 ```
 
 That runs [`publish.py`](publish.py) twice:
-- `summarise` reads each named run's `result.json` and writes the summary. It holds only the numbers
-  the README shows, each with its source: the run folders, commit, image digest, Jellyfin version, run
-  count, host class (cores and memory) and fixture hash. It refuses fewer than three Jellyfin-comparison
-  runs, and runs of different images, hosts or fixtures.
+- `summarise` reads each named benchmark run's `result.json`, and the session's `adoption/result.json`,
+  and writes the summary. It holds only the numbers the README shows, each with its source: the run
+  folders, commit, image digest, Jellyfin version, run count, host class (cores and memory) and fixture
+  hash. It also holds the adoption status of every row of the session, with the session's commit and date.
+  It refuses fewer than three Jellyfin-comparison runs, and runs of different images, hosts or fixtures. It
+  also refuses a session of uncommitted code, or one that measured another commit than the runs.
 - `readme` draws every graph of the newest summary into `docs/results/<version>/`, a light and a dark SVG
   each, and replaces the block between the `BEGIN`/`END GENERATED RESULTS` markers in `README.md`. The same
   summary files give byte-identical output, and `publish.py readme --check` exits 1 when the block or the
@@ -122,3 +125,6 @@ evidence is incomplete, is withheld and listed with its reason under the graphs.
 - time to first screen;
 - peak and idle memory;
 - CPU per completed screen, where the work matched.
+
+Below them, a grid gives the adoption status of every supported Jellyfin version and upgrade route:
+passed, failed, skipped (a fixture that was not built) or unfinished, with a table of the reasons.

@@ -127,6 +127,22 @@ class ViewerTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn('result.json is not a valid result', page)
 
+    def test_the_adoption_tab_lists_standalone_runs_and_every_session_s_adoption(self):
+        work, runs = self.root / 'gates' / 'work', self.root / 'gates' / 'runs'
+        self.report_html(work, 'adoption', '<p>standalone</p>')   # gates/adoption/run.sh's work/adoption
+        self.report_html(runs / 'release-v1.4.0-20261026-0101', 'adoption', '<p>in a session</p>')
+        (runs / 'release-v1.4.0-20261026-0101' / 'session.json').write_text('{}')
+        roots = {**self.roots, 'adoption': [str(work), str(runs)]}
+        self.assertEqual({n for n, _ in report.discover('adoption', roots['adoption'])},
+                         {'adoption', 'release-v1.4.0-20261026-0101/adoption'})
+        self.assertEqual(self.get('/report/adoption/adoption', roots)[2], '<p>standalone</p>')
+        self.assertEqual(self.get('/report/adoption/release-v1.4.0-20261026-0101/adoption', roots)[2], '<p>in a session</p>')
+        self.assertEqual(self.get('/report/adoption/../secret', roots)[0], 404)
+        self.report_html(runs, 'adoption', '<p>a stray run named like work/adoption</p>')   # a name in both: the first root's
+        self.assertEqual(self.get('/report/adoption/adoption', roots)[2], '<p>standalone</p>')
+        self.assertEqual({n for n, _ in report.discover('adoption', [str(runs)])},   # one of the two alone
+                         {'adoption', 'release-v1.4.0-20261026-0101/adoption'})
+
     def test_discovery_without_a_directory_is_empty(self):
         self.assertEqual(report.discover('parity', None), [])
         self.assertEqual(report.discover('parity', str(self.root / 'missing')), [])
@@ -349,13 +365,13 @@ class ViewerTests(unittest.TestCase):
         gates = self.root / 'gates'
         runs, work = gates / 'runs', gates / 'work'
         cases = [  # (argv, environment beyond the root, the tabs served)
-            (['--serve'], {}, {'benchmark': str(runs), 'adoption': str(work), 'parity': str(runs), 'verify': str(runs)}),
+            (['--serve'], {}, {'benchmark': str(runs), 'adoption': [str(work), str(runs)], 'parity': str(runs), 'verify': str(runs)}),
             # a positional RUNS_DIR, a flag and a variable each still win over the root
             (['--serve', str(self.bench), '--parity-dir', str(self.parity)], {'FERROFIN_ADOPTION_RUNS': str(self.adoption)},
              {'benchmark': str(self.bench), 'adoption': str(self.adoption), 'parity': str(self.parity), 'verify': str(runs)}),
             # a variable naming a missing directory is an empty tab, not the root's
             (['--serve'], {'FERROFIN_PARITY_RUNS': str(self.root / 'missing')},
-             {'benchmark': str(runs), 'adoption': str(work), 'parity': None, 'verify': str(runs)}),
+             {'benchmark': str(runs), 'adoption': [str(work), str(runs)], 'parity': None, 'verify': str(runs)}),
         ]
         self.parity.mkdir()
         self.adoption.mkdir()
@@ -365,7 +381,7 @@ class ViewerTests(unittest.TestCase):
                 runs.mkdir()
             else:  # an adoption-only root has no runs/ yet: empty benchmark and parity tabs, not an exit
                 runs.rmdir()
-                cases = [(['--serve'], {}, {'benchmark': str(runs), 'adoption': str(work), 'parity': None, 'verify': None})]
+                cases = [(['--serve'], {}, {'benchmark': str(runs), 'adoption': [str(work)], 'parity': None, 'verify': None})]
             for argv, env, tabs in cases:
                 with self.subTest(argv=argv, env=env, runs=create_runs), \
                         patch.dict('os.environ', {'FERROFIN_GATES_DIR': str(gates), **env}, clear=True), \

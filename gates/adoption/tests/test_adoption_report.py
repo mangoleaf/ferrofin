@@ -334,6 +334,54 @@ class Robustness(Scratch):
         self.assertTrue(recorder.started)
 
 
+class ResultJson(Scratch):
+    """WORK/result.json: the same reading of the run as the page, in every gate's envelope (gates/result.py)."""
+
+    def test_the_result_holds_every_row_as_the_page_shows_it(self):
+        self.recorder.start("gates/adoption/run.sh", image="ferrofin:x", oracle="12.2", image_id="sha256:abc", commit="c0ffee")
+        self.recorder.begin("passed", "path", "12.2.0")
+        self.recorder.check("passed", "after adoption", "boot log", "PASS")
+        self.recorder.row("passed", "path", "12.2.0", "PASS")
+        self.recorder.begin("failed-check", "messy", "12.2.0")
+        self.recorder.check("failed-check", "after adoption", "shapes", "FAIL", "gone_file_userdata differs")
+        self.recorder.row("failed-check", "messy", "12.2.0", "PASS")   # a failed check fails the row whatever it says
+        self.recorder.row("missing", "path", "10.11.11", "SKIP", "fixture not built")
+        self.recorder.attach("scale", "scale", SCALE)
+        self.recorder.row("scale", "scale", "10.11.11", "PASS")
+        self.recorder.begin("killed", "path", "12.1.0")   # never finished
+        page = self.page()
+        doc = report.gate_result().read(str(self.work), "adoption")   # a valid envelope, adoption's
+        self.assertEqual((doc["verdict"], doc["counts"]), ("failed", {"pass": 2, "fail": 1, "incomplete": 1, "skip": 1}))
+        self.assertEqual({k: doc["source"][k] for k in ("commit", "image", "image_digest", "oracle")},
+                         {"commit": "c0ffee", "image": "ferrofin:x", "image_digest": "sha256:abc", "oracle": "12.2"})
+        rows = {r["fixture"]: r for r in doc["detail"]["rows"]}
+        self.assertEqual({f: r["verdict"] for f, r in rows.items()},
+                         {"passed": "PASS", "failed-check": "FAIL", "missing": "SKIP", "scale": "PASS", "killed": "INCOMPLETE"})
+        self.assertEqual(rows["failed-check"]["checks"], [{"stage": "after adoption", "check": "shapes", "verdict": "FAIL",
+                                                          "detail": "gone_file_userdata differs"}])
+        self.assertEqual(rows["scale"]["scale"]["migration_seconds"], 12.5)
+        self.assertEqual(rows["missing"]["detail"], "fixture not built")
+        for fixture, row in rows.items():   # the page lists the same rows with the same verdicts
+            self.assertIn(f"<code>{fixture}</code>", page)
+            self.assertIn(f"<span class='v {row['verdict']}'>", page.split(f"<code>{fixture}</code>", 1)[1][:200])
+        self.assertIsNotNone(doc["started"])
+
+    def test_an_empty_run_is_nothing_ran_and_start_forgets_the_previous_result(self):
+        self.recorder.start("run")
+        self.recorder.build()
+        self.assertEqual(report.gate_result().read(str(self.work), "adoption")["verdict"], "nothing ran")
+        self.recorder.start("again")
+        self.assertFalse((self.work / report.RESULT).exists())   # a stale result never outlives its run
+
+    def test_start_takes_the_image_id_and_commit_from_the_command_line(self):
+        report.main(["start", str(self.work), "--title", "t", "--image", "i", "--image-id", "sha256:d", "--commit", "c"])
+        report.main(["row", str(self.work), "fx", "path", "12.2.0", "PASS"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(report.main(["build", str(self.work)]), 0)
+        source = json.loads((self.work / report.RESULT).read_text())["source"]
+        self.assertEqual((source["image_digest"], source["commit"]), ("sha256:d", "c"))
+
+
 class SharedViewer(Scratch):
     """The report is a self-contained page in a work directory: gates/bench/report.py --serve lists it."""
 

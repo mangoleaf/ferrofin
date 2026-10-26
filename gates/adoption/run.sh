@@ -31,7 +31,8 @@
 # Every check's verdict is recorded as it runs, and WORK/report.html (gates/adoption/adoption_report.py) is built from
 # those however the run ends: per fixture and stage, every check, the table-digest differences, the
 # messy shapes against Jellyfin 12.2 and the scale measurements. It opens from disk, and the shared
-# viewer lists it (python3 gates/bench/report.py --serve --adoption-dir WORK/..).
+# viewer lists it (python3 gates/bench/report.py --serve). WORK/result.json beside it holds the same rows
+# in every gate's envelope (gates/result.py): what the gates session page and the release summary read.
 # One PASS/FAIL line per fixture; exit status is non-zero if any failed. Each fixture
 # includes two boots and a full scan. Fixtures are synthetic and NOT in the repository:
 # build-fixtures.sh builds DIR (invented media under DIR/media, the only media mounted) — see
@@ -84,7 +85,9 @@ trap finish EXIT
 trap 'exit 130' INT   # bash runs the EXIT trap only on an exit, not on a fatal signal: the report is built either way
 trap 'exit 143' TERM
 trap 'exit 129' HUP
-record start "$WORK" --title "gates/adoption/run.sh" --image "$IMAGE" --oracle "$ORACLE_VERSION"
+record start "$WORK" --title "gates/adoption/run.sh" --image "$IMAGE" --oracle "$ORACLE_VERSION" \
+  --image-id "$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)" \
+  --commit "$(docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE" 2>/dev/null)"
 # fixture_line <kind> <verdict> <expected> <fixture> <detail>: the PASS/FAIL line, and the fixture's row in the report.
 fixture_line() {
   printf '%-5s %-9s %-28s %s\n' "$2" "$3" "$4" "$5"

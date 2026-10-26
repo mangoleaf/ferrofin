@@ -67,6 +67,8 @@ PRs or plugin development are welcome too if anyone wants to get involved!
 ## Results
 
 <!-- BEGIN GENERATED RESULTS — do not edit by hand. Regenerate with: make publish-results (gates/publish.py) -->
+### Speed and memory against Jellyfin
+
 Ferrofin **v1.4.0** against **Jellyfin 12.2.0**: the median of 3 runs on one host (32 cores, 125 GiB), each server alone in its container, over the same library, 2026-10-26. Every comparable cell is drawn, the biggest speed-up first.
 
 **12.1× faster cold start** · **2.2–4.1× the speed on 5 screens at 5 screens/s** · **2.6× lighter peak memory under load** · **2.6× lighter idle memory**
@@ -233,6 +235,37 @@ Withheld, because the servers did different work or the evidence is incomplete:
 - CPU per screen · stress level: Ferrofin: search:artists: ids differs for a request pick
 
 Source: detached-5112240e1923-20261026-0101/bench, detached-5112240e1923-20261026-0151/bench, detached-5112240e1923-20261026-0219/bench; commit `5112240e`, image `sha256:673a122ff717`, fixture `4b217db66afc`. The full tables are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); what each number means is in [`gates/bench/README.md`](gates/bench/README.md).
+
+### Adopting an existing Jellyfin database
+
+Each supported Jellyfin version and upgrade route, adopted in place by Ferrofin **v1.4.0** (commit `5112240e1923`) in a local gates session on 2026-10-26: **13 of 14 passed**. Adoption is one-way; see [Migrating from Jellyfin](#migrating-from-jellyfin).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/adoption-dark.svg">
+  <img alt="Adopting an existing Jellyfin database: every supported version and route: 13 of 14 passed; jellyfin-10.11.11-messy failed." src="docs/results/v1.4.0/adoption.svg">
+</picture>
+
+<details><summary>Adoption: every row</summary>
+
+| Jellyfin database | Kind | Checked at | Result | Why |
+|---|---|---|---|---|
+| jellyfin-10.11.8 | path | 10.11.8 | passed |  |
+| jellyfin-10.11.9 | path | 10.11.8 | passed |  |
+| jellyfin-10.11.10 | path | 10.11.11 | passed |  |
+| jellyfin-10.11.11 | path | 10.11.11 | passed |  |
+| jellyfin-12.0 | path | 12.0.0 | passed |  |
+| jellyfin-12.1-from-10 | path | 12.1.0 | passed |  |
+| jellyfin-12.1-from-12 | path | 12.1.0 | passed |  |
+| jellyfin-12.2-from-10 | path | 12.2.0 | passed |  |
+| jellyfin-12.2-from-12 | path | 12.2.0 | passed |  |
+| jellyfin-12.2-from-121 | path | 12.2.0 | passed |  |
+| jellyfin-12.2-fresh | path | 12.2.0 | passed |  |
+| jellyfin-10.11.11-messy | messy | 10.11.11 | failed | messy: gone_file_userdata: {'item': True, 'userdata_on_item': 2, 'userdata_with_key': 2}, expected {'item': False, 'userdata_on_item': 0, 'userdata_with_key': 2} (Jellyfin 12.2);after restart: messy:  |
+| jellyfin-12.2-messy | messy | 12.2.0 | passed |  |
+| jellyfin-10.11.11-scale | scale | 10.11.11 | passed |  |
+
+</details>
+
 <!-- END GENERATED RESULTS -->
 
 
