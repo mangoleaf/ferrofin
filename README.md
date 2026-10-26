@@ -269,6 +269,85 @@ Each supported Jellyfin version and upgrade route, adopted in place by Ferrofin 
 
 </details>
 
+### Answering like Jellyfin
+
+The parity gate replays the **2,353** requests jellyfin-web makes against Jellyfin 12.2.0 and Ferrofin **v1.4.0** (commit `5112240e`, a local gates session on 2026-10-26) and compares the answers. Of the 2,307 it could compare, **1,242 are identical** and **1,051 differ in accepted ways** (each recorded with its reason in the parity ledger); **2 are filed as issues** and **12 are new**. 46 were not compared because Jellyfin itself failed them.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/parity-dark.svg">
+  <img alt="Answering jellyfin-web like Jellyfin 12.2.0: of 2353 requests, 1242 identical, 1051 accepted differences, 2 filed as issues, 12 new differences, 46 not compared (Jellyfin failed them)." src="docs/results/v1.4.0/parity.svg">
+</picture>
+
+<details><summary>Parity: every API area</summary>
+
+| Area | Requests | Identical | Accepted | Filed | New | Not compared |
+|---|---|---|---|---|---|---|
+| /Items | 490 | 151 | 333 | 0 | 1 | 5 |
+| /Artists | 408 | 407 | 1 | 0 | 0 | 0 |
+| /Shows | 325 | 76 | 249 | 0 | 0 | 0 |
+| /Genres | 187 | 55 | 132 | 0 | 0 | 0 |
+| /MusicGenres | 187 | 60 | 127 | 0 | 0 | 0 |
+| /UserItems | 157 | 42 | 115 | 0 | 0 | 0 |
+| /Studios | 155 | 150 | 5 | 0 | 0 | 0 |
+| /Persons | 85 | 80 | 5 | 0 | 0 | 0 |
+| /LiveTv | 41 | 19 | 16 | 0 | 0 | 6 |
+| /Users | 32 | 20 | 12 | 0 | 0 | 0 |
+| /Sessions | 31 | 20 | 0 | 0 | 11 | 0 |
+| /Videos | 23 | 12 | 5 | 2 | 0 | 4 |
+| /SyncPlay | 22 | 21 | 1 | 0 | 0 | 0 |
+| /Playlists | 19 | 18 | 1 | 0 | 0 | 0 |
+| /Audio | 17 | 10 | 4 | 0 | 0 | 3 |
+| /Library | 17 | 15 | 2 | 0 | 0 | 0 |
+| /System | 17 | 12 | 5 | 0 | 0 | 0 |
+| /Plugins | 9 | 0 | 9 | 0 | 0 | 0 |
+| /Intros | 8 | 0 | 0 | 0 | 0 | 8 |
+| /Auth | 7 | 7 | 0 | 0 | 0 | 0 |
+| /Startup | 7 | 6 | 1 | 0 | 0 | 0 |
+| /Branding | 6 | 5 | 1 | 0 | 0 | 0 |
+| /Collections | 6 | 6 | 0 | 0 | 0 | 0 |
+| /Environment | 6 | 5 | 0 | 0 | 0 | 1 |
+| /ScheduledTasks | 6 | 4 | 1 | 0 | 0 | 1 |
+| /Channels | 5 | 3 | 2 | 0 | 0 | 0 |
+| /Devices | 5 | 4 | 1 | 0 | 0 | 0 |
+| /Backup | 4 | 1 | 3 | 0 | 0 | 0 |
+| /Localization | 4 | 4 | 0 | 0 | 0 | 0 |
+| /MergeVersions | 4 | 0 | 0 | 0 | 0 | 4 |
+| /Packages | 4 | 1 | 3 | 0 | 0 | 0 |
+| /QuickConnect | 4 | 2 | 2 | 0 | 0 | 0 |
+| /UserImage | 4 | 2 | 2 | 0 | 0 | 0 |
+| /Episode | 3 | 0 | 0 | 0 | 0 | 3 |
+| /MediaSegmentsApi | 3 | 0 | 0 | 0 | 0 | 3 |
+| /PlayingItems | 3 | 3 | 0 | 0 | 0 | 0 |
+| /UserViews | 3 | 1 | 2 | 0 | 0 | 0 |
+| /Albums | 2 | 2 | 0 | 0 | 0 | 0 |
+| /DisplayPreferences | 2 | 2 | 0 | 0 | 0 | 0 |
+| /FallbackFont | 2 | 2 | 0 | 0 | 0 | 0 |
+| /IntroSkipper | 2 | 0 | 0 | 0 | 0 | 2 |
+| /LiveStreams | 2 | 1 | 1 | 0 | 0 | 0 |
+| /MediaSegments | 2 | 2 | 0 | 0 | 0 | 0 |
+| /Movies | 2 | 1 | 1 | 0 | 0 | 0 |
+| /Providers | 2 | 0 | 1 | 0 | 0 | 1 |
+| /Repositories | 2 | 2 | 0 | 0 | 0 | 0 |
+| /SkipButtonCss | 2 | 0 | 0 | 0 | 0 | 2 |
+| /Trailers | 2 | 0 | 1 | 0 | 0 | 1 |
+| /UserFavoriteItems | 2 | 2 | 0 | 0 | 0 | 0 |
+| /UserPlayedItems | 2 | 2 | 0 | 0 | 0 | 0 |
+| /Years | 2 | 0 | 2 | 0 | 0 | 0 |
+| /web | 2 | 0 | 2 | 0 | 0 | 0 |
+| /ClientLog | 1 | 1 | 0 | 0 | 0 | 0 |
+| /FileTransformation | 1 | 0 | 0 | 0 | 0 | 1 |
+| /GetUtcTime | 1 | 1 | 0 | 0 | 0 | 0 |
+| /Jellyfin.Plugin.OpenSubtitles | 1 | 0 | 0 | 0 | 0 | 1 |
+| /Libraries | 1 | 0 | 1 | 0 | 0 | 0 |
+| /Playback | 1 | 0 | 1 | 0 | 0 | 0 |
+| /Search | 1 | 0 | 1 | 0 | 0 | 0 |
+| /Songs | 1 | 1 | 0 | 0 | 0 | 0 |
+| /Tmdb | 1 | 1 | 0 | 0 | 0 | 0 |
+
+Filed as issues: gl-832, gl-860.
+
+</details>
+
 <!-- END GENERATED RESULTS -->
 
 
