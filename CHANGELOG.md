@@ -79,6 +79,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   test pass `--locked`, so a manifest change without its lockfile fails instead of resolving
   anew. The release's cargo-zigbuild and ziglang are pinned (0.23.4 and 0.16.0, the pair the
   v1.3.2 aarch64 build used), and GitLab's `:latest` images to the versions they are today
+- A release is measured against the Jellyfin release its branch pins (`UPSTREAM_TAG`, the
+  latest release when the branch was cut): a newer Jellyfin release no longer refuses the
+  release A/B gate (`gate.py`, `gates/run --previous`) or `gates/parity/run.sh --gate`. It is
+  noted ("measured against Jellyfin v12.2, the release this branch pins; v12.3 is out") and
+  recorded with the oracle in `session.json`, `gate.json`, the verdict JSON, each run's
+  `run.json` and the reports. A pin that cannot be read (an `UPSTREAM_TAG` that is not a release
+  tag, an empty image pin) is still refused, and so is a pinned image that reports another
+  release (`oracle.py matches`). `oracle.py check` no longer takes `--gate`
 
 ### Parity
 - Find the playlists folder by its type when a playlist is created, as Jellyfin's

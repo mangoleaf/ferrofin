@@ -1575,33 +1575,47 @@ class GateTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r"fewer items.*'episodes': '7489 \(fixture 7490\)'"):
             scan.counts(api, 'u', summary)
 
-    def test_a_gate_run_refuses_a_stale_oracle_pin_before_anything_starts(self):
+    def test_a_gate_run_refuses_an_unreadable_oracle_pin_before_anything_starts(self):
         out = self.root / 'session'
-        with patch.object(gate.oracle, 'check', return_value=({'tag': 'v12.2', 'image': 'jf@sha256:x'},
-                                                              'Jellyfin v12.3 is out; the oracle pin is v12.2')), \
+        with patch.object(gate.oracle, 'check', side_effect=ValueError('UPSTREAM_TAG v12.3-rc1 is not a release')), \
                 patch.object(gate, 'image_ref', side_effect=AssertionError('docker touched')):
-            with self.assertRaisesRegex(SystemExit, 'v12.3 is out'):
+            with self.assertRaisesRegex(SystemExit, 'cannot read the Jellyfin oracle pin.*v12.3-rc1'):
                 gate.main(['ab', 'old', 'new', '--out', str(out), '--testdata', str(self.root / 'td')])
         self.assertFalse(out.exists())
 
-    def test_a_gate_run_records_the_oracle_it_checked_in_gate_json(self):
-        out = self.root / 'session'
-        pin = {'tag': 'v12.2', 'image': 'jf@sha256:x'}
-        with patch.object(gate.oracle, 'check', return_value=(pin, None)), \
-                patch.object(gate, 'image_ref', return_value='sha256:img'), \
-                patch.object(gate, 'run_session'), patch.object(gate, 'render', return_value=('', [])):
-            self.assertEqual(gate.main(['ab', 'old', 'new', '--out', str(out), '--testdata', str(self.root / 'td')]), 0)
-        self.assertEqual(json.loads((out / 'gate.json').read_text())['oracle'], pin)
+    def test_a_gate_run_measures_against_the_branch_pin_and_records_a_newer_release(self):
+        # A release is measured against the Jellyfin release its branch pins (owner decision
+        # 2026-10-25): a newer release is recorded with the oracle, never a refusal.
+        for pin in ({'tag': 'v12.2', 'image': 'jf@sha256:x'},
+                    {'tag': 'v12.2', 'image': 'jf@sha256:x',
+                     'note': 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'}):
+            out = self.root / f'session-{len(pin)}'
+            with self.subTest(pin), patch.object(gate.oracle, 'check', return_value=pin), \
+                    patch.object(gate, 'image_ref', return_value='sha256:img'), \
+                    patch.object(gate, 'run_session') as ran, patch.object(gate, 'render', return_value=('', [])), \
+                    patch('sys.stdout', new_callable=io.StringIO) as printed:
+                self.assertEqual(gate.main(['ab', 'old', 'new', '--out', str(out), '--testdata', str(self.root / 'td')]), 0)
+            ran.assert_called_once()
+            self.assertEqual(json.loads((out / 'gate.json').read_text())['oracle'], pin)
+            self.assertEqual('v12.3 is out' in printed.getvalue(), 'note' in pin)
 
-    def test_the_session_report_names_the_oracle(self):
+    def test_the_session_report_and_verdict_name_the_oracle_and_a_newer_release(self):
+        note = 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'
         out = self.session('ab', [10, 10, 10, 10, 10, 10])
         self.edit(out / 'gate.json', lambda p: p.update(oracle={'tag': 'v12.2', 'image': 'jf@sha256:abc'}))
         gate.render(str(out))
         self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc)', (out / 'report.html').read_text())
+        self.assertNotIn('is out', (out / 'report.html').read_text())
+        self.edit(out / 'gate.json', lambda p: p['oracle'].update(note=note))
+        gate.render(str(out))
+        for page in ('report.html', 'report.md'):
+            self.assertIn(f'Jellyfin oracle v12.2 (jf@sha256:abc) — {note}', (out / page).read_text())
+        self.assertEqual(json.loads((out / 'verdict.json').read_text())['oracle'],
+                         {'tag': 'v12.2', 'image': 'jf@sha256:abc', 'note': note})
 
 
 class OracleTests(unittest.TestCase):
-    """The Jellyfin oracle pin (oracle.py): release-tag parsing, the stale-pin check, and where it shows."""
+    """The Jellyfin oracle pin (oracle.py): release-tag parsing, the note on a newer release, and where it shows."""
     write, make_run, shapes = ReportTests.write, ReportTests.make_run, ReportTests.shapes
     LS_REMOTE = '\n'.join(f'{"0" * 40}\trefs/tags/{t}' for t in (
         'v10.11.8', 'v10.11.11', 'v12.0-rc7', 'v12.0', 'v12.0^{}', 'v12.1', 'v12.2', 'v12.3-rc1', 'nightly'))
@@ -1622,15 +1636,15 @@ class OracleTests(unittest.TestCase):
                 patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
             return oracle.check(ls_remote=lambda: listing)
 
-    def test_a_pin_behind_the_latest_release_is_a_problem_and_equal_or_newer_is_not(self):
-        info, problem = self.check('v12.2', 'v12.1', 'v12.2', 'v12.3')
-        self.assertEqual(info, {'tag': 'v12.2', 'image': 'jf@sha256:abc'})
-        self.assertIn('Jellyfin v12.3 is out', problem)
-        self.assertIsNone(self.check('v12.2', 'v12.1', 'v12.2', 'v12.3-rc1')[1])
-        self.assertIsNone(self.check('v12.2.0', 'v12.2')[1])
-        self.assertIsNone(self.check('v12.3', 'v12.2')[1])
+    def test_a_pin_behind_the_latest_release_is_noted_and_equal_or_newer_is_not(self):
+        self.assertEqual(self.check('v12.2', 'v12.1', 'v12.2', 'v12.3'), {
+            'tag': 'v12.2', 'image': 'jf@sha256:abc',
+            'note': 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'})
+        self.assertEqual(self.check('v12.2', 'v12.1', 'v12.2', 'v12.3-rc1'), {'tag': 'v12.2', 'image': 'jf@sha256:abc'})
+        self.assertNotIn('note', self.check('v12.2.0', 'v12.2'))
+        self.assertNotIn('note', self.check('v12.3', 'v12.2'))
 
-    def test_a_failed_or_empty_lookup_is_a_problem(self):
+    def test_a_failed_or_empty_lookup_is_noted(self):
         failures = (OSError('network unreachable'), subprocess.TimeoutExpired(['git'], 10),
                     subprocess.CalledProcessError(128, ['git'], stderr='fatal: unable to access\n'))
 
@@ -1639,10 +1653,27 @@ class OracleTests(unittest.TestCase):
                 raise failure
             with self.subTest(reason), patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
                     patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
-                self.assertIn(reason, oracle.check(ls_remote=lookup)[1])
+                note = oracle.check(ls_remote=lookup)['note']
+            self.assertIn('measured against Jellyfin v12.2, the release this branch pins', note)
+            self.assertIn(reason, note)
+        # a timeout setting that is not a number is a lookup problem too, never an unreadable pin
+        with patch.dict(os.environ, {'HTTP_TIMEOUT_S': 'ten'}), patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
+                patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
+            note = oracle.check()['note']   # the real lookup: float('ten') fails before git is run
+        self.assertIn('the latest Jellyfin release could not be looked up (could not convert', note)
         with patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
                 patch.object(oracle, 'pinned_image', return_value='jf@sha256:abc'):
-            self.assertIn('no Jellyfin release tags', oracle.check(ls_remote=lambda: '')[1])
+            self.assertIn('no Jellyfin release tags', oracle.check(ls_remote=lambda: '')['note'])
+
+    def test_a_pin_that_is_not_a_release_or_is_empty_cannot_be_read(self):
+        def lookup():
+            raise AssertionError('the network was asked about a pin that cannot be read')
+        for tag, image, error in (('v12.3-rc1', 'jf@sha256:abc', 'UPSTREAM_TAG v12.3-rc1 .* not a Jellyfin release'),
+                                  ('v12.2', '', 'jellyfin-image.txt is empty')):
+            with self.subTest(tag=tag, image=image), patch.object(oracle, 'upstream_tag', return_value=tag), \
+                    patch.object(oracle, 'pinned_image', return_value=image):
+                with self.assertRaisesRegex(ValueError, error):
+                    oracle.check(ls_remote=lookup)
 
     def test_matches_accepts_only_the_oracle_release_the_pinned_image_reports(self):
         with patch.object(oracle, 'upstream_tag', return_value='v12.2'), \
@@ -1652,16 +1683,26 @@ class OracleTests(unittest.TestCase):
             self.assertEqual(oracle.main(['matches', '12.2.0-beta']), 1)
         self.assertIn('reports Jellyfin 12.1.0, not the oracle v12.2', err.getvalue())
 
-    def test_gate_refuses_and_an_ad_hoc_run_warns_and_continues(self):
-        stale = ({'tag': 'v12.2', 'image': 'jf@sha256:abc'}, 'Jellyfin v12.3 is out')
-        for flags, code in (([], 0), (['--gate'], 1)):
-            with self.subTest(flags), patch.object(oracle, 'check', return_value=stale), \
+    def test_check_prints_a_newer_release_as_a_note_and_never_refuses_it(self):
+        # Every run, the release gate's included, is measured against the release its branch pins.
+        behind = {'tag': 'v12.2', 'image': 'jf@sha256:abc',
+                  'note': 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'}
+        with patch.object(oracle, 'check', return_value=behind), \
+                patch('sys.stdout', new_callable=io.StringIO) as out, \
+                patch('sys.stderr', new_callable=io.StringIO) as err:
+            self.assertEqual(oracle.main(['check']), 0)
+        self.assertEqual(json.loads(out.getvalue()), behind)
+        self.assertEqual(err.getvalue(), f'oracle: {behind["note"]}\n')
+
+    def test_check_refuses_a_pin_it_cannot_read(self):
+        for failure in (ValueError('UPSTREAM_TAG v12.3-rc1 is not a Jellyfin release tag'),
+                        FileNotFoundError(2, 'No such file or directory')):
+            with self.subTest(failure), patch.object(oracle, 'check', side_effect=failure), \
                     patch('sys.stdout', new_callable=io.StringIO) as out, \
                     patch('sys.stderr', new_callable=io.StringIO) as err:
-                self.assertEqual(oracle.main(['check', *flags]), code)
-            self.assertEqual(json.loads(out.getvalue()), stale[0])
-            self.assertIn('v12.3 is out', err.getvalue())
-            self.assertIn('refusing' if code else 'warning', err.getvalue())
+                self.assertEqual(oracle.main(['check']), 2)
+            self.assertEqual(out.getvalue(), '')
+            self.assertIn('oracle: cannot read the pin', err.getvalue())
 
     def test_upstream_tag_is_read_from_the_rust_source_and_fails_clearly_without_it(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1683,7 +1724,13 @@ class OracleTests(unittest.TestCase):
         meta = json.loads((run / 'run.json').read_text())
         meta['oracle'] = {'tag': 'v12.2', 'image': 'jf@sha256:abc'}
         (run / 'run.json').write_text(json.dumps(meta))
-        self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc)', report.render_html(report.build([str(run)])))
+        page = report.render_html(report.build([str(run)]))
+        self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc)', page)
+        self.assertNotIn('is out', page)
+        meta['oracle']['note'] = 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'
+        (run / 'run.json').write_text(json.dumps(meta))
+        self.assertIn('Jellyfin oracle v12.2 (jf@sha256:abc) — measured against Jellyfin v12.2, the release this '
+                      'branch pins; v12.3 is out', report.render_html(report.build([str(run)])))
 
 
 if __name__ == '__main__':

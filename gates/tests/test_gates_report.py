@@ -148,6 +148,18 @@ class SessionReportTests(unittest.TestCase):
         self.assertIn("<dt>previous release</dt><dd>ferrofin:v8</dd>", Path(report.write(str(s))).read_text(encoding="utf-8"))
         self.assertEqual(row["counts"], [("gated cells regressed", 1), ("not comparable", 0), ("improved", 0), ("within noise", 1)])
 
+    def test_the_oracle_line_names_the_release_the_branch_pins_and_a_newer_one(self):
+        s = self.session(["bench"], {"bench": ("passed", 0)}, previous="ferrofin:v8")
+        self.assertEqual(dict(report.facts(report.summarise(str(s))[0]))["Jellyfin oracle"],
+                         "jellyfin/jellyfin@sha256:pin")   # a session made before the oracle carried its tag
+        note = "measured against Jellyfin v12.2, the release this branch pins; v12.3 is out"
+        record = session.load(str(s))
+        record["oracle"].update(tag="v12.2", note=note)
+        session.save(str(s), record)
+        line = f"v12.2 (jellyfin/jellyfin@sha256:pin) — {note}"
+        self.assertIn(f"<dt>Jellyfin oracle</dt><dd>{line}</dd>", Path(report.write(str(s))).read_text(encoding="utf-8"))
+        self.assertIn(f"- **Jellyfin oracle:** {line}", (s / "report.md").read_text(encoding="utf-8"))
+
     def test_missing_corrupt_and_misshapen_results_are_shown_as_such(self):
         s = self.session(report.GATES, {g: ("failed", 1) for g in report.GATES})
         self.write(s / "parity/results.json", "{not json")

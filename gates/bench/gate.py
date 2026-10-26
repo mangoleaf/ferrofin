@@ -31,8 +31,11 @@
 --testdata defaults to $FERROFIN_GATES_DIR/fixtures/bench-testdata and --out to
 $FERROFIN_GATES_DIR/runs/bench-gate-<mode>-<date>-<time> (the output root's layout is in gates/lib.sh).
 
-Before anything starts, `oracle.check` must find the Jellyfin oracle pin (UPSTREAM_TAG) on the
-latest Jellyfin release; a stale pin or a failed lookup refuses the session (decision DO).
+Before anything starts, `oracle.check` reads the Jellyfin oracle pin (UPSTREAM_TAG and its
+digest); a pin it cannot read refuses the session. A release is measured against the Jellyfin
+release its branch pins (owner decision 2026-10-25, which replaced the earlier refusal of a pin
+behind the latest release): a newer release is noted with the oracle in gate.json, the verdict
+JSON and the report, never refused.
 
 Each run is `run.sh --servers ferrofin --only PHASES[mode]` (below; `scan` runs `scan.py`
 instead) into SESSION_DIR/NN-a or
@@ -423,8 +426,10 @@ def render(session):
     if not plan:
         raise ValueError(f"{session} has no gate.json")
     gate = report.load_gate()
+    # What the session was measured against, with any newer Jellyfin release noted (oracle.check).
+    pinned = {"oracle": plan["oracle"]} if plan.get("oracle") else {}
     if plan["mode"] == "soak":
-        result = soak_session(session, plan, gate)
+        result = soak_session(session, plan, gate) | pinned
         with open(os.path.join(session, "verdict.json"), "w") as f:
             json.dump(result, f, indent=2, default=str)
         md = soak.render_md(header(plan), result)
@@ -468,6 +473,7 @@ def render(session):
         result = {"verdicts": verdicts(built["a"], built["b"], gate)}
         name, block = "verdict.json", blocking(result["verdicts"])
     result["blocking"] = block
+    result |= pinned
     with open(os.path.join(session, name), "w") as f:
         json.dump(result, f, indent=2, default=str)
     md = render_md(plan, result)
@@ -563,8 +569,9 @@ def md_table(head, rows):
 
 def header(plan):
     imgs = "; ".join(f"{role} = {i['ref']} ({i['id'][:19]})" for role, i in plan["images"].items())
-    o = plan.get("oracle")
-    pin = f"; Jellyfin oracle {o['tag']} ({o['image']})" if o else ""
+    o, pin = plan.get("oracle"), ""
+    if o:
+        pin = f"; Jellyfin oracle {o['tag']} ({o['image']})" + (f" — {o['note']}" if o.get("note") else "")
     return f"{plan['mode'].upper()} session {plan['name']}, {len(plan['schedule'])} runs, {plan['date']}: {imgs}{pin}"
 
 
@@ -695,13 +702,14 @@ def main(argv):
     if os.path.exists(session):
         sys.exit(f"gate: {session} exists — a session directory is never reused")
     testdata = os.path.abspath(opts["--testdata"] or gates_dir("fixtures/bench-testdata"))
-    # A release gate never runs against a Jellyfin pin behind the latest release (DO).
+    # The Jellyfin release this branch pins, whatever has shipped since (owner decision
+    # 2026-10-25): a newer release is noted with it, and only a pin that cannot be read refuses.
     try:
-        plan["oracle"], problem = oracle.check()
+        plan["oracle"] = oracle.check()
     except (OSError, ValueError) as err:
-        problem = f"cannot read the Jellyfin oracle pin ({err})"
-    if problem:
-        sys.exit(f"gate: refusing: {problem}")
+        sys.exit(f"gate: refusing: cannot read the Jellyfin oracle pin ({err})")
+    if "note" in plan["oracle"]:
+        print(f"  oracle: {plan['oracle']['note']}")
     plan["images"] = {}
     for role, image in images.items():
         ref = image_ref(image)

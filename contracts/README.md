@@ -46,7 +46,8 @@ the clients speak; Jellyfin 12's surface is smaller (364 operations in 12.0-rc7 
 `DynamicHls` family, `/MusicGenres`, `/CriticReviews` and more), so implementing it
 instead would break clients. The **C# that behaviour is ported from** is `v12.2`
 (`UPSTREAM_TAG` in `crates/ferrofin-api/src/handlers/mod.rs`) because Jellyfin 12 is the
-fixed, corrected version of 10.11's logic, and that pin always follows the latest Jellyfin
+fixed, corrected version of 10.11's logic. That pin is the latest Jellyfin release when a
+release branch is cut; the branch keeps it, and the next release branch moves to the newest
 release. Where the two disagree on shape, the contract wins.
 
 ## Re-pinning
