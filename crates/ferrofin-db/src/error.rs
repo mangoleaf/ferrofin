@@ -48,8 +48,11 @@ pub enum DbError {
 
     /// The database holds dangling foreign-key references after the migration
     /// chain ran (`foreign_key_check` reported violations). They may pre-date
-    /// this boot or come from a migration. The database is not opened; the
-    /// pre-migration backup should be restored.
+    /// this boot or come from a migration. The database is not opened. When
+    /// the boot that applied the migrations snapshotted the file first
+    /// (`<db>.pre-NNNN`, which a failed boot keeps), that copy is the one to
+    /// restore; there is none when nothing was pending or the copy could not
+    /// be written.
     #[error(
         "database has {violations} foreign-key violation(s) after migrating ({tables}); database not opened"
     )]
