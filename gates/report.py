@@ -212,12 +212,24 @@ def short_id(image_id):
     return f"{algorithm}:{digest[:12]}" if digest else algorithm
 
 
+def oracle_line(oracle):
+    """The Jellyfin oracle: the release the branch pins and its digest, and the note on a newer
+    release (gates/bench/oracle.py). A session that never checked the pin (verify or adoption
+    alone, or one made before the record carried the tag) shows the digest only."""
+    line = oracle.get("image")
+    if oracle.get("tag"):
+        line = f"{oracle['tag']} ({line})"
+    if oracle.get("note"):
+        line = f"{line} — {oracle['note']}"
+    return line
+
+
 def facts(record):
     image = record.get("image") or {}
     lines = [("branch", record.get("branch")),
              ("commit", (record.get("commit") or "")[:12] + (" (uncommitted changes)" if record.get("dirty") else "")),
              ("image", f"{image.get('ref')} ({short_id(image.get('id'))})"),
-             ("Jellyfin oracle", (record.get("oracle") or {}).get("image")),
+             ("Jellyfin oracle", oracle_line(record.get("oracle") or {})),
              ("started", record.get("started")), ("ended", record.get("ended") or "still running")]
     if record.get("previous"):
         lines.insert(3, ("previous release", record["previous"].get("ref")))

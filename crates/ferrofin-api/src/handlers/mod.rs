@@ -850,11 +850,13 @@ pub const EXTENSION_ROUTES: &[(&str, &str, &str)] = &[
 /// It is one fact for the whole record, so no row can carry a wrong tag or commit.
 /// Owner decisions: Jellyfin 12 (10.12 in all but name) is the source of truth,
 /// and where 10.11.8 differs from it, 10.11.8 is the one that is wrong
-/// (2026-09-02). The pin is always the **latest Jellyfin release**, never a
-/// release candidate: when a newer one ships, move this tag and the commit to
-/// it, set [`UPSTREAM_PIN_DATE`] to that day, and list every row not already
-/// listed in [`VERIFIED_AGAINST_EARLIER_PIN`] (or, for a subsystem row,
-/// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`]) under the old tag (2026-10-16).
+/// (2026-09-02). The pin is the **latest Jellyfin release when a release branch
+/// is cut**, never a release candidate (2026-10-16); the branch keeps it until
+/// its release, and the next release branch moves to the newest release
+/// (2026-10-25). To move it, move this tag and the commit, set
+/// [`UPSTREAM_PIN_DATE`] to that day, and list every row not already listed in
+/// [`VERIFIED_AGAINST_EARLIER_PIN`] (or, for a subsystem row,
+/// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`]) under the old tag.
 /// The vendored OpenAPI contract stays 10.11.8: that is the API clients speak,
 /// even though Jellyfin 12 dropped operations from it.
 pub const UPSTREAM_TAG: &str = "v12.2";
