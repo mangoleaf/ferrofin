@@ -63,6 +63,8 @@ signal on as a TERM, again every second until the worker's cleanup has started (
 `gates_supervise`): bash 5.2 drops a trapped signal that lands while it parses a `$( … )`. So what a
 run records (`session.json`, a report) says 143 for a Ctrl-C too. A SIGKILL cannot be passed on, so
 never stop a run with `kill -9`: its worker would run on. Ctrl-Z suspends only the waiting shell.
+`adoption/run.sh` hands its run to a worker too, but its own supervisor stops the worker outright and
+builds the report itself ([its README](adoption/README.md)).
 
 The root [`Makefile`](../Makefile) offers the same as targets: `make run-gates` for all four, and
 `make run-verify`, `make run-adoption`, `make run-parity` or `make run-bench` for one, with `IMAGE=`
