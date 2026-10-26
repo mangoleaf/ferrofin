@@ -23,7 +23,7 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::by_name::{additional_dto_options, project_item_rows};
-use crate::handlers::items::{parse_order_by, resolve_user};
+use crate::handlers::items::{parse_order_by, resolve_user_or_api_key};
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
 
@@ -101,7 +101,7 @@ async fn get_years(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<YearsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     let recursive = query.recursive.unwrap_or(true);
     // C# `GetParentItem(parentId, userId)` falls back to the **user root
     // folder** when no parent was named, and `recursive: false` then walks that
@@ -109,6 +109,9 @@ async fn get_years(
     // `ProductionYear`, so an unscoped `recursive=false` legitimately returns
     // nothing. Leaving the parent unset made it return every year in the
     // library instead. The root is only resolved when it can change the answer.
+    // With no user (an API key) upstream walks the `AggregateFolder`'s
+    // children instead, the library folders again, and answers the same
+    // nothing.
     let parent_id = match query.parent_id.filter(|p| !p.is_nil()) {
         Some(parent) => parent,
         None if !recursive => state
@@ -126,10 +129,10 @@ async fn get_years(
     let exclude_item_types = parse_csv_enums_lenient(query.exclude_item_types.as_deref());
     let media_types = parse_csv_enums_lenient(query.media_types.as_deref());
     // The user row moves into the query and is borrowed back out for the DTO
-    // projection below — `resolve_user` already cloned it off the auth context,
-    // and a second full copy of every string on it buys nothing.
+    // projection below — `resolve_user_or_api_key` already cloned it off the
+    // auth context, and a second full copy of every string on it buys nothing.
     let internal = ferrofin_traits::options::InternalItemsQuery {
-        user: Some(user),
+        user,
         start_index: query.start_index,
         limit: query.limit,
         recursive,
@@ -190,7 +193,7 @@ async fn get_year(
     Path(year): Path<i32>,
     Query(query): Query<YearQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     if year <= 0 {
         return Err(ApiError::BadRequest(format!(
             "years less than or equal to 0 are invalid: {year}"
@@ -204,7 +207,7 @@ async fn get_year(
     let options = DtoOptions::default();
     let dto = state
         .dto
-        .get_base_item_dto(&item, &options, Some(&user), None)
+        .get_base_item_dto(&item, &options, user.as_ref(), None)
         .await?;
     Ok(Json(dto))
 }

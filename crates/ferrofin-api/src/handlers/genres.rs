@@ -25,7 +25,7 @@ use crate::extract::Query;
 use crate::handlers::by_name::{
     ByNameItemQuery, ByNameListQuery, project_query_result, resolve_by_name_or_slug,
 };
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::resolve_user_or_api_key;
 use crate::state::AppState;
 
 /// `GET /Genres` — the library's genres.
@@ -45,8 +45,8 @@ async fn get_genres(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
-    let internal = query.base_query(Some(user.clone()))?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
+    let internal = query.base_query(user.clone())?;
     let result = if is_music_collection_folder(&state, query.parent_id).await? {
         state.library.get_music_genres(&internal).await?
     } else {
@@ -62,7 +62,7 @@ async fn get_genres(
         result,
         &options,
         query.should_include_item_types(),
-        Some(&user),
+        user.as_ref(),
     )
     .await?;
     Ok(Json(projected))
@@ -127,7 +127,7 @@ async fn get_genre(
     Path(genre_name): Path<String>,
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `item ??= new Genre()`: upstream serializes a default-constructed
     // entity rather than 404ing, so this route has no not-found arm at all.
     let item = match resolve_by_name_or_slug(&state, BaseItemKind::Genre, &genre_name).await? {
@@ -137,7 +137,7 @@ async fn get_genre(
     let options = DtoOptions::default();
     let dto = state
         .dto
-        .get_base_item_dto(&item, &options, Some(&user), None)
+        .get_base_item_dto(&item, &options, user.as_ref(), None)
         .await?;
     Ok(Json(dto))
 }

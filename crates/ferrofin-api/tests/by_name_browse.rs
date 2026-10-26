@@ -161,6 +161,8 @@ fn named_entity(id: Uuid, name: &str) -> BaseItemEntity {
 struct ByNameLibrary {
     created: Arc<std::sync::Mutex<Vec<(BaseItemKind, String)>>>,
     seen: Arc<std::sync::Mutex<Vec<InternalItemsQuery>>>,
+    /// The people queries `GET /Persons` ran with.
+    seen_people: Arc<std::sync::Mutex<Vec<InternalPeopleQuery>>>,
 }
 
 impl ByNameLibrary {
@@ -318,6 +320,7 @@ impl LibraryManager for ByNameLibrary {
     }
     /// Backs the `get_people_items` default for `GET /Persons`.
     async fn get_people(&self, q: &InternalPeopleQuery) -> Result<Vec<PeopleEntity>, ServiceError> {
+        self.seen_people.lock().expect("lock").push(q.clone());
         // Nobody is favorited in this fixture: a favorites-scoped query (the
         // handler must fold `Filters=IsFavorite` onto `is_favorite`) is empty.
         if q.is_favorite == Some(true) {
@@ -333,8 +336,9 @@ impl LibraryManager for ByNameLibrary {
     /// Backs the `get_years` default: one distinct production year.
     async fn get_query_filters_legacy(
         &self,
-        _q: &InternalItemsQuery,
+        q: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError> {
+        self.saw(q);
         Ok(QueryFiltersLegacy {
             years: vec![1999],
             ..QueryFiltersLegacy::default()
@@ -584,6 +588,38 @@ impl AuthorizationContext for OkAuth {
     }
 }
 
+/// An [`AuthService`]/[`AuthorizationContext`] pair for an API key: an
+/// authenticated request with no user, as `AuthorizationContext` builds it for
+/// a server key.
+struct ApiKeyAuth;
+
+impl ApiKeyAuth {
+    fn info() -> AuthorizationInfo {
+        AuthorizationInfo {
+            is_api_key: true,
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        }
+    }
+}
+
+#[async_trait]
+impl AuthService for ApiKeyAuth {
+    async fn authenticate(&self, _r: &RequestContext) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for ApiKeyAuth {
+    async fn get_authorization_info(
+        &self,
+        _r: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
 fn by_name_state() -> AppState {
     by_name_state_with(Arc::new(OkDto), ByNameLibrary::default())
 }
@@ -602,6 +638,16 @@ fn by_name_state_with_dto(dto: Arc<dyn DtoService>) -> AppState {
 
 /// The by-name test state with both seams injected.
 fn by_name_state_with(dto: Arc<dyn DtoService>, library: ByNameLibrary) -> AppState {
+    by_name_state_authed(dto, library, Arc::new(OkAuth))
+}
+
+/// The by-name test state with both seams injected, authenticating every
+/// request through `auth`.
+fn by_name_state_authed<A: AuthService + AuthorizationContext + 'static>(
+    dto: Arc<dyn DtoService>,
+    library: ByNameLibrary,
+    auth: Arc<A>,
+) -> AppState {
     AppState::new(
         Arc::new(library),
         Arc::new(OkUsers),
@@ -617,8 +663,8 @@ fn by_name_state_with(dto: Arc<dyn DtoService>, library: ByNameLibrary) -> AppSt
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         dto,
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        auth.clone(),
+        auth,
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -1220,4 +1266,72 @@ async fn by_name_browses_honour_image_and_user_data_toggles() {
     let base = options_for("/Studios").await;
     assert!(base.enable_images);
     assert_eq!(base.image_type_limit, i32::MAX);
+}
+
+/// An API key that names no `userId` has no user, and every by-name list runs
+/// with none, unscoped: v12.2 `GenresController.GetGenres` and its siblings
+/// build `new InternalItemsQuery(user)` with `user` null
+/// (`GenresController.cs:106-112`, `PersonsController.cs:98-118`,
+/// `YearsController.cs:95-100`), and `/Persons` builds no access filter
+/// (`BuildAccessFilter(null)`). Never the `400` of a request with no user.
+#[rstest::rstest]
+#[case::genres("/Genres")]
+#[case::music_genres("/MusicGenres")]
+#[case::studios("/Studios")]
+#[case::artists("/Artists")]
+#[case::album_artists("/Artists/AlbumArtists")]
+#[case::persons("/Persons")]
+#[case::years("/Years")]
+#[tokio::test]
+async fn an_api_key_lists_by_name_items_with_no_user(#[case] uri: &str) {
+    let library = ByNameLibrary::default();
+    let state = by_name_state_authed(Arc::new(OkDto), library.clone(), Arc::new(ApiKeyAuth));
+    let response = create_router(state)
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    let body = json_body(response).await;
+    assert_eq!(body["TotalRecordCount"], 1, "{uri}");
+    let people = library.seen_people.lock().expect("lock");
+    let items = library.seen.lock().expect("lock");
+    assert!(
+        !people.is_empty() || !items.is_empty(),
+        "{uri} ran no query"
+    );
+    for query in people.iter() {
+        assert!(query.user_id.is_none(), "{uri} ran as a user");
+        assert!(
+            query.access_filter.is_none(),
+            "{uri} built an access filter"
+        );
+    }
+    for query in items.iter() {
+        assert!(query.user.is_none(), "{uri} ran as a user");
+    }
+}
+
+/// The single by-name routes serve an API key with no user too: v12.2
+/// `GetGenre`, `GetMusicGenre`, `GetStudio`, `GetArtistByName`, `GetPerson`
+/// and `GetYear` project the item with no user when `userId` is empty.
+#[rstest::rstest]
+#[case::genre("/Genres/Drama", "Drama")]
+#[case::music_genre("/MusicGenres/Jazz", "Jazz")]
+#[case::studio("/Studios/A24", "A24")]
+#[case::artist("/Artists/Miles%20Davis", "Miles Davis")]
+#[case::person("/Persons/Uma", "Uma")]
+#[case::year("/Years/1999", "1999")]
+#[tokio::test]
+async fn an_api_key_reads_a_by_name_item_with_no_user(#[case] uri: &str, #[case] name: &str) {
+    let state = by_name_state_authed(
+        Arc::new(OkDto),
+        ByNameLibrary::default(),
+        Arc::new(ApiKeyAuth),
+    );
+    let response = create_router(state)
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    assert_eq!(json_body(response).await["Name"], name, "{uri}");
 }

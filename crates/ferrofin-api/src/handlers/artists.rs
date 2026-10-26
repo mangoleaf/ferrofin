@@ -23,7 +23,7 @@ use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::by_name::{ByNameItemQuery, ByNameListQuery, project_query_result};
-use crate::handlers::items::resolve_user;
+use crate::handlers::items::resolve_user_or_api_key;
 use crate::state::AppState;
 
 /// `GET /Artists` — the library's artists.
@@ -41,8 +41,8 @@ async fn get_artists(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
-    let internal = query.artists_query(&state, Some(user.clone())).await?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
+    let internal = query.artists_query(&state, user.clone()).await?;
     let result = state.library.get_artists(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
     let projected = project_query_result(
@@ -50,7 +50,7 @@ async fn get_artists(
         result,
         &options,
         query.should_include_item_types(),
-        Some(&user),
+        user.as_ref(),
     )
     .await?;
     Ok(Json(projected))
@@ -71,8 +71,8 @@ async fn get_album_artists(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
-    let internal = query.artists_query(&state, Some(user.clone())).await?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
+    let internal = query.artists_query(&state, user.clone()).await?;
     let result = state.library.get_album_artists(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
     let projected = project_query_result(
@@ -80,7 +80,7 @@ async fn get_album_artists(
         result,
         &options,
         query.should_include_item_types(),
-        Some(&user),
+        user.as_ref(),
     )
     .await?;
     Ok(Json(projected))
@@ -109,7 +109,7 @@ async fn get_artist_by_name(
     Path(name): Path<String>,
     Query(query): Query<ByNameItemQuery>,
 ) -> Result<Json<BaseItemDto>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     let item = state
         .library
         .get_named_item(BaseItemKind::MusicArtist, &name)
@@ -118,7 +118,7 @@ async fn get_artist_by_name(
     let options = DtoOptions::default();
     let dto = state
         .dto
-        .get_base_item_dto(&item, &options, Some(&user), None)
+        .get_base_item_dto(&item, &options, user.as_ref(), None)
         .await?;
     Ok(Json(dto))
 }
