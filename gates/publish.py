@@ -571,7 +571,7 @@ def parity_section(parity, version, rel, results_dir):
     title = f"Answering jellyfin-web like {src['oracle']}"
     compared = parity["sent"] - c["oracle_failed"]
     alt = (f"{title}: of {parity['sent']} requests, " + ", ".join(f"{c[k]} {PARITY_OUTCOMES[k]}" for k in PARITY_OUTCOMES) + ".")
-    cap = (f"Ferrofin {version} (commit {src['commit'][:8]}) against {src['oracle']}, gates session {src['session']}, "
+    cap = (f"{ferrofin(version)} (commit {src['commit'][:8]}) against {src['oracle']}, gates session {src['session']}, "
            f"{src['date']}. How differences are judged: gates/parity/README.md")
     files = {os.path.join(results_dir, version, f"parity{'' if theme == 'light' else '-dark'}.svg"):
              parity_graph(title, parity, cap, theme, alt) for theme in STYLE}
@@ -603,7 +603,7 @@ def adoption_section(adoption, version, rel, results_dir):
     title = "Adopting an existing Jellyfin database: every supported version and route"
     alt = (f"{title}: {passed} of {len(rows)} passed"
            + "".join(f"; {r['fixture']} {VERDICT_WORDS[r['verdict']]}" for r in rows if r["verdict"] != "PASS") + ".")
-    cap = (f"Ferrofin {version} (commit {src['commit'][:8]}), gates session {src['session']}, {src['date']}. "
+    cap = (f"{ferrofin(version)} (commit {src['commit'][:8]}), gates session {src['session']}, {src['date']}. "
            "What each row checks: gates/adoption/README.md")
     files = {os.path.join(results_dir, version, f"adoption{'' if theme == 'light' else '-dark'}.svg"):
              status_graph(title, rows, cap, theme, alt) for theme in STYLE}
@@ -649,8 +649,13 @@ def graphs(bench):
     return [g for g in out if g[3]]
 
 
+def ferrofin(version):
+    """`Ferrofin vX.Y.Z`, or `Ferrofin` alone for a build no release names (a gates session's)."""
+    return f"Ferrofin {version}" if version else "Ferrofin"
+
+
 def caption(src, version):
-    return (f"Ferrofin {version} (commit {str(src['commit'])[:8]}) against {src['oracle']}, the median of {src['run_count']} "
+    return (f"{ferrofin(version)} (commit {str(src['commit'])[:8]}) against {src['oracle']}, the median of {src['run_count']} "
             f"run{'s' if src['run_count'] != 1 else ''} on one host ({host_text(src['host_class'])}), {src['date']}. "
             "Every number and its range: docs/BENCHMARKS.md")
 
@@ -905,7 +910,7 @@ def render(results_dir, readme_text, readme_dir=ROOT):
     return files, readme_text[:i] + section + readme_text[j:]
 
 
-def session_graphs(bench_result, version="this session"):
+def session_graphs(bench_result, version=""):
     """The same graphs, inline, for one benchmark result (the gates session page): drawn from a summary
     of that one run, light and dark, the theme the reader's browser prefers shown."""
     bench = bench_summary([bench_result], [bench_result["detail"]["runs"][0]], min_runs=1)
@@ -916,7 +921,7 @@ def session_graphs(bench_result, version="this session"):
     return "".join(out)
 
 
-def session_parity_graph(session, commit, version="this session"):
+def session_parity_graph(session, commit, version=""):
     """The README's parity overview graph, inline, for a gates session's parity result (the session page)."""
     parity = parity_summary(session, commit, publishing=False)
     if parity is None:   # a run that compared nothing: its row on the page already says why
@@ -926,7 +931,7 @@ def session_parity_graph(session, commit, version="this session"):
                    for theme, svg in zip(STYLE, (files[p] for p in sorted(files, key=lambda p: p.endswith("-dark.svg")))))
 
 
-def session_adoption_graph(session, version="this session"):
+def session_adoption_graph(session, version=""):
     """The README's adoption grid, inline, for a gates session's adoption result (the session page)."""
     adoption = adoption_summary(session, publishing=False)
     files, _ = adoption_section(adoption, version, ".", session)
