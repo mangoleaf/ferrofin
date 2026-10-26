@@ -10,8 +10,9 @@
 //!   TV type sets).
 //!
 //! Both endpoints scope to an optional parent and honor the `includeItemTypes`
-//! restriction (a lone `Trailer`/`Program` type skips the parent lookup, exactly
-//! as Jellyfin does). The genre facet dispatches to the music-genre aggregate for
+//! restriction. A lone `Trailer`/`Program` type skips the parent lookup, as
+//! Jellyfin does: the legacy facets are then empty, and `Filters2` aggregates
+//! with no scope. The genre facet dispatches to the music-genre aggregate for
 //! a music-only type set and to the plain-genre aggregate otherwise.
 
 use axum::extract::State;
@@ -29,6 +30,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
+use crate::handlers::by_name::resolve_parent;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::state::AppState;
@@ -128,15 +130,20 @@ async fn get_query_filters_legacy(
         parse_csv_enums_lenient(query.include_item_types.as_deref());
     let media_types: Vec<MediaType> = parse_csv_enums_lenient(query.media_types.as_deref());
 
-    // A lone Trailer/Program type set skips the parent lookup; otherwise a parent
-    // that is not a folder yields empty filters (the C# `is not Folder` guard).
-    // Without the OOP folder tree we always aggregate over the parent's subtree.
-    let mut ancestor_ids = Vec::new();
-    if !is_trailer_or_program(&include_item_types)
-        && let Some(parent) = query.parent_id
-    {
-        ancestor_ids.push(parent);
+    // v12.2 `FilterController.cs:66-77`: a lone Trailer/Program type set skips
+    // `GetParentItem`, which leaves the item null, and null `is not Folder`:
+    // empty filters. Otherwise a `parentId` naming no item is `GetParentItem`'s
+    // 400, and the parent's subtree is the scope (upstream answers empty
+    // filters for a parent that is no `Folder`; the subtree of one is empty
+    // unless rows hang below it, the same non-folder gap gl-971 records for
+    // the by-name lists). No `parentId` keeps the user's whole
+    // library (the root's empty answer upstream is a Jellyfin bug not ported,
+    // owner decision gl-862).
+    if is_trailer_or_program(&include_item_types) {
+        return Ok(Json(QueryFiltersLegacy::default()));
     }
+    resolve_parent(&state, query.parent_id).await?;
+    let ancestor_ids: Vec<Uuid> = query.parent_id.into_iter().collect();
 
     let internal = InternalItemsQuery {
         user,
@@ -307,9 +314,14 @@ async fn get_query_filters(
     let stream_types = stream_language_types(&include_item_types);
 
     // `parentItem` (`FilterController.cs:131-141`): none for a lone Trailer or
-    // Program type set, else the item `parentId` names, if there is one.
+    // Program type set, else the item `parentId` names, if there is one. An id
+    // naming no item leaves it null, but the zero id is `GetItemById`'s
+    // `ArgumentException` ("Guid can't be empty"): a 400.
     let (ancestor_ids, parent_id) = match query.parent_id {
         Some(id) if !is_trailer_or_program(&include_item_types) => {
+            if id.is_nil() {
+                return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+            }
             let parent = state.library.get_item_by_id(id).await?;
             parent_scope(id, parent.as_ref(), query.recursive)
         }
