@@ -263,7 +263,23 @@ def css():
         return FALLBACK_CSS
 
 
-def render_html(record, rows):
+def bench_graphs(session, record):
+    """The README's graphs for the session's benchmark run (gates/publish.py), inline; an empty string
+    for an A/B gate session or a run with no comparable result, and a note when they cannot be drawn."""
+    if record.get("previous") or (record.get("gates", {}).get("bench") or {}).get("status") in (None, "pending", "skipped"):
+        return ""
+    try:
+        doc = gate_result(os.path.join(session, "bench"), "bench")
+        if not doc or "jellyfin" not in (doc["detail"].get("servers") or {}):
+            return ""
+        graphs = gate_module("publish.py").session_graphs(doc)
+    except Exception as error:  # noqa: BLE001 — the page is written whatever the result holds
+        return f"<p class='problem'>The benchmark graphs could not be drawn ({html.escape(type(error).__name__)}: {html.escape(str(error))}).</p>"
+    return ("<h2>Benchmark against Jellyfin</h2><p class='lede'>The README's graphs for this session's one run "
+            f"(the published ones are the median of three).</p>{graphs}") if graphs else ""
+
+
+def render_html(record, rows, graphs=""):
     e = html.escape
     name = e(str(record.get("name")))
     head = "".join(f"<dt>{e(k)}</dt><dd>{e(str(v))}</dd>" for k, v in facts(record))
@@ -285,15 +301,18 @@ def render_html(record, rows):
             f"<style>{css()}dl.facts{{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}}"
             f"dl.facts dt{{color:var(--muted)}}dl.facts dd{{margin:0}}tr.bad th,.problem{{color:var(--bad)}}"
             f"tr.good th{{color:var(--good)}}table.gates td,table.gates th{{text-align:left;vertical-align:top;"
-            f"padding:6px 12px}}</style></head><body><main>"
+            f"padding:6px 12px}}.graph svg{{max-width:100%;height:auto;margin:14px 0}}.graph.dark{{display:none}}"
+            f"@media (prefers-color-scheme:dark){{.graph.light{{display:none}}.graph.dark{{display:block}}}}"
+            f"</style></head><body><main>"
             f"<h1>Gates session {name}</h1><dl class='facts'>{head}</dl>"
             f"<table class='gates'><thead><tr><th>Gate</th><th>Status</th><th>Verdict</th><th>Counts</th>"
-            f"<th>Report</th></tr></thead><tbody>{''.join(body)}</tbody></table></main></body></html>")
+            f"<th>Report</th></tr></thead><tbody>{''.join(body)}</tbody></table>{graphs}</main></body></html>")
 
 
 def write(session):
     record, rows = summarise(session)
-    for name, text in (("index.html", render_html(record, rows)), ("report.md", render_md(record, rows))):
+    for name, text in (("index.html", render_html(record, rows, bench_graphs(session, record))),
+                       ("report.md", render_md(record, rows))):
         path = os.path.join(session, name)
         with open(path + ".tmp", "w", encoding="utf-8") as f:
             f.write(text)

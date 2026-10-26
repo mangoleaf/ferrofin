@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Render a run (or several) as the README tables, or as an HTML page for comparing
-(PLAN_BENCHMARK_V3 §7). stdlib only.
+"""Render a run (or several) as the full tables (docs/BENCHMARKS.md), or as an HTML page for comparing
+(PLAN_BENCHMARK_V3 §7). stdlib only. The README's Results section and its graphs are gates/publish.py's,
+drawn from the result.json this writes.
 
     report.py RUN_DIR [RUN_DIR ...]          markdown on stdout (the full tables, docs/BENCHMARKS.md style)
-    report.py --readme [README.md] RUN_DIR... the README "Benchmarks" section (headline table + prose);
-                                             with a README path, replaces the block between the
-                                             BEGIN/END GENERATED BENCHMARKS markers in place
     report.py --html RUN_DIR                 write RUN_DIR/report.html (self-contained) and RUN_DIR/result.json
                                              (gates/result.py's envelope) from one model; run.sh does this
     report.py --serve [PORT] [RUNS_DIR] [--adoption-dir DIR] [--parity-dir DIR] [--verify-dir DIR]
@@ -1201,7 +1199,7 @@ def endpoints_table(m, as_html=False):
     return diagnostic_table(title, head, rows) + f"\n{why}\n"
 
 
-# ── markdown (the README tables) ────────────────────────────────────────────
+# ── markdown (the full tables) ──────────────────────────────────────────────
 def render_md(m):
     oracle_label = m["oracle_label"]
     meta, servers, out = m["meta"], m["servers"], []
@@ -1288,20 +1286,9 @@ def render_md(m):
     return "\n".join(out) + "\n"
 
 
-# ── README section (headline table + Mermaid charts) ────────────────────────
-README_BEGIN = "<!-- BEGIN GENERATED BENCHMARKS"
-README_END = "<!-- END GENERATED BENCHMARKS -->"
-#: The level the README quotes: five screens a second is the closest of the three to
-#: ordinary use (unloaded is a control, stress exists to find the knee).
-README_LEVEL = "loaded"
-#: The time-to-first-screen and memory rows the README headlines, by row name. HLS is
-#: withheld like any flagged cell whenever a repetition's transcode parameters or
-#: first-segment properties differ from the oracle's. The interference/swap rows describe
-#: the run, not the server.
-README_TTFS = ("cold start (restart → authenticated views; host caches retained)", "HLS first segment (forced transcode)",
-               "direct-play TTFB (1 MiB range)")
-README_MEMORY = ("peak under load", "steady idle")
-
+#: The memory rows of a result.json: the server's own peak and idle memory. The interference and
+#: swap rows describe the run, not the server.
+MEMORY_ROWS = ("peak under load", "steady idle")
 
 
 def _ratio(c, oracle_cell):
@@ -1310,132 +1297,6 @@ def _ratio(c, oracle_cell):
         return None
     mine, theirs = displayed(c), displayed(oracle_cell)
     return theirs / mine if mine and theirs else None
-
-
-def render_readme(m, run_dirs):
-    """The README `## Benchmarks` body: setup sentence, the headline table with a
-    "Ferrofin vs oracle" column, the per-endpoint range sentence, the spread sentence
-    computed from the runs, and the pointers to the full tables. Wrapped in markers so `--readme README.md` can replace it in place;
-    everything inside the markers is generated — edit the prose here, not in the README."""
-    oracle_label = m["oracle_label"]
-    meta, servers = m["meta"], m["servers"]
-    if "ferrofin" not in dict(servers):
-        raise ValueError("README comparison requires Ferrofin")
-    lv = m["levels"].get(README_LEVEL)
-    if not lv:
-        sys.exit(f"the runs have no '{README_LEVEL}' level; the README section needs it")
-    tc = meta.get("testdata_counts", {})
-    tag = meta.get("name") or os.path.basename(run_dirs[0].rstrip("/"))
-    nruns = len(m["runs"])
-    notes = Notes()
-    out = []
-    p = out.append
-    cmd = "python3 gates/bench/report.py --readme README.md " + " ".join(f"\"$FERROFIN_GATES_DIR\"/runs/{os.path.basename(r.rstrip('/'))}" for r in run_dirs)
-    p(f"{README_BEGIN} — do not edit by hand. Regenerate with:\n     {cmd} -->")
-    cpus = str(meta.get("server_cpus", ""))
-    try:
-        ncores = sum(int(part.split("-")[-1]) - int(part.split("-")[0]) + 1 for part in cpus.split(","))
-    except ValueError:
-        ncores = "?"
-    limit = str(meta.get("memory_limit", "?")).replace("g", " GiB")
-    article = "an" if limit[:1] in "8aeiou" else "a"
-    opponents = " and ".join(f"**{label}**" for k, label in servers if k != "ferrofin")
-    comparison = f" against {opponents}" if opponents else " (no Jellyfin reference selected)"
-    p(f"Ferrofin `{tag}`{comparison}, measured {meta.get('date', '')[:10]} "
-      f"on one machine ({meta.get('cpu', '?').replace(' 16-Core Processor', '')}), each server alone in a container pinned to "
-      f"{ncores} logical CPUs with {article} {limit} limit, over a fixture of "
-      f"{tc.get('movies', '?')} movies, {tc.get('series', '?')} series and {tc.get('episodes', '?')} episodes. "
-      f"Published figures are medians across {nruns} selected run{'s' if nruns != 1 else ''}; "
-      "incomplete or non-comparable cells are withheld.")
-    if m.get("load_problems"):
-        p("Measured load windows contain failures or incomplete evidence; see the full report.\n")
-    else:
-        p("No measured request failed in the recorded load windows (" + ", ".join(m["levels"]) + ").\n")
-    p(f"The screen rows are scripted HTTP transactions based on jellyfin-web 10.11.8, "
-      f"replayed at {lv['rate']} screens per second (the \"{README_LEVEL}\" level). They include "
-      "API and poster requests, not browser rendering. Latency reads "
-      f"**p50 / p95 / p99 in milliseconds**; the last column compares p50 with {oracle_label}.\n")
-    # ── headline table ──
-    p("| | " + " | ".join(f"**{lbl}**" if k == "ferrofin" else lbl for k, lbl in servers) + f" | Ferrofin vs {oracle_label.split()[1]} |")
-    p("|---|" + "---|" * (len(servers) + 1))
-
-    def row(name, cells, label_md, unit_suffix=""):
-        cols = []
-        for k, label in servers:
-            c = cells[k]
-            if c.flag or not c.vals:
-                reason = c.flag or "missing measurement"
-                txt = f"— ⚠[{notes.add(reason, f'{label}: {name}')}]"
-            else:
-                txt = " / ".join(part.value() for part in c.parts()) if "p95" in c.sub else c.value()
-            cols.append(f"**{txt}**" if k == "ferrofin" else txt)
-        f, o = cells["ferrofin"], cells.get(ORACLE)
-        sp = speedup(f, o) if _ratio(f, o) is not None else None
-        p(f"| {label_md} | " + " | ".join(cols) + f" | **{sp or '—'}** |")
-
-    for name, cells in lv["screens"]:
-        row(name, cells, f"**{name}** screen")
-    for name, cells in m["ttfs"]:
-        if name in README_TTFS:
-            row(name, cells, name)
-    for name, cells in m["memory"]:
-        if name in README_MEMORY:
-            row(name, cells, f"{name} memory")
-    p("")
-    eps = [(name, _ratio(cells["ferrofin"], cells.get(ORACLE))) for name, cells in lv["endpoints"]]
-    eps = [(n, r) for n, r in eps if r]
-    if eps:
-        ties = sum(f"{r:.1f}" == "1.0" for _, r in eps)
-        wins = sum(r > 1 and f"{r:.1f}" != "1.0" for _, r in eps)
-        losses = len(eps) - wins - ties
-        p(f"Among {len(eps)} comparable endpoint measurements at this level, Ferrofin is faster on "
-          f"{wins}, about the same on {ties}, and slower on {losses} against {oracle_label}. "
-          "Flagged or missing endpoints are excluded from these counts. The full tables are in "
-          "[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).\n")
-    else:
-        p("No endpoint speed comparisons have complete, comparable evidence in this selection.\n")
-    if notes:
-        p("⚠ marks a withheld cell: its evidence is incomplete or the servers did different work. "
-          "Raw diagnostic numbers remain in the full report.\n")
-        for n, text, sources in notes.items:
-            p(f"{n}. {', '.join(sources)}: {text}")
-        p("")
-    # ── spread sentence, computed ──
-    def moved(part):
-        return len(part.vals) > 1 and part.median and (max(part.vals) - min(part.vals)) > 0.15 * part.median
-    p50s = tails = p50_moved = tail_moved = 0
-    for _, cells in lv["screens"] + lv["endpoints"]:
-        for k, _ in servers:
-            parts = cells[k].parts()
-            if not parts or parts[0].median is None:
-                continue
-            p50s += 1
-            p50_moved += moved(parts[0])
-            for part in parts[1:]:
-                tails += 1
-                tail_moved += moved(part)
-    if nruns > 1:
-        p(f"How steady are these numbers? Across the {nruns} runs, {p50_moved} of the {p50s} medians in the "
-          f"{README_LEVEL}-level tables moved by more than 15 % of their value, against {tail_moved} of the {tails} "
-          f"p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, "
-          f"and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); "
-          f"the harness and the one-sentence definition of each number are in [`gates/bench/README.md`](gates/bench/README.md). "
-          f"It is a deliberate, local instrument, not a CI job.")
-    p(README_END)
-    return "\n".join(out) + "\n"
-
-
-def inject_readme(path, section):
-    """Replace the block between the GENERATED BENCHMARKS markers in `path` with
-    `section` (which carries its own markers). Refuses to guess when they are absent."""
-    text = open(path, encoding="utf-8").read()
-    i, j = text.find(README_BEGIN), text.find(README_END)
-    if i < 0 or j < 0:
-        sys.exit(f"{path} has no {README_BEGIN} … {README_END} block to replace")
-    j += len(README_END)
-    if text[j:j + 1] == "\n":
-        j += 1
-    open(path, "w", encoding="utf-8").write(text[:i] + section + text[j:])
 
 
 # ── html (the comparison page) ──────────────────────────────────────────────
@@ -2262,7 +2123,7 @@ def row_json(name, cells, servers):
     """A row of every server's numbers; `ratio`, the oracle's number over Ferrofin's as the reports
     print them (above 1: Ferrofin faster or lighter), None when there is nothing comparable; and
     `withheld`, each server's reason when either cell cannot be published (the servers did different
-    work, or the evidence is incomplete), as `render_readme` withholds it."""
+    work, or the evidence is incomplete), as the README withholds it."""
     withheld = reasons(*(f"{label}: {cells[k].flag}" for k, label in servers if k in cells and cells[k].flag))
     return {"name": name, "servers": {k: cell_json(cells[k]) for k, _ in servers if k in cells},
             "ratio": _ratio(cells.get("ferrofin"), cells.get(ORACLE)), "withheld": withheld}
@@ -2317,7 +2178,7 @@ def run_result(m):
               "levels": {level: {"rate": lv["rate"], "screens": rows(lv["screens"]), "endpoints": rows(lv["endpoints"])}
                          for level, lv in m["levels"].items()},
               "ttfs": rows(m["ttfs"]),
-              "memory": rows((name, cells) for name, cells in m["memory"] if name in README_MEMORY),
+              "memory": rows((name, cells) for name, cells in m["memory"] if name in MEMORY_ROWS),
               "cpu_per_screen": rows(cpu_rows(m)),
               "missing": m["missing"], "load_problems": m["load_problems"]}
     verdict, counts = phase_verdict(m)
@@ -2420,23 +2281,6 @@ def main():
         if not os.path.isdir(runs_dir) and not from_root:
             sys.exit(f"{runs_dir} is not a directory")
         serve(port, {"benchmark": runs_dir, **roots})
-        return
-    if args and args[0] == "--readme":
-        target = None
-        rest = args[1:]
-        if rest and rest[0].lower().endswith(".md"):
-            target, rest = rest[0], rest[1:]
-        if not rest:
-            sys.exit(__doc__)
-        for r in rest:
-            if not os.path.isfile(os.path.join(r, "run.json")):
-                sys.exit(f"{r} is not a run dir (no run.json)")
-        section = render_readme(build(rest), rest)
-        if target:
-            inject_readme(target, section)
-            sys.stderr.write(f"replaced the generated benchmarks block in {target}\n")
-        else:
-            sys.stdout.write(section)
         return
     if not args or any(a.startswith("--") for a in args):
         sys.exit(__doc__)
