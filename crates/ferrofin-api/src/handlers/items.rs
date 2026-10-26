@@ -79,7 +79,8 @@ pub(crate) async fn require_visible_item(
 ///
 /// This is the **single** implementation of the rule for the whole crate: any
 /// handler that accepts a `userId` from the request must route it through here
-/// (directly, or via [`resolve_user`] / [`resolve_user_opt`]) rather than
+/// (directly, or via [`resolve_user`] / [`resolve_user_opt`] /
+/// [`resolve_user_or_api_key`]) rather than
 /// hand-rolling a `user_id.unwrap_or(caller)` fallback, which silently drops
 /// half 2 and lets any authenticated account act as any other.
 pub(crate) async fn effective_user_id(
@@ -122,6 +123,42 @@ pub(crate) async fn resolve_user(
     if effective.is_nil() {
         return Err(ApiError::BadRequest("no user for request".to_owned()));
     }
+    load_user(state, auth, effective).await
+}
+
+/// Resolves the effective user for an action that also serves an API key with
+/// no user: v12.2 `ItemsController.GetItems` (`ItemsController.cs:263-274`).
+///
+/// An API key that names no `userId` has no user (`GetUserId` falls back to
+/// the key's empty claim), so the action runs with none: unscoped, with no
+/// per-user filters and no `UserData`. Any other caller without a user is a
+/// `400`, upstream's rule; no request reaches that arm today, because the
+/// default authorization policy already refuses a token that is neither a
+/// key nor a user (`403`). An id naming no account is a `404`, as
+/// [`resolve_user`].
+pub(crate) async fn resolve_user_or_api_key(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    user_id: Option<Uuid>,
+) -> Result<Option<UserEntity>, ApiError> {
+    let effective = effective_user_id(state, auth, user_id).await?;
+    if effective.is_nil() {
+        return if auth.is_api_key {
+            Ok(None)
+        } else {
+            Err(ApiError::BadRequest("userId is required".to_owned()))
+        };
+    }
+    load_user(state, auth, effective).await.map(Some)
+}
+
+/// The account `effective` names: the caller's own row when it is the caller,
+/// else a lookup, a `404` when no account has that id.
+async fn load_user(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    effective: Uuid,
+) -> Result<UserEntity, ApiError> {
     // The auth layer already loaded the caller's row — reuse it instead of
     // re-fetching the identical user on every user-scoped request.
     if effective == auth.user_id()
@@ -578,7 +615,7 @@ async fn get_items(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ItemsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let user = resolve_user(&state, &auth, query.user_id).await?;
+    let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
 
     let mut internal = items_query_options(&query, user)?;
     // `query.MinParentalRating = _localization.GetRatingScore(minOfficialRating)`
@@ -731,8 +768,8 @@ async fn get_items(
 /// `IncludeItemTypes=Playlist` one), not only the playlists the folder holds.
 /// So the listing is re-rooted at the user root, as the typed browse is
 /// ([`redirect_container_browse`]). With no user (an API key without
-/// `userId`, which this route answers with a `400` first, [`resolve_user`])
-/// upstream lists the folder's own children only.
+/// `userId`, [`resolve_user_or_api_key`]) upstream lists the folder's own
+/// children only, and so does this.
 fn list_playlists_folder_as_playlists(internal: &mut InternalItemsQuery) {
     if matches!(
         internal.parent_type,
@@ -882,10 +919,10 @@ fn official_rating_score(
 /// Convert HTTP query fields once, retaining the resolved user for DTO projection.
 fn items_query_options(
     query: &ItemsQuery,
-    user: UserEntity,
+    user: Option<UserEntity>,
 ) -> Result<InternalItemsQuery, ApiError> {
     Ok(InternalItemsQuery {
-        user: Some(user),
+        user,
         parent_id: query.parent_id.unwrap_or_default(),
         start_index: query.start_index,
         limit: query.limit,
@@ -2450,7 +2487,7 @@ mod tests {
             let Query(query) =
                 Query::<ItemsQuery>::try_from_uri(&format!("/Items?{q}").parse().expect("uri"))
                     .expect(q);
-            items_query_options(&query, crate::test_support::sample_user()).expect("maps")
+            items_query_options(&query, Some(crate::test_support::sample_user())).expect("maps")
         };
         let internal = bind("audioLanguages=eng,ger&subtitleLanguages=fre");
         assert_eq!(internal.audio_languages, ["eng", "ger"]);
@@ -2475,7 +2512,7 @@ mod tests {
         )
         .expect("binds");
         let internal =
-            items_query_options(&query, crate::test_support::sample_user()).expect("maps");
+            items_query_options(&query, Some(crate::test_support::sample_user())).expect("maps");
         assert_eq!(
             (internal.is_missing, internal.is_unaired),
             (Some(false), Some(true))

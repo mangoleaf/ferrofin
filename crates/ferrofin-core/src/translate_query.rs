@@ -63,6 +63,51 @@ pub(crate) const ALTERNATE_VERSION_HIDDEN: &str = r#" AND (bi."PrimaryVersionId"
 pub(crate) const NO_OWNER: &str =
     r#"(bi."OwnerId" IS NULL OR bi."OwnerId" = '00000000-0000-0000-0000-000000000000')"#;
 
+/// Whether [`push_access_filter`]'s library scope may drive the statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TopParentTerm {
+    /// A plain `TopParentId IN (…)`, which the planner may seek on.
+    Seek,
+    /// `+TopParentId IN (…)`: a residual check on a row the statement reaches
+    /// another way. A `CROSS JOIN` aggregate that probes `BaseItems` by its
+    /// primary key would otherwise switch to a `(Type, TopParentId, Id)` index
+    /// and probe once per type and library.
+    Residual,
+}
+
+/// Pushes C# `ApplyAccessFiltering` (v12.2 `BaseItemRepository.QueryBuilding.cs:
+/// 459-477`) on `bi`, each term opening with ` AND `: the libraries in
+/// `top_parents` (`ApplyTopParentFiltering`; none, no scope), the filter's
+/// parental restrictions, and, unless the filter includes owned items, a
+/// version only while its primary is not in the same library
+/// ([`ALTERNATE_VERSION_HIDDEN`]) and no owned non-extra ([`NO_OWNER`]
+/// accepts the zero GUID a Jellyfin database stores on every unowned row).
+///
+/// No item-by-name type is exempt from the library scope: the callers name
+/// none in `IncludeItemTypes`.
+pub(crate) fn push_access_filter(
+    qb: &mut QueryBuilder<Sqlite>,
+    filter: &InternalItemsQuery,
+    top_parents: &[Uuid],
+    term: TopParentTerm,
+) {
+    if !top_parents.is_empty() {
+        qb.push(" AND ");
+        let column = match term {
+            TopParentTerm::Seek => r#"bi."TopParentId""#,
+            TopParentTerm::Residual => r#"+bi."TopParentId""#,
+        };
+        push_in_list(qb, column, &to_guid_strings(top_parents));
+    }
+    append_parental_restrictions(qb, filter, "bi");
+    if !filter.include_owned_items {
+        qb.push(ALTERNATE_VERSION_HIDDEN)
+            .push(" AND (")
+            .push(NO_OWNER)
+            .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
+    }
+}
+
 /// HD/UHD resolution thresholds used by the `IsHD` / `Is4K` filters
 /// (C# `HDWidth` / `UHDWidth` / `UHDHeight`).
 const HD_WIDTH: i64 = 1200;
@@ -3413,6 +3458,41 @@ mod tests {
     use ferrofin_model::dto::SortOrder;
     use ferrofin_model::live_tv::ItemSortBy;
     use ferrofin_traits::options::InternalItemsQuery;
+
+    /// `push_access_filter`'s text: no library term for an empty scope, a
+    /// plain or `+` term by [`super::TopParentTerm`], and no version or owner
+    /// term once owned items are included.
+    #[test]
+    fn the_access_filter_text_follows_its_scope_and_term() {
+        use super::{TopParentTerm, push_access_filter};
+        use sqlx::{QueryBuilder, Sqlite};
+        let text = |filter: &InternalItemsQuery, top_parents: &[uuid::Uuid], term| {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("");
+            push_access_filter(&mut qb, filter, top_parents, term);
+            qb.sql().as_str().to_owned()
+        };
+        let plain = InternalItemsQuery::default();
+        let one = [uuid::Uuid::from_u128(1)];
+        let versions = format!(
+            "{} AND ({} OR bi.\"ExtraType\" IS NOT NULL)",
+            super::ALTERNATE_VERSION_HIDDEN,
+            super::NO_OWNER
+        );
+        assert_eq!(text(&plain, &[], TopParentTerm::Seek), versions);
+        assert_eq!(
+            text(&plain, &one, TopParentTerm::Seek),
+            format!(" AND bi.\"TopParentId\" IN (?){versions}")
+        );
+        assert_eq!(
+            text(&plain, &one, TopParentTerm::Residual),
+            format!(" AND +bi.\"TopParentId\" IN (?){versions}")
+        );
+        let owned = InternalItemsQuery {
+            include_owned_items: true,
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(text(&owned, &[], TopParentTerm::Residual), "");
+    }
 
     /// The closing sweep's dead genre and studio selections
     /// ([`crate::library_scan::dead_by_name_queries`]) seek the by-name rows
