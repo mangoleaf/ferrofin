@@ -64,8 +64,8 @@ fn before_group_by<'q>(
 
 /// Adds the same rating predicate as browsing before an existing aggregate's
 /// GROUP BY ([`before_group_by`]). Related-id aggregates correlate a
-/// primary-key lookup; the child-count and whole-server aggregates already
-/// read the counted row as `bi`.
+/// primary-key lookup; the child-count aggregates and the whole-server played
+/// arm already read the counted row as `bi`.
 fn restrict_count_query<'q>(
     query: impl Execute<'q, Sqlite>,
     filter: &InternalItemsQuery,
@@ -938,13 +938,12 @@ impl ItemCountService for FerrofinItemCountService {
         filter: &InternalItemsQuery,
         ancestor_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError> {
-        // The `AggregateFolder` is every item's ancestor upstream; Ferrofin's
-        // closure stops at the library, so its scope is stated directly, as in
-        // `get_played_and_total_count_batch`.
+        // The `AggregateFolder`'s leaves are counted by their roots, as in
+        // `get_played_and_total_count_batch` (`whole_server_leaf_counts`).
         if let (Some(roots), Some(user)) = (self.roots, filter.user.as_ref())
             && roots.aggregate == ancestor_id
         {
-            return self.whole_server_leaf_counts(user).await;
+            return self.whole_server_leaf_counts(user, roots).await;
         }
         // ponytail: summed per member where upstream unions the members' leaves
         // first; members are distinct merged folders, whose leaves cannot
@@ -1100,15 +1099,17 @@ impl ItemCountService for FerrofinItemCountService {
             }
         }
         // The `AggregateFolder` is the PHYSICAL root
-        // (`AggregateFolder.IsPhysicalRoot`), so every item on the server is one
-        // of its descendants. Jellyfin reaches that through an ancestor closure
-        // that carries the aggregate on every scanned row; Ferrofin's closure
-        // climbs to the library instead, so the scope is stated directly. One
-        // extra pair of counts, and only when the aggregate is on the page.
+        // (`AggregateFolder.IsPhysicalRoot`), the ancestor of every library row
+        // but an extra. Its leaves are counted by their roots
+        // (`whole_server_leaf_counts`): one extra pair of counts, and only when
+        // the aggregate is on the page.
         if let Some(roots) = self.roots
             && folder_ids.contains(&roots.aggregate)
         {
-            out.insert(roots.aggregate, self.whole_server_leaf_counts(user).await?);
+            out.insert(
+                roots.aggregate,
+                self.whole_server_leaf_counts(user, roots).await?,
+            );
         }
         Ok(out)
     }
@@ -1370,52 +1371,42 @@ impl FerrofinItemCountService {
             .collect())
     }
 
-    /// Every non-folder, non-alternate row on the server, and this user's
-    /// played subset — `GetRecursiveChildCount`/`GetUnplayedCount` for the
-    /// physical root, whose descendants are everything.
+    /// The `AggregateFolder`'s countable leaves and this user's played subset
+    /// (`GetRecursiveChildCount`/`GetUnplayedCount` for the physical root).
     ///
-    /// The played arm is [`WHOLE_SERVER_PLAYED_COUNT_SQL`]; read its doc for why
-    /// the count is `DISTINCT` and why the `UserData` join is the cheap form
-    /// here even though the sibling closure query wants an `EXISTS`.
+    /// v12.2 reaches the aggregate's leaves through its `AncestorIds` closure
+    /// (`GetPlayedAndTotalCountBatch`, `ItemCountService.cs:614-654`), which
+    /// holds every library row but an extra: an extra has no parent, so its
+    /// closure (`BaseItem.GetAncestorIds`) holds only its library's
+    /// `CollectionFolder`. The closure holds neither the migration's
+    /// `PLACEHOLDER` row, which holds detached `UserData`, nor the by-name rows
+    /// (`Genre`, `MusicGenre`, `Studio`, `Person`, `Year`, a by-name
+    /// `MusicArtist`), all stored `IsFolder = 0` with no `AncestorIds`. So a
+    /// leaf counts here when it has no owner and its closure holds one of the
+    /// `whole_server_roots!` (the aggregate, or a library's `CollectionFolder`
+    /// for rows an older Ferrofin scan wrote). Counting every leaf row on the
+    /// server instead served 36,552 on a Jellyfin 12.x adoption fixture whose
+    /// libraries hold 12,659.
     ///
-    /// TODO: BOTH arms owe a placeholder filter. Migration `0001_initial`
-    /// (`:187-194`) inserts one `PLACEHOLDER` `BaseItems` row — "a placeholder
-    /// item for `UserData` that has been detached from its original item" —
-    /// which is `IsFolder = 0`, `IsVirtualItem = 0` and has no
-    /// `PrimaryVersionId`, so both statements below see it. v12 never counts it:
-    /// it reaches the `AggregateFolder`'s leaves through
-    /// `AncestorIds`/`LinkedChildren` (v12.2 `ItemCountService.cs:622-654`) and the
-    /// placeholder is in neither. Measured on the adopted bench database, the
-    /// `total` arm serves 23,928 where the honest answer is 23,927 (the
-    /// placeholder is one of those rows and has zero `AncestorIds` rows). The
-    /// played arm is exposed the same way and for a sharper reason — that row
-    /// exists precisely to hold DETACHED `UserData`, so a detached row with
-    /// `Played = 1` would inflate it too; it reads clean on this database only
-    /// because none happens to be played. The fix is to exclude the placeholder
-    /// (`Type = 'PLACEHOLDER'`) from both arms, with its own before/after. Kept
-    /// out of the `DISTINCT` commit so that fix had a clean before/after; the
-    /// test const `UNSEEDED_LEAVES` pins the current behaviour meanwhile. The
-    /// same gap is wider than that one row: every by-name row (`Genre`,
-    /// `MusicGenre`, `Studio`, `Person`, `Year`, and a by-name `MusicArtist`)
-    /// is `IsFolder = 0` with no `AncestorIds` either, and both arms count it.
-    /// Counting only rows reachable through `AncestorIds`/`LinkedChildren`, as
-    /// upstream does, fixes both.
+    /// The total arm is [`WHOLE_SERVER_TOTAL_COUNT_SQL`], the played arm
+    /// [`WHOLE_SERVER_PLAYED_COUNT_SQL`]; read the latter's doc for why that
+    /// count is `DISTINCT` and drives from `UserData`.
     async fn whole_server_leaf_counts(
         &self,
         user: &UserEntity,
+        roots: RootFolderIds,
     ) -> Result<PlayedAndTotal, ServiceError> {
         let mut filter = InternalItemsQuery::default();
         filter.set_user(user.clone());
         let preferences = crate::query_restrictions::resolve(&self.db, &filter).await?;
         let filter = preferences.unwrap_or(filter);
+        let (aggregate, user_root) = (guid_to_db(roots.aggregate), guid_to_db(roots.user_root));
         let mut total_query = restrict_count_query(
-            sqlx::query(
-                r#"SELECT COUNT(*) FROM "BaseItems" bi
-               WHERE bi."IsFolder" = 0 AND bi."PrimaryVersionId" IS NULL AND bi."IsVirtualItem" = 0
-                 AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)"#,
-            ),
+            sqlx::query(WHOLE_SERVER_TOTAL_COUNT_SQL)
+                .bind(aggregate.as_str())
+                .bind(user_root.as_str()),
             &filter,
-            None,
+            Some(r#"anc."ItemId""#),
         )?;
         let total: i64 = total_query
             .build_query_scalar()
@@ -1423,7 +1414,10 @@ impl FerrofinItemCountService {
             .await
             .map_err(db_err)?;
         let mut played_query = restrict_count_query(
-            sqlx::query(WHOLE_SERVER_PLAYED_COUNT_SQL).bind(user.id.as_str()),
+            sqlx::query(WHOLE_SERVER_PLAYED_COUNT_SQL)
+                .bind(aggregate.as_str())
+                .bind(user_root.as_str())
+                .bind(user.id.as_str()),
             &filter,
             None,
         )?;
@@ -1664,9 +1658,25 @@ fn folder_leaf_count_sql(extra_join: &str, extra_where: &str) -> String {
     )
 }
 
+/// The folders whose closures hold the `AggregateFolder`'s leaves, bound as
+/// `(aggregate, user root)`: the aggregate itself, which a Jellyfin scan and
+/// a current Ferrofin scan put in the closure of every library row but an
+/// extra, and every folder directly under the user root, the libraries'
+/// `CollectionFolder`s, for rows an older Ferrofin scan wrote, whose closure
+/// stops there. (The aggregate's own children, the location folders, never
+/// hold a row the aggregate does not.)
+///
+/// The head of both whole-server statements.
+macro_rules! whole_server_roots {
+    () => {
+        r#"WITH roots("Id") AS (SELECT ? UNION SELECT r."Id" FROM "BaseItems" r WHERE r."ParentId" = ?)"#
+    };
+}
+
 /// The whole-server played-leaf count — the `AggregateFolder`'s played arm,
 /// bound to one `UserId`. The sibling of [`folder_leaf_count_sql`] for the one
-/// parent whose descendants are everything, so it needs no ancestor closure.
+/// parent whose closure is every library, so it drives from the played rows
+/// rather than from a closure.
 ///
 /// The `COUNT(DISTINCT bi."Id")` is v12.2's rule and it is load-bearing.
 /// `ItemCountService.GetPlayedAndTotalCountFromQuery`
@@ -1681,7 +1691,8 @@ fn folder_leaf_count_sql(extra_join: &str, extra_where: &str) -> String {
 /// can carry several rows — 2,154 such pairs on the adopted bench database —
 /// and a bare `COUNT(*)` over the join counts a leaf once per key row. It read
 /// 4,031 played leaves against a true 1,574 for the `bench` user (855 against
-/// 285 for `viewer`), out of 23,928 total.
+/// 285 for `viewer`), out of 23,928 total (counted, before gl-226, over every
+/// leaf row on the server rather than the libraries' closures).
 ///
 /// It also restores an invariant the old form could break: the played
 /// predicates are a strict superset of the `total` arm's, so `played <= total`
@@ -1691,10 +1702,10 @@ fn folder_leaf_count_sql(extra_join: &str, extra_where: &str) -> String {
 /// `DISTINCT` and not `EXISTS`, which is the opposite of the choice
 /// [`folder_leaf_count_sql`] makes for its leaf test — because the driving side
 /// is the opposite too. There the closure is small and `BaseItems` is the
-/// library, so an `EXISTS` is what STOPS `IsFolder` from driving. Here there is
-/// no closure: an `EXISTS` form makes `bi."IsFolder" = 0` the only driving term,
-/// so SQLite walks every leaf row on the server and probes `UserData` per row
-/// (`SEARCH bi USING INDEX IX_BaseItems_IsFolder_… (IsFolder=?)` +
+/// library, so an `EXISTS` is what STOPS `IsFolder` from driving. Here no
+/// closure drives: an `EXISTS` leaf test makes `bi."IsFolder" = 0` the only
+/// driving term, so SQLite walks every leaf row on the server and probes
+/// `UserData` per row (`SEARCH bi USING INDEX IX_BaseItems_IsFolder_… (IsFolder=?)` +
 /// `CORRELATED SCALAR SUBQUERY`), measured 15.9 ms against the join's 1.6 on the
 /// adopted bench database. The join keeps SQLite seeding from
 /// `FerrofinIX_UserData_UserId_Played_ItemId (UserId=? AND Played=?)` — only the
@@ -1705,11 +1716,38 @@ fn folder_leaf_count_sql(extra_join: &str, extra_where: &str) -> String {
 /// order is pinned and no index is added: the planner already picks the played
 /// rows as the driving side, and `whole_server_leaf_counts_seek_from_the_user`
 /// pins that shape.
-const WHOLE_SERVER_PLAYED_COUNT_SQL: &str = r#"SELECT COUNT(DISTINCT bi."Id") FROM "BaseItems" bi
+///
+/// A leaf counts only with no owner and in the closure of one of the
+/// `whole_server_roots!`: one `AncestorIds` primary-key probe per played
+/// row, which leaves the driving side alone.
+const WHOLE_SERVER_PLAYED_COUNT_SQL: &str = concat!(
+    whole_server_roots!(),
+    r#"
+   SELECT COUNT(DISTINCT bi."Id") FROM "BaseItems" bi
    JOIN "UserData" ud ON ud."ItemId" = bi."Id"
    WHERE bi."IsFolder" = 0 AND bi."PrimaryVersionId" IS NULL
-     AND (bi."OwnerId" IS NULL OR bi."ExtraType" IS NOT NULL)
-     AND bi."IsVirtualItem" = 0 AND ud."UserId" = ? AND ud."Played" = 1"#;
+     AND bi."OwnerId" IS NULL
+     AND bi."IsVirtualItem" = 0 AND ud."UserId" = ? AND ud."Played" = 1
+     AND EXISTS (SELECT 1 FROM "AncestorIds" anc
+                 WHERE anc."ItemId" = bi."Id" AND anc."ParentItemId" IN (SELECT "Id" FROM roots))"#
+);
+
+/// The whole-server leaf count, the `AggregateFolder`'s total arm: the
+/// distinct countable leaves in the closures of the `whole_server_roots!`. It
+/// seeds `AncestorIds` by `ParentItemId` per root and tests each row as a
+/// leaf by primary key, the `EXISTS` keeping `BaseItems."IsFolder"` from
+/// driving, as in [`folder_leaf_count_sql`]; `whole_server_leaf_counts_seek_from_the_roots`
+/// pins it.
+const WHOLE_SERVER_TOTAL_COUNT_SQL: &str = concat!(
+    whole_server_roots!(),
+    r#"
+   SELECT COUNT(DISTINCT anc."ItemId") FROM "AncestorIds" anc
+   WHERE anc."ParentItemId" IN (SELECT "Id" FROM roots)
+     AND EXISTS (SELECT 1 FROM "BaseItems" bi
+                 WHERE bi."Id" = anc."ItemId" AND bi."IsFolder" = 0
+                   AND bi."PrimaryVersionId" IS NULL AND bi."IsVirtualItem" = 0
+                   AND bi."OwnerId" IS NULL)"#
+);
 
 /// The per-clean-value count aggregate for the `ItemValues`-backed by-name kinds
 /// (genre / music genre / studio / artist): `cleans` bound clean values,
@@ -2056,13 +2094,20 @@ mod tests {
                 .unwrap()[&folder],
             1
         );
-        let whole = service.whole_server_leaf_counts(&user).await.unwrap();
+        // The folder is a library's: directly under the user root.
+        seed_roots(&db).await;
+        under_user_root(&db, folder).await;
+        let whole = service
+            .whole_server_leaf_counts(&user, ROOTS)
+            .await
+            .unwrap();
         let mut unrestricted_user = user.clone();
         unrestricted_user.max_parental_rating_score = None;
         let unrestricted = service
-            .whole_server_leaf_counts(&unrestricted_user)
+            .whole_server_leaf_counts(&unrestricted_user, ROOTS)
             .await
             .unwrap();
+        assert_eq!(unrestricted.total, 2, "the folder's two leaves");
         assert_eq!(whole.played, 0);
         assert_eq!(whole.total, unrestricted.total - 1);
         // A by-name item's counts cover the libraries its viewer may open
@@ -2809,7 +2854,8 @@ mod tests {
     /// `ExtraType`, no `PrimaryVersionId` — is neither a child of its folder
     /// nor a leaf of its own, in a folder's counts or the whole server's, so
     /// the folder's unplayed badge clears once the primary is played. An
-    /// extra is still counted.
+    /// extra still counts in its folder, but not on the whole server: an
+    /// extra has no parent upstream, so the aggregate's closure never holds it.
     #[tokio::test]
     async fn a_stacked_part_counts_as_no_item_of_its_own() {
         let db = test_db().await;
@@ -2849,6 +2895,9 @@ mod tests {
         }
         let user_id = Uuid::from_u128(0x5F0D);
         let user = seed_user(&db, user_id).await;
+        // The folder is a library's: directly under the user root.
+        seed_roots(&db).await;
+        under_user_root(&db, folder).await;
 
         let children = service
             .get_child_count_batch(&[folder], None)
@@ -2861,7 +2910,7 @@ mod tests {
             .expect("batch");
         assert_eq!((before[&folder].played, before[&folder].total), (0, 2));
         let server = service
-            .whole_server_leaf_counts(&user)
+            .whole_server_leaf_counts(&user, ROOTS)
             .await
             .expect("server");
         let leaves = server.total;
@@ -2871,7 +2920,7 @@ mod tests {
             .await
             .expect("unown");
         let unowned = service
-            .whole_server_leaf_counts(&user)
+            .whole_server_leaf_counts(&user, ROOTS)
             .await
             .expect("server");
         assert_eq!(unowned.total, leaves + 1, "an unowned part is a leaf");
@@ -2894,10 +2943,14 @@ mod tests {
             "nothing left unplayed"
         );
         let server = service
-            .whole_server_leaf_counts(&user)
+            .whole_server_leaf_counts(&user, ROOTS)
             .await
             .expect("server");
-        assert_eq!((server.played, server.total), (2, leaves));
+        assert_eq!(
+            (server.played, server.total),
+            (1, leaves),
+            "the primary only"
+        );
     }
 
     #[tokio::test]
@@ -5076,55 +5129,164 @@ mod tests {
         assert_eq!(rows[0], rows[1], "the join-order pin changed the counts");
     }
 
-    /// Seeds an `AggregateFolder` and `leaves` movies directly under it, the
-    /// nth played for the returned user when `n < played`, each carrying
-    /// `extra_keys` FURTHER `UserData` rows under distinct `CustomDataKey`s.
-    ///
-    /// No `AncestorIds` rows: the whole-server arm counts every leaf on the
-    /// server by scope, not through the closure, which is exactly why it needs
-    /// its own oracle.
+    /// The root ids the whole-server tests inject.
+    const ROOTS: RootFolderIds = RootFolderIds {
+        user_root: Uuid::from_u128(0xC001),
+        aggregate: Uuid::from_u128(0xC002),
+    };
+
+    /// The library [`seed_roots_and_library`] seeds under the user root.
+    const LIBRARY: Uuid = Uuid::from_u128(0xC003);
+
+    /// Seeds the `AggregateFolder` and the user root ([`ROOTS`]).
+    async fn seed_roots(db: &Database) {
+        use crate::test_support::seed_folder_item;
+        seed_folder_item(
+            db,
+            ROOTS.aggregate,
+            BaseItemKind::AggregateFolder,
+            "root",
+            None,
+        )
+        .await;
+        seed_folder_item(
+            db,
+            ROOTS.user_root,
+            BaseItemKind::UserRootFolder,
+            "MF",
+            None,
+        )
+        .await;
+    }
+
+    /// Hangs `folder` directly under the user root, as a library's
+    /// `CollectionFolder` is ([`seed_roots`] first).
+    async fn under_user_root(db: &Database, folder: Uuid) {
+        set_column(db, folder, "ParentId", Some(guid_to_db(ROOTS.user_root))).await;
+    }
+
+    /// Seeds the roots and a library under the user root, as a Ferrofin scan
+    /// leaves them, and returns the library; [`in_library`] files a leaf there.
+    async fn seed_roots_and_library(db: &Database) -> Uuid {
+        let library = LIBRARY;
+        seed_roots(db).await;
+        crate::test_support::seed_folder_item(
+            db,
+            library,
+            BaseItemKind::CollectionFolder,
+            "Movies",
+            None,
+        )
+        .await;
+        under_user_root(db, library).await;
+        library
+    }
+
+    /// Writes the `AncestorIds` edge `item` → `ancestor`.
+    async fn in_library(db: &Database, item: Uuid, ancestor: Uuid) {
+        sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+            .bind(guid_to_db(item))
+            .bind(guid_to_db(ancestor))
+            .execute(db.writer())
+            .await
+            .expect("ancestor");
+    }
+
+    /// Seeds the roots and a library ([`seed_roots_and_library`]) and `leaves`
+    /// movies in it, the nth played for the returned user when `n < played`,
+    /// each carrying `extra_keys` FURTHER `UserData` rows under distinct
+    /// `CustomDataKey`s.
     async fn seed_whole_server(
         db: &Database,
         played: usize,
         unplayed: usize,
         extra_keys: usize,
     ) -> (RootFolderIds, UserEntity) {
-        use crate::test_support::seed_folder_item;
         let user_id = Uuid::from_u128(0x5EED_0002);
         let user = seed_user(db, user_id).await;
-        let aggregate = Uuid::from_u128(0xC002);
-        let user_root = Uuid::from_u128(0xC001);
-        seed_folder_item(db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
-        seed_folder_item(db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        let library = seed_roots_and_library(db).await;
         for i in 0..(played + unplayed) {
             let leaf = Uuid::from_u128(0xC100 + i as u128);
             seed_item(db, leaf, BaseItemKind::Movie).await;
+            in_library(db, leaf, library).await;
             seed_user_data(db, user_id, leaf, i < played, None).await;
             for k in 0..extra_keys {
                 seed_extra_user_data_key(db, user_id, leaf, k, i < played).await;
             }
         }
-        (
-            RootFolderIds {
-                user_root,
-                aggregate,
-            },
-            user,
-        )
+        (ROOTS, user)
     }
 
-    /// Leaf rows the whole-server arm counts that nobody seeded: the single
-    /// `PLACEHOLDER` row migration `0001_initial` inserts ("a placeholder item
-    /// for `UserData` that has been detached from its original item"), which is
-    /// `IsFolder = 0`, `IsVirtualItem = 0` and has no `PrimaryVersionId`, so the
-    /// whole-server scope statement sees it.
-    ///
-    /// It is a divergence — v12 never counts that row — and it is an open work
-    /// item on BOTH whole-server arms, not just the `total` one. The TODO on
-    /// [`FerrofinItemCountService::whole_server_leaf_counts`] carries the
-    /// reasoning, the measurement and the un-fix path; this const only pins the
-    /// current behaviour so the played assertions below stay readable.
-    const UNSEEDED_LEAVES: i32 = 1;
+    /// The `AggregateFolder` counts the leaves in its libraries, reached as
+    /// v12.2 reaches them, through the closure (`ItemCountService.cs:614-654`):
+    /// a leaf an older Ferrofin scan filed under a library's
+    /// `CollectionFolder` only, one a Jellyfin scan filed with the aggregate
+    /// itself in its closure, and one a current scan filed under both (once).
+    /// Not an extra, which upstream's aggregate closure never holds; not the
+    /// migration's `PLACEHOLDER` row, which holds detached `UserData` (a played
+    /// one included); not a by-name row (all stored `IsFolder = 0`); and not a
+    /// leaf in no library.
+    #[tokio::test]
+    async fn the_whole_server_counts_only_the_leaves_in_its_libraries() {
+        let db = test_db().await;
+        let (roots, user) = seed_whole_server(&db, 1, 1, 0).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let adopted = Uuid::from_u128(0xC200);
+        seed_item(&db, adopted, BaseItemKind::Movie).await;
+        in_library(&db, adopted, roots.aggregate).await;
+        for (n, kind) in [
+            BaseItemKind::Genre,
+            BaseItemKind::MusicGenre,
+            BaseItemKind::Studio,
+            BaseItemKind::Person,
+            BaseItemKind::Year,
+            BaseItemKind::MusicArtist,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            seed_named_item(&db, Uuid::from_u128(0xC210 + n as u128), kind, "by name").await;
+        }
+        let loose = Uuid::from_u128(0xC220);
+        seed_item(&db, loose, BaseItemKind::Movie).await;
+        seed_user_data(&db, user_id, loose, true, None).await;
+        let placeholder =
+            Uuid::parse_str(crate::translate_query::PLACEHOLDER_ID).expect("placeholder id");
+        seed_user_data(&db, user_id, placeholder, true, None).await;
+
+        // A current scan's leaf, its closure holding the library, the
+        // location folder and the aggregate: one leaf, however many roots
+        // reach it.
+        let location = Uuid::from_u128(0xC230);
+        crate::test_support::seed_folder_item(&db, location, BaseItemKind::Folder, "loc", None)
+            .await;
+        set_column(&db, location, "ParentId", Some(guid_to_db(roots.aggregate))).await;
+        let current = Uuid::from_u128(0xC231);
+        seed_item(&db, current, BaseItemKind::Movie).await;
+        for ancestor in [LIBRARY, location, roots.aggregate] {
+            in_library(&db, current, ancestor).await;
+        }
+        seed_user_data(&db, user_id, current, true, None).await;
+        // An extra, owned and filed with its library only: upstream's
+        // aggregate closure never holds it.
+        let extra = Uuid::from_u128(0xC232);
+        seed_item(&db, extra, BaseItemKind::Trailer).await;
+        set_column(&db, extra, "OwnerId", Some(guid_to_db(current))).await;
+        set_column(&db, extra, "ExtraType", Some("2".to_owned())).await;
+        in_library(&db, extra, LIBRARY).await;
+        seed_user_data(&db, user_id, extra, true, None).await;
+
+        let got = svc(&db)
+            .with_root_ids(roots)
+            .get_played_and_total_count_batch(&[roots.aggregate], &user)
+            .await
+            .expect("whole-server counts")[&roots.aggregate];
+        assert_eq!(
+            (got.played, got.total),
+            (2, 4),
+            "the two library leaves, the adopted one and the current one; two played"
+        );
+    }
 
     /// The `AggregateFolder`'s played/total pair, pinned against duplicate
     /// `UserData` key rows.
@@ -5163,7 +5325,7 @@ mod tests {
             (got.played, got.total),
             (
                 i32::try_from(played).expect("small"),
-                i32::try_from(played + unplayed).expect("small") + UNSEEDED_LEAVES
+                i32::try_from(played + unplayed).expect("small")
             ),
             "aggregate played/total with {extra_keys} extra UserData key rows per leaf"
         );
@@ -5188,15 +5350,10 @@ mod tests {
     /// would pin only the `Any` rule and pass under either form.
     #[tokio::test]
     async fn a_whole_server_leaf_is_played_when_any_of_its_user_data_keys_is() {
-        use crate::test_support::seed_folder_item;
-
         let db = test_db().await;
         let user_id = Uuid::from_u128(0x5EED_0002);
         let user = seed_user(&db, user_id).await;
-        let aggregate = Uuid::from_u128(0xC002);
-        let user_root = Uuid::from_u128(0xC001);
-        seed_folder_item(&db, aggregate, BaseItemKind::AggregateFolder, "root", None).await;
-        seed_folder_item(&db, user_root, BaseItemKind::UserRootFolder, "MF", None).await;
+        let library = seed_roots_and_library(&db).await;
 
         // Base row played + extra unplayed, base unplayed + extra played, BOTH
         // played, and both unplayed. The first three are played leaves, the
@@ -5207,20 +5364,18 @@ mod tests {
         {
             let leaf = Uuid::from_u128(0xC100 + n as u128);
             seed_item(&db, leaf, BaseItemKind::Movie).await;
+            in_library(&db, leaf, library).await;
             seed_user_data(&db, user_id, leaf, base, None).await;
             seed_extra_user_data_key(&db, user_id, leaf, 0, extra).await;
         }
 
         let counts = svc(&db)
-            .with_root_ids(RootFolderIds {
-                user_root,
-                aggregate,
-            })
-            .get_played_and_total_count_batch(&[aggregate], &user)
+            .with_root_ids(ROOTS)
+            .get_played_and_total_count_batch(&[ROOTS.aggregate], &user)
             .await
             .expect("whole-server counts");
-        let got = counts.get(&aggregate).copied().unwrap_or_default();
-        assert_eq!((got.played, got.total), (3, 4 + UNSEEDED_LEAVES));
+        let got = counts.get(&ROOTS.aggregate).copied().unwrap_or_default();
+        assert_eq!((got.played, got.total), (3, 4));
     }
 
     /// Another user's played rows are not this user's played leaves — the
@@ -5242,7 +5397,7 @@ mod tests {
         let got = counts.get(&roots.aggregate).copied().unwrap_or_default();
         assert_eq!(
             (got.played, got.total),
-            (0, 3 + UNSEEDED_LEAVES),
+            (0, 3),
             "the other user has played nothing, but the total is the server's"
         );
     }
@@ -5252,7 +5407,7 @@ mod tests {
     ///
     /// This is the mirror of [`folder_leaf_counts_seek_from_the_page_folders`]
     /// and the reason the count is a `DISTINCT` over a join rather than an
-    /// `EXISTS`: with no ancestor closure to drive from, an `EXISTS` leaves
+    /// `EXISTS`: with no closure driving it, an `EXISTS` leaf test leaves
     /// `IsFolder = 0` as the only driving term and SQLite walks every leaf row
     /// on the server, probing `UserData` per row — 15.9 ms against 1.6 on the
     /// adopted bench database. Driven from
@@ -5261,7 +5416,13 @@ mod tests {
     #[tokio::test]
     async fn whole_server_leaf_counts_seek_from_the_user() {
         let db = test_db().await;
-        let plan = query_plan(&db, WHOLE_SERVER_PLAYED_COUNT_SQL, 1).await;
+        let plan = query_plan(&db, WHOLE_SERVER_PLAYED_COUNT_SQL, 3).await;
+        assert!(
+            plan.iter().any(
+                |s| s.starts_with("SEARCH anc ") && s.contains("(ItemId=? AND ParentItemId=?)")
+            ),
+            "a played leaf's roots are a primary-key probe, got: {plan:?}"
+        );
 
         assert!(
             !plan.iter().any(|s| s.contains("IsFolder=?")),
@@ -5281,6 +5442,39 @@ mod tests {
             plan.iter()
                 .any(|s| s.starts_with("SEARCH bi") && s.contains("Id=?")),
             "the whole-server played arm must reach BaseItems by id, got: {plan:?}"
+        );
+    }
+
+    /// The whole-server total arm seeds `AncestorIds` from the roots
+    /// (`ParentItemId=?`) and tests each row as a leaf by primary key: never
+    /// driven by `BaseItems."IsFolder"`, never a `BaseItems` scan, the roots
+    /// themselves found through `IX_BaseItems_ParentId`.
+    #[tokio::test]
+    async fn whole_server_leaf_counts_seek_from_the_roots() {
+        let db = test_db().await;
+        let plan = query_plan(&db, WHOLE_SERVER_TOTAL_COUNT_SQL, 2).await;
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH anc USING") && s.contains("(ParentItemId=?)")),
+            "the closure is seeded by root, got: {plan:?}"
+        );
+        assert!(
+            plan.iter().any(|s| s.starts_with("SEARCH bi ")
+                && s.ends_with("USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)")),
+            "a leaf is tested by its id, got: {plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|s| s.starts_with("SEARCH r USING") && s.contains("ParentId=?")),
+            "the roots come from IX_BaseItems_ParentId, got: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|s| s.contains("IsFolder=?")
+                || s.starts_with("SCAN bi")
+                || s == "SCAN r"
+                || s.starts_with("SCAN r ")
+                || s.contains("SCAN BaseItems")),
+            "never driven by IsFolder or a BaseItems scan, got: {plan:?}"
         );
     }
 }
