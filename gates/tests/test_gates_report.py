@@ -214,6 +214,7 @@ class SessionReportTests(unittest.TestCase):
         self.assertIn("<h2>Parity</h2>", page)
         self.assertEqual(page.count("<div class='graph light'><svg"), 1)
         self.assertIn("Answering jellyfin-web like Jellyfin 12.2.0", page)
+        self.assertIn("Ferrofin (commit c0ffee12) against Jellyfin 12.2.0", page)
         self.parity_run(s / "parity", {"verdict": "run failed", "reason": "ferrofin did not start", "planned": 0, "requests": []})
         page = Path(report.write(str(s))).read_text(encoding="utf-8")
         self.assertNotIn("<h2>Parity</h2>", page)   # nothing compared: the gate's row says why, no graph and no error
@@ -227,6 +228,7 @@ class SessionReportTests(unittest.TestCase):
         self.assertEqual(page.count("<div class='graph light'><svg"), 1)
         self.assertIn(">failed<", page)
         self.assertIn("12.2-fresh", page)
+        self.assertIn("Ferrofin (commit c0ffee12), gates session", page)
 
     def test_an_ab_gate_session_counts_its_gated_cells_and_what_blocks(self):
         s = self.session(["bench"], {"bench": ("failed", 1)}, previous="ferrofin:v8")
