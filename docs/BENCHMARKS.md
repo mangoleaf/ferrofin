@@ -1,7 +1,7 @@
 # Benchmarks — three-run results
 
-Measured on **2026-10-26** from server source **`5112240e`** (`release/v1.4.0` with the gates' publishing
-changes; the server code is `release/v1.4.0` at `4bedc9df`), against **Jellyfin 12.2.0** (pinned by digest in
+Measured on **2026-10-26** from commit **`5112240e`** (`release/v1.4.0` at `4bedc9df` with the gates'
+publishing changes, so the server code is `4bedc9df`'s), against **Jellyfin 12.2.0** (pinned by digest in
 `gates/bench/testdata/jellyfin-image.txt`), using three complete repetitions: the benchmark of one full gates
 session and two benchmark sessions, all of one image. The root [README](../README.md#results) graphs every
 comparable cell and lists the withheld ones; this detailed report keeps flagged raw measurements as
