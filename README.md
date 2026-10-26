@@ -26,12 +26,9 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
 
 ## Why Ferrofin
 
-- **Faster movie browsing, lower memory.** Across three runs on the same machine and
-  fixture, Ferrofin's movie-screen HTTP workload had **16 ms median latency against
-  36 ms** for Jellyfin 12.2.0, and steady idle memory was **168 MiB against 422 MiB**.
-  Playback is also faster; home, detail, series and search remain withheld where response
-  validation differs.
-  Results, ranges and limitations are in [Results](#results).
+- **Measured against Jellyfin, every release.** Each release is measured against Jellyfin on the same
+  machine and library: speed, time to first screen and memory, with every comparable cell graphed
+  and the rest listed with the reason they are withheld. See [Results](#results).
 - **One binary, no runtime.** A single `ferrofin-server` executable plus ffmpeg. No .NET
   runtime, no JIT warm-up. The Docker image bundles both jellyfin-ffmpeg and the jellyfin-web
   client, so `docker run` gives you the whole server, web UI included.
