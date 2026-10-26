@@ -111,7 +111,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --out) OUT=$2; shift 2;;
   *) echo "unknown $1" >&2; exit 2;;
 esac; done
-[[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] && (( SLOTS % 10 == 0 )) || { echo "SLOTS must be a positive multiple of ten" >&2; exit 2; }
+if ! [[ "$SLOTS" =~ ^[1-9][0-9]*$ ]] || (( SLOTS % 10 != 0 )); then echo "SLOTS must be a positive multiple of ten" >&2; exit 2; fi
 for tunable in SHAPE_VUS READY_TIMEOUT_S DRAIN_TIMEOUT_S HTTP_TIMEOUT_S STREAM_HTTP_TIMEOUT_S PHASE_TIMEOUT_S CLEANUP_TIMEOUT_S COLDSTART_ATTEMPT_TIMEOUT_MS MEM_SAMPLE_MS SAMPLE_BRACKET_INTERVALS SAMPLE_GAP_INTERVALS RESTARTS TTFS_REPS RAMP_START RAMP_STEP_RATE RAMP_STEP_S RAMP_CAP RAMP_BOUND_MS SOAK_S RATE_SOAK SOAK_SKIP_S ENDPOINT_COUNT ENDPOINT_MAX_S; do
   [[ "${!tunable}" =~ ^[1-9][0-9]*$ ]] || { echo "$tunable must be a positive integer" >&2; exit 2; }
 done
@@ -184,7 +184,7 @@ explicit() { [[ ",$ONLY," == *",$1,"* ]]; }   # opt-in phases never run by defau
 [ ! -e "$OUT" ] || die "$OUT exists — a run directory is never reused"
 [ -f "$TESTDATA/ids.json" ] || die "no $TESTDATA/ids.json — build the test data first (gates/bench/testdata/build.sh)"
 for t in docker k6 python3 jq taskset curl sha256sum timeout setsid; do command -v $t >/dev/null || die "$t not installed"; done
-[ ! -z "$ONLY" ] && ! want ttfs || command -v ffprobe >/dev/null || die "ffprobe not installed"
+[ -n "$ONLY" ] && ! want ttfs || command -v ffprobe >/dev/null || die "ffprobe not installed"
 jq -e '.viewer_name and .viewer_password and .viewer and (.viewer != .user)' "$TESTDATA/ids.json" >/dev/null || die "playback role missing; run gates/bench/testdata/build.sh --export-pools, then prepare Jellyfin again"
 jq -e '.pools | (.movies|length)>0 and (.series|length)>0 and (.terms|length)>0 and (.movieCount>0) and (.nextUpCutoff|type=="string")' "$TESTDATA/ids.json" >/dev/null || die "fixture pools missing; run gates/bench/testdata/build.sh --export-pools"
 for s in ${SERVERS//,/ }; do docker_cmd image inspect "$(image_of "$s")" >/dev/null 2>&1 || die "image $(image_of "$s") missing"; done
@@ -236,6 +236,7 @@ wait_ready() {
   done
   FAIL_REASON="readiness timed out"; return 1
 }
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 drain() {
   verify_isolation || return 1
   local deadline=$((SECONDS + DRAIN_TIMEOUT_S)) busy
@@ -246,6 +247,7 @@ drain() {
   done
   FAIL_REASON="scheduled tasks did not drain before deadline"; return 1
 }
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 count() { api "$1" | jq -r 'if type=="array" then length else (.TotalRecordCount // (.Items|length)) end'; }
 disable_plugins() {  # installed Jellyfin plugins / all Ferrofin plugins off; no WASM
   local wasm; wasm=$(find "$1" -name '*.wasm' 2>/dev/null | head -1)
@@ -273,12 +275,19 @@ disable_schedules() {
   done < <(jq -r '.[].Id' "$D/tasks-before.json")
 }
 verify_isolation() {
-  api "/Plugins" > "$D/plugins.json" &&
-    jq -e --arg server "$NAME" 'type == "array" and all(.[]; .Status == "Disabled" or ($server != "ferrofin" and .CanUninstall == false))' "$D/plugins.json" >/dev/null || { FAIL_REASON="plugins not disabled"; return 1; }
-  api "/ScheduledTasks" > "$D/tasks.json" &&
-    jq -e 'type == "array" and length > 0 and all(.[]; .Triggers == [])' "$D/tasks.json" >/dev/null || { FAIL_REASON="automatic task triggers remain enabled"; return 1; }
-  api "/Library/VirtualFolders" > "$D/libraries.json" &&
-    jq -e 'type == "array" and length > 0 and all(.[]; .LibraryOptions | .EnableRealtimeMonitor == false and .AutomaticRefreshIntervalDays == 0 and (.TypeOptions | length > 0 and all(.[]; .MetadataFetchers == [] and .ImageFetchers == [])))' "$D/libraries.json" >/dev/null || { FAIL_REASON="library monitoring/automatic refresh/fetchers not disabled"; return 1; }
+  # each check fails when either its request or its condition does
+  if ! { api "/Plugins" > "$D/plugins.json" &&
+         jq -e --arg server "$NAME" 'type == "array" and all(.[]; .Status == "Disabled" or ($server != "ferrofin" and .CanUninstall == false))' "$D/plugins.json" >/dev/null; }; then
+    FAIL_REASON="plugins not disabled"; return 1
+  fi
+  if ! { api "/ScheduledTasks" > "$D/tasks.json" &&
+         jq -e 'type == "array" and length > 0 and all(.[]; .Triggers == [])' "$D/tasks.json" >/dev/null; }; then
+    FAIL_REASON="automatic task triggers remain enabled"; return 1
+  fi
+  if ! { api "/Library/VirtualFolders" > "$D/libraries.json" &&
+         jq -e 'type == "array" and length > 0 and all(.[]; .LibraryOptions | .EnableRealtimeMonitor == false and .AutomaticRefreshIntervalDays == 0 and (.TypeOptions | length > 0 and all(.[]; .MetadataFetchers == [] and .ImageFetchers == [])))' "$D/libraries.json" >/dev/null; }; then
+    FAIL_REASON="library monitoring/automatic refresh/fetchers not disabled"; return 1
+  fi
 }
 # A client gets its own process group, so interruption/timeout also stops descendants.
 client() {
@@ -297,6 +306,7 @@ client() {
   CLIENT_PID=""
   return "$rc"
 }
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 k6run() {
   local arg output="" validation
   for arg in "$@"; do case "$arg" in OUT=*) output=${arg#OUT=};; esac; done
@@ -332,6 +342,7 @@ stop_sampler() {
   SAMPLER_PID=""
   return "$rc"
 }
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 cleanup() {
   local rc=$? cid deadline cleanup_rc=0
   set +e
@@ -358,6 +369,7 @@ cleanup() {
   exit "$((rc != 0 || FAILED != 0 || cleanup_rc != 0))"
 }
 
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 phase_counts() {
   local movies series episodes albums tracks artists persons genres studios resume nextup latest
   movies=$(count "/Items?userId=$U&recursive=true&includeItemTypes=Movie&limit=0") &&
@@ -375,17 +387,19 @@ phase_counts() {
     '$ARGS.named | map_values(tonumber? // .)' > "$D/counts.json"
   echo "  counts: $(jq -c . "$D/counts.json")"
 }
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 setup_users() {
   client python3 gates/bench/testdata/seed.py --isolation-auth "$URL" "$TESTDATA/ids.json" "$D/ids-private.json" || return 1
   IDS=$D/ids-private.json
   client python3 gates/bench/testdata/seed.py --state-snapshot "$URL" "$IDS" "$D/state-baseline.json"
 }
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 state_check() {
   local name=$1
-  client python3 gates/bench/testdata/seed.py --state-snapshot "$URL" "$IDS" "$D/state-$name.json" &&
-    client python3 gates/bench/testdata/seed.py --state-compare "$D/state-baseline.json" "$D/state-$name.json" "$D/isolation-$name.json" || {
-      FAIL_REASON="browse state/session isolation failed; see state-$name.json and isolation-$name.json"; return 1;
-    }
+  if ! { client python3 gates/bench/testdata/seed.py --state-snapshot "$URL" "$IDS" "$D/state-$name.json" &&
+         client python3 gates/bench/testdata/seed.py --state-compare "$D/state-baseline.json" "$D/state-$name.json" "$D/isolation-$name.json"; }; then
+    FAIL_REASON="browse state/session isolation failed; see state-$name.json and isolation-$name.json"; return 1
+  fi
 }
 isolated_phase() {
   local name=$1 rc=0; shift
@@ -396,6 +410,7 @@ isolated_phase() {
   phase "isolation-$name-after" state_check "$name-after" || rc=1
   return "$rc"
 }
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 phase_shape() {
   local validation
   client taskset -c "$CLIENT_CPUS" k6 run --quiet --log-format json --console-output "$D/shape.log" \
@@ -404,6 +419,7 @@ phase_shape() {
   validation=$(python3 gates/bench/report.py --shape-coverage "$D" 2>&1) || { FAIL_REASON="$validation"; echo "$validation" >&2; return 1; }
   echo "$validation"
 }
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 phase_coldstart() {
   client taskset -c "$CLIENT_CPUS" python3 gates/bench/coldstart.py "$CONTAINER" "$URL" "$IDS" "$D/coldstart.json" "$RESTARTS" "$POLL_MS" || return 1
   wait_ready && drain || return 1
@@ -458,6 +474,7 @@ phase_load() {
   if (( sampler_ok )); then state sampler completed; else state sampler failed "sampler exit or coverage failed"; FAILED=1; fi
 }
 
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 phase_ramp() {
   local rate=$RAMP_START reason rc
   jq -n --argjson start "$RAMP_START" --argjson step "$RAMP_STEP_RATE" --argjson step_s "$RAMP_STEP_S" --argjson cap "$RAMP_CAP" --argjson bound_ms "$RAMP_BOUND_MS" \
@@ -487,6 +504,7 @@ phase_ramp() {
   esac
 }
 
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 phase_endpoints() {
   local sets=() entry bound
   for entry in ${ENDPOINT_SETS//,/ }; do sets+=(--set "$entry"); done
@@ -498,6 +516,7 @@ phase_endpoints() {
     --count "$ENDPOINT_COUNT" --max-s "$ENDPOINT_MAX_S" --timeout "$HTTP_TIMEOUT_S" "${sets[@]}"
 }
 
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 phase_ttfs() {
   drain || return 1
   client taskset -c "$CLIENT_CPUS" python3 gates/bench/ttfs.py "$URL" "$IDS" "$D/ttfs.json" "$TTFS_REPS" || return 1
@@ -594,6 +613,7 @@ PY_ISOLATION
 }
 
 rc=0; SERVER_PID=""
+# shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 interrupt_run() {
   trap - INT TERM
   if [ -n "$SERVER_PID" ]; then kill -TERM "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" || true; fi
