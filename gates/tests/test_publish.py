@@ -231,7 +231,8 @@ class PublishTests(unittest.TestCase):
                 root = ET.fromstring(svg)
                 self.assertEqual(root.get("width"), str(publish.WIDTH))
                 self.assertNotRegex(svg, r"(href|src)=['\"]")
-                self.assertIn("against Jellyfin 12.2.0, the median of 3 runs", svg)
+                self.assertIn("One point per Ferrofin release" if os.path.basename(path).startswith("history")
+                              else "against Jellyfin 12.2.0, the median of 3 runs", svg)
         endpoints = files[next(p for p in files if p.endswith("endpoints-loaded.svg"))]
         self.assertLess(endpoints.index("home:image"), endpoints.index("playback:intros"))   # wins first
         self.assertIn(publish.STYLE["light"]["slower"], endpoints)   # the slower cell in amber
@@ -274,6 +275,56 @@ class PublishTests(unittest.TestCase):
         publish.write_json(str(results / "v1.5.0" / "summary.json"), doc)
         with self.assertRaisesRegex(publish.Refused, "holds v1.4.0's results, not v1.5.0's"):
             publish.render(str(results), README, str(self.root))
+
+    def history(self, versions, hosts=None, fixtures=None, change=None):
+        """The rendered files and README of summaries of `versions` (and only those), each from the same three
+        runs, on host class `hosts[i]` and fixture `fixtures[i]` when given; `change(i, doc)` edits one."""
+        base, out = self.summary(), []
+        for i, version in enumerate(versions):
+            doc = {**copy.deepcopy(base), "version": version}
+            if hosts:
+                doc["bench"]["source"]["host_class"] = hosts[i]
+            if fixtures:
+                doc["bench"]["source"]["fixture"] = fixtures[i]
+            if change:
+                change(i, doc)
+            out.append(doc)
+        results = self.root / "history" / str(len(list(self.root.glob("history/*"))))
+        for doc in out:
+            publish.write_json(str(results / doc["version"] / "summary.json"), doc)
+        files, readme = publish.render(str(results), README, str(self.root))
+        return files[str(results / "history.svg")], readme
+
+    def test_one_release_is_drawn_as_points_and_named_with_its_jellyfin(self):
+        svg, readme = self.history(["v1.4.0"])
+        ET.fromstring(svg)
+        self.assertNotIn("stroke-width='2'", svg)   # one point per server per panel: no line to draw
+        for text in (">v1.4.0<", ">vs Jellyfin 12.2.0<", ">379 ms<", ">3420 ms<", ">17 ms<", "Cold start", "Idle memory"):
+            self.assertIn(text, svg)
+        self.assertIn('### Release over release', readme)
+        self.assertIn('srcset="history/0/history-dark.svg"', readme)
+
+    def test_two_releases_on_one_host_are_joined_and_another_host_starts_a_new_line(self):
+        joined, _ = self.history(["v1.4.0", "v1.5.0"])
+        self.assertEqual(joined.count("stroke-width='2'"), 2 * len(publish.HISTORY))   # Ferrofin and Jellyfin, per panel
+        self.assertNotIn("new host or fixture", joined)
+        same, other = {"cores": 32, "memory_gib": 125}, {"cores": 16, "memory_gib": 64}
+        for kwargs in ({"hosts": [same, same, other]}, {"fixtures": ["4b21", "4b21", "77aa"]}):
+            with self.subTest(**kwargs):
+                split, _ = self.history(["v1.4.0", "v1.5.0", "v1.6.0"], **kwargs)
+                self.assertEqual(split.count("stroke-width='2'"), 2 * len(publish.HISTORY))   # 1.4→1.5, not on to 1.6
+                self.assertEqual(split.count("new host or fixture"), 1)
+                self.assertEqual(split.count("stroke-dasharray"), len(publish.HISTORY))   # inside each panel's plot
+
+    def test_releases_are_ordered_by_version_number_and_a_withheld_number_breaks_its_line(self):
+        svg, _ = self.history(["v1.10.0", "v1.9.0"])
+        self.assertLess(svg.index(">v1.9.0<"), svg.index(">v1.10.0<"))
+        def withhold_cold_start(i, doc):
+            if i == 1:
+                doc["bench"]["ttfs"][0].update(ratio=None, withheld="Ferrofin: different work")
+        svg, _ = self.history(["v1.4.0", "v1.5.0", "v1.6.0"], change=withhold_cold_start)
+        self.assertEqual(svg.count("stroke-width='2'"), 2 * 2 * (len(publish.HISTORY) - 1))   # cold start's line is broken
+        self.assertIn(">withheld<", svg)
 
     def test_the_newest_release_is_drawn(self):
         new = self.summary()
