@@ -36,13 +36,13 @@ run-bench:
 
 # A release's published results (gates/README.md, "Publishing the results"): docs/results/<VERSION>/summary.json
 # from the local results named (the release's gates session, and three or more Jellyfin-comparison benchmark
-# runs), then the README Results block and its graphs from every summary file. All are taken from the command
-# line only.
+# runs, and with AB=DIR the release A/B gate's session), then the README Results block and its graphs from every
+# summary file. All are taken from the command line only.
 publish-results:
 	$(if $(call cli,VERSION),,$(error VERSION=vX.Y.Z is required))
 	$(if $(call cli,SESSION),,$(error SESSION=DIR is required: the release's gates session, for its adoption and parity))
 	$(if $(call cli,BENCH),,$(error BENCH="RUN RUN RUN" is required: three or more Jellyfin-comparison runs))
-	python3 gates/publish.py summarise --version '$(VERSION)' --session '$(SESSION)' --bench $(BENCH)
+	python3 gates/publish.py summarise --version '$(VERSION)' --session '$(SESSION)' --bench $(BENCH) $(if $(call cli,AB),--ab '$(AB)')
 	python3 gates/publish.py readme
 
 # The gates' own tests, which need no docker, server or fixtures: shellcheck, the bats tests and the

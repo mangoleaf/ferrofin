@@ -98,7 +98,7 @@ release that stays in the repository, `docs/results/<version>/summary.json`. The
 local runs it is made from; nothing is picked automatically, and nothing here runs a gate:
 
 ```bash
-make publish-results VERSION=v1.4.0 SESSION="$FERROFIN_GATES_DIR/runs/<session>" BENCH="<run> <run> <run>"
+make publish-results VERSION=v1.4.0 SESSION="$FERROFIN_GATES_DIR/runs/<session>" BENCH="<run> <run> <run>" [AB=<A/B session>]
 ```
 
 That runs [`publish.py`](publish.py) twice:
@@ -123,6 +123,11 @@ evidence is incomplete, is withheld and listed with its reason under the graphs.
 - time to first screen;
 - peak and idle memory;
 - CPU per completed screen, where the work matched.
+
+With `AB=` (the release A/B gate's session, `gates/bench/gate.py ab` or `gates/run --previous`), a graph
+follows of the release against the previous one: every gated cell as how many times better the candidate
+is, coloured by the gate's verdict (improved, within noise, regressed; the biggest gain first), with a table
+of every cell and the reason a cell was not comparable.
 
 Below them, a grid gives the adoption status of every supported Jellyfin version and upgrade route:
 passed, failed, skipped (a fixture that was not built) or unfinished, with a table of the reasons. Then the

@@ -2,11 +2,11 @@
 """The published results (stdlib only): one summary file per release, and the README Results section
 and its graphs drawn from those files alone.
 
-    publish.py summarise --version vX.Y.Z --bench RUN RUN RUN [--session DIR] [--out DIR]
+    publish.py summarise --version vX.Y.Z --bench RUN RUN RUN [--session DIR] [--ab DIR] [--out DIR]
         DIR/<version>/summary.json (DIR defaults to docs/results) from the result.json of three or more
         Jellyfin-comparison benchmark runs the operator names and, with --session, the adoption and parity
-        results of that gates session (both required): only the numbers the README shows, each with its
-        source. Nothing is picked
+        results of that gates session (both required), and with --ab, the release A/B gate's verdict cells
+        against the previous release: only the numbers the README shows, each with its source. Nothing is picked
         automatically, and every input is a local run.
     publish.py readme [--check] [--results DIR] [--readme README.md]
         draw every graph of the newest DIR/*/summary.json into DIR/<version>/ (a light and a dark SVG
@@ -265,7 +265,42 @@ def parity_summary(session, commit, publishing=True):
                       for a in detail.get("areas", [])]}
 
 
-def summarise(version, bench_runs, session=None):
+#: How an A/B verdict reads in the README, and the colour of its bar.
+AB_VERDICTS = {"improved": ("improved", "ferrofin"), "within noise": ("within noise", "jellyfin"),
+               "regressed": ("regressed", "FAIL"), "not comparable": ("not comparable", "SKIP")}
+
+
+def ab_summary(path):
+    """The release A/B gate's gated cells (gates/bench/gate.py): each cell's previous and candidate medians,
+    change and verdict, and the session's images, pairs and date. PATH is a gates session run with
+    PREVIOUS= (its bench/ folder is the A/B gate) or the gate.py session itself."""
+    d = os.path.join(path, "bench") if os.path.isfile(os.path.join(path, "session.json")) else path
+    try:
+        doc = result.read(d, "bench")
+    except ValueError as error:
+        raise Refused(f"{d}: {error}") from error
+    if doc is None:
+        raise Refused(f"{d} has no result.json (python3 gates/bench/gate.py render {d} writes it)")
+    detail = doc["detail"]
+    if detail.get("mode") != "ab":
+        raise Refused(f"{d} is not an A/B gate session (its mode is {detail.get('mode')!r})")
+    cells = [{"cell": key, "kind": v.get("kind"), "unit": v.get("unit"), "a_median": v.get("a_median"),
+              "b_median": v.get("b_median"), "pct": v.get("pct"), "verdict": v.get("verdict"), "reason": v.get("reason")}
+             for key, v in sorted(detail.get("verdicts", {}).items()) if v.get("gated")]
+    if not cells:
+        raise Refused(f"{d} judged no gated cell: there is nothing to publish")
+    images = detail.get("images") or {}
+    # each image's runs (a session from before `runs` was recorded: the values each verdict cell holds)
+    pairs = (detail.get("runs") or {}).get("b") or max((len(v.get("b") or []) for v in detail.get("verdicts", {}).values()), default=0)
+    if pairs < MIN_RUNS:
+        raise Refused(f"{d} ran {pairs} pair{'s' if pairs != 1 else ''}: a release A/B gate is at least {MIN_RUNS}")
+    return {"source": {"session": os.path.basename(os.path.normpath(path)), "previous": (images.get("a") or {}).get("ref"),
+                       "candidate": (images.get("b") or {}).get("ref"), "commit": doc["source"].get("commit"),
+                       "pairs": pairs, "date": (doc.get("started") or "")[:10] or None},
+            "verdict": doc["verdict"], "blocking": detail.get("blocking", []), "cells": cells}
+
+
+def summarise(version, bench_runs, session=None, ab=None):
     """The summary file of release `version`."""
     if not re.fullmatch(r"v\d+\.\d+\.\d+", version):
         raise Refused(f"{version!r} is not a release version (vX.Y.Z)")
@@ -278,6 +313,8 @@ def summarise(version, bench_runs, session=None):
     if session:
         out["adoption"] = adoption_summary(session, out["bench"]["source"]["commit"])
         out["parity"] = parity_summary(session, out["bench"]["source"]["commit"])
+    if ab:
+        out["ab"] = ab_summary(ab)
     return out
 
 
@@ -325,6 +362,18 @@ def summary_problems(doc):
                 out.append(f"bench row {r['name']} has a ratio but not two positive medians and a positive ratio")
             elif r["ratio"] is None and not r["withheld"]:
                 out.append(f"bench row {r['name']} has neither a ratio nor a reason it is withheld")
+    if "ab" in doc:
+        ab = doc["ab"]
+        if not isinstance(ab, dict) or not isinstance(ab.get("source"), dict) or not isinstance(ab.get("cells"), list):
+            out.append("ab is not an object with a source and cells")
+        else:
+            out += [f"ab.source has no {k}" for k in ("previous", "candidate", "commit", "date") if not ab["source"].get(k)]
+            if not isinstance(ab["source"].get("pairs"), int) or ab["source"]["pairs"] < MIN_RUNS:
+                out.append(f"ab.source.pairs is under {MIN_RUNS}")
+            for c in ab["cells"]:
+                if (not isinstance(c, dict) or c.get("verdict") not in AB_VERDICTS or not c.get("cell")
+                        or any(c.get(k) is not None and not isinstance(c.get(k), (int, float)) for k in ("a_median", "b_median", "pct"))):
+                    out.append(f"an A/B cell is not shaped as expected: {str(c)[:80]}")
     if "parity" in doc:
         parity = doc["parity"]
         if not isinstance(parity, dict) or not isinstance(parity.get("counts"), dict) or not isinstance(parity.get("areas"), list):
@@ -592,6 +641,93 @@ def parity_section(parity, version, rel, results_dir):
     lines += [f"| {md(a['area'])} | {a['requests']} | " + " | ".join(str(a[k]) for k in PARITY_OUTCOMES) + " |"
               for a in parity["areas"]]
     lines += ["", f"Filed as issues: {md(issues)}." if issues else "", "\n</details>\n"]
+    return files, lines
+
+
+def ab_ratio(cell):
+    """How many times better the candidate is than the previous release on one cell (above 1 is better):
+    the previous median over the candidate's (an A/B gate's cells are latencies and memory, lower is
+    better); None when either median is missing or zero."""
+    a, b = cell.get("a_median"), cell.get("b_median")
+    if not (isinstance(a, (int, float)) and isinstance(b, (int, float)) and a > 0 and b > 0):
+        return None
+    return a / b
+
+
+def ab_graph(title, cells, previous, caption, theme_name, alt=""):
+    """One bar per gated cell from 1× on a log axis, its colour its verdict (improved, within noise,
+    regressed), the biggest gain first; each bar carries its multiple and the two medians."""
+    t = STYLE[theme_name]
+    rows = sorted(((c, ab_ratio(c)) for c in cells if c["verdict"] != "not comparable" and ab_ratio(c)),
+                  key=lambda cr: (-cr[1], cr[0]["cell"]))
+    notes = [f"{speedup_text(r, c['unit'])}  ·  {value_text(c['b_median'], c['unit'])} vs {value_text(c['a_median'], c['unit'])}"
+             f"  ·  {c['verdict']}" for c, r in rows]   # what is drawn after each bar, measured whole for the margin
+    left = label_width([c["cell"] for c, _ in rows]) + 14
+    right = label_width(notes, 11) + 12
+    plot = WIDTH - left - right
+    lo, hi = min([r for _, r in rows] + [1.0]), max([r for _, r in rows] + [1.0])
+    lo_exp = min(math.floor(math.log2(lo)), -1) if lo < 1 else 0
+    hi_exp = max(math.ceil(math.log2(hi)), 1)
+    x = lambda v: left + plot * (math.log2(v) - lo_exp) / (hi_exp - lo_exp)
+    row_h, bar_h, y0 = 22, 14, 60
+    end = y0 + row_h * len(rows)
+    body = []
+    for e in range(lo_exp, hi_exp + 1):
+        tx = x(2 ** e)
+        body.append(f"<line x1='{tx:.1f}' y1='{y0 - 6}' x2='{tx:.1f}' y2='{end:.1f}' stroke='{t['grid' if e else 'muted']}' stroke-width='1'/>")
+        body.append(text(tx, end + 15, f"{2 ** e:g}×", 11, "muted", "middle", theme=t))
+    body.append(text(left + plot / 2, end + 32, f"times better than {previous} (median, log scale; right of 1× is better)",
+                     12, "muted", "middle", theme=t))
+    for n, ((c, r), note) in enumerate(zip(rows, notes)):
+        y = y0 + n * row_h
+        a, b = sorted((x(1), x(r)))
+        colour = AB_VERDICTS[c["verdict"]][1]
+        body.append(text(left - 10, y + bar_h - 3, c["cell"], 12, anchor="end", theme=t))
+        body.append(f"<rect x='{a:.1f}' y='{y:.1f}' width='{max(b - a, 1):.1f}' height='{bar_h}' rx='2' fill='{t[colour]}'/>")
+        body.append(text(max(b, x(1)) + 5, y + bar_h - 3, note, 11, "muted", theme=t))
+    body.append(caption_lines(caption, end + 54, t))
+    legend = tuple((AB_VERDICTS[v][1], AB_VERDICTS[v][0]) for v in ("improved", "within noise", "regressed"))
+    return frame(title, end + 76, "".join(body), theme_name, legend, alt)
+
+
+def release_name(ref):
+    """`Ferrofin v1.3.2` for an image tagged with a release, else the image reference as given."""
+    tag = re.search(r":(v\d+\.\d+\.\d+)$", ref or "")
+    return f"Ferrofin {tag.group(1)}" if tag else str(ref)
+
+
+def ab_section(ab, version, rel, results_dir):
+    """`(files, README lines)` of the release against the previous one, from its A/B gate."""
+    src, cells = ab["source"], ab["cells"]
+    previous = release_name(src["previous"])
+    count = {v: sum(c["verdict"] == v for c in cells) for v in AB_VERDICTS}
+    title = f"{ferrofin(version)} against {previous}"
+    alt = (f"{title}, the release A/B gate: of {len(cells)} gated cells, {count['improved']} improved, "
+           f"{count['within noise']} within noise, {count['regressed']} regressed, {count['not comparable']} not comparable.")
+    cap = (f"{ferrofin(version)} (commit {str(src['commit'])[:8]}) against {previous}, {src['pairs']} interleaved pairs, "
+           f"{src['date']}. Images: {src['candidate']} against {src['previous']}; how cells are judged: gates/bench/README.md")
+    files = {os.path.join(results_dir, version, f"previous-release{'' if theme == 'light' else '-dark'}.svg"):
+             ab_graph(title, cells, previous, cap, theme, alt) for theme in STYLE}
+    blocks = (f"; **{len(ab['blocking'])} gated cell{'s' if len(ab['blocking']) != 1 else ''} blocked the release**"
+              if ab["blocking"] else "; nothing blocked the release")
+    unjudged = (f", and {count['not comparable']} could not be compared (it blocks like a regression)"
+                if count["not comparable"] else "")
+    lines = ["### Against the previous release\n",
+             f"Ferrofin **{version}** against **{previous}** (`{src['previous']}`) in the release's A/B gate ({src['pairs'] or '?'} "
+             f"interleaved pairs on one host, {src['date']}): of {len(cells)} gated cells, **{count['improved']} improved**, "
+             f"{count['within noise']} {'is' if count['within noise'] == 1 else 'are'} within noise and "
+             f"**{count['regressed']} regressed**{unjudged}{blocks}.\n",
+             f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel}/previous-release-dark.svg">\n'
+             f'  <img alt="{html.escape(alt)}" src="{rel}/previous-release.svg">\n</picture>\n',
+             f"<details><summary>Against {md(previous)}: every gated cell</summary>\n",
+             "| Cell | Previous | Candidate | Change | Verdict |", "|---|---|---|---|---|"]
+    fmt = lambda v, unit: value_text(v, unit) if isinstance(v, (int, float)) else "—"
+    change = lambda c: format(c["pct"], "+.1f") + "%" if isinstance(c.get("pct"), (int, float)) else "—"
+    why = lambda c: (": " + c["reason"] if c.get("reason") else
+                     " (not drawn: a median is missing)" if c["verdict"] != "not comparable" and ab_ratio(c) is None else "")
+    lines += [f"| {md(c['cell'])} | {fmt(c['a_median'], c['unit'])} | {fmt(c['b_median'], c['unit'])} | {change(c)} | "
+              f"{md(c['verdict'] + why(c))} |" for c in cells]
+    lines += ["\n</details>\n"]
     return files, lines
 
 
@@ -888,6 +1024,10 @@ def render(results_dir, readme_text, readme_dir=ROOT):
     block.append(f"Source: {md(', '.join(src['runs']))}; commit `{src['commit']}`, image `{str(src['image_digest'])[:19]}`, "
                  f"fixture `{str(src['fixture'])[:12]}`. The full tables are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); "
                  "what each number means is in [`gates/bench/README.md`](gates/bench/README.md).\n")
+    if "ab" in latest:
+        more, lines = ab_section(latest["ab"], version, rel, results_dir)
+        files.update(more)
+        block += lines
     if "adoption" in latest:
         more, lines = adoption_section(latest["adoption"], version, rel, results_dir)
         files.update(more)
@@ -946,6 +1086,7 @@ def main(argv):
     s.add_argument("--version", required=True)
     s.add_argument("--bench", nargs="+", required=True, metavar="RUN")
     s.add_argument("--session", metavar="DIR", help="the release's gates session: its adoption status")
+    s.add_argument("--ab", metavar="DIR", help="the release's A/B gate session: its verdicts against the previous release")
     s.add_argument("--out", default=os.path.join(ROOT, "docs", "results"))
     r = sub.add_parser("readme")
     r.add_argument("--check", action="store_true")
@@ -954,7 +1095,7 @@ def main(argv):
     args = parser.parse_args(argv)
     try:
         if args.command == "summarise":
-            doc = summarise(args.version, args.bench, args.session)
+            doc = summarise(args.version, args.bench, args.session, args.ab)
             path = os.path.join(args.out, args.version, "summary.json")
             write_json(path, doc)
             print(path)

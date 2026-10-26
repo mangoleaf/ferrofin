@@ -419,8 +419,9 @@ VERDICT_COUNTS = ("regressed", "not comparable", "improved", "within noise")
 
 def session_result(session, plan, result, block):
     """The session's result envelope (gates/result.py): blocked or passed (an A/A, which judges
-    nothing, measured), the gated cells counted by verdict, and every verdict cell (`a_median`,
-    `b_median`, `pct`, `verdict`, `gated`…) as the session judged it, from the candidate's side."""
+    nothing, measured), the gated cells counted by verdict, every verdict cell (`a_median`,
+    `b_median`, `pct`, `verdict`, `gated`…) as the session judged it, from the candidate's side, and
+    how many runs each image had."""
     role = "b" if any(r == "b" for _, r, _ in plan["schedule"]) else "a"   # an A/A runs one image
     first = next(name for name, r, _ in plan["schedule"] if r == role)
     meta = report.load(os.path.join(session, first, "run.json")) or {}
@@ -430,7 +431,10 @@ def session_result(session, plan, result, block):
     source = {"commit": meta.get("sha"), "image": image["ref"], "image_digest": image["id"],
               "oracle": (plan.get("oracle") or {}).get("image"), "host_class": report.gate_result().host_class(),
               "fixture": meta.get("ids_sha256")}
-    detail = {"mode": plan["mode"], "name": plan["name"], "images": plan["images"], "verdicts": verdicts,
+    runs = {}
+    for _, r, _ in plan["schedule"]:
+        runs[r] = runs.get(r, 0) + 1
+    detail = {"mode": plan["mode"], "name": plan["name"], "images": plan["images"], "runs": runs, "verdicts": verdicts,
               "blocking": block}
     verdict = "measured" if plan["mode"] == "aa" else "blocked" if block else "passed"
     counts = {v: sum(1 for c in gated if c.get("verdict") == v) for v in VERDICT_COUNTS}

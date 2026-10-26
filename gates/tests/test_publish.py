@@ -3,6 +3,7 @@ graphs from fixed summary files (stdlib)."""
 
 import contextlib
 import copy
+import re
 import io
 import json
 import os
@@ -22,6 +23,11 @@ sys.path.insert(0, str(GATES / "adoption"))
 import adoption_report  # noqa: E402
 sys.path.insert(0, str(GATES / "parity"))
 import diff as parity_diff  # noqa: E402
+import importlib.util  # noqa: E402
+_spec = importlib.util.spec_from_file_location("gates_bench_gate_for_tests", GATES / "bench" / "gate.py")
+sys.path.insert(0, str(GATES / "bench"))
+bench_gate = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(bench_gate)
 
 README = "# Ferrofin\n\nIntro.\n\n## Results\n\n<!-- BEGIN GENERATED RESULTS -->\nold\n<!-- END GENERATED RESULTS -->\n\n## After\n"
 
@@ -87,6 +93,31 @@ def adoption_session(root, rows, commit="5112240e1923cdc9", dirty=False, parity=
 ADOPTION = [("jellyfin-10.11.8", "path", "10.11.8", "PASS", ""), ("jellyfin-12.2-from-10", "path", "12.2.0", "PASS", ""),
             ("jellyfin-10.11.11-messy", "messy", "10.11.11", "FAIL", "messy: gone_file_userdata " + "x" * 400),
             ("jellyfin-12.1-from-12", "path", "12.1.0", "SKIP", "fixture not built")]
+
+
+def ab_session(root, verdicts, mode="ab", blocking=()):
+    """A gates session run with PREVIOUS=: its bench/ folder is a gate.py session whose result.json gate.py's own
+    session_result wrote (three pairs)."""
+    s = root / "ab-session"
+    (s / "bench").mkdir(parents=True)
+    (s / "session.json").write_text("{}")
+    plan = {"mode": mode, "name": "bench", "date": "2026-10-26T03:00:00+00:00",
+            "schedule": [[f"0{i}-{r}", r, img] for i, (r, img) in enumerate([("a", "v1.3.2"), ("b", "rc")] * 3, 1)],
+            "images": {"a": {"ref": "ghcr.io/mangoleaf/ferrofin:v1.3.2", "id": "sha256:a"},
+                       "b": {"ref": "ferrofin:v1.4.0-rc", "id": "sha256:b"}}}
+    (s / "bench" / "02-b").mkdir()   # the candidate's first run, whose run.json names the commit
+    (s / "bench" / "02-b" / "run.json").write_text(json.dumps({"sha": "5112240e", "ids_sha256": "4b21"}))
+    result.write(str(s / "bench"), bench_gate.session_result(str(s / "bench"), plan, {"verdicts": verdicts}, list(blocking)))
+    return s
+
+
+AB_VERDICTS = {
+    "loaded/screens/home": {"kind": "screens", "unit": "ms", "a_median": 20, "b_median": 10, "pct": -50.0, "verdict": "improved", "gated": True},
+    "loaded/screens/movies": {"kind": "screens", "unit": "ms", "a_median": 10, "b_median": 10.2, "pct": 2.0, "verdict": "within noise", "gated": True},
+    "memory/peak under load": {"kind": "memory", "unit": "MiB", "a_median": 100, "b_median": 125, "pct": 25.0, "verdict": "regressed", "gated": True},
+    "loaded/endpoints/items": {"kind": "endpoints", "unit": "ms", "a_median": 4, "b_median": 3, "pct": -25.0, "verdict": "improved", "gated": True},
+    "loaded/screens/search": {"kind": "screens", "unit": "ms", "verdict": "not comparable", "reason": "other work", "gated": True},
+    "loaded/endpoints/x": {"kind": "endpoints", "unit": "ms", "a_median": 1, "b_median": 1, "verdict": "within noise", "gated": False}}
 
 
 class PublishTests(unittest.TestCase):
@@ -458,6 +489,70 @@ class PublishTests(unittest.TestCase):
         (bare / "adoption" / "result.json").unlink()
         with self.assertRaisesRegex(publish.Refused, "has no result.json .*adoption_report.py build"):
             publish.summarise("v1.4.0", runs, str(bare))
+
+    def test_the_previous_release_comes_from_the_release_ab_gate(self):
+        s = ab_session(self.root, AB_VERDICTS, blocking=["memory/peak under load"])
+        doc = publish.summarise("v1.4.0", self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)]), ab=str(s))
+        self.assertEqual(publish.summary_problems(doc), [])
+        ab = doc["ab"]
+        self.assertEqual((ab["source"]["previous"], ab["source"]["candidate"], ab["source"]["pairs"], ab["verdict"]),
+                         ("ghcr.io/mangoleaf/ferrofin:v1.3.2", "ferrofin:v1.4.0-rc", 3, "blocked"))
+        self.assertEqual([c["cell"] for c in ab["cells"]], sorted(k for k, v in AB_VERDICTS.items() if v["gated"]))
+        files, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        graph = files[next(p for p in files if p.endswith("/previous-release.svg"))]
+        ET.fromstring(graph)
+        # every comparable gated cell, the biggest gain first; the ramp ceiling is better when higher
+        order = [graph.index(f">{cell}<") for cell in ("loaded/screens/home", "loaded/endpoints/items", "loaded/screens/movies",
+                                                         "memory/peak under load")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("2.0× faster  ·  10.0 ms vs 20.0 ms  ·  improved", graph)
+        self.assertIn("1.2× heavier  ·  125 MiB vs 100 MiB  ·  regressed", graph)
+        self.assertIn(f"fill='{publish.STYLE['light']['FAIL']}'", graph)   # the regression in its own colour
+        self.assertNotIn("loaded/screens/search<", graph)   # not comparable: listed below, not drawn
+        self.assertNotIn("loaded/endpoints/x", graph)   # not gated
+        self.assertIn(">Ferrofin v1.4.0 against Ferrofin v1.3.2<", graph)
+        widest = max(float(x) + len(t) * 11 * 0.58 for x, t in re.findall(r"<text x='([\d.]+)'[^>]*font-size='11'[^>]*>([^<]*)</text>", graph))
+        self.assertLessEqual(widest, publish.WIDTH)   # every bar's note fits the graph (by the same width estimate)
+        for text in ("### Against the previous release", "**Ferrofin v1.3.2** (`ghcr.io/mangoleaf/ferrofin:v1.3.2`)", "3 interleaved pairs",
+                     "of 5 gated cells, **2 improved**, 1 is within noise and **1 regressed**, and 1 could not be compared "
+                     "(it blocks like a regression); **1 gated cell blocked the release**",
+                     "| memory/peak under load | 100 MiB | 125 MiB | +25.0% | regressed |",
+                     "| loaded/screens/search | — | — | — | not comparable: other work |",
+                     'srcset="docs/results/v1.4.0/previous-release-dark.svg"'):
+            self.assertIn(text, readme)
+        self.assertLess(readme.index("### Speed and memory against Jellyfin"), readme.index("### Against the previous release"))
+
+    def test_an_older_session_counts_its_pairs_from_its_cells_and_fewer_than_three_are_refused(self):
+        s = ab_session(self.root / "old", AB_VERDICTS)
+        doc = json.loads((s / "bench" / "result.json").read_text())
+        del doc["detail"]["runs"]
+        for v in doc["detail"]["verdicts"].values():
+            v["b"] = [1, 2, 3]
+        (s / "bench" / "result.json").write_text(json.dumps(doc))
+        self.assertEqual(publish.ab_summary(str(s))["source"]["pairs"], 3)
+        for v in doc["detail"]["verdicts"].values():
+            v["b"] = [1, 2]
+        (s / "bench" / "result.json").write_text(json.dumps(doc))
+        with self.assertRaisesRegex(publish.Refused, "ran 2 pairs: a release A/B gate is at least 3"):
+            publish.ab_summary(str(s))
+
+    def test_a_regressed_cell_with_a_missing_median_is_listed_not_drawn(self):
+        verdicts = {**AB_VERDICTS, "memory/steady idle": {"kind": "memory", "unit": "MiB", "a_median": 0, "b_median": 90,
+                                                          "verdict": "regressed", "gated": True}}
+        doc = publish.summarise("v1.4.0", self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)]),
+                                ab=str(ab_session(self.root / "zero", verdicts)))
+        files, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        self.assertNotIn("memory/steady idle", files[next(p for p in files if p.endswith("/previous-release.svg"))])
+        self.assertIn("| memory/steady idle | 0.00 MiB | 90.0 MiB | — | regressed (not drawn: a median is missing) |", readme)
+
+    def test_summarise_refuses_a_session_that_is_not_an_ab_gate_or_judged_nothing(self):
+        runs = self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)])
+        with self.assertRaisesRegex(publish.Refused, "is not an A/B gate session .its mode is 'aa'."):
+            publish.summarise("v1.4.0", runs, ab=str(ab_session(self.root / "aa", AB_VERDICTS, mode="aa")))
+        with self.assertRaisesRegex(publish.Refused, "judged no gated cell"):
+            publish.summarise("v1.4.0", runs, ab=str(ab_session(self.root / "none", {"x": {"gated": False, "verdict": "improved"}})))
+        with self.assertRaisesRegex(publish.Refused, "has no result.json .*gate.py render"):
+            publish.summarise("v1.4.0", runs, ab=str(self.root))
 
     def test_summarise_writes_the_release_file(self):
         out = self.root / "out"
