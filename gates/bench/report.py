@@ -6,7 +6,8 @@
     report.py --readme [README.md] RUN_DIR... the README "Benchmarks" section (headline table + prose);
                                              with a README path, replaces the block between the
                                              BEGIN/END GENERATED BENCHMARKS markers in place
-    report.py --html RUN_DIR                 write RUN_DIR/report.html (self-contained; run.sh does this)
+    report.py --html RUN_DIR                 write RUN_DIR/report.html (self-contained) and RUN_DIR/result.json
+                                             (gates/result.py's envelope) from one model; run.sh does this
     report.py --serve [PORT] [RUNS_DIR] [--adoption-dir DIR] [--parity-dir DIR] [--verify-dir DIR]
                                              the viewer on http://127.0.0.1:PORT (default 8097; RUNS_DIR defaults
                                              to $FERROFIN_GATES_DIR/runs, else gates/bench/runs):
@@ -952,6 +953,24 @@ def build(runs):
     return m
 
 
+def cpu_evidence(m, k, i, window):
+    """Server `k`'s CPU in run `i`'s `window`: `(problem, seconds, completed, validity, cost, work_flags)`,
+    where `problem` is what is wrong with the resource evidence itself, `completed` the screens k6
+    finished, `work_flags` the workload-validation flags of the level's screens, `validity` the problem
+    and those flags, and `cost` the CPU-seconds per completed screen (None when it cannot be computed)."""
+    r = m["resources"][k][i].get(window, {})
+    phases = m["phases"][k][i] or {}
+    failures = [f"{name}: {phases[name]['status']} ({phases[name].get('reason') or 'no reason recorded'})"
+                for name in ("startup", "startup-drain", "sampler", window)
+                if name in phases and phases[name].get("status") != "completed"]
+    problem = reasons(r.get("error"), *failures)
+    seconds = r.get("cpu_seconds")
+    completed = (load(os.path.join(m["runs"][i], k, f"k6-{window}.json")) or {}).get("iterations")
+    work_flags = [cell[k].flag for _, cell in m.get("levels", {}).get(window, {}).get("screens", []) if k in cell and cell[k].flag]
+    cost = seconds / completed if number(seconds) and number(completed) and completed > 0 else None
+    return problem, seconds, completed, reasons(problem, *work_flags), cost, work_flags
+
+
 def cpu_tables(m):
     """Keep each repetition and its resource validity visible, including missing data."""
     cpu, busy, capacity, per_screen, comparison, coverage = [], [], [], [], [], []
@@ -964,12 +983,7 @@ def cpu_tables(m):
             values, details, cores, shares, costs, numeric_costs, validity = {}, {}, {}, {}, {}, {}, {}
             for k, _ in m["servers"]:
                 r = records[k]
-                phases = m["phases"][k][i] or {}
-                failures = [f"{name}: {phases[name]['status']} ({phases[name].get('reason') or 'no reason recorded'})"
-                            for name in ("startup", "startup-drain", "sampler", window)
-                            if name in phases and phases[name].get("status") != "completed"]
-                problem = reasons(r.get("error"), *failures)
-                seconds = r.get("cpu_seconds")
+                problem, seconds, completed, validity[k], numeric_costs[k], work_flags = cpu_evidence(m, k, i, window)
                 values[k] = (f"{seconds:.3f}" if number(seconds) else "unavailable") + (" ⚠" if problem else "")
                 start, end = r.get("observed_start"), r.get("observed_end")
                 duration = end - start if number(start) and number(end) and end > start else None
@@ -982,12 +996,7 @@ def cpu_tables(m):
                 suffix = " ⚠" if problem else ""
                 cores[k] = f"{mean:.3f}" + suffix if mean is not None else "unavailable"
                 shares[k] = f"{100 * mean / count:.2f}%" + suffix if mean is not None and count else "unavailable"
-                summary = load(os.path.join(m["runs"][i], k, f"k6-{window}.json")) or {}
-                completed = summary.get("iterations")
-                work_flags = [cell[k].flag for _, cell in m.get("levels", {}).get(window, {}).get("screens", []) if k in cell and cell[k].flag]
-                validity[k] = reasons(problem, *work_flags)
-                numeric_costs[k] = seconds / completed if number(seconds) and number(completed) and completed > 0 else None
-                costs[k] = f"{seconds * 1000 / completed:.3f}" + suffix if number(seconds) and number(completed) and completed > 0 else "unavailable"
+                costs[k] = f"{seconds * 1000 / completed:.3f}" + suffix if numeric_costs[k] is not None else "unavailable"
                 if work_flags:
                     costs[k] += " ⚠ workload validation failed"
                 stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds") if number(t) else "unavailable"
@@ -1902,7 +1911,9 @@ def list_runs(runs_dir):
     runs found there are named `<session>/<run>`; a scan session's runs have no run.json. A
     gates/run session is read through its `bench/` folder, named `<session>/bench`.
     A session `gate.py render` wrote a report.html for is listed too, as `<session>`: the
-    gate's own page, which is the only one a scan session has."""
+    gate's own page, which is the only one a scan session has. A run or session with a valid
+    result.json is labelled from it (its start, commit, servers or verdict), else from run.json
+    or gate.json."""
     out = []
     for entry in os.listdir(runs_dir):
         # a gates/run session (gates/session.py) holds its benchmark in bench/: a run, or a gate.py session
@@ -1917,14 +1928,21 @@ def list_runs(runs_dir):
         if nested and os.path.isfile(os.path.join(top, "report.html")):
             plan = load(os.path.join(top, "gate.json"))
             plan = plan if isinstance(plan, dict) else {}
-            date = str(plan.get("date", ""))
-            out.append((date, session, f"{session}  ·  {date[:16].replace('T', ' ')}  ·  gate {plan.get('mode', '?')}"))
+            doc = read_result(top)
+            date = str((doc or {}).get("started") or plan.get("date", ""))
+            mode = (doc or {}).get("detail", {}).get("mode") or plan.get("mode", "?")
+            out.append((date, session, f"{session}  ·  {date[:16].replace('T', ' ')}  ·  gate {mode}"
+                        + (f"  ·  {doc['verdict']}" if doc else "")))
         for name in ([f"{session}/{sub}" for sub in os.listdir(top)] if nested else [session]):
             d = os.path.join(runs_dir, name)
             meta = load(os.path.join(d, "run.json"))
             if isinstance(meta, dict):
-                srv = [k for k, _ in SERVERS if os.path.isdir(os.path.join(d, k))]
-                out.append((meta.get("date", ""), name, f"{name}  ·  {meta.get('date', '')[:16].replace('T', ' ')}  ·  {meta.get('sha', '?')}  ·  {', '.join(srv)}"))
+                doc = read_result(d)
+                if doc:
+                    date, sha, srv = doc["started"] or meta.get("date", ""), doc["source"]["commit"], list(doc["detail"].get("servers") or {})
+                else:
+                    date, sha, srv = meta.get("date", ""), meta.get("sha"), [k for k, _ in SERVERS if os.path.isdir(os.path.join(d, k))]
+                out.append((date, name, f"{name}  ·  {date[:16].replace('T', ' ')}  ·  {sha or '?'}  ·  {', '.join(srv)}"))
     return [(n, lbl) for _, n, lbl in sorted(out, reverse=True)]
 
 
@@ -2052,13 +2070,74 @@ def error_html(what, ex, picker=""):
                      f"{html.escape(type(ex).__name__)}: {html.escape(str(ex))} — a run that is still in progress renders once it finishes.</p>{picker}", "benchmark")
 
 
+def read_result(d):
+    """The benchmark's result.json in `d`, None when there is none or it is not a valid one."""
+    try:
+        return gate_result().read(d, "bench")
+    except ValueError:
+        return None
+
+
+def result_page(doc, name):
+    """A compact page from a benchmark result.json alone: each level's screen and endpoint rows,
+    time to first screen, memory and CPU per screen (every server's median and range, Ferrofin's
+    ratio, a withheld cell's reason), or a gate session's verdict cells."""
+    e = html.escape
+    detail = doc["detail"]
+    fmt = lambda v: sig3(v) if number(v) else "—"
+    if "verdicts" in detail and not detail["verdicts"]:
+        tables = f"<p class='lede'>No verdict cells: a {e(str(detail.get('mode')))} session judges none.</p>"
+    elif "verdicts" in detail:
+        rows = []
+        for key, v in detail["verdicts"].items():
+            verdict = str(v.get("verdict"))
+            change = f"{v['pct']:+.1f}%" if isinstance(v.get("pct"), (int, float)) else "—"
+            rows.append(f"<tr><th>{e(key)}</th><td class='verdict {e(verdict.replace(' ', '-'))}'>{e(verdict)}</td>"
+                        f"<td class='num'>{fmt(v.get('a_median'))}</td><td class='num'>{fmt(v.get('b_median'))}</td>"
+                        f"<td class='num'>{change}</td><td>{'gated' if v.get('gated') else ''}</td></tr>")
+        rows = "".join(rows)
+        tables = ("<div class='scroll'><table><thead><tr><th>Cell</th><th>Verdict</th><th>Previous</th><th>Candidate</th>"
+                  f"<th>Change</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>")
+    else:
+        servers = list(detail.get("servers") or {})
+        head = "".join(f"<th>{e(detail['servers'][k])}</th>" for k in servers)
+
+        def table(title, rows):
+            body = []
+            for r in rows:
+                cells = []
+                for k in servers:
+                    c = r["servers"].get(k) or {}
+                    spread = f" <span class='tail'>{fmt(c.get('min'))}–{fmt(c.get('max'))}</span>" if c.get("min") != c.get("max") else ""
+                    cells.append(f"<td class='num'>{fmt(c.get('median'))} {e(c.get('unit') or '')}{spread}</td>")
+                ratio = f"{r['ratio']:.1f}×" if number(r.get("ratio")) else "—"
+                note = f"<br><span class='tail'>withheld: {e(r['withheld'])}</span>" if r["withheld"] else ""
+                body.append(f"<tr><th>{e(r['name'])}{note}</th>{''.join(cells)}<td class='num'>{ratio}</td></tr>")
+            return (f"<h2>{e(title)}</h2><div class='scroll'><table><thead><tr><th></th>{head}<th>vs oracle</th></tr></thead>"
+                    f"<tbody>{''.join(body)}</tbody></table></div>")
+        parts = []
+        for level, lv in detail.get("levels", {}).items():
+            parts.append(table(f"{level} · screens ({lv.get('rate')} screens/s), p50", lv.get("screens", [])))
+            parts.append(table(f"{level} · endpoints, p50", lv.get("endpoints", [])))
+        parts += [table("Time to first screen", detail.get("ttfs", [])), table("Memory", detail.get("memory", [])),
+                  table("CPU per completed screen", detail.get("cpu_per_screen", []))]
+        tables = "".join(parts)
+    src = doc["source"]
+    lede = (f"{e(doc['verdict'])} · commit {e(str(src.get('commit')))} · image {e(str(src.get('image')))} · "
+            f"started {e(str(doc.get('started')))} — rendered from result.json")
+    return page_html(f"Ferrofin {name}", f"<h1>{e(name)}</h1><p class='lede'>{lede}</p>{tables}")
+
+
 def benchmark_report(root, name):
-    """A benchmark run's `report.html`: the file its run wrote, else the run rendered now."""
+    """A benchmark run's `report.html`: the file its run wrote, else a page from its result.json,
+    else the run rendered now."""
     run = os.path.join(root, name)
     static = os.path.join(run, "report.html")
     if os.path.isfile(static):
         with open(static, encoding="utf-8") as f:
             return 200, f.read()
+    if doc := read_result(run):
+        return 200, result_page(doc, name)
     try:
         return 200, render_html(build([run]), verdicts=load_verdicts([run]))
     except Exception as ex:
@@ -2155,14 +2234,111 @@ def serve(port, roots):
         pass
 
 
+# ── result.json (gates/result.py's envelope) ───────────────────────────────
+def gate_result():
+    """gates/result.py, the envelope every gate's result.json is written in, loaded by its path (a
+    plain `import result` could find another module of that name first)."""
+    if "gates_result" not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "gates_result", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "result.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules["gates_result"] = module
+    return sys.modules["gates_result"]
+
+
+def cell_json(c):
+    """One server's number: its median and range over the runs, each run's value, a latency cell's
+    p95 and p99 medians, and why it is not publishable (None when it is)."""
+    out = {"median": c.median, "min": min(c.vals, default=None), "max": max(c.vals, default=None),
+           "values": c.vals, "unit": c.unit, "flag": c.flag}
+    for key in ("p95", "p99"):
+        if key in c.sub:
+            out[key] = c.sub[key].median
+    return out
+
+
+def row_json(name, cells, servers):
+    """A row of every server's numbers; `ratio`, the oracle's number over Ferrofin's as the reports
+    print them (above 1: Ferrofin faster or lighter), None when there is nothing comparable; and
+    `withheld`, each server's reason when either cell cannot be published (the servers did different
+    work, or the evidence is incomplete), as `render_readme` withholds it."""
+    withheld = reasons(*(f"{label}: {cells[k].flag}" for k, label in servers if k in cells and cells[k].flag))
+    return {"name": name, "servers": {k: cell_json(cells[k]) for k, _ in servers if k in cells},
+            "ratio": _ratio(cells.get("ferrofin"), cells.get(ORACLE)), "withheld": withheld}
+
+
+def cpu_rows(m):
+    """Per load level with CPU evidence: CPU milliseconds per completed screen, one cell per server
+    over the runs, flagged where the resource evidence or the level's workload failed validation."""
+    rows, runs = [], range(len(m["runs"]))
+    for level in LOAD_LEVELS:
+        if not any(m["resources"][k][i].get(level) for k, _ in m["servers"] for i in runs):
+            continue
+        cells = {}
+        for k, _ in m["servers"]:
+            evidence = [cpu_evidence(m, k, i, level) for i in runs]
+            cells[k] = Cell([e[4] * 1000 if e[4] is not None else None for e in evidence], sig3,
+                            reasons(*(e[3] for e in evidence)), unit="ms")
+        rows.append((level, cells))
+    return rows
+
+
+def phase_verdict(m):
+    """`(verdict, counts)` from each server's phases: failed when a phase failed, incomplete when one
+    never finished or a server's run recorded no phases at all (a run from before phases.json existed,
+    `phase_schema` absent from its run.json, never has one), else measured."""
+    counts = {"completed": 0, "failed": 0, "unfinished": 0, "skipped": 0}
+    unrecorded = False
+    for recorded in (p for per_run in m["phases"].values() for p in per_run):
+        unrecorded = unrecorded or (bool(m["meta"].get("phase_schema")) and not isinstance(recorded, dict))
+        for phase in (recorded if isinstance(recorded, dict) else {}).values():
+            status = phase.get("status") if isinstance(phase, dict) else None
+            counts[status if status in ("completed", "failed", "skipped") else "unfinished"] += 1
+    return ("failed" if counts["failed"] else "incomplete" if counts["unfinished"] or unrecorded else "measured"), counts
+
+
+def run_result(m):
+    """The benchmark's result envelope for the runs of model `m`: per level the screen and endpoint
+    cells, time to first screen, peak and idle memory and CPU per screen, each with every server's
+    median and range, Ferrofin's ratio to the oracle and the reason a cell is withheld."""
+    meta, servers = m["meta"], m["servers"]
+    identity = (image_id(os.path.join(m["runs"][0], "ferrofin")) or "").split()
+    measured_oracle = ORACLE in dict(servers)
+    source = {"commit": meta.get("sha"), "image": identity[0] if identity else None,
+              "image_digest": meta.get("ferrofin_image") or (identity[1] if len(identity) > 1 else None),
+              "oracle": (meta.get("oracle") or {}).get("image") if measured_oracle else None,
+              "host_class": gate_result().host_class(), "fixture": meta.get("ids_sha256")}
+    rows = lambda pairs: [row_json(name, cells, servers) for name, cells in pairs]
+    detail = {"runs": [os.path.basename(os.path.normpath(r)) for r in m["runs"]], "servers": dict(servers),
+              "oracle_label": m["oracle_label"] if measured_oracle else None,
+              "conditions": {"server_cpus": meta.get("server_cpus"), "memory_limit": meta.get("memory_limit"),
+                             "fixture_counts": meta.get("testdata_counts")},
+              "levels": {level: {"rate": lv["rate"], "screens": rows(lv["screens"]), "endpoints": rows(lv["endpoints"])}
+                         for level, lv in m["levels"].items()},
+              "ttfs": rows(m["ttfs"]),
+              "memory": rows((name, cells) for name, cells in m["memory"] if name in README_MEMORY),
+              "cpu_per_screen": rows(cpu_rows(m)),
+              "missing": m["missing"], "load_problems": m["load_problems"]}
+    verdict, counts = phase_verdict(m)
+    # the run ended when its last recorded phase did (None for a run from before phases.json)
+    ends = [p["end"] for per_run in m["phases"].values() for rec in per_run if isinstance(rec, dict)
+            for p in rec.values() if isinstance(p, dict) and number(p.get("end"))]
+    ended = datetime.fromtimestamp(max(ends), timezone.utc).isoformat(timespec="seconds") if ends else None
+    return gate_result().envelope("bench", verdict, counts, source, meta.get("date"), ended, detail)
+
+
 def write_html(run):
-    """Write `report.html` beside the run (self-contained: opens from disk, uploads as a
-    CI artifact) and return its path."""
+    """Write `report.html` and `result.json` beside the run, both from one `build` model (the page is
+    self-contained: opens from disk, uploads as a CI artifact), and return the page's path."""
     path = os.path.join(run, "report.html")
-    page = render_html(build([run]), verdicts=load_verdicts([run]))  # before the file is touched: a failure leaves no empty report
+    m = build([run])
+    page = render_html(m, verdicts=load_verdicts([run]))  # before the file is touched: a failure leaves no empty report
+    doc = run_result(m)
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         f.write(page)
     os.replace(path + ".tmp", path)
+    gate_result().write(run, doc)
     return path
 
 

@@ -414,9 +414,33 @@ def judge_candidate_runs(session, plan, rows):
         report.write_html(run)
 
 
+VERDICT_COUNTS = ("regressed", "not comparable", "improved", "within noise")
+
+
+def session_result(session, plan, result, block):
+    """The session's result envelope (gates/result.py): blocked or passed (an A/A, which judges
+    nothing, measured), the gated cells counted by verdict, and every verdict cell (`a_median`,
+    `b_median`, `pct`, `verdict`, `gated`…) as the session judged it, from the candidate's side."""
+    role = "b" if any(r == "b" for _, r, _ in plan["schedule"]) else "a"   # an A/A runs one image
+    first = next(name for name, r, _ in plan["schedule"] if r == role)
+    meta = report.load(os.path.join(session, first, "run.json")) or {}
+    image = plan["images"][role]
+    verdicts = json.loads(json.dumps(result.get("verdicts") or {}, default=str))
+    gated = [v for v in verdicts.values() if v.get("gated")]
+    source = {"commit": meta.get("sha"), "image": image["ref"], "image_digest": image["id"],
+              "oracle": (plan.get("oracle") or {}).get("image"), "host_class": report.gate_result().host_class(),
+              "fixture": meta.get("ids_sha256")}
+    detail = {"mode": plan["mode"], "name": plan["name"], "images": plan["images"], "verdicts": verdicts,
+              "blocking": block}
+    verdict = "measured" if plan["mode"] == "aa" else "blocked" if block else "passed"
+    counts = {v: sum(1 for c in gated if c.get("verdict") == v) for v in VERDICT_COUNTS}
+    return report.gate_result().envelope("bench", verdict, counts, source, plan["date"], None, detail)   # its runs record their own ends
+
+
 def render(session):
-    """Compute the session's tables, write report.md, report.html and the machine-readable
-    noise.json (A/A) or verdict.json (A/B); returns the blocking cells. An A/B, ramp or soak
+    """Compute the session's tables; write report.md, report.html, the machine-readable
+    noise.json (A/A) or verdict.json (A/B), and the session's result.json. Returns the
+    blocking cells. An A/B, ramp or soak
     gate also gives its candidate runs the gated verdicts ([`judge_candidate_runs`]); the
     session's own report.html is listed in the viewer too (`report.list_runs`)."""
     plan = report.load(os.path.join(session, "gate.json"))
@@ -432,6 +456,7 @@ def render(session):
             f.write(md)
         with open(os.path.join(session, "report.html"), "w") as f:
             f.write(soak.render_html(header(plan), result, report.CSS))
+        report.gate_result().write(session, session_result(session, plan, result, result["blocking"]))
         judge_candidate_runs(session, plan, result["verdicts"])
         return md, result["blocking"]
     if plan["mode"] == "endpoints":
@@ -475,6 +500,7 @@ def render(session):
         f.write(md)
     with open(os.path.join(session, "report.html"), "w") as f:
         f.write(render_html(plan, result))
+    report.gate_result().write(session, session_result(session, plan, result, block))
     if plan["mode"] in ("ab", "ramp", "endpoints"):
         judge_candidate_runs(session, plan, result["verdicts"])
     return md, block

@@ -127,34 +127,29 @@ def parity(d, record):
 
 
 def bench(d, record):
+    result = gate_result(d, "bench")
+    if result is None and os.path.exists(os.path.join(d, "verdict.json" if record.get("previous") else "report.md")):
+        how = "gates/bench/gate.py render DIR" if record.get("previous") else "gates/bench/report.py --html DIR"
+        return found(problems=[f"no result.json: a run from before the benchmark wrote one (python3 {how} writes it)"],
+                     bad=True)
     if record.get("previous"):   # the release A/B gate (gates/run --previous): a gate.py session
-        if not os.path.exists(os.path.join(d, "gate.json")):
-            return found(problems=["no gate.json: the A/B gate ended before it started"], bad=True)
-        result = read_json(os.path.join(d, "verdict.json"))
         if result is None:
-            return found(problems=["no verdict.json: the A/B gate ended before it judged its runs"], bad=True)
-        verdicts = result.get("verdicts") or {}
-        gated = [v for v in (verdicts.values() if isinstance(verdicts, dict) else verdicts) if v.get("gated")]
-        cells = Counter(v.get("verdict") for v in gated)
-        blocking = result.get("blocking") or []
+            return found(problems=["no result.json: the A/B gate ended before it judged its runs"], bad=True)
+        counts, blocking = result["counts"], result["detail"].get("blocking") or []
         return found(f"blocked by {plural(len(blocking), 'cell')}" if blocking else "nothing blocks",
-                     [("gated cells regressed", cells["regressed"]), ("not comparable", cells["not comparable"]),
-                      ("improved", cells["improved"]), ("within noise", cells["within noise"])], bad=bool(blocking))
-    if read_json(os.path.join(d, "run.json")) is None:
-        return found(problems=["no run.json: the run ended before it started measuring"], bad=True)
-    phases, absent = Counter(), []
-    for server in ("ferrofin", "jellyfin"):   # gates/run runs both; state() writes pending, running, completed, failed, skipped
-        recorded = read_json(os.path.join(d, server, "phases.json"))
-        if recorded is None:
-            absent.append(server)
-        for phase in (recorded or {}).values():
-            status = phase.get("status")
-            phases[status if status in ("completed", "failed", "skipped") else "unfinished"] += 1
-    verdict = (f"{plural(phases['failed'], 'phase')} failed" if phases["failed"]
-               else "incomplete" if phases["unfinished"] or absent else "measured")
-    return found(verdict, [("phases completed", phases["completed"]), ("failed", phases["failed"]),
-                           ("unfinished", phases["unfinished"]), ("skipped", phases["skipped"])],
-                 [absent and f"no phases recorded for {' or '.join(absent)}: its run never started"],
+                     [("gated cells regressed", counts.get("regressed", 0)), ("not comparable", counts.get("not comparable", 0)),
+                      ("improved", counts.get("improved", 0)), ("within noise", counts.get("within noise", 0))],
+                     bad=bool(blocking))
+    if result is None:
+        return found(problems=["no result.json: the run ended before writing its report and result"], bad=True)
+    counts = result["counts"]
+    # gates/run measures both servers: one with no results at all never started
+    absent = [s for s in ("ferrofin", "jellyfin") if s not in (result["detail"].get("servers") or {})]
+    verdict = (f"{plural(counts.get('failed', 0), 'phase')} failed" if result["verdict"] == "failed"
+               else "incomplete" if result["verdict"] == "incomplete" or absent else result["verdict"])
+    return found(verdict, [("phases completed", counts.get("completed", 0)), ("failed", counts.get("failed", 0)),
+                           ("unfinished", counts.get("unfinished", 0)), ("skipped", counts.get("skipped", 0))],
+                 [absent and f"no results for {' or '.join(absent)}: its run never started"],
                  bad=verdict != "measured")
 
 

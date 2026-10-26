@@ -19,6 +19,8 @@ report = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(report)
 adoption_report = report.gate_module("adoption/adoption_report.py")
 verify_report = report.gate_module("verify/verify_report.py")
+bench_report = report.gate_module("bench/report.py")
+bench_gate = report.gate_module("bench/gate.py")
 TAG = "0123456789abcdef0123456789abcdef"   # an image tag, as a key in an item's ImageBlurHashes
 
 
@@ -50,6 +52,23 @@ class SessionReportTests(unittest.TestCase):
         verify_report.result.write(str(d), doc)
         verify_report.write_report(str(d), doc)
 
+    def bench_run(self, d, phases):
+        """What gates/bench/run.sh leaves: result.json, its verdict and counts from the benchmark's own
+        reading of each server's phases.json."""
+        verdict, counts = bench_report.phase_verdict({"phases": {k: [p] for k, p in phases.items()}, "meta": {"phase_schema": 1}})
+        d.mkdir(parents=True, exist_ok=True)
+        bench_report.gate_result().write(str(d), bench_report.gate_result().envelope(
+            "bench", verdict, counts, {"image": "ferrofin:v9"}, None, "2026-10-24T13:00:00+00:00",
+            {"servers": {k: k.title() for k in phases}}))
+
+    def ab_session(self, d, verdicts, blocking):
+        """What gate.py ab leaves: the session's result.json, from gate.py's own session_result."""
+        plan = {"mode": "ab", "name": "gate", "date": "2026-10-24T12:00:00+00:00",
+                "schedule": [["01-a", "a", "old"], ["02-b", "b", "new"]],
+                "images": {"a": {"ref": "ferrofin:v8", "id": "sha256:a"}, "b": {"ref": "ferrofin:v9", "id": "sha256:b"}}}
+        d.mkdir(parents=True, exist_ok=True)
+        bench_report.gate_result().write(str(d), bench_gate.session_result(str(d), plan, {"verdicts": verdicts}, blocking))
+
     def adoption_run(self, d, rows, unfinished=()):
         """What gates/adoption/run.sh records: a begin per fixture, its checks, then its row."""
         recorder = adoption_report.Recorder(str(d))
@@ -76,10 +95,8 @@ class SessionReportTests(unittest.TestCase):
             {"differences": [{"path": f"ImageBlurHashes.Primary.{'f' * 32}", "kind": "value", "filed": None},
                              {"path": "C", "kind": "value", "filed": "gl-1"}]}]})
         self.write(s / "parity/report.html", "<p>parity</p>")
-        self.write(s / "bench/run.json", {"date": "2026-10-24T12:00:00"})
-        self.write(s / "bench/ferrofin/phases.json", {"counts": {"status": "completed"}, "loaded": {"status": "failed"},
-                                                      "ttfs": {"status": "skipped"}})
-        self.write(s / "bench/jellyfin/phases.json", {})
+        self.bench_run(s / "bench", {"ferrofin": {"counts": {"status": "completed"}, "loaded": {"status": "failed"},
+                                                  "ttfs": {"status": "skipped"}}, "jellyfin": {}})
         self.write(s / "bench/report.html", "<p>bench</p>")
 
     def rows(self, s):
@@ -134,24 +151,32 @@ class SessionReportTests(unittest.TestCase):
 
     def test_bench_counts_only_completed_phases_and_a_run_cut_short_is_incomplete(self):
         s = self.session(["bench"], {"bench": ("failed", 143)})
-        self.write(s / "bench/run.json", {})
-        self.write(s / "bench/ferrofin/phases.json", {"counts": {"status": "completed"}, "loaded": {"status": "running"},
-                                                      "stress": {"status": "pending"}, "ttfs": {"status": "pending"}})
+        self.assertEqual(self.rows(s)["bench"]["problem"], "no result.json: the run ended before writing its report and result; "
+                                                           "no report.html: the gate ended before writing its report")
+        self.bench_run(s / "bench", {"ferrofin": {"counts": {"status": "completed"}, "loaded": {"status": "running"},
+                                                  "stress": {"status": "pending"}, "ttfs": {"status": "pending"}}})
         row = self.rows(s)["bench"]
         self.assertEqual((row["verdict"], row["counts"]),
                          ("incomplete", [("phases completed", 1), ("failed", 0), ("unfinished", 3), ("skipped", 0)]))
-        # the Jellyfin half never started: no phases of it at all
-        self.assertEqual(row["problem"], "no phases recorded for jellyfin: its run never started; "
+        # the Jellyfin half never started: no results of it at all
+        self.assertEqual(row["problem"], "no results for jellyfin: its run never started; "
                                          "no report.html: the gate ended before writing its report")
+
+    def test_a_bench_run_from_before_result_json_says_how_to_add_one(self):
+        s = self.session(["bench"], {"bench": ("passed", 0)})
+        self.write(s / "bench/report.md", "# tables\n")
+        self.assertIn("a run from before the benchmark wrote one (python3 gates/bench/report.py --html DIR",
+                      self.rows(s)["bench"]["problem"])
+        s = self.session(["bench"], {"bench": ("passed", 0)}, previous="ferrofin:v8")
+        self.write(s / "bench/verdict.json", {"verdicts": {}})
+        self.assertIn("(python3 gates/bench/gate.py render DIR writes it)", self.rows(s)["bench"]["problem"])
 
     def test_an_ab_gate_session_counts_its_gated_cells_and_what_blocks(self):
         s = self.session(["bench"], {"bench": ("failed", 1)}, previous="ferrofin:v8")
-        self.assertEqual(self.rows(s)["bench"]["problem"], "no gate.json: the A/B gate ended before it started; "
+        self.assertEqual(self.rows(s)["bench"]["problem"], "no result.json: the A/B gate ended before it judged its runs; "
                                                            "no report.html: the gate ended before writing its report")
-        self.write(s / "bench/gate.json", {"mode": "ab"})
-        self.write(s / "bench/verdict.json", {"verdicts": {
-            "x": {"verdict": "regressed", "gated": True}, "y": {"verdict": "within noise", "gated": True},
-            "z": {"verdict": "regressed", "gated": False}}, "blocking": ["x"]})
+        self.ab_session(s / "bench", {"x": {"verdict": "regressed", "gated": True}, "y": {"verdict": "within noise", "gated": True},
+                                      "z": {"verdict": "regressed", "gated": False}}, ["x"])
         self.write(s / "bench/report.html", "<p>gate</p>")
         row = self.rows(s)["bench"]
         self.assertEqual((row["verdict"], row["links"]), ("blocked by 1 cell", [("A/B gate report", "bench/report.html"),
@@ -163,8 +188,9 @@ class SessionReportTests(unittest.TestCase):
         s = self.session(report.GATES, {g: ("failed", 1) for g in report.GATES})
         self.write(s / "parity/results.json", "{not json")
         self.verify_run(s / "verify", {"exit": 3, "libraries": {"movies": None, "tvshows": None}})
-        self.write(s / "bench/run.json", {})
-        self.write(s / "bench/ferrofin/phases.json", ["not", "a", "map"])
+        self.bench_run(s / "bench", {})
+        doc = json.loads((s / "bench/result.json").read_text())
+        self.write(s / "bench/result.json", {**doc, "detail": {"servers": 5}})
         rows = self.rows(s)
         self.assertEqual((rows["verify"]["verdict"], rows["verify"]["problem"]),
                          ("nothing verified", "no rows from the movies and tvshows libraries: the check ended before them "
@@ -172,7 +198,7 @@ class SessionReportTests(unittest.TestCase):
         self.assertEqual(rows["adoption"]["problem"], "no results.jsonl: the gate ended before it recorded anything; "
                                                       "no report.html: the gate ended before writing its report")
         self.assertIn("results.json cannot be read", rows["parity"]["problem"])
-        self.assertIn("its result is not shaped as expected (AttributeError", rows["bench"]["problem"])
+        self.assertIn("its result is not shaped as expected (TypeError", rows["bench"]["problem"])
         self.write(s / "parity/results.json", {"verdict": "pass", "planned": 1, "requests": [{}]})
         self.assertEqual(self.rows(s)["parity"]["problem"],
                          "no new-differences.json: its counts are unknown; no report.html: the gate ended before writing its report")

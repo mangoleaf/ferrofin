@@ -519,8 +519,18 @@ show in every tab: rename a run moved under the root to `bench-<name>` or `parit
 
 Each run is one self-contained `report.html` (no external assets, so it opens from disk
 and works as a CI artifact). `run.sh` writes the benchmark's beside `report.md`
-(`report.py --html RUN_DIR` rewrites it); the viewer renders a benchmark run that has none
-on demand. The adoption and parity tabs list whatever `report.html` files those harnesses leave in
+(`report.py --html RUN_DIR` rewrites it), and with it `result.json`, from the same model: the
+benchmark's result in the envelope every gate shares ([`gates/result.py`](../result.py)). It
+holds, per server, the median, range and each run's value of every screen and endpoint cell
+at each level (with p95 and p99), time to first screen, peak and idle memory and CPU
+milliseconds per completed screen, Ferrofin's ratio to Jellyfin where the cells are
+comparable, and the reason a cell is withheld where they are not (the servers did different
+work, or the evidence is incomplete); its verdict and counts come from the phase states. Every
+`gate.py` session writes one too, holding its verdict cells (`a_median`, `b_median`, `pct`,
+`verdict`, `gated`) and the blocking ones. The gates' session page reads the benchmark only
+through it, and the viewer labels a run from it. The viewer renders a benchmark run that has no
+`report.html` on demand: from its `result.json` when it has one (the headline tables only),
+else from the run. The adoption and parity tabs list whatever `report.html` files those harnesses leave in
 their directory, and a tab with no runs says so and names the flag. Pick an A and a B of the same harness to see their reports side by side;
 runs of different harnesses are never compared. If a benchmark run directory holds an
 `ab-verdicts.json` (`{"cells": [{"cell", "verdict", "baseline", "candidate", "unit",
@@ -606,5 +616,5 @@ counts are not compared: v1.3.2's fresh scan lists the 40 alternate versions as 
 their own (3,041), and it must stay measurable as a previous release. The test data must
 hold at least 10,000 items. Every cell gates: wall time by the `[scan]` row of
 [`gate.toml`](gate.toml), peak anon by the `[memory]` row, with the A/B verdict rule. The
-session directory holds `report.md`, `report.html` and `verdict.json`; each run directory
+session directory holds `report.md`, `report.html`, `verdict.json` and `result.json`; each run directory
 holds `scan.json`, and each measurement's `server.log`, `mem.csv` and data dir.
