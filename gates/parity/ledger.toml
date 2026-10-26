@@ -648,14 +648,6 @@ kind = "value"
 issue = 416
 reason = "By-name counts lack v12's roll-up of the episodes of tagged series."
 
-# An alternate version upstream's access filter drops is counted.
-[[entry]]
-request = "GetGenre"
-path = "MovieCount"
-kind = "value"
-issue = 79
-reason = "An alternate version upstream's access filter drops is counted."
-
 # Jellyfin answers this error with its message as a bare JSON string; Ferrofin with an object.
 [[entry]]
 request = "GetArtistImage"

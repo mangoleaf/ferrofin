@@ -32,17 +32,16 @@ use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{
-    ALTERNATE_VERSION_HIDDEN, QueryShape, append_parental_restrictions, build_query,
+    ALTERNATE_VERSION_HIDDEN, QueryShape, TopParentTerm, append_parental_restrictions, build_query,
+    push_access_filter,
 };
 
-/// Adds the same rating predicate as browsing before an existing aggregate's
-/// GROUP BY. Its suffix contains no parameters, so the original bind order is
-/// retained. Related-id aggregates correlate a primary-key lookup; by-name
-/// aggregates already have the `bi` row in hand.
-fn restrict_count_query<'q>(
+/// Re-opens a bound aggregate and lets `push` add predicates before its
+/// GROUP BY. The suffix contains no parameters, so the original bind order is
+/// retained.
+fn before_group_by<'q>(
     mut query: impl Execute<'q, Sqlite>,
-    filter: &InternalItemsQuery,
-    related_id: Option<&str>,
+    push: impl FnOnce(&mut QueryBuilder<Sqlite>),
 ) -> Result<QueryBuilder<Sqlite>, ServiceError> {
     let arguments = query
         .take_arguments()
@@ -56,22 +55,56 @@ fn restrict_count_query<'q>(
             (prefix, Some(suffix))
         });
     let mut qb = QueryBuilder::with_arguments(prefix, arguments);
-    let restricted = crate::translate_query::has_parental_restrictions(filter);
-    if restricted {
+    push(&mut qb);
+    if let Some(suffix) = suffix {
+        qb.push(" GROUP BY ").push(suffix);
+    }
+    Ok(qb)
+}
+
+/// Adds the same rating predicate as browsing before an existing aggregate's
+/// GROUP BY ([`before_group_by`]). Related-id aggregates correlate a
+/// primary-key lookup; the child-count and whole-server aggregates already
+/// read the counted row as `bi`.
+fn restrict_count_query<'q>(
+    query: impl Execute<'q, Sqlite>,
+    filter: &InternalItemsQuery,
+    related_id: Option<&str>,
+) -> Result<QueryBuilder<Sqlite>, ServiceError> {
+    before_group_by(query, |qb| {
+        if !crate::translate_query::has_parental_restrictions(filter) {
+            return;
+        }
         if let Some(id) = related_id {
             qb.push(format!(
                 r#" AND EXISTS (SELECT 1 FROM "BaseItems" bi WHERE bi."Id" = {id}"#
             ));
         }
-        append_parental_restrictions(&mut qb, filter, "bi");
+        append_parental_restrictions(qb, filter, "bi");
         if related_id.is_some() {
             qb.push(")");
         }
-    }
-    if let Some(suffix) = suffix {
-        qb.push(" GROUP BY ").push(suffix);
-    }
-    Ok(qb)
+    })
+}
+
+/// A by-name count aggregate over v12.2 `ApplyAccessFiltering`, the
+/// related items `ItemCountService.GetItemCountsForNameItems` counts
+/// (`ItemCountService.cs:172-176`), added before its GROUP BY: the libraries
+/// [`crate::item_repository::scope_to_user_libraries`] put in
+/// `filter.top_parent_ids` for its user (`LibraryManager.AddUserToQuery`;
+/// none with no user), the parental rules, and no alternate version or owned
+/// non-extra, whoever asks ([`push_access_filter`]).
+///
+/// The library scope is a residual check: each statement already reaches
+/// `BaseItems` from the names asked for, by primary key or by `Type`, and
+/// keeps that plan (`access_filtered_name_counts_keep_their_seeks`).
+fn access_filtered_count_query<'q>(
+    query: impl Execute<'q, Sqlite>,
+    filter: &InternalItemsQuery,
+) -> Result<QueryBuilder<Sqlite>, ServiceError> {
+    before_group_by(query, |qb| {
+        push_access_filter(qb, filter, &filter.top_parent_ids, TopParentTerm::Residual);
+    })
 }
 
 /// `BaseItem.DisplayExtraTypes`: Unknown, Clip, BehindTheScenes,
@@ -379,7 +412,7 @@ impl FerrofinItemCountService {
             for t in &type_names {
                 query = query.bind(*t);
             }
-            let mut restricted = restrict_count_query(query, access_filter, None)?;
+            let mut restricted = access_filtered_count_query(query, access_filter)?;
             for (name, type_, count) in restricted
                 .build_query_as::<(String, String, i64)>()
                 .fetch_all(self.db.pool())
@@ -449,7 +482,7 @@ impl FerrofinItemCountService {
             for t in &type_names {
                 query = query.bind(*t);
             }
-            let mut restricted = restrict_count_query(query, access_filter, None)?;
+            let mut restricted = access_filtered_count_query(query, access_filter)?;
             for (year, type_, count) in restricted
                 .build_query_as::<(i64, String, i64)>()
                 .fetch_all(self.db.pool())
@@ -607,8 +640,6 @@ impl ItemCountService for FerrofinItemCountService {
         related_item_kinds: &[BaseItemKind],
         access_filter: &InternalItemsQuery,
     ) -> Result<HashMap<Uuid, ItemCounts>, ServiceError> {
-        let preferences = crate::query_restrictions::resolve(&self.db, access_filter).await?;
-        let access_filter = preferences.as_ref().unwrap_or(access_filter);
         // Every row reports counts (zeros when its CleanName is missing),
         // matching the per-item form's defaults.
         let mut out: HashMap<Uuid, ItemCounts> = rows
@@ -618,6 +649,18 @@ impl ItemCountService for FerrofinItemCountService {
         if rows.is_empty() {
             return Ok(out);
         }
+        // v12.2 `LibraryManager.GetItemCountsForNameItems` runs
+        // `AddUserToQuery` for a user, so the counts cover the libraries that
+        // user may open; with no user (an API key) they cover the server.
+        // The preferences come resolved with it.
+        let visibility = crate::item_repository::bound_visibility(&self.visibility);
+        let scoped = crate::item_repository::scope_to_user_libraries(
+            &self.db,
+            visibility.as_deref(),
+            access_filter,
+        )
+        .await?;
+        let access_filter = scoped.as_ref().unwrap_or(access_filter);
 
         // People live in `PeopleBaseItemMap`/`Peoples`, not `ItemValues`, so a Person's
         // filmography is counted by joining the people map on the person's Name — the
@@ -689,7 +732,7 @@ impl ItemCountService for FerrofinItemCountService {
             for t in &type_names {
                 query = query.bind(*t);
             }
-            let mut restricted = restrict_count_query(query, access_filter, None)?;
+            let mut restricted = access_filtered_count_query(query, access_filter)?;
             for (clean, type_, count) in restricted
                 .build_query_as::<(String, String, i64)>()
                 .fetch_all(self.db.pool())
@@ -1590,7 +1633,11 @@ fn by_name_count_value_types(kind: BaseItemKind) -> Option<&'static [ItemValueTy
 /// clean-value aggregate answered 0 for every year that has content.
 /// `IX_BaseItems_ProductionYear` is not part of the pinned Jellyfin schema, so
 /// this is a scan of the type-filtered rows — the same shape the C# query
-/// planner runs.
+/// planner runs. A viewer's library scope is a residual check here too
+/// ([`access_filtered_count_query`]): it would move the walk onto a
+/// `(Type, TopParentId)` index, faster for a user with one library and slower
+/// for one with all of them, and that trade is not one to take from a single
+/// statement. `access_filtered_name_counts_keep_their_seeks` pins the walk.
 fn production_year_counts_sql(years: usize, types: usize) -> String {
     let mut sql = format!(
         r#"SELECT bi."ProductionYear", bi."Type", COUNT(DISTINCT bi."Id")
@@ -1867,6 +1914,11 @@ mod tests {
             .unwrap();
         assert_eq!(whole.played, 0);
         assert_eq!(whole.total, unrestricted.total - 1);
+        // A by-name item's counts cover the libraries its viewer may open
+        // (`AddUserToQuery`), so the rated pair goes in one this user can.
+        crate::test_support::seed_library_over(&db, &[adult, child]).await;
+        crate::test_support::grant_default_permissions(&db, Uuid::parse_str(&user.id).unwrap())
+            .await;
         for (kind, name) in [
             (BaseItemKind::Genre, "Shared"),
             (BaseItemKind::Year, "2020"),
@@ -3618,7 +3670,10 @@ mod tests {
             .execute(db.writer())
             .await
             .unwrap();
-        let mut user = seed_user(&db, Uuid::new_v4()).await;
+        // The viewer's counts cover the libraries they may open.
+        crate::test_support::seed_library_over(&db, &[0xCC10, 0xCC11, 0xCC12].map(Uuid::from_u128))
+            .await;
+        let mut user = crate::test_support::seed_user_with_defaults(&db, Uuid::new_v4()).await;
         user.max_parental_rating_score = Some(12);
         let filter = InternalItemsQuery {
             user: Some(user),
@@ -3634,6 +3689,224 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((counts.movie_count, counts.series_count), (1, 1));
+    }
+
+    /// Credits the `Peoples` row `people` on `item`.
+    async fn credit(db: &Database, people: Uuid, item: Uuid) {
+        sqlx::query(
+            r#"INSERT INTO "PeopleBaseItemMap" ("ItemId","PeopleId","Role","ListOrder","SortOrder")
+               VALUES (?1,?2,'Role',0,0)"#,
+        )
+        .bind(guid_to_db(item))
+        .bind(guid_to_db(people))
+        .execute(db.writer())
+        .await
+        .expect("seed people map");
+    }
+
+    /// Gives `item` the genre "Shared", the production year 1999 and a credit
+    /// for the `Peoples` row `people`, the three things a Genre, a Year and a
+    /// Person count by.
+    async fn tag_for_every_count(db: &Database, item: Uuid, people: Uuid) {
+        seed_item_genre(db, item, "Shared").await;
+        set_column(db, item, "ProductionYear", Some("1999".to_owned())).await;
+        credit(db, people, item).await;
+    }
+
+    /// The by-name rows a Genre "Shared", a Person "Pat Shared" and a Year
+    /// 1999 are, as `(kind, id)`.
+    async fn seed_name_rows(db: &Database) -> [(BaseItemKind, Uuid); 3] {
+        let rows = [
+            (BaseItemKind::Genre, Uuid::from_u128(0x7911), "Shared"),
+            (BaseItemKind::Person, Uuid::from_u128(0x7912), "Pat Shared"),
+            (BaseItemKind::Year, Uuid::from_u128(0x7913), "1999"),
+        ];
+        for (kind, id, name) in rows {
+            seed_named_item(db, id, kind, name).await;
+            set_clean_name(db, id, name).await;
+        }
+        rows.map(|(kind, id, _)| (kind, id))
+    }
+
+    /// A by-name item's counts cover only the libraries its viewer may open:
+    /// v12.2 `LibraryManager.GetItemCountsForNameItems` runs `AddUserToQuery`,
+    /// which sets the `TopParentIds` that `ItemCountService`'s
+    /// `ApplyAccessFiltering` then applies. A Genre, a Person and a Year
+    /// alike. With no user (an API key) nothing narrows them; a user who may
+    /// open no library counts nothing. A by-name `MusicArtist` row carrying
+    /// the genre is in no library, and the access filter exempts no by-name
+    /// type, so it drops out of the genre's `ArtistCount` for every user, as
+    /// it does upstream.
+    #[tokio::test]
+    async fn name_counts_cover_only_the_viewers_libraries() {
+        let db = test_db().await;
+        let service = svc(&db);
+        let (first, second) = (Uuid::from_u128(0x7901), Uuid::from_u128(0x7902));
+        seed_named_item(&db, first, BaseItemKind::CollectionFolder, "First").await;
+        seed_named_item(&db, second, BaseItemKind::CollectionFolder, "Second").await;
+        let people = Uuid::from_u128(0x790A);
+        crate::people_repository::seed_people_row(&db, people, "Pat Shared", "Actor").await;
+        for (movie, library) in [(0x7903, first), (0x7904, second)] {
+            let movie = Uuid::from_u128(movie);
+            crate::test_support::seed_top_parented_item(
+                &db,
+                movie,
+                BaseItemKind::Movie,
+                "m",
+                library,
+            )
+            .await;
+            tag_for_every_count(&db, movie, people).await;
+        }
+        let user_id = Uuid::from_u128(0x7905);
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        sqlx::query(r#"UPDATE "Permissions" SET "Value" = 0 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
+            .bind(guid_to_db(user_id))
+            .bind(i32::from(
+                ferrofin_db::enums::PermissionKind::EnableAllFolders,
+            ))
+            .execute(db.writer())
+            .await
+            .expect("revoke");
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::EnabledFolders,
+            &[first.to_string()],
+        )
+        .await
+        .expect("enable the first library only");
+        let viewer = InternalItemsQuery {
+            user: Some(user),
+            ..InternalItemsQuery::default()
+        };
+        let no_library = InternalItemsQuery {
+            user: Some(
+                crate::test_support::seed_named_user(&db, Uuid::from_u128(0x7906), "none").await,
+            ),
+            ..InternalItemsQuery::default()
+        };
+        let artist = Uuid::from_u128(0x7907);
+        seed_named_item(&db, artist, BaseItemKind::MusicArtist, "Band").await;
+        seed_item_genre(&db, artist, "Shared").await;
+        let related = [BaseItemKind::Movie, BaseItemKind::MusicArtist];
+        let counts = |kind, id, filter| {
+            let service = &service;
+            async move {
+                let counts = service
+                    .get_item_counts_for_name_item(kind, id, &related, filter)
+                    .await
+                    .expect("name counts");
+                (counts.movie_count, counts.artist_count)
+            }
+        };
+
+        let anyone = InternalItemsQuery::default();
+        for (kind, id) in seed_name_rows(&db).await {
+            let artists = i32::from(kind == BaseItemKind::Genre);
+            assert_eq!(
+                counts(kind, id, &anyone).await,
+                (2, artists),
+                "{kind:?} with no user"
+            );
+            assert_eq!(
+                counts(kind, id, &viewer).await,
+                (1, 0),
+                "{kind:?} for a user who may open one library"
+            );
+            assert_eq!(
+                counts(kind, id, &no_library).await,
+                (0, 0),
+                "{kind:?} for a user who may open no library"
+            );
+        }
+    }
+
+    /// The counts leave out what `ApplyAccessFiltering` hides while
+    /// `IncludeOwnedItems` is off, for every caller: an alternate version
+    /// whose primary is in the same library, and an owned item that is not an
+    /// extra (a local version or a stacked part, which copy their primary's
+    /// genres and year). An extra counts, and so does an alternate whose
+    /// primary is in another library (`ApplyAlternateVersionFiltering`).
+    #[rstest]
+    #[case::no_user(false)]
+    #[case::user(true)]
+    #[tokio::test]
+    async fn name_counts_skip_alternate_versions_and_owned_parts(#[case] as_user: bool) {
+        let db = test_db().await;
+        let service = svc(&db);
+        let (films, four_k) = (Uuid::from_u128(0x7921), Uuid::from_u128(0x7922));
+        seed_named_item(&db, films, BaseItemKind::CollectionFolder, "Films").await;
+        seed_named_item(&db, four_k, BaseItemKind::CollectionFolder, "4K").await;
+        let people = Uuid::from_u128(0x792A);
+        crate::people_repository::seed_people_row(&db, people, "Pat Shared", "Actor").await;
+        let [primary, merged, local, part, other_library] =
+            [0x7923, 0x7924, 0x7925, 0x7926, 0x7927].map(Uuid::from_u128);
+        for (movie, library) in [
+            (primary, films),
+            (merged, films),
+            (local, films),
+            (part, films),
+            (other_library, four_k),
+        ] {
+            crate::test_support::seed_top_parented_item(
+                &db,
+                movie,
+                BaseItemKind::Movie,
+                "m",
+                library,
+            )
+            .await;
+            tag_for_every_count(&db, movie, people).await;
+        }
+        crate::test_support::link_alternate_version(&db, merged, primary).await;
+        crate::test_support::link_alternate_version(&db, other_library, primary).await;
+        // A local version is owned by its primary as well as linked to it
+        // (the "Island Night" row of the parity replay); a stacked part is
+        // owned only.
+        crate::test_support::link_alternate_version(&db, local, primary).await;
+        set_column(&db, local, "OwnerId", Some(guid_to_db(primary))).await;
+        set_column(&db, part, "OwnerId", Some(guid_to_db(primary))).await;
+        let trailer = Uuid::from_u128(0x7928);
+        crate::test_support::seed_top_parented_item(
+            &db,
+            trailer,
+            BaseItemKind::Trailer,
+            "t",
+            films,
+        )
+        .await;
+        tag_for_every_count(&db, trailer, people).await;
+        set_column(&db, trailer, "OwnerId", Some(guid_to_db(primary))).await;
+        set_column(&db, trailer, "ExtraType", Some("2".to_owned())).await;
+        let filter = if as_user {
+            InternalItemsQuery {
+                user: Some(
+                    crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x7929))
+                        .await,
+                ),
+                ..InternalItemsQuery::default()
+            }
+        } else {
+            InternalItemsQuery::default()
+        };
+
+        for (kind, id) in seed_name_rows(&db).await {
+            let counts = service
+                .get_item_counts_for_name_item(
+                    kind,
+                    id,
+                    &[BaseItemKind::Movie, BaseItemKind::Trailer],
+                    &filter,
+                )
+                .await
+                .expect("name counts");
+            assert_eq!(
+                (counts.movie_count, counts.trailer_count),
+                (2, 1),
+                "{kind:?}: the primary, the other library's alternate and the trailer extra"
+            );
+        }
     }
 
     /// `EXPLAIN QUERY PLAN` for one statement, as the `detail` column of each
@@ -3740,6 +4013,103 @@ mod tests {
                     || step.contains("SCAN BaseItems")),
                 "{sql}\n{plan:?}"
             );
+        }
+    }
+
+    /// [`query_plan`] for a by-name count statement once
+    /// [`access_filtered_count_query`] has added `filter`'s access terms, its
+    /// own `binds` placeholders bound first.
+    async fn access_filtered_plan(
+        db: &Database,
+        sql: &str,
+        binds: usize,
+        filter: &InternalItemsQuery,
+    ) -> Vec<String> {
+        use sqlx::{Execute, Row};
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.to_owned()));
+        for _ in 0..binds {
+            query = query.bind("x");
+        }
+        let mut builder = access_filtered_count_query(query, filter).expect("access filter");
+        let mut built = builder.build();
+        let args = built.take_arguments().expect("arguments").expect("binds");
+        let explain = format!("EXPLAIN QUERY PLAN {}", built.sql().as_str());
+        sqlx::query_with(sqlx::AssertSqlSafe(explain), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect()
+    }
+
+    /// The access terms ([`access_filtered_count_query`]: the viewer's
+    /// libraries, the parental rules, the alternate-version and owned-item
+    /// rules) leave every by-name statement's plan as it was without them.
+    /// The person and value aggregates drive from the names asked for and
+    /// probe `BaseItems` by primary key; a plain `TopParentId IN (…)` moved
+    /// that probe onto `IX_BaseItems_Type_TopParentId_Id`, once per related
+    /// type and library (about 25 ms to 470 ms on a 60k-row synthetic
+    /// library), which is why the scope is a `+` term. The year aggregate
+    /// keeps its `Type` walk.
+    #[tokio::test]
+    async fn access_filtered_name_counts_keep_their_seeks() {
+        let db = test_db().await;
+        let scoped = InternalItemsQuery {
+            top_parent_ids: vec![Uuid::from_u128(0x7931), Uuid::from_u128(0x7932)],
+            max_parental_rating: Some(ferrofin_model::entities_media::ParentalRatingScore {
+                score: 12,
+                sub_score: None,
+            }),
+            exclude_inherited_tags: vec!["horror".to_owned()],
+            ..Default::default()
+        };
+        let by_primary_key = "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)";
+        let statements = [
+            ("person", people_name_counts_sql(3, 2), 5),
+            (
+                "value",
+                item_value_counts_sql(3, 2, &[ItemValueType::Genre]),
+                5,
+            ),
+            ("year", production_year_counts_sql(2, 2), 4),
+        ];
+        for (name, sql, binds) in statements {
+            let bare = query_plan(&db, &sql, binds).await;
+            for filter in [&InternalItemsQuery::default(), &scoped] {
+                let plan = access_filtered_plan(&db, &sql, binds, filter).await;
+                assert_eq!(
+                    plan[0], bare[0],
+                    "{name}: the access terms must not change the driving loop"
+                );
+                assert!(
+                    !plan.iter().any(|s| s.contains("TopParentId=?")),
+                    "{name}: the library scope must not be seeked, got: {plan:?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|s| s.starts_with("SCAN bi") || s.contains("SCAN BaseItems")),
+                    "{name}: no count may scan BaseItems, got: {plan:?}"
+                );
+                match name {
+                    "person" => assert!(
+                        plan[0].contains("IX_Peoples_Name")
+                            && plan.iter().any(|s| s == by_primary_key),
+                        "person: Peoples by Name, then BaseItems by id, got: {plan:?}"
+                    ),
+                    "value" => assert!(
+                        plan[0].starts_with("SEARCH iv ")
+                            && plan.iter().any(|s| s == by_primary_key),
+                        "value: ItemValues first, then BaseItems by id, got: {plan:?}"
+                    ),
+                    _ => assert!(
+                        plan[0].starts_with("SEARCH bi USING INDEX")
+                            && plan[0].ends_with("(Type=?)"),
+                        "year: a Type walk, got: {plan:?}"
+                    ),
+                }
+            }
         }
     }
 
