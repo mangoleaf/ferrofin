@@ -207,6 +207,7 @@ class SessionReportTests(unittest.TestCase):
         self.assertEqual(page.count("<div class='graph light'><svg"), 1)
         self.assertIn(">failed<", page)
         self.assertIn("12.2-fresh", page)
+        self.assertIn("Ferrofin (commit c0ffee12), gates session", page)
 
     def test_an_ab_gate_session_counts_its_gated_cells_and_what_blocks(self):
         s = self.session(["bench"], {"bench": ("failed", 1)}, previous="ferrofin:v8")

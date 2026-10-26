@@ -460,7 +460,7 @@ def adoption_section(adoption, version, rel, results_dir):
     title = "Adopting an existing Jellyfin database: every supported version and route"
     alt = (f"{title}: {passed} of {len(rows)} passed"
            + "".join(f"; {r['fixture']} {VERDICT_WORDS[r['verdict']]}" for r in rows if r["verdict"] != "PASS") + ".")
-    cap = (f"Ferrofin {version} (commit {src['commit'][:8]}), gates session {src['session']}, {src['date']}. "
+    cap = (f"{ferrofin(version)} (commit {src['commit'][:8]}), gates session {src['session']}, {src['date']}. "
            "What each row checks: gates/adoption/README.md")
     files = {os.path.join(results_dir, version, f"adoption{'' if theme == 'light' else '-dark'}.svg"):
              status_graph(title, rows, cap, theme, alt) for theme in STYLE}
@@ -654,7 +654,7 @@ def session_graphs(bench_result, version=""):
     return "".join(out)
 
 
-def session_adoption_graph(session, version="this session"):
+def session_adoption_graph(session, version=""):
     """The README's adoption grid, inline, for a gates session's adoption result (the session page)."""
     adoption = adoption_summary(session, publishing=False)
     files, _ = adoption_section(adoption, version, ".", session)
