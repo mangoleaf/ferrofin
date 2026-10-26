@@ -257,6 +257,13 @@ class MetadataTest(unittest.TestCase):
         self.assertGreaterEqual(self.scan_calls, 3)
         self.assertIn("/Library/Refresh", self.requests)
 
+    def test_scan_started_by_a_trigger_returns_its_result(self):
+        base = self.api_fixture()
+        api = metadata.Api(base, self.db)
+        self.assertEqual(api.scan(10, interval=0, trigger=lambda: "created"), "created")
+        self.assertNotIn("/Library/Refresh", self.requests)
+        self.assertGreaterEqual(self.scan_calls, 3)
+
     def test_failed_or_cancelled_scan_fails(self):
         for status in ("Failed", "Cancelled", "Aborted"):
             with self.subTest(status=status):

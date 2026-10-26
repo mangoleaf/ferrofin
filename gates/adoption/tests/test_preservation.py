@@ -432,6 +432,30 @@ class ServerReadyTest(unittest.TestCase):
         ready.join(10)
         self.assertFalse(ready.is_alive())
 
+    def test_a_refused_request_names_its_query_and_the_body(self):
+        # Jellyfin answers an exception with a bare 400 body; the error must still tell
+        # which request it was (gl-952: GET /Items?parentId=<a removed collection>).
+        body = b'Error processing request.' + b'x' * 500
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self):
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(body)
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        api = synthetic_fixture.Api(f'http://127.0.0.1:{server.server_port}')
+        with self.assertRaises(CheckError) as raised:
+            api.get(f'/Items/{uuid.uuid4()}', userId='u', parentId='p')
+        expected = body[:synthetic_fixture.REASON_BYTES]
+        self.assertEqual(str(raised.exception),
+                         f"synthetic fixture GET /Items/<id> returned 400 (query ['parentId', 'userId'], body {expected!r})")
+
 
 class SeededAdoptionTest(unittest.TestCase):
     def setUp(self):

@@ -107,10 +107,13 @@ jobs:
           name: adoption-matrix-report
           path: ${{ runner.temp }}/adoption/work/report.html
           if-no-files-found: ignore
-      # Server logs, smoke diffs and reports of the disposable copies; all synthetic data.
+      # Server logs, smoke diffs and reports of the disposable copies, and each fixture build's server
+      # log, which alone holds the exception behind a refused request. All synthetic data.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
           name: adoption-work
-          path: ${{ runner.temp }}/adoption/work
+          path: |
+            ${{ runner.temp }}/adoption/work
+            ${{ runner.temp }}/adoption/*.server.log
           if-no-files-found: ignore

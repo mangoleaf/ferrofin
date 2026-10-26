@@ -399,7 +399,7 @@ python3 gates/bench/report.py --serve      # run.sh's page as `adoption` ($FERRO
 
 The `Adoption` workflow uploads the two pages as the `adoption-report` (`run.sh`) and
 `adoption-matrix-report` artifacts on every run, pass or fail (the whole work directory is still
-uploaded as `adoption-work` on a failure).
+uploaded as `adoption-work` on a failure, with each fixture build's server log).
 
 ## Messy rows
 
@@ -888,8 +888,8 @@ a newer push replaces the run still waiting, never the one running): it builds t
 the commit, restores the fixtures from a cache keyed on the recipe, `smoke.sh`,
 `build-fixtures.sh` and the Jellyfin image digests (building them on a miss; GitHub scopes
 the cache to the branch, so each new release branch builds once), and runs
-`run.sh` and `synthetic.py run`. A failed run uploads `work/` as the `adoption-work`
-artifact. Its green run on the frozen release commit is the release's adoption evidence,
+`run.sh` and `synthetic.py run`. A failed run uploads `work/` and each fixture build's server
+log as the `adoption-work` artifact. Its green run on the frozen release commit is the release's adoption evidence,
 linked from the test record above (`RELEASE.md`, "Validate adoption").
 
 ### Populated Ferrofin upgrade
