@@ -345,6 +345,15 @@ Filed as issues: gl-832, gl-860.
 
 </details>
 
+### Release over release
+
+The same headline numbers for every release published so far (v1.4.0), each against the Jellyfin release it was measured with. Only releases measured on the same host class and fixture are joined by a line.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/history-dark.svg">
+  <img alt="Release over release: 1 release, v1.4.0 to v1.4.0, on 1 host and fixture series; the latest, v1.4.0 against Jellyfin 12.2.0: cold start 275 ms vs 3333 ms, screens at 5 screens/s 8 ms vs 33 ms, peak memory under load 206 MiB vs 544 MiB, idle memory 154 MiB vs 393 MiB." src="docs/results/history.svg">
+</picture>
+
 <!-- END GENERATED RESULTS -->
 
 

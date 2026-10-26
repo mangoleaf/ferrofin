@@ -133,4 +133,7 @@ passed, failed, skipped (a fixture that was not built) or unfinished, with a tab
 parity overview: of the requests jellyfin-web makes, how many Ferrofin answers identically, with an accepted
 difference, with a difference filed as an issue, or with a new one, and how many could not be compared because
 Jellyfin itself failed them, as one stacked bar per API area (the busiest twelve, then the rest as one) and a
-table of every area.
+table of every area. Last, one graph follows the headline numbers (cold start, the median p50 of the comparable
+screens at 5 screens/s, peak and idle memory) over every release published, each against the Jellyfin release it
+was measured with; a release measured on another host class or benchmark fixture starts a new line, so a moved
+host never reads as a regression or a win. It is drawn from every summary file into `docs/results/history.svg`.

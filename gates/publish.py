@@ -725,6 +725,123 @@ def withheld_rows(bench):
     return [(where, name, r["withheld"]) for where, name, r in rows if r["ratio"] is None]
 
 
+def version_key(version):
+    return tuple(int(p) for p in version[1:].split("."))
+
+
+def history_value(bench, metric):
+    """`{server: value}` of one headline number of a release's benchmark summary, or None when it is
+    withheld (the servers did different work) or missing."""
+    if metric == "screens":
+        screens = [r for r in (bench["levels"].get("loaded") or {}).get("screens", []) if r["ratio"] is not None]
+        return {s: statistics.median(r[s]["median"] for r in screens) for s in ("ferrofin", "jellyfin")} if screens else None
+    group, name = metric
+    row = next((r for r in bench[group] if r["name"] == name), None)
+    return {s: row[s]["median"] for s in ("ferrofin", "jellyfin")} if row and row["ratio"] is not None else None
+
+
+#: The headline numbers drawn over the releases: (panel title, unit, what `history_value` reads).
+HISTORY = (("Cold start", "ms", ("ttfs", "cold start (restart → authenticated views; host caches retained)")),
+           ("Screens at 5 screens/s: median p50 of the comparable screens", "ms", "screens"),
+           ("Peak memory under load", "MiB", ("memory", "peak under load")),
+           ("Idle memory", "MiB", ("memory", "steady idle")))
+
+
+def history_series(summaries):
+    """The releases in order, each with its series: the host class and benchmark fixture it was measured
+    on. A release on another host class or fixture than the one before starts a new series, because a moved
+    host would read as a regression or a win."""
+    out, last, series = [], None, 0
+    for doc in sorted(summaries, key=lambda d: version_key(d["version"])):
+        src = doc["bench"]["source"]
+        key = json.dumps([src["host_class"], src["fixture"]], sort_keys=True)
+        if last is not None and key != last:
+            series += 1
+        last = key
+        out.append({"version": doc["version"], "oracle": src["oracle"], "series": series, "bench": doc["bench"]})
+    return out
+
+
+def history_graph(releases, theme_name, alt=""):
+    """One panel per headline number: a point per Ferrofin release (Ferrofin's in its colour, the Jellyfin
+    release it was measured against in grey), joined only within one series (a release a number is withheld
+    in breaks its line), each labelled with its value. A dashed rule inside each plot marks where a new series
+    starts."""
+    # ponytail: one column per release; the x labels crowd from about seven releases, thin them out then
+    t = STYLE[theme_name]
+    left, right, panel_h, top_pad = 64, 40, 150, 62
+    plot = WIDTH - left - right
+    n = len(releases)
+    x = lambda i: left + plot * (i + 0.5) / n
+    body, y0 = [], top_pad
+    for title, unit, metric in HISTORY:
+        values = [history_value(r["bench"], metric) for r in releases]
+        top = max([v[s] for v in values if v for s in v], default=0) or 1   # every number withheld, or zero
+        step = nice_step(top, 4)
+        scale_top = step * math.ceil(top * 1.15 / step)
+        plot_top, plot_h = y0 + 22, panel_h - 50
+        y = lambda v: plot_top + plot_h * (1 - v / scale_top)
+        for i in range(1, n):   # where a new series starts, inside the plot (clear of the panel's title)
+            if releases[i]["series"] != releases[i - 1]["series"]:
+                sx = (x(i - 1) + x(i)) / 2
+                body.append(f"<line x1='{sx:.1f}' y1='{plot_top:.1f}' x2='{sx:.1f}' y2='{plot_top + plot_h:.1f}' "
+                            f"stroke='{t['muted']}' stroke-width='1' stroke-dasharray='4 4'/>")
+        body.append(text(0, y0 + 10, f"{title} ({unit})", 13, weight="600", theme=t))
+        for i in range(int(round(scale_top / step)) + 1):
+            ty = y(i * step)
+            body.append(f"<line x1='{left}' y1='{ty:.1f}' x2='{WIDTH - right}' y2='{ty:.1f}' stroke='{t['grid']}' stroke-width='1'/>")
+            body.append(text(left - 8, ty + 4, f"{i * step:g}", 11, "muted", "end", theme=t))
+        for server, colour in (("jellyfin", "jellyfin"), ("ferrofin", "ferrofin")):
+            for i, v in enumerate(values):
+                if not v:
+                    continue
+                prev = values[i - 1] if i else None
+                if prev and releases[i - 1]["series"] == releases[i]["series"]:
+                    body.append(f"<line x1='{x(i - 1):.1f}' y1='{y(prev[server]):.1f}' x2='{x(i):.1f}' y2='{y(v[server]):.1f}' "
+                                f"stroke='{t[colour]}' stroke-width='2'/>")
+                body.append(f"<circle cx='{x(i):.1f}' cy='{y(v[server]):.1f}' r='4' fill='{t[colour]}'/>")
+                # the higher of the two values labelled above its point, the lower below, clear of the lines
+                # (Ferrofin above on a tie)
+                other = v["jellyfin" if server == "ferrofin" else "ferrofin"]
+                above = v[server] > other or (v[server] == other and server == "ferrofin")
+                body.append(text(x(i), y(v[server]) + (-9 if above else 17), value_text(v[server], unit, metric == "screens"), 11,
+                                 "ink" if server == "ferrofin" else "muted", "middle", theme=t))
+        for i, r in enumerate(releases):
+            if not values[i]:
+                body.append(text(x(i), plot_top + plot_h / 2, "withheld", 11, "muted", "middle", theme=t))
+        y0 += panel_h
+    for i, r in enumerate(releases):
+        body.append(text(x(i), y0 + 4, r["version"], 12, anchor="middle", weight="600", theme=t))
+        body.append(text(x(i), y0 + 19, f"vs {r['oracle']}", 11, "muted", "middle", theme=t))
+        if i and r["series"] != releases[i - 1]["series"]:
+            body.append(text((x(i - 1) + x(i)) / 2, y0 + 34, "new host or fixture", 10, "muted", "middle", theme=t))
+    body.append(caption_lines("One point per Ferrofin release, against the Jellyfin release it was measured with. Points "
+                              "measured on another host class or fixture start a new line.", y0 + 58, t))
+    return frame("Release over release", y0 + 90, "".join(body), theme_name,
+                 (("ferrofin", "Ferrofin"), ("jellyfin", "Jellyfin")), alt)
+
+
+def history_section(summaries, rel_root, results_dir):
+    """`(files, README lines)` of the release-over-release graph, drawn from every summary file."""
+    releases = history_series(summaries)
+    latest = releases[-1]
+    numbers = ", ".join(f"{title.split(':')[0].lower()} {value_text(v['ferrofin'], unit, metric == 'screens')} vs "
+                        f"{value_text(v['jellyfin'], unit, metric == 'screens')}"
+                        for title, unit, metric in HISTORY for v in [history_value(latest["bench"], metric)] if v)
+    alt = (f"Release over release: {len(releases)} release{'s' if len(releases) != 1 else ''}, "
+           f"{releases[0]['version']} to {latest['version']}, on {latest['series'] + 1} host and fixture "
+           f"series; the latest, {latest['version']} against {latest['oracle']}: {numbers or 'every number withheld'}.")
+    files = {os.path.join(results_dir, f"history{'' if theme == 'light' else '-dark'}.svg"): history_graph(releases, theme, alt)
+             for theme in STYLE}
+    lines = ["### Release over release\n",
+             f"The same headline numbers for every release published so far ({', '.join(r['version'] for r in releases)}), "
+             "each against the Jellyfin release it was measured with. Only releases measured on the same host class and "
+             "fixture are joined by a line.\n",
+             f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel_root}/history-dark.svg">\n'
+             f'  <img alt="{html.escape(alt)}" src="{rel_root}/history.svg">\n</picture>\n']
+    return files, lines
+
+
 def render(results_dir, readme_text, readme_dir=ROOT):
     """`(files, README text)`: every SVG of the newest summary, by path, and the README with its Results
     block replaced, its image links relative to `readme_dir`. Pure: reads the summary files, writes
@@ -743,7 +860,7 @@ def render(results_dir, readme_text, readme_dir=ROOT):
             summaries.append(doc)
     if not summaries:
         raise Refused(f"no {results_dir}/*/summary.json: run summarise first")
-    latest = max(summaries, key=lambda d: tuple(int(p) for p in d["version"][1:].split(".")))
+    latest = max(summaries, key=lambda d: version_key(d["version"]))
     version, bench = latest["version"], latest["bench"]
     rel = os.path.relpath(os.path.join(results_dir, version), readme_dir).replace(os.sep, "/")
     files, block = {}, []
@@ -779,6 +896,9 @@ def render(results_dir, readme_text, readme_dir=ROOT):
         more, lines = parity_section(latest["parity"], version, rel, results_dir)
         files.update(more)
         block += lines
+    more, lines = history_section(summaries, os.path.relpath(results_dir, readme_dir).replace(os.sep, "/"), results_dir)
+    files.update(more)
+    block += lines
     block.append(END)
     section = "\n".join(block) + "\n"
     i, j = readme_text.find(BEGIN), readme_text.find(END)
