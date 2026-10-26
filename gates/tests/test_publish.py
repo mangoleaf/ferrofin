@@ -280,6 +280,7 @@ class PublishTests(unittest.TestCase):
         html = publish.session_graphs(bench_result())
         self.assertEqual(html.count("<div class='graph light'><svg"), html.count("<div class='graph dark'><svg"))
         self.assertIn("the median of 1 run", html)
+        self.assertIn("Ferrofin (commit 5112240e) against", html)   # a session's build has no release name
         self.assertNotIn("<img", html)
 
 

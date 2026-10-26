@@ -300,7 +300,7 @@ def render_html(record, rows, graphs=""):
             f"<meta name='viewport' content='width=device-width, initial-scale=1'><title>Gates {name}</title>"
             f"<style>{css()}dl.facts{{display:grid;grid-template-columns:max-content 1fr;gap:4px 16px}}"
             f"dl.facts dt{{color:var(--muted)}}dl.facts dd{{margin:0}}tr.bad th,.problem{{color:var(--bad)}}"
-            f"tr.good th{{color:var(--good)}}table.gates td,table.gates th{{text-align:left;vertical-align:top;"
+            f"tr.good th{{color:var(--good)}}a{{color:var(--accent-ink)}}table.gates td,table.gates th{{text-align:left;vertical-align:top;"
             f"padding:6px 12px}}.graph svg{{max-width:100%;height:auto;margin:14px 0}}.graph.dark{{display:none}}"
             f"@media (prefers-color-scheme:dark){{.graph.light{{display:none}}.graph.dark{{display:block}}}}"
             f"</style></head><body><main>"

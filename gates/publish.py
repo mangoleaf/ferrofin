@@ -402,8 +402,13 @@ def graphs(bench):
     return [g for g in out if g[3]]
 
 
+def ferrofin(version):
+    """`Ferrofin vX.Y.Z`, or `Ferrofin` alone for a build no release names (a gates session's)."""
+    return f"Ferrofin {version}" if version else "Ferrofin"
+
+
 def caption(src, version):
-    return (f"Ferrofin {version} (commit {str(src['commit'])[:8]}) against {src['oracle']}, the median of {src['run_count']} "
+    return (f"{ferrofin(version)} (commit {str(src['commit'])[:8]}) against {src['oracle']}, the median of {src['run_count']} "
             f"run{'s' if src['run_count'] != 1 else ''} on one host ({host_text(src['host_class'])}), {src['date']}. "
             "Every number and its range: docs/BENCHMARKS.md")
 
@@ -529,7 +534,7 @@ def render(results_dir, readme_text, readme_dir=ROOT):
     return files, readme_text[:i] + section + readme_text[j:]
 
 
-def session_graphs(bench_result, version="this session"):
+def session_graphs(bench_result, version=""):
     """The same graphs, inline, for one benchmark result (the gates session page): drawn from a summary
     of that one run, light and dark, the theme the reader's browser prefers shown."""
     bench = bench_summary([bench_result], [bench_result["detail"]["runs"][0]], min_runs=1)
