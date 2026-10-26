@@ -1087,8 +1087,9 @@ impl UserViewManager for FerrofinUserViewManager {
         // `{InternalMetadataPath}/views/` and only `GetUserViews` appends it.
         // The exclusion is UNCONDITIONAL, not the Live-TV-disabled gate
         // `get_user_views` applies: an enabled tuner puts the view in
-        // `/UserViews`, never in `/Library/MediaFolders`. (`user_id` still
-        // selects the user whose libraries these are.)
+        // `/UserViews`, never in `/Library/MediaFolders`. The folders are the
+        // same for every caller (upstream reads no user), so `user_id` is
+        // unused.
         let _ = user_id;
         let folders = self.items.get_item_list(&query).await?;
         Ok(folders

@@ -1934,6 +1934,40 @@ async fn items_query(params: &str) -> (StatusCode, Option<InternalItemsQuery>) {
     (response.status(), query)
 }
 
+/// v12.2 `ItemsController.GetItems` (`ItemsController.cs:263-274`): an API key
+/// that names no `userId` runs the query with no user, unscoped. It was a
+/// `400` ("no user for request").
+#[tokio::test]
+async fn an_api_key_lists_items_with_no_user() {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5B),
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let state = ok_state_full(
+        library,
+        Arc::new(OkUsers),
+        Arc::new(OkDto),
+        (
+            Arc::new(ferrofin_api::test_support::FakeAuthContext),
+            Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+        ),
+    );
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/Items?recursive=true&includeItemTypes=Movie")
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let query = seen.lock().unwrap().take().expect("the query ran");
+    assert!(query.user.is_none(), "an API key has no user");
+}
+
 /// The filters v12.2 `GetItems` copies straight onto the query
 /// (ItemsController.cs:396-430, 491-525): `seriesStatus` (jellyfin-web's TV
 /// Status filter), `personTypes`, `isPlaceHolder` and `hasOfficialRating`, and
