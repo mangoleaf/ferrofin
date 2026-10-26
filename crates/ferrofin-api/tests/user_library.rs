@@ -187,15 +187,17 @@ struct OkAuth {
     elevated: bool,
     /// The user's `EnableUserPreferenceAccess` is off.
     restricted: bool,
+    /// A server API key, which carries no user at all.
+    keyless_user: bool,
 }
 
 impl OkAuth {
-    /// The authenticated user, restricted or not.
-    fn user(&self) -> UserEntity {
-        UserEntity {
+    /// The authenticated user, restricted or not; none for a server API key.
+    fn user(&self) -> Option<UserEntity> {
+        (!self.keyless_user).then(|| UserEntity {
             enable_user_preference_access: !self.restricted,
             ..user_entity(USER_ID, "alice")
-        }
+        })
     }
 }
 
@@ -206,8 +208,8 @@ impl AuthService for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(self.user()),
-            is_api_key: self.elevated,
+            user: self.user(),
+            is_api_key: self.elevated || self.keyless_user,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -221,8 +223,8 @@ impl AuthorizationContext for OkAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Ok(AuthorizationInfo {
-            user: Some(self.user()),
-            is_api_key: self.elevated,
+            user: self.user(),
+            is_api_key: self.elevated || self.keyless_user,
             is_authenticated: true,
             ..AuthorizationInfo::default()
         })
@@ -726,6 +728,20 @@ fn state_with_views(elevated: bool, views: StubUserViews) -> AppState {
 
 /// [`state_with_views`], the user's preference access off when `restricted`.
 fn state_with(elevated: bool, restricted: bool, views: StubUserViews) -> AppState {
+    state_authed(
+        OkAuth {
+            elevated,
+            restricted,
+            keyless_user: false,
+        },
+        views,
+    )
+}
+
+/// An [`AppState`] wired with the user-library stubs, authenticating every
+/// request as `auth`.
+fn state_authed(auth: OkAuth, views: StubUserViews) -> AppState {
+    let auth = Arc::new(auth);
     AppState::new(
         Arc::new(StubLibrary),
         Arc::new(OkUsers::default()),
@@ -741,14 +757,8 @@ fn state_with(elevated: bool, restricted: bool, views: StubUserViews) -> AppStat
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         Arc::new(OkDto),
-        Arc::new(OkAuth {
-            elevated,
-            restricted,
-        }),
-        Arc::new(OkAuth {
-            elevated,
-            restricted,
-        }),
+        auth.clone(),
+        auth,
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),
         Arc::new(ferrofin_api::test_support::FakeCollections),
@@ -1144,6 +1154,26 @@ async fn media_folders_returns_collection_folders() {
     }
 }
 
+/// A server API key carries no user, and upstream's `GetMediaFolders` reads
+/// none (`LibraryController.cs`, `RequiresElevation`), so it lists the media
+/// folders. It was a `400` ("no user for request").
+#[tokio::test]
+async fn an_api_key_lists_the_media_folders() {
+    let state = state_authed(
+        OkAuth {
+            elevated: false,
+            restricted: false,
+            keyless_user: true,
+        },
+        StubUserViews::default(),
+    );
+    let (status, body) =
+        send_with_state(state, "GET", "/Library/MediaFolders", Body::empty()).await;
+    assert_eq!(status, StatusCode::OK);
+    let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("folders");
+    assert_eq!(result.items.len(), 5);
+}
+
 // The remaining path-scoped `/Users/{userId}/…` aliases forward to the modern
 // handlers with the path user folded in; each must execute the real handler
 // body (legacy_routes.rs only proves registration via 401s).
@@ -1478,10 +1508,12 @@ fn latest_state(
                 Arc::new(OkAuth {
                     elevated: false,
                     restricted: false,
+                    keyless_user: false,
                 }),
                 Arc::new(OkAuth {
                     elevated: false,
                     restricted: false,
+                    keyless_user: false,
                 }),
             )
         };
@@ -2226,10 +2258,12 @@ fn resume_state(excludes: Vec<Uuid>) -> (AppState, Arc<RecordingResumeLibrary>) 
         Arc::new(OkAuth {
             elevated: false,
             restricted: false,
+            keyless_user: false,
         }),
         Arc::new(OkAuth {
             elevated: false,
             restricted: false,
+            keyless_user: false,
         }),
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         Arc::new(ferrofin_api::test_support::FakePlaylists),

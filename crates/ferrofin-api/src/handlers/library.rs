@@ -55,7 +55,7 @@ use uuid::Uuid;
 use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
-use crate::handlers::items::{resolve_user, resolve_user_opt, user_uuid};
+use crate::handlers::items::resolve_user_opt;
 use crate::handlers::query_parse::parse_csv_enums_lenient;
 use crate::handlers::streaming::serve_static_file;
 use crate::state::AppState;
@@ -620,9 +620,10 @@ async fn get_available_options(
 /// name-sorted, projected to [`BaseItemDto`] as a
 /// [`QueryResult`](ferrofin_model::querying::QueryResult).
 ///
-/// Resolved against the authenticated user (not the nil user) so the folders and
-/// their user data are the caller's. Ferrofin does not model a per-folder hidden
-/// flag, so no folder is hidden: an `isHidden=true` filter returns nothing, and
+/// Upstream reads no user here: the folders are the same for every caller, an
+/// API key with no user included, and carry no user data. Ferrofin does not
+/// model a per-folder hidden flag, so no folder is hidden: an `isHidden=true`
+/// filter returns nothing, and
 /// `false`/absent returns them all (a faithful projection of "nothing hidden").
 #[utoipa::path(
     get,
@@ -636,8 +637,6 @@ async fn get_media_folders(
     RequireAdmin(auth): RequireAdmin,
     Query(query): Query<MediaFoldersQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let user = resolve_user(&state, &auth, None).await?;
-    let user_uuid = user_uuid(&user)?;
     // The media folders are the user-root children — the collection folders plus
     // the auto-provisioned Playlists folder — returned name-sorted by the view seam
     // (C# GetUserRootFolder().Children).
@@ -645,7 +644,10 @@ async fn get_media_folders(
         // No folder carries a hidden flag, so none match `isHidden=true`.
         Vec::new()
     } else {
-        state.user_views.get_media_folders(user_uuid).await?
+        // Upstream reads no user here (`LibraryController.GetMediaFolders`),
+        // so an API key with none is served like an administrator; the id is
+        // the caller's, and the folders do not depend on it.
+        state.user_views.get_media_folders(auth.user_id()).await?
     };
     let options = DtoOptions::default();
     // NO user, matching C# `GetMediaFolders`:
@@ -656,8 +658,6 @@ async fn get_media_folders(
     // the call passes no user, so upstream's media folders carry no `UserData`.
     // Ferrofin was passing `Some(&user)`, which both added a `UserData` block
     // Jellyfin does not send AND paid for the user-data prefetch to build it.
-    // The user is still needed ABOVE to choose which folders the caller may
-    // see; it just has no place in the projection.
     let dtos = state
         .dto
         .get_base_item_dtos(&folders, &options, None, None, true)
