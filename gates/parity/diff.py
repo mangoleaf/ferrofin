@@ -16,6 +16,11 @@
         print an access token for the corpus's browse user
     diff.py failure --out DIR --reason TEXT [--cap-exceeded]
         write the report of a run that could not complete (a server did not boot, the cap passed)
+    diff.py result --out DIR
+        write DIR/result.json again from DIR/results.json (a run from before result.json existed)
+
+`run` and `failure` also write DIR/result.json, the run's overview in the envelope every gate shares
+(gates/result.py): each request's outcome counted, overall and by API area.
 
 A run that completes always produces a report. Python and the standard library only.
 
@@ -44,6 +49,7 @@ import fnmatch
 import hashlib
 import html
 import http.client
+import importlib.util
 import json
 import os
 import re
@@ -56,6 +62,7 @@ import time
 import tomllib
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
 
@@ -1271,6 +1278,68 @@ def write_results(out, summary):
     out.mkdir(parents=True, exist_ok=True)
     (out / "results.json").write_text(json.dumps(summary, indent=1, sort_keys=True))
     (out / "report.html").write_text(render(summary))
+    gate_result().write(str(out), result_doc(summary))
+
+
+# ── result.json (the overview) ──────────────────────────────────────────────
+#: A request's outcome in the overview, in the order they are shown.
+OUTCOMES = ("identical", "accepted", "filed", "new", "oracle_failed")
+
+
+def gate_result():
+    """gates/result.py, the envelope every gate's result.json is written in, loaded by its path."""
+    if "gates_result" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("gates_result", HERE.parent / "result.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules["gates_result"] = module
+    return sys.modules["gates_result"]
+
+
+def outcome(result):
+    """What one request's comparison came to: identical; accepted (every difference is in the ledger);
+    filed (every difference the ledger does not accept is filed as an issue); new; or oracle failed
+    (Jellyfin did not answer as the request expects, so nothing was compared: never counted identical)."""
+    if result["state"] in ("match", "ledgered", "oracle failed"):
+        return {"match": "identical", "ledgered": "accepted", "oracle failed": "oracle_failed"}[result["state"]]
+    unaccepted = [d for d in result["differences"] if not d["ledger"]]
+    return "filed" if unaccepted and all(d.get("filed") for d in unaccepted) else "new"
+
+
+def area(target):
+    """The API area a request belongs to: its path's first segment (`/Items`, `/Users`, `/Shows` …)."""
+    return "/" + target.split("?", 1)[0].lstrip("/").split("/", 1)[0]
+
+
+def result_doc(summary, regenerated=False):
+    """The run's overview in the result envelope: the verdict, each request's outcome counted overall and
+    by API area (busiest first), the new differences and the groups of them not filed yet, the issues
+    filed, and the Jellyfin version compared against. A result `regenerated` later (`diff.py result`) records
+    no host class: the host it would name is the one regenerating it, not the one that ran the gate."""
+    results, run = summary.get("requests") or [], summary.get("run") or {}
+    counts = dict.fromkeys(OUTCOMES, 0)
+    areas = {}
+    for r in results:
+        kind = outcome(r)
+        counts[kind] += 1
+        areas.setdefault(area(r["target"]), dict.fromkeys(OUTCOMES, 0))[kind] += 1
+    unaccepted = [d for r in results for d in r["differences"] if not d["ledger"]]
+    detail = {"reason": summary.get("reason", ""), "planned": summary.get("planned", 0), "sent": len(results),
+              "oracle_version": (run.get("oracle") or {}).get("version"),
+              "areas": [{"area": name, "requests": sum(c.values()), **c}
+                        for name, c in sorted(areas.items(), key=lambda kv: (-sum(kv[1].values()), kv[0]))],
+              "new_differences": len(unaccepted),
+              "unfiled_groups": len({(tag_path(d.get("path", "")), d.get("kind")) for d in unaccepted if not d.get("filed")}),
+              "filed_issues": sorted({d["filed"] for d in unaccepted if d.get("filed")})}
+    stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="seconds") if isinstance(t, (int, float)) else None
+    started = run.get("started")
+    ferrofin, oracle = run.get("ferrofin") or {}, run.get("oracle") or {}
+    source = {"commit": run.get("sha") or None, "image": ferrofin.get("image") or None,
+              "image_digest": ferrofin.get("image_id") or None, "oracle": oracle.get("image") or None,
+              "host_class": None if regenerated else gate_result().host_class(), "fixture": run.get("ids_sha256") or None}
+    ended = started + summary["elapsed_s"] if isinstance(started, (int, float)) and summary.get("elapsed_s") else None
+    return gate_result().envelope("parity", summary.get("verdict") or "run failed", counts,
+                                  source, stamp(started), stamp(ended), detail)
 
 
 def new_differences(results, rules):
@@ -1505,6 +1574,8 @@ def build_parser():
     fail.add_argument("--out", required=True)
     fail.add_argument("--reason", required=True)
     fail.add_argument("--cap-exceeded", action="store_true")
+    again = sub.add_parser("result", help="write DIR/result.json again from DIR/results.json")
+    again.add_argument("--out", required=True, help="the run directory")
     return parser
 
 
@@ -1525,9 +1596,13 @@ def main(argv):
         if args.command == "login":
             print(login(args.url, json.loads(Path(args.ids).read_text()), args.timeout))
             return 0
+        if args.command == "result":
+            summary = json.loads((Path(args.out) / "results.json").read_text())
+            print(gate_result().write(args.out, result_doc(summary, regenerated=True)))
+            return 0
         return command_failure(args)
-    except (ParityError, OSError, ValueError) as err:
-        print(f"parity: {err}", file=sys.stderr)
+    except (ParityError, OSError, ValueError, KeyError, TypeError) as err:
+        print(f"parity: {err!r}" if isinstance(err, (KeyError, TypeError)) else f"parity: {err}", file=sys.stderr)
         return 2
 
 

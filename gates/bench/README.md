@@ -510,7 +510,7 @@ renamed directory. `--out` overrides the whole thing.
 |---|---|
 | Benchmark | `RUNS_DIR` (default `$FERROFIN_GATES_DIR/runs`, else `gates/bench/runs`, where runs went before the output root): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab`, `ramp`, `soak` or `endpoints` session (a directory with a `gate.json`), listed as `<session>/<run>`. A session `gate.py render` has written a `report.html` for is also listed as `<session>`, opening the gate's own report: the only page a `gate.py scan` session has, since its runs hold `scan.json` and are not listed |
 | Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`, else both `$FERROFIN_GATES_DIR/work` (standalone runs) and `$FERROFIN_GATES_DIR/runs` (each session's `<session>/adoption`): every directory under them holding a `report.html` (or `DIR` itself) |
-| Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, else `$FERROFIN_GATES_DIR/runs`, the same way |
+| Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, else `$FERROFIN_GATES_DIR/runs`: every directory holding a `report.html` or a `result.json`; a run without the page shows its overview from `result.json` |
 | Verify | `--verify-dir DIR` or `FERROFIN_VERIFY_RUNS`, else `$FERROFIN_GATES_DIR/runs`: every directory holding a `report.html` or a `result.json`; a run without the page is rendered from its `result.json` |
 
 The output root's `runs/` holds every gate's runs, so each tab lists only the directories named for

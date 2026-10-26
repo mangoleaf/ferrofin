@@ -4,8 +4,9 @@ and its graphs drawn from those files alone.
 
     publish.py summarise --version vX.Y.Z --bench RUN RUN RUN [--session DIR] [--out DIR]
         DIR/<version>/summary.json (DIR defaults to docs/results) from the result.json of three or more
-        Jellyfin-comparison benchmark runs the operator names and, with --session, the adoption result of
-        that gates session: only the numbers the README shows, each with its source. Nothing is picked
+        Jellyfin-comparison benchmark runs the operator names and, with --session, the adoption and parity
+        results of that gates session (both required): only the numbers the README shows, each with its
+        source. Nothing is picked
         automatically, and every input is a local run.
     publish.py readme [--check] [--results DIR] [--readme README.md]
         draw every graph of the newest DIR/*/summary.json into DIR/<version>/ (a light and a dark SVG
@@ -48,10 +49,12 @@ END = "<!-- END GENERATED RESULTS -->"
 STYLE = {
     "light": {"ink": "#1A1E24", "muted": "#5B636E", "grid": "#E1E5EA", "ferrofin": "#2E6E8E",
               "jellyfin": "#A3ACB7", "slower": "#B7791F", "on_bar": "#FFFFFF",
-              "PASS": "#2E7D4F", "FAIL": "#A83A2E", "SKIP": "#8A939E", "INCOMPLETE": "#B7791F"},
+              "PASS": "#2E7D4F", "FAIL": "#A83A2E", "SKIP": "#8A939E", "INCOMPLETE": "#B7791F",
+              "identical": "#2E7D4F", "accepted": "#2E6E8E", "filed": "#B7791F", "new": "#A83A2E", "oracle_failed": "#C3C9D1"},
     "dark": {"ink": "#E7EAEE", "muted": "#9AA3AE", "grid": "#2B323C", "ferrofin": "#6FB3D2",
              "jellyfin": "#5B636E", "slower": "#E0B25A", "on_bar": "#13161B",
-             "PASS": "#6CC08B", "FAIL": "#E07A6E", "SKIP": "#6B7480", "INCOMPLETE": "#E0B25A"},
+             "PASS": "#6CC08B", "FAIL": "#E07A6E", "SKIP": "#6B7480", "INCOMPLETE": "#E0B25A",
+             "identical": "#6CC08B", "accepted": "#6FB3D2", "filed": "#E0B25A", "new": "#E07A6E", "oracle_failed": "#4A515B"},
 }
 FONT = "system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif"
 WIDTH = 760
@@ -216,6 +219,52 @@ def adoption_summary(session, bench_commit=None, publishing=True):
     return {"source": source, "verdict": doc["verdict"], "rows": rows}
 
 
+#: A parity request's outcome, as gates/parity/diff.py counts it, and how the README names it.
+PARITY_OUTCOMES = {"identical": "identical", "accepted": "accepted differences", "filed": "filed as issues",
+                   "new": "new differences", "oracle_failed": "not compared (Jellyfin failed them)"}
+#: How many API areas the parity graph draws, busiest first; the rest are one "other areas" bar.
+PARITY_AREAS = 12
+
+
+def same_commit(a, b):
+    """Whether two commit ids (either may be abbreviated) name the same commit."""
+    a, b = str(a or ""), str(b or "")
+    return bool(a and b) and (a.startswith(b) or b.startswith(a))
+
+
+def parity_summary(session, commit, publishing=True):
+    """The parity overview of a gates session's parity run: each request's outcome counted overall and by
+    API area, the Jellyfin version compared against, and the session's commit and date. When publishing,
+    refused for a run that did not finish (it failed, or sent fewer requests than it planned), one of
+    another commit, or one with no Jellyfin version; otherwise None for a run that compared nothing."""
+    try:
+        doc = result.read(os.path.join(session, "parity"), "parity")
+    except ValueError as error:
+        raise Refused(f"{session}/parity: {error}") from error
+    if doc is None:
+        raise Refused(f"{session}/parity has no result.json (python3 gates/parity/diff.py result --out {session}/parity writes it)")
+    detail = doc["detail"]
+    if not publishing and not detail.get("sent"):
+        return None
+    if publishing:
+        if doc["verdict"] == "run failed" or not detail.get("sent") or detail.get("sent") != detail.get("planned"):
+            raise Refused(f"{session}/parity did not finish ({detail.get('reason') or doc['verdict']}; "
+                          f"{detail.get('sent', 0)} of {detail.get('planned', 0)} requests sent): there is no overview to publish")
+        if not same_commit(doc["source"]["commit"], commit):
+            raise Refused(f"{session}/parity measured {doc['source']['commit']}, the benchmark runs {commit}")
+        if not detail.get("oracle_version"):
+            raise Refused(f"{session}/parity records no Jellyfin version: the overview names what it compared against")
+    record = load(os.path.join(session, "session.json"))
+    return {"source": {"session": os.path.basename(os.path.normpath(session)), "commit": commit,
+                       "oracle": f"Jellyfin {detail.get('oracle_version')}" if detail.get("oracle_version") else None,
+                       "date": (record.get("started") or "")[:10] or None},
+            "verdict": doc["verdict"], "counts": {k: doc["counts"].get(k, 0) for k in PARITY_OUTCOMES},
+            "sent": detail["sent"], "planned": detail.get("planned", 0), "new_differences": detail.get("new_differences", 0),
+            "filed_issues": detail.get("filed_issues", []),
+            "areas": [{"area": a["area"], "requests": a["requests"], **{k: a.get(k, 0) for k in PARITY_OUTCOMES}}
+                      for a in detail.get("areas", [])]}
+
+
 def summarise(version, bench_runs, session=None):
     """The summary file of release `version`."""
     if not re.fullmatch(r"v\d+\.\d+\.\d+", version):
@@ -228,6 +277,7 @@ def summarise(version, bench_runs, session=None):
     out = {"schema": SCHEMA, "version": version, "bench": bench_summary(docs, names)}
     if session:
         out["adoption"] = adoption_summary(session, out["bench"]["source"]["commit"])
+        out["parity"] = parity_summary(session, out["bench"]["source"]["commit"])
     return out
 
 
@@ -275,6 +325,19 @@ def summary_problems(doc):
                 out.append(f"bench row {r['name']} has a ratio but not two positive medians and a positive ratio")
             elif r["ratio"] is None and not r["withheld"]:
                 out.append(f"bench row {r['name']} has neither a ratio nor a reason it is withheld")
+    if "parity" in doc:
+        parity = doc["parity"]
+        if not isinstance(parity, dict) or not isinstance(parity.get("counts"), dict) or not isinstance(parity.get("areas"), list):
+            out.append("parity is not an object with counts and areas")
+        else:
+            out += [f"parity.source has no {k}" for k in ("session", "commit", "oracle", "date") if not (parity.get("source") or {}).get(k)]
+            if sum(parity["counts"].get(k, 0) for k in PARITY_OUTCOMES) != parity.get("sent"):
+                out.append("parity's counts do not add up to the requests sent")
+            if sum(a.get("requests", 0) for a in parity["areas"] if isinstance(a, dict)) != parity.get("sent"):
+                out.append("parity's areas do not add up to the requests sent")
+            for a in parity["areas"]:
+                if not isinstance(a, dict) or sum(a.get(k, 0) for k in PARITY_OUTCOMES) != a.get("requests") or not a.get("requests"):
+                    out.append(f"a parity area is not shaped as expected: {str(a)[:80]}")
     if "adoption" in doc:
         adoption = doc["adoption"]
         if not isinstance(adoption, dict) or not isinstance(adoption.get("source"), dict) or not isinstance(adoption.get("rows"), list):
@@ -452,6 +515,86 @@ def status_graph(title, rows, caption, theme_name, alt=""):
     return frame(title, end + 44, "".join(body), theme_name, (("PASS", "passed"), ("FAIL", "failed"), ("SKIP", "skipped")), alt)
 
 
+def parity_rows(areas):
+    """The busiest areas, then one "other areas" row summing the rest."""
+    top, rest = areas[:PARITY_AREAS], areas[PARITY_AREAS:]
+    if rest:
+        top = top + [{"area": f"{len(rest)} other areas", "requests": sum(a["requests"] for a in rest),
+                      **{k: sum(a[k] for a in rest) for k in PARITY_OUTCOMES}}]
+    return top
+
+
+def parity_graph(title, parity, caption, theme_name, alt=""):
+    """One stacked bar per API area, its length the requests sent there, split by outcome: identical,
+    accepted differences, filed, new and not compared, with the area's share answered identically or
+    with an accepted difference at the right."""
+    t = STYLE[theme_name]
+    rows = parity_rows(parity["areas"])
+    left = label_width([r["area"] for r in rows]) + 14
+    right = 150
+    plot = WIDTH - left - right
+    top = max(r["requests"] for r in rows)
+    step = nice_step(top)
+    scale_top = step * math.ceil(top / step)
+    x = lambda v: left + plot * v / scale_top
+    row_h, bar_h, y0 = 24, 14, 62
+    end = y0 + row_h * len(rows)
+    body = []
+    for i in range(int(round(scale_top / step)) + 1):
+        tx = x(i * step)
+        body.append(f"<line x1='{tx:.1f}' y1='{y0 - 6}' x2='{tx:.1f}' y2='{end:.1f}' stroke='{t['grid']}' stroke-width='1'/>")
+        body.append(text(tx, end + 15, f"{i * step:g}", 11, "muted", "middle", theme=t))
+    body.append(text(left + plot / 2, end + 32, "requests jellyfin-web makes, by API area", 12, "muted", "middle", theme=t))
+    for n, r in enumerate(rows):
+        y = y0 + n * row_h
+        body.append(text(left - 10, y + bar_h - 3, r["area"], 12, anchor="end", theme=t))
+        at = left
+        for key in PARITY_OUTCOMES:
+            width = plot * r[key] / scale_top
+            if width > 0:
+                body.append(f"<rect x='{at:.1f}' y='{y:.1f}' width='{width:.1f}' height='{bar_h}' fill='{t[key]}'/>")
+                at += width
+        compared = r["requests"] - r["oracle_failed"]
+        alike = r["identical"] + r["accepted"]
+        # rounded down, so an area reads 100% only when every compared request is alike
+        share = (("100" if alike == compared else f"{math.floor(1000 * alike / compared) / 10:g}") + "% alike"
+                 if compared else "not compared")
+        body.append(text(at + 5, y + bar_h - 3, f"{r['requests']}  ·  {share}", 11, "muted", theme=t))
+    body.append(caption_lines(caption, end + 54, t))
+    legend = tuple((k, PARITY_OUTCOMES[k].split(" (")[0]) for k in PARITY_OUTCOMES)
+    return frame(title, end + 76, "".join(body), theme_name, legend, alt)
+
+
+def parity_section(parity, version, rel, results_dir):
+    """`(files, README lines)` of the parity overview."""
+    src, c = parity["source"], parity["counts"]
+    title = f"Answering jellyfin-web like {src['oracle']}"
+    compared = parity["sent"] - c["oracle_failed"]
+    alt = (f"{title}: of {parity['sent']} requests, " + ", ".join(f"{c[k]} {PARITY_OUTCOMES[k]}" for k in PARITY_OUTCOMES) + ".")
+    cap = (f"Ferrofin {version} (commit {src['commit'][:8]}) against {src['oracle']}, gates session {src['session']}, "
+           f"{src['date']}. How differences are judged: gates/parity/README.md")
+    files = {os.path.join(results_dir, version, f"parity{'' if theme == 'light' else '-dark'}.svg"):
+             parity_graph(title, parity, cap, theme, alt) for theme in STYLE}
+    issues = ", ".join(f"gl-{i}" if str(i).isdigit() else str(i) for i in parity["filed_issues"])
+    lines = ["### Answering like Jellyfin\n",
+             f"The parity gate replays the **{parity['sent']:,}** requests jellyfin-web makes against {src['oracle']} and "
+             f"Ferrofin **{version}** (commit `{src['commit'][:12]}`, a local gates session on {src['date']}) and compares the "
+             f"answers. Of the {compared:,} it could compare, **{c['identical']:,} are identical** and **{c['accepted']:,} differ "
+             "in accepted ways** (each recorded with its reason in the parity ledger); "
+             f"**{c['filed']} {'is filed as an issue' if c['filed'] == 1 else 'are filed as issues'}** and "
+             f"**{c['new']} {'is' if c['new'] == 1 else 'are'} new**. {c['oracle_failed']} "
+             f"{'was' if c['oracle_failed'] == 1 else 'were'} not compared because Jellyfin itself failed "
+             f"{'it' if c['oracle_failed'] == 1 else 'them'}.\n",
+             f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel}/parity-dark.svg">\n'
+             f'  <img alt="{html.escape(alt)}" src="{rel}/parity.svg">\n</picture>\n',
+             "<details><summary>Parity: every API area</summary>\n",
+             "| Area | Requests | Identical | Accepted | Filed | New | Not compared |", "|---|---|---|---|---|---|---|"]
+    lines += [f"| {md(a['area'])} | {a['requests']} | " + " | ".join(str(a[k]) for k in PARITY_OUTCOMES) + " |"
+              for a in parity["areas"]]
+    lines += ["", f"Filed as issues: {md(issues)}." if issues else "", "\n</details>\n"]
+    return files, lines
+
+
 def adoption_section(adoption, version, rel, results_dir):
     """`(files, README lines)` of the adoption status."""
     src, rows = adoption["source"], adoption["rows"]
@@ -627,6 +770,10 @@ def render(results_dir, readme_text, readme_dir=ROOT):
         more, lines = adoption_section(latest["adoption"], version, rel, results_dir)
         files.update(more)
         block += lines
+    if "parity" in latest:
+        more, lines = parity_section(latest["parity"], version, rel, results_dir)
+        files.update(more)
+        block += lines
     block.append(END)
     section = "\n".join(block) + "\n"
     i, j = readme_text.find(BEGIN), readme_text.find(END)
@@ -647,6 +794,16 @@ def session_graphs(bench_result, version="this session"):
         for theme in STYLE:
             out.append(f"<div class='graph {theme}'>{render_svg(graph, bench, version, theme)}</div>")
     return "".join(out)
+
+
+def session_parity_graph(session, commit, version="this session"):
+    """The README's parity overview graph, inline, for a gates session's parity result (the session page)."""
+    parity = parity_summary(session, commit, publishing=False)
+    if parity is None:   # a run that compared nothing: its row on the page already says why
+        return ""
+    files, _ = parity_section(parity, version, ".", session)
+    return "".join(f"<div class='graph {theme}'>{svg}</div>"
+                   for theme, svg in zip(STYLE, (files[p] for p in sorted(files, key=lambda p: p.endswith("-dark.svg")))))
 
 
 def session_adoption_graph(session, version="this session"):

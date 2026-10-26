@@ -1043,6 +1043,63 @@ class Report(Scratch):
 UNSET = object()
 
 
+class Overview(Scratch):
+    """result.json: each request's outcome counted overall and by API area, for the session page and the README."""
+
+    @staticmethod
+    def summary():
+        new = lambda path, kind="value", filed=None, ledger=None: {"path": path, "kind": kind, "ledger": ledger, "filed": filed}
+        requests = [
+            {"target": "/Items/1?Fields=Overview", "state": "match", "differences": []},
+            {"target": "/Items/2", "state": "match", "differences": []},
+            {"target": "/Items/3", "state": "ledgered", "differences": [new("Tags", ledger="ledger.toml#12")]},
+            {"target": "Users/u1/Items", "state": "differences", "differences": [new("A"), new("B", ledger="ledger.toml#3")]},
+            {"target": "/Videos/1/stream", "state": "differences", "differences": [new("C", filed=832), new("D", ledger="x")]},
+            {"target": "/Videos/2/stream", "state": "differences", "differences": [new("E", filed=860), new("F")]},
+            {"target": "/Intros", "state": "oracle failed", "differences": []}]
+        return {"verdict": "new differences", "reason": "2 new difference(s)", "planned": 9, "requests": requests,
+                "elapsed_s": 60.0, "run": {"started": 1792915910, "sha": "5112240e", "ids_sha256": "4b21",
+                                           "oracle": {"version": "12.2.0", "image": "jellyfin@pin"},
+                                           "ferrofin": {"image": "ferrofin:x", "image_id": "sha256:f"}}}
+
+    def test_each_request_has_one_outcome_and_an_oracle_failure_is_never_identical(self):
+        outcomes = [diff.outcome(r) for r in self.summary()["requests"]]
+        self.assertEqual(outcomes, ["identical", "identical", "accepted", "new", "filed", "new", "oracle_failed"])
+
+    def test_the_overview_counts_outcomes_overall_and_by_area_with_its_source(self):
+        doc = diff.result_doc(self.summary())
+        self.assertEqual(diff.gate_result().problems(doc), [])
+        self.assertEqual((doc["gate"], doc["verdict"]), ("parity", "new differences"))
+        self.assertEqual(doc["counts"], {"identical": 2, "accepted": 1, "filed": 1, "new": 2, "oracle_failed": 1})
+        detail = doc["detail"]
+        self.assertEqual(detail["areas"], [
+            {"area": "/Items", "requests": 3, "identical": 2, "accepted": 1, "filed": 0, "new": 0, "oracle_failed": 0},
+            {"area": "/Videos", "requests": 2, "identical": 0, "accepted": 0, "filed": 1, "new": 1, "oracle_failed": 0},
+            {"area": "/Intros", "requests": 1, "identical": 0, "accepted": 0, "filed": 0, "new": 0, "oracle_failed": 1},
+            {"area": "/Users", "requests": 1, "identical": 0, "accepted": 0, "filed": 0, "new": 1, "oracle_failed": 0}])
+        self.assertEqual((detail["sent"], detail["planned"], detail["oracle_version"]), (7, 9, "12.2.0"))
+        self.assertEqual((detail["new_differences"], detail["unfiled_groups"], detail["filed_issues"]), (4, 2, [832, 860]))
+        self.assertEqual({k: doc["source"][k] for k in ("commit", "image", "image_digest", "oracle", "fixture")},
+                         {"commit": "5112240e", "image": "ferrofin:x", "image_digest": "sha256:f", "oracle": "jellyfin@pin",
+                          "fixture": "4b21"})
+        self.assertEqual((doc["started"], doc["ended"]), ("2026-10-25T08:11:50+00:00", "2026-10-25T08:12:50+00:00"))
+
+    def test_the_result_command_writes_the_overview_of_a_run_from_before_it(self):
+        out = self.dir / "run"
+        out.mkdir()
+        (out / "results.json").write_text(json.dumps(self.summary()))
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(diff.main(["result", "--out", str(out)]), 0)
+        self.assertEqual(printed.getvalue().strip(), str(out / "result.json"))
+        again = diff.gate_result().read(str(out), "parity")
+        self.assertEqual(again["counts"], diff.result_doc(self.summary())["counts"])
+        self.assertIsNone(again["source"]["host_class"])   # not the host regenerating it
+        (out / "results.json").write_text(json.dumps({"requests": [{"target": "/x", "state": "differences", "differences": [{}]}]}))
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(diff.main(["result", "--out", str(out)]), 2)   # a misshapen file is said, not a traceback
+        self.assertIn("KeyError", err.getvalue())
+
+
 class Handler(BaseHTTPRequestHandler):
     routes = {}
     login = UNSET   # what POST /Users/AuthenticateByName answers, instead of a token
@@ -1158,6 +1215,10 @@ class Live(Scratch):
         summary = json.loads((out / "results.json").read_text())
         self.assertEqual((summary["verdict"], summary["requests"][0]["state"]), ("pass", "match"))
         self.assertIn("PASS", (out / "report.html").read_text())
+        result = diff.gate_result().read(str(out), "parity")   # its overview beside the report
+        self.assertEqual((result["verdict"], result["counts"]["identical"], result["detail"]["areas"][0]["area"]),
+                         ("pass", 1, "/Items"))
+        self.assertIn(f"New differences ({result['detail']['new_differences']})", (out / "report.html").read_text())
 
     def test_a_whole_run_with_a_nulled_field_exits_one_and_names_the_field_path_in_the_report(self):
         sick = {"Id": "m1", "Name": "x", "MediaSources": [{"Size": 5, "Path": None}]}
@@ -1255,6 +1316,9 @@ class Live(Scratch):
         self.assertIn("ferrofin did not start", page)
         self.assertIn("failed-run", page)
         self.assertEqual(json.loads((out / "new-differences.json").read_text())["requests"], [])
+        result = diff.gate_result().read(str(out), "parity")   # the overview of a run that compared nothing
+        self.assertEqual((result["verdict"], result["detail"]["sent"], result["detail"]["reason"]),
+                         ("run failed", 0, "ferrofin did not start"))
 
     def test_a_failure_report_is_written_even_when_run_json_is_empty_or_garbled(self):
         for content in ("", "{not json", "[1, 2]"):
