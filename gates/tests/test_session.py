@@ -1,5 +1,6 @@
 """gates/session.py: a session's directory name and the record of its gates (stdlib unittest)."""
 
+import io
 import json
 import os
 import sys
@@ -7,6 +8,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import session  # noqa: E402
@@ -43,6 +45,19 @@ class SessionTests(unittest.TestCase):
                           {"image": "jf@sha256:x"}))
         self.assertEqual({g: e["status"] for g, e in r["gates"].items()}, {"verify": "pending", "bench": "pending"})
         self.assertNotIn("previous", r)
+
+    def test_the_oracle_records_the_release_the_branch_pins_and_a_newer_one(self):
+        note = "measured against Jellyfin v12.2, the release this branch pins; v12.3 is out"
+        s = session.new(self.runs, ["bench"], "release/v1.4.0", "c0ffee", False, "ferrofin:test", "sha256:t",
+                        "jf@sha256:x", "ferrofin:old", "sha256:o", when=WHEN,
+                        oracle_pin={"tag": "v12.2", "image": "jf@sha256:x", "note": note})
+        self.assertEqual(self.record(s)["oracle"], {"image": "jf@sha256:x", "tag": "v12.2", "note": note})
+        # what gates/run passes: the JSON gates/bench/oracle.py check printed
+        with patch("sys.stdout", new_callable=io.StringIO) as printed:
+            session.main(["new", self.runs, "--gates", "bench", "--branch", "b", "--commit", "c", "--dirty", "false",
+                          "--image", "i", "--image-id", "sha256:i", "--oracle-image", "jf@sha256:x",
+                          "--oracle-pin", '{"tag": "v12.2", "image": "jf@sha256:x"}'])
+        self.assertEqual(self.record(printed.getvalue().strip())["oracle"], {"image": "jf@sha256:x", "tag": "v12.2"})
 
     def test_a_gate_records_its_start_end_and_exit(self):
         s = self.new()

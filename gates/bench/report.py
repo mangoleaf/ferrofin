@@ -1820,6 +1820,7 @@ def render_html(m, base=None, picker="", gate=None, verdicts=None):
              f"{e(str(meta.get('memory_limit', '?')))} limit, no swap · test data {e(str(tc.get('movies', '?')))} movies / {e(str(tc.get('series', '?')))} series / {e(str(tc.get('episodes', '?')))} episodes · "
              f"windows {e(str(meta.get('window_s', '?')))} s · {run_list(m['runs'], 'run')}"
              + (f" · Jellyfin oracle {e(o['tag'])} ({e(o['image'])})" if (o := meta.get("oracle")) else "")
+             + (f" — {e(o['note'])}" if o and o.get("note") else "")
              + (f" · baseline, median of {run_list(base['runs'], 'run')}" if base else "") + "</p>"]
     # tiles: the four headline numbers
     tiles = []
