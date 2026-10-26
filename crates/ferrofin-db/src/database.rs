@@ -1624,8 +1624,17 @@ async fn backup_before_rebuild(
 }
 
 /// Copies the database file to `backup`, on the migration connection before
-/// the pools open: the write-ahead log is folded into the main file first, so
-/// a byte-for-byte copy is complete (startup: no other writers yet).
+/// the pools open.
+///
+/// The write-ahead log is folded into the main file first, so a byte-for-byte
+/// copy is complete. That checkpoint cannot finish while another process holds
+/// a read transaction on the file (Jellyfin still running on it, a database
+/// browser, the previous pod of a rolling update): `wal_checkpoint` then
+/// reports itself busy instead of failing, and a file copy would miss the
+/// commits still in the log. The copy is then a `VACUUM INTO`, which reads one
+/// consistent view, log included, and waits for no other process; a warning
+/// says why. Refusing the boot instead could leave a rolling update waiting
+/// forever on a pod that never becomes ready (owner decision, 2026-10-25).
 async fn copy_database_file(
     conn: &mut sqlx::SqliteConnection,
     path: &std::path::Path,
@@ -1633,13 +1642,29 @@ async fn copy_database_file(
 ) -> Result<()> {
     let partial = start_snapshot(backup)?;
     let written = async {
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&mut *conn)
-            .await?;
-        std::fs::copy(path, &partial).map_err(|source| crate::DbError::Backup {
-            path: backup.display().to_string(),
-            source,
-        })?;
+        // (busy, frames in the log, frames checkpointed); both counts are -1
+        // when the database is not in WAL mode.
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_one(&mut *conn)
+                .await?;
+        if busy == 0 && log == checkpointed {
+            std::fs::copy(path, &partial).map_err(|source| crate::DbError::Backup {
+                path: backup.display().to_string(),
+                source,
+            })?;
+        } else {
+            tracing::warn!(
+                database = %path.display(),
+                backup = %backup.display(),
+                log_frames = log,
+                checkpointed_frames = checkpointed,
+                "another process has the database open, so its write-ahead log could not be folded in: copying it with VACUUM INTO instead"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(vacuum_into(&partial)))
+                .execute(&mut *conn)
+                .await?;
+        }
         publish_snapshot(&partial, backup)
     }
     .await;
@@ -2180,6 +2205,66 @@ mod tests {
             .expect("newest migration");
         sqlx::Connection::close(conn).await.expect("close");
         newest
+    }
+
+    /// A copy taken while another process holds a read transaction misses no
+    /// commit. The checkpoint cannot fold the write-ahead log into the file
+    /// then (it reports itself busy rather than failing), so a file copy would
+    /// lack the commit made after that reader began; the copy is a
+    /// `VACUUM INTO` instead.
+    #[tokio::test]
+    async fn a_copy_taken_while_another_process_reads_has_every_commit() {
+        use sqlx::ConnectOptions as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        // No busy timeout: the checkpoint gives up at once instead of after 30 s.
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::ZERO);
+        let mut conn = options.clone().connect().await.expect("connect");
+        sqlx::raw_sql("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .execute(&mut conn)
+            .await
+            .expect("seed");
+        let mut reader = options.connect().await.expect("reader");
+        sqlx::raw_sql("BEGIN; SELECT COUNT(*) FROM t;")
+            .execute(&mut reader)
+            .await
+            .expect("read transaction");
+        sqlx::query("INSERT INTO t VALUES (2)")
+            .execute(&mut conn)
+            .await
+            .expect("a commit the reader's view predates");
+        let (_, log, checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
+                .fetch_one(&mut conn)
+                .await
+                .expect("checkpoint");
+        assert!(log > checkpointed, "the reader keeps a commit in the WAL");
+
+        let backup = dir.path().join("jellyfin.db.pre-0007");
+        copy_database_file(&mut conn, &path, &backup)
+            .await
+            .expect("copy");
+        sqlx::raw_sql("COMMIT;")
+            .execute(&mut reader)
+            .await
+            .expect("end the read");
+
+        let mut copy = SqliteConnectOptions::new()
+            .filename(&backup)
+            .read_only(true)
+            .connect()
+            .await
+            .expect("open the copy");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+            .fetch_one(&mut copy)
+            .await
+            .expect("count");
+        assert_eq!(rows, 2, "the copy must hold the commit still in the WAL");
+        assert!(!dir.path().join("jellyfin.db.pre-0007.partial").exists());
     }
 
     /// Runs `sql` against a database file created at `path`.
