@@ -3,9 +3,9 @@
 **Parity: 7 / 412 operations deep-verified against Jellyfin v12.2** (`ca0f16eb7c`), none
 owed a re-check against an earlier release, 0 subsystem rows (as of 2026-10-19; the
 `contract_superset` test prints the current line).
-**Latest live parity run: none yet.** The replay that sends the same jellyfin-web requests
-to Jellyfin and to Ferrofin and diffs the answers is still being built; its verdict appears
-here once a release branch has run it.
+**Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
+Ferrofin answers the way Jellyfin does (identical, an accepted difference, filed, new), by API
+area, is in the root README's [Results](../README.md#answering-like-jellyfin).
 
 Ferrofin implements the Jellyfin server API surface, not a subset of it. Every one of the
 **412 operations** in the vendored OpenAPI contract is wired to a real handler — there are

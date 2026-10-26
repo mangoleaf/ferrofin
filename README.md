@@ -422,9 +422,8 @@ Jellyfin, while the original spelling remains visible. If existing usernames col
 under these rules, startup stops with the conflicting account IDs and names; resolve
 the names in the original server before retrying. Accounts are never merged.
 
-All six 10.11–12.1 releases passed the live adoption suite on 2026-09-16; the 12.2 paths
-passed the synthetic suite on 2026-10-13. Nine fixture paths total, including both
-10.11.8 → 12.1.0 and 10.11.8 → 12.0.0 → 12.1.0 and both 12.2 routes. Checks cover API
+Every release's gates session adopts each supported version and upgrade route, and the latest
+release's status is in [Results](#adopting-an-existing-jellyfin-database). Checks cover API
 summaries against Jellyfin 12.2, database integrity, and stable responses without repeated
 repairs after restart. See the [support matrix and tested build](gates/adoption/README.md#supported-and-tested-versions).
 Support is determined by the exact migration history; these version numbers do not imply

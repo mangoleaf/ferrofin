@@ -50,6 +50,9 @@ jobs:
       - run: python3 -m unittest discover -s gates/bench -p test_soak.py
       - run: python3 -m unittest discover -s gates/bench -p test_endpoints.py
       - run: python3 -m unittest discover -s gates/bench -p test_viewer.py
+      # The README Results block and its graphs must be what the committed summary files give
+      # (gates/README.md, "Publishing the results"): a re-render, no gate and no benchmark.
+      - run: python3 gates/publish.py readme --check
 
   # fmt and clippy. The workspace tests run beside it in lint-tests; the aggregate `lint`
   # job below is the status check main's branch protection requires.

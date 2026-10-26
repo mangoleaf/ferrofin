@@ -8,6 +8,10 @@ real installation.
 
 ## Supported and tested versions
 
+The status every release's gates session found, per version and upgrade route, is published with
+that release in the root README's [Results](../../README.md#adopting-an-existing-jellyfin-database).
+The record below is the per-version history.
+
 The 10.11 and 12.0–12.1 fixture paths below **passed** the live suite on **2026-09-16
 (US/Mountain)**, against fixtures derived from a real library. The suite no longer uses real
 libraries: since 2026-10-14 every fixture is [synthetic](#the-fixtures-are-synthetic). All ten

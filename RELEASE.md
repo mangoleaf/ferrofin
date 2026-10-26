@@ -186,10 +186,13 @@ from.
    leaves the combinations out. Whether the release session does that is still open: the
    owner decides.
 
-   **The Jellyfin comparison is publication only.** The three-server `gates/bench/run.sh` runs
-   (Ferrofin and both Jellyfins, three runs, median) produce the published tables in the root
-   README and `docs/BENCHMARKS.md`. Run them when those numbers are refreshed. They never
-   decide a release.
+   **Run the publication inputs.** Every release publishes its results in the root README
+   (step 6) from local runs of the release candidate's image, all of one commit: one full gates
+   session, `make run-gates IMAGE=<candidate>` without `PREVIOUS=` (its adoption and parity gates give the README's
+   adoption status and parity overview, and its benchmark is the first Jellyfin comparison), then
+   two more `make run-bench IMAGE=<candidate>` sessions for the second and third comparison. They
+   are publication inputs only: their numbers never decide a release, and parity is not a gate
+   here. Keep the three session folders for step 6.
 
    **Validate adoption.** The evidence is a green run of the `Adoption` workflow
    (`.github/workflows/adoption.yml`) on the frozen release commit. It builds the image from
@@ -217,6 +220,22 @@ from.
    `Adoption` run from step 2.
    After a patch release from `main`, merge `main` into the open release branch so the fix
    is carried forward.
+6. **Publish the results**, also after the tag ([`gates/README.md`](gates/README.md#publishing-the-results)).
+   Choose the release's local results from step 2 (nothing is picked for you) and run
+
+   ```bash
+   make publish-results VERSION=vX.Y.Z SESSION=$FERROFIN_GATES_DIR/runs/<full session> \
+     BENCH="$FERROFIN_GATES_DIR/runs/<full session>/bench $FERROFIN_GATES_DIR/runs/<bench session 2>/bench $FERROFIN_GATES_DIR/runs/<bench session 3>/bench"
+   ```
+
+   It writes `docs/results/vX.Y.Z/summary.json`, the graphs beside it and the README's Results
+   block, and refuses runs of different commits, images, hosts or fixtures. Regenerate
+   `docs/BENCHMARKS.md` from the same three runs: `python3 gates/bench/report.py <run> <run> <run>`
+   prints the tables, which replace everything between the file's two rules; update the date,
+   commit and run notes above the first rule to match. Commit all of it to the release PR
+   (release branch → `main`), or to `main` for a patch release. CI's `benchmark-report` job fails
+   when the block or the graphs differ from what the committed summary files give, so never edit
+   them by hand.
 
 The workflow needs the repository secret `RELEASE_TOKEN`: a fine-grained personal
 access token for this repository with **Contents: read and write**. Tags pushed with the
