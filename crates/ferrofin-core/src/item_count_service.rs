@@ -503,6 +503,123 @@ impl FerrofinItemCountService {
         }
         Ok(out)
     }
+
+    /// v12.2 `CountEpisodesOfTaggedSeriesByCleanName`
+    /// (`ItemCountService.cs:351-407`): per clean value, the distinct episodes under a series that
+    /// carries it, and those of them that carry it themselves. Series and
+    /// episodes alike are the related items the counts read
+    /// ([`tagged_series_episodes_query`]). A value with no such episode is
+    /// absent.
+    async fn episodes_of_tagged_series(
+        &self,
+        cleans: &[&str],
+        value_types: &[ItemValueType],
+        access_filter: &InternalItemsQuery,
+    ) -> Result<HashMap<String, TaggedSeriesEpisodes>, ServiceError> {
+        let mut out = HashMap::new();
+        for chunk in cleans.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+            let mut qb = tagged_series_episodes_query(chunk, value_types, access_filter);
+            for (clean, of_tagged, tagged_of_tagged) in qb
+                .build_query_as::<(String, i64, i64)>()
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?
+            {
+                out.insert(
+                    clean,
+                    TaggedSeriesEpisodes {
+                        of_tagged_series: i32::try_from(of_tagged).unwrap_or(i32::MAX),
+                        tagged_of_tagged_series: i32::try_from(tagged_of_tagged)
+                            .unwrap_or(i32::MAX),
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// One clean value's episode roll-up: [`FerrofinItemCountService::episodes_of_tagged_series`].
+#[derive(Clone, Copy, Default)]
+struct TaggedSeriesEpisodes {
+    /// The distinct episodes under a series carrying the value.
+    of_tagged_series: i32,
+    /// Those of them that carry the value themselves.
+    tagged_of_tagged_series: i32,
+}
+
+/// v12.2 `RollsUpEpisodes` (`ItemCountService.cs:346-349`): a studio or genre
+/// (or music genre) counted over episodes and series counts the episodes of
+/// the series it is written on.
+fn rolls_up_episodes(kind: BaseItemKind, related_item_kinds: &[BaseItemKind]) -> bool {
+    matches!(
+        kind,
+        BaseItemKind::Studio | BaseItemKind::Genre | BaseItemKind::MusicGenre
+    ) && related_item_kinds.contains(&BaseItemKind::Episode)
+        && related_item_kinds.contains(&BaseItemKind::Series)
+}
+
+/// The episode roll-up for `cleans`: per clean value, the distinct episodes
+/// whose `SeriesId` is a series carrying it (`episodesOfTaggedSeries`), and
+/// those of them that carry it themselves (`taggedEpisodesOfTaggedSeries`).
+///
+/// Both the series and the episodes pass [`access_filtered_count_query`]'s
+/// terms, as `related` does upstream. The tagged series (`ts`) seed from
+/// `ItemValues`, as [`item_value_counts_sql`] does, reach `BaseItems` by
+/// primary key, and are made distinct (an item may carry a value through two
+/// value types); `CROSS JOIN` keeps them the outer loop, each probing its
+/// episodes through `IX_BaseItems_SeriesId`. The `+` on the episode's `Type`
+/// keeps it off the `Type`-led composites, which would walk every episode on
+/// the server once per tagged series. `EXPLAIN QUERY PLAN` pinned by
+/// `the_tagged_series_roll_up_seeks_from_the_values`.
+fn tagged_series_episodes_query(
+    cleans: &[&str],
+    value_types: &[ItemValueType],
+    access_filter: &InternalItemsQuery,
+) -> QueryBuilder<Sqlite> {
+    let value_types = value_types
+        .iter()
+        .map(|t| i32::from(*t).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let series = stored_type_name(BaseItemKind::Series).unwrap_or_default();
+    let episode = stored_type_name(BaseItemKind::Episode).unwrap_or_default();
+    // Bound discriminants, not user input, inlined as in `item_value_counts_sql`.
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+        r#"SELECT ts."CleanValue", COUNT(DISTINCT bi."Id"),
+                  COUNT(DISTINCT CASE WHEN EXISTS (
+                      SELECT 1 FROM "ItemValuesMap" em
+                      CROSS JOIN "ItemValues" ev ON ev."ItemValueId" = em."ItemValueId"
+                      WHERE em."ItemId" = bi."Id" AND ev."CleanValue" = ts."CleanValue"
+                        AND ev."Type" IN ({value_types})) THEN bi."Id" END)
+           FROM (SELECT DISTINCT iv."CleanValue" AS "CleanValue", bi."Id" AS "SeriesId"
+                 FROM "ItemValues" iv
+                 CROSS JOIN "ItemValuesMap" ivm ON ivm."ItemValueId" = iv."ItemValueId"
+                 CROSS JOIN "BaseItems" bi ON bi."Id" = ivm."ItemId"
+                 WHERE iv."Type" IN ({value_types}) AND "#
+    ));
+    crate::translate_query::push_in_list(&mut qb, r#"iv."CleanValue""#, cleans);
+    qb.push(r#" AND bi."Type" = "#).push_bind(series);
+    push_access_filter(
+        &mut qb,
+        access_filter,
+        &access_filter.top_parent_ids,
+        TopParentTerm::Residual,
+    );
+    qb.push(
+        r#") ts
+           CROSS JOIN "BaseItems" bi ON bi."SeriesId" = ts."SeriesId"
+           WHERE +bi."Type" = "#,
+    )
+    .push_bind(episode);
+    push_access_filter(
+        &mut qb,
+        access_filter,
+        &access_filter.top_parent_ids,
+        TopParentTerm::Residual,
+    );
+    qb.push(r#" GROUP BY ts."CleanValue""#);
+    qb
 }
 
 #[async_trait]
@@ -746,9 +863,43 @@ impl ItemCountService for FerrofinItemCountService {
             }
         }
 
+        // v12.2 `CountByItemValue` (`ItemCountService.cs:227-252`): a studio
+        // or genre is usually written on the series, so the episodes of a
+        // series carrying the value count towards it, once the page has
+        // counted a series at all.
+        let series_type = stored_type_name(BaseItemKind::Series).unwrap_or_default();
+        let roll_up = if rolls_up_episodes(kind, related_item_kinds)
+            && by_clean
+                .values()
+                .any(|by_type| by_type.contains_key(series_type))
+        {
+            Some(
+                self.episodes_of_tagged_series(&distinct_cleans, value_types, access_filter)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         for (id, clean) in clean_by_id {
             if let Some(by_type) = by_clean.get(clean) {
-                out.insert(id, counts_from_type_map(by_type));
+                let mut counts = counts_from_type_map(by_type);
+                if let Some(roll_up) = &roll_up {
+                    let tagged = roll_up.get(clean).copied().unwrap_or_default();
+                    // A tagged episode of a tagged series is counted by the
+                    // roll-up already, so it comes off the direct ones.
+                    let episodes = tagged
+                        .of_tagged_series
+                        .saturating_add(counts.episode_count)
+                        .saturating_sub(tagged.tagged_of_tagged_series);
+                    // `ItemCountBuilder.SetEpisodeCount` moves the total with it.
+                    counts.item_count = counts
+                        .item_count
+                        .saturating_add(episodes)
+                        .saturating_sub(counts.episode_count);
+                    counts.episode_count = episodes;
+                }
+                out.insert(id, counts);
             }
         }
         Ok(out)
@@ -3909,6 +4060,246 @@ mod tests {
         }
     }
 
+    /// v12.2 `ItemCountServiceTests.SeedGenresTaggingSeriesAndEpisodes`: genres
+    /// "rolled", "loose" and "empty" (their ids, in that order); a series tagged
+    /// "rolled" holding two episodes, the second tagged "rolled" itself; an
+    /// untagged series whose episodes carry "loose" and "rolled" on their own;
+    /// and a movie tagged "rolled".
+    async fn seed_genres_tagging_series_and_episodes(db: &Database) -> Vec<Uuid> {
+        let genres: Vec<Uuid> = ["rolled", "loose", "empty"]
+            .into_iter()
+            .enumerate()
+            .map(|(n, _)| Uuid::from_u128(0x4160 + n as u128))
+            .collect();
+        for (id, name) in genres.iter().zip(["rolled", "loose", "empty"]) {
+            seed_named_item(db, *id, BaseItemKind::Genre, name).await;
+            set_clean_name(db, *id, name).await;
+        }
+        let [tagged_series, untagged_series] = [0x4171, 0x4172].map(Uuid::from_u128);
+        seed_named_item(db, tagged_series, BaseItemKind::Series, "Tagged").await;
+        seed_named_item(db, untagged_series, BaseItemKind::Series, "Untagged").await;
+        let [of_tagged, tagged_of_tagged, loose, rolled_loose] =
+            [0x4173, 0x4174, 0x4175, 0x4176].map(Uuid::from_u128);
+        for (episode, series) in [
+            (of_tagged, tagged_series),
+            (tagged_of_tagged, tagged_series),
+            (loose, untagged_series),
+            (rolled_loose, untagged_series),
+        ] {
+            crate::test_support::seed_item_of_series(
+                db,
+                episode,
+                BaseItemKind::Episode,
+                "e",
+                series,
+            )
+            .await;
+        }
+        let movie = Uuid::from_u128(0x4177);
+        seed_named_item(db, movie, BaseItemKind::Movie, "m").await;
+        for (item, genre) in [
+            (tagged_series, "rolled"),
+            (tagged_of_tagged, "rolled"),
+            (rolled_loose, "rolled"),
+            (loose, "loose"),
+            (movie, "rolled"),
+        ] {
+            seed_item_genre(db, item, genre).await;
+        }
+        genres
+    }
+
+    /// v12.2 `GetItemCountsForNameItems_TaggedSeries_RollsEpisodesUpIntoTheGenre`:
+    /// the episodes of a tagged series count towards the genre even untagged,
+    /// a tagged episode of a tagged series counts once, and a tagged episode
+    /// of an untagged series counts as itself (`CountEpisodesOfTaggedSeriesByCleanName`).
+    #[tokio::test]
+    async fn a_tagged_series_rolls_its_episodes_up_into_the_genre() {
+        let db = test_db().await;
+        let genres = seed_genres_tagging_series_and_episodes(&db).await;
+        let rows = stored_rows(&db, &genres).await;
+        let batch = svc(&db)
+            .get_item_counts_for_name_items(
+                BaseItemKind::Genre,
+                &name_rows(&rows),
+                &[
+                    BaseItemKind::Episode,
+                    BaseItemKind::Series,
+                    BaseItemKind::Movie,
+                ],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("batch");
+        let pair = |id: &Uuid| (batch[id].episode_count, batch[id].series_count);
+        assert_eq!(pair(&genres[0]), (3, 1), "rolled");
+        assert_eq!(pair(&genres[1]), (1, 0), "loose");
+        assert_eq!(pair(&genres[2]), (0, 0), "empty");
+        // The total moves with the episodes (`SetEpisodeCount`), as the DTO's
+        // ChildCount, the sum of the count fields, does.
+        assert_eq!(batch[&genres[0]].item_count, 5, "rolled: 3 + 1 + the movie");
+    }
+
+    /// v12.2 `GetItemCountsForNameItems_TaggedSeriesAndEpisodes_MatchesCountingEachNameItemOnItsOwn`:
+    /// the page and the single item agree, with the roll-up's related kinds
+    /// and without them.
+    #[rstest]
+    #[case::rolls_up([BaseItemKind::Episode, BaseItemKind::Series, BaseItemKind::Movie])]
+    #[case::plain([BaseItemKind::Movie, BaseItemKind::Series, BaseItemKind::MusicAlbum])]
+    #[tokio::test]
+    async fn the_roll_up_counts_a_page_as_it_counts_each_name(#[case] related: [BaseItemKind; 3]) {
+        let db = test_db().await;
+        let genres = seed_genres_tagging_series_and_episodes(&db).await;
+        let rows = stored_rows(&db, &genres).await;
+        let service = svc(&db);
+        let filter = InternalItemsQuery::default();
+        let batch = service
+            .get_item_counts_for_name_items(
+                BaseItemKind::Genre,
+                &name_rows(&rows),
+                &related,
+                &filter,
+            )
+            .await
+            .expect("batch");
+        assert_eq!(batch.len(), genres.len());
+        // Without Episode among the related kinds nothing rolls up and no
+        // episode counts at all: "rolled" is its series and the movie.
+        let rolled = &batch[&genres[0]];
+        let expected = if related.contains(&BaseItemKind::Episode) {
+            (3, 5)
+        } else {
+            (0, 2)
+        };
+        assert_eq!((rolled.episode_count, rolled.item_count), expected);
+        for id in &genres {
+            let single = service
+                .get_item_counts_for_name_item(BaseItemKind::Genre, *id, &related, &filter)
+                .await
+                .expect("single");
+            assert_eq!(batch[id], single, "{id}");
+        }
+    }
+
+    /// v12.2 `GetItemCountsForNameItems_EpisodeAndItsSeriesTaggedDifferently_KeepsTheGenresApart`:
+    /// the episode rolls up into its series' genre, and stays a direct count
+    /// of its own genre, which no series carries.
+    #[tokio::test]
+    async fn an_episode_and_its_series_tagged_differently_keep_the_genres_apart() {
+        let db = test_db().await;
+        let [on_series, on_episode, series, episode] =
+            [0x4181, 0x4182, 0x4183, 0x4184].map(Uuid::from_u128);
+        for (id, name) in [(on_series, "on-series"), (on_episode, "on-episode")] {
+            seed_named_item(&db, id, BaseItemKind::Genre, name).await;
+            set_clean_name(&db, id, name).await;
+        }
+        seed_named_item(&db, series, BaseItemKind::Series, "S").await;
+        crate::test_support::seed_item_of_series(&db, episode, BaseItemKind::Episode, "e", series)
+            .await;
+        seed_item_genre(&db, series, "on-series").await;
+        seed_item_genre(&db, episode, "on-episode").await;
+        let rows = stored_rows(&db, &[on_series, on_episode]).await;
+        let batch = svc(&db)
+            .get_item_counts_for_name_items(
+                BaseItemKind::Genre,
+                &name_rows(&rows),
+                &[
+                    BaseItemKind::Episode,
+                    BaseItemKind::Series,
+                    BaseItemKind::Movie,
+                ],
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("batch");
+        assert_eq!(batch[&on_series].episode_count, 1);
+        assert_eq!(
+            (
+                batch[&on_episode].episode_count,
+                batch[&on_episode].series_count
+            ),
+            (1, 0)
+        );
+    }
+
+    /// Both sides of the roll-up are `ApplyAccessFiltering`'s `related`: an
+    /// episode the viewer may not see (a merged alternate here) rolls nothing
+    /// up, and nor does an episode the viewer can see whose series sits in a
+    /// library the viewer cannot open.
+    #[tokio::test]
+    async fn the_roll_up_reads_only_what_the_viewer_may_see() {
+        let db = test_db().await;
+        let [genre, open_series, shut_series] = [0x4191, 0x4192, 0x4193].map(Uuid::from_u128);
+        seed_named_item(&db, genre, BaseItemKind::Genre, "Shared").await;
+        set_clean_name(&db, genre, "Shared").await;
+        let [open, shut] = [0x4194, 0x4195].map(Uuid::from_u128);
+        seed_named_item(&db, open, BaseItemKind::CollectionFolder, "Open").await;
+        seed_named_item(&db, shut, BaseItemKind::CollectionFolder, "Shut").await;
+        let [episode, alternate, hidden] = [0x4196, 0x4197, 0x4198].map(Uuid::from_u128);
+        for (series, library) in [(open_series, open), (shut_series, shut)] {
+            crate::test_support::seed_top_parented_item(
+                &db,
+                series,
+                BaseItemKind::Series,
+                "s",
+                library,
+            )
+            .await;
+            seed_item_genre(&db, series, "Shared").await;
+        }
+        // `hidden` is in the open library, its series in the shut one.
+        for (id, series, library) in [
+            (episode, open_series, open),
+            (alternate, open_series, open),
+            (hidden, shut_series, open),
+        ] {
+            crate::test_support::seed_item_of_series(&db, id, BaseItemKind::Episode, "e", series)
+                .await;
+            set_column(&db, id, "TopParentId", Some(guid_to_db(library))).await;
+        }
+        crate::test_support::link_alternate_version(&db, alternate, episode).await;
+        let user_id = Uuid::from_u128(0x4199);
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        sqlx::query(r#"UPDATE "Permissions" SET "Value" = 0 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
+            .bind(guid_to_db(user_id))
+            .bind(i32::from(
+                ferrofin_db::enums::PermissionKind::EnableAllFolders,
+            ))
+            .execute(db.writer())
+            .await
+            .expect("revoke");
+        crate::user_entity_ext::set_preference(
+            db.pool(),
+            &guid_to_db(user_id),
+            ferrofin_db::enums::PreferenceKind::EnabledFolders,
+            &[open.to_string()],
+        )
+        .await
+        .expect("enable the open library only");
+        let viewer = InternalItemsQuery {
+            user: Some(user),
+            ..InternalItemsQuery::default()
+        };
+        let related = [BaseItemKind::Episode, BaseItemKind::Series];
+        let service = svc(&db);
+        let pair = |counts: ItemCounts| (counts.episode_count, counts.series_count);
+        let anyone = service
+            .get_item_counts_for_name_item(
+                BaseItemKind::Genre,
+                genre,
+                &related,
+                &InternalItemsQuery::default(),
+            )
+            .await
+            .expect("no user");
+        assert_eq!(pair(anyone), (2, 2), "both series, without the alternate");
+        let scoped = service
+            .get_item_counts_for_name_item(BaseItemKind::Genre, genre, &related, &viewer)
+            .await
+            .expect("viewer");
+        assert_eq!(pair(scoped), (1, 1), "the open library only");
+    }
+
     /// `EXPLAIN QUERY PLAN` for one statement, as the `detail` column of each
     /// step in outer-to-inner order.
     async fn query_plan(db: &Database, sql: &str, binds: usize) -> Vec<String> {
@@ -4110,6 +4501,67 @@ mod tests {
                     ),
                 }
             }
+        }
+    }
+
+    /// The episode roll-up ([`tagged_series_episodes_query`]) seeds from the
+    /// values asked for, reaches each tagged series by primary key, and its
+    /// episodes through `IX_BaseItems_SeriesId`, with or without a viewer's
+    /// access terms: never a `BaseItems` scan, never a seek on the library
+    /// scope, and the per-episode tag test probes `ItemValuesMap` by item.
+    #[tokio::test]
+    async fn the_tagged_series_roll_up_seeks_from_the_values() {
+        use sqlx::{Execute, Row};
+        let db = test_db().await;
+        let scoped = InternalItemsQuery {
+            top_parent_ids: vec![Uuid::from_u128(0x41A1), Uuid::from_u128(0x41A2)],
+            max_parental_rating: Some(ferrofin_model::entities_media::ParentalRatingScore {
+                score: 12,
+                sub_score: None,
+            }),
+            exclude_inherited_tags: vec!["horror".to_owned()],
+            ..Default::default()
+        };
+        for filter in [&InternalItemsQuery::default(), &scoped] {
+            let mut builder =
+                tagged_series_episodes_query(&["action", "drama"], &[ItemValueType::Genre], filter);
+            let mut built = builder.build();
+            let args = built.take_arguments().expect("arguments").expect("binds");
+            let explain = format!("EXPLAIN QUERY PLAN {}", built.sql().as_str());
+            let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(explain), args)
+                .fetch_all(db.pool())
+                .await
+                .expect("explain")
+                .iter()
+                .map(|row| row.get::<String, _>("detail"))
+                .collect();
+            let outer = plan.iter().position(|s| s == "SCAN ts").expect("ts drives");
+            assert_eq!(
+                plan[outer + 1],
+                "SEARCH bi USING INDEX IX_BaseItems_SeriesId (SeriesId=?)",
+                "the episodes come by their series, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|s| s.starts_with("SEARCH iv USING INDEX IX_ItemValues_Type_CleanValue")),
+                "the tagged series seed from the values, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|s| s == "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)"),
+                "a tagged series is read by its id, got: {plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|s| s == "SEARCH em USING INDEX IX_ItemValuesMap_ItemId (ItemId=?)"),
+                "an episode's own tag is probed by item, got: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|s| s.contains("TopParentId=?")
+                    || s.starts_with("SCAN bi")
+                    || s.contains("SCAN BaseItems")),
+                "no library seek and no BaseItems scan, got: {plan:?}"
+            );
         }
     }
 

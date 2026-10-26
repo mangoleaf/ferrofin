@@ -619,35 +619,6 @@ kind = "length"
 issue = 862
 reason = "Owner decision 2026-10-24, a Jellyfin bug not ported: with no parent, upstream answers empty lists."
 
-# By-name counts lack v12's roll-up of the episodes of tagged series.
-[[entry]]
-request = "GetGenre"
-path = "ChildCount"
-kind = "value"
-issue = 416
-reason = "By-name counts lack v12's roll-up of the episodes of tagged series."
-
-[[entry]]
-request = "GetGenre"
-path = "EpisodeCount"
-kind = "value"
-issue = 416
-reason = "By-name counts lack v12's roll-up of the episodes of tagged series."
-
-[[entry]]
-request = "GetStudio"
-path = "ChildCount"
-kind = "value"
-issue = 416
-reason = "By-name counts lack v12's roll-up of the episodes of tagged series."
-
-[[entry]]
-request = "GetStudio"
-path = "EpisodeCount"
-kind = "value"
-issue = 416
-reason = "By-name counts lack v12's roll-up of the episodes of tagged series."
-
 # Jellyfin answers this error with its message as a bare JSON string; Ferrofin with an object.
 [[entry]]
 request = "GetArtistImage"
