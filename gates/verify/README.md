@@ -25,6 +25,13 @@ Ferrofin (a new data directory, one movie and one TV library, `/metrics` on, rea
 every metadata fetcher off, outbound HTTP to an unreachable proxy), runs the check on each library and
 removes the container. Its rows and the server's log land in `$FERROFIN_GATES_DIR/runs/verify-<date>/`
 (or `--out DIR`); `gates/run verify` runs it as part of a gates session ([`gates/README.md`](../README.md)).
+However the run ends, it also writes there `result.json`, verify's result in the envelope every gate
+shares ([`gates/result.py`](../result.py)), and `report.html`
+([`verify_report.py`](verify_report.py)), which opens from disk: for each library, every row with what
+it checks, PASS, FAIL or SKIP, and each check's observed and expected value; a failed row opens on its
+checks and links `server.log`, and a library the check never reached says so. The session page links
+that report first, and the viewer (`gates/bench/report.py --serve`) lists every run in its Verify tab,
+rendering a run that has no `report.html` from its `result.json`.
 
 Against any running Ferrofin:
 
@@ -52,8 +59,9 @@ FERROFIN_TOKEN=… gates/verify/scan-behaviour.sh BASE_URL LIBRARY_ID SCRATCH_DI
   3), because a file the server cannot probe is re-probed on every scan.
 - `--timeout SECONDS` sets how long one scan may take (default 300).
 - `--json FILE` also writes the rows, when they end, to `FILE` as data: each row's number,
-  scenario, result and detail, and the PASS/FAIL/SKIP counts. `run.sh` gathers them into its
-  `verify.json`, which the gates' session report reads.
+  scenario, result and detail, every check it made (what, observed, operator, expected and
+  whether it held), and the PASS/FAIL/SKIP counts. `run.sh` gathers them into its
+  `verify.json`, and builds `result.json` and `report.html` from that.
 - `--nfo-wait SECONDS` sets how long row 4 waits, after the scratch items were saved,
   before it rewrites an NFO (default 62). The server re-reads an NFO only once the NFO is
   more than a minute newer than the item's last save, and it compares the file's mtime

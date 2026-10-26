@@ -1,5 +1,6 @@
 """The local report viewer (`report.py --serve`): run discovery, the tab index, the
 side-by-side compare and the served reports, against synthetic run directories."""
+import importlib.util
 import io
 import json
 from pathlib import Path
@@ -27,7 +28,9 @@ class ViewerTests(unittest.TestCase):
         self.bench = fixtures.root
         self.adoption = self.root / 'adoption'
         self.parity = self.root / 'parity'
-        self.roots = {'benchmark': str(self.bench), 'adoption': str(self.adoption), 'parity': str(self.parity)}
+        self.verify = self.root / 'verify'
+        self.roots = {'benchmark': str(self.bench), 'adoption': str(self.adoption), 'parity': str(self.parity),
+                      'verify': str(self.verify)}
 
     def report_html(self, root, name, text):
         run = root / name
@@ -57,10 +60,11 @@ class ViewerTests(unittest.TestCase):
         for name in ('bench-v1', 'parity-20261024-1200-abc', 'verify-20261024-1201', 'old-unprefixed'):
             self.report_html(runs, name, f'<p>{name}</p>')
             (runs / name / 'run.json').write_text('{"date": "2026-10-24T12:00:00"}')
-        listed = {h: {n for n, _ in report.discover(h, str(runs))} for h in ('benchmark', 'parity', 'adoption')}
+        listed = {h: {n for n, _ in report.discover(h, str(runs))} for h in ('benchmark', 'parity', 'adoption', 'verify')}
         self.assertEqual(listed, {'benchmark': {'bench-v1', 'old-unprefixed'},
                                   'parity': {'parity-20261024-1200-abc', 'old-unprefixed'},
-                                  'adoption': {'old-unprefixed'}})
+                                  'adoption': {'old-unprefixed'},
+                                  'verify': {'verify-20261024-1201', 'old-unprefixed'}})
 
     def test_a_gates_run_session_lists_its_benchmark_run_or_its_ab_gate_runs(self):
         runs = self.root / 'runs'
@@ -77,14 +81,60 @@ class ViewerTests(unittest.TestCase):
         status, _, body = self.get('/report/parity/parity-x-20261024-1200/parity', {**self.roots, 'parity': str(runs)})
         self.assertEqual((status, body), (200, '<p>a session of a branch named parity-x</p>'))
 
+    def verify_result(self, run, verdict='passed'):
+        """What gates/verify/run.sh leaves: a result.json (and server.log), from verify's own code."""
+        run.mkdir(parents=True, exist_ok=True)
+        (run / 'verify.json').write_text(json.dumps({'exit': 1, 'libraries': {
+            'movies': {'rows': [{'row': 2, 'scenario': 'rescan, nothing changed', 'result': 'FAIL' if verdict == 'failed' else 'PASS',
+                                 'detail': 'updated 1 (want = 0)',
+                                 'checks': [{'what': 'updated', 'observed': 1, 'op': 'eq', 'expected': 0, 'ok': False}]}]},
+            'tvshows': None}}))
+        (run / 'server.log').write_text('log\n')
+        spec = importlib.util.spec_from_file_location('verify_report_for_tests', Path(report.__file__).parent.parent / 'verify' / 'verify_report.py')
+        verify_report = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verify_report)
+        verify_report.result.write(str(run), verify_report.build(str(run), 'ferrofin:v9'))
+
+    def test_verify_tab_lists_standalone_runs_and_session_gates_by_their_result(self):
+        runs = self.root / 'runs'
+        self.verify_result(runs / 'verify-20261025-1200', 'failed')
+        self.verify_result(runs / 'release-v1.4.0-20261025-1300' / 'verify')
+        (runs / 'release-v1.4.0-20261025-1300' / 'session.json').write_text('{}')
+        (runs / 'release-v1.4.0-20261025-1400').mkdir()   # a session that did not run verify
+        (runs / 'release-v1.4.0-20261025-1400' / 'session.json').write_text('{}')
+        (runs / 'verify-20261025-1500').mkdir()   # a run that left nothing
+        self.assertEqual({n for n, _ in report.discover('verify', str(runs))},
+                         {'verify-20261025-1200', 'release-v1.4.0-20261025-1300/verify'})
+        roots = {**self.roots, 'verify': str(runs)}
+        status, _, page = self.get('/report/verify/verify-20261025-1200', roots)
+        self.assertEqual(status, 200)
+        for text in ('<h1>Verify: failed</h1>', 'rescan, nothing changed', "<td class='num bad'>1</td>", '0 PASS · 1 FAIL · 0 SKIP'):
+            self.assertIn(text, page)
+        self.assertNotIn('server.log', page)   # the viewer serves the page alone: a relative log link would not resolve
+        self.assertEqual(self.get('/report/verify/release-v1.4.0-20261025-1300/verify', roots)[0], 200)
+        _, _, tab = self.get('/verify', roots)
+        self.assertIn("href='/report/verify/verify-20261025-1200'", tab)
+
+    def test_a_verify_report_on_disk_is_served_as_written(self):
+        self.verify_result(self.verify / 'verify-1')
+        (self.verify / 'verify-1' / 'report.html').write_text('<p>static</p>')
+        self.assertEqual(self.get('/report/verify/verify-1')[2], '<p>static</p>')
+
+    def test_an_invalid_verify_result_is_a_readable_error(self):
+        (self.verify / 'verify-1').mkdir(parents=True)
+        (self.verify / 'verify-1' / 'result.json').write_text('{"schema": 1}')
+        status, _, page = self.get('/report/verify/verify-1')
+        self.assertEqual(status, 400)
+        self.assertIn('result.json is not a valid result', page)
+
     def test_discovery_without_a_directory_is_empty(self):
         self.assertEqual(report.discover('parity', None), [])
         self.assertEqual(report.discover('parity', str(self.root / 'missing')), [])
 
-    def test_index_has_three_tabs_and_lists_benchmark_runs(self):
+    def test_index_has_four_tabs_and_lists_benchmark_runs(self):
         status, kind, page = self.get('/')
         self.assertEqual((status, kind), (200, 'text/html; charset=utf-8'))
-        for tab in ('/benchmark', '/adoption', '/parity'):
+        for tab in ('/benchmark', '/adoption', '/parity', '/verify'):
             self.assertIn(f"href='{tab}'", page)
         self.assertIn("href='/report/benchmark/a'", page)
         self.assertIn("href='/report/benchmark/b'", page)
@@ -243,16 +293,19 @@ class ViewerTests(unittest.TestCase):
             report.load_verdicts([str(self.bench / 'a')])
 
     def test_serve_takes_directories_from_flags_then_environment(self):
-        env = {'FERROFIN_ADOPTION_RUNS': str(self.adoption), 'FERROFIN_PARITY_RUNS': str(self.root / 'missing')}
-        cases = [(['--serve', '1234', str(self.bench), '--parity-dir', str(self.parity)], 1234,
-                  {'benchmark': str(self.bench), 'adoption': str(self.adoption), 'parity': str(self.parity)}),
+        env = {'FERROFIN_ADOPTION_RUNS': str(self.adoption), 'FERROFIN_PARITY_RUNS': str(self.root / 'missing'),
+               'FERROFIN_VERIFY_RUNS': str(self.verify)}
+        cases = [(['--serve', '1234', str(self.bench), '--parity-dir', str(self.parity), '--verify-dir', str(self.adoption)], 1234,
+                  {'benchmark': str(self.bench), 'adoption': str(self.adoption), 'parity': str(self.parity),
+                   'verify': str(self.adoption)}),
                  (['--serve', str(self.bench)], 8097,
-                  {'benchmark': str(self.bench), 'adoption': str(self.adoption), 'parity': None})]
+                  {'benchmark': str(self.bench), 'adoption': str(self.adoption), 'parity': None, 'verify': str(self.verify)})]
         for argv, port, roots in cases:
             with self.subTest(argv), patch.dict('os.environ', env), patch.object(report.sys, 'argv', ['report.py', *argv]), \
                     patch.object(report, 'serve') as serve:
                 self.parity.mkdir(exist_ok=True)
                 self.adoption.mkdir(exist_ok=True)
+                self.verify.mkdir(exist_ok=True)
                 report.main()
                 serve.assert_called_once_with(port, roots)
 
@@ -260,13 +313,13 @@ class ViewerTests(unittest.TestCase):
         gates = self.root / 'gates'
         runs, work = gates / 'runs', gates / 'work'
         cases = [  # (argv, environment beyond the root, the tabs served)
-            (['--serve'], {}, {'benchmark': str(runs), 'adoption': str(work), 'parity': str(runs)}),
+            (['--serve'], {}, {'benchmark': str(runs), 'adoption': str(work), 'parity': str(runs), 'verify': str(runs)}),
             # a positional RUNS_DIR, a flag and a variable each still win over the root
             (['--serve', str(self.bench), '--parity-dir', str(self.parity)], {'FERROFIN_ADOPTION_RUNS': str(self.adoption)},
-             {'benchmark': str(self.bench), 'adoption': str(self.adoption), 'parity': str(self.parity)}),
+             {'benchmark': str(self.bench), 'adoption': str(self.adoption), 'parity': str(self.parity), 'verify': str(runs)}),
             # a variable naming a missing directory is an empty tab, not the root's
             (['--serve'], {'FERROFIN_PARITY_RUNS': str(self.root / 'missing')},
-             {'benchmark': str(runs), 'adoption': str(work), 'parity': None}),
+             {'benchmark': str(runs), 'adoption': str(work), 'parity': None, 'verify': str(runs)}),
         ]
         self.parity.mkdir()
         self.adoption.mkdir()
@@ -276,7 +329,7 @@ class ViewerTests(unittest.TestCase):
                 runs.mkdir()
             else:  # an adoption-only root has no runs/ yet: empty benchmark and parity tabs, not an exit
                 runs.rmdir()
-                cases = [(['--serve'], {}, {'benchmark': str(runs), 'adoption': str(work), 'parity': None})]
+                cases = [(['--serve'], {}, {'benchmark': str(runs), 'adoption': str(work), 'parity': None, 'verify': None})]
             for argv, env, tabs in cases:
                 with self.subTest(argv=argv, env=env, runs=create_runs), \
                         patch.dict('os.environ', {'FERROFIN_GATES_DIR': str(gates), **env}, clear=True), \
