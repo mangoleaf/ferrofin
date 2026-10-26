@@ -60,7 +60,9 @@ pub enum DbError {
         tables: String,
     },
 
-    /// The pre-migration database snapshot could not be written.
+    /// A database snapshot (the adoption copy, the one kept before a
+    /// table-rebuilding migration, or a boot repair's) could not be written,
+    /// flushed or renamed into place.
     #[error("failed to write database backup `{path}`: {source}")]
     Backup {
         /// The destination the snapshot was being copied to.

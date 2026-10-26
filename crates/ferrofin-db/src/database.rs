@@ -975,8 +975,7 @@ impl Database {
             tracing::info!("database snapshot waiting for database maintenance to finish");
             Arc::clone(&self.maintenance).lock_owned().await
         };
-        let dest = dest.to_string_lossy().replace('\'', "''");
-        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{dest}'")))
+        sqlx::query(sqlx::AssertSqlSafe(vacuum_into(dest)))
             .execute(&self.snapshotter)
             .await?;
         Ok(())
@@ -1004,17 +1003,32 @@ impl Database {
     /// in-memory database or when that snapshot already exists (an earlier
     /// boot's, the file as it was before the first attempt).
     ///
+    /// The snapshot is written under a temporary name and only renamed into
+    /// place once it is complete and on disk ([`publish_snapshot`]), so an
+    /// existing one is never a copy a full disk or a kill cut short. Something
+    /// other than a file on the snapshot's name (a directory) is no snapshot:
+    /// the rename onto it fails, and so does the repair, rather than run with
+    /// none.
+    ///
     /// # Errors
-    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the snapshot fails.
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the snapshot fails,
+    /// or [`DbError::Backup`](crate::DbError::Backup) if it cannot be flushed
+    /// or renamed into place.
     pub async fn snapshot_once(&self, extension: &str) -> Result<Option<std::path::PathBuf>> {
         let Some(path) = &self.file_path else {
             return Ok(None);
         };
         let backup = path.with_extension(extension);
-        if backup.exists() {
+        if backup.is_file() {
+            log_kept_snapshot(&backup);
             return Ok(None);
         }
-        self.snapshot_to(&backup).await?;
+        let partial = start_snapshot(&backup)?;
+        let written = match self.snapshot_to(&partial).await {
+            Ok(()) => publish_snapshot(&partial, &backup),
+            Err(error) => Err(error),
+        };
+        abandon_on_error(&partial, written)?;
         Ok(Some(backup))
     }
 }
@@ -1475,16 +1489,13 @@ async fn adopt_jellyfin_database(
         return Err(unsupported_generation(&applied));
     };
 
-    // One-time safety copy, WAL folded in first so the file is complete.
-    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&mut *conn)
-        .await?;
+    // One-time safety copy. An earlier boot's is kept: it is complete, and it
+    // is the file as that boot found it.
     let backup = path.with_extension("db.pre-ferrofin");
-    if !backup.exists() {
-        std::fs::copy(path, &backup).map_err(|source| crate::DbError::Backup {
-            path: backup.display().to_string(),
-            source,
-        })?;
+    if backup.is_file() {
+        log_kept_snapshot(&backup);
+    } else {
+        copy_database_file(conn, path, &backup).await?;
     }
 
     // Baseline + adoption record, atomically: a crash between the two would
@@ -1559,9 +1570,15 @@ const REBUILD_MIGRATIONS: &[i64] = &[7, 32, 44];
 /// A rebuild drops and recreates `BaseItems`/`Users`/… — the riskiest thing a
 /// migration does (one such rebuild once cascade-deleted every user's data,
 /// `cbc983f`) — so an existing file-backed database is copied aside once
-/// (`<db>.pre-00NN`, for the highest [`REBUILD_MIGRATIONS`] entry not yet
+/// (`<db>.pre-00NN`, for the first [`REBUILD_MIGRATIONS`] entry not yet
 /// recorded) before it runs. Fresh databases (no `_sqlx_migrations` yet) and
 /// databases already past every rebuild are left alone.
+///
+/// The first attempt wins: an existing snapshot of that name is kept as an
+/// earlier boot left it (complete, see [`publish_snapshot`]), because a retry
+/// after a boot that committed part of the chain must not replace the file as
+/// it was before it. A boot that keeps failing therefore writes one copy, not
+/// one per attempt.
 async fn backup_before_rebuild(
     conn: &mut sqlx::SqliteConnection,
     path: &std::path::Path,
@@ -1592,22 +1609,133 @@ async fn backup_before_rebuild(
     let Some(version) = pending else {
         return Ok(());
     };
-    // Fold the WAL into the main file so a plain file copy is a complete,
-    // consistent snapshot (startup: no other writers yet).
-    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&mut *conn)
-        .await?;
     let backup = path.with_extension(format!("db.pre-{version:04}"));
-    std::fs::copy(path, &backup).map_err(|source| crate::DbError::Backup {
-        path: backup.display().to_string(),
-        source,
-    })?;
+    if backup.is_file() {
+        log_kept_snapshot(&backup);
+        return Ok(());
+    }
+    copy_database_file(conn, path, &backup).await?;
     tracing::info!(
         backup = %backup.display(),
         migration = version,
         "database snapshot taken before a table-rebuilding or row-deleting migration"
     );
     Ok(())
+}
+
+/// Copies the database file to `backup`, on the migration connection before
+/// the pools open: the write-ahead log is folded into the main file first, so
+/// a byte-for-byte copy is complete (startup: no other writers yet).
+async fn copy_database_file(
+    conn: &mut sqlx::SqliteConnection,
+    path: &std::path::Path,
+    backup: &std::path::Path,
+) -> Result<()> {
+    let partial = start_snapshot(backup)?;
+    let written = async {
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&mut *conn)
+            .await?;
+        std::fs::copy(path, &partial).map_err(|source| crate::DbError::Backup {
+            path: backup.display().to_string(),
+            source,
+        })?;
+        publish_snapshot(&partial, backup)
+    }
+    .await;
+    abandon_on_error(&partial, written)
+}
+
+/// The temporary name a snapshot is written under until it is complete
+/// (`backup` with `.partial` appended), after removing whatever an earlier,
+/// interrupted attempt left there.
+fn start_snapshot(backup: &std::path::Path) -> Result<std::path::PathBuf> {
+    let mut partial = backup.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
+    // Removed, or nothing there: either way the name is free.
+    match std::fs::remove_file(&partial) {
+        Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+            Err(crate::DbError::Backup {
+                path: partial.display().to_string(),
+                source,
+            })
+        }
+        _ => Ok(partial),
+    }
+}
+
+/// Gives a complete snapshot its name: flushes `partial` to disk (SQLite does
+/// not sync a `VACUUM INTO` file, and a plain copy sits in the page cache),
+/// renames it to `backup` and flushes the directory, so the name survives a
+/// crash. Until then only `partial` exists, so a snapshot that a full disk or a
+/// kill cut short is never taken for a complete one: the next attempt removes
+/// it and starts over.
+fn publish_snapshot(partial: &std::path::Path, backup: &std::path::Path) -> Result<()> {
+    let failed = |source| crate::DbError::Backup {
+        path: backup.display().to_string(),
+        source,
+    };
+    // A handle opened for writing: Windows will not flush a read-only one.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(partial)
+        .and_then(|file| file.sync_all())
+        .map_err(failed)?;
+    std::fs::rename(partial, backup).map_err(failed)?;
+    sync_parent_dir(backup).map_err(failed)
+}
+
+/// Passes `written` through, removing the half-written `partial` first when
+/// it failed: a copy cut short by a full disk must not keep holding the space
+/// the migrations after it need.
+fn abandon_on_error(partial: &std::path::Path, written: Result<()>) -> Result<()> {
+    if written.is_err()
+        && let Err(error) = std::fs::remove_file(partial)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(
+            path = %partial.display(),
+            error = %error,
+            "could not remove a half-written database snapshot"
+        );
+    }
+    written
+}
+
+/// Flushes the directory holding `path`, so a rename into it survives a crash.
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Only Unix can open a directory to flush it; elsewhere the rename is left to
+/// the filesystem.
+#[cfg(not(unix))]
+fn sync_parent_dir(_: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Says that a snapshot an earlier boot took was kept, so the log never passes
+/// it off as a copy of the database as it is now. It is trusted by its name,
+/// even if it is another database's that was moved into this folder (owner
+/// decision, 2026-10-25).
+fn log_kept_snapshot(backup: &std::path::Path) {
+    tracing::info!(
+        backup = %backup.display(),
+        "kept the database snapshot an earlier boot took; it is the file as that boot found it, not a copy taken now"
+    );
+}
+
+/// The `VACUUM INTO` statement that writes a copy of the database to `dest`,
+/// its quotes doubled for the SQL string literal.
+fn vacuum_into(dest: &std::path::Path) -> String {
+    let dest = dest.to_string_lossy().replace('\'', "''");
+    format!("VACUUM INTO '{dest}'")
 }
 
 /// What a database file records about the migrations applied to it, as read
@@ -1970,6 +2098,88 @@ mod tests {
             memory.snapshot_once("db.pre-rehome").await.expect("memory"),
             None
         );
+    }
+
+    /// An existing repair snapshot is kept as an earlier boot left it, and
+    /// something other than a file on its name fails the repair instead of
+    /// letting it run with no snapshot.
+    #[tokio::test]
+    async fn a_repair_snapshot_keeps_an_earlier_one_and_refuses_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let db = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrate");
+        let earlier = dir.path().join("jellyfin.db.pre-rehome");
+        std::fs::write(&earlier, b"an earlier boot's snapshot").expect("earlier");
+        assert_eq!(db.snapshot_once("db.pre-rehome").await.expect("kept"), None);
+        assert!(
+            std::fs::read(&earlier).expect("read") == b"an earlier boot's snapshot",
+            "an earlier boot's snapshot is left as it was"
+        );
+
+        std::fs::create_dir(dir.path().join("jellyfin.db.pre-harmonize")).expect("squat");
+        let err = db
+            .snapshot_once("db.pre-harmonize")
+            .await
+            .expect_err("a directory is no snapshot");
+        assert!(
+            matches!(&err, crate::DbError::Backup { path, .. } if path.ends_with("jellyfin.db.pre-harmonize")),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.path()
+                .join("jellyfin.db.pre-harmonize.partial")
+                .exists()
+        );
+    }
+
+    /// A kill during a repair snapshot leaves a truncated file, but only under
+    /// its temporary name: the final name is given to complete snapshots only,
+    /// so the next attempt is not fooled, removes the leftover and starts over.
+    #[tokio::test]
+    async fn an_interrupted_repair_snapshot_is_redone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let db = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrate");
+        let partial = dir.path().join("jellyfin.db.pre-rehome.partial");
+        std::fs::write(&partial, b"SQLite format 3\0cut short").expect("leftover");
+
+        let written = db.snapshot_once("db.pre-rehome").await.expect("snapshot");
+        assert_eq!(written, Some(dir.path().join("jellyfin.db.pre-rehome")));
+        assert!(!partial.exists(), "the interrupted attempt is removed");
+        assert_eq!(
+            newest_migration(&dir.path().join("jellyfin.db.pre-rehome")).await,
+            MIGRATOR.iter().last().map(|m| m.version),
+            "the snapshot is a complete copy of the database"
+        );
+    }
+
+    /// The newest migration the database file at `path` records, read-only:
+    /// a file that opens and answers this is a complete database.
+    async fn newest_migration(path: &std::path::Path) -> Option<i64> {
+        use sqlx::ConnectOptions as _;
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .connect()
+            .await
+            .expect("open the snapshot");
+        let ok: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&mut conn)
+            .await
+            .expect("integrity_check");
+        assert_eq!(ok, "ok", "{} is not intact", path.display());
+        let newest = sqlx::query_scalar(r#"SELECT MAX(version) FROM "_sqlx_migrations""#)
+            .fetch_one(&mut conn)
+            .await
+            .expect("newest migration");
+        sqlx::Connection::close(conn).await.expect("close");
+        newest
     }
 
     /// Runs `sql` against a database file created at `path`.
@@ -2563,6 +2773,54 @@ mod tests {
             .expect("version");
         assert_eq!(at, 6, "the schema must be untouched after a refused open");
         sqlx::Connection::close(conn).await.expect("close");
+        assert!(
+            !path.with_extension("db.pre-0007.partial").exists(),
+            "the half-written copy does not keep holding the disk"
+        );
+    }
+
+    /// A retried upgrade keeps the snapshot its first attempt took before the
+    /// table rebuilds: that attempt may have committed part of the chain, so
+    /// the file now is not the file as it was. Only a complete snapshot ever
+    /// has the final name, so keeping it is safe.
+    #[tokio::test]
+    async fn a_retried_upgrade_keeps_the_snapshot_its_first_attempt_took() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let url = seed_pre_0007_database(&path).await;
+        let first = path.with_extension("db.pre-0007");
+        std::fs::write(&first, b"the first attempt's copy").expect("an earlier snapshot");
+
+        Database::connect_sized(&url, Some(1))
+            .await
+            .expect("upgrade");
+        // `assert!`, not `assert_eq!`: a replaced snapshot is a whole database.
+        assert!(
+            std::fs::read(&first).expect("read") == b"the first attempt's copy",
+            "a retry must not replace the first attempt's snapshot"
+        );
+    }
+
+    /// The snapshot before a table rebuild is taken through its temporary
+    /// name: what an interrupted attempt left there is removed, and the
+    /// snapshot is the complete database as it was before the rebuild.
+    #[tokio::test]
+    async fn the_pre_rebuild_snapshot_is_complete_and_replaces_an_interrupted_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let url = seed_pre_0007_database(&path).await;
+        let partial = path.with_extension("db.pre-0007.partial");
+        std::fs::write(&partial, b"SQLite format 3\0cut short").expect("leftover");
+
+        Database::connect_sized(&url, Some(1))
+            .await
+            .expect("upgrade");
+        assert!(!partial.exists(), "the interrupted attempt is removed");
+        assert_eq!(
+            newest_migration(&path.with_extension("db.pre-0007")).await,
+            Some(6),
+            "the snapshot is the database before 0007"
+        );
     }
 
     /// The seatbelt on the `foreign_keys = OFF` migration connection: a boot
@@ -2947,6 +3205,46 @@ mod tests {
                 generation.name
             );
         }
+    }
+
+    /// A retried adoption keeps the `.pre-ferrofin` copy its first attempt
+    /// took, and one cut short (only ever under its temporary name) is redone.
+    #[tokio::test]
+    async fn a_retried_adoption_keeps_its_first_copy_and_redoes_an_interrupted_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture(&path, &JELLYFIN_10_11_8_MIGRATIONS).await;
+        let copy = path.with_extension("db.pre-ferrofin");
+        std::fs::write(&copy, b"the first attempt's copy").expect("an earlier copy");
+        let url = format!("sqlite://{}", path.display());
+        drop(Database::connect_sized(&url, Some(1)).await.expect("adopt"));
+        assert!(
+            std::fs::read(&copy).expect("read") == b"the first attempt's copy",
+            "a retry must not replace the first attempt's copy"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture(&path, &JELLYFIN_10_11_8_MIGRATIONS).await;
+        let partial = path.with_extension("db.pre-ferrofin.partial");
+        std::fs::write(&partial, b"SQLite format 3\0cut short").expect("leftover");
+        let url = format!("sqlite://{}", path.display());
+        drop(Database::connect_sized(&url, Some(1)).await.expect("adopt"));
+        assert!(!partial.exists(), "the interrupted attempt is removed");
+        let ef_rows: i64 = {
+            use sqlx::ConnectOptions as _;
+            let mut conn = SqliteConnectOptions::new()
+                .filename(path.with_extension("db.pre-ferrofin"))
+                .read_only(true)
+                .connect()
+                .await
+                .expect("open the copy");
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#)
+                .fetch_one(&mut conn)
+                .await
+                .expect("the copy is the unadopted database")
+        };
+        assert_eq!(ef_rows, 68);
     }
 
     #[tokio::test]
