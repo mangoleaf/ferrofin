@@ -1079,6 +1079,45 @@ async fn display_preferences_post_cross_user_as_non_admin_is_forbidden() {
     assert!(prefs.row.lock().unwrap().is_none());
 }
 
+/// `[FromQuery, Required] string client`: ASP.NET binds a missing, empty or
+/// whitespace-only value as `null`, and model validation answers `400` before
+/// the action, so ahead of `GetUserId`'s `403` for another user's id. Probed on
+/// Jellyfin 12.2: `?client=%20` and `?client=%09` are `400` for GET and POST,
+/// and a non-administrator's `?client=%20&userId=<other>` is `400`, not `403`.
+/// The `Query` extractor does both (`query/required.json` lists `client`).
+#[rstest::rstest]
+#[case::get_space("GET", "client=%20")]
+#[case::get_tab("GET", "client=%09")]
+#[case::get_empty("GET", "client=")]
+#[case::get_missing("GET", "")]
+#[case::get_blank_for_another_user("GET", "client=%20&userId=OTHER")]
+#[case::post_space("POST", "client=%20")]
+#[case::post_blank_for_another_user("POST", "client=%20&userId=OTHER")]
+#[tokio::test]
+async fn display_preferences_refuse_a_blank_client(#[case] method: &str, #[case] query: &str) {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let app = state_with_display_prefs(prefs.clone());
+    let body = if method == "POST" {
+        Body::from(r#"{"CustomPrefs":{}}"#)
+    } else {
+        Body::empty()
+    };
+    let (status, _) = send(
+        app,
+        method,
+        &format!(
+            "/DisplayPreferences/home?{}",
+            query.replace("OTHER", &OTHER_USER_ID.to_string())
+        ),
+        body,
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Refused before any row is read or created.
+    assert!(prefs.asked_item.lock().unwrap().is_none());
+}
+
 /// The other half of the rule: an **administrator** naming another user's id is
 /// still served. A gate that refuses everyone is not a port of `GetUserId`.
 #[tokio::test]

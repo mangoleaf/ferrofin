@@ -8,6 +8,13 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — the config file must be TOML
+
+Usually nothing to do: `{data_dir}/config.toml` reads as before. A `--config` or
+`FERROFIN_CONFIG_FILE` path with another extension (`.json`, `.json5`, `.yaml`, `.yml`,
+`.ini`, `.ron`) used to be read in that format; it now stops the server with "is not of a
+supported file format". Rewrite the file as TOML under a `.toml` name.
+
 ## Unreleased — user and policy saves need a complete body
 
 Usually nothing to do: the web client posts back the user it read. A script that calls

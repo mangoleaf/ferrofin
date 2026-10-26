@@ -11,7 +11,6 @@ workspace = true
 
 [dependencies]
 if-addrs.workspace = true
-ferrofin-common.workspace = true
 ferrofin-model.workspace = true
 ferrofin-util.workspace = true
 serde.workspace = true

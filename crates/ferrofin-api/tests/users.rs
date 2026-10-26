@@ -342,10 +342,12 @@ impl QuickConnect for OkQuickConnect {
     }
 }
 
-/// Records token revocation while leaving unrelated session methods unused.
+/// Records token revocation and user-session pushes while leaving unrelated
+/// session methods unused.
 #[derive(Default)]
 struct NoopSessions {
     revoked: Mutex<Vec<(Uuid, String)>>,
+    pushed: Mutex<Vec<(Vec<Uuid>, SessionMessageType)>>,
 }
 
 #[async_trait]
@@ -425,12 +427,16 @@ impl SessionManager for NoopSessions {
     }
     async fn send_message_to_user_sessions(
         &self,
-        _user_ids: &[Uuid],
-        _message_type: SessionMessageType,
+        user_ids: &[Uuid],
+        message_type: SessionMessageType,
         _data: &str,
     ) -> Result<(), ServiceError> {
         // The user-update handlers push UserUpdated/UserDeleted here
         // best-effort; delivery is covered by ferrofin-core's tests.
+        self.pushed
+            .lock()
+            .unwrap()
+            .push((user_ids.to_vec(), message_type));
         Ok(())
     }
     async fn send_message_to_user_device_sessions(
@@ -2295,6 +2301,57 @@ async fn update_user_renames_whenever_the_name_differs(
     );
     let renamed = users.renamed.lock().unwrap().clone();
     assert_eq!(renamed.as_ref().map(|(_, name)| name.as_str()), renamed_to);
+}
+
+/// v12.2 raises `UserUpdatedEventArgs`, whose `UserUpdatedNotifier` is the only
+/// sender of `UserUpdated`, from `RenameUser` and `UpdatePolicyAsync` alone:
+/// `UpdateUser` renames only when the name changed, and
+/// `UpdateConfigurationAsync` raises nothing.
+#[rstest::rstest]
+#[case::update_without_rename("/Users?userId=BOB", r#"{"Name":"bob","Policy":null}"#, false)]
+#[case::update_with_rename("/Users?userId=BOB", r#"{"Name":"robert","Policy":null}"#, true)]
+#[case::user_scoped_update("/Users/BOB", r#"{"Name":"bob","Policy":null}"#, false)]
+#[case::configuration("/Users/Configuration?userId=BOB", "{}", false)]
+#[case::user_scoped_configuration("/Users/BOB/Configuration", "{}", false)]
+#[case::policy("/Users/BOB/Policy", "POLICY", true)]
+#[tokio::test]
+async fn only_a_rename_or_a_policy_save_pushes_user_updated(
+    #[case] uri: &str,
+    #[case] body: &str,
+    #[case] pushes: bool,
+) {
+    let sessions = Arc::new(NoopSessions::default());
+    let router = create_router(state_with_sessions(
+        Arc::new(MemUsers::default()),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::new(AdminAuth),
+        sessions.clone(),
+    ));
+    let body = if body == "POLICY" {
+        serde_json::to_string(&complete_policy()).unwrap()
+    } else {
+        body.to_owned()
+    };
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri.replace("BOB", &BOB_ID.to_string()))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let expected = if pushes {
+        vec![(vec![BOB_ID], SessionMessageType::UserUpdated)]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(*sessions.pushed.lock().unwrap(), expected);
 }
 
 /// `UserDto`'s constructor supplies a default `UserConfiguration`, so a body

@@ -26,6 +26,9 @@ ffmpeg/ffprobe are auto-discovered on `$PATH`; without them only transcoding is 
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --workspace          # + cargo test --workspace --doc for doctests
+cargo deny --locked check              # advisories, licenses, bans, sources (deny.toml)
+cargo machete apps crates              # declared but unused dependencies
+scripts/check-workspace-deps.py        # every dependency through [workspace.dependencies]
 ```
 
 Every `pub` item needs a `///` doc and pedantic clippy must pass (warnings are
@@ -42,6 +45,15 @@ translation, DTO fields, user data, access filtering, images, paging and sort), 
 operation rows reference through `refs`. A re-checked row leaves
 `VERIFIED_AGAINST_EARLIER_PIN` (or `VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`). Live
 parity runs and benchmark shape checks are supporting evidence; they never add a row.
+
+**Dependencies.** Declare a dependency once, in the root `[workspace.dependencies]`, and
+reference it as `dep.workspace = true`; `scripts/check-workspace-deps.py` refuses an inline
+version, and cargo-deny a workspace entry nothing uses. When `cargo deny` reports an
+advisory, even one published after your change, upgrade the crate if a fixed version exists
+(`cargo update -p <crate> --precise <version>`, or a manifest bump for a new major). An
+advisory with no fix, or one that does not reach Ferrofin's use of the crate, goes into
+`deny.toml`'s `[advisories] ignore` with its reason, and leaves it once the crate is fixed.
+A new license is a compatibility decision against GPL-3.0-only, not a fix.
 
 **Coverage gate — ≥80% line coverage, per crate:**
 

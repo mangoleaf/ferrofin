@@ -221,6 +221,9 @@ request via `Authorization: MediaBrowser Token="…", Client="…", Device="…"
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --workspace          # + `cargo test --workspace --doc` for doctests
+cargo deny --locked check              # advisories, licenses, bans, sources (deny.toml)
+cargo machete apps crates              # declared but unused dependencies
+scripts/check-workspace-deps.py        # every dependency through [workspace.dependencies]
 ```
 
 **Coverage gate — ≥80% line coverage, enforced per-crate:**

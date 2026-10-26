@@ -10,7 +10,6 @@ description = "Common infra for Ferrofin (port of MediaBrowser.Common): config, 
 workspace = true
 
 [dependencies]
-serde.workspace = true
 thiserror.workspace = true
 regex.workspace = true
 uuid.workspace = true

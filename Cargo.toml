@@ -79,13 +79,12 @@ ferrofin-api = { path = "crates/ferrofin-api" }
 
 # ── http / async ───────────────────────────────────────────────────
 axum = "0.8"
-axum-extra = { version = "0.12.6", features = ["typed-header"] }
 tower = "0.5"
 tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
 # Decoders for the response-compression tests only (the server never decodes a
 # response it just encoded). Streaming readers validate the wire response.
 flate2 = "1.1.10"
-zip = { version = "8", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books)
+zip = { version = "9", default-features = false, features = ["deflate"] }   # .cbz/.epub archives (ferrofin-providers books); backup archives (ferrofin-api, which adds `time`)
 tar = { version = "0.4.46", default-features = false }   # .cbt comic covers (ferrofin-providers books); read-only, so no `xattr`
 sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip2", "deflate", "ppmd"] }   # .cb7 comic covers (ferrofin-providers books)
 brotli = "9.0.0"
@@ -101,7 +100,8 @@ futures-util = "0.3.34"
 notify = "8.2"
 
 # ── persistence: sqlx + SQLite (speed-first; see plan) ─────────────
-sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio", "tls-rustls-ring", "macros", "chrono", "uuid"] }
+# SQLite has no network transport, so no TLS; `macros` stays only because it carries `migrate!`.
+sqlx = { version = "0.9.0", default-features = false, features = ["sqlite", "runtime-tokio", "macros", "migrate", "chrono", "uuid"] }
 # Direct handle on the SQLite C API, pinned to the exact version sqlx resolves so
 # cargo unifies them to ONE linked copy — a second copy would mean a second,
 # unconfigured SQLite. Used only to call sqlite3_config() before any connection.
@@ -139,7 +139,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
 p12-keystore = "0.4.1"
 # Self-signed certificates for the HTTPS tests (dev-dependency only).
-rcgen = "0.14.10"
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 
 # ── openapi ────────────────────────────────────────────────────────
 utoipa = "6.0.0"
@@ -151,7 +151,8 @@ utoipa = "6.0.0"
 opentelemetry = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["metrics", "trace"] }
 opentelemetry-prometheus = "0.33.0"
-opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "trace"] }
+# TLS for an https collector: aws-lc as everywhere else, roots from the system store.
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "trace", "tls-aws-lc", "tls-roots"] }
 tracing-opentelemetry = "0.34.0"
 # encode-only; ferrofin-metrics ONLY — the 0.32 exporter exposes no render helper,
 # so `Registry` + `TextEncoder` come from a direct dep (dedupes with the exporter's ^0.14).
@@ -164,7 +165,7 @@ prometheus = { version = "0.14", default-features = false }
 # so the list is the sandbox's grant (`threads`, `gc` with exceptions,
 # `component-model-async` and `stack-switching` stay off, and so do the
 # profiling, cache, coredump and pooling extras). Only WASIp2 is linked.
-wasmtime = { version = "49.0.0", default-features = false, features = [
+wasmtime = { version = "49.0.4", default-features = false, features = [
     "addr2line",
     "anyhow",
     "backtrace",
@@ -176,7 +177,7 @@ wasmtime = { version = "49.0.0", default-features = false, features = [
     "std",
 ] }
 # Locked-down empty WASI ctx (no preopens/sockets) so std guests link.
-wasmtime-wasi = { version = "49.0.0", default-features = false, features = ["p2"] }
+wasmtime-wasi = { version = "49.0.4", default-features = false, features = ["p2"] }
 wat = "1.259.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────
@@ -184,6 +185,7 @@ uuid = { version = "1.26.1", features = ["v4", "serde"] }
 url = "2.5.8"
 chrono = { version = "0.4", features = ["serde"] }
 unicode-normalization = "0.1.25"
+rand = "0.10.3"           # ShuffleExtensions (ferrofin-util `shuffle`)
 # Legacy text encodings (subtitles, playlist files) — C# `UtfUnknown`.
 encoding_rs = "0.8.35"
 chardetng = "0.1.17"
@@ -191,7 +193,6 @@ shlex = "2"              # ffmpeg command strings → argv (ferrofin-mediaencodi
 async-trait = "0.1.92"
 libc = "0.2"
 windows-sys = { version = "0.61.2", features = ["Win32_System_Threading"] }
-argon2 = "0.6.0"
 pbkdf2 = "0.13.0"          # password hashing — matches Jellyfin's Rfc2898DeriveBytes.Pbkdf2
 sha2 = "0.11.0"            # PBKDF2-HMAC-SHA512 (default hash id)
 sha1 = "0.11.0"            # PBKDF2-HMAC-SHA1 (legacy "PBKDF2" hash id)
@@ -200,7 +201,7 @@ kamadak-exif = "0.6"                                        # photo EXIF (ferrof
 webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via libwebp (BSD-3) — image-webp is lossless-only; Skia parity needs Google's encoder
 jpeg-encoder = "0.7"     # JPEG encode with 4:2:0 chroma subsampling — the `image` crate's encoder is hardcoded 4:4:4; Skia's SkJpegEncoder defaults to 4:2:0
 blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not byte-identical to Jellyfin's Skia)
-config = "0.15.26"
+config = { version = "0.15.26", default-features = false, features = ["toml"] }   # config.toml is TOML only
 clap = { version = "4.6.7", features = ["derive"] }
 clap_mangen = "0.3.3"      # renders the .deb man page from the clap definition (test-maintained)
 bitflags = "2.13.2"
@@ -230,7 +231,6 @@ lofty = "0.25.4"
 
 # ── dev / test ─────────────────────────────────────────────────────
 rstest = "0.27.0"         # [Theory]/[InlineData] → #[case] transliteration
-insta = { version = "1", features = ["json"] }   # golden-file parity snapshots
 tempfile = "3"          # temp SQLite files for ferrofin-db tests
 
 # ── build profiles ─────────────────────────────────────────────────

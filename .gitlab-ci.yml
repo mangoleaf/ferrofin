@@ -96,7 +96,7 @@ create-release:
         matrix:
           - SHARD: [core, heavy, rest]   # every shard; keep in step with the `coverage` job's matrix
     - job: benchmark-report
-  image: alpine/git:latest        # has git + busybox awk/grep/sed; NO git-cliff
+  image: alpine/git:v2.54.0       # has git + busybox awk/grep/sed; NO git-cliff
   variables:
     GIT_DEPTH: "0"   # need full history + tags to derive the bump from commits
   script:
@@ -367,9 +367,9 @@ lint:
     - rustup target add wasm32-wasip2
   script:
     - cargo fmt --all --check
-    - cargo clippy --all-targets --all-features -- -D warnings
-    - cargo nextest run --workspace
-    - cargo test --workspace --doc   # nextest can't run doctests
+    - cargo clippy --locked --all-targets --all-features -- -D warnings
+    - cargo nextest run --locked --workspace
+    - cargo test --locked --workspace --doc   # nextest can't run doctests
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
       interruptible: true
@@ -437,7 +437,7 @@ coverage:
 # ---------------------------------------------------------------------------
 image-version:
   stage: .pre
-  image: alpine/git:latest
+  image: alpine/git:v2.54.0
   variables:
     GIT_DEPTH: "0"   # full history + tags to count build-relevant commits
   script:
@@ -560,7 +560,7 @@ docker-image:
 release-notes:
   stage: release
   image:
-    name: orhunp/git-cliff:latest
+    name: orhunp/git-cliff:2.14.2   # = mise.toml and release.yml
     entrypoint: [""]
   variables:
     GIT_DEPTH: 0                               # git-cliff needs full history + tags
@@ -575,7 +575,7 @@ release-notes:
 
 release:
   stage: release
-  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  image: registry.gitlab.com/gitlab-org/release-cli:v0.24.0
   needs: [release-notes]
   script:
     - echo "Creating GitLab Release for $CI_COMMIT_TAG"

@@ -28,7 +28,6 @@ ferrofin-traits.workspace = true
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
 ferrofin-common.workspace = true
-ferrofin-naming.workspace = true
 ferrofin-networking.workspace = true
 ferrofin-health.workspace = true
 ferrofin-mediaencoding.workspace = true
@@ -41,9 +40,7 @@ ferrofin-livetv.workspace = true
 ferrofin-metrics.workspace = true
 
 axum = { workspace = true, features = ["ws", "macros"] }
-tower.workspace = true
-# wasm_plugins integration test: compile the inline-WAT fixture component.
-wat.workspace = true        # outer path-canonicalization layer (case-insensitive routing)
+tower.workspace = true        # outer path-canonicalization layer (case-insensitive routing)
 tower-http.workspace = true   # ServeDir/ServeFile for the static web client
 socket2 = { workspace = true }
 rustls.workspace = true

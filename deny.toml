@@ -1,0 +1,70 @@
+# cargo-deny: the supply-chain gate. CI's `dependencies` job runs `cargo deny --locked check`
+# on every push and PR, and release.yml re-checks the advisories before it tags a release.
+# What to do when it fails is in CONTRIBUTING.md, "Dependencies".
+
+[graph]
+# Every optional feature too: the gate covers whatever any build of the workspace can link.
+all-features = true
+
+[advisories]
+# Every RustSec advisory against a crate the workspace builds fails the gate: vulnerabilities,
+# and the unmaintained and unsound notices of transitive crates too (a yanked version only
+# warns). Cargo.lock also records optional crates no feature turns on (quinn, for reqwest's
+# unused HTTP/3); the gate does not see those, so keep them patched with `cargo update` too.
+# An entry here needs a reason, and goes once its crate is upgraded or dropped.
+unmaintained = "all"
+unsound = "all"
+ignore = [
+    # A proc-macro lofty (tag and lyrics reading) builds with; every 0.25 release, 0.25.5
+    # included, depends on it. Not a vulnerability, and no code of it ships in the binary.
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained proc-macro of lofty 0.25, no fixed release" },
+]
+
+[licenses]
+# Licenses compatible with Ferrofin's GPL-3.0-only. A new one is a decision, not a fix:
+# check its compatibility before adding it.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-only",
+    "IJG",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "bzip2-1.0.6",
+]
+
+[bans]
+# Two versions of a crate are reported, not refused: most come from transitive majors no
+# manifest here chooses.
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace's own path dependencies carry no version; that is not a wildcard.
+allow-wildcard-paths = true
+deny = [
+    # One TLS crypto backend: rustls and tokio-rustls use aws-lc-rs, so ring would be a second
+    # C/asm stack to build and to watch for advisories. Cargo.lock still lists it as an optional
+    # dependency nothing turns on; the ban is on building it.
+    { crate = "ring", reason = "aws-lc-rs is the one rustls crypto provider" },
+]
+
+[bans.workspace-dependencies]
+# A dependency several crates declare apart from the root [workspace.dependencies] (CLAUDE.md),
+# and a workspace entry nothing uses. One crate's lone inline version passes this;
+# scripts/check-workspace-deps.py, in the same CI job, refuses it.
+duplicates = "deny"
+include-path-dependencies = true
+unused = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

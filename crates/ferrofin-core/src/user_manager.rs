@@ -57,7 +57,7 @@ use crate::auth_providers::{
 use crate::db_error::db_err;
 use crate::user_entity_ext::{
     has_permission, is_parental_schedule_allowed, seed_defaults, set_permission, set_permission_tx,
-    set_preference, set_preference_tx,
+    set_preference_tx,
 };
 
 /// The C# type name of the default password-reset provider, stored on
@@ -365,6 +365,24 @@ impl FerrofinUserManager {
         stored
             .filter(|id| apps.iter().any(|app| app.id == *id))
             .or_else(|| apps.first().map(|app| app.id.clone()))
+    }
+
+    /// The `CastReceiverId` a configuration save stores, `None` to keep the
+    /// stored one. Port of `UpdateConfigurationAsync`: only a non-empty id
+    /// naming a configured receiver application (ordinal) is taken. Without a
+    /// configuration seam there is no list to check, and the id is taken as
+    /// [`Self::resolve_cast_receiver_id`] echoes it.
+    async fn accepted_cast_receiver_id<'a>(&self, sent: Option<&'a str>) -> Option<&'a str> {
+        let sent = sent.filter(|id| !id.is_empty())?;
+        let Some(config) = &self.config else {
+            return Some(sent);
+        };
+        let configured = config.configuration().await.ok()?;
+        configured
+            .cast_receiver_applications
+            .iter()
+            .any(|app| app.id == sent)
+            .then_some(sent)
     }
 
     /// Attaches the activity-log seam so an account lockout is recorded as a
@@ -1362,7 +1380,14 @@ impl UserManager for FerrofinUserManager {
     ) -> Result<(), ServiceError> {
         self.require_user(user_id).await?;
         let id = guid_to_db(user_id);
+        let cast_receiver_id = self
+            .accepted_cast_receiver_id(config.cast_receiver_id.as_deref())
+            .await;
 
+        // One writer transaction, as upstream's single `SaveChangesAsync`. It
+        // starts with the UPDATE, so it holds the write lock from its first
+        // statement and never reads a snapshot a scan write could invalidate.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"UPDATE "Users" SET
                 "AudioLanguagePreference" = ?2, "PlayDefaultAudioTrack" = ?3,
@@ -1370,7 +1395,8 @@ impl UserManager for FerrofinUserManager {
                 "SubtitleMode" = ?6, "DisplayCollectionsView" = ?7,
                 "EnableLocalPassword" = ?8, "HidePlayedInLatest" = ?9,
                 "RememberAudioSelections" = ?10, "RememberSubtitleSelections" = ?11,
-                "EnableNextEpisodeAutoPlay" = ?12, "CastReceiverId" = ?13,
+                "EnableNextEpisodeAutoPlay" = ?12,
+                "CastReceiverId" = coalesce(?13, "CastReceiverId"),
                 "RowVersion" = "RowVersion" + 1
                WHERE "Id" = ?1"#,
         )
@@ -1386,40 +1412,26 @@ impl UserManager for FerrofinUserManager {
         .bind(config.remember_audio_selections)
         .bind(config.remember_subtitle_selections)
         .bind(config.enable_next_episode_auto_play)
-        .bind(&config.cast_receiver_id)
-        .execute(self.db.writer())
+        .bind(cast_receiver_id)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
 
-        // The list-valued configuration fields are stored as user preferences.
-        set_uuid_preference(
-            self.db.pool(),
-            &id,
-            PreferenceKind::GroupedFolders,
-            &config.grouped_folders,
-        )
-        .await?;
-        set_uuid_preference(
-            self.db.pool(),
-            &id,
-            PreferenceKind::OrderedViews,
-            &config.ordered_views,
-        )
-        .await?;
-        set_uuid_preference(
-            self.db.pool(),
-            &id,
-            PreferenceKind::LatestItemExcludes,
-            &config.latest_items_excludes,
-        )
-        .await?;
-        set_uuid_preference(
-            self.db.pool(),
-            &id,
-            PreferenceKind::MyMediaExcludes,
-            &config.my_media_excludes,
-        )
-        .await?;
+        // The list-valued configuration fields are stored as user preferences,
+        // as the hyphenated strings C# persists.
+        for (kind, values) in [
+            (PreferenceKind::OrderedViews, &config.ordered_views),
+            (PreferenceKind::GroupedFolders, &config.grouped_folders),
+            (PreferenceKind::MyMediaExcludes, &config.my_media_excludes),
+            (
+                PreferenceKind::LatestItemExcludes,
+                &config.latest_items_excludes,
+            ),
+        ] {
+            let strings: Vec<String> = values.iter().map(Uuid::to_string).collect();
+            set_preference_tx(&mut tx, &id, kind, &strings).await?;
+        }
+        tx.commit().await.map_err(db_err)?;
         self.auth_cache.clear();
         Ok(())
     }
@@ -1669,19 +1681,6 @@ async fn build_user_policy(
         blocked_media_folders: Some(blocked_media_folders),
         block_unrated_items,
     })
-}
-
-/// Writes a list of [`Uuid`]s to a list-valued preference, stored as their
-/// hyphenated strings (the form C# persists for the folder/view preference
-/// lists).
-async fn set_uuid_preference(
-    pool: &sqlx::sqlite::SqlitePool,
-    user_id: &str,
-    kind: PreferenceKind,
-    values: &[Uuid],
-) -> Result<(), ServiceError> {
-    let strings: Vec<String> = values.iter().map(Uuid::to_string).collect();
-    set_preference(pool, user_id, kind, &strings).await
 }
 
 /// Narrows a stored `i64` column to the DTO's `i32`, clamping on overflow.
@@ -2093,6 +2092,47 @@ mod tests {
         assert_eq!(bare.resolve_cast_receiver_id(None).await, None);
     }
 
+    // v12.2 `UpdateConfigurationAsync`: "Only set cast receiver id if it is
+    // passed in and it exists in the server config", else the stored one stays.
+    #[rstest::rstest]
+    #[case::configured(Some("F007D354"), Some("F007D354"))]
+    #[case::null(None, Some("6F511C87"))]
+    #[case::empty(Some(""), Some("6F511C87"))]
+    #[case::not_configured(Some("GONE"), Some("6F511C87"))]
+    #[case::case_differs(Some("6f511c87"), Some("6F511C87"))]
+    #[tokio::test]
+    async fn a_configuration_save_stores_only_a_configured_cast_receiver(
+        #[case] sent: Option<&str>,
+        #[case] stored: Option<&str>,
+    ) {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager> = Arc::new(
+            crate::configuration_manager::FerrofinServerConfigurationManager::load(
+                crate::app_paths::test_paths(dir.path()),
+            )
+            .await
+            .expect("config"),
+        );
+        let mgr = FerrofinUserManager::new(db).with_configuration(config);
+        let user = mgr.create_user("alice").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("id");
+        let save = |cast_receiver_id: Option<&str>| UserConfiguration {
+            cast_receiver_id: cast_receiver_id.map(str::to_owned),
+            ..UserConfiguration::default()
+        };
+        mgr.update_configuration(id, &save(Some("6F511C87")))
+            .await
+            .expect("pick a receiver");
+
+        mgr.update_configuration(id, &save(sent))
+            .await
+            .expect("save");
+
+        let user = mgr.get_user_by_id(id).await.expect("get").expect("present");
+        assert_eq!(user.cast_receiver_id.as_deref(), stored);
+    }
+
     #[tokio::test]
     async fn initialize_bootstraps_one_admin() {
         let db = test_db().await;
@@ -2263,11 +2303,11 @@ mod tests {
 
         // Seed a list-valued preference directly (the read path parses Guids).
         let folder = Uuid::from_u128(0xF00D);
-        set_uuid_preference(
-            db.pool(),
+        crate::user_entity_ext::set_preference(
+            db.writer(),
             &user.id,
             PreferenceKind::EnabledFolders,
-            &[folder],
+            &[folder.to_string()],
         )
         .await
         .expect("seed pref");

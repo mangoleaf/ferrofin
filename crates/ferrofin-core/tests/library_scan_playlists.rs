@@ -710,3 +710,57 @@ async fn a_playlist_files_sidecar_leaves_its_album_an_album() {
     assert!(f.row(f.id(BaseItemKind::Playlist, ALBUM)).await.is_none());
     assert_eq!(f.members(&format!("{ALBUM}/playlist.m3u")).await, [ONE]);
 }
+
+/// `PlaylistResolver`'s `new Playlist { OpenAccess = true }` is saved with
+/// the item, so the scan's save of a playlist writes its ownership row in the
+/// same transaction: a playlist is never without one, which would read as a
+/// legacy playlist every caller owns. A row a user or an adoption set is kept.
+#[tokio::test]
+async fn a_scanned_playlist_is_saved_with_its_ownership_row() {
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrate");
+    let persistence = FerrofinItemPersistenceService::new(db.clone());
+    let id = guid_to_db(Uuid::new_v4());
+    let playlist = BaseItemEntity {
+        id: id.clone(),
+        type_: "MediaBrowser.Controller.Playlists.Playlist".to_owned(),
+        name: Some("Mix".to_owned()),
+        path: Some("/music/Mix.m3u".to_owned()),
+        data: Some(
+            r#"{"OwnerUserId":"00000000-0000-0000-0000-000000000000","OpenAccess":true,"Shares":[],"PlaylistMediaType":"Audio"}"#
+                .to_owned(),
+        ),
+        ..BaseItemEntity::default()
+    };
+    let meta = || async {
+        sqlx::query_as::<_, (String, bool)>(
+            r#"SELECT "OwnerUserId", "OpenAccess" FROM "FerrofinPlaylists" WHERE "PlaylistId" = ?1"#,
+        )
+        .bind(&id)
+        .fetch_optional(db.pool())
+        .await
+        .expect("meta")
+    };
+
+    persistence
+        .save_scanned_items(std::slice::from_ref(&playlist))
+        .await
+        .expect("save");
+    assert_eq!(meta().await, Some((guid_to_db(Uuid::nil()), true)));
+
+    let owner = guid_to_db(Uuid::new_v4());
+    sqlx::query(
+        r#"UPDATE "FerrofinPlaylists" SET "OwnerUserId" = ?2, "OpenAccess" = 0
+           WHERE "PlaylistId" = ?1"#,
+    )
+    .bind(&id)
+    .bind(&owner)
+    .execute(db.writer())
+    .await
+    .expect("owner");
+    persistence
+        .save_scanned_items(std::slice::from_ref(&playlist))
+        .await
+        .expect("rescan");
+    assert_eq!(meta().await, Some((owner, false)));
+}

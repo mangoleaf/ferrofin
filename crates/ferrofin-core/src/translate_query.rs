@@ -1522,7 +1522,8 @@ fn append_name_predicates(
 
 /// The three letter-range filters run on the substituted BoxSet row in a
 /// recursive collapsed query (pinned ApplyGroupingFilter/ApplyNameFilters).
-fn append_name_ranges(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
+/// A by-name list's outer query runs them too (`GetItemValues`).
+pub(crate) fn append_name_ranges(qb: &mut QueryBuilder<Sqlite>, filter: &InternalItemsQuery) {
     if let Some(prefix) = non_blank(filter.name_starts_with.as_ref()) {
         push_name_starts_with(qb, prefix);
     }
