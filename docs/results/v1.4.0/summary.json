@@ -1,4 +1,114 @@
 {
+ "adoption": {
+  "rows": [
+   {
+    "expected": "10.11.8",
+    "fixture": "jellyfin-10.11.8",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "10.11.8",
+    "fixture": "jellyfin-10.11.9",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "10.11.11",
+    "fixture": "jellyfin-10.11.10",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "10.11.11",
+    "fixture": "jellyfin-10.11.11",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.0.0",
+    "fixture": "jellyfin-12.0",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.1.0",
+    "fixture": "jellyfin-12.1-from-10",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.1.0",
+    "fixture": "jellyfin-12.1-from-12",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.2-from-10",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.2-from-12",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.2-from-121",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.2-fresh",
+    "kind": "path",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "10.11.11",
+    "fixture": "jellyfin-10.11.11-messy",
+    "kind": "messy",
+    "reason": "messy: gone_file_userdata: {'item': True, 'userdata_on_item': 2, 'userdata_with_key': 2}, expected {'item': False, 'userdata_on_item': 0, 'userdata_with_key': 2} (Jellyfin 12.2);after restart: messy: ",
+    "verdict": "FAIL"
+   },
+   {
+    "expected": "12.2.0",
+    "fixture": "jellyfin-12.2-messy",
+    "kind": "messy",
+    "reason": "",
+    "verdict": "PASS"
+   },
+   {
+    "expected": "10.11.11",
+    "fixture": "jellyfin-10.11.11-scale",
+    "kind": "scale",
+    "reason": "",
+    "verdict": "PASS"
+   }
+  ],
+  "source": {
+   "commit": "5112240e1923cdc9a735b628945cc5ab6047c70d",
+   "date": "2026-10-26",
+   "image_digest": "sha256:673a122ff7175de381c72fda7faeec69d1e3f0073f22c73bd9eea043f381bd07",
+   "oracle": "12.2",
+   "session": "detached-5112240e1923-20261026-0101"
+  },
+  "verdict": "failed"
+ },
  "bench": {
   "cpu_per_screen": [
    {
