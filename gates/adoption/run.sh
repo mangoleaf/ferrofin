@@ -40,6 +40,7 @@
 # $FERROFIN_GATES_DIR (fixtures/adoption-<key>). The work directory is ADOPTION_WORK_DIR, else
 # $FERROFIN_GATES_DIR/work/adoption, else DIR/work/run (gates/lib.sh).
 set -uo pipefail
+ARGS=("$@")   # the worker gets them again (see below)
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=gates/adoption/lib.sh
 . "$HERE/lib.sh"
@@ -72,19 +73,45 @@ REPORT_PY="$HERE/adoption_report.py"
 record() { python3 "$REPORT_PY" "$@" >/dev/null 2>&1 || true; }
 # record_detail <args...> <detail>: the last argument goes in on stdin, so a detail that starts with "-" or is huge survives.
 record_detail() { local detail=${!#}; set -- "${@:1:$#-1}"; printf '%s' "$detail" | python3 "$REPORT_PY" "$@" --detail-stdin >/dev/null 2>&1 || true; }
+# bash 5.2 loses a trapped signal that arrives while it is parsing a $( … ): it prints "trap: line 2:
+# unexpected EOF while looking for matching `)'" and carries on, and this script parses them all the time, so
+# a TERM could go unanswered until every readiness deadline had run out (gl-920; bash 5.3 is not affected, and
+# a trap that only sets a flag fails the same way). So the run itself goes to a worker, in a session of its
+# own and with no traps (TERM keeps its default action; INT and QUIT are ignored, as for any asynchronous
+# command, and so they are here too when this shell was started in the background), and this shell only
+# waits for it: a signal always finds it in `wait`. It then stops the worker's process group (the worker,
+# its sampler, any docker or curl call: nothing in the run starts a group of its own) and builds the
+# report. A SIGKILL cannot be passed on: kill this shell that way and the worker runs on.
+if [ -z "${ADOPTION_RUN_WORKER:-}" ]; then
+  command -v setsid >/dev/null || { echo "run: setsid (util-linux) is required" >&2; exit 2; }
+  worker='' spawned=''
+  # shellcheck disable=SC2317,SC2329  # invoked by the EXIT trap (SC2317 is the code before shellcheck 0.11)
+  finish() {
+    trap '' INT TERM HUP QUIT   # a second signal must not cut the report short
+    # a signal between the spawn and `worker=$!` finds the worker in $! alone
+    local w=${worker:-}; [ -n "$w" ] || [ -z "$spawned" ] || w=${!:-}
+    if [ -n "$w" ]; then kill -TERM -- "-$w" 2>/dev/null; wait "$w" 2>/dev/null; fi
+    python3 "$REPORT_PY" build "$WORK" >/dev/null 2>&1 || true
+    # The recorder's own messages go to /dev/null so they never change what a run prints; a missing page is said here.
+    if [ -f "$WORK/report.html" ]; then [ ! -t 1 ] || echo "report: $WORK/report.html"; else echo "report: not written to $WORK/report.html" >&2; fi
+  }
+  trap finish EXIT
+  trap 'exit 130' INT   # bash runs the EXIT trap only on an exit, not on a fatal signal: the report is built either way
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  trap 'exit 131' QUIT   # the worker ignores it (an asynchronous command): Ctrl-\ stops the run here
+  record start "$WORK" --title "gates/adoption/run.sh" --image "$IMAGE" --oracle "$ORACLE_VERSION"
+  # <&0: an asynchronous command's stdin would otherwise be /dev/null. Without job control the background
+  # job leads no process group, so setsid makes the session in place and $! is its leader and group.
+  spawned=1
+  ADOPTION_RUN_WORKER=1 setsid "$BASH" "$0" "${ARGS[@]}" <&0 &
+  worker=$!
+  status=0; wait "$worker" || status=$?
+  worker='' spawned=''
+  exit "$status"
+fi
 sampler=
-# shellcheck disable=SC2317,SC2329  # invoked by the EXIT trap (SC2317 is the code before shellcheck 0.11)
-finish() {
-  [ -z "$sampler" ] || kill "$sampler" 2>/dev/null
-  python3 "$REPORT_PY" build "$WORK" >/dev/null 2>&1 || true
-  # The recorder's own messages go to /dev/null so they never change what a run prints; a missing page is said here.
-  if [ -f "$WORK/report.html" ]; then [ ! -t 1 ] || echo "report: $WORK/report.html"; else echo "report: not written to $WORK/report.html" >&2; fi
-}
-trap finish EXIT
-trap 'exit 130' INT   # bash runs the EXIT trap only on an exit, not on a fatal signal: the report is built either way
-trap 'exit 143' TERM
-trap 'exit 129' HUP
-record start "$WORK" --title "gates/adoption/run.sh" --image "$IMAGE" --oracle "$ORACLE_VERSION"
+trap '[ -z "$sampler" ] || kill "$sampler" 2>/dev/null' EXIT
 # fixture_line <kind> <verdict> <expected> <fixture> <detail>: the PASS/FAIL line, and the fixture's row in the report.
 fixture_line() {
   printf '%-5s %-9s %-28s %s\n' "$2" "$3" "$4" "$5"

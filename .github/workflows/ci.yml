@@ -199,6 +199,9 @@ jobs:
     # time medians — its log parsing is driven with canned job logs). The gates' part is one list, the
     # Makefile's test-gates-offline target.
     runs-on: ubuntu-latest
+    # About 5 minutes normally (4.5 to 5.0 over 20 runs, 2026-10-25). A hung test once held it for 24
+    # minutes (gl-920); without a limit a hang would run to GitHub's 6-hour default.
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
