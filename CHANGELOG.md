@@ -11,6 +11,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 ## [Unreleased]
 
 ### Database
+- Rebuild the Live TV channel table without its cascading key to the tuner hosts
+  (migration 0046), keeping every channel and airing; the guide refresh removes a deleted
+  tuner's channels
 - Converge the schema on Jellyfin 12.0 (migrations 0032–0034): table rebuilds with a
   pre-rebuild snapshot, 12.0's index set (Ferrofin's 14 duplicate `BaseItems` indexes are
   not recreated), `LinkedChildren` as the only membership store
@@ -104,6 +107,28 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   release (`oracle.py matches`). `oracle.py check` no longer takes `--gate`
 
 ### Parity
+- `POST /LiveTv/TunerHosts` with the id of a configured tuner in another case keeps the id
+  as posted, as Jellyfin's `config.TunerHosts[index] = info` does, renaming the tuner and
+  its channels' link to it (channel ids and their user data do not change); an id padded
+  with spaces no longer matches a tuner, so it adds one
+- Open a local M3U playlist or XMLTV guide exactly as configured, as Jellyfin's
+  `AsyncFile.OpenRead` does: a `file://` URL is no longer stripped to the path it names,
+  so saving a `file://` M3U tuner is refused with `404`
+- Decode an XMLTV guide declared `ISO-8859-9` (or `latin5`, `l5` and its other .NET names)
+  as .NET's code page 28599 does, with `0x80`-`0x9F` as the C1 controls, not as
+  `windows-1254`
+- `DELETE /LiveTv/TunerHosts` removes only the tuner, as Jellyfin's
+  `TunerHostManager.DeleteTunerHost` does: its channels and their airings stay in
+  `GET /LiveTv/Channels` and the guide until the guide refresh it queues removes them,
+  where they used to vanish from the guide at once while their items remained (migration
+  0046 drops the tuner → channel cascade)
+- Read an XMLTV guide as strictly as Jellyfin's `XmlReader`: a mismatched end tag, a second
+  root element, text outside the root, a bare `&` or undeclared entity in an attribute or
+  in text, a `<` in an attribute, a repeated attribute, `--` in a comment and an XML
+  declaration that is not at the start make the guide unreadable (the refresh keeps the stored
+  guide), where they were read past; and the guide is the first `<tv>` element wherever it
+  is (`ReadToDescendant`), so a well-formed document without one is an empty guide
+  (Lineups `[]`, the refresh drains the provider) rather than an unreadable one
 - A single genre, studio, person, year, music genre or artist (`GET /Genres/{genreName}` and its
   siblings, and by-name rows with `fields=ItemCounts`) counts only what its viewer may open, as
   Jellyfin 12.2 does: the viewer's libraries, and no alternate version, local version or stacked
@@ -651,6 +676,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
+- A Live TV tuner, guide provider, series timer or timer whose stored settings no longer
+  parse is logged (a warning naming its table and id, once) instead of vanishing silently,
+  and a `livetv.json` that cannot be read or parsed logs a warning naming it once per change
+  before the defaults are used; a timer for a programme is found past a broken one
 - A backup no longer reports success with something left out:
   - a file it cannot read, or whose name is not UTF-8, fails the create with a `500`,
     and the server log names the file;

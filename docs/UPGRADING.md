@@ -8,6 +8,33 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — Live TV sources and guides follow Jellyfin more closely
+
+- **A local M3U playlist is opened exactly as configured.** An M3U tuner configured as a
+  `file://` URL (`file:///srv/tv/list.m3u`) is no longer read from the path it names: like
+  Jellyfin, Ferrofin now takes the whole value as a file path, which does not exist. Saving
+  such a tuner is refused with `404`. A stored one can no longer be read: the guide refresh
+  logs a warning and keeps the channels and guide it already has. Configure the plain path
+  (`/srv/tv/list.m3u`) instead. (An XMLTV guide's `file://` path was already refused on
+  save, and is now not read either.)
+- **An XMLTV guide declared `ISO-8859-9` is decoded as that code page.** Bytes `0x80`-`0x9F`
+  read as control characters, as in Jellyfin, not as the `windows-1254` punctuation (`€`,
+  `‚`, …) they were read as before. Turkish letters are unchanged.
+- **Removing a tuner leaves its channels listed until the guide refresh it starts finishes.**
+  As in Jellyfin, the guide and `GET /LiveTv/Channels` keep showing the removed tuner's
+  channels (they cannot be played) until a guide refresh finishes cleanly; one that cannot
+  read a tuner or a guide leaves them for the next. Migration 0046 rebuilds the Live TV channel
+  table to allow this; it keeps every channel and airing.
+- **XMLTV guides must be well-formed XML, as in Jellyfin.** A guide with a bare `&` (say, in
+  an `<icon src="…?a=1&b=2">` URL), an undeclared entity, a mismatched or stray end tag,
+  text after its closing `</tv>`, an XML declaration that is not the very first thing in the
+  file (even a blank line before it), or any other well-formedness error used to load, and
+  now keeps the guide you already have,
+  with a warning in the log, until its source is fixed: escape `&` as `&amp;`. A
+  well-formed document that holds no `<tv>` element (an XHTML error page) now reads as an
+  empty guide and clears that provider's programmes, as in Jellyfin; an HTML page that is
+  not well-formed still keeps the stored guide.
+
 ## Unreleased — the config file must be TOML
 
 Usually nothing to do: `{data_dir}/config.toml` reads as before. A `--config` or
