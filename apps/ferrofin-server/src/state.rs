@@ -815,7 +815,13 @@ pub async fn build_app_state(
     // ONE auth cache shared by the authorization context (read-through) and the
     // user/device managers (invalidation on mutation) — the sharing is what
     // makes cached auth revocation-correct. See ferrofin_core::auth_cache.
-    let auth_cache = Arc::new(ferrofin_core::auth_cache::AuthCache::default());
+    let auth_cache = Arc::new(ferrofin_core::auth_cache::AuthCache::new(
+        config
+            .auth_cache_ttl_secs
+            .map_or(ferrofin_core::auth_cache::AUTH_CACHE_TTL, |secs| {
+                std::time::Duration::from_secs(secs.into())
+            }),
+    ));
     let activity: Arc<dyn ferrofin_traits::activity::ActivityManager> =
         Arc::new(FerrofinActivityManager::new(db.clone()));
     // One manager supplies peer-aware advertisement and HTTP access policy.
@@ -2548,6 +2554,16 @@ pub async fn build_app_state(
     // state below, which takes ownership of these.
     let sync_play_users = Arc::clone(&users);
     let sync_play_library = Arc::clone(&library);
+
+    // The policy and library row caches (ferrofin_db::row_cache), on only now: the boot repairs
+    // above write those rows outside the managers that invalidate them.
+    db.enable_row_cache(
+        config
+            .row_cache_ttl_secs
+            .map_or(ferrofin_db::row_cache::ROW_CACHE_TTL, |secs| {
+                std::time::Duration::from_secs(secs.into())
+            }),
+    );
 
     // ---- assemble (33 managers, in AppState::new field order) -------------
     let state = AppState::new(

@@ -151,6 +151,8 @@ struct FileConfig {
     scan_probe_concurrency: Option<u32>,
     scan_directory_cache_records: Option<u32>,
     scan_directory_cache_idle_secs: Option<u32>,
+    auth_cache_ttl_secs: Option<u32>,
+    row_cache_ttl_secs: Option<u32>,
     trickplay_concurrency: Option<CountOrAuto>,
     wasm_call_timeout_secs: Option<u32>,
     wasm_memory_limit_mb: Option<u32>,
@@ -505,6 +507,23 @@ pub struct Config {
     /// error.
     pub scan_directory_cache_idle_secs: Option<u32>,
 
+    /// How long, in seconds, a resolved access token (its device, user and
+    /// policy) may be served from the auth cache. `None` = 30 s
+    /// (`AUTH_CACHE_TTL`). Every change made through the server takes effect
+    /// at once; this only bounds how long one made outside it, in the database
+    /// itself, goes unseen. Resolved `FERROFIN_AUTH_CACHE_TTL_SECS` env >
+    /// `auth_cache_ttl_secs` in `config.toml` > default; must be within
+    /// [`CACHE_TTL_RANGE_SECS`].
+    pub auth_cache_ttl_secs: Option<u32>,
+
+    /// How long, in seconds, the per-user access check may serve a user's
+    /// policy rows and the libraries' rows and options from its cache
+    /// (`ferrofin_db::row_cache`). `None` = 30 s (`ROW_CACHE_TTL`). As for
+    /// the auth cache, it only bounds edits made outside the server. Resolved
+    /// `FERROFIN_ROW_CACHE_TTL_SECS` env > `row_cache_ttl_secs` in
+    /// `config.toml` > default; must be within [`CACHE_TTL_RANGE_SECS`].
+    pub row_cache_ttl_secs: Option<u32>,
+
     /// How many trickplay generations (one item width each, an ffmpeg frame
     /// extraction plus tile packing) run at once. A library scan runs several;
     /// the scheduled task runs one but shares the cap. `None` = `auto`: as many as the shared image-encoding
@@ -833,6 +852,18 @@ impl Config {
                 "scan_directory_cache_idle_secs",
                 file.scan_directory_cache_idle_secs,
             )?,
+            auth_cache_ttl_secs: resolve_cache_ttl(
+                env,
+                "FERROFIN_AUTH_CACHE_TTL_SECS",
+                "auth_cache_ttl_secs",
+                file.auth_cache_ttl_secs,
+            )?,
+            row_cache_ttl_secs: resolve_cache_ttl(
+                env,
+                "FERROFIN_ROW_CACHE_TTL_SECS",
+                "row_cache_ttl_secs",
+                file.row_cache_ttl_secs,
+            )?,
             trickplay_concurrency: resolve_trickplay_concurrency(env, file.trickplay_concurrency)?,
             wasm_call_timeout_secs: parse_var(env, "FERROFIN_WASM_CALL_TIMEOUT_SECS")
                 .or(file.wasm_call_timeout_secs),
@@ -1015,6 +1046,8 @@ impl Config {
             scan_probe_concurrency: None,
             scan_directory_cache_records: None,
             scan_directory_cache_idle_secs: None,
+            auth_cache_ttl_secs: None,
+            row_cache_ttl_secs: None,
             trickplay_concurrency: None,
             wasm_call_timeout_secs: None,
             wasm_memory_limit_mb: None,
@@ -1110,6 +1143,32 @@ fn resolve_positive(
         "invalid {file_key} `0` in config.toml: expected a positive integer"
     );
     Ok(file)
+}
+
+/// The seconds a cache lifetime setting may take (`auth_cache_ttl_secs`,
+/// `row_cache_ttl_secs`): from 5, below which a busy client's request burst
+/// stops hitting the cache, to 300, past which an edit made outside the server
+/// goes unseen for longer than an operator would wait for it.
+pub const CACHE_TTL_RANGE_SECS: std::ops::RangeInclusive<u32> = 5..=300;
+
+/// [`resolve_positive`] for a cache lifetime, which must also lie within
+/// [`CACHE_TTL_RANGE_SECS`].
+fn resolve_cache_ttl(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u32>,
+) -> anyhow::Result<Option<u32>> {
+    let secs = resolve_positive(env, env_key, file_key, file)?;
+    if let Some(n) = secs {
+        anyhow::ensure!(
+            CACHE_TTL_RANGE_SECS.contains(&n),
+            "invalid {env_key} / {file_key} `{n}`: expected {} to {} seconds",
+            CACHE_TTL_RANGE_SECS.start(),
+            CACHE_TTL_RANGE_SECS.end()
+        );
+    }
+    Ok(secs)
 }
 
 /// Resolves the trickplay concurrency: `FERROFIN_TRICKPLAY_CONCURRENCY` env
@@ -1947,6 +2006,66 @@ mod tests {
         let env = FakeEnv::new().with("FERROFIN_WASM_PRIVATE_HTTP_ALLOW", "  ");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.wasm_private_http_allow, None, "blank is unset");
+    }
+
+    #[test]
+    fn cache_ttls_resolve_and_reject_values_out_of_range() {
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            (cfg.auth_cache_ttl_secs, cfg.row_cache_ttl_secs),
+            (None, None)
+        );
+        let env = FakeEnv::new()
+            .with("FERROFIN_AUTH_CACHE_TTL_SECS", "5")
+            .with("FERROFIN_ROW_CACHE_TTL_SECS", "300");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(
+            (cfg.auth_cache_ttl_secs, cfg.row_cache_ttl_secs),
+            (Some(5), Some(300))
+        );
+        for key in [
+            "FERROFIN_AUTH_CACHE_TTL_SECS",
+            "FERROFIN_ROW_CACHE_TTL_SECS",
+        ] {
+            for value in ["0", "4", "301", "soon"] {
+                let err = Config::load_from(Cli::default(), &FakeEnv::new().with(key, value))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains(key), "{key}={value}: {err}");
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(
+            &toml,
+            "auth_cache_ttl_secs = 60
+row_cache_ttl_secs = 10
+",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(
+            (cfg.auth_cache_ttl_secs, cfg.row_cache_ttl_secs),
+            (Some(60), Some(10))
+        );
+        std::fs::write(
+            &toml,
+            "row_cache_ttl_secs = 1000
+",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(toml),
+            ..Cli::default()
+        };
+        let err = Config::load_from(cli, &FakeEnv::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("row_cache_ttl_secs"), "{err}");
     }
 
     #[test]

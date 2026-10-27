@@ -875,13 +875,14 @@ async fn add_tuner_host(
     Ok(Json(saved))
 }
 
-/// `DELETE /LiveTv/TunerHosts?id=` — remove a tuner host (and its channels).
+/// `DELETE /LiveTv/TunerHosts?id=` — remove a tuner host.
 ///
 /// Port of `LiveTvController.DeleteTunerHost` → `TunerHostManager.DeleteTunerHost`
-/// (v12.2 TunerHostManager.cs:104-128), which ends with
-/// `CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`: the queued
-/// refresh's `CleanDatabase` pass removes the host's channel and programme
-/// items. Its `{cache}/{id}_channels` file has no counterpart here.
+/// (v12.2 TunerHostManager.cs:104-128), which only edits the configuration and
+/// ends with `CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`: the host's
+/// channels and their programmes stay listed until the queued refresh's
+/// `CleanDatabase` pass removes them. Its `{cache}/{id}_channels` file has no
+/// counterpart here.
 async fn delete_tuner_host(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,

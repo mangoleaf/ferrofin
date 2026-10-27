@@ -358,14 +358,9 @@ async fn a_non_admin_sees_the_transcode_but_not_the_silicon() {
     );
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "viewer").await;
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
     let dto = mgr
         .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
@@ -525,14 +520,9 @@ async fn bus_connected_session_is_controllable_and_receives_play() {
     );
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
     let dto = mgr
         .log_session_activity("TV App", "1.0", "dev-tv", "Living Room", "e", Some(&user))
         .await
@@ -607,14 +597,9 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
     let mgr = manager(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
 
     let request = AuthenticationRequest {
         user_id: Some(user_id),
@@ -669,14 +654,9 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
     let mgr = manager(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "bob").await;
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
 
     let request = AuthenticationRequest {
         username: Some("bob".to_owned()),
@@ -692,14 +672,9 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
         mgr.authenticate_new_session(&request).await,
         Err(ServiceError::Forbidden(_))
     ));
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableRemoteAccess,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableRemoteAccess, true)
+        .await
+        .unwrap();
     let result = mgr.authenticate_new_session(&request).await.unwrap();
     assert_eq!(result.session.user_id, user_id);
     assert!(
@@ -756,14 +731,9 @@ async fn logout_by_token_ends_the_session() {
     let mgr = manager(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
     let request = AuthenticationRequest {
         user_id: Some(user_id),
         app: Some("Web".to_owned()),
@@ -840,14 +810,9 @@ async fn revoking_a_users_tokens_keeps_only_the_current_device() {
     let bob_id = Uuid::new_v4();
     let bob = seed_named_user(&db, bob_id, "bob").await;
     for user in [&alice, &bob] {
-        set_permission(
-            db.writer(),
-            &user.id,
-            PermissionKind::EnableAllDevices,
-            true,
-        )
-        .await
-        .unwrap();
+        set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+            .await
+            .unwrap();
     }
     let current = sign_in(&mgr, alice_id, "alice-phone").await;
     let other = sign_in(&mgr, alice_id, "alice-tv").await;
@@ -923,14 +888,9 @@ async fn get_sessions_admin_sees_all() {
     let mgr = manager(&db);
     let admin_id = Uuid::new_v4();
     let admin = seed_named_user(&db, admin_id, "admin").await;
-    set_permission(
-        db.writer(),
-        &admin.id,
-        PermissionKind::IsAdministrator,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &admin.id, PermissionKind::IsAdministrator, true)
+        .await
+        .unwrap();
     let other = seed_named_user(&db, Uuid::new_v4(), "other").await;
     mgr.log_session_activity("Web", "1.0", "a", "A", "e", Some(&admin))
         .await
@@ -2390,14 +2350,9 @@ async fn set_sort_name(db: &Database, id: Uuid, sort_name: &str) {
 
 /// Grants the playback permission `GetPlayAccess` gates every cast on.
 async fn allow_playback(db: &Database, user: &UserEntity) {
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableMediaPlayback,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(db, &user.id, PermissionKind::EnableMediaPlayback, true)
+        .await
+        .unwrap();
 }
 
 /// A `PlayNow` cast of exactly these ids.
@@ -2931,7 +2886,7 @@ async fn casting_stamps_the_controlling_user_on_play_and_playstate() {
     let controller_id = Uuid::new_v4();
     let controller = seed_named_user(&db, controller_id, "controller").await;
     set_permission(
-        db.writer(),
+        &db,
         &controller.id,
         PermissionKind::EnableRemoteControlOfOtherUsers,
         true,
@@ -3112,14 +3067,9 @@ async fn concurrent_logins_cannot_exceed_max_active_sessions() {
         )
         .await
         .unwrap();
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
 
     let logins = 16;
     let gate = Arc::new(tokio::sync::Barrier::new(logins));
@@ -3246,7 +3196,7 @@ async fn remote_control_permission_gates_delivery_and_saved_changes() {
     };
     for enabled in [false, true, false] {
         set_permission(
-            db.writer(),
+            &db,
             &alice.id,
             PermissionKind::EnableRemoteControlOfOtherUsers,
             enabled,
@@ -3260,14 +3210,9 @@ async fn remote_control_permission_gates_delivery_and_saved_changes() {
         assert_eq!(result.is_ok(), enabled);
         assert_eq!(received.lock().unwrap().len(), usize::from(enabled));
     }
-    set_permission(
-        db.writer(),
-        &alice.id,
-        PermissionKind::IsAdministrator,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &alice.id, PermissionKind::IsAdministrator, true)
+        .await
+        .unwrap();
     assert!(
         matches!(
             mgr.assert_can_control(&controller, &target).await,
@@ -3302,14 +3247,9 @@ async fn shared_device_filter_uses_the_requested_user_and_device_access() {
     let (mgr, bus) = cast_manager(&db);
     let alice = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
     let id = Uuid::parse_str(&alice.id).unwrap();
-    set_permission(
-        db.writer(),
-        &alice.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &alice.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
     let (own, _) = cast_target(&mgr, bus.as_ref(), &alice, "own").await;
     mgr.report_capabilities(
         &own,
@@ -3338,7 +3278,7 @@ async fn shared_device_filter_uses_the_requested_user_and_device_access() {
     bus.register(public.clone(), Box::new(|_| {}));
     for enabled in [false, true, false] {
         set_permission(
-            db.writer(),
+            &db,
             &alice.id,
             PermissionKind::EnableSharedDeviceControl,
             enabled,
@@ -3370,14 +3310,9 @@ async fn shared_device_filter_uses_the_requested_user_and_device_access() {
             .unwrap()
             .is_empty()
     );
-    set_permission(
-        db.writer(),
-        &alice.id,
-        PermissionKind::EnableAllDevices,
-        false,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &alice.id, PermissionKind::EnableAllDevices, false)
+        .await
+        .unwrap();
     assert!(
         mgr.get_sessions(id, None, None, Some(id), false)
             .await

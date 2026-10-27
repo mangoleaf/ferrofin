@@ -105,8 +105,10 @@ pub async fn timer_is_manual(db: &Database, id: &str) -> Result<bool, ServiceErr
     Ok(flag.is_some_and(|f| f != 0))
 }
 
-/// One stored series timer's row: the published DTO JSON, the external id it was
-/// derived from, and the listings series id the fan-out queries with.
+/// One stored series timer's row: the published DTO JSON, unparsed, the
+/// external id it was derived from, and the listings series id the fan-out
+/// queries with. The caller parses the JSON, so a row that does not parse is
+/// reported where the manager keeps its record of them.
 ///
 /// # Errors
 ///
@@ -114,20 +116,15 @@ pub async fn timer_is_manual(db: &Database, id: &str) -> Result<bool, ServiceErr
 pub async fn series_timer_row(
     db: &Database,
     id: &str,
-) -> Result<Option<(SeriesTimerInfoDto, String, Option<String>)>, ServiceError> {
-    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+) -> Result<Option<(String, String, Option<String>)>, ServiceError> {
+    sqlx::query_as(
         r#"SELECT "Data","ExternalId","SeriesId" FROM "FerrofinLiveTvSeriesTimers"
            WHERE "Id" = ?1"#,
     )
     .bind(id)
     .fetch_optional(db.pool())
     .await
-    .map_err(db_err)?;
-    Ok(row.and_then(|(data, external_id, series_id)| {
-        serde_json::from_str(&data)
-            .ok()
-            .map(|dto| (dto, external_id, series_id))
-    }))
+    .map_err(db_err)
 }
 
 /// Inserts or replaces one series timer, DTO and identity columns together.
@@ -182,32 +179,34 @@ pub async fn timer_ids_for_series(
         .map_err(db_err)
 }
 
-/// The stored timer whose `ProgramId` or `ExternalProgramId` names this
-/// programme, or `None` when nothing is scheduled for it.
+/// The `(Id, Data)` rows of the stored timers whose `ProgramId` or
+/// `ExternalProgramId` names this programme, unparsed, in stored order.
 ///
-/// Port of `TimerManager.GetTimerByProgramId`, widened to accept either
-/// spelling of the programme id, because the two travel together on the DTO.
+/// Port of `TimerManager.GetTimerByProgramId` (the first match), widened to
+/// accept either spelling of the programme id, because the two travel together
+/// on the DTO. Every match is returned so the caller can skip, and report, a
+/// row that does not parse and take the next, as upstream's list never holds
+/// one.
 ///
 /// # Errors
 ///
 /// Fails when the read fails.
-pub async fn timer_for_program(
+pub async fn timers_for_program(
     db: &Database,
     program_id: &str,
     external_program_id: Option<&str>,
-) -> Result<Option<TimerInfoDto>, ServiceError> {
-    let data: Option<String> = sqlx::query_scalar(
-        r#"SELECT "Data" FROM "FerrofinLiveTvTimers"
+) -> Result<Vec<(String, String)>, ServiceError> {
+    sqlx::query_as(
+        r#"SELECT "Id","Data" FROM "FerrofinLiveTvTimers"
            WHERE "ProgramId" IS NOT NULL
              AND ("ProgramId" = ?1 COLLATE NOCASE OR "ProgramId" = ?2 COLLATE NOCASE)
-           LIMIT 1"#,
+           ORDER BY rowid"#,
     )
     .bind(program_id)
     .bind(external_program_id.unwrap_or(program_id))
-    .fetch_optional(db.pool())
+    .fetch_all(db.pool())
     .await
-    .map_err(db_err)?;
-    Ok(data.and_then(|d| serde_json::from_str(&d).ok()))
+    .map_err(db_err)
 }
 
 /// Inserts the row a capture is about to fill.
@@ -434,6 +433,16 @@ pub mod test_support {
     /// Overwrites a stored timer's `Data` with JSON that no longer parses.
     pub async fn corrupt_timer_data(db: &Database, id: &str) -> Result<(), ServiceError> {
         sqlx::query(r#"UPDATE "FerrofinLiveTvTimers" SET "Data" = '{' WHERE "Id" = ?1"#)
+            .bind(id)
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Overwrites a stored series timer's `Data` with JSON that no longer parses.
+    pub async fn corrupt_series_timer_data(db: &Database, id: &str) -> Result<(), ServiceError> {
+        sqlx::query(r#"UPDATE "FerrofinLiveTvSeriesTimers" SET "Data" = '{' WHERE "Id" = ?1"#)
             .bind(id)
             .execute(db.writer())
             .await

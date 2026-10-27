@@ -1114,7 +1114,6 @@ impl ItemCountService for FerrofinItemCountService {
         Ok(out)
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn get_child_count_batch(
         &self,
         parent_ids: &[Uuid],
@@ -1123,11 +1122,26 @@ impl ItemCountService for FerrofinItemCountService {
         if parent_ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let user = match user_id {
+            Some(id) => crate::item_repository::query_user(&self.db, id).await?,
+            None => None,
+        };
+        self.get_child_count_batch_for(parent_ids, user.as_ref())
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn get_child_count_batch_for(
+        &self,
+        parent_ids: &[Uuid],
+        user: Option<&UserEntity>,
+    ) -> Result<HashMap<Uuid, i32>, ServiceError> {
+        if parent_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut access_filter = InternalItemsQuery::default();
-        if let Some(id) = user_id
-            && let Some(user) = crate::item_repository::query_user(&self.db, id).await?
-        {
-            access_filter.set_user(user);
+        if let Some(user) = user {
+            access_filter.set_user(user.clone());
         }
         let has_user = access_filter.user.is_some();
         // `includeVirtual`: missing episodes count for no user, or for one
@@ -3973,7 +3987,7 @@ mod tests {
             .await
             .expect("revoke");
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             ferrofin_db::enums::PreferenceKind::EnabledFolders,
             &[first.to_string()],
@@ -4322,7 +4336,7 @@ mod tests {
             .await
             .expect("revoke");
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             ferrofin_db::enums::PreferenceKind::EnabledFolders,
             &[open.to_string()],
@@ -4373,26 +4387,52 @@ mod tests {
     /// `GetChildCountBatch`'s statements seek their grouped column's own
     /// index, for either access rule and whatever the virtual rule:
     /// `ParentId` for direct children, `SeasonId` for a season's episodes,
-    /// and the `LinkedChildren` parent for links, each child then read by its
-    /// primary key. The `+bi."SeasonId" IS NULL` term must not pull the
-    /// direct count onto the `SeasonId` index, where most rows are NULL; a
-    /// user's alternate-version rule is one primary-key probe per child.
+    /// and the `LinkedChildren` parent for links. Any other row a statement
+    /// needs (a linked child, an alternate's primary) is read by its primary
+    /// key.
+    ///
+    /// The direct count never leaves its covering index
+    /// (`FerrofinIX_BaseItems_ChildCount`, migration 0047), unless a user's
+    /// parental or tag rules ([`restrict_count_query`]) add columns it does
+    /// not hold; the read then visits the row, as it did before the index.
+    /// The merged read selects each child's `Id` and `PresentationUniqueKey`,
+    /// which the index does not hold either: nothing in the SQL keeps it off
+    /// the wider index, only the planner's preference for the narrower
+    /// `IX_BaseItems_ParentId`, which this test pins.
+    ///
+    /// The `+bi."SeasonId" IS NULL` term must not pull the direct count onto
+    /// the `SeasonId` index, where most rows are NULL; a user's
+    /// alternate-version rule is one primary-key probe per child.
     #[tokio::test]
     async fn the_child_counts_seek_their_grouped_column() {
         let db = test_db().await;
         let by_key = "USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)";
         for has_user in [false, true] {
             for include_virtual in [true, false] {
-                for (child_of, index) in [
-                    (ChildOf::Parent, "IX_BaseItems_ParentId (ParentId=?)"),
-                    (ChildOf::Season, "IX_BaseItems_SeasonId (SeasonId=?)"),
+                for (child_of, count_index, merged_index) in [
+                    (
+                        ChildOf::Parent,
+                        "COVERING INDEX FerrofinIX_BaseItems_ChildCount (ParentId=?)",
+                        "INDEX IX_BaseItems_ParentId (ParentId=?)",
+                    ),
+                    (
+                        ChildOf::Season,
+                        "INDEX IX_BaseItems_SeasonId (SeasonId=?)",
+                        "INDEX IX_BaseItems_SeasonId (SeasonId=?)",
+                    ),
                 ] {
-                    for sql in [
-                        child_count_sql(child_of, 2, has_user, include_virtual),
-                        merged_children_sql(child_of, 2, has_user, include_virtual),
+                    for (sql, index) in [
+                        (
+                            child_count_sql(child_of, 2, has_user, include_virtual),
+                            count_index,
+                        ),
+                        (
+                            merged_children_sql(child_of, 2, has_user, include_virtual),
+                            merged_index,
+                        ),
                     ] {
                         let plan = query_plan(&db, &sql, 2).await;
-                        assert_eq!(plan[0], format!("SEARCH bi USING INDEX {index}"), "{sql}");
+                        assert_eq!(plan[0], format!("SEARCH bi USING {index}"), "{sql}");
                         assert!(
                             plan[1..].iter().all(|step| step.contains(by_key)
                                 || step.starts_with("CORRELATED")),

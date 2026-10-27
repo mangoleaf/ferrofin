@@ -76,6 +76,42 @@ async fn an_m3u_tuner_with_a_missing_playlist_file_is_not_found() {
     assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
 }
 
+/// A local source is opened exactly as given: `AsyncFile.OpenRead(info.Url)`
+/// takes `file:///…` as a relative path, which does not exist, so the tuner
+/// is refused with upstream's `FileNotFoundException`, a `404`, even though
+/// the file the URL names is there.
+#[tokio::test]
+async fn an_m3u_tuner_given_as_a_file_url_is_not_found() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let playlist = dir.path().join("list.m3u");
+    std::fs::write(&playlist, "#EXTM3U\n").expect("write");
+    let url = format!("file://{}", playlist.to_str().expect("utf-8"));
+    let host = M3uTunerHost::new(Arc::new(ReqwestFetcher::new()));
+    let err = host
+        .validate(&mut m3u_tuner(&url))
+        .await
+        .expect_err("refused");
+    assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
+}
+
+/// The other readers take a local source as given too
+/// (`XmlTvListingsProvider.GetXml`'s `AsyncFile.OpenRead(info.Path)`).
+#[tokio::test]
+async fn a_file_url_names_no_local_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let guide = dir.path().join("guide.xml");
+    std::fs::write(&guide, "<tv/>").expect("write");
+    let url = format!("file://{}", guide.to_str().expect("utf-8"));
+    let fetcher = ReqwestFetcher::new();
+    assert!(fetcher.fetch(&url).await.is_err(), "fetch");
+    assert!(fetcher.fetch_bytes(&url).await.is_err(), "fetch_bytes");
+    assert!(fetcher.open(&url, None).await.is_err(), "open");
+    assert!(
+        fetcher.fetch_listings(&url).await.is_err(),
+        "fetch_listings"
+    );
+}
+
 /// `Validate`: a directory is no playlist; `AsyncFile.OpenRead` refuses it
 /// (`UnauthorizedAccessException`, a `500`).
 #[tokio::test]

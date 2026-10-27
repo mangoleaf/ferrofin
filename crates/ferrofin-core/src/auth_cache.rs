@@ -59,8 +59,8 @@ type TokenResolution = (
 ///
 /// 30 s: long enough that a busy client's request bursts (a home-screen load
 /// is dozens of requests in a few seconds) hit the cache, short enough that
-/// un-hooked out-of-band changes converge quickly. FLAGGED as a candidate
-/// setting — surface as a config knob if an operator ever needs to tune it.
+/// un-hooked out-of-band changes converge quickly. The default: the server's
+/// `auth_cache_ttl_secs` setting (`FERROFIN_AUTH_CACHE_TTL_SECS`) overrides it.
 pub const AUTH_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Hard entry cap — a runaway bound, not a working-set tuner. Tokens are one
@@ -313,6 +313,13 @@ mod tests {
             is_active: true,
             user_id: "u-1".into(),
         }
+    }
+
+    /// The policy rows the visibility check caches (`ferrofin_db::row_cache`) are the same facts a
+    /// cached token resolution carries: by default they expire together (each has its setting).
+    #[test]
+    fn the_row_cache_expires_with_the_auth_cache_by_default() {
+        assert_eq!(AUTH_CACHE_TTL, ferrofin_db::row_cache::ROW_CACHE_TTL);
     }
 
     #[test]

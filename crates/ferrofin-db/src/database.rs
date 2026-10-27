@@ -84,6 +84,9 @@ pub struct Database {
     /// One snapshot or one vacuum-and-checkpoint pass at a time
     /// ([`Database::try_maintenance_turn`]), shared by every clone.
     maintenance: Arc<tokio::sync::Mutex<()>>,
+    /// The cross-request caches of policy and library rows ([`crate::row_cache`]), shared by
+    /// every clone.
+    rows: Arc<crate::row_cache::RowCache>,
     /// The on-disk database file, when file-backed (`None` for in-memory).
     /// Lets [`Database::run_migrations`] snapshot the file before a
     /// table-rebuild migration.
@@ -203,6 +206,7 @@ impl Database {
             writer,
             snapshotter,
             maintenance: Arc::default(),
+            rows: Arc::new(crate::row_cache::RowCache::new()),
             file_path: None,
         })
     }
@@ -246,6 +250,7 @@ impl Database {
             writer,
             snapshotter,
             maintenance: Arc::default(),
+            rows: Arc::new(crate::row_cache::RowCache::new()),
             file_path,
         })
     }
@@ -323,6 +328,85 @@ impl Database {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Turns on this handle's cross-request row caches ([`crate::row_cache`]), for every clone,
+    /// with entries kept for `ttl` ([`crate::row_cache::ROW_CACHE_TTL`] by default). The
+    /// composition root does, once; until then every read goes to the database.
+    pub fn enable_row_cache(&self, ttl: std::time::Duration) {
+        self.rows.enable(ttl);
+    }
+
+    /// Whether [`Database::enable_row_cache`] has run.
+    #[must_use]
+    pub fn row_cache_enabled(&self) -> bool {
+        self.rows.enabled()
+    }
+
+    /// A user's `Permissions` and `Preferences` rows, from the cross-request cache or, on a miss,
+    /// the database ([`crate::row_cache`]).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if a read fails.
+    pub async fn user_policy(
+        &self,
+        user_id: &str,
+    ) -> Result<Arc<crate::row_cache::UserPolicyRows>> {
+        if let Some(hit) = self.rows.policy(user_id) {
+            return Ok(hit);
+        }
+        let generation = self.rows.policy_generation();
+        let permissions =
+            sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Permissions" WHERE "UserId" = ?"#)
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let preferences =
+            sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Preferences" WHERE "UserId" = ?"#)
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let rows = crate::row_cache::UserPolicyRows {
+            permissions,
+            preferences,
+        };
+        Ok(self.rows.put_policy(generation, user_id, rows))
+    }
+
+    /// Drops `user_id`'s cached policy rows. Called after a committed write to that user's
+    /// `Permissions`, `Preferences` or `Users` row.
+    pub fn invalidate_user_policy(&self, user_id: &str) {
+        self.rows.invalidate_policy(Some(user_id));
+    }
+
+    /// Drops every user's cached policy rows, after a write that touched several users.
+    pub fn invalidate_all_user_policies(&self) {
+        self.rows.invalidate_policy(None);
+    }
+
+    /// The cached library set, when one is live ([`crate::row_cache`]).
+    #[must_use]
+    pub fn cached_libraries(&self) -> Option<Arc<crate::row_cache::LibrarySet>> {
+        self.rows.libraries()
+    }
+
+    /// Starts reading the library set: take it before reading the rows and options, and
+    /// [`store`](crate::row_cache::LibraryLoad::store) what was read. While it is held, any item
+    /// write keeps what it read out of the cache.
+    pub fn begin_library_load(&self) -> crate::row_cache::LibraryLoad<'_> {
+        self.rows.begin_library_load()
+    }
+
+    /// Drops the cached library set. Called after a committed write that adds, removes, renames
+    /// or edits a library, its row or its options.
+    pub fn invalidate_libraries(&self) {
+        self.rows.invalidate_libraries();
+    }
+
+    /// Called after a committed write to the `BaseItems` rows `ids` (stored GUID form): drops the
+    /// cached library set if one of them is a library row.
+    pub fn note_items_written<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        self.rows.note_items_written(ids);
     }
 
     /// Counts library items grouped by their stored (C#) `Type` name.
@@ -3478,6 +3562,12 @@ mod tests {
         sqlx::Connection::close(conn).await.expect("close");
     }
 
+    /// Every migration's version, in order. Not `1..=head`: the numbers may skip
+    /// one that an open change has taken and has not merged yet.
+    fn chain_versions() -> Vec<i64> {
+        MIGRATOR.iter().map(|m| m.version).collect()
+    }
+
     async fn recorded_versions(db: &Database) -> Vec<i64> {
         sqlx::query_scalar(r#"SELECT version FROM "_sqlx_migrations" ORDER BY version"#)
             .fetch_all(db.pool())
@@ -3597,9 +3687,7 @@ mod tests {
 
         // Shape migrations baselined, everything else actually applied.
         let versions = recorded_versions(&db).await;
-        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
-        let recorded = i64::try_from(versions.len()).expect("small count");
-        assert_eq!(recorded, head, "every migration recorded");
+        assert_eq!(versions, chain_versions(), "every migration recorded");
         assert!(versions.contains(&7));
         assert!(versions.contains(&32) && versions.contains(&33));
         // 0032 EXECUTED here (the 10.11.8 shape had to be converged), so the
@@ -4530,8 +4618,7 @@ mod tests {
             .expect("adoption succeeds");
 
         let versions = recorded_versions(&db).await;
-        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
-        assert_eq!(i64::try_from(versions.len()).expect("small"), head);
+        assert_eq!(versions, chain_versions());
         assert!(versions.contains(&32), "0032 baselined");
         assert!(versions.contains(&33), "0033 executed");
         // 0032 was baselined, never run: no rebuild happened, no snapshot.
@@ -4683,11 +4770,7 @@ mod tests {
         let db = Database::connect_sized(&url, Some(2))
             .await
             .expect("boot after the crash completes the chain");
-        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
-        assert_eq!(
-            i64::try_from(recorded_versions(&db).await.len()).expect("small"),
-            head
-        );
+        assert_eq!(recorded_versions(&db).await, chain_versions());
         // No second adoption happened: no safety copy was taken by the gate.
         assert!(!path.with_extension("db.pre-ferrofin").exists());
         assert_eq!(
@@ -4786,8 +4869,9 @@ mod tests {
         .execute(db.pool())
         .await
         .expect("program insert under FK enforcement");
-        // The cascade works through the CORRECT target: deleting the tuner
-        // clears its channel, and the channel its programme.
+        // Deleting the tuner leaves its channel for the guide refresh to prune
+        // (0046), and the programme key cascades through the CORRECT target:
+        // deleting the channel clears its programme.
         sqlx::query(r#"DELETE FROM "FerrofinLiveTvTunerHosts" WHERE "Id" = 't-fk'"#)
             .execute(db.pool())
             .await
@@ -4798,8 +4882,19 @@ mod tests {
         )
         .fetch_one(db.pool())
         .await
+        .expect("tuner delete audit");
+        assert_eq!(left, 2, "a tuner's delete leaves its channel and programme");
+        sqlx::query(r#"DELETE FROM "FerrofinLiveTvChannels" WHERE "Id" = 'c-fk'"#)
+            .execute(db.pool())
+            .await
+            .expect("channel delete");
+        let left: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM "FerrofinLiveTvPrograms" WHERE "Id"='p-fk'"#,
+        )
+        .fetch_one(db.pool())
+        .await
         .expect("cascade audit");
-        assert_eq!(left, 0, "delete must cascade tuner → channel → programme");
+        assert_eq!(left, 0, "delete must cascade channel → programme");
     }
 
     #[tokio::test]

@@ -713,8 +713,19 @@ impl MediaSegmentManager for FerrofinMediaSegmentManager {
         let Some(item) = self.library_manager.get_item_by_id(item_id).await? else {
             return Ok(Vec::new());
         };
+        self.get_item_segments(&item, types, filter_by_provider)
+            .await
+    }
+    async fn get_item_segments(
+        &self,
+        item: &BaseItemEntity,
+        types: Option<&[MediaSegmentType]>,
+        filter_by_provider: bool,
+    ) -> Result<Vec<MediaSegmentDto>, ServiceError> {
+        let item_id = Uuid::parse_str(&item.id)
+            .map_err(|_| ServiceError::invalid_input("the item's id is not a GUID"))?;
         let providers = if filter_by_provider {
-            let options = self.options(&item).await?;
+            let options = self.options(item).await?;
             self.providers()
                 .into_iter()
                 .filter(|p| Self::enabled(p.as_ref(), &options))

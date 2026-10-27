@@ -64,14 +64,13 @@ async fn get_item_segments(
     Path(item_id): Path<Uuid>,
     Query(pairs): Query<Vec<(String, String)>>,
 ) -> Result<Json<QueryResult<MediaSegmentDto>>, ApiError> {
-    if state
+    let Some(item) = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
-        .is_none()
-    {
+    else {
         return Err(ApiError::NotFound(format!("item {item_id}")));
-    }
+    };
 
     let raw_types = include_segment_types(&pairs);
     let types: Vec<MediaSegmentType> = parse_csv_enums_lenient(raw_types.as_deref());
@@ -83,7 +82,7 @@ async fn get_item_segments(
 
     let mut segments = state
         .media_segments
-        .get_segments(item_id, type_filter, true)
+        .get_item_segments(&item, type_filter, true)
         .await?;
     // The Intro Skipper's `MediaSegmentsFirstEpisodeFilter` (`SkipFirstEpisode`).
     if segments.iter().any(|s| s.type_ == MediaSegmentType::Intro)

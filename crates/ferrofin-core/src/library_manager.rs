@@ -2623,6 +2623,28 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.retrieve_item(id).await
     }
 
+    /// The trait's lookup-then-check, with the item and its chain read together
+    /// ([`ItemVisibility::visible_item`]).
+    async fn get_item_by_id_for_user(
+        &self,
+        id: Uuid,
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let Some(user) = user else {
+            return self.get_item_by_id(id).await;
+        };
+        match &self.visibility {
+            Some(visibility) => visibility.visible_item(id, user).await,
+            None => match self.get_item_by_id(id).await? {
+                None => Ok(None),
+                Some(item) => self
+                    .is_item_visible_standalone(&item, user)
+                    .await
+                    .map(|visible| visible.then_some(item)),
+            },
+        }
+    }
+
     async fn containing_folder_path(&self, item: &BaseItemEntity) -> Option<String> {
         self.item_containing_folder(item).await
     }
@@ -2916,14 +2938,12 @@ impl LibraryManager for FerrofinLibraryManager {
         &self,
         items: &[BaseItemEntity],
     ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        // The snapshot, not `get_virtual_folders`: that rebuilds every library's
+        // full listing (its image and existence reads included) for one option.
         let folders = if items.iter().any(|item| item.type_.ends_with(".Series")) {
-            if let Some(folders) = &self.virtual_folders {
-                folders.get_virtual_folders().await?
-            } else {
-                Vec::new()
-            }
+            self.configured_libraries().await?
         } else {
-            Vec::new()
+            Arc::from([])
         };
         let grouped_series: Vec<Uuid> = items
             .iter()
@@ -5861,7 +5881,7 @@ mod tests {
         row.tags = Some("Private".into());
         crate::test_support::save_item(&db, &row).await;
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &user.id,
             ferrofin_db::enums::PreferenceKind::BlockedTags,
             &["private".to_owned()],
@@ -7481,14 +7501,9 @@ mod tests {
             users.push(crate::test_support::seed_named_user(&db, id, name).await);
             crate::test_support::grant_default_permissions(&db, id).await;
         }
-        set_permission(
-            db.pool(),
-            &users[2].id,
-            PermissionKind::IsAdministrator,
-            true,
-        )
-        .await
-        .expect("admin");
+        set_permission(&db, &users[2].id, PermissionKind::IsAdministrator, true)
+            .await
+            .expect("admin");
         let share = serde_json::json!([{"UserId": member, "CanEdit": false}]);
         for (name, shares, open) in [
             ("Private", serde_json::json!([]), false),
@@ -7653,7 +7668,7 @@ mod tests {
             }
         }
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &user.id,
             ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
             &[ferrofin_db::store::guid_to_db(blocked_library)],

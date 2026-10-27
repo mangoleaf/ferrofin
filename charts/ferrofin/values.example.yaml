@@ -165,6 +165,11 @@ ferrofin:
     # MaxCachedRecords) or after this many idle seconds (default 300).
     # FERROFIN_SCAN_DIRECTORY_CACHE_RECORDS: "100000"
     # FERROFIN_SCAN_DIRECTORY_CACHE_IDLE_SECS: "300"
+    # Seconds a resolved access token, and a user's permissions with the libraries'
+    # rows and options, are served from memory (5-300, default 30 each). Changes
+    # made through the server apply at once; these only bound changes made outside it.
+    # FERROFIN_AUTH_CACHE_TTL_SECS: "30"
+    # FERROFIN_ROW_CACHE_TTL_SECS: "30"
     # How many trickplay images are generated at once (default: auto, up to the
     # image-encoding limit, one per CPU). Each is an ffmpeg process, and with
     # hardware acceleration holds GPU memory; "1" matches Jellyfin.

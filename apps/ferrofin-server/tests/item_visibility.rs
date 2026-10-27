@@ -19,6 +19,7 @@ const ADMIN_PASSWORD: &str = "visibility-admin-pw";
 /// scanned.
 struct Harness {
     wired: WiredApp,
+    db: Database,
     temp: tempfile::TempDir,
 }
 
@@ -73,7 +74,7 @@ async fn boot() -> Harness {
     ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
         .await
         .expect("seed admin");
-    Harness { wired, temp }
+    Harness { wired, db, temp }
 }
 
 /// Sends one request as `token` (on its own device) and returns status + body.
@@ -1595,4 +1596,105 @@ async fn current_web_schedule_payload_saves_and_revokes_existing_requests() {
             StatusCode::OK
         );
     }
+}
+
+/// The viewer's `GET /Items/{allowed}` status.
+async fn viewer_reads_allowed(f: &Fixture) -> StatusCode {
+    call(
+        &f.router,
+        "GET",
+        &format!("/Items/{}", f.allowed),
+        Some(&f.viewer),
+        None,
+    )
+    .await
+    .0
+}
+
+#[tokio::test]
+async fn library_option_and_library_row_edits_reach_the_next_request() {
+    // The policy and library rows are cached across requests (ferrofin_db::row_cache, gl-973):
+    // each edit below must reach the request right after it, with the caches already warm.
+    let f = fixture().await;
+    assert!(
+        f.h.db.row_cache_enabled(),
+        "the composition root turns the caches on"
+    );
+    assert_eq!(viewer_reads_allowed(&f).await, StatusCode::OK);
+    assert!(
+        f.h.db.cached_libraries().is_some(),
+        "and the read filled them"
+    );
+    let (_, folders) = call(
+        &f.router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let allowed = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "Allowed")
+        .unwrap()
+        .clone();
+    let library = allowed["ItemId"].as_str().unwrap().to_owned();
+    // A library disabled through its options is hidden (`CollectionFolder.IsVisible`).
+    let library_path = format!("/Items/{library}");
+    let read_library = || call(&f.router, "GET", &library_path, Some(&f.viewer), None);
+    assert_eq!(read_library().await.0, StatusCode::OK);
+    for (enabled, expected) in [(false, StatusCode::NOT_FOUND), (true, StatusCode::OK)] {
+        let mut options = allowed["LibraryOptions"].clone();
+        options["Enabled"] = json!(enabled);
+        let (status, _) = call(
+            &f.router,
+            "POST",
+            "/Library/VirtualFolders/LibraryOptions",
+            Some(&f.admin),
+            Some(json!({"Id": library, "LibraryOptions": options})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(read_library().await.0, expected, "Enabled = {enabled}");
+    }
+    // A tag on the library's own row is inherited by its items, so a blocked tag hides them.
+    let (_, mut user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    user["Policy"]["BlockedTags"] = json!(["kept-out"]);
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Users/{}/Policy", f.viewer_id),
+        Some(&f.admin),
+        Some(user["Policy"].clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        viewer_reads_allowed(&f).await,
+        StatusCode::OK,
+        "no tag on the library yet"
+    );
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Items/{library}"),
+        Some(&f.admin),
+        Some(json!({"Name": "Allowed", "Tags": ["kept-out"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        viewer_reads_allowed(&f).await,
+        StatusCode::NOT_FOUND,
+        "the library's tag is blocked"
+    );
 }
