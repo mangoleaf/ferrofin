@@ -210,3 +210,116 @@ fake_tools() { # docker and taskset that do nothing, first on PATH, so a script 
   [ "$output" = "verify: $TMP/taken exists: a run directory is never reused" ]
   [ ! -e "$ROOT" ]
 }
+
+# looper: a gate-shaped script under gates_supervise, in $TMP/looper.sh: a teardown on its EXIT trap that
+# records the status it ended with, and a loop that parses a $( … ) as fast as it can, the shape that loses
+# a trapped TERM under bash 5.2 (gl-968). It writes its worker's PID to out/worker once it loops. The loop
+# never ends by itself: a dropped signal can break the parse of the $( … ) it landed in too, and a loop that
+# tested the result (or ran under set -e) would then end with its own status instead of the TERM's.
+looper() {
+  mkdir -p "$TMP/out"
+  cat > "$TMP/looper.sh" <<'SH'
+#!/usr/bin/env bash
+set -uo pipefail
+. "$GATES/lib.sh"
+gates_supervise "$PWD" "$0" "$@"
+OUT=$1
+cleanup() { local rc=$?; trap '' INT TERM HUP; gates_ack; echo "$rc" > "$OUT/teardown"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+echo "$BASHPID" > "$OUT/worker"
+while :; do x=$(echo true) || :; done
+SH
+}
+
+# session_pids <sid>: the processes still in that session (from /proc: busybox has no pgrep -s).
+session_pids() {
+  local stat pid s
+  for stat in /proc/[0-9]*/stat; do
+    read -r pid _ _ _ _ s _ 2>/dev/null < "$stat" || continue
+    [ "$s" != "$1" ] || echo "$pid"
+  done
+}
+
+@test "gates_supervise: a TERM to the group or the shell alone, a HUP or a Ctrl-C stops a worker looping on \$( … ), after its teardown" {
+  looper
+  export GATES
+  mkdir acks
+  set -m   # a background job keeps SIGINT (a non-interactive shell would ignore it), and leads its own group
+  for how in group pid hup int group pid hup int group pid hup int; do   # under bash 5.2 some land mid-parse
+    rm -f out/worker out/teardown
+    TMPDIR=$TMP/acks bash looper.sh "$TMP/out" & leader=$!
+    for _ in $(seq 1 100); do [ ! -s out/worker ] || break; sleep 0.05; done
+    worker=$(cat out/worker)
+    sleep "0.$((RANDOM % 3))"
+    case $how in
+      group) kill -TERM -- "-$leader"; want=143;;
+      pid) kill -TERM "$leader"; want=143;;
+      hup) kill -HUP "$leader"; want=129;;
+      int) kill -INT "$leader"; want=130;;
+    esac
+    for _ in $(seq 1 40); do kill -0 "$leader" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$leader" 2>/dev/null; then
+      kill -KILL -- "-$leader" "$worker" 2>/dev/null; set +m
+      echo "$how: still running 4 s after the signal" >&2; return 1
+    fi
+    status=0; wait "$leader" || status=$?
+    [ "$status" -eq "$want" ] || { set +m; echo "$how: exit $status, not $want" >&2; return 1; }
+    [ "$(cat out/teardown)" = 143 ] || { set +m; echo "$how: the teardown saw $(cat out/teardown)" >&2; return 1; }
+    [ -z "$(session_pids "$worker")" ] || { set +m; echo "$how: the worker's session outlived it" >&2; return 1; }
+    [ -z "$(ls -A acks)" ] || { set +m; echo "$how: the supervisor left $(ls acks)" >&2; return 1; }
+  done
+  set +m
+}
+
+# bencher: bench/run.sh's shape under gates_supervise, in $TMP/bencher.sh: the worker's top level traps a
+# signal and relays it (interrupt_run → gates_stop) to a background shell that loops on $( … ) and keeps its
+# own traps, whose teardown gives TERM its default action back and takes a moment (a TERM sent to it again
+# then would kill it before it wrote out/teardown).
+bencher() {
+  mkdir -p "$TMP/out"
+  cat > "$TMP/bencher.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+. "$GATES/lib.sh"
+gates_supervise "$PWD" "$0" "$@"
+OUT=$1
+run_server() {
+  cleanup() { local rc=$?; set +e; gates_ack; trap - EXIT INT TERM; sleep 0.5; echo "$rc" > "$OUT/teardown"; }
+  trap cleanup EXIT
+  trap 'exit 143' TERM
+  echo "$BASHPID" > "$OUT/server"
+  while :; do x=$(echo true) || :; done   # never ends by itself, set -e or not (looper)
+}
+SERVER_PID=
+interrupt_run() { gates_ack; trap - INT TERM; [ -z "$SERVER_PID" ] || gates_stop "$SERVER_PID"; exit 130; }
+trap interrupt_run INT TERM
+echo "$BASHPID" > "$OUT/worker"
+run_server &
+SERVER_PID=$!
+wait "$SERVER_PID"
+SH
+}
+
+@test "gates_stop: bench's relay reaches a background shell looping on \$( … ), and its slow teardown is never cut short" {
+  bencher
+  export GATES
+  for how in group pid group pid group pid; do
+    rm -f out/worker out/server out/teardown
+    setsid bash bencher.sh "$TMP/out" & leader=$!
+    for _ in $(seq 1 100); do [ ! -s out/server ] || break; sleep 0.05; done
+    worker=$(cat out/worker)
+    sleep "0.$((RANDOM % 3))"
+    if [ "$how" = group ]; then kill -TERM -- "-$leader"; else kill -TERM "$leader"; fi
+    for _ in $(seq 1 40); do kill -0 "$leader" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$leader" 2>/dev/null; then
+      kill -KILL -- "-$leader" "-$worker" 2>/dev/null; echo "$how: still running 4 s after the TERM" >&2; return 1
+    fi
+    status=0; wait "$leader" || status=$?
+    [ "$status" -eq 143 ] || { echo "$how: exit $status" >&2; return 1; }
+    [ "$(cat out/teardown 2>/dev/null)" = 143 ] || { echo "$how: the server's teardown did not finish" >&2; return 1; }
+    [ -z "$(session_pids "$worker")" ] || { echo "$how: the worker's session outlived it" >&2; return 1; }
+  done
+}

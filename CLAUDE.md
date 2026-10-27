@@ -146,8 +146,12 @@ so a database Ferrofin has migrated is not guaranteed to open under Jellyfin aga
 adoption path copies the original to `jellyfin.db.pre-ferrofin` before touching it and logs
 the path; the table-rebuilding migrations (`0007`, `0032`) and the dangling-row cleanup
 (`0044`) each snapshot the file to `jellyfin.db.pre-00NN` first, and every file-backed boot
-runs `PRAGMA foreign_key_check`; returning to Jellyfin means restoring that backup. Never describe the swap as
-two-way or round-trip in user-facing text. (Suite v3 exercises adoption — every server
+runs `PRAGMA foreign_key_check`; returning to Jellyfin means restoring
+`jellyfin.db.pre-ferrofin`, the only copy older than every change Ferrofin made. Any other
+migrating boot also snapshots the file, to a `.pre-NNNN` it deletes once it has passed (as
+Jellyfin does) and only warns about when it cannot write it. Every snapshot is written to
+`.partial` and renamed whole, and an existing one is kept, never replaced. Never describe the
+swap as two-way or round-trip in user-facing text. (Suite v3 exercises adoption — every server
 boots a disposable copy of a Jellyfin-scanned database and Ferrofin migrates it in place —
 but nothing checks that Jellyfin still opens the result, and nothing is expected to.)
 

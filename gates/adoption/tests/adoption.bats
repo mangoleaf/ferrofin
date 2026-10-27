@@ -803,15 +803,18 @@ EOS
   grep -q "NOTHING RAN" fixtures/work/run/report.html
 }
 
-@test "run.sh: a run that is terminated still leaves a report, listing the fixture it was on as unfinished" {
+# A messy 12.x row whose container "is running" and never answers, so the row waits for it, run in a
+# session of its own; started_waiting_row sets $leader once the row has begun. The fake docker records its
+# session, the run's worker's (run.sh's own work runs there, gl-920), in docker.sid.
+started_waiting_row() {
   mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
   smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
   empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
   printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json
   printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
-  # every container "is running" and never answers: the row waits for it
   cat > bin/docker <<'EOS'
 #!/usr/bin/env bash
+read -r _ _ _ _ _ sid _ < /proc/$$/stat; echo "$sid" > "$PWD/docker.sid.$$"; mv "$PWD/docker.sid.$$" "$PWD/docker.sid"
 case "$1" in
   image|run|restart|rm|logs) exit 0;;
   inspect) echo true; exit 0;;
@@ -823,11 +826,52 @@ EOS
   leader=$!
   for _ in $(seq 1 40); do grep -q '"begin"' fixtures/work/run/results.jsonl 2>/dev/null && break; sleep 0.25; done
   grep -q '"begin"' fixtures/work/run/results.jsonl
-  kill -TERM -- "-$leader"
+}
+
+# session_pids <sid>: the processes still in that session (from /proc: busybox has no pgrep -s).
+session_pids() {
+  local stat pid s
+  for stat in /proc/[0-9]*/stat; do
+    read -r pid _ _ _ _ s _ 2>/dev/null < "$stat" || continue
+    [ "$s" != "$1" ] || echo "$pid"
+  done
+}
+
+# stopped_within <seconds>: the run ends in time, else it is killed and the test fails (a run that ignores
+# its TERM would otherwise wait out two 600 s readiness deadlines, as gl-920's did on CI).
+stopped_within() {
+  local _
+  for _ in $(seq 1 $(($1 * 4))); do kill -0 "$leader" 2>/dev/null || break; sleep 0.25; done
+  if kill -0 "$leader" 2>/dev/null; then
+    kill -KILL -- "-$leader" 2>/dev/null || true
+    [ ! -s docker.sid ] || session_pids "$(cat docker.sid)" | xargs -r kill -KILL 2>/dev/null || true
+    echo "run.sh was still running $1 s after its TERM" >&2
+    return 1
+  fi
   status=0; wait "$leader" || status=$?
+}
+
+@test "run.sh: a run that is terminated still leaves a report, listing the fixture it was on as unfinished" {
+  started_waiting_row
+  kill -TERM -- "-$leader"
+  stopped_within 30
   [ "$status" -eq 143 ]
   grep -q "INCOMPLETE" fixtures/work/run/report.html
   grep -q "jellyfin-12.2-messy" fixtures/work/run/report.html
+}
+
+@test "run.sh: a TERM to run.sh alone stops everything the run started" {
+  started_waiting_row
+  sid=$(cat docker.sid)   # the worker's: its own docker calls come before the row begins
+  [ -n "$sid" ]
+  [ "$sid" != "$leader" ]   # the work runs in a session of its own
+  kill -TERM "$leader"
+  stopped_within 30
+  [ "$status" -eq 143 ]
+  grep -q "INCOMPLETE" fixtures/work/run/report.html
+  # what the TERM killed may take a moment to be reaped
+  for _ in $(seq 1 20); do [ -n "$(session_pids "$sid")" ] || break; sleep 0.1; done
+  [ -z "$(session_pids "$sid")" ]
 }
 
 @test "adoption report: recording, verdicts, the page and the viewer's listing" {

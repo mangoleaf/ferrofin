@@ -56,6 +56,16 @@ for it ([`bench/oracle.py`](bench/oracle.py)). A gate that
 fails does not stop the next; `gates/run` exits 1 when one failed and 2 when the preflight refused.
 Each gate's own script still runs on its own; its README says how.
 
+Stop a run with Ctrl-C or a TERM: it stops at once, removes what it started and still writes its
+report, and exits 130 or 143. `gates/run`, `verify/run.sh`, `verify/scan-behaviour.sh`, `parity/run.sh`
+and `bench/run.sh` hand the run to a worker in a session of its own and only wait for it, then pass a
+signal on as a TERM, again every second until the worker's cleanup has started ([`lib.sh`](lib.sh),
+`gates_supervise`): bash 5.2 drops a trapped signal that lands while it parses a `$( … )`. So what a
+run records (`session.json`, a report) says 143 for a Ctrl-C too. A SIGKILL cannot be passed on, so
+never stop a run with `kill -9`: its worker would run on. Ctrl-Z suspends only the waiting shell.
+`adoption/run.sh` hands its run to a worker too, but its own supervisor stops the worker outright and
+builds the report itself ([its README](adoption/README.md)).
+
 The root [`Makefile`](../Makefile) offers the same as targets: `make run-gates` for all four, and
 `make run-verify`, `make run-adoption`, `make run-parity` or `make run-bench` for one, with `IMAGE=`
 and `PREVIOUS=` passed through from the command line (`make run-gates IMAGE=ferrofin:v1.4.0-rc
