@@ -338,6 +338,8 @@ benchmark-report:
     - python3 -m unittest discover -s gates/bench -p test_ramp.py
     - python3 -m unittest discover -s gates/bench -p test_soak.py
     - python3 -m unittest discover -s gates/bench -p test_viewer.py
+    # the README Results block and its graphs are what the committed summary files give (no gate runs)
+    - python3 gates/publish.py readme --check
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

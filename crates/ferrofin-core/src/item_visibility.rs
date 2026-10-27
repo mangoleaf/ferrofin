@@ -10,6 +10,7 @@ use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::{PermissionKind, PreferenceKind};
+use ferrofin_db::row_cache::LibrarySet;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::localization::LocalizationManager;
@@ -49,11 +50,11 @@ pub struct ItemVisibility {
 }
 
 /// The library rows and each library's options that visibility and rating
-/// evaluations read, from [`ItemVisibility::rating_libraries`]. A batch job
-/// that evaluates one item at a time reads them once and passes them along.
+/// evaluations read, from [`ItemVisibility::rating_libraries`]: the database's
+/// cached library set ([`ferrofin_db::row_cache`]). A batch job that evaluates
+/// one item at a time reads them once and passes them along.
 pub(crate) struct RatingLibraries {
-    rows: Vec<BaseItemEntity>,
-    options: HashMap<Uuid, ferrofin_model::configuration::LibraryOptions>,
+    set: Arc<LibrarySet>,
 }
 
 impl ItemVisibility {
@@ -115,6 +116,33 @@ impl ItemVisibility {
                 }
             })
             .collect()
+    }
+
+    /// `LibraryManager.GetItemById(id, user)`: the item when `user` may see it standalone, else
+    /// `None`. The item and the chain above it come in one read, so with the policy and library
+    /// rows cached the check reads nothing more (gl-973).
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for cyclic hierarchy/channel corruption.
+    pub async fn visible_item(
+        &self,
+        id: Uuid,
+        user: &UserEntity,
+    ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        // `ItemRepository::retrieve_item`'s rows: never the nil id or the placeholder row
+        // (`ferrofin_db::PLACEHOLDER_ITEM_ID`, `00000000-0000-0000-0000-000000000001`).
+        if id.is_nil() || id == Uuid::from_u128(1) {
+            return Ok(None);
+        }
+        let chain = repository::reachable(&self.db, &[id]).await?;
+        let Some(item) = chain.iter().find(|row| row_id(row) == id).cloned() else {
+            return Ok(None);
+        };
+        let context = self
+            .load_known(std::slice::from_ref(&item), chain, Some(user), None)
+            .await?;
+        let row = context.rows.get(&id).unwrap_or(&item);
+        Ok(context.standalone(row)?.then_some(item))
     }
 
     /// `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck)` for each row,
@@ -332,6 +360,11 @@ impl ItemVisibility {
     /// # Errors
     /// Returns storage errors.
     pub(crate) async fn rating_libraries(&self) -> Result<RatingLibraries, ServiceError> {
+        if let Some(set) = self.db.cached_libraries() {
+            return Ok(RatingLibraries { set });
+        }
+        // Begun before the reads: a library written meanwhile keeps this set out of the cache.
+        let load = self.db.begin_library_load();
         let rows = repository::libraries(&self.db).await?;
         #[cfg(test)]
         self.library_loads
@@ -351,7 +384,26 @@ impl ItemVisibility {
                 );
             }
         }
-        Ok(RatingLibraries { rows, options })
+        // The rows above the libraries (the user root, the root folder), where every walk ends.
+        let library_ids: HashSet<Uuid> = rows.iter().map(row_id).collect();
+        let above: Vec<Uuid> = rows
+            .iter()
+            .flat_map(references)
+            .filter(|id| !library_ids.contains(id))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let ancestors = if above.is_empty() {
+            Vec::new()
+        } else {
+            repository::reachable(&self.db, &above).await?
+        };
+        let set = load.store(LibrarySet {
+            rows,
+            ancestors,
+            options,
+        });
+        Ok(RatingLibraries { set })
     }
 
     async fn update_rating_scores_with(
@@ -440,18 +492,9 @@ impl ItemVisibility {
             for id in fresh {
                 examined.insert(id);
                 let row = &rows[&id];
-                for next in [
-                    row.parent_id.as_deref(),
-                    row.owner_id.as_deref(),
-                    row.channel_id.as_deref(),
-                    row.season_id.as_deref(),
-                    row.series_id.as_deref(),
-                ]
-                .into_iter()
-                .filter_map(uuid)
-                .chain(links.get(&id).into_iter().flatten().copied())
-                {
-                    if requested.insert(next) {
+                for next in references(row).chain(links.get(&id).into_iter().flatten().copied()) {
+                    // A row the last read brought in is not asked for again.
+                    if !rows.contains_key(&next) && requested.insert(next) {
                         wanted.insert(next);
                     }
                 }
@@ -459,12 +502,13 @@ impl ItemVisibility {
             if wanted.is_empty() {
                 break;
             }
-            for row in self
-                .items
-                .retrieve_items(&wanted.into_iter().collect::<Vec<_>>())
-                .await?
+            // The whole chain above `wanted` in one read. A reference it could not follow (a
+            // missing row) is asked for once more, by itself, in the next round.
+            for row in
+                repository::reachable(&self.db, &wanted.into_iter().collect::<Vec<_>>()).await?
             {
-                rows.insert(row_id(&row), row);
+                // What the caller passed (an item with unsaved changes, the cached libraries) wins.
+                rows.entry(row_id(&row)).or_insert(row);
             }
         }
         Ok(links)
@@ -485,6 +529,18 @@ impl ItemVisibility {
         user: Option<&'a UserEntity>,
         libraries: Option<&'a RatingLibraries>,
     ) -> Result<Context<'a>, ServiceError> {
+        self.load_known(items, Vec::new(), user, libraries).await
+    }
+
+    /// [`Self::load_with`] when the caller has read some of the hierarchy too: `known` rows are
+    /// not read again.
+    async fn load_known<'a>(
+        &'a self,
+        items: &[BaseItemEntity],
+        known: Vec<BaseItemEntity>,
+        user: Option<&'a UserEntity>,
+        libraries: Option<&'a RatingLibraries>,
+    ) -> Result<Context<'a>, ServiceError> {
         let (permissions, preferences) = if let Some(user) = user {
             (
                 repository::permissions(&self.db, &user.id).await?,
@@ -493,21 +549,21 @@ impl ItemVisibility {
         } else {
             (Vec::new(), Vec::new())
         };
-        let (libraries, options) = if let Some(libraries) = libraries {
-            (
-                libraries.rows.clone(),
-                std::borrow::Cow::Borrowed(&libraries.options),
-            )
-        } else {
-            let libraries = self.rating_libraries().await?;
-            (libraries.rows, std::borrow::Cow::Owned(libraries.options))
+        let libraries = match libraries {
+            Some(libraries) => Arc::clone(&libraries.set),
+            None => self.rating_libraries().await?.set,
         };
-        let library_ids: Vec<Uuid> = libraries.iter().map(row_id).collect();
+        let library_ids: Vec<Uuid> = libraries.rows.iter().map(row_id).collect();
         let mut rows: HashMap<Uuid, BaseItemEntity> = libraries
-            .into_iter()
+            .rows
+            .iter()
+            .cloned()
             .chain(items.iter().cloned())
             .map(|row| (row_id(&row), row))
             .collect();
+        for row in known.into_iter().chain(libraries.ancestors.iter().cloned()) {
+            rows.entry(row_id(&row)).or_insert(row);
+        }
         let links = self
             .load_hierarchy(
                 &mut rows,
@@ -541,7 +597,7 @@ impl ItemVisibility {
             rows,
             library_ids,
             links,
-            options,
+            libraries,
             playlists,
             permissions: permissions.into_iter().collect(),
             preferences: preferences
@@ -566,10 +622,24 @@ struct Context<'a> {
     rows: HashMap<Uuid, BaseItemEntity>,
     library_ids: Vec<Uuid>,
     links: HashMap<Uuid, Vec<Uuid>>,
-    options: std::borrow::Cow<'a, HashMap<Uuid, ferrofin_model::configuration::LibraryOptions>>,
+    /// The library set the rows above were read with; its `options` are each library's.
+    libraries: Arc<LibrarySet>,
     playlists: HashMap<Uuid, bool>,
     permissions: HashMap<i32, bool>,
     preferences: HashMap<i32, Vec<String>>,
+}
+
+/// The rows `row` refers to up its hierarchy: the columns [`repository::reachable`] walks.
+fn references(row: &BaseItemEntity) -> impl Iterator<Item = Uuid> + '_ {
+    [
+        row.parent_id.as_deref(),
+        row.owner_id.as_deref(),
+        row.channel_id.as_deref(),
+        row.season_id.as_deref(),
+        row.series_id.as_deref(),
+    ]
+    .into_iter()
+    .filter_map(uuid)
 }
 
 fn uuid(value: Option<&str>) -> Option<Uuid> {
@@ -707,7 +777,7 @@ impl Context<'_> {
                             })
                         })
                     // `read_options` has already expanded these.
-                    || self.options.get(id).is_some_and(|opts| {
+                    || self.libraries.options.get(id).is_some_and(|opts| {
                         opts.path_infos
                             .iter()
                             .any(|p| p.path.eq_ignore_ascii_case(path))
@@ -779,7 +849,7 @@ impl Context<'_> {
         }
         if kind(item) == BaseItemKind::CollectionFolder
             && (!self.folder_allowed(id, false)
-                || self.options.get(&id).is_some_and(|o| !o.enabled))
+                || self.libraries.options.get(&id).is_some_and(|o| !o.enabled))
         {
             return Ok(false);
         }
@@ -1002,7 +1072,7 @@ impl Context<'_> {
             .or_else(|| {
                 libraries
                     .iter()
-                    .filter_map(|id| self.options.get(id))
+                    .filter_map(|id| self.libraries.options.get(id))
                     .find_map(|opts| nonempty(opts.metadata_country_code.as_deref()))
             }))
     }
@@ -1054,6 +1124,10 @@ mod tests {
     impl Fixture {
         async fn new() -> Self {
             let db = test_db().await;
+            // The server's caches, on (ferrofin_db::row_cache): every test below also checks that
+            // the writes it makes through the persistence service and the policy setters reach
+            // the next evaluation.
+            db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
             let user = seed_user_with_defaults(&db, Uuid::from_u128(0x9000)).await;
             let service = ItemVisibility::new(
                 db.clone(),
@@ -1096,7 +1170,7 @@ mod tests {
 
         async fn pref(&self, kind: PreferenceKind, values: &[&str]) {
             set_preference(
-                self.db.pool(),
+                &self.db,
                 &self.user.id,
                 kind,
                 &values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>(),
@@ -1111,6 +1185,112 @@ mod tests {
                 .await
                 .expect("visibility")[0]
         }
+    }
+
+    /// `visible_item` reads an item with the chain above it at once, and answers as the trait's
+    /// lookup-then-check does: the stored row when it is visible standalone, else `None` (gl-973).
+    #[tokio::test]
+    async fn visible_item_answers_as_the_lookup_then_check_does() {
+        let f = Fixture::new().await;
+        let allowed = f
+            .item(
+                30,
+                BaseItemKind::CollectionFolder,
+                Some("/views/allowed"),
+                None,
+            )
+            .await;
+        let hidden = f
+            .item(
+                31,
+                BaseItemKind::CollectionFolder,
+                Some("/views/hidden"),
+                None,
+            )
+            .await;
+        let folder = f
+            .item(32, BaseItemKind::Folder, Some("/media/a"), Some(&allowed))
+            .await;
+        let seen = f
+            .item(
+                33,
+                BaseItemKind::Movie,
+                Some("/media/a/seen.mkv"),
+                Some(&folder),
+            )
+            .await;
+        let unseen = f
+            .item(
+                34,
+                BaseItemKind::Movie,
+                Some("/media/b/unseen.mkv"),
+                Some(&hidden),
+            )
+            .await;
+        set_permission(&f.db, &f.user.id, PermissionKind::EnableAllFolders, false)
+            .await
+            .expect("permission");
+        f.pref(PreferenceKind::EnabledFolders, &[&allowed.id]).await;
+        for item in [&seen, &unseen, &folder, &hidden] {
+            let id = row_id(item);
+            let found = f.service.visible_item(id, &f.user).await.expect("lookup");
+            assert_eq!(found.is_some(), f.visible(item).await, "{:?}", item.path);
+            if let Some(found) = found {
+                let stored = f.service.items.retrieve_item(id).await.expect("read");
+                assert_eq!(Some(found), stored, "the stored row, as read");
+            }
+        }
+        assert!(f.visible(&seen).await && !f.visible(&unseen).await);
+        let missing = f
+            .service
+            .visible_item(Uuid::from_u128(0x9999), &f.user)
+            .await;
+        assert!(missing.expect("lookup").is_none());
+        let placeholder = Uuid::parse_str(ferrofin_db::PLACEHOLDER_ITEM_ID).expect("id");
+        assert!(
+            f.service
+                .visible_item(placeholder, &f.user)
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+    }
+
+    /// With the server's caches on, any number of evaluations read the library set once, and
+    /// read it again only after a library's own row is written (gl-973).
+    #[tokio::test]
+    async fn the_library_set_is_read_once_until_a_library_row_is_written() {
+        let f = Fixture::new().await;
+        let library = f
+            .item(20, BaseItemKind::CollectionFolder, Some("/views/one"), None)
+            .await;
+        let movie = f
+            .item(
+                21,
+                BaseItemKind::Movie,
+                Some("/media/one.mkv"),
+                Some(&library),
+            )
+            .await;
+        let before = f.service.library_loads();
+        for _ in 0..3 {
+            assert!(f.visible(&movie).await);
+        }
+        assert_eq!(f.service.library_loads(), before + 1);
+        f.save(&movie).await;
+        f.visible(&movie).await;
+        assert_eq!(
+            f.service.library_loads(),
+            before + 1,
+            "another row: the set is kept"
+        );
+        f.save(&library).await;
+        f.visible(&movie).await;
+        assert_eq!(
+            f.service.library_loads(),
+            before + 2,
+            "the library's row: read again"
+        );
     }
 
     /// C# `Person.IsVisible(user)` is `base.IsVisible(user, skipAllowedTagsCheck:
@@ -1298,14 +1478,9 @@ mod tests {
         extra.owner_id = Some(movie.id.clone());
         f.save(&extra).await;
         assert!(f.visible(&movie).await);
-        set_permission(
-            f.db.pool(),
-            &f.user.id,
-            PermissionKind::EnableAllFolders,
-            false,
-        )
-        .await
-        .expect("permission");
+        set_permission(&f.db, &f.user.id, PermissionKind::EnableAllFolders, false)
+            .await
+            .expect("permission");
         f.pref(PreferenceKind::EnabledFolders, &[&allowed.id]).await;
         assert!(!f.visible(&movie).await);
         assert!(!f.visible(&extra).await);
@@ -1331,14 +1506,9 @@ mod tests {
         assert!(f.visible(&movie).await);
         f.pref(PreferenceKind::BlockedMediaFolders, &[&hidden.id])
             .await;
-        set_permission(
-            f.db.pool(),
-            &f.user.id,
-            PermissionKind::IsAdministrator,
-            true,
-        )
-        .await
-        .expect("admin");
+        set_permission(&f.db, &f.user.id, PermissionKind::IsAdministrator, true)
+            .await
+            .expect("admin");
         assert!(!f.visible(&movie).await);
         let root = f
             .item(14, BaseItemKind::UserRootFolder, None, Some(&hidden))
@@ -1562,14 +1732,9 @@ mod tests {
         movie.channel_id = Some(channel.id.clone());
         f.save(&movie).await;
         for admin in [false, true] {
-            set_permission(
-                f.db.pool(),
-                &f.user.id,
-                PermissionKind::IsAdministrator,
-                admin,
-            )
-            .await
-            .expect("admin");
+            set_permission(&f.db, &f.user.id, PermissionKind::IsAdministrator, admin)
+                .await
+                .expect("admin");
             for (all, selected, blocked, expected) in [
                 (true, false, None, true),
                 (false, false, None, false),
@@ -1577,14 +1742,9 @@ mod tests {
                 (true, true, Some(&channel.id), false),
                 (false, false, Some(&other), true),
             ] {
-                set_permission(
-                    f.db.pool(),
-                    &f.user.id,
-                    PermissionKind::EnableAllChannels,
-                    all,
-                )
-                .await
-                .expect("channels");
+                set_permission(&f.db, &f.user.id, PermissionKind::EnableAllChannels, all)
+                    .await
+                    .expect("channels");
                 let enabled = if selected {
                     vec![channel.id.as_str()]
                 } else {
@@ -1648,7 +1808,7 @@ mod tests {
             .load(std::slice::from_ref(&item), Some(&f.user))
             .await
             .expect("context");
-        context.options.to_mut().insert(
+        Arc::make_mut(&mut context.libraries).options.insert(
             row_id(&library),
             ferrofin_model::configuration::LibraryOptions {
                 enabled: false,

@@ -22,11 +22,17 @@ EOS
 import os, sys
 print('{"checked_cpus": [0]}' if sys.argv[1] == "--topology" else os.environ.get("FAKE_IDLE", "1.0"))
 EOS
-  cat > repo/gates/bench/oracle.py <<'EOS'
-import os, sys
-if "--gate" in sys.argv and os.environ.get("FAKE_STALE"):   # a release gate refuses a stale pin
-    sys.exit("oracle: refusing: Jellyfin v99 is out")
-print('{"tag": "v12.2", "image": "jf@sha256:x"}')
+  # The real oracle check (gates/bench/oracle.py) on a pin of the copy's own, with a git whose ls-remote
+  # lists $FAKE_LATEST_TAG as the latest Jellyfin release instead of asking the network.
+  mkdir -p repo/crates/ferrofin-api/src/handlers
+  echo 'pub const UPSTREAM_TAG: &str = "v12.2";' > repo/crates/ferrofin-api/src/handlers/mod.rs
+  cat > bin/git <<EOS
+#!/usr/bin/env bash
+if [ "\$1" = ls-remote ]; then
+  [ -n "\${FAKE_LATEST_TAG:-}" ] || exit 128
+  printf 'abc\trefs/tags/%s\n' "\$FAKE_LATEST_TAG"; exit 0
+fi
+exec $(command -v git) "\$@"
 EOS
   git -C repo init -q -b main && git -C repo add -A && git -C repo -c user.name=t -c user.email=t@t commit -q -m t
   COMMIT=$(git -C repo rev-parse HEAD)
@@ -51,6 +57,7 @@ EOS
   PATH="$TMP/bin:$PATH"
   ORACLE=$(cat repo/gates/bench/testdata/jellyfin-image.txt)
   export FAKE_CALLS="$TMP/calls" FAKE_IMAGES="ferrofin:test ferrofin:old $ORACLE" FAKE_REVISION=$COMMIT
+  export FAKE_LATEST_TAG=v12.2   # the pin is the latest Jellyfin release unless a test says otherwise
   export FERROFIN_GATES_DIR="$TMP/root"
   ROOT=$FERROFIN_GATES_DIR
   # the inputs the preflight looks for
@@ -58,7 +65,7 @@ EOS
   mkdir -p "$fixtures/oracle" "$fixtures/media" "$ROOT/fixtures/bench-testdata/jellyfin"
   touch "$fixtures/oracle/smoke-jellyfin-12.2.txt" "$ROOT/fixtures/bench-testdata/ids.json" \
     "$ROOT/fixtures/bench-testdata/jellyfin/preparation.json"
-  unset FAKE_RC_verify FAKE_RC_adoption FAKE_RC_parity FAKE_RC_bench FAKE_SLEEP FAKE_IDLE FAKE_LEFT FAKE_STALE FAKE_DOCKER_DOWN FAKE_MOVE \
+  unset FAKE_RC_verify FAKE_RC_adoption FAKE_RC_parity FAKE_RC_bench FAKE_SLEEP FAKE_IDLE FAKE_LEFT FAKE_DOCKER_DOWN FAKE_MOVE \
     FERROFIN_ADOPTION_FIXTURES ADOPTION_ORACLE ADOPTION_WORK_DIR FERROFIN_BENCH_IMAGE PARITY_PIN   # a developer's own exports
 }
 
@@ -182,9 +189,12 @@ session() { # the one session directory made under the root
 @test "gates/run: a terminated run stops the running gate, records it as interrupted and the rest as skipped" {
   FAKE_SLEEP=30 repo/gates/run verify,adoption --image ferrofin:test > out.txt 2>&1 & pid=$!
   for _ in $(seq 1 100); do grep -q '^verify ' "$FAKE_CALLS" 2>/dev/null && break; sleep 0.1; done
+  worker=$(pgrep -P "$pid")   # the run goes to a worker in a session of its own (gates_supervise)
+  [ -n "$worker" ]
   kill -TERM "$pid"
   wait "$pid" && status=0 || status=$?
   [ "$status" -eq 143 ]
+  [ -z "$(pgrep -s "$worker")" ]
   s=$(session)
   [ "$(jq -r '.gates | to_entries | map("\(.key)=\(.value.status)/\(.value.note // "")") | join(" ")' "$s/session.json")" = \
     "verify=failed/interrupted adoption=skipped/not reached" ]
@@ -192,6 +202,19 @@ session() { # the one session directory made under the root
   grep -q "| verify | failed (exit 143), interrupted |" "$s/report.md"   # an interrupted session is reported too
   run ! kill -0 "$(cat "$FAKE_CALLS.pids")"   # the gate was stopped, not left running
   run ! grep -q '^adoption ' "$FAKE_CALLS"
+}
+
+@test "gates/run: a TERM to its process group stops the gate and leaves nothing of the run's own session" {
+  FAKE_SLEEP=30 setsid repo/gates/run verify,adoption --image ferrofin:test > out.txt 2>&1 & pid=$!
+  for _ in $(seq 1 100); do grep -q '^verify ' "$FAKE_CALLS" 2>/dev/null && break; sleep 0.1; done
+  worker=$(pgrep -P "$pid")   # the run goes to a worker in a session of its own (gates_supervise)
+  [ -n "$worker" ]
+  kill -TERM -- "-$pid"
+  wait "$pid" && status=0 || status=$?
+  [ "$status" -eq 143 ]
+  [ "$(jq -r '.gates.verify.note' "$(session)/session.json")" = interrupted ]
+  run ! kill -0 "$(cat "$FAKE_CALLS.pids")"
+  [ -z "$(pgrep -s "$worker")" ]
 }
 
 @test "gates/run: -h prints the usage from any directory; no gate is the usage and status 2" {
@@ -207,12 +230,30 @@ session() { # the one session directory made under the root
   [[ "${lines[0]}" == "gates/verify/run.sh "* ]]
 }
 
-@test "gates/run: the release A/B gate's refusals stop the preflight: a stale pin, a missing previous image, --previous without bench" {
-  FAKE_STALE=1 run repo/gates/run bench --image ferrofin:test --dry-run   # an ad-hoc comparison only warns
+@test "gates/run: the release A/B gate runs against the branch's pin and records a newer Jellyfin release" {
+  local note="measured against Jellyfin v12.2, the release this branch pins; v99.0 is out"
+  FAKE_LATEST_TAG=v99.0 run repo/gates/run bench --image ferrofin:test --previous ferrofin:old --dry-run
   [ "$status" -eq 0 ]
-  FAKE_STALE=1 run repo/gates/run bench --image ferrofin:test --previous ferrofin:old --dry-run
+  [[ "$output" == *"oracle: $note"* ]]
+  [[ "$output" == *"preflight: passed"* ]]
+  FAKE_LATEST_TAG=v99.0 run repo/gates/run bench --image ferrofin:test --previous ferrofin:old
+  [ "$status" -eq 0 ]
+  grep -q "^bench-gate ab ferrofin:old ferrofin:test " "$FAKE_CALLS"
+  [ "$(jq -c .oracle "$(session)/session.json")" = "$(jq -nc --arg i "$ORACLE" --arg n "$note" '{image: $i, tag: "v12.2", note: $n}')" ]
+  grep -qF -- "- **Jellyfin oracle:** v12.2 ($ORACLE) — $note" "$(session)/report.md"
+  unset FAKE_LATEST_TAG   # a lookup that fails is noted too, and refuses nothing
+  run repo/gates/run bench --image ferrofin:test --previous ferrofin:old --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"oracle: measured against Jellyfin v12.2, the release this branch pins; the latest Jellyfin release could not be looked up"* ]]
+}
+
+@test "gates/run: the release A/B gate's refusals stop the preflight: an unreadable pin, a missing previous image, --previous without bench" {
+  echo 'pub const UPSTREAM_TAG: &str = "v12.3-rc1";' > repo/crates/ferrofin-api/src/handlers/mod.rs
+  run repo/gates/run bench --image ferrofin:test --previous ferrofin:old --dry-run
   [ "$status" -eq 2 ]
-  [[ "$output" == *"run: the Jellyfin oracle pin was refused"* ]]
+  [[ "$output" == *"UPSTREAM_TAG v12.3-rc1"*"is not a Jellyfin release tag"* ]]
+  [[ "$output" == *"run: the Jellyfin oracle pin cannot be read (see above)"* ]]
+  git -C repo checkout -q -- crates
   run repo/gates/run bench --image ferrofin:test --previous ferrofin:gone --dry-run
   [[ "$output" == *"image ferrofin:gone (--previous) is missing"* ]]
   run repo/gates/run verify --image ferrofin:test --previous ferrofin:old --dry-run

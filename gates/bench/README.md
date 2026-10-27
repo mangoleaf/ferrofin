@@ -34,15 +34,19 @@ The owner withdrew the fixed 15% spread gate on 2026-09-04: tail variation was n
 reliable pass/fail test. Reports retain ranges for review instead.
 
 The benchmark reference is the Jellyfin release named by the C# source-parity pin
-(`UPSTREAM_TAG` in `handlers/mod.rs`, always the latest Jellyfin release), pinned by digest
-in `testdata/jellyfin-image.txt`. `oracle.py check` compares that tag with the latest
-Jellyfin release tag (release candidates excluded). When the pin is behind or the lookup
-fails, a release-gate session (`gate.py aa|ab|scan|ramp|soak|endpoints`) refuses to start and `run.sh` warns and
-continues. Each run records the oracle in `run.json`, and its `report.html` names the tag
-and digest. A run that boots Jellyfin also stops unless the pinned image reports the
-`UPSTREAM_TAG` release (`oracle.py matches`), so the digest cannot drift from the tag.
-Moving the pin means moving `UPSTREAM_TAG`, pinning that release's image and preparing the
-corpus again.
+(`UPSTREAM_TAG` in `handlers/mod.rs`), pinned by digest in `testdata/jellyfin-image.txt`.
+The pin is the latest Jellyfin release when a release branch is cut, and the branch keeps it:
+a release is measured against the Jellyfin release its branch pins, and the next release
+branch moves to the newest one (owner decision 2026-10-25). `oracle.py check` compares the tag
+with the latest Jellyfin release tag (release candidates excluded). When the pin is behind or
+the lookup fails, it notes so ("measured against Jellyfin v12.2, the release this branch pins;
+v12.3 is out") and nothing is refused: neither `run.sh` nor a release-gate session
+(`gate.py aa|ab|scan|ramp|soak|endpoints`). Only a pin it cannot read is refused. Each run records
+the oracle, note included, in `run.json`, and its `report.html` names the tag, digest and note;
+a gate session records them in `gate.json` and its verdict JSON, and names them in its report.
+A run that boots Jellyfin also stops unless the pinned image reports the `UPSTREAM_TAG` release
+(`oracle.py matches`), so the digest cannot drift from the tag. Moving the pin means moving
+`UPSTREAM_TAG`, pinning that release's image and preparing the corpus again.
 The owner requested plugin checks and background scan suppression; the isolation
 policy below implements that request on disposable configurations.
 
@@ -118,8 +122,8 @@ warm-up at the same rate (different picks) that is discarded, and a window in wh
   iteration, found by the `ramp` phase.
 - **Parity** — `N / 412 operations deep-verified against <UPSTREAM_TAG>, plus M compared
   against an earlier release`: the number of contract operations whose Ferrofin
-  implementation was compared against the upstream Jellyfin C# (`UPSTREAM_TAG`, the latest
-  Jellyfin release; M counts rows in `VERIFIED_AGAINST_EARLIER_PIN`, compared against an
+  implementation was compared against the upstream Jellyfin C# (`UPSTREAM_TAG`, the release
+  this branch pins; M counts rows in `VERIFIED_AGAINST_EARLIER_PIN`, compared against an
   earlier pin and owed a re-check) for behavioral equivalence, recorded as rows of
   `handlers::VERIFIED` in
   `crates/ferrofin-api/src/handlers/mod.rs` and printed by
@@ -468,8 +472,8 @@ gates/bench/testdata/build.sh                           # source fixture, once, 
 gates/bench/testdata/build.sh --prepare-jellyfin          # once per source fixture / pinned image
 gates/bench/run.sh                                      # one full run, ~40 min → $FERROFIN_GATES_DIR/runs/bench-<version>/report.md
 python3 gates/bench/report.py "$FERROFIN_GATES_DIR"/runs/bench-{A,B,C}   # the full tables: medians, markers, notes
-python3 gates/bench/report.py --readme README.md "$FERROFIN_GATES_DIR"/runs/bench-{A,B,C}
-                                                  # rewrites the README "Benchmarks" block (headline table + prose)
+make publish-results VERSION=vX.Y.Z BENCH="$FERROFIN_GATES_DIR/runs/bench-A …"
+                                                  # the release's summary, the README Results block and its graphs (gates/README.md)
 python3 gates/bench/report.py --serve                   # the comparison viewer at http://127.0.0.1:8097/ (every gate's runs)
 ```
 
@@ -504,22 +508,33 @@ resolved name and the dirty flag are also written into `run.json`, so they survi
 renamed directory. `--out` overrides the whole thing.
 
 `python3 gates/bench/report.py --serve [PORT] [RUNS_DIR]` is the one local viewer
-(127.0.0.1:8097, loopback only) for every harness's runs, with three tabs:
+(127.0.0.1:8097, loopback only) for every harness's runs, with four tabs:
 
 | Tab | Runs come from |
 |---|---|
 | Benchmark | `RUNS_DIR` (default `$FERROFIN_GATES_DIR/runs`, else `gates/bench/runs`, where runs went before the output root): every directory with a `run.json`, and the runs inside a `gate.py aa`, `ab`, `ramp`, `soak` or `endpoints` session (a directory with a `gate.json`), listed as `<session>/<run>`. A session `gate.py render` has written a `report.html` for is also listed as `<session>`, opening the gate's own report: the only page a `gate.py scan` session has, since its runs hold `scan.json` and are not listed |
-| Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`, else `$FERROFIN_GATES_DIR/work`: every directory under it holding a `report.html` (or `DIR` itself) |
-| Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, else `$FERROFIN_GATES_DIR/runs`, the same way |
+| Adoption | `--adoption-dir DIR` or `FERROFIN_ADOPTION_RUNS`, else both `$FERROFIN_GATES_DIR/work` (standalone runs) and `$FERROFIN_GATES_DIR/runs` (each session's `<session>/adoption`): every directory under them holding a `report.html` (or `DIR` itself) |
+| Parity | `--parity-dir DIR` or `FERROFIN_PARITY_RUNS`, else `$FERROFIN_GATES_DIR/runs`: every directory holding a `report.html` or a `result.json`; a run without the page shows its overview from `result.json` |
+| Verify | `--verify-dir DIR` or `FERROFIN_VERIFY_RUNS`, else `$FERROFIN_GATES_DIR/runs`: every directory holding a `report.html` or a `result.json`; a run without the page is rendered from its `result.json` |
 
 The output root's `runs/` holds every gate's runs, so each tab lists only the directories named for
-its gate (`bench-*`, `parity-*`) and those with no gate prefix, which come from before the root and so
+its gate (`bench-*`, `parity-*`, `verify-*`) and those with no gate prefix, which come from before the root and so
 show in every tab: rename a run moved under the root to `bench-<name>` or `parity-<name>`.
 
 Each run is one self-contained `report.html` (no external assets, so it opens from disk
 and works as a CI artifact). `run.sh` writes the benchmark's beside `report.md`
-(`report.py --html RUN_DIR` rewrites it); the viewer renders a benchmark run that has none
-on demand. The adoption and parity tabs list whatever `report.html` files those harnesses leave in
+(`report.py --html RUN_DIR` rewrites it), and with it `result.json`, from the same model: the
+benchmark's result in the envelope every gate shares ([`gates/result.py`](../result.py)). It
+holds, per server, the median, range and each run's value of every screen and endpoint cell
+at each level (with p95 and p99), time to first screen, peak and idle memory and CPU
+milliseconds per completed screen, Ferrofin's ratio to Jellyfin where the cells are
+comparable, and the reason a cell is withheld where they are not (the servers did different
+work, or the evidence is incomplete); its verdict and counts come from the phase states. Every
+`gate.py` session writes one too, holding its verdict cells (`a_median`, `b_median`, `pct`,
+`verdict`, `gated`) and the blocking ones. The gates' session page reads the benchmark only
+through it, and the viewer labels a run from it. The viewer renders a benchmark run that has no
+`report.html` on demand: from its `result.json` when it has one (the headline tables only),
+else from the run. The adoption and parity tabs list whatever `report.html` files those harnesses leave in
 their directory, and a tab with no runs says so and names the flag. Pick an A and a B of the same harness to see their reports side by side;
 runs of different harnesses are never compared. If a benchmark run directory holds an
 `ab-verdicts.json` (`{"cells": [{"cell", "verdict", "baseline", "candidate", "unit",
@@ -605,5 +620,5 @@ counts are not compared: v1.3.2's fresh scan lists the 40 alternate versions as 
 their own (3,041), and it must stay measurable as a previous release. The test data must
 hold at least 10,000 items. Every cell gates: wall time by the `[scan]` row of
 [`gate.toml`](gate.toml), peak anon by the `[memory]` row, with the A/B verdict rule. The
-session directory holds `report.md`, `report.html` and `verdict.json`; each run directory
+session directory holds `report.md`, `report.html`, `verdict.json` and `result.json`; each run directory
 holds `scan.json`, and each measurement's `server.log`, `mem.csv` and data dir.

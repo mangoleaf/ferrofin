@@ -181,7 +181,10 @@ struct LibrarySnapshot {
 
 /// Drops the library snapshot when the write holding it ends, whether it
 /// succeeds, fails part-way or is cancelled.
-struct SnapshotInvalidation<'a>(&'a std::sync::Mutex<LibrarySnapshot>);
+struct SnapshotInvalidation<'a>(
+    &'a std::sync::Mutex<LibrarySnapshot>,
+    Option<&'a ferrofin_db::Database>,
+);
 
 impl Drop for SnapshotInvalidation<'_> {
     fn drop(&mut self) {
@@ -191,6 +194,11 @@ impl Drop for SnapshotInvalidation<'_> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         snapshot.generation = snapshot.generation.wrapping_add(1);
         snapshot.folders = None;
+        // The library set the visibility check caches (ferrofin_db::row_cache) holds these
+        // libraries' options too.
+        if let Some(db) = self.1 {
+            db.invalidate_libraries();
+        }
     }
 }
 
@@ -350,7 +358,11 @@ impl FerrofinVirtualFolderManager {
     /// Marks the start of a write: the library snapshot is dropped when the
     /// returned guard is.
     fn invalidate_on_drop(&self) -> SnapshotInvalidation<'_> {
-        SnapshotInvalidation(&self.snapshot)
+        let db = self.user_preferences.as_ref().map(|(db, _)| db);
+        SnapshotInvalidation(
+            &self.snapshot,
+            db.or(self.physical_root.as_ref().map(|(db, _)| db)),
+        )
     }
 
     /// The current write generation and the snapshot taken under it, if any.
@@ -596,6 +608,7 @@ impl FerrofinVirtualFolderManager {
         .await?;
         if rewritten > 0 {
             auth_cache.clear();
+            db.invalidate_all_user_policies();
             tracing::info!(
                 users = rewritten,
                 %old_id,
@@ -2186,7 +2199,7 @@ mod tests {
             ),
             (PreferenceKind::BlockedTags, vec!["keep".to_owned()]),
         ] {
-            crate::user_entity_ext::set_preference(db.writer(), &user.id, kind, &values)
+            crate::user_entity_ext::set_preference(&db, &user.id, kind, &values)
                 .await
                 .expect("seed preference");
         }
@@ -2268,7 +2281,7 @@ mod tests {
             (PreferenceKind::MyMediaExcludes, old_shadow),
         ] {
             crate::user_entity_ext::set_preference(
-                db.writer(),
+                &db,
                 &user.id,
                 kind,
                 &[id.hyphenated().to_string()],
@@ -2328,7 +2341,7 @@ mod tests {
             .expect("new id");
         let user = crate::test_support::seed_user(&db, uuid::Uuid::from_u128(0x405)).await;
         crate::user_entity_ext::set_preference(
-            db.writer(),
+            &db,
             &user.id,
             PreferenceKind::EnabledFolders,
             &[stored.hyphenated().to_string()],
@@ -2370,7 +2383,7 @@ mod tests {
         // A duplicate the remap would drop if it ran.
         let values = [id.hyphenated().to_string(), id.simple().to_string()];
         crate::user_entity_ext::set_preference(
-            db.writer(),
+            &db,
             &user.id,
             PreferenceKind::EnabledFolders,
             &values,

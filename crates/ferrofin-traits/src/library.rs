@@ -2320,6 +2320,24 @@ pub trait MediaSourceManager: Send + Sync {
         enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError>;
 
+    /// [`Self::get_playback_media_sources`] for an item and user the caller has already read, as
+    /// upstream's `GetPlaybackMediaSources(BaseItem item, User user, …)` takes them: their rows
+    /// are not read again. `user`, when given, is `user_id`'s row.
+    async fn get_playback_media_sources_for(
+        &self,
+        item: &BaseItemEntity,
+        user: Option<&UserEntity>,
+        user_id: Uuid,
+        allow_media_probe: bool,
+        enable_path_substitution: bool,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let _ = user;
+        let id = Uuid::parse_str(&item.id)
+            .map_err(|_| ServiceError::invalid_input("the item's id is not a GUID"))?;
+        self.get_playback_media_sources(id, user_id, allow_media_probe, enable_path_substitution)
+            .await
+    }
+
     /// Gets the static (non-probed) media sources for an item.
     async fn get_static_media_sources(
         &self,

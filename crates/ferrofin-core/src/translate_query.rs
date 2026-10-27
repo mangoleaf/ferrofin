@@ -63,6 +63,51 @@ pub(crate) const ALTERNATE_VERSION_HIDDEN: &str = r#" AND (bi."PrimaryVersionId"
 pub(crate) const NO_OWNER: &str =
     r#"(bi."OwnerId" IS NULL OR bi."OwnerId" = '00000000-0000-0000-0000-000000000000')"#;
 
+/// Whether [`push_access_filter`]'s library scope may drive the statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TopParentTerm {
+    /// A plain `TopParentId IN (…)`, which the planner may seek on.
+    Seek,
+    /// `+TopParentId IN (…)`: a residual check on a row the statement reaches
+    /// another way. A `CROSS JOIN` aggregate that probes `BaseItems` by its
+    /// primary key would otherwise switch to a `(Type, TopParentId, Id)` index
+    /// and probe once per type and library.
+    Residual,
+}
+
+/// Pushes C# `ApplyAccessFiltering` (v12.2 `BaseItemRepository.QueryBuilding.cs:
+/// 459-477`) on `bi`, each term opening with ` AND `: the libraries in
+/// `top_parents` (`ApplyTopParentFiltering`; none, no scope), the filter's
+/// parental restrictions, and, unless the filter includes owned items, a
+/// version only while its primary is not in the same library
+/// ([`ALTERNATE_VERSION_HIDDEN`]) and no owned non-extra ([`NO_OWNER`]
+/// accepts the zero GUID a Jellyfin database stores on every unowned row).
+///
+/// No item-by-name type is exempt from the library scope: the callers name
+/// none in `IncludeItemTypes`.
+pub(crate) fn push_access_filter(
+    qb: &mut QueryBuilder<Sqlite>,
+    filter: &InternalItemsQuery,
+    top_parents: &[Uuid],
+    term: TopParentTerm,
+) {
+    if !top_parents.is_empty() {
+        qb.push(" AND ");
+        let column = match term {
+            TopParentTerm::Seek => r#"bi."TopParentId""#,
+            TopParentTerm::Residual => r#"+bi."TopParentId""#,
+        };
+        push_in_list(qb, column, &to_guid_strings(top_parents));
+    }
+    append_parental_restrictions(qb, filter, "bi");
+    if !filter.include_owned_items {
+        qb.push(ALTERNATE_VERSION_HIDDEN)
+            .push(" AND (")
+            .push(NO_OWNER)
+            .push(r#" OR bi."ExtraType" IS NOT NULL)"#);
+    }
+}
+
 /// HD/UHD resolution thresholds used by the `IsHD` / `Is4K` filters
 /// (C# `HDWidth` / `UHDWidth` / `UHDHeight`).
 const HD_WIDTH: i64 = 1200;
@@ -1049,7 +1094,18 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
 
     // IsVirtualItem also covers IsMissing (C# `filter.IsVirtualItem ?? filter.IsMissing`).
     if let Some(virt) = filter.is_virtual_item.or(filter.is_missing) {
-        qb.push(r#" AND bi."IsVirtualItem" = "#).push_bind(virt);
+        // A search matches by name, which no index serves, and its `isMissing=false`
+        // (jellyfin-web sends it) pulled the type-and-library probe onto the
+        // `TopParentId`-led `IsVirtualItem` index: 12 ms against 8 ms on
+        // `IX_BaseItems_Type_TopParentId_StartDate` on the benchmark corpus (gl-976). The
+        // `+` keeps the equality off the index; plan pinned by
+        // `a_search_probes_type_and_library_not_the_virtual_item_index`.
+        qb.push(if non_blank(filter.search_term.as_ref()).is_some() {
+            r#" AND +bi."IsVirtualItem" = "#
+        } else {
+            r#" AND bi."IsVirtualItem" = "#
+        })
+        .push_bind(virt);
     }
 
     if let Some(special) = filter.is_special_season {
@@ -3414,6 +3470,41 @@ mod tests {
     use ferrofin_model::live_tv::ItemSortBy;
     use ferrofin_traits::options::InternalItemsQuery;
 
+    /// `push_access_filter`'s text: no library term for an empty scope, a
+    /// plain or `+` term by [`super::TopParentTerm`], and no version or owner
+    /// term once owned items are included.
+    #[test]
+    fn the_access_filter_text_follows_its_scope_and_term() {
+        use super::{TopParentTerm, push_access_filter};
+        use sqlx::{QueryBuilder, Sqlite};
+        let text = |filter: &InternalItemsQuery, top_parents: &[uuid::Uuid], term| {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("");
+            push_access_filter(&mut qb, filter, top_parents, term);
+            qb.sql().as_str().to_owned()
+        };
+        let plain = InternalItemsQuery::default();
+        let one = [uuid::Uuid::from_u128(1)];
+        let versions = format!(
+            "{} AND ({} OR bi.\"ExtraType\" IS NOT NULL)",
+            super::ALTERNATE_VERSION_HIDDEN,
+            super::NO_OWNER
+        );
+        assert_eq!(text(&plain, &[], TopParentTerm::Seek), versions);
+        assert_eq!(
+            text(&plain, &one, TopParentTerm::Seek),
+            format!(" AND bi.\"TopParentId\" IN (?){versions}")
+        );
+        assert_eq!(
+            text(&plain, &one, TopParentTerm::Residual),
+            format!(" AND +bi.\"TopParentId\" IN (?){versions}")
+        );
+        let owned = InternalItemsQuery {
+            include_owned_items: true,
+            ..InternalItemsQuery::default()
+        };
+        assert_eq!(text(&owned, &[], TopParentTerm::Residual), "");
+    }
+
     /// The closing sweep's dead genre and studio selections
     /// ([`crate::library_scan::dead_by_name_queries`]) seek the by-name rows
     /// by `Type` and each row's values by `IX_ItemValues_Type_Value`: never a
@@ -3479,6 +3570,63 @@ mod tests {
             "{plan:#?}"
         );
         assert!(!plan.iter().any(|d| d.starts_with("SCAN bi")), "{plan:#?}");
+    }
+
+    /// A search with jellyfin-web's `isMissing=false` probes its types and libraries through
+    /// `IX_BaseItems_Type_TopParentId_StartDate`, as before `IsMissing` became an
+    /// `IsVirtualItem` filter: on the `TopParentId`-led `IsVirtualItem` index the benchmark's
+    /// search page took 12 ms against 8 (gl-976).
+    #[tokio::test]
+    async fn a_search_probes_type_and_library_not_the_virtual_item_index() {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let filter = InternalItemsQuery {
+            search_term: Some("crimson".to_owned()),
+            is_missing: Some(false),
+            recursive: true,
+            include_item_types: vec![
+                BaseItemKind::Movie,
+                BaseItemKind::Series,
+                BaseItemKind::Episode,
+            ],
+            top_parent_ids: vec![uuid::Uuid::from_u128(0x8691), uuid::Uuid::from_u128(0x8692)],
+            limit: Some(800),
+            ..InternalItemsQuery::default()
+        };
+        let mut builder = super::build_query(&filter, super::QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("USING INDEX IX_BaseItems_Type_TopParentId_StartDate")),
+            "{plan:#?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|d| d.contains("IX_BaseItems_TopParentId_Type_IsVirtualItem")),
+            "{plan:#?}"
+        );
+        // Without a search term the equality is not pinned: no other query's plan moves.
+        let browse = InternalItemsQuery {
+            search_term: None,
+            ..filter
+        };
+        let sql = super::build_query(&browse, super::QueryShape::FullRows).into_sql();
+        let sql = sql.as_str();
+        assert!(
+            sql.contains(r#" AND bi."IsVirtualItem" = "#)
+                && !sql.contains(r#"+bi."IsVirtualItem""#),
+            "{sql}"
+        );
     }
 
     /// The `ItemValues` sort keys (`OrderMapper`'s `Artist`, `AlbumArtist`,

@@ -122,6 +122,20 @@ impl std::fmt::Debug for FerrofinUserManager {
 }
 
 impl FerrofinUserManager {
+    /// After a committed write to user rows: drops every cached token
+    /// resolution and every user's cached policy rows
+    /// ([`Database::invalidate_all_user_policies`]).
+    fn users_changed(&self) {
+        self.auth_cache.clear();
+        self.db.invalidate_all_user_policies();
+    }
+
+    /// After a committed write to `user_id`'s rows alone.
+    fn user_changed(&self, user_id: &str) {
+        self.auth_cache.invalidate_user(user_id);
+        self.db.invalidate_user_policy(user_id);
+    }
+
     /// Creates a user manager over the given database with only the built-in
     /// [`DefaultAuthenticationProvider`] registered.
     #[must_use]
@@ -214,7 +228,7 @@ impl FerrofinUserManager {
                     .await
                     .map_err(db_err)?;
                 id.clone_into(&mut user.authentication_provider_id);
-                self.auth_cache.clear();
+                self.users_changed();
             }
             return Ok((resolved, true));
         }
@@ -232,9 +246,9 @@ impl FerrofinUserManager {
             .login_attempts_before_lockout
             .is_some_and(|max| attempts >= max)
         {
-            set_permission(self.db.writer(), &user.id, PermissionKind::IsDisabled, true).await?;
+            set_permission(&self.db, &user.id, PermissionKind::IsDisabled, true).await?;
             // A locked-out account's cached auth must not outlive the lock.
-            self.auth_cache.clear();
+            self.users_changed();
             tracing::warn!(
                 username = %user.username,
                 user_id = %user.id,
@@ -263,7 +277,7 @@ impl FerrofinUserManager {
         // Only this user's row changed (a lockout cleared everything above);
         // a wholesale clear here would let a stream of wrong passwords for one
         // account keep every other user's cached auth cold.
-        self.auth_cache.invalidate_user(&user.id);
+        self.user_changed(&user.id);
         tracing::warn!(
             username = %user.username,
             user_id = %user.id,
@@ -671,7 +685,7 @@ impl FerrofinUserManager {
         }
         // One `SaveChangesAsync`: all or nothing.
         tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(PolicySaved {
             newly_disabled: policy.is_disabled && !was_disabled,
         })
@@ -749,6 +763,8 @@ impl FerrofinUserManager {
         seed_defaults(&mut tx, &id_str).await?;
         configure(&mut tx, &id_str).await?;
         tx.commit().await.map_err(db_err)?;
+        // A read for this id before it existed may have cached empty policy rows.
+        self.db.invalidate_user_policy(&id_str);
 
         self.require_user(id).await
     }
@@ -931,7 +947,7 @@ impl UserManager for FerrofinUserManager {
             }
             return Err(db_err(e));
         }
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
     }
 
@@ -1014,7 +1030,7 @@ impl UserManager for FerrofinUserManager {
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
     }
 
@@ -1089,7 +1105,7 @@ impl UserManager for FerrofinUserManager {
             .await
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
     }
 
@@ -1115,7 +1131,7 @@ impl UserManager for FerrofinUserManager {
         let provider = candidates[0]; // The invalid-provider fallback guarantees a candidate.
         provider.change_password(&user, new_password).await?;
         if provider_id(provider.name()) != DEFAULT_AUTH_PROVIDER_ID {
-            self.auth_cache.clear();
+            self.users_changed();
             return Ok(());
         }
         // The built-in provider supplies the hash while this manager owns its
@@ -1127,7 +1143,7 @@ impl UserManager for FerrofinUserManager {
         user_repository::set_password(self.db.writer(), &guid_to_db(user_id), hash.as_deref())
             .await
             .map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
     }
 
@@ -1237,7 +1253,7 @@ impl UserManager for FerrofinUserManager {
 
         tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
         // The writes above touch this user's row only.
-        self.auth_cache.invalidate_user(&user.id);
+        self.user_changed(&user.id);
         Ok(Some(user))
     }
 
@@ -1432,7 +1448,7 @@ impl UserManager for FerrofinUserManager {
             set_preference_tx(&mut tx, &id, kind, &strings).await?;
         }
         tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
     }
 
@@ -1482,7 +1498,7 @@ impl UserManager for FerrofinUserManager {
             .await
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
     }
 
@@ -1514,7 +1530,7 @@ impl UserManager for FerrofinUserManager {
             }
         }
         tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
     }
 
@@ -2304,7 +2320,7 @@ mod tests {
         // Seed a list-valued preference directly (the read path parses Guids).
         let folder = Uuid::from_u128(0xF00D);
         crate::user_entity_ext::set_preference(
-            db.writer(),
+            &db,
             &user.id,
             PreferenceKind::EnabledFolders,
             &[folder.to_string()],

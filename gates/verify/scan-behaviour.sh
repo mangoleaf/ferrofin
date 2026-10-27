@@ -32,7 +32,8 @@
 #                       more than a minute newer than the item's last save). Raise it when the
 #                       server's clock and the file server's differ (NFS, a remote pod).
 #   --json FILE         also write the rows, when they end, to FILE as data:
-#                       {"rows": [{"row", "scenario", "result", "detail"}…], "summary": {"pass", "fail", "skip"}}
+#                       {"rows": [{"row", "scenario", "result", "detail", "checks"}…], "summary": {"pass", "fail", "skip"}}
+#                       where checks is every check the row made, [{"what", "observed", "op", "expected", "ok"}…]
 #
 # Needs curl and jq. The server must run with /metrics on (FERROFIN_ENABLE_METRICS=true), and
 # the library with real-time monitoring off (the watcher would process the scratch changes
@@ -44,8 +45,11 @@
 # or a row fails that did nothing wrong.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=gates/lib.sh
+. "$HERE/../lib.sh"
 # shellcheck source=gates/verify/lib.sh
 . "$HERE/lib.sh"
+gates_supervise "$PWD" "$0" "$@"   # the check itself goes to a worker (gates/lib.sh, gl-968)
 
 # usage: the header above, without its comment markers.
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
@@ -134,6 +138,7 @@ remove_work() {
 cleanup() {
   local status=$? i before
   trap - EXIT
+  gates_ack
   # A second Ctrl-C (or a TERM) during the cleanup's own waits still removes the token.
   trap 'remove_work; exit 130' INT
   trap 'remove_work; exit 143' TERM
@@ -343,9 +348,9 @@ if [ "$KIND" = tvshows ]; then
 fi
 
 # ---- rows -----------------------------------------------------------------------------------
-declare -A RESULT DETAIL SCENARIO
+declare -A RESULT DETAIL SCENARIO CHECKS
 FAILS=(); ROW=; BEFORE=$WORK/before.txt; AFTER=$WORK/after.txt
-row_start() { ROW=$1; SCENARIO[$1]=$2; FAILS=(); scrape "$BEFORE" >/dev/null; }
+row_start() { ROW=$1; SCENARIO[$1]=$2; FAILS=(); VERIFY_CHECKS=(); scrape "$BEFORE" >/dev/null; }
 # observe <trigger>: the row's counts, from the scrapes around it.
 observe() {
   local t=$1
@@ -391,7 +396,7 @@ scan() {
   local limit=$SCAN_TIMEOUT
   [ "$1" != webhook ] || limit=$((SCAN_TIMEOUT + MONITOR_DELAY))
   if ! wait_scans "$BEFORE" "$AFTER" "$1" 1 "$limit"; then
-    FAILS+=("the $1 scan did not finish")
+    verify_fail FAILS "the $1 scan did not finish"
     row_end "stopping: the rows after this one build on its state"
     finish
   fi
@@ -403,17 +408,18 @@ row_end() {
     result=FAIL
     detail="$(IFS=';'; echo "${FAILS[*]}") | $detail"
   fi
-  RESULT[$ROW]=$result; DETAIL[$ROW]=$detail
+  RESULT[$ROW]=$result; DETAIL[$ROW]=$detail; CHECKS[$ROW]=$(printf '%s\n' "${VERIFY_CHECKS[@]}")
   verify_row_line "$ROW" "$result" "${SCENARIO[$ROW]}" "$detail"
 }
-row_skip() { SCENARIO[$1]=$2; RESULT[$1]=SKIP; DETAIL[$1]=$3; verify_row_line "$1" SKIP "$2" "$3"; }
+row_skip() { SCENARIO[$1]=$2; RESULT[$1]=SKIP; DETAIL[$1]=$3; CHECKS[$1]=; verify_row_line "$1" SKIP "$2" "$3"; }
 # write_json: the rows finish() prints, as data, when --json named a file (gates/report.py reads it).
 write_json() {
   [ -n "$JSON" ] || return 0
   local row
   for row in $(printf '%s\n' "${!RESULT[@]}" | sort -n); do
     jq -n --argjson row "$row" --arg scenario "${SCENARIO[$row]}" --arg result "${RESULT[$row]}" \
-      --arg detail "${DETAIL[$row]}" '{row: $row, scenario: $scenario, result: $result, detail: $detail}'
+      --arg detail "${DETAIL[$row]}" --argjson checks "$(printf '%s' "${CHECKS[$row]}" | jq -sc .)" \
+      '{row: $row, scenario: $scenario, result: $result, detail: $detail, checks: $checks}'
   done | jq -s '{rows: ., summary: {pass: map(select(.result == "PASS")) | length,
                                     fail: map(select(.result == "FAIL")) | length,
                                     skip: map(select(.result != "PASS" and .result != "FAIL")) | length}}' > "$JSON" \
@@ -457,7 +463,7 @@ else
   new_video "$A" ferrofinverifya; new_video "$B" ferrofinverifyb; new_video "$C" ferrofinverifyc
 fi
 PRUNE=1
-refresh_library || FAILS+=("the refresh was refused")
+refresh_library || verify_fail FAILS "the refresh was refused"
 scan api
 SAVED_AT=$SECONDS
 verify_expect FAILS created "$CREATED" eq "$NEW_ITEMS"
@@ -467,16 +473,16 @@ verify_expect FAILS removed "$REMOVED" eq 0
 verify_expect FAILS probes "$PROBES" eq 3
 expect_first_providers
 ID_A=$(item_id "$A"); ID_B=$(item_id "$B"); ID_C=$(item_id "$C")
-if [ -z "$ID_A" ] || [ -z "$ID_B" ] || [ -z "$ID_C" ]; then FAILS+=("the scratch items are not all in /Items"); fi
+if [ -z "$ID_A" ] || [ -z "$ID_B" ] || [ -z "$ID_C" ]; then verify_fail FAILS "the scratch items are not all in /Items"; fi
 if [ "$KIND" = tvshows ]; then
   # Row 1's fuzzy name search may have pinned a real show on the scratch series: then its
   # episodes would ask that show's providers, and no later row could expect 0.
   if [ -z "$SERIES_ID" ]; then
-    FAILS+=("the scratch series is not in /Items")
+    verify_fail FAILS "the scratch series is not in /Items"
   else
     series_ids=$(item "$SERIES_ID" | jq -c '.ProviderIds // {}')
     [ "$series_ids" = '{}' ] ||
-      FAILS+=("the scratch series matched a real show $series_ids: rename the scratch folder and delete that series")
+      verify_fail FAILS "the scratch series matched a real show $series_ids: rename the scratch folder and delete that series"
   fi
 fi
 row_end "$(counts)"
@@ -512,7 +518,7 @@ verify_expect FAILS updated "$UPDATED" le "$PARENT_UPDATES"
 verify_expect FAILS removed "$REMOVED" eq 0
 verify_expect FAILS probes "$PROBES" eq 1
 expect_providers
-[ -n "$(item_id "$D")" ] || FAILS+=("the new item is not in /Items")
+[ -n "$(item_id "$D")" ] || verify_fail FAILS "the new item is not in /Items"
 row_end "$(counts)"
 
 # 6: the webhook reports it deleted.
@@ -525,7 +531,7 @@ verify_expect FAILS created "$CREATED" eq 0
 verify_expect FAILS updated "$UPDATED" le "$PARENT_UPDATES"
 verify_expect FAILS probes "$PROBES" eq 0
 verify_expect FAILS "provider requests" "$PROVIDERS" eq 0
-[ -z "$(item_id "$D")" ] || FAILS+=("the deleted item is still in /Items")
+[ -z "$(item_id "$D")" ] || verify_fail FAILS "the deleted item is still in /Items"
 row_end "$(counts)"
 
 # 4: an NFO written more than a minute after the item's last save re-reads its local metadata.
@@ -548,7 +554,7 @@ row_end "$(counts)"
 row_start 7 "edit Overview (no LockData), rescan"
 # The cleared field is the official rating: no "already enriched" gate reads it, so clearing
 # it cannot make the next scan ask the providers again (clearing a rating could, with OMDb on).
-edit "$ID_A" '.Overview = "Edited by the verify script." | .OfficialRating = null' || FAILS+=("the edit was refused")
+edit "$ID_A" '.Overview = "Edited by the verify script." | .OfficialRating = null' || verify_fail FAILS "the edit was refused"
 refresh_library; scan api
 verify_expect FAILS created "$CREATED" eq 0
 verify_expect FAILS updated "$UPDATED" eq 0
@@ -568,7 +574,7 @@ verify_expect FAILS probes "$PROBES" eq 1
 expect_providers
 dto=$(item "$ID_A")
 verify_expect_str FAILS Overview "$(jq -r '.Overview // ""' <<<"$dto")" "Edited by the verify script."
-[ "$(jq -r '.OfficialRating' <<<"$dto")" != null ] || FAILS+=("the cleared official rating was not filled")
+[ "$(jq -r '.OfficialRating' <<<"$dto")" != null ] || verify_fail FAILS "the cleared official rating was not filled"
 row_end "$(counts) OfficialRating=$(jq -r '.OfficialRating' <<<"$dto")"
 
 # 9: "Replace all metadata" replaces the unlocked overview.
@@ -578,28 +584,28 @@ verify_expect FAILS updated "$UPDATED" eq 1
 verify_expect FAILS probes "$PROBES" eq 1
 expect_providers
 overview=$(item "$ID_A" | jq -r '.Overview // ""')
-[ "$overview" != "Edited by the verify script." ] || FAILS+=("the edited overview was not replaced")
+[ "$overview" != "Edited by the verify script." ] || verify_fail FAILS "the edited overview was not replaced"
 row_end "$(counts) Overview='$overview'"
 
 # 10: a locked field survives "Replace all metadata"; the unlocked rating is replaced.
 row_start 10 "lock Overview, \"Replace all metadata\""
 edit "$ID_A" '.Overview = "Locked by the verify script." | .CommunityRating = 1 | .LockedFields = ["Overview"]' ||
-  FAILS+=("the edit was refused")
+  verify_fail FAILS "the edit was refused"
 refresh_item "$ID_A" true; scan api
 verify_expect FAILS updated "$UPDATED" eq 1
 expect_providers
 dto=$(item "$ID_A")
 verify_expect_str FAILS Overview "$(jq -r '.Overview // ""' <<<"$dto")" "Locked by the verify script."
 verify_expect_str FAILS LockedFields "$(jq -c '.LockedFields' <<<"$dto")" '["Overview"]'
-[ "$(jq -r '.CommunityRating' <<<"$dto")" != 1 ] || FAILS+=("the unlocked rating was not replaced")
+[ "$(jq -r '.CommunityRating' <<<"$dto")" != 1 ] || verify_fail FAILS "the unlocked rating was not replaced"
 row_end "$(counts) rating=$(jq -r '.CommunityRating' <<<"$dto")"
 
 # 11: LockData refuses the providers; a new local poster is still discovered. The item's file
 # is touched too: unlocked, that alone makes a scan ask its remote providers (row 3, when the
 # library's fetchers are on), so with them on it is the lock that keeps this rescan quiet.
 row_start 11 "LockData=true, add a poster, touch, rescan"
-edit "$ID_B" '.LockData = true' || FAILS+=("the lock was refused")
-[ "$(item "$ID_B" | jq -r '.ImageTags.Primary // ""')" = "" ] || FAILS+=("the item had a poster already")
+edit "$ID_B" '.LockData = true' || verify_fail FAILS "the lock was refused"
+[ "$(item "$ID_B" | jq -r '.ImageTags.Primary // ""')" = "" ] || verify_fail FAILS "the item had a poster already"
 base64 -d <<<"$VERIFY_POSTER_PNG" >"$WORK/poster.png"
 new_file "$POSTER" "$WORK/poster.png"
 touch -m -- "$LOCAL/$B"
@@ -611,7 +617,7 @@ verify_expect FAILS created "$CREATED" eq 0
 verify_expect FAILS probes "$PROBES" eq 1
 verify_expect FAILS "provider requests" "$PROVIDERS" eq 0
 dto=$(item "$ID_B")
-[ -n "$(jq -r '.ImageTags.Primary // ""' <<<"$dto")" ] || FAILS+=("the poster was not discovered")
+[ -n "$(jq -r '.ImageTags.Primary // ""' <<<"$dto")" ] || verify_fail FAILS "the poster was not discovered"
 verify_expect_str FAILS LockData "$(jq -r '.LockData' <<<"$dto")" true
 row_end "$(counts)"
 
@@ -637,7 +643,7 @@ if [ "$KIND" != tvshows ]; then
 else
   row_start 13 "episode date/year survive rescans"
   edit "$ID_C" '.PremiereDate = "2010-01-05T00:00:00.0000000Z" | .ProductionYear = 2010' ||
-    FAILS+=("the edit was refused")
+    verify_fail FAILS "the edit was refused"
   fields='{PremiereDate, ProductionYear}'
   before_fields=$(item "$ID_C" | jq -cS "$fields")
   refresh_library; scan api

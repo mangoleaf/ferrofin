@@ -4,7 +4,8 @@
 # One validation of one commit: a preflight of the host, then each chosen gate against one Ferrofin
 # image, all of it in one session folder under the output root (gates/lib.sh):
 #   runs/<branch>-<YYYYMMDD-HHMM>/      a rerun in the same minute gets -run2, -run3 …
-#     session.json                      branch, commit, dirty tree, images, oracle pin, and each gate's
+#     session.json                      branch, commit, dirty tree, images, oracle pin (with its note
+#                                       when a newer Jellyfin release is out), and each gate's
 #                                       status, start, end and exit status (gates/session.py)
 #     <gate>/  <gate>.log               each gate's own run directory, and what it printed
 #     index.html  report.md             the session's report: every gate's verdict and counts, with
@@ -31,6 +32,7 @@ SELF=$(cd "$(dirname "$0")" && pwd)/${0##*/}   # for usage, after the cd below
 cd "$(dirname "$0")/.." || exit 2
 # shellcheck source=gates/adoption/lib.sh
 . gates/adoption/lib.sh   # gates/lib.sh, and where the adoption fixtures are
+gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/lib.sh, gl-968)
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; }
 ORDER=(verify adoption parity bench)
@@ -75,6 +77,7 @@ if [ -z "$IMAGE" ]; then   # the commit as gates/bench/run.sh names its runs
   IMAGE=ferrofin:$tag
 fi
 ORACLE_IMAGE=$(cat gates/bench/testdata/jellyfin-image.txt)
+ORACLE_PIN=   # what gates/bench/oracle.py check printed, once the preflight checked the pin
 TESTDATA=$ROOT/fixtures/bench-testdata
 ADOPTION_FIXTURES=$(adoption_fixtures_dir run) || exit 2
 
@@ -129,10 +132,10 @@ if wants parity || wants bench; then
   if wants parity || [ -z "$PREVIOUS" ]; then   # Jellyfin boots a prepared copy of it
     [ -f "$TESTDATA/jellyfin/preparation.json" ] || problem "the corpus is not prepared for Jellyfin: gates/bench/testdata/build.sh --prepare-jellyfin"
   fi
-  # The pin, once for the session: behind the latest Jellyfin release it warns, as an ad-hoc run
-  # does, unless bench runs the release A/B gate, which refuses it (gates/bench/gate.py).
-  oracle=(check); [ -z "$PREVIOUS" ] || oracle+=(--gate)
-  python3 gates/bench/oracle.py "${oracle[@]}" >/dev/null || problem "the Jellyfin oracle pin was refused (see above)"
+  # The pin, once for the session (gates/bench/oracle.py). Every run, the release A/B gate's too, is
+  # measured against the Jellyfin release this branch pins: a newer release is noted and recorded in
+  # session.json, never refused (owner decision 2026-10-25). Only a pin that cannot be read refuses.
+  ORACLE_PIN=$(python3 gates/bench/oracle.py check) || problem "the Jellyfin oracle pin cannot be read (see above)"
   # One idle check for the session (gates/lib.sh); parity alone skips it with PARITY_PIN=0, as it does.
   if wants bench || [ "${PARITY_PIN:-1}" != 0 ]; then
     busy=$(gates_idle_check "${SERVER_CPUS:-$GATES_SERVER_CPUS}" "${CLIENT_CPUS:-$GATES_CLIENT_CPUS}" \
@@ -174,7 +177,7 @@ fi
 
 S=$(python3 gates/session.py new "$ROOT/runs" --gates "$(IFS=,; echo "${GATES[*]}")" --branch "$BRANCH" \
   --commit "$COMMIT" --dirty "$DIRTY" --image "$IMAGE" --image-id "$IMAGE_ID" --oracle-image "$ORACLE_IMAGE" \
-  ${PREVIOUS:+--previous "$PREVIOUS" --previous-id "$PREVIOUS_ID"}) || exit 2
+  ${ORACLE_PIN:+--oracle-pin "$ORACLE_PIN"} ${PREVIOUS:+--previous "$PREVIOUS" --previous-id "$PREVIOUS_ID"}) || exit 2
 echo "session: $S"
 GATE_PID=; TAIL_PID=; CURRENT=
 finish() { # finish <exit status>: the session's end, its report (gates/report.py), and the exit
@@ -187,6 +190,7 @@ finish() { # finish <exit status>: the session's end, its report (gates/report.p
 # shellcheck disable=SC2317,SC2329  # invoked by the traps below (SC2317 is the code before shellcheck 0.11)
 interrupted() { # interrupted <exit status>: stop the running gate (its own cleanup runs), then finish
   trap '' INT TERM HUP
+  gates_ack
   if [ -n "$GATE_PID" ]; then kill -TERM -- "-$GATE_PID" 2>/dev/null; wait "$GATE_PID"; fi
   [ -z "$TAIL_PID" ] || wait "$TAIL_PID"
   [ -z "$CURRENT" ] || python3 gates/session.py gate "$S" "$CURRENT" failed --exit "$1" --note interrupted

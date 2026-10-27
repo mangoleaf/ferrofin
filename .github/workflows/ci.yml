@@ -50,6 +50,9 @@ jobs:
       - run: python3 -m unittest discover -s gates/bench -p test_soak.py
       - run: python3 -m unittest discover -s gates/bench -p test_endpoints.py
       - run: python3 -m unittest discover -s gates/bench -p test_viewer.py
+      # The README Results block and its graphs must be what the committed summary files give
+      # (gates/README.md, "Publishing the results"): a re-render, no gate and no benchmark.
+      - run: python3 gates/publish.py readme --check
 
   # fmt and clippy. The workspace tests run beside it in lint-tests; the aggregate `lint`
   # job below is the status check main's branch protection requires.
@@ -231,6 +234,9 @@ jobs:
     # time medians — its log parsing is driven with canned job logs). The gates' part is one list, the
     # Makefile's test-gates-offline target.
     runs-on: ubuntu-latest
+    # About 5 minutes normally (4.5 to 5.0 over 20 runs, 2026-10-25). A hung test once held it for 24
+    # minutes (gl-920); without a limit a hang would run to GitHub's 6-hour default.
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:

@@ -66,8 +66,8 @@ pub(crate) async fn resolve(
         ]
         .into_iter()
         .any(|kind| !values(kind).is_empty())
-        || !crate::user_entity_ext::has_permission(
-            db.pool(),
+        || !crate::user_entity_ext::cached_permission(
+            db,
             &user.id,
             PermissionKind::EnableAllFolders,
         )

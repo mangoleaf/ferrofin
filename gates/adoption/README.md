@@ -8,6 +8,10 @@ real installation.
 
 ## Supported and tested versions
 
+The status every release's gates session found, per version and upgrade route, is published with
+that release in the root README's [Results](../../README.md#adopting-an-existing-jellyfin-database).
+The record below is the per-version history.
+
 The 10.11 and 12.0–12.1 fixture paths below **passed** the live suite on **2026-09-16
 (US/Mountain)**, against fixtures derived from a real library. The suite no longer uses real
 libraries: since 2026-10-14 every fixture is [synthetic](#the-fixtures-are-synthetic). All ten
@@ -363,8 +367,13 @@ Failed fixtures are open and passing ones collapsed. The checks are recorded one
 `work/results.jsonl` as the run goes (`gates/adoption/adoption_report.py` is the recorder and the renderer), and the
 page is built from that when the run ends, **however it ends**: a run that is terminated, or stops
 on an error, still leaves its page, with the fixture it was on listed as unfinished (`INCOMPLETE`,
-which fails the run) and, for the matrix, the error that stopped it as a failed check. A run
-refused before it starts (a missing fixture directory, no docker) leaves nothing, and a matrix
+which fails the run) and, for the matrix, the error that stopped it as a failed check. A
+terminated `run.sh` stops at once, with everything it started: the shell that holds its signal
+traps only waits for a worker, which does the run in a session of its own, and on a signal stops
+the worker's process group. Bash 5.2 drops a trapped signal that arrives while it parses a
+`$( … )`, and the run parses them all the time (gl-920). A SIGKILL cannot be passed on, so stop
+a run with Ctrl-C or a TERM, not `kill -9`. A run refused before it starts (a missing fixture
+directory, no docker) leaves nothing, and a matrix
 refused before its first fixture starts (no oracle, a recipe change, a previous run's copy still in
 `work/`) leaves the last report alone. The matrix has no messy or scale sections: those fixtures
 are `run.sh`'s. A page embeds the first 500 table-digest differences of a stage and counts the rest
@@ -376,10 +385,16 @@ recorder's own messages go to `/dev/null` there, so they never change what a run
 stdout is a terminal, `run.sh` also prints the page's path at the end: the one line of stdout
 recording adds, and only on a terminal.
 
+`result.json` is written beside the page from the same reading of the run, in the envelope every gate
+shares ([`gates/result.py`](../result.py)): the verdict, the rows counted (passed, failed, unfinished,
+skipped), and per fixture its kind, expected generation, verdict, reason, every check and the scale
+measurements. The table differences and the messy shapes stay in the page. The gates session page and
+the release summary (`gates/publish.py`, the README's adoption grid) read it.
+
 The shared viewer lists it in its Adoption tab and compares two runs side by side:
 
 ```bash
-python3 gates/bench/report.py --serve      # run.sh's page as `adoption` ($FERROFIN_GATES_DIR/work); the matrix: --adoption-dir DIR/work
+python3 gates/bench/report.py --serve      # run.sh's page as `adoption` ($FERROFIN_GATES_DIR/work) and every session's; the matrix: --adoption-dir DIR/work
 ```
 
 The `Adoption` workflow uploads the two pages as the `adoption-report` (`run.sh`) and
@@ -563,8 +578,8 @@ The probes run as the synthetic administrator, which has a **Jellyfin Web** sess
 `Devices` and an **API key** in `ApiKeys`; `oracle/user.txt` records it, and `--user NAME`
 or `ADOPTION_USER` overrides. Credentials are read from the copy at run time and never
 written. The builder and runner need Docker, Python 3, Pillow (`python3-pil` on
-Debian/Ubuntu), PyICU (`python3-icu`, for the `CleanValue` derivation), `sqlite3`, `jq` and
-`curl`. Media encoding uses the Jellyfin image's FFmpeg.
+Debian/Ubuntu), PyICU (`python3-icu`, for the `CleanValue` derivation), `sqlite3`, `jq`,
+`curl` and, for the runner, `setsid` (util-linux). Media encoding uses the Jellyfin image's FFmpeg.
 
 ```bash
 export FERROFIN_GATES_DIR=/srv/gates                # the output root: absolute, a local disk, outside the checkout
@@ -648,7 +663,8 @@ failed; a fixture that began and never finished is `INCOMPLETE`; a run that ran 
 every section of the page, that run text cannot inject markup, that the page is self-contained,
 the command line, and that the viewer's Adoption tab lists it. `adoption.bats` runs `run.sh` with a
 fake docker to see the checks recorded in the page of a failing row, of a skipped one and of a
-terminated run. CI runs the Bats tests with `bats gates/adoption/tests`
+terminated run (a TERM to its process group, and one to its PID alone). CI runs the Bats
+tests with `bats gates/adoption/tests`
 next to `scripts/tests`; locally `mise exec bats@latest -- bats gates/adoption/tests` or
 a system `bats` works.
 

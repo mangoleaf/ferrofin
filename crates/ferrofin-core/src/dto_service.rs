@@ -1567,14 +1567,11 @@ impl FerrofinDtoService {
     /// candidate set of `LibraryManager.GetCollectionFolders`.
     /// Every `CollectionFolder` with the paths `GetCollectionFoldersInternal`
     /// matches on. Read per page, and only when a walk runs out of parents
-    /// (`needs_folders`) — on an adopted Jellyfin DB that is the common shape,
-    /// so this is a handful of rows and JSON blobs on those pages. Measured
-    /// end-to-end it is noise (movies list 9.1 ms, an 800-item search 27.7 ms,
-    /// both under Jellyfin 12.0-rc7), so it is deliberately not cached: a cache
-    /// here would have to be invalidated on every library add/remove/rename,
-    /// and a stale one shows the wrong inherited images. If a profile ever puts
-    /// this on the critical path, cache it on the service behind the library
-    /// mutation hooks — not before.
+    /// (`needs_folders`) — on an adopted Jellyfin DB that is the common shape.
+    /// The rows come from the library set the visibility check caches
+    /// (`ferrofin_db::row_cache`) when one is live: the library mutation hooks
+    /// that keep it current are what a cache here needs, since a stale one
+    /// would show the wrong inherited images. With none cached they are read.
     async fn collection_folder_locations(
         &self,
     ) -> Result<Vec<CollectionFolderLocations>, ServiceError> {
@@ -1583,11 +1580,21 @@ impl FerrofinDtoService {
         else {
             return Ok(Vec::new());
         };
-        Ok(self
-            .db
-            .rows_of_type(type_name)
-            .await
-            .map_err(|e| ServiceError::Backend(e.to_string()))?
+        // The visibility check's cached library set (`ferrofin_db::row_cache`), when one is live:
+        // the same rows, kept current by the library mutation hooks.
+        let rows = match self.db.cached_libraries() {
+            Some(set) => set
+                .rows
+                .iter()
+                .map(|row| (row.id.clone(), row.path.clone(), row.data.clone()))
+                .collect(),
+            None => self
+                .db
+                .rows_of_type(type_name)
+                .await
+                .map_err(|e| ServiceError::Backend(e.to_string()))?,
+        };
+        Ok(rows
             .into_iter()
             .filter_map(|(id, path, data)| {
                 let id = Uuid::parse_str(&id).ok()?;
@@ -10192,7 +10199,7 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             ferrofin_db::enums::PreferenceKind::GroupedFolders,
             &values,
@@ -10274,7 +10281,7 @@ mod tests {
         let user_id = Uuid::new_v4();
         let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             ferrofin_db::enums::PreferenceKind::GroupedFolders,
             &[grouped.to_string()],

@@ -85,9 +85,28 @@ verify_nfo() {
   printf '</%s>\n' "$kind"
 }
 
+# VERIFY_CHECKS: every check since it was last emptied (a row's start), one JSON object per line,
+# {"what", "observed", "op", "expected", "ok"}: what verify_expect, verify_expect_str and verify_fail
+# were asked and found, passed or not, so a row's report can show each check's observed and expected
+# value. An integer check's values are numbers, a string check's strings (op "eq"), and a failure
+# no comparison stands behind has null values.
+VERIFY_CHECKS=()
+
+# verify_check <what> <observed> <op> <expected> <ok> [int]: one entry of VERIFY_CHECKS. With int,
+# <observed> and <expected> become numbers (decimal, leading zeros included), else they stay strings;
+# an empty <op> makes all three null.
+verify_check() {
+  VERIFY_CHECKS+=("$(jq -nc --arg what "$1" --arg observed "$2" --arg op "$3" --arg expected "$4" --argjson ok "$5" \
+    --arg kind "${6:-}" '
+    def value: if $kind == "int" and test("^-?[0-9]+$") then tonumber else . end;
+    {what: $what, observed: (if $op == "" then null else ($observed | value) end),
+     op: (if $op == "" then null else $op end),
+     expected: (if $op == "" then null else ($expected | value) end), ok: $ok}')")
+}
+
 # verify_expect <failures-var> <what> <actual> <op> <expected>: appends "<what> <actual> (want
-# <op> <expected>)" to the named array when the integer comparison does not hold. <op> is one of
-# eq, le, ge.
+# <op> <expected>)" to the named array when the integer comparison does not hold, and the check
+# to VERIFY_CHECKS either way. <op> is one of eq, le, ge.
 verify_expect() {
   # shellcheck disable=SC2178 # a nameref to the caller's array
   local -n _fails=$1
@@ -102,6 +121,9 @@ verify_expect() {
     local sign
     case $op in eq) sign='=' ;; le) sign='<=' ;; ge) sign='>=' ;; *) sign=$op ;; esac
     _fails+=("$what $actual (want $sign $expected)")
+    verify_check "$what" "$actual" "$op" "$expected" false int
+  else
+    verify_check "$what" "$actual" "$op" "$expected" true int
   fi
 }
 
@@ -109,12 +131,37 @@ verify_expect() {
 verify_expect_str() {
   # shellcheck disable=SC2178 # a nameref to the caller's array
   local -n _fails=$1
-  [ "$3" = "$4" ] || _fails+=("$2 '$3' (want '$4')")
+  if [ "$3" = "$4" ]; then
+    verify_check "$2" "$3" eq "$4" true
+  else
+    _fails+=("$2 '$3' (want '$4')")
+    verify_check "$2" "$3" eq "$4" false
+  fi
+}
+
+# verify_fail <failures-var> <what>: a failure no comparison stands behind (a refused request, an
+# item missing from /Items), in the named array and in VERIFY_CHECKS.
+verify_fail() {
+  # shellcheck disable=SC2178 # a nameref to the caller's array
+  local -n _fails=$1
+  _fails+=("$2")
+  verify_check "$2" '' '' '' false
 }
 
 # verify_row_line <row> <result> <scenario> <detail>: one line of the PASS/FAIL table.
 verify_row_line() {
   printf '%4s  %-4s  %-46s  %s\n' "$1" "$2" "$3" "$4"
+}
+
+# verify_finish <dir> <exit status> <image> <image id> <commit> <started>: what gates/verify/run.sh
+# leaves however its run ends: DIR/verify.json (every library null when the run ended before
+# verify_combine wrote it), then DIR/result.json and DIR/report.html from it (verify_report.py).
+# Fails, naming what, when the result or the report could not be written.
+verify_finish() {
+  local dir=$1 rc=$2
+  [ -e "$dir/verify.json" ] || verify_combine "$dir" "$rc" movies tvshows
+  python3 "$(dirname "${BASH_SOURCE[0]}")/verify_report.py" "$dir" --image "$3" --image-id "$4" --commit "$5" \
+    --started "$6" >/dev/null || { echo "verify: the result or the report could not be written in $dir" >&2; return 1; }
 }
 
 # verify_combine <dir> <exit status> <library kind…>: DIR/verify.json, what gates/report.py reads: the

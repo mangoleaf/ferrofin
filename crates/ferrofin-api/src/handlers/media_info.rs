@@ -198,7 +198,8 @@ fn non_blank(value: Option<&str>) -> Option<&str> {
 /// requested version when the client names one.
 async fn resolve_playback_media_sources(
     state: &AppState,
-    item_id: Uuid,
+    item: &ferrofin_db::entities::base_items::BaseItemEntity,
+    user: Option<&ferrofin_db::entities::users::UserEntity>,
     user_id: Uuid,
     media_source_id: Option<&str>,
     live_stream_id: Option<&str>,
@@ -210,7 +211,7 @@ async fn resolve_playback_media_sources(
     }
     let mut sources = state
         .media_sources
-        .get_playback_media_sources(item_id, user_id, true, true)
+        .get_playback_media_sources_for(item, user, user_id, true, true)
         .await?;
     if let Some(id) = non_blank(media_source_id) {
         sources.retain(|s| s.id.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(id)));
@@ -374,7 +375,8 @@ async fn playback_info(
     };
     let mut media_sources = resolve_playback_media_sources(
         state,
-        item_id,
+        &item,
+        user.as_ref(),
         resolved_user_id,
         request.media_source_id.as_deref(),
         request.live_stream_id.as_deref(),
@@ -702,7 +704,8 @@ pub(crate) async fn universal_audio_source(
     // Every version (the universal route takes no live stream id), narrowed
     // below rather than by the helper's exact match.
     let mut media_sources =
-        resolve_playback_media_sources(state, item_id, resolved_user_id, None, None).await?;
+        resolve_playback_media_sources(state, &item, user.as_ref(), resolved_user_id, None, None)
+            .await?;
     // The version is matched in either GUID spelling, as the static stream
     // routes match it (`MediaSourceInfo::id_matches`): the universal URL's
     // `mediaSourceId` is what a direct-play request for it would carry.

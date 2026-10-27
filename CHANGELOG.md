@@ -25,8 +25,23 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   where the database already owns `NormalizedUsername`; an atomic adoption record drives the
   one-shot membership import)
 - Run `PRAGMA foreign_key_check` on every boot, not only after a migration
+- Snapshot the database before any pending migration, as Jellyfin does: a boot that migrates
+  copies the file to `<db>.pre-NNNN` first and deletes the copy once its migrations and the
+  foreign-key check have passed; a failed boot keeps it, and a copy that cannot be written
+  only warns (Jellyfin stops its startup). The copies before `0007`, `0032` and `0044` are
+  kept for good, as before
+- Write every database snapshot (`.pre-ferrofin`, `.pre-NNNN`, the boot repairs' copies) to
+  `<name>.partial` and rename it only once it is complete and on disk, so a full disk or a
+  kill never leaves a cut-short copy under the real name; the first snapshot taken is kept
+  on a retry instead of being replaced
+- Take the copies made before migrating or adopting with `VACUUM INTO` when another process
+  is reading or writing the database, instead of a file copy that missed what was still in
+  the write-ahead log
 
 ### Tooling
+- `gates/adoption/run.sh` stops at once when terminated, under bash 5.2 too (a TERM was
+  sometimes lost and the run waited out its deadlines); GitHub's shell-tests job gets a
+  15-minute timeout
 - `gates/parity/filed.toml` records the two differences of the 2026-10-24 replay that have an open
   issue and no ledger entry (the HLS video segment's timestamps, the live HLS segment names); the
   run's other groups are accepted by the ledger, gone under the current comparison, fixed since,
@@ -82,6 +97,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   test pass `--locked`, so a manifest change without its lockfile fails instead of resolving
   anew. The release's cargo-zigbuild and ziglang are pinned (0.23.4 and 0.16.0, the pair the
   v1.3.2 aarch64 build used), and GitLab's `:latest` images to the versions they are today
+- A release is measured against the Jellyfin release its branch pins (`UPSTREAM_TAG`, the
+  latest release when the branch was cut): a newer Jellyfin release no longer refuses the
+  release A/B gate (`gate.py`, `gates/run --previous`) or `gates/parity/run.sh --gate`. It is
+  noted ("measured against Jellyfin v12.2, the release this branch pins; v12.3 is out") and
+  recorded with the oracle in `session.json`, `gate.json`, the verdict JSON, each run's
+  `run.json` and the reports. A pin that cannot be read (an `UPSTREAM_TAG` that is not a release
+  tag, an empty image pin) is still refused, and so is a pinned image that reports another
+  release (`oracle.py matches`). `oracle.py check` no longer takes `--gate`
 
 ### Parity
 - `POST /LiveTv/TunerHosts` with the id of a configured tuner in another case keeps the id
@@ -106,6 +129,21 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   guide), where they were read past; and the guide is the first `<tv>` element wherever it
   is (`ReadToDescendant`), so a well-formed document without one is an empty guide
   (Lineups `[]`, the refresh drains the provider) rather than an unreadable one
+- A single genre, studio, person, year, music genre or artist (`GET /Genres/{genreName}` and its
+  siblings, and by-name rows with `fields=ItemCounts`) counts only what its viewer may open, as
+  Jellyfin 12.2 does: the viewer's libraries, and no alternate version, local version or stacked
+  part, whoever asks. A studio or genre also counts the episodes of the series it is written on,
+  as the list already did (`/Genres/Action` read `EpisodeCount` 0 where Jellyfin reads 366)
+- A server API key with no `userId` is served with no user on `GET /Items`, the by-name lists and
+  single routes (`/Genres`, `/MusicGenres`, `/Studios`, `/Artists`, `/Artists/AlbumArtists`,
+  `/Persons`, `/Years`) and `GET /Library/MediaFolders`, as Jellyfin does; they answered 400
+- A `parentId` naming no item (the zero id included) answers 400 on the by-name lists, `/Years`
+  and `/Items/Filters`, as Jellyfin's `GetParentItem` does; they answered an empty 200.
+  `/Items/Filters` with a lone `Trailer` or `Program` type answers empty filters, and
+  `/Items/Filters2` refuses the zero id
+- The server root's (`AggregateFolder`) `RecursiveItemCount` and unplayed count cover the leaves
+  in its libraries only, reached through the ancestor closure as Jellyfin does; they counted the
+  placeholder row and every person, genre, studio and year row as well
 - Find the playlists folder by its type when a playlist is created, as Jellyfin's
   `GetPlaylistsFolder` does, instead of by its path or derived id, and write nothing during
   the lookup. Startup now makes a playlists folder kept at the folder's directory under an id
@@ -507,6 +545,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   87 → 37 ms)
 - Recursive `/Items` sorted by `Artist`, `AlbumArtist` or `Studio`: read each item's own
   values for the sort key (4.0 s → 0.26 s)
+- The per-user visibility check on by-id requests (Jellyfin's `GetItemById(id, user)`) reads
+  the item and the chain above it in one statement, and keeps users' permissions and
+  preferences and the libraries' rows and options in memory, dropped by every write to them.
+  It had added about six statements to every by-id request and read a user's policy up to
+  five times in one. Against 1.3.2, the release A/B gate's regressed cells went from 26 to
+  11, and an item's intros and images are back within noise of it.
+  `FERROFIN_ROW_CACHE_TTL_SECS` and `FERROFIN_AUTH_CACHE_TTL_SECS`
+  (5–300, default 30) bound how long a change made outside the server, in the database
+  itself, goes unseen
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

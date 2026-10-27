@@ -9,7 +9,10 @@
 # $FERROFIN_GATES_DIR/runs/verify-<YYYYMMDD-HHMM> (gates/lib.sh) and is never reused. It ends with
 #   DIR/scan-behaviour-movies.txt, DIR/scan-behaviour-tvshows.txt   the check's rows on each
 #   DIR/verify.json      the same rows as data, per library (null when the check ended before them),
-#                        and the exit status: what gates/report.py reads
+#                        each row with its checks, and the exit status
+#   DIR/result.json      verify's result in every gate's envelope (gates/result.py), from verify.json:
+#                        what gates/report.py and the viewer read
+#   DIR/report.html      the rows and each check's observed and expected value (verify_report.py)
 #   DIR/server.log                                                  the server's log
 # and the container (gates-verify) removed, however the run ends. --clip is passed to the check.
 # Settings (environment): VERIFY_PORT, the loopback port the server answers on (default 18131);
@@ -24,7 +27,8 @@ cd "$(dirname "$0")/../.." || exit 2
 # shellcheck source=gates/lib.sh
 . gates/lib.sh
 # shellcheck source=gates/verify/lib.sh
-. gates/verify/lib.sh   # verify_combine
+. gates/verify/lib.sh   # verify_combine, verify_finish
+gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/lib.sh, gl-968)
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; }
 die() { echo "verify: $*" >&2; exit 2; }
@@ -46,7 +50,7 @@ READY_TIMEOUT_S=${READY_TIMEOUT_S:-300}
 HTTP_TIMEOUT_S=${HTTP_TIMEOUT_S:-10}
 for setting in VERIFY_PORT READY_TIMEOUT_S HTTP_TIMEOUT_S; do [[ "${!setting}" =~ ^[1-9][0-9]*$ ]] || die "$setting must be a positive integer"; done
 (( VERIFY_PORT <= 65535 )) || die "VERIFY_PORT is at most 65535"
-for t in docker curl jq; do command -v "$t" >/dev/null || die "$t not installed"; done
+for t in docker curl jq python3; do command -v "$t" >/dev/null || die "$t not installed"; done
 # Every request and docker call is bounded, so a server that takes a connection and never answers
 # cannot hold the run (and a gates/run session's lock) forever.
 http() { curl -sf --connect-timeout "$HTTP_TIMEOUT_S" --max-time "$HTTP_TIMEOUT_S" "$@"; }
@@ -59,6 +63,9 @@ fi
 gates_require_local "$OUT" || exit 2
 [ ! -e "$OUT" ] || die "$OUT exists: a run directory is never reused"
 dock image inspect "$IMAGE" >/dev/null 2>&1 || die "image $IMAGE missing"
+IMAGE_ID=$(dock image inspect -f '{{.Id}}' "$IMAGE")
+COMMIT=$(dock image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")
+STARTED=$(date -Iseconds)
 NAME=gates-verify
 [ -z "$(dock ps -aq --filter "name=^$NAME\$")" ] || die "a $NAME container exists (another run's); it is not this run's to remove"
 
@@ -73,12 +80,15 @@ PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')
 AUTH='MediaBrowser Client="gates", Device="gates", DeviceId="gates-verify", Version="1"'
 # shellcheck disable=SC2317,SC2329  # invoked by the EXIT trap
 cleanup() {   # only the container this run made (its id in the cidfile): never another run's of the same name
+  local rc=$?
   trap '' INT TERM HUP
+  gates_ack
   if [ -s "$SECRETS/cid" ]; then
     dock logs "$(cat "$SECRETS/cid")" > "$OUT/server.log" 2>&1
     dock rm -f "$(cat "$SECRETS/cid")" >/dev/null 2>&1
   fi
   rm -f -- "$SECRETS/env" "$SECRETS/auth" "$SECRETS/cid"; rmdir -- "$SECRETS" 2>/dev/null
+  verify_finish "$OUT" "$rc" "$IMAGE" "$IMAGE_ID" "$COMMIT" "$STARTED"   # a run that ended early too
 }
 trap cleanup EXIT
 trap 'exit 130' INT

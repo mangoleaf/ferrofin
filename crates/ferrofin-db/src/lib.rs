@@ -16,6 +16,7 @@ pub mod enums;
 pub mod error;
 pub mod normalized_usernames;
 pub mod presentation_key;
+pub mod row_cache;
 mod sqlite_casing;
 pub mod sqlite_random;
 pub mod store;

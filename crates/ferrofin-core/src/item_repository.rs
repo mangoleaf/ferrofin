@@ -50,7 +50,7 @@ use crate::translate_query::{
     build_latest_music_albums_query, build_query, media_type_name, non_blank, push_in_list,
     to_guid_strings,
 };
-use crate::user_entity_ext::{guid_preference, has_permission, live_tv_enabled_for};
+use crate::user_entity_ext::{cached_guid_preference, cached_permission, live_tv_enabled_for};
 use crate::virtual_paths::VirtualPathExpander;
 use sqlx::{FromRow, QueryBuilder, Row, Sqlite};
 
@@ -849,7 +849,7 @@ impl FerrofinItemRepository {
         if !blocked.is_empty() {
             return Ok(blocked);
         }
-        if has_permission(self.db.pool(), &user.id, PermissionKind::EnableAllFolders).await? {
+        if cached_permission(&self.db, &user.id, PermissionKind::EnableAllFolders).await? {
             return Ok(Vec::new());
         }
         let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
@@ -2853,7 +2853,7 @@ pub(crate) async fn grouped_libraries(
     if !matches!(view_type, None | Some("movies" | "tvshows")) {
         return Ok(Vec::new());
     }
-    let grouped = guid_preference(db.pool(), &user.id, PreferenceKind::GroupedFolders).await?;
+    let grouped = cached_guid_preference(db, &user.id, PreferenceKind::GroupedFolders).await?;
     if grouped.is_empty() {
         return Ok(Vec::new());
     }
@@ -2967,7 +2967,7 @@ async fn visible_view_rows(
     };
     let blocked = folder_preference(db, user, PreferenceKind::BlockedMediaFolders).await?;
     let enabled = if blocked.is_empty()
-        && !has_permission(db.pool(), &user.id, PermissionKind::EnableAllFolders).await?
+        && !cached_permission(db, &user.id, PermissionKind::EnableAllFolders).await?
     {
         Some(folder_preference(db, user, PreferenceKind::EnabledFolders).await?)
     } else {
@@ -3278,7 +3278,7 @@ async fn folder_preference(
     user: &UserEntity,
     kind: PreferenceKind,
 ) -> Result<Vec<Uuid>, ServiceError> {
-    guid_preference(user_db.pool(), &user.id, kind).await
+    cached_guid_preference(user_db, &user.id, kind).await
 }
 
 /// `ManagedFileSystem.SwapFiles`: exchanges the contents of two files through a
@@ -4872,7 +4872,7 @@ mod tests {
                 (PreferenceKind::AllowedTags, &allowed),
             ] {
                 crate::user_entity_ext::set_preference(
-                    db.writer(),
+                    &db,
                     &user.id,
                     kind,
                     &values.iter().map(|v| (*v).to_owned()).collect::<Vec<_>>(),
@@ -5071,7 +5071,7 @@ mod tests {
             (Vec::new(), 2),
         ] {
             crate::user_entity_ext::set_preference(
-                db.writer(),
+                &db,
                 &user.id,
                 PreferenceKind::BlockUnratedItems,
                 &blocked,
@@ -6116,7 +6116,7 @@ mod tests {
         seed_user_data(&db, user_id, played, true, None).await;
         seed_item_value(&db, blocked, ItemValueType::Tags, "blocked-selection").await;
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &user.id,
             PreferenceKind::BlockedTags,
             &["blocked-selection".to_owned()],
@@ -6124,7 +6124,7 @@ mod tests {
         .await
         .unwrap();
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user.id,
             PermissionKind::EnableAllFolders,
             false,
@@ -6521,7 +6521,7 @@ mod tests {
         .await;
         let user = seed_user_with_defaults(&db, Uuid::from_u128(0xE3FF)).await;
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &user.id,
             PreferenceKind::BlockedMediaFolders,
             &[blocked.to_string()],
@@ -7698,7 +7698,7 @@ mod tests {
         );
 
         crate::user_entity_ext::set_preference(
-            db.writer(),
+            &db,
             &user.id,
             PreferenceKind::AllowedTags,
             &["kids".to_owned()],
@@ -8995,7 +8995,7 @@ mod tests {
         let user_id = Uuid::from_u128(0xA5D0);
         let user = seed_user_with_defaults(&db, user_id).await;
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user.id,
             PermissionKind::EnableAllFolders,
             false,
@@ -9380,7 +9380,7 @@ mod tests {
                 .expect("is_played non-recursive with unplayed child")
         );
         crate::user_entity_ext::set_preference(
-            db.writer(),
+            &db,
             &user.id,
             ferrofin_db::enums::PreferenceKind::BlockUnratedItems,
             &["Series".to_owned()],
@@ -10755,7 +10755,7 @@ mod tests {
         ids: &[Uuid],
     ) {
         let values: Vec<String> = ids.iter().map(ToString::to_string).collect();
-        crate::user_entity_ext::set_preference(db.pool(), &guid_to_db(user_id), kind, &values)
+        crate::user_entity_ext::set_preference(db, &guid_to_db(user_id), kind, &values)
             .await
             .expect("set preference");
     }
@@ -10799,7 +10799,7 @@ mod tests {
         let user_key = guid_to_db(user_id);
         let tags = |values: &[&str]| values.iter().map(|&v| v.to_owned()).collect::<Vec<_>>();
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &user_key,
             PreferenceKind::BlockedTags,
             &tags(&["gore"]),
@@ -10819,7 +10819,7 @@ mod tests {
 
         // Library access alone is a restriction too.
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &user_key,
             PreferenceKind::BlockedTags,
             &tags(&[]),
@@ -13262,7 +13262,7 @@ mod tests {
         // AllowedTags exempts these immediate root children. Folder permissions
         // still remove the other library; plugin folders retain source visibility.
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             PreferenceKind::AllowedTags,
             &["only-media".to_owned()],
@@ -14418,7 +14418,7 @@ mod folder_get_result_tests {
         )
         .await;
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             PreferenceKind::BlockedMediaFolders,
             &[guid_to_db(view), guid_to_db(plugin)],

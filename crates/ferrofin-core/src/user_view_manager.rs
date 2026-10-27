@@ -640,8 +640,8 @@ impl FerrofinUserViewManager {
         else {
             return Ok((views, false));
         };
-        let grouped = user_entity_ext::guid_preference(
-            db.pool(),
+        let grouped = user_entity_ext::cached_guid_preference(
+            db,
             &ferrofin_db::store::guid_to_db(user_id),
             ferrofin_db::enums::PreferenceKind::GroupedFolders,
         )
@@ -1087,8 +1087,9 @@ impl UserViewManager for FerrofinUserViewManager {
         // `{InternalMetadataPath}/views/` and only `GetUserViews` appends it.
         // The exclusion is UNCONDITIONAL, not the Live-TV-disabled gate
         // `get_user_views` applies: an enabled tuner puts the view in
-        // `/UserViews`, never in `/Library/MediaFolders`. (`user_id` still
-        // selects the user whose libraries these are.)
+        // `/UserViews`, never in `/Library/MediaFolders`. The folders are the
+        // same for every caller (upstream reads no user), so `user_id` is
+        // unused.
         let _ = user_id;
         let folders = self.items.get_item_list(&query).await?;
         Ok(folders
@@ -1354,8 +1355,8 @@ impl FerrofinUserViewManager {
         let Some(db) = &self.db else {
             return Ok(views);
         };
-        let excluded = user_entity_ext::guid_preference(
-            db.pool(),
+        let excluded = user_entity_ext::cached_guid_preference(
+            db,
             &ferrofin_db::store::guid_to_db(user_id),
             ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
         )
@@ -1382,8 +1383,8 @@ impl FerrofinUserViewManager {
         let Some(db) = &self.db else {
             return Ok(views);
         };
-        let orders = user_entity_ext::guid_preference(
-            db.pool(),
+        let orders = user_entity_ext::cached_guid_preference(
+            db,
             &ferrofin_db::store::guid_to_db(user_id),
             ferrofin_db::enums::PreferenceKind::OrderedViews,
         )
@@ -1885,7 +1886,7 @@ mod tests {
 
     async fn block_folders(db: &Database, user: Uuid, folders: &[Uuid]) {
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            db,
             &guid_to_db(user),
             ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
             &folders.iter().map(|id| guid_to_db(*id)).collect::<Vec<_>>(),
@@ -1981,7 +1982,7 @@ mod tests {
             let db = db.clone();
             async move {
                 crate::user_entity_ext::set_preference(
-                    db.pool(),
+                    &db,
                     &guid_to_db(user),
                     ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
                     &ids,
@@ -2195,7 +2196,7 @@ mod tests {
         crate::test_support::seed_named_user(&db, owner, "owner").await;
         crate::test_support::seed_named_user(&db, admin, "admin").await;
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &guid_to_db(admin),
             ferrofin_db::enums::PermissionKind::IsAdministrator,
             true,
@@ -2593,7 +2594,7 @@ mod tests {
         );
 
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             PreferenceKind::OrderedViews,
             &[
@@ -2621,7 +2622,7 @@ mod tests {
 
         // Hidden views are not listed, and the saved order still holds for the rest.
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             PreferenceKind::MyMediaExcludes,
             &[guid_to_db(c)],
@@ -3435,7 +3436,7 @@ mod tests {
         assert_eq!(shape(&latest(&mgr, query.clone()).await), expected);
 
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
             &[guid_to_db(MOVIES)],
@@ -4004,7 +4005,7 @@ mod tests {
         assert_eq!(localized.name.as_deref(), Some("Dossiers"));
         assert_eq!(localized.sort_name.as_deref(), Some("dossiers"));
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user),
             ferrofin_db::enums::PreferenceKind::MyMediaExcludes,
             &[guid_to_db(id)],
@@ -4246,7 +4247,7 @@ mod tests {
     async fn group(db: &Database, user: Uuid, libraries: &[Uuid]) {
         let ids: Vec<String> = libraries.iter().map(|id| guid_to_db(*id)).collect();
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            db,
             &guid_to_db(user),
             ferrofin_db::enums::PreferenceKind::GroupedFolders,
             &ids,
@@ -4459,7 +4460,7 @@ mod tests {
         assert_eq!(row.sort_name.as_deref(), Some("movies"));
 
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user),
             PreferenceKind::OrderedViews,
             &[guid_to_db(series), guid_to_db(id)],
@@ -4468,7 +4469,7 @@ mod tests {
         .expect("order");
         assert_eq!(view_names(&mgr, user).await, ["Series", "Movies"]);
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user),
             PreferenceKind::MyMediaExcludes,
             &[guid_to_db(id)],

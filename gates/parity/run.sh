@@ -16,8 +16,9 @@
 #                on a fresh database copy: gates/parity/reset.sh restores both servers to the snapshot taken at boot
 #   --out        the run directory: default $FERROFIN_GATES_DIR/runs/parity-<name>; never reused
 #                (the output root's layout is in gates/lib.sh)
-#   --gate       a release-gate run: a stale oracle pin, or an --oracle other than the pin, is refused
-#                (an ad-hoc run only warns)
+#   --gate       a release-gate run: an --oracle other than the pin is refused (an ad-hoc run only
+#                warns), and the cores must be pinned. A Jellyfin release newer than the pin is noted
+#                and recorded in run.json, never refused, on any run
 #
 # Exit: 0 no new difference; 1 a new difference or a run failure (a server did not boot, the cap
 # passed, a reset failed); 2 the arguments or inputs were refused before anything started.
@@ -40,6 +41,7 @@ START_EPOCH=$(date +%s)
 source gates/lib.sh          # the output root and the local-disk check
 # shellcheck source=gates/parity/lib.sh
 source gates/parity/lib.sh   # READY_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S, KILL_GRACE_S, POLL_S, and the readiness check
+gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/lib.sh, gl-968)
 
 PARITY_CAP_S=${PARITY_CAP_S:-7200}
 PARITY_REQUEST_TIMEOUT=${PARITY_REQUEST_TIMEOUT:-30}
@@ -120,10 +122,9 @@ expected_ids=$(sha256sum "$IDS" | cut -d' ' -f1)
 jq -e --arg image "$expected_image" --arg source "$expected_source" --arg ids "$expected_ids" \
   '.image_id == $image and .source_db_sha256 == $source and .ids_sha256 == $ids' "$PREP" >/dev/null \
   || die "the Jellyfin preparation does not match this oracle image and source fixture"
-# The oracle is the Jellyfin release named by UPSTREAM_TAG, pinned by digest (gates/bench/oracle.py): a
-# release-gate run refuses a stale pin, an ad-hoc run warns.
-oracle_args=(check); ! $GATE || oracle_args+=(--gate)
-ORACLE_PIN=$(python3 gates/bench/oracle.py "${oracle_args[@]}") || die "the oracle pin was refused (see above)"
+# The oracle is the Jellyfin release this branch pins, UPSTREAM_TAG by digest (gates/bench/oracle.py): a
+# newer release is noted and recorded with it in run.json, never refused (owner decision 2026-10-25).
+ORACLE_PIN=$(python3 gates/bench/oracle.py check) || die "cannot read the oracle pin (see above)"
 if [ "$ORACLE_IMAGE" != "$(jq -r .image <<<"$ORACLE_PIN")" ]; then
   $GATE && die "--oracle $ORACLE_IMAGE is not the pinned oracle $(jq -r .image <<<"$ORACLE_PIN")"
   echo "parity: warning: --oracle $ORACLE_IMAGE is not the pinned oracle $(jq -r .image <<<"$ORACLE_PIN")" >&2
@@ -146,6 +147,7 @@ cleanup() {   # the EXIT trap: stops what runs, removes the containers, and make
   set +e
   trap - EXIT
   trap '' INT TERM HUP   # a second signal must not abort the teardown
+  gates_ack
   # Stop whatever is still running first: a boot in progress, the comparison.
   for job in $(jobs -p); do kill "$job" 2>/dev/null; done
   wait 2>/dev/null

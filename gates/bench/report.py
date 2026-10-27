@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Render a run (or several) as the README tables, or as an HTML page for comparing
-(PLAN_BENCHMARK_V3 §7). stdlib only.
+"""Render a run (or several) as the full tables (docs/BENCHMARKS.md), or as an HTML page for comparing
+(PLAN_BENCHMARK_V3 §7). stdlib only. The README's Results section and its graphs are gates/publish.py's,
+drawn from the result.json this writes.
 
     report.py RUN_DIR [RUN_DIR ...]          markdown on stdout (the full tables, docs/BENCHMARKS.md style)
-    report.py --readme [README.md] RUN_DIR... the README "Benchmarks" section (headline table + prose);
-                                             with a README path, replaces the block between the
-                                             BEGIN/END GENERATED BENCHMARKS markers in place
-    report.py --html RUN_DIR                 write RUN_DIR/report.html (self-contained; run.sh does this)
-    report.py --serve [PORT] [RUNS_DIR] [--adoption-dir DIR] [--parity-dir DIR]
+    report.py --html RUN_DIR                 write RUN_DIR/report.html (self-contained) and RUN_DIR/result.json
+                                             (gates/result.py's envelope) from one model; run.sh does this
+    report.py --serve [PORT] [RUNS_DIR] [--adoption-dir DIR] [--parity-dir DIR] [--verify-dir DIR]
                                              the viewer on http://127.0.0.1:PORT (default 8097; RUNS_DIR defaults
                                              to $FERROFIN_GATES_DIR/runs, else gates/bench/runs):
-                                             Benchmark, Adoption and Parity tabs, each listing that harness's
-                                             runs (a report.html each) and comparing two side by side. The
-                                             directories also come from FERROFIN_ADOPTION_RUNS / FERROFIN_PARITY_RUNS,
-                                             else from the output root ($FERROFIN_GATES_DIR/work, /runs).
+                                             Benchmark, Adoption, Parity and Verify tabs, each listing that
+                                             harness's runs (a report.html each; verify's, or its result.json)
+                                             and comparing two side by side. The directories also come from
+                                             FERROFIN_ADOPTION_RUNS / FERROFIN_PARITY_RUNS / FERROFIN_VERIFY_RUNS,
+                                             else from the output root ($FERROFIN_GATES_DIR/work, /runs, /runs).
 
 One run dir: the numbers of that run. Several: each cell is the median across runs, and
 where the runs disagreed at the precision published, the range they spanned; a cell that
@@ -41,6 +41,7 @@ comparison, never the change against the baseline. Missing phases are named.
 
 import csv
 import html
+import importlib.util
 import http.server
 import json
 import math
@@ -950,6 +951,24 @@ def build(runs):
     return m
 
 
+def cpu_evidence(m, k, i, window):
+    """Server `k`'s CPU in run `i`'s `window`: `(problem, seconds, completed, validity, cost, work_flags)`,
+    where `problem` is what is wrong with the resource evidence itself, `completed` the screens k6
+    finished, `work_flags` the workload-validation flags of the level's screens, `validity` the problem
+    and those flags, and `cost` the CPU-seconds per completed screen (None when it cannot be computed)."""
+    r = m["resources"][k][i].get(window, {})
+    phases = m["phases"][k][i] or {}
+    failures = [f"{name}: {phases[name]['status']} ({phases[name].get('reason') or 'no reason recorded'})"
+                for name in ("startup", "startup-drain", "sampler", window)
+                if name in phases and phases[name].get("status") != "completed"]
+    problem = reasons(r.get("error"), *failures)
+    seconds = r.get("cpu_seconds")
+    completed = (load(os.path.join(m["runs"][i], k, f"k6-{window}.json")) or {}).get("iterations")
+    work_flags = [cell[k].flag for _, cell in m.get("levels", {}).get(window, {}).get("screens", []) if k in cell and cell[k].flag]
+    cost = seconds / completed if number(seconds) and number(completed) and completed > 0 else None
+    return problem, seconds, completed, reasons(problem, *work_flags), cost, work_flags
+
+
 def cpu_tables(m):
     """Keep each repetition and its resource validity visible, including missing data."""
     cpu, busy, capacity, per_screen, comparison, coverage = [], [], [], [], [], []
@@ -962,12 +981,7 @@ def cpu_tables(m):
             values, details, cores, shares, costs, numeric_costs, validity = {}, {}, {}, {}, {}, {}, {}
             for k, _ in m["servers"]:
                 r = records[k]
-                phases = m["phases"][k][i] or {}
-                failures = [f"{name}: {phases[name]['status']} ({phases[name].get('reason') or 'no reason recorded'})"
-                            for name in ("startup", "startup-drain", "sampler", window)
-                            if name in phases and phases[name].get("status") != "completed"]
-                problem = reasons(r.get("error"), *failures)
-                seconds = r.get("cpu_seconds")
+                problem, seconds, completed, validity[k], numeric_costs[k], work_flags = cpu_evidence(m, k, i, window)
                 values[k] = (f"{seconds:.3f}" if number(seconds) else "unavailable") + (" ⚠" if problem else "")
                 start, end = r.get("observed_start"), r.get("observed_end")
                 duration = end - start if number(start) and number(end) and end > start else None
@@ -980,12 +994,7 @@ def cpu_tables(m):
                 suffix = " ⚠" if problem else ""
                 cores[k] = f"{mean:.3f}" + suffix if mean is not None else "unavailable"
                 shares[k] = f"{100 * mean / count:.2f}%" + suffix if mean is not None and count else "unavailable"
-                summary = load(os.path.join(m["runs"][i], k, f"k6-{window}.json")) or {}
-                completed = summary.get("iterations")
-                work_flags = [cell[k].flag for _, cell in m.get("levels", {}).get(window, {}).get("screens", []) if k in cell and cell[k].flag]
-                validity[k] = reasons(problem, *work_flags)
-                numeric_costs[k] = seconds / completed if number(seconds) and number(completed) and completed > 0 else None
-                costs[k] = f"{seconds * 1000 / completed:.3f}" + suffix if number(seconds) and number(completed) and completed > 0 else "unavailable"
+                costs[k] = f"{seconds * 1000 / completed:.3f}" + suffix if numeric_costs[k] is not None else "unavailable"
                 if work_flags:
                     costs[k] += " ⚠ workload validation failed"
                 stamp = lambda t: datetime.fromtimestamp(t, timezone.utc).isoformat(timespec="milliseconds") if number(t) else "unavailable"
@@ -1190,7 +1199,7 @@ def endpoints_table(m, as_html=False):
     return diagnostic_table(title, head, rows) + f"\n{why}\n"
 
 
-# ── markdown (the README tables) ────────────────────────────────────────────
+# ── markdown (the full tables) ──────────────────────────────────────────────
 def render_md(m):
     oracle_label = m["oracle_label"]
     meta, servers, out = m["meta"], m["servers"], []
@@ -1277,20 +1286,9 @@ def render_md(m):
     return "\n".join(out) + "\n"
 
 
-# ── README section (headline table + Mermaid charts) ────────────────────────
-README_BEGIN = "<!-- BEGIN GENERATED BENCHMARKS"
-README_END = "<!-- END GENERATED BENCHMARKS -->"
-#: The level the README quotes: five screens a second is the closest of the three to
-#: ordinary use (unloaded is a control, stress exists to find the knee).
-README_LEVEL = "loaded"
-#: The time-to-first-screen and memory rows the README headlines, by row name. HLS is
-#: withheld like any flagged cell whenever a repetition's transcode parameters or
-#: first-segment properties differ from the oracle's. The interference/swap rows describe
-#: the run, not the server.
-README_TTFS = ("cold start (restart → authenticated views; host caches retained)", "HLS first segment (forced transcode)",
-               "direct-play TTFB (1 MiB range)")
-README_MEMORY = ("peak under load", "steady idle")
-
+#: The memory rows of a result.json: the server's own peak and idle memory. The interference and
+#: swap rows describe the run, not the server.
+MEMORY_ROWS = ("peak under load", "steady idle")
 
 
 def _ratio(c, oracle_cell):
@@ -1299,132 +1297,6 @@ def _ratio(c, oracle_cell):
         return None
     mine, theirs = displayed(c), displayed(oracle_cell)
     return theirs / mine if mine and theirs else None
-
-
-def render_readme(m, run_dirs):
-    """The README `## Benchmarks` body: setup sentence, the headline table with a
-    "Ferrofin vs oracle" column, the per-endpoint range sentence, the spread sentence
-    computed from the runs, and the pointers to the full tables. Wrapped in markers so `--readme README.md` can replace it in place;
-    everything inside the markers is generated — edit the prose here, not in the README."""
-    oracle_label = m["oracle_label"]
-    meta, servers = m["meta"], m["servers"]
-    if "ferrofin" not in dict(servers):
-        raise ValueError("README comparison requires Ferrofin")
-    lv = m["levels"].get(README_LEVEL)
-    if not lv:
-        sys.exit(f"the runs have no '{README_LEVEL}' level; the README section needs it")
-    tc = meta.get("testdata_counts", {})
-    tag = meta.get("name") or os.path.basename(run_dirs[0].rstrip("/"))
-    nruns = len(m["runs"])
-    notes = Notes()
-    out = []
-    p = out.append
-    cmd = "python3 gates/bench/report.py --readme README.md " + " ".join(f"\"$FERROFIN_GATES_DIR\"/runs/{os.path.basename(r.rstrip('/'))}" for r in run_dirs)
-    p(f"{README_BEGIN} — do not edit by hand. Regenerate with:\n     {cmd} -->")
-    cpus = str(meta.get("server_cpus", ""))
-    try:
-        ncores = sum(int(part.split("-")[-1]) - int(part.split("-")[0]) + 1 for part in cpus.split(","))
-    except ValueError:
-        ncores = "?"
-    limit = str(meta.get("memory_limit", "?")).replace("g", " GiB")
-    article = "an" if limit[:1] in "8aeiou" else "a"
-    opponents = " and ".join(f"**{label}**" for k, label in servers if k != "ferrofin")
-    comparison = f" against {opponents}" if opponents else " (no Jellyfin reference selected)"
-    p(f"Ferrofin `{tag}`{comparison}, measured {meta.get('date', '')[:10]} "
-      f"on one machine ({meta.get('cpu', '?').replace(' 16-Core Processor', '')}), each server alone in a container pinned to "
-      f"{ncores} logical CPUs with {article} {limit} limit, over a fixture of "
-      f"{tc.get('movies', '?')} movies, {tc.get('series', '?')} series and {tc.get('episodes', '?')} episodes. "
-      f"Published figures are medians across {nruns} selected run{'s' if nruns != 1 else ''}; "
-      "incomplete or non-comparable cells are withheld.")
-    if m.get("load_problems"):
-        p("Measured load windows contain failures or incomplete evidence; see the full report.\n")
-    else:
-        p("No measured request failed in the recorded load windows (" + ", ".join(m["levels"]) + ").\n")
-    p(f"The screen rows are scripted HTTP transactions based on jellyfin-web 10.11.8, "
-      f"replayed at {lv['rate']} screens per second (the \"{README_LEVEL}\" level). They include "
-      "API and poster requests, not browser rendering. Latency reads "
-      f"**p50 / p95 / p99 in milliseconds**; the last column compares p50 with {oracle_label}.\n")
-    # ── headline table ──
-    p("| | " + " | ".join(f"**{lbl}**" if k == "ferrofin" else lbl for k, lbl in servers) + f" | Ferrofin vs {oracle_label.split()[1]} |")
-    p("|---|" + "---|" * (len(servers) + 1))
-
-    def row(name, cells, label_md, unit_suffix=""):
-        cols = []
-        for k, label in servers:
-            c = cells[k]
-            if c.flag or not c.vals:
-                reason = c.flag or "missing measurement"
-                txt = f"— ⚠[{notes.add(reason, f'{label}: {name}')}]"
-            else:
-                txt = " / ".join(part.value() for part in c.parts()) if "p95" in c.sub else c.value()
-            cols.append(f"**{txt}**" if k == "ferrofin" else txt)
-        f, o = cells["ferrofin"], cells.get(ORACLE)
-        sp = speedup(f, o) if _ratio(f, o) is not None else None
-        p(f"| {label_md} | " + " | ".join(cols) + f" | **{sp or '—'}** |")
-
-    for name, cells in lv["screens"]:
-        row(name, cells, f"**{name}** screen")
-    for name, cells in m["ttfs"]:
-        if name in README_TTFS:
-            row(name, cells, name)
-    for name, cells in m["memory"]:
-        if name in README_MEMORY:
-            row(name, cells, f"{name} memory")
-    p("")
-    eps = [(name, _ratio(cells["ferrofin"], cells.get(ORACLE))) for name, cells in lv["endpoints"]]
-    eps = [(n, r) for n, r in eps if r]
-    if eps:
-        ties = sum(f"{r:.1f}" == "1.0" for _, r in eps)
-        wins = sum(r > 1 and f"{r:.1f}" != "1.0" for _, r in eps)
-        losses = len(eps) - wins - ties
-        p(f"Among {len(eps)} comparable endpoint measurements at this level, Ferrofin is faster on "
-          f"{wins}, about the same on {ties}, and slower on {losses} against {oracle_label}. "
-          "Flagged or missing endpoints are excluded from these counts. The full tables are in "
-          "[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).\n")
-    else:
-        p("No endpoint speed comparisons have complete, comparable evidence in this selection.\n")
-    if notes:
-        p("⚠ marks a withheld cell: its evidence is incomplete or the servers did different work. "
-          "Raw diagnostic numbers remain in the full report.\n")
-        for n, text, sources in notes.items:
-            p(f"{n}. {', '.join(sources)}: {text}")
-        p("")
-    # ── spread sentence, computed ──
-    def moved(part):
-        return len(part.vals) > 1 and part.median and (max(part.vals) - min(part.vals)) > 0.15 * part.median
-    p50s = tails = p50_moved = tail_moved = 0
-    for _, cells in lv["screens"] + lv["endpoints"]:
-        for k, _ in servers:
-            parts = cells[k].parts()
-            if not parts or parts[0].median is None:
-                continue
-            p50s += 1
-            p50_moved += moved(parts[0])
-            for part in parts[1:]:
-                tails += 1
-                tail_moved += moved(part)
-    if nruns > 1:
-        p(f"How steady are these numbers? Across the {nruns} runs, {p50_moved} of the {p50s} medians in the "
-          f"{README_LEVEL}-level tables moved by more than 15 % of their value, against {tail_moved} of the {tails} "
-          f"p95/p99 tails, so read the p50s as the numbers and the tails as shape. Run-to-run ranges for every cell, "
-          f"and every place the servers did different work, are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); "
-          f"the harness and the one-sentence definition of each number are in [`gates/bench/README.md`](gates/bench/README.md). "
-          f"It is a deliberate, local instrument, not a CI job.")
-    p(README_END)
-    return "\n".join(out) + "\n"
-
-
-def inject_readme(path, section):
-    """Replace the block between the GENERATED BENCHMARKS markers in `path` with
-    `section` (which carries its own markers). Refuses to guess when they are absent."""
-    text = open(path, encoding="utf-8").read()
-    i, j = text.find(README_BEGIN), text.find(README_END)
-    if i < 0 or j < 0:
-        sys.exit(f"{path} has no {README_BEGIN} … {README_END} block to replace")
-    j += len(README_END)
-    if text[j:j + 1] == "\n":
-        j += 1
-    open(path, "w", encoding="utf-8").write(text[:i] + section + text[j:])
 
 
 # ── html (the comparison page) ──────────────────────────────────────────────
@@ -1809,6 +1681,7 @@ def render_html(m, base=None, picker="", gate=None, verdicts=None):
              f"{e(str(meta.get('memory_limit', '?')))} limit, no swap · test data {e(str(tc.get('movies', '?')))} movies / {e(str(tc.get('series', '?')))} series / {e(str(tc.get('episodes', '?')))} episodes · "
              f"windows {e(str(meta.get('window_s', '?')))} s · {run_list(m['runs'], 'run')}"
              + (f" · Jellyfin oracle {e(o['tag'])} ({e(o['image'])})" if (o := meta.get("oracle")) else "")
+             + (f" — {e(o['note'])}" if o and o.get("note") else "")
              + (f" · baseline, median of {run_list(base['runs'], 'run')}" if base else "") + "</p>"]
     # tiles: the four headline numbers
     tiles = []
@@ -1900,7 +1773,9 @@ def list_runs(runs_dir):
     runs found there are named `<session>/<run>`; a scan session's runs have no run.json. A
     gates/run session is read through its `bench/` folder, named `<session>/bench`.
     A session `gate.py render` wrote a report.html for is listed too, as `<session>`: the
-    gate's own page, which is the only one a scan session has."""
+    gate's own page, which is the only one a scan session has. A run or session with a valid
+    result.json is labelled from it (its start, commit, servers or verdict), else from run.json
+    or gate.json."""
     out = []
     for entry in os.listdir(runs_dir):
         # a gates/run session (gates/session.py) holds its benchmark in bench/: a run, or a gate.py session
@@ -1915,14 +1790,21 @@ def list_runs(runs_dir):
         if nested and os.path.isfile(os.path.join(top, "report.html")):
             plan = load(os.path.join(top, "gate.json"))
             plan = plan if isinstance(plan, dict) else {}
-            date = str(plan.get("date", ""))
-            out.append((date, session, f"{session}  ·  {date[:16].replace('T', ' ')}  ·  gate {plan.get('mode', '?')}"))
+            doc = read_result(top)
+            date = str((doc or {}).get("started") or plan.get("date", ""))
+            mode = (doc or {}).get("detail", {}).get("mode") or plan.get("mode", "?")
+            out.append((date, session, f"{session}  ·  {date[:16].replace('T', ' ')}  ·  gate {mode}"
+                        + (f"  ·  {doc['verdict']}" if doc else "")))
         for name in ([f"{session}/{sub}" for sub in os.listdir(top)] if nested else [session]):
             d = os.path.join(runs_dir, name)
             meta = load(os.path.join(d, "run.json"))
             if isinstance(meta, dict):
-                srv = [k for k, _ in SERVERS if os.path.isdir(os.path.join(d, k))]
-                out.append((meta.get("date", ""), name, f"{name}  ·  {meta.get('date', '')[:16].replace('T', ' ')}  ·  {meta.get('sha', '?')}  ·  {', '.join(srv)}"))
+                doc = read_result(d)
+                if doc:
+                    date, sha, srv = doc["started"] or meta.get("date", ""), doc["source"]["commit"], list(doc["detail"].get("servers") or {})
+                else:
+                    date, sha, srv = meta.get("date", ""), meta.get("sha"), [k for k, _ in SERVERS if os.path.isdir(os.path.join(d, k))]
+                out.append((date, name, f"{name}  ·  {date[:16].replace('T', ' ')}  ·  {sha or '?'}  ·  {', '.join(srv)}"))
     return [(n, lbl) for _, n, lbl in sorted(out, reverse=True)]
 
 
@@ -1941,22 +1823,53 @@ nav.tabs a.on{color:var(--ink);border-bottom-color:var(--accent);font-weight:600
 
 #: The viewer's tabs, in order: the harness key, its tab label, the flag and the
 #: environment variable that name the directory holding its runs. The benchmark's runs
-#: are the `--serve` argument (default `$FERROFIN_GATES_DIR/runs`, else `gates/bench/runs`); the other two harnesses decide where
+#: are the `--serve` argument (default `$FERROFIN_GATES_DIR/runs`, else `gates/bench/runs`); the other harnesses decide where
 #: their runs go, so the viewer is told.
 HARNESSES = (("benchmark", "Benchmark", None, None),
              ("adoption", "Adoption", "--adoption-dir", "FERROFIN_ADOPTION_RUNS"),
-             ("parity", "Parity", "--parity-dir", "FERROFIN_PARITY_RUNS"))
+             ("parity", "Parity", "--parity-dir", "FERROFIN_PARITY_RUNS"),
+             ("verify", "Verify", "--verify-dir", "FERROFIN_VERIFY_RUNS"))
 HTML = "text/html; charset=utf-8"
+#: The files that make a directory one of a harness's runs: its report, or (for a gate whose report the
+#: viewer renders on demand) the result.json it is rendered from (gates/result.py).
+RUN_FILES = {"verify": ("report.html", "result.json"), "parity": ("report.html", "result.json")}
 
 
-def run_dir(root, name):
-    """The directory of adoption/parity run `name`, or None: a subdirectory of `root`
-    holding a `report.html`, else `root` itself when `name` is its own name (a harness
-    writes its report into its work directory)."""
+def run_page(d, harness):
+    """The first of the harness's run files present in `d`, or None."""
+    return next((os.path.join(d, f) for f in RUN_FILES.get(harness, ("report.html",)) if os.path.isfile(os.path.join(d, f))), None)
+
+
+def run_dir(root, name, harness=None):
+    """The directory of adoption/parity/verify run `name`, or None: a subdirectory of `root`
+    holding a `report.html` (or verify's `result.json`), else `root` itself when `name` is its own
+    name (a harness writes its report into its work directory)."""
     sub = os.path.join(root, name)
-    if os.path.isfile(os.path.join(sub, "report.html")):
+    if run_page(sub, harness):
         return sub
     return root if name == os.path.basename(os.path.abspath(root)) else None
+
+
+def found_runs(harness, root):
+    """`[(mtime, run name, label, directory)]` of the adoption, parity or verify runs under `root`, one
+    directory or a list of them (adoption's default is both the output root's work/ and runs/); a name
+    found twice is the first directory's."""
+    out, seen = [], set()
+    for base in (root if isinstance(root, (list, tuple)) else [root]):
+        if not base or not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)) + [os.path.basename(os.path.abspath(base))]:
+            if os.path.isfile(os.path.join(base, name, "session.json")):   # a gates/run session: its gate's folder
+                name = f"{name}/{harness}"
+            elif other_gate(harness, name):
+                continue
+            d = run_dir(base, name, harness)
+            page = d and run_page(d, harness)
+            if name not in seen and page:
+                seen.add(name)
+                when = datetime.fromtimestamp(os.path.getmtime(page)).strftime("%Y-%m-%d %H:%M")
+                out.append((os.path.getmtime(page), name, f"{name}  ·  {when}", d))
+    return out
 
 
 def discover(harness, root):
@@ -1964,25 +1877,13 @@ def discover(harness, root):
 
     A benchmark run is a directory with a `run.json` (it has a `report.html` only once
     `--html` or `run.sh` wrote one; the viewer renders it otherwise). An adoption or parity
-    run is a directory holding a `report.html`; `root` itself counts as a run when it holds
-    one, because a harness writes its report into its work directory."""
-    if not root or not os.path.isdir(root):
-        return []
+    run is a directory holding a `report.html`, a verify run one holding a `report.html` or a
+    `result.json` (parity too, though its report.html is written with it); `root` itself counts as a
+    run when it holds one, because a harness writes
+    its report into its work directory. `root` may be a list of directories (`found_runs`)."""
     if harness == "benchmark":
-        return list_runs(root)
-    out, seen = [], set()
-    for name in sorted(os.listdir(root)) + [os.path.basename(os.path.abspath(root))]:
-        if os.path.isfile(os.path.join(root, name, "session.json")):   # a gates/run session: its gate's folder
-            name = f"{name}/{harness}"
-        elif other_gate(harness, name):
-            continue
-        d = run_dir(root, name)
-        page = d and os.path.join(d, "report.html")
-        if name not in seen and page and os.path.isfile(page):
-            seen.add(name)
-            when = datetime.fromtimestamp(os.path.getmtime(page)).strftime("%Y-%m-%d %H:%M")
-            out.append((os.path.getmtime(page), name, f"{name}  ·  {when}"))
-    return [(n, lbl) for _, n, lbl in sorted(out, reverse=True)]
+        return list_runs(root) if root and os.path.isdir(root) else []
+    return [(n, lbl) for _, n, lbl, _ in sorted(found_runs(harness, root), reverse=True)]
 
 
 def tabs_html(active):
@@ -2040,15 +1941,118 @@ def error_html(what, ex, picker=""):
                      f"{html.escape(type(ex).__name__)}: {html.escape(str(ex))} — a run that is still in progress renders once it finishes.</p>{picker}", "benchmark")
 
 
+def read_result(d):
+    """The benchmark's result.json in `d`, None when there is none or it is not a valid one."""
+    try:
+        return gate_result().read(d, "bench")
+    except ValueError:
+        return None
+
+
+def result_page(doc, name):
+    """A compact page from a benchmark result.json alone: each level's screen and endpoint rows,
+    time to first screen, memory and CPU per screen (every server's median and range, Ferrofin's
+    ratio, a withheld cell's reason), or a gate session's verdict cells."""
+    e = html.escape
+    detail = doc["detail"]
+    fmt = lambda v: sig3(v) if number(v) else "—"
+    if "verdicts" in detail and not detail["verdicts"]:
+        tables = f"<p class='lede'>No verdict cells: a {e(str(detail.get('mode')))} session judges none.</p>"
+    elif "verdicts" in detail:
+        rows = []
+        for key, v in detail["verdicts"].items():
+            verdict = str(v.get("verdict"))
+            change = f"{v['pct']:+.1f}%" if isinstance(v.get("pct"), (int, float)) else "—"
+            rows.append(f"<tr><th>{e(key)}</th><td class='verdict {e(verdict.replace(' ', '-'))}'>{e(verdict)}</td>"
+                        f"<td class='num'>{fmt(v.get('a_median'))}</td><td class='num'>{fmt(v.get('b_median'))}</td>"
+                        f"<td class='num'>{change}</td><td>{'gated' if v.get('gated') else ''}</td></tr>")
+        rows = "".join(rows)
+        tables = ("<div class='scroll'><table><thead><tr><th>Cell</th><th>Verdict</th><th>Previous</th><th>Candidate</th>"
+                  f"<th>Change</th><th></th></tr></thead><tbody>{rows}</tbody></table></div>")
+    else:
+        servers = list(detail.get("servers") or {})
+        head = "".join(f"<th>{e(detail['servers'][k])}</th>" for k in servers)
+
+        def table(title, rows):
+            body = []
+            for r in rows:
+                cells = []
+                for k in servers:
+                    c = r["servers"].get(k) or {}
+                    spread = f" <span class='tail'>{fmt(c.get('min'))}–{fmt(c.get('max'))}</span>" if c.get("min") != c.get("max") else ""
+                    cells.append(f"<td class='num'>{fmt(c.get('median'))} {e(c.get('unit') or '')}{spread}</td>")
+                ratio = f"{r['ratio']:.1f}×" if number(r.get("ratio")) else "—"
+                note = f"<br><span class='tail'>withheld: {e(r['withheld'])}</span>" if r["withheld"] else ""
+                body.append(f"<tr><th>{e(r['name'])}{note}</th>{''.join(cells)}<td class='num'>{ratio}</td></tr>")
+            return (f"<h2>{e(title)}</h2><div class='scroll'><table><thead><tr><th></th>{head}<th>vs oracle</th></tr></thead>"
+                    f"<tbody>{''.join(body)}</tbody></table></div>")
+        parts = []
+        for level, lv in detail.get("levels", {}).items():
+            parts.append(table(f"{level} · screens ({lv.get('rate')} screens/s), p50", lv.get("screens", [])))
+            parts.append(table(f"{level} · endpoints, p50", lv.get("endpoints", [])))
+        parts += [table("Time to first screen", detail.get("ttfs", [])), table("Memory", detail.get("memory", [])),
+                  table("CPU per completed screen", detail.get("cpu_per_screen", []))]
+        tables = "".join(parts)
+    src = doc["source"]
+    lede = (f"{e(doc['verdict'])} · commit {e(str(src.get('commit')))} · image {e(str(src.get('image')))} · "
+            f"started {e(str(doc.get('started')))} — rendered from result.json")
+    return page_html(f"Ferrofin {name}", f"<h1>{e(name)}</h1><p class='lede'>{lede}</p>{tables}")
+
+
 def benchmark_report(root, name):
-    """A benchmark run's `report.html`: the file its run wrote, else the run rendered now."""
+    """A benchmark run's `report.html`: the file its run wrote, else a page from its result.json,
+    else the run rendered now."""
     run = os.path.join(root, name)
     static = os.path.join(run, "report.html")
     if os.path.isfile(static):
         with open(static, encoding="utf-8") as f:
             return 200, f.read()
+    if doc := read_result(run):
+        return 200, result_page(doc, name)
     try:
         return 200, render_html(build([run]), verdicts=load_verdicts([run]))
+    except Exception as ex:
+        return (400 if isinstance(ex, ValueError) else 500), error_html(name, ex)
+
+
+def verify_report(run, name):
+    """A verify run's page rendered now from its result.json (gates/verify/verify_report.py)."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        spec = importlib.util.spec_from_file_location("gates_verify_report", os.path.join(here, "..", "verify", "verify_report.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        doc = module.result.read(run, "verify")
+        if doc is None:
+            raise ValueError("result.json is gone")
+        # no log link: the viewer serves the page alone, so a relative server.log would not resolve
+        return 200, module.render(doc, log=False, style=CSS)
+    except Exception as ex:
+        return (400 if isinstance(ex, ValueError) else 500), error_html(name, ex)
+
+
+def parity_overview(run, name):
+    """A parity run's overview rendered now from its result.json alone (the full report.html is written
+    with results.json): each outcome counted overall and by API area."""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        spec = importlib.util.spec_from_file_location("gates_publish", os.path.join(here, "..", "publish.py"))
+        publish = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(publish)
+        doc = publish.result.read(run, "parity")
+        if doc is None:
+            raise ValueError("result.json is gone")
+        d, e = doc["detail"], html.escape
+        rows = "".join(f"<tr><th>{e(a['area'])}</th><td class='num'>{a['requests']}</td>"
+                       + "".join(f"<td class='num'>{a.get(k, 0)}</td>" for k in publish.PARITY_OUTCOMES) + "</tr>"
+                       for a in d.get("areas", []))
+        counts = " · ".join(f"{doc['counts'].get(k, 0)} {e(label)}" for k, label in publish.PARITY_OUTCOMES.items())
+        body = (f"<h1>Parity {e(name)}</h1><p class='lede'>{e(doc['verdict'])}: {e(d.get('reason', ''))} — {d.get('sent', 0)} of "
+                f"{d.get('planned', 0)} requests against Jellyfin {e(str(d.get('oracle_version') or 'of an unrecorded version'))}: {counts}. Rendered from "
+                "result.json; the full report is written with results.json.</p><div class='scroll'><table><thead><tr><th>Area</th>"
+                "<th>Requests</th><th>Identical</th><th>Accepted</th><th>Filed</th><th>New</th><th>Not compared</th></tr></thead>"
+                f"<tbody>{rows}</tbody></table></div>")
+        return 200, page_html(f"Parity {name}", body)
     except Exception as ex:
         return (400 if isinstance(ex, ValueError) else 500), error_html(name, ex)
 
@@ -2073,7 +2077,14 @@ def handle(target, roots):
             return reply(404, page_html("Not found", "<h1>No such run</h1>"))
         if harness == "benchmark":
             return reply(*benchmark_report(roots["benchmark"], name))
-        with open(os.path.join(run_dir(roots[harness], name), "report.html"), "rb") as f:
+        d = next((d for _, n, _, d in found_runs(harness, roots[harness]) if n == name), None)
+        if d is None:   # removed since it was listed
+            return reply(404, page_html("Not found", "<h1>No such run</h1>"))
+        page = run_page(d, harness)
+        if page.endswith("result.json"):
+            render = verify_report if harness == "verify" else parity_overview
+            return reply(*render(os.path.dirname(page), name))
+        with open(page, "rb") as f:
             return 200, HTML, f.read()
     harness = "benchmark" if path == "/" else parts[0]
     if len(parts) != 1 or harness not in keys:
@@ -2124,14 +2135,111 @@ def serve(port, roots):
         pass
 
 
+# ── result.json (gates/result.py's envelope) ───────────────────────────────
+def gate_result():
+    """gates/result.py, the envelope every gate's result.json is written in, loaded by its path (a
+    plain `import result` could find another module of that name first)."""
+    if "gates_result" not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "gates_result", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "result.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        sys.modules["gates_result"] = module
+    return sys.modules["gates_result"]
+
+
+def cell_json(c):
+    """One server's number: its median and range over the runs, each run's value, a latency cell's
+    p95 and p99 medians, and why it is not publishable (None when it is)."""
+    out = {"median": c.median, "min": min(c.vals, default=None), "max": max(c.vals, default=None),
+           "values": c.vals, "unit": c.unit, "flag": c.flag}
+    for key in ("p95", "p99"):
+        if key in c.sub:
+            out[key] = c.sub[key].median
+    return out
+
+
+def row_json(name, cells, servers):
+    """A row of every server's numbers; `ratio`, the oracle's number over Ferrofin's as the reports
+    print them (above 1: Ferrofin faster or lighter), None when there is nothing comparable; and
+    `withheld`, each server's reason when either cell cannot be published (the servers did different
+    work, or the evidence is incomplete), as the README withholds it."""
+    withheld = reasons(*(f"{label}: {cells[k].flag}" for k, label in servers if k in cells and cells[k].flag))
+    return {"name": name, "servers": {k: cell_json(cells[k]) for k, _ in servers if k in cells},
+            "ratio": _ratio(cells.get("ferrofin"), cells.get(ORACLE)), "withheld": withheld}
+
+
+def cpu_rows(m):
+    """Per load level with CPU evidence: CPU milliseconds per completed screen, one cell per server
+    over the runs, flagged where the resource evidence or the level's workload failed validation."""
+    rows, runs = [], range(len(m["runs"]))
+    for level in LOAD_LEVELS:
+        if not any(m["resources"][k][i].get(level) for k, _ in m["servers"] for i in runs):
+            continue
+        cells = {}
+        for k, _ in m["servers"]:
+            evidence = [cpu_evidence(m, k, i, level) for i in runs]
+            cells[k] = Cell([e[4] * 1000 if e[4] is not None else None for e in evidence], sig3,
+                            reasons(*(e[3] for e in evidence)), unit="ms")
+        rows.append((level, cells))
+    return rows
+
+
+def phase_verdict(m):
+    """`(verdict, counts)` from each server's phases: failed when a phase failed, incomplete when one
+    never finished or a server's run recorded no phases at all (a run from before phases.json existed,
+    `phase_schema` absent from its run.json, never has one), else measured."""
+    counts = {"completed": 0, "failed": 0, "unfinished": 0, "skipped": 0}
+    unrecorded = False
+    for recorded in (p for per_run in m["phases"].values() for p in per_run):
+        unrecorded = unrecorded or (bool(m["meta"].get("phase_schema")) and not isinstance(recorded, dict))
+        for phase in (recorded if isinstance(recorded, dict) else {}).values():
+            status = phase.get("status") if isinstance(phase, dict) else None
+            counts[status if status in ("completed", "failed", "skipped") else "unfinished"] += 1
+    return ("failed" if counts["failed"] else "incomplete" if counts["unfinished"] or unrecorded else "measured"), counts
+
+
+def run_result(m):
+    """The benchmark's result envelope for the runs of model `m`: per level the screen and endpoint
+    cells, time to first screen, peak and idle memory and CPU per screen, each with every server's
+    median and range, Ferrofin's ratio to the oracle and the reason a cell is withheld."""
+    meta, servers = m["meta"], m["servers"]
+    identity = (image_id(os.path.join(m["runs"][0], "ferrofin")) or "").split()
+    measured_oracle = ORACLE in dict(servers)
+    source = {"commit": meta.get("sha"), "image": identity[0] if identity else None,
+              "image_digest": meta.get("ferrofin_image") or (identity[1] if len(identity) > 1 else None),
+              "oracle": (meta.get("oracle") or {}).get("image") if measured_oracle else None,
+              "host_class": gate_result().host_class(), "fixture": meta.get("ids_sha256")}
+    rows = lambda pairs: [row_json(name, cells, servers) for name, cells in pairs]
+    detail = {"runs": [os.path.basename(os.path.normpath(r)) for r in m["runs"]], "servers": dict(servers),
+              "oracle_label": m["oracle_label"] if measured_oracle else None,
+              "conditions": {"server_cpus": meta.get("server_cpus"), "memory_limit": meta.get("memory_limit"),
+                             "fixture_counts": meta.get("testdata_counts")},
+              "levels": {level: {"rate": lv["rate"], "screens": rows(lv["screens"]), "endpoints": rows(lv["endpoints"])}
+                         for level, lv in m["levels"].items()},
+              "ttfs": rows(m["ttfs"]),
+              "memory": rows((name, cells) for name, cells in m["memory"] if name in MEMORY_ROWS),
+              "cpu_per_screen": rows(cpu_rows(m)),
+              "missing": m["missing"], "load_problems": m["load_problems"]}
+    verdict, counts = phase_verdict(m)
+    # the run ended when its last recorded phase did (None for a run from before phases.json)
+    ends = [p["end"] for per_run in m["phases"].values() for rec in per_run if isinstance(rec, dict)
+            for p in rec.values() if isinstance(p, dict) and number(p.get("end"))]
+    ended = datetime.fromtimestamp(max(ends), timezone.utc).isoformat(timespec="seconds") if ends else None
+    return gate_result().envelope("bench", verdict, counts, source, meta.get("date"), ended, detail)
+
+
 def write_html(run):
-    """Write `report.html` beside the run (self-contained: opens from disk, uploads as a
-    CI artifact) and return its path."""
+    """Write `report.html` and `result.json` beside the run, both from one `build` model (the page is
+    self-contained: opens from disk, uploads as a CI artifact), and return the page's path."""
     path = os.path.join(run, "report.html")
-    page = render_html(build([run]), verdicts=load_verdicts([run]))  # before the file is touched: a failure leaves no empty report
+    m = build([run])
+    page = render_html(m, verdicts=load_verdicts([run]))  # before the file is touched: a failure leaves no empty report
+    doc = run_result(m)
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         f.write(page)
     os.replace(path + ".tmp", path)
+    gate_result().write(run, doc)
     return path
 
 
@@ -2180,9 +2288,9 @@ def main():
     if args and args[0] == "--serve":
         rest = args[1:]
         roots = {}
-        # Under the output root (gates/lib.sh) each tab has a default: runs/, and adoption's work/.
+        # Under the output root (gates/lib.sh) each tab has a default: runs/, and for adoption work/ as well.
         gates = os.environ.get("FERROFIN_GATES_DIR")
-        under_root = {"adoption": "work", "parity": "runs"}
+        under_root = {"parity": "runs", "verify": "runs"}
         for key, _, flag, env in HARNESSES[1:]:
             if flag in rest:
                 i = rest.index(flag)
@@ -2192,6 +2300,11 @@ def main():
                 del rest[i:i + 2]
                 if not os.path.isdir(roots[key]):
                     sys.exit(f"{roots[key]} is not a directory")
+            elif key == "adoption" and gates and not os.environ.get(env):   # standalone runs, and sessions'
+                roots[key] = [d for d in (os.path.join(gates, "work"), os.path.join(gates, "runs")) if os.path.isdir(d)] or None
+                if not roots[key]:
+                    sys.stderr.write(f"neither {gates}/work nor {gates}/runs (from FERROFIN_GATES_DIR) is a directory: "
+                                     "the adoption tab stays empty\n")
             else:  # a variable may be set for every shell: a missing directory is an empty tab
                 source = env if os.environ.get(env) else "FERROFIN_GATES_DIR" if gates else None
                 roots[key] = os.environ.get(env) or (gates and os.path.join(gates, under_root[key])) or None
@@ -2213,23 +2326,6 @@ def main():
         if not os.path.isdir(runs_dir) and not from_root:
             sys.exit(f"{runs_dir} is not a directory")
         serve(port, {"benchmark": runs_dir, **roots})
-        return
-    if args and args[0] == "--readme":
-        target = None
-        rest = args[1:]
-        if rest and rest[0].lower().endswith(".md"):
-            target, rest = rest[0], rest[1:]
-        if not rest:
-            sys.exit(__doc__)
-        for r in rest:
-            if not os.path.isfile(os.path.join(r, "run.json")):
-                sys.exit(f"{r} is not a run dir (no run.json)")
-        section = render_readme(build(rest), rest)
-        if target:
-            inject_readme(target, section)
-            sys.stderr.write(f"replaced the generated benchmarks block in {target}\n")
-        else:
-            sys.stdout.write(section)
         return
     if not args or any(a.startswith("--") for a in args):
         sys.exit(__doc__)

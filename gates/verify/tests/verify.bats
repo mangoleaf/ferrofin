@@ -131,9 +131,37 @@ EOM
   [ "${fails[3]}" = "Overview 'old' (want 'new')" ]
 }
 
+@test "checks: every check is kept as data, passed or failed, with what it observed and wanted" {
+  local fails=()
+  VERIFY_CHECKS=()
+  verify_expect fails created 3 eq 3
+  verify_expect fails probes 08 le 1
+  verify_expect_str fails Overview "old" "new"
+  verify_expect_str fails LockData true true
+  verify_fail fails "the edit was refused"
+  [ "${#fails[@]}" -eq 3 ] && [ "${fails[2]}" = "the edit was refused" ]
+  [ "$(printf '%s\n' "${VERIFY_CHECKS[@]}" | jq -sc .)" = '[{"what":"created","observed":3,"op":"eq","expected":3,"ok":true},{"what":"probes","observed":8,"op":"le","expected":1,"ok":false},{"what":"Overview","observed":"old","op":"eq","expected":"new","ok":false},{"what":"LockData","observed":"true","op":"eq","expected":"true","ok":true},{"what":"the edit was refused","observed":null,"op":null,"expected":null,"ok":false}]' ]
+}
+
 @test "row_line: row, result, scenario and detail in columns" {
   run verify_row_line 3 PASS "touch one file's mtime, rescan" "updated=1"
   [ "$output" = "   3  PASS  touch one file's mtime, rescan                  updated=1" ]
+}
+
+@test "finish: however a run ended, it leaves verify.json, a valid result.json and report.html" {
+  mkdir ended-early ended-late
+  verify_finish ended-early 130 ferrofin:test sha256:abc c0ffee 2026-10-25T12:00:00+00:00
+  [ "$(jq -c . ended-early/verify.json)" = '{"exit":130,"libraries":{"movies":null,"tvshows":null}}' ]
+  [ "$(jq -c '[.gate, .verdict, .source.image, .source.commit, .detail.exit]' ended-early/result.json)" = '["verify","nothing verified","ferrofin:test","c0ffee",130]' ]
+  grep -q "Did not run" ended-early/report.html
+  printf '{"exit": 1, "libraries": {"movies": {"rows": [{"row": 1, "result": "FAIL", "checks": []}]}, "tvshows": null}}' > ended-late/verify.json
+  verify_finish ended-late 1 ferrofin:test sha256:abc c0ffee 2026-10-25T12:00:00+00:00
+  [ "$(jq -c .counts ended-late/result.json)" = '{"pass":0,"fail":1,"skip":0}' ]   # its verify.json, not a new one
+  [ -s ended-late/report.html ]
+  mkdir ended-late/result.json.tmp   # the result cannot be written: said, and failed
+  run verify_finish ended-late 1 ferrofin:test sha256:abc c0ffee 2026-10-25T12:00:00+00:00
+  [ "$status" -eq 1 ]
+  [[ "$output" == *"verify: the result or the report could not be written in ended-late"* ]]
 }
 
 # --- the script's refusals ----------------------------------------------------------------
@@ -416,7 +444,7 @@ real_item_untouched() {
 
 # token_hidden <pid>: the script's command line (read while it runs) names the script and not
 # the token, and no request so far carried the token in its URL.
-token_hidden() {
+token_hidden() {   # $1 is the supervisor (gates_supervise); its worker has the same arguments
   local cmdline=
   for _ in $(seq 1 100); do
     cmdline=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || break
@@ -467,6 +495,11 @@ LIB_ID=f137a2dd21bbc1b99aa5c0f6bf02a805
   [ "$(jq -c .summary rows.json)" = '{"pass":11,"fail":1,"skip":1}' ]
   [ "$(jq -r '.rows[] | select(.row == 2) | [.result, .scenario] | join(" ")' rows.json)" = "FAIL rescan, nothing changed" ]
   jq -e '.rows[] | select(.row == 2) | .detail | contains("updated 1 (want = 0)")' rows.json >/dev/null
+  # each row's checks as data: the failed one with what it saw and wanted, the passed ones too, none for a skip
+  jq -e '.rows[] | select(.row == 2) | .checks | index({what: "updated", observed: 1, op: "eq", expected: 0, ok: false})' rows.json >/dev/null
+  jq -e '.rows[] | select(.row == 2) | .checks | map(select(.ok)) | length > 0' rows.json >/dev/null
+  jq -e '[.rows[] | select(.result == "PASS") | .checks[] | .ok] | all' rows.json >/dev/null
+  jq -e '[.rows[] | select(.result == "SKIP") | .checks] | all(. == [])' rows.json >/dev/null
   [ "$(find lib/scratch -type f)" = "lib/scratch/Ferrofin Verify Beta (2002)/movie.nfo" ]
   real_item_untouched
 }
@@ -622,15 +655,35 @@ wait_for_refreshes() {
 
 @test "run: SIGINT mid-run exits 130 after the cleanup" {
   interrupted_run
+  worker=$(pgrep -P "$pid")   # the check goes to a worker in a session of its own (gates_supervise)
+  [ -n "$worker" ]
   kill -INT "$pid"
   status=0
   wait "$pid" || status=$?
   set +m
   [ "$status" -eq 130 ]
+  [ -z "$(pgrep -s "$worker")" ]
   [ "$(grep -c -- "$FERROFIN_TOKEN" requests.log)" = 0 ]
   grep -q 'scratch files removed' run.log
   [ -z "$(ls -A lib/scratch)" ]
   [ -z "$(ls -A work)" ]
+  real_item_untouched
+}
+
+@test "run: a TERM to its process group exits 143 after the cleanup, leaving nothing of the check's own session" {
+  interrupted_run
+  worker=$(pgrep -P "$pid")   # the check goes to a worker in a session of its own (gates_supervise)
+  [ -n "$worker" ]
+  kill -TERM -- "-$pid"
+  status=0
+  wait "$pid" || status=$?
+  set +m
+  [ "$status" -eq 143 ]
+  [ "$(grep -c -- "$FERROFIN_TOKEN" requests.log)" = 0 ]
+  grep -q 'scratch files removed' run.log
+  [ -z "$(ls -A lib/scratch)" ]
+  [ -z "$(ls -A work)" ]
+  [ -z "$(pgrep -s "$worker")" ]
   real_item_untouched
 }
 
@@ -639,7 +692,7 @@ wait_for_refreshes() {
   interrupted_run '.[2].hold = true'
   kill -INT "$pid"
   wait_for_refreshes 3
-  [ -n "$(ls -A work)" ]
+  compgen -G 'work/tmp.*' >/dev/null   # the check's own directory (beside it, its supervisor's)
   kill -INT "$pid"
   status=0
   wait "$pid" || status=$?

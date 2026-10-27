@@ -49,9 +49,22 @@ and idle-core checks, so keep one root per host.
 
 Each run is a session folder, `runs/<branch>-<YYYYMMDD-HHMM>/` (a rerun in the same minute gets
 `-run2`): `session.json` records the branch, commit, images, the Jellyfin oracle pin and each gate's
-status, times and exit status, beside each gate's own run directory and its `<gate>.log`. A gate that
+status, times and exit status, beside each gate's own run directory and its `<gate>.log`. Every gate,
+the release A/B gate included, runs against the Jellyfin release the branch pins: when a newer one is
+out, the preflight notes it and `session.json` records the note with the pin, and nothing is refused
+for it ([`bench/oracle.py`](bench/oracle.py)). A gate that
 fails does not stop the next; `gates/run` exits 1 when one failed and 2 when the preflight refused.
 Each gate's own script still runs on its own; its README says how.
+
+Stop a run with Ctrl-C or a TERM: it stops at once, removes what it started and still writes its
+report, and exits 130 or 143. `gates/run`, `verify/run.sh`, `verify/scan-behaviour.sh`, `parity/run.sh`
+and `bench/run.sh` hand the run to a worker in a session of its own and only wait for it, then pass a
+signal on as a TERM, again every second until the worker's cleanup has started ([`lib.sh`](lib.sh),
+`gates_supervise`): bash 5.2 drops a trapped signal that lands while it parses a `$( … )`. So what a
+run records (`session.json`, a report) says 143 for a Ctrl-C too. A SIGKILL cannot be passed on, so
+never stop a run with `kill -9`: its worker would run on. Ctrl-Z suspends only the waiting shell.
+`adoption/run.sh` hands its run to a worker too, but its own supervisor stops the worker outright and
+builds the report itself ([its README](adoption/README.md)).
 
 The root [`Makefile`](../Makefile) offers the same as targets: `make run-gates` for all four, and
 `make run-verify`, `make run-adoption`, `make run-parity` or `make run-bench` for one, with `IMAGE=`
@@ -67,15 +80,70 @@ would read as the cargo tests.
 
 However a session ends, `gates/run` writes its report, `index.html` and the same as `report.md`
 ([`report.py`](report.py), which writes it again for any session: `python3 gates/report.py SESSION`).
-It shows the commit, images and oracle pin, and one row per gate, every gate included:
+It shows the commit, images and oracle pin (with its note on a newer release), and one row per gate,
+every gate included:
 
 | Gate | Counts | Links to |
 |---|---|---|
-| verify | checks passed, failed and skipped, over both libraries | each library's rows |
-| adoption | fixture rows passed, failed, unfinished and skipped, by the adoption report's own rules | the adoption report |
-| parity | new differences, the groups of them not filed yet, requests sent and planned; the verdict and its reason | the parity report |
-| bench | phases completed, failed, unfinished and skipped; for the A/B gate (`--previous`), the gated cells regressed, not comparable, improved and within noise, and whether anything blocks | the benchmark or A/B gate report |
+| verify | checks passed, failed and skipped, over both libraries, from its `result.json` | the verify report; each library's rows, `result.json`, `verify.json` and the server log |
+| adoption | from its `result.json`: fixture rows passed, failed, unfinished and skipped, by the adoption report's own rules | the adoption report |
+| parity | from its `result.json`: new differences, the groups of them not filed yet, requests sent and planned; the verdict and its reason | the parity report |
+| bench | from its `result.json`: phases completed, failed, unfinished and skipped; for the A/B gate (`--previous`), the gated cells regressed, not comparable, improved and within noise, and whether anything blocks | the benchmark or A/B gate report |
 
 A gate the session did not ask for, did not reach, is still running, ended before writing its result,
-or left a result that cannot be read is shown as such, never left out. The page opens from disk (every
+or left a result that cannot be read is shown as such, never left out. Each gate's own report is its
+main link; its raw files and the log follow it. The page opens from disk (every
 link is relative) and replaces none of the gates' own reports.
+
+Every gate is moving to one structured result, `<run>/result.json`, in the envelope
+[`result.py`](result.py) defines and validates: `schema`, `gate`, `verdict`, `counts`, `source`
+(`commit`, `image`, `image_digest`, `oracle`, `host_class` (cores and memory, never a host name),
+`fixture`), `started`, `ended`, and `detail`, the gate's own data. Its HTML report, this page and the
+viewer read that file, never the gate's internal files. Every gate writes one.
+
+The page also shows the README's graphs for the session's own results ([`publish.py`](publish.py), inline,
+in the reader's light or dark theme): the adoption grid, the parity overview, and for a Jellyfin-comparison
+benchmark the speed and memory graphs of that one run.
+
+## Publishing the results
+
+The README's Results section shows each release's numbers against Jellyfin, drawn from one small file per
+release that stays in the repository, `docs/results/<version>/summary.json`. The release operator chooses the
+local runs it is made from; nothing is picked automatically, and nothing here runs a gate:
+
+```bash
+make publish-results VERSION=v1.4.0 SESSION="$FERROFIN_GATES_DIR/runs/<session>" BENCH="<run> <run> <run>"
+```
+
+That runs [`publish.py`](publish.py) twice:
+- `summarise` reads each named benchmark run's `result.json`, and the session's `adoption/result.json` and
+  `parity/result.json`, and writes the summary. It holds only the numbers the README shows, each with its source: the run
+  folders, commit, image digest, Jellyfin version, run count, host class (cores and memory) and fixture
+  hash. It also holds the adoption status of every row of the session and its parity overview, with the
+  session's commit and date.
+  It refuses fewer than three Jellyfin-comparison runs, and runs of different images, hosts or fixtures. It
+  also refuses a session of uncommitted code, one that measured another commit than the runs, and one
+  whose adoption ran nothing or whose parity run is missing or did not send every request it planned.
+- `readme` draws every graph of the newest summary into `docs/results/<version>/`, a light and a dark SVG
+  each, and replaces the block between the `BEGIN`/`END GENERATED RESULTS` markers in `README.md`. The same
+  summary files give byte-identical output, and `publish.py readme --check` exits 1 when the block or the
+  images differ from what they give.
+
+Every graph follows one style: Ferrofin in blue and Jellyfin in grey. Ferrofin's bar turns amber where it is
+slower. Each bar carries its value, each axis its unit, and each graph a caption naming its source. Every
+comparable cell is drawn, the biggest speed-up first. A cell the servers answered differently, or whose
+evidence is incomplete, is withheld and listed with its reason under the graphs. The graphs are:
+- p50 per screen and endpoint at the loaded and stress levels;
+- time to first screen;
+- peak and idle memory;
+- CPU per completed screen, where the work matched.
+
+Below them, a grid gives the adoption status of every supported Jellyfin version and upgrade route:
+passed, failed, skipped (a fixture that was not built) or unfinished, with a table of the reasons. Then the
+parity overview: of the requests jellyfin-web makes, how many Ferrofin answers identically, with an accepted
+difference, with a difference filed as an issue, or with a new one, and how many could not be compared because
+Jellyfin itself failed them, as one stacked bar per API area (the busiest twelve, then the rest as one) and a
+table of every area. Last, one graph follows the headline numbers (cold start, the median p50 of the comparable
+screens at 5 screens/s, peak and idle memory) over every release published, each against the Jellyfin release it
+was measured with; a release measured on another host class or benchmark fixture starts a new line, so a moved
+host never reads as a regression or a win. It is drawn from every summary file into `docs/results/history.svg`.
