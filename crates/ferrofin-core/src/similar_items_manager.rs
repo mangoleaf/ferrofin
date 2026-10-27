@@ -1677,7 +1677,7 @@ mod tests {
     /// user holds by default (`seed_user` writes the bare row only).
     async fn grant_all_folders(db: &Database, user: &UserEntity) {
         crate::user_entity_ext::set_permission(
-            db.writer(),
+            db,
             &user.id,
             ferrofin_db::enums::PermissionKind::EnableAllFolders,
             true,
@@ -1690,7 +1690,7 @@ mod tests {
     /// = folders`) — the dashboard's "Library access" checkboxes.
     async fn restrict_to_folders(db: &Database, user: &UserEntity, folders: &[Uuid]) {
         crate::user_entity_ext::set_permission(
-            db.writer(),
+            db,
             &user.id,
             ferrofin_db::enums::PermissionKind::EnableAllFolders,
             false,
@@ -1699,7 +1699,7 @@ mod tests {
         .expect("revoke EnableAllFolders");
         let ids: Vec<String> = folders.iter().map(ToString::to_string).collect();
         crate::user_entity_ext::set_preference(
-            db.writer(),
+            db,
             &user.id,
             ferrofin_db::enums::PreferenceKind::EnabledFolders,
             &ids,
@@ -3100,7 +3100,7 @@ mod tests {
             crate::test_support::seed_item(&db, folder, BaseItemKind::CollectionFolder).await;
         }
         crate::user_entity_ext::set_preference(
-            db.writer(),
+            &db,
             &user.id,
             ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
             &[blocked.to_string()],

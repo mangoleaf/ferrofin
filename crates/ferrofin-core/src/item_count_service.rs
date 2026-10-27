@@ -3973,7 +3973,7 @@ mod tests {
             .await
             .expect("revoke");
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             ferrofin_db::enums::PreferenceKind::EnabledFolders,
             &[first.to_string()],
@@ -4322,7 +4322,7 @@ mod tests {
             .await
             .expect("revoke");
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &guid_to_db(user_id),
             ferrofin_db::enums::PreferenceKind::EnabledFolders,
             &[open.to_string()],

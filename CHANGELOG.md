@@ -520,6 +520,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   87 → 37 ms)
 - Recursive `/Items` sorted by `Artist`, `AlbumArtist` or `Studio`: read each item's own
   values for the sort key (4.0 s → 0.26 s)
+- The per-user visibility check on by-id requests (Jellyfin's `GetItemById(id, user)`) reads
+  the item and the chain above it in one statement, and keeps users' permissions and
+  preferences and the libraries' rows and options in memory, dropped by every write to them.
+  It had added about six statements to every by-id request and read a user's policy up to
+  five times in one. Against 1.3.2, the release A/B gate's regressed cells went from 26 to
+  11, and an item's intros and images are back within noise of it.
+  `FERROFIN_ROW_CACHE_TTL_SECS` and `FERROFIN_AUTH_CACHE_TTL_SECS`
+  (5–300, default 30) bound how long a change made outside the server, in the database
+  itself, goes unseen
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

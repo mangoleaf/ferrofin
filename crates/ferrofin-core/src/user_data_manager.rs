@@ -1748,35 +1748,19 @@ impl UserDataManager for FerrofinUserDataManager {
         user_id: Uuid,
     ) -> Result<Option<ContentPermissions>, ServiceError> {
         use ferrofin_db::enums::{PermissionKind, PreferenceKind};
-        // One indexed read over both `(UserId, Kind)` tables, the shape
-        // `user_manager::load_permission_and_preference_maps` uses: the five
-        // permissions and the "Allow media deletion from" list (stored
-        // `,`-delimited, as C# writes it).
-        let rows: Vec<(i64, i32, String)> = sqlx::query_as(
-            r#"SELECT 0, "Kind", CAST("Value" AS TEXT) FROM "Permissions"
-               WHERE "UserId" = ?1 AND "Kind" IN (?2, ?3, ?4, ?5, ?6)
-               UNION ALL
-               SELECT 1, "Kind", "Value" FROM "Preferences"
-               WHERE "UserId" = ?1 AND "Kind" = ?7"#,
-        )
-        .bind(guid_to_db(user_id))
-        .bind(i32::from(PermissionKind::IsAdministrator))
-        .bind(i32::from(PermissionKind::EnableContentDeletion))
-        .bind(i32::from(PermissionKind::EnableContentDownloading))
-        .bind(i32::from(PermissionKind::EnableCollectionManagement))
-        .bind(i32::from(PermissionKind::EnableMediaPlayback))
-        .bind(i32::from(PreferenceKind::EnableContentDeletionFromFolders))
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
-        let has = |kind: PermissionKind| {
-            rows.iter()
-                .any(|(src, k, v)| *src == 0 && *k == i32::from(kind) && v == "1")
-        };
-        let content_deletion_folders = rows
-            .iter()
-            .filter(|(src, ..)| *src == 1)
-            .flat_map(|(_, _, value)| value.split(','))
+        // The user's policy rows, from the cross-request cache (`Database::user_policy`): the
+        // five permissions and the "Allow media deletion from" list (stored `,`-delimited, as
+        // C# writes it).
+        let policy = self
+            .db
+            .user_policy(&guid_to_db(user_id))
+            .await
+            .map_err(ServiceError::from)?;
+        let has = |kind: PermissionKind| policy.permission(i32::from(kind));
+        let content_deletion_folders = policy
+            .preference(i32::from(PreferenceKind::EnableContentDeletionFromFolders))
+            .into_iter()
+            .flat_map(|value| value.split(','))
             .filter_map(ferrofin_util::guid_extensions::parse_dotnet_guid)
             .collect();
         Ok(Some(ContentPermissions {
@@ -1795,16 +1779,18 @@ impl UserDataManager for FerrofinUserDataManager {
     ) -> Result<Option<ferrofin_traits::library::PlaybackPermissions>, ServiceError> {
         // Kind 8 = EnableAudioPlaybackTranscoding, 9 =
         // EnableVideoPlaybackTranscoding, 19 = EnablePlaybackRemuxing
-        // (`PermissionKind`). One indexed read for all three, because the
-        // overwrite reads all three on one request.
-        let rows: Vec<(i32, bool)> = sqlx::query_as(
-            r#"SELECT "Kind", "Value" FROM "Permissions"
-               WHERE "UserId" = ?1 AND "Kind" IN (8, 9, 19)"#,
-        )
-        .bind(guid_to_db(user_id))
-        .fetch_all(self.db.pool())
-        .await
-        .map_err(db_err)?;
+        // (`PermissionKind`), from the cached policy rows (`Database::user_policy`).
+        let policy = self
+            .db
+            .user_policy(&guid_to_db(user_id))
+            .await
+            .map_err(ServiceError::from)?;
+        let rows: Vec<(i32, bool)> = policy
+            .permissions
+            .iter()
+            .filter(|(kind, _)| matches!(kind, 8 | 9 | 19))
+            .copied()
+            .collect();
         if rows.is_empty() {
             // No permission rows at all is "no policy known" — an unknown user
             // id, whose sources upstream leaves untouched because `user` is
@@ -3684,7 +3670,7 @@ mod tests {
         assert!(granted.video_transcoding && granted.audio_transcoding && granted.remuxing);
 
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user.id,
             PermissionKind::EnablePlaybackRemuxing,
             false,

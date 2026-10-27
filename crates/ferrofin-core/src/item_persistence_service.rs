@@ -547,6 +547,7 @@ pub(crate) async fn moved_container(
         return Ok(None);
     }
     set_container_path(db.writer(), id, path).await?;
+    db.invalidate_libraries(); // the container may be a library row
     tracing::info!(item_id = %id, from = row.path.as_deref().unwrap_or_default(), path,
         "moved a container to the data directory");
     Ok(Some(id))
@@ -592,8 +593,10 @@ pub(crate) async fn ensure_container(
         }
         // …and the same for the `Data` blob, which an older Ferrofin left NULL:
         // without it the row's `CollectionType` reads as absent forever.
-        if let Some(data) = data {
-            backfill_container_data(db.writer(), id, data).await?;
+        if let Some(data) = data
+            && backfill_container_data(db.writer(), id, data).await?
+        {
+            db.invalidate_libraries();
         }
         return Ok(Some(id));
     }
@@ -653,6 +656,7 @@ pub(crate) async fn ensure_container(
         backfill_container_data(&mut *tx, id, data).await?;
     }
     tx.commit().await.map_err(db_err)?;
+    db.invalidate_libraries(); // the new container may be a library row
     Ok(Some(id))
 }
 
@@ -690,12 +694,13 @@ pub(crate) async fn container_row(
 /// database: Jellyfin's own blob carries `PhysicalLocationsList`,
 /// `PhysicalFolderIds` and the rest, and overwriting it with a one-key document
 /// would destroy the library's physical paths on swap-back.
+/// Returns whether the row changed.
 async fn backfill_container_data<'e>(
     conn: impl sqlx::SqliteExecutor<'e>,
     id: Uuid,
     data: &str,
-) -> Result<(), ServiceError> {
-    sqlx::query(
+) -> Result<bool, ServiceError> {
+    let written = sqlx::query(
         r#"UPDATE "BaseItems" SET "Data" = ?2
            WHERE "Id" = ?1 AND ("Data" IS NULL OR "Data" = '')"#,
     )
@@ -704,7 +709,7 @@ async fn backfill_container_data<'e>(
     .execute(conn)
     .await
     .map_err(db_err)?;
-    Ok(())
+    Ok(written.rows_affected() > 0)
 }
 
 /// Parents a container to the root row it belongs under, if it is not there
@@ -721,7 +726,7 @@ async fn attach_to_root(db: &Database, id: Uuid, root: Uuid) -> Result<(), Servi
     if !row_exists(db, root).await? {
         return Ok(());
     }
-    sqlx::query(
+    let written = sqlx::query(
         r#"UPDATE "BaseItems" SET "ParentId" = ?2
            WHERE "Id" = ?1 AND ("ParentId" IS NULL OR "ParentId" <> ?2)"#,
     )
@@ -730,6 +735,10 @@ async fn attach_to_root(db: &Database, id: Uuid, root: Uuid) -> Result<(), Servi
     .execute(db.writer())
     .await
     .map_err(db_err)?;
+    if written.rows_affected() > 0 {
+        // A container may be a library row (the Collections `CollectionFolder`).
+        db.invalidate_libraries();
+    }
     Ok(())
 }
 
@@ -779,6 +788,22 @@ pub(crate) async fn playlists_folder_by_type(
     Ok(None)
 }
 
+/// After a committed write to item rows: keeps the library set the visibility check caches
+/// (`ferrofin_db::row_cache`) current. Writing a row that is, or becomes, a library drops it.
+fn note_written(db: &Database, ids: &[String], library: bool) {
+    if library {
+        db.invalidate_libraries();
+    } else {
+        db.note_items_written(ids.iter().map(String::as_str));
+    }
+}
+
+/// Whether `item` is a library row (`CollectionFolder`).
+fn is_library(item: &BaseItemEntity) -> bool {
+    Some(item.type_.as_str())
+        == crate::item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
+}
+
 /// Inserts one of the two root folders (`AggregateFolder`/`UserRootFolder`) —
 /// a parentless, top-parentless folder row at a fixed path.
 ///
@@ -815,6 +840,7 @@ pub(crate) async fn insert_root_folder(
     .execute(db.writer())
     .await
     .map_err(db_err)?;
+    db.invalidate_libraries();
     Ok(())
 }
 
@@ -876,7 +902,9 @@ pub(crate) async fn rekey_container(
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-    tx.commit().await.map_err(db_err)
+    tx.commit().await.map_err(db_err)?;
+    db.invalidate_libraries();
+    Ok(())
 }
 
 /// Parents a plug-in folder to the `AggregateFolder` and makes it its own top
@@ -902,6 +930,7 @@ pub(crate) async fn reparent_virtual_child(
     .execute(db.writer())
     .await
     .map_err(db_err)?;
+    db.invalidate_libraries();
     Ok(())
 }
 
@@ -935,6 +964,7 @@ pub(crate) async fn retype_container(
             .fetch_optional(db.pool())
             .await
             .map_err(db_err)?;
+    db.invalidate_libraries();
     Ok(stored.as_deref() == Some(to))
 }
 
@@ -972,6 +1002,7 @@ pub(crate) async fn repath_virtual_child(
     .execute(db.writer())
     .await
     .map_err(db_err)?;
+    db.invalidate_libraries();
     Ok(())
 }
 
@@ -989,6 +1020,7 @@ pub(crate) async fn repath_root_folder(
         .execute(db.writer())
         .await
         .map_err(db_err)?;
+    db.invalidate_libraries();
     Ok(())
 }
 
@@ -1035,6 +1067,7 @@ pub(crate) async fn adopt_orphans(
     .execute(db.writer())
     .await
     .map_err(db_err)?;
+    db.invalidate_libraries();
     Ok(())
 }
 
@@ -1839,6 +1872,7 @@ impl FerrofinItemPersistenceService {
         } else {
             query.execute(self.db.writer()).await.map_err(db_err)?;
         }
+        note_written(&self.db, std::slice::from_ref(&item.id), is_library(item));
         if scan {
             self.push_name_to_children(item).await?;
         }
@@ -2385,6 +2419,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .await
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
+        note_written(&self.db, &closure, false);
         Ok(closure
             .iter()
             .filter_map(|id| Uuid::parse_str(id).ok())
@@ -2777,6 +2812,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        note_written(&self.db, std::slice::from_ref(&id), false);
         Ok(())
     }
 
@@ -2835,6 +2871,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        note_written(&self.db, std::slice::from_ref(&id), false);
         Ok(())
     }
 
@@ -2979,12 +3016,14 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     }
 
     async fn set_item_path(&self, id: Uuid, path: &str) -> Result<(), ServiceError> {
+        let id = guid_to_db(id);
         sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
-            .bind(guid_to_db(id))
+            .bind(&id)
             .bind(path)
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
+        note_written(&self.db, std::slice::from_ref(&id), false);
         Ok(())
     }
 
@@ -3730,6 +3769,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        note_written(&self.db, std::slice::from_ref(&item.id), is_library(item));
         Ok(written.rows_affected() > 0)
     }
 
@@ -3849,6 +3889,9 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .map_err(db_err)?
         .rows_affected()
             > 0;
+        if written {
+            note_written(&self.db, std::slice::from_ref(&item.id), false);
+        }
         if written && let Some(changed) = self.changed.get() {
             changed.record_updated(std::slice::from_ref(item));
         }
@@ -4404,6 +4447,11 @@ pub(crate) async fn rekey_rows_at(
         }
     }
     tx.commit().await.map_err(db_err)?;
+    if !done.is_empty() {
+        // Ids and kinds changed, and merged rows went with their cascades: the cached library
+        // set may name any of them.
+        db.invalidate_libraries();
+    }
     Ok(done)
 }
 

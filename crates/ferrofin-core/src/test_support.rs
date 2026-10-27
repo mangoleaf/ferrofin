@@ -992,7 +992,7 @@ pub async fn seed_box_set_across_libraries(db: &Database) -> BoxSetAcrossLibrari
         seeded.push((library, movie));
     }
     crate::user_entity_ext::set_preference(
-        db.pool(),
+        db,
         &user.id,
         ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
         &[guid_to_db(seeded[1].0)],

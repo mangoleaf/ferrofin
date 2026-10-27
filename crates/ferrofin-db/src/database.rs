@@ -84,6 +84,9 @@ pub struct Database {
     /// One snapshot or one vacuum-and-checkpoint pass at a time
     /// ([`Database::try_maintenance_turn`]), shared by every clone.
     maintenance: Arc<tokio::sync::Mutex<()>>,
+    /// The cross-request caches of policy and library rows ([`crate::row_cache`]), shared by
+    /// every clone.
+    rows: Arc<crate::row_cache::RowCache>,
     /// The on-disk database file, when file-backed (`None` for in-memory).
     /// Lets [`Database::run_migrations`] snapshot the file before a
     /// table-rebuild migration.
@@ -203,6 +206,7 @@ impl Database {
             writer,
             snapshotter,
             maintenance: Arc::default(),
+            rows: Arc::new(crate::row_cache::RowCache::new()),
             file_path: None,
         })
     }
@@ -246,6 +250,7 @@ impl Database {
             writer,
             snapshotter,
             maintenance: Arc::default(),
+            rows: Arc::new(crate::row_cache::RowCache::new()),
             file_path,
         })
     }
@@ -323,6 +328,85 @@ impl Database {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Turns on this handle's cross-request row caches ([`crate::row_cache`]), for every clone,
+    /// with entries kept for `ttl` ([`crate::row_cache::ROW_CACHE_TTL`] by default). The
+    /// composition root does, once; until then every read goes to the database.
+    pub fn enable_row_cache(&self, ttl: std::time::Duration) {
+        self.rows.enable(ttl);
+    }
+
+    /// Whether [`Database::enable_row_cache`] has run.
+    #[must_use]
+    pub fn row_cache_enabled(&self) -> bool {
+        self.rows.enabled()
+    }
+
+    /// A user's `Permissions` and `Preferences` rows, from the cross-request cache or, on a miss,
+    /// the database ([`crate::row_cache`]).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if a read fails.
+    pub async fn user_policy(
+        &self,
+        user_id: &str,
+    ) -> Result<Arc<crate::row_cache::UserPolicyRows>> {
+        if let Some(hit) = self.rows.policy(user_id) {
+            return Ok(hit);
+        }
+        let generation = self.rows.policy_generation();
+        let permissions =
+            sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Permissions" WHERE "UserId" = ?"#)
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let preferences =
+            sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Preferences" WHERE "UserId" = ?"#)
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let rows = crate::row_cache::UserPolicyRows {
+            permissions,
+            preferences,
+        };
+        Ok(self.rows.put_policy(generation, user_id, rows))
+    }
+
+    /// Drops `user_id`'s cached policy rows. Called after a committed write to that user's
+    /// `Permissions`, `Preferences` or `Users` row.
+    pub fn invalidate_user_policy(&self, user_id: &str) {
+        self.rows.invalidate_policy(Some(user_id));
+    }
+
+    /// Drops every user's cached policy rows, after a write that touched several users.
+    pub fn invalidate_all_user_policies(&self) {
+        self.rows.invalidate_policy(None);
+    }
+
+    /// The cached library set, when one is live ([`crate::row_cache`]).
+    #[must_use]
+    pub fn cached_libraries(&self) -> Option<Arc<crate::row_cache::LibrarySet>> {
+        self.rows.libraries()
+    }
+
+    /// Starts reading the library set: take it before reading the rows and options, and
+    /// [`store`](crate::row_cache::LibraryLoad::store) what was read. While it is held, any item
+    /// write keeps what it read out of the cache.
+    pub fn begin_library_load(&self) -> crate::row_cache::LibraryLoad<'_> {
+        self.rows.begin_library_load()
+    }
+
+    /// Drops the cached library set. Called after a committed write that adds, removes, renames
+    /// or edits a library, its row or its options.
+    pub fn invalidate_libraries(&self) {
+        self.rows.invalidate_libraries();
+    }
+
+    /// Called after a committed write to the `BaseItems` rows `ids` (stored GUID form): drops the
+    /// cached library set if one of them is a library row.
+    pub fn note_items_written<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        self.rows.note_items_written(ids);
     }
 
     /// Counts library items grouped by their stored (C#) `Type` name.

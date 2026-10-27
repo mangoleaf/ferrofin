@@ -240,7 +240,7 @@ async fn a_boxsets_library_is_in_scope_only_with_a_box_set_the_user_can_see() {
     )
     .await;
     crate::user_entity_ext::set_preference(
-        db.pool(),
+        &db,
         &guid_to_db(USER),
         PreferenceKind::BlockedMediaFolders,
         &[guid_to_db(HIDDEN_LIBRARY)],
