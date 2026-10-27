@@ -225,11 +225,13 @@ from.
 
    ```bash
    make publish-results VERSION=vX.Y.Z SESSION=$FERROFIN_GATES_DIR/runs/<full session> \
-     BENCH="$FERROFIN_GATES_DIR/runs/<full session>/bench $FERROFIN_GATES_DIR/runs/<bench session 2>/bench $FERROFIN_GATES_DIR/runs/<bench session 3>/bench"
+     BENCH="$FERROFIN_GATES_DIR/runs/<full session>/bench $FERROFIN_GATES_DIR/runs/<bench session 2>/bench $FERROFIN_GATES_DIR/runs/<bench session 3>/bench" \
+     AB=$FERROFIN_GATES_DIR/runs/bench-gate-ab-<date>-<time>
    ```
 
-   It writes `docs/results/vX.Y.Z/summary.json`, the graphs beside it and the README's Results
-   block, and refuses runs of different commits, images, hosts or fixtures. Regenerate
+   `AB` is step 2's A/B gate session (its verdict cells give the README's graph against the previous
+   release). It writes `docs/results/vX.Y.Z/summary.json`, the graphs beside it and the README's
+   Results block, and refuses runs of different commits, images, hosts or fixtures. Regenerate
    `docs/BENCHMARKS.md` from the same three runs: `python3 gates/bench/report.py <run> <run> <run>`
    prints the tables, which replace everything between the file's two rules; update the date,
    commit and run notes above the first rule to match. Commit all of it to the release PR
