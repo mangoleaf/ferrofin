@@ -220,6 +220,194 @@ impl FerrofinMediaSourceManager {
         self
     }
 
+    /// `GetPlaybackMediaSources(item, user, …)` over the item's and the user's rows when the
+    /// caller has read them already (`known`, `user`); a probed item is read again.
+    async fn playback_sources(
+        &self,
+        item_id: Uuid,
+        known: Option<ferrofin_db::entities::base_items::BaseItemEntity>,
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
+        user_id: Uuid,
+        allow_media_probe: bool,
+        enable_path_substitution: bool,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        // Playback sources build on the static sources; the per-user bitrate/profile
+        // negotiation (MediaStreamSelector) is deferred, so the static set is the
+        // playback set for v1.
+        let mut sources = self
+            .static_sources(
+                item_id,
+                known,
+                enable_path_substitution,
+                Some(user_id),
+                user,
+            )
+            .await?;
+        // `GetPlaybackMediaSources`: a `.strm` shortcut, or an item whose main
+        // stream is missing, is refreshed in full with the remote probe on
+        // before it is played, and its sources are read again.
+        if allow_media_probe
+            && let Some(probe) = &self.remote_probe
+            && let Some(path) = self.playback_probe_path(item_id, &sources).await?
+        {
+            probe(path).await?;
+            sources = self
+                .get_static_media_sources(item_id, enable_path_substitution, Some(user_id))
+                .await?;
+        }
+        // `preferredId`: the first static source's id when it is a `Guid` —
+        // the queried version's own file — else the item's id
+        // (`MediaSourceManager.cs:232-234`).
+        let preferred = sources
+            .first()
+            .and_then(|s| s.id.as_deref())
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .unwrap_or(item_id);
+        sort_media_sources(&mut sources, preferred);
+        Ok(sources)
+    }
+
+    /// `GetStaticMediaSources(item, enablePathSubstitution, user)`: the trait's
+    /// [`get_static_media_sources`](MediaSourceManager::get_static_media_sources), over the
+    /// item's row and the user's row when the caller has read them already (`known`, `user`).
+    async fn static_sources(
+        &self,
+        item_id: Uuid,
+        known: Option<ferrofin_db::entities::base_items::BaseItemEntity>,
+        enable_path_substitution: bool,
+        user_id: Option<Uuid>,
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let stored = match known {
+            Some(item) => Some(item),
+            None => self.items.retrieve_item(item_id).await?,
+        };
+        // The Live TV branch is chosen by what the id IS, not by whether a row
+        // was found. A channel is a real `BaseItems` row (the guide refresh
+        // mirrors the lineup, exactly as `GuideManager.GetChannel` stores each
+        // channel item), yet its playable sources still come from the tuner:
+        // upstream reaches them through `LiveTvMediaSourceProvider`, which
+        // `MediaSourceManager.GetPlaybackMediaSources` selects on the item's
+        // type. Keying on "the row was missing" instead would have made every
+        // channel report an unplayable static source the moment the rows
+        // started existing. A DVR recording has no row at all and takes the
+        // same branch.
+        let is_channel = stored
+            .as_ref()
+            .and_then(|row| crate::item_type_lookup::kind_from_type_name(&row.type_))
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    ferrofin_model::data::BaseItemKind::LiveTvChannel
+                        | ferrofin_model::data::BaseItemKind::TvChannel
+                )
+            });
+        if stored.is_none() || is_channel {
+            let mut sources = self.channel_media_source(item_id).await?;
+            if sources.is_empty() {
+                sources = self.recording_media_source(item_id).await?;
+            }
+            if sources.is_empty() {
+                return Ok(sources);
+            }
+            // `GetPlaybackMediaSources`' per-user overwrite over the DYNAMIC
+            // sources (v10.11.8 MediaSourceManager.cs:204-217), applied AFTER
+            // the `SupportsDirectStream(Path, Protocol)` validation the
+            // channel path already ran — that order is upstream's, and it is
+            // why an HDHomeRun channel (Protocol Udp, so the validation says
+            // false) is still reported direct-streamable to a user who has
+            // `EnablePlaybackRemuxing`.
+            self.apply_playback_permissions(&mut sources, item_id, None, user_id)
+                .await?;
+            if enable_path_substitution {
+                self.substitute_paths(&mut sources).await?;
+            }
+            return Ok(sources);
+        }
+        let Some(item) = stored else {
+            return Ok(Vec::new());
+        };
+        // `hasMediaSources.GetMediaSources(...)` on the item itself
+        // (`BaseItem.GetMediaSources`, `BaseItem.cs:1156-1189`): every version
+        // in its group, each once, its own source first — so playing an
+        // alternate (or a part) by its own id defaults to that file, and a
+        // version's sources list the whole group.
+        let item_id = Uuid::parse_str(&item.id).unwrap_or(item_id);
+        let versions = crate::video_versions::VersionRows::load(
+            &crate::video_versions::RepositoryVersionReader(self.items.as_ref()),
+            &[&item],
+        )
+        .await?;
+        let group = versions.items_for_media_sources(&item);
+        let mut built: HashMap<Uuid, MediaSourceInfo> = HashMap::with_capacity(group.len());
+        for (row, _) in &group {
+            let Ok(row_id) = Uuid::parse_str(&row.id) else {
+                continue;
+            };
+            let streams = self.streams_dto(row_id).await?;
+            let attachments = self.get_media_attachments(row_id).await?;
+            built.insert(row_id, Self::static_source(row, streams, attachments));
+        }
+        let mut sources = versions.media_sources(&item, |row| {
+            Uuid::parse_str(&row.id)
+                .ok()
+                .and_then(|id| built.remove(&id))
+                .unwrap_or_else(|| Self::static_source(row, Vec::new(), Vec::new()))
+        });
+        // `GetStaticMediaSources(item, …, user)`: a version the user may not
+        // open is no source for them (`MediaSourceManager.cs:397-403`); the
+        // queried item itself always is.
+        if sources.len() > 1 {
+            let others: Vec<Uuid> = group
+                .iter()
+                .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
+                .filter(|id| *id != item_id)
+                .collect();
+            if let Some(visible) = self.visible_versions(others, user_id, user).await? {
+                sources.retain(|s| {
+                    s.id.as_deref()
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                        .is_none_or(|id| id == item_id || visible.contains(&id))
+                });
+            }
+        }
+        // `SetDefaultAudioAndSubtitleStreamIndices` (MediaSourceManager.cs:401):
+        // when a user was supplied, each source gets per-user audio/subtitle
+        // defaults based on their preferences and remembered selections.
+        if let Some(uid) = user_id {
+            for source in &mut sources {
+                self.set_default_audio_and_subtitle_stream_indices(&item, source, uid, user)
+                    .await?;
+            }
+        }
+        // `GetStaticMediaSources(item, enablePathSubstitution, user)`'s tail
+        // (v10.11.8 MediaSourceManager.cs:355-372): when a user was supplied,
+        // the policy decides `SupportsTranscoding` and (for video)
+        // `SupportsDirectStream`. `user` is null on the anonymous paths
+        // (`GET /Videos/{id}/stream`), and there the sources stay as built.
+        self.apply_playback_permissions(&mut sources, item_id, item.media_type.as_deref(), user_id)
+            .await?;
+        // `SetAlternateVersionResumeStates` (`MediaSourceManager.cs:420`), for
+        // a user, when there are versions: one batched user-data read.
+        if let (Some(user_id), Some(user_data)) = (user_id, self.user_data.as_ref())
+            && sources.len() > 1
+            && item.primary_version_id.is_none()
+        {
+            let ids: Vec<Uuid> = sources
+                .iter()
+                .filter_map(|s| s.id.as_deref().and_then(|id| Uuid::parse_str(id).ok()))
+                .collect();
+            let data = user_data.get_user_data_batch(&ids, user_id).await?;
+            crate::video_versions::put_resumed_version_first(&item, &mut sources, |id| {
+                data.get(&id)
+            });
+        }
+        if enable_path_substitution {
+            self.substitute_paths(&mut sources).await?;
+        }
+        Ok(sources)
+    }
+
     /// The versions among `ids` the user may open — `GetStaticMediaSources`'
     /// per-user filter (`MediaSourceManager.cs:397-403`: `GetItemById(id,
     /// user) is not null`, i.e. `IsVisibleStandalone`), as one batched
@@ -229,19 +417,28 @@ impl FerrofinMediaSourceManager {
         &self,
         ids: Vec<Uuid>,
         user_id: Option<Uuid>,
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
     ) -> Result<Option<std::collections::HashSet<Uuid>>, ServiceError> {
         let (Some(user_id), Some(users)) = (user_id, self.users.as_ref()) else {
             return Ok(None);
         };
-        let Some(user) = users.get_user_by_id(user_id).await? else {
-            return Ok(None);
+        let read;
+        let user = match user {
+            Some(user) => user,
+            None => match users.get_user_by_id(user_id).await? {
+                Some(row) => {
+                    read = row;
+                    &read
+                }
+                None => return Ok(None),
+            },
         };
         let visibility = self
             .visibility
             .as_ref()
             .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
         let rows = self.items.retrieve_items(&ids).await?;
-        let visible = visibility.visible(&rows, &user, true).await?;
+        let visible = visibility.visible(&rows, user, true).await?;
         Ok(Some(
             rows.iter()
                 .zip(visible)
@@ -384,6 +581,7 @@ impl FerrofinMediaSourceManager {
         item: &BaseItemEntity,
         source: &mut MediaSourceInfo,
         user_id: Uuid,
+        known_user: Option<&ferrofin_db::entities::users::UserEntity>,
     ) -> Result<(), ServiceError> {
         let media_type = item.media_type.as_deref().unwrap_or("Video");
 
@@ -391,8 +589,12 @@ impl FerrofinMediaSourceManager {
             let Some(users) = &self.users else {
                 return Ok(());
             };
-            let Some(user) = users.get_user_by_id(user_id).await? else {
-                return Ok(());
+            let user = match known_user {
+                Some(user) => user.clone(),
+                None => match users.get_user_by_id(user_id).await? {
+                    Some(user) => user,
+                    None => return Ok(()),
+                },
             };
             let remembered = if let Some(user_data) = &self.user_data {
                 let item_id = Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil());
@@ -1561,34 +1763,36 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         allow_media_probe: bool,
         enable_path_substitution: bool,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        // Playback sources build on the static sources; the per-user bitrate/profile
-        // negotiation (MediaStreamSelector) is deferred, so the static set is the
-        // playback set for v1.
-        let mut sources = self
-            .get_static_media_sources(item_id, enable_path_substitution, Some(user_id))
-            .await?;
-        // `GetPlaybackMediaSources`: a `.strm` shortcut, or an item whose main
-        // stream is missing, is refreshed in full with the remote probe on
-        // before it is played, and its sources are read again.
-        if allow_media_probe
-            && let Some(probe) = &self.remote_probe
-            && let Some(path) = self.playback_probe_path(item_id, &sources).await?
-        {
-            probe(path).await?;
-            sources = self
-                .get_static_media_sources(item_id, enable_path_substitution, Some(user_id))
-                .await?;
-        }
-        // `preferredId`: the first static source's id when it is a `Guid` —
-        // the queried version's own file — else the item's id
-        // (`MediaSourceManager.cs:232-234`).
-        let preferred = sources
-            .first()
-            .and_then(|s| s.id.as_deref())
-            .and_then(|id| Uuid::parse_str(id).ok())
-            .unwrap_or(item_id);
-        sort_media_sources(&mut sources, preferred);
-        Ok(sources)
+        self.playback_sources(
+            item_id,
+            None,
+            None,
+            user_id,
+            allow_media_probe,
+            enable_path_substitution,
+        )
+        .await
+    }
+
+    async fn get_playback_media_sources_for(
+        &self,
+        item: &BaseItemEntity,
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
+        user_id: Uuid,
+        allow_media_probe: bool,
+        enable_path_substitution: bool,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        let item_id = Uuid::parse_str(&item.id)
+            .map_err(|_| ServiceError::invalid_input("the item's id is not a GUID"))?;
+        self.playback_sources(
+            item_id,
+            Some(item.clone()),
+            user,
+            user_id,
+            allow_media_probe,
+            enable_path_substitution,
+        )
+        .await
     }
 
     async fn get_alternate_versions_batch(
@@ -1619,131 +1823,8 @@ impl MediaSourceManager for FerrofinMediaSourceManager {
         enable_path_substitution: bool,
         user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        let stored = self.items.retrieve_item(item_id).await?;
-        // The Live TV branch is chosen by what the id IS, not by whether a row
-        // was found. A channel is a real `BaseItems` row (the guide refresh
-        // mirrors the lineup, exactly as `GuideManager.GetChannel` stores each
-        // channel item), yet its playable sources still come from the tuner:
-        // upstream reaches them through `LiveTvMediaSourceProvider`, which
-        // `MediaSourceManager.GetPlaybackMediaSources` selects on the item's
-        // type. Keying on "the row was missing" instead would have made every
-        // channel report an unplayable static source the moment the rows
-        // started existing. A DVR recording has no row at all and takes the
-        // same branch.
-        let is_channel = stored
-            .as_ref()
-            .and_then(|row| crate::item_type_lookup::kind_from_type_name(&row.type_))
-            .is_some_and(|kind| {
-                matches!(
-                    kind,
-                    ferrofin_model::data::BaseItemKind::LiveTvChannel
-                        | ferrofin_model::data::BaseItemKind::TvChannel
-                )
-            });
-        if stored.is_none() || is_channel {
-            let mut sources = self.channel_media_source(item_id).await?;
-            if sources.is_empty() {
-                sources = self.recording_media_source(item_id).await?;
-            }
-            if sources.is_empty() {
-                return Ok(sources);
-            }
-            // `GetPlaybackMediaSources`' per-user overwrite over the DYNAMIC
-            // sources (v10.11.8 MediaSourceManager.cs:204-217), applied AFTER
-            // the `SupportsDirectStream(Path, Protocol)` validation the
-            // channel path already ran — that order is upstream's, and it is
-            // why an HDHomeRun channel (Protocol Udp, so the validation says
-            // false) is still reported direct-streamable to a user who has
-            // `EnablePlaybackRemuxing`.
-            self.apply_playback_permissions(&mut sources, item_id, None, user_id)
-                .await?;
-            if enable_path_substitution {
-                self.substitute_paths(&mut sources).await?;
-            }
-            return Ok(sources);
-        }
-        let Some(item) = stored else {
-            return Ok(Vec::new());
-        };
-        // `hasMediaSources.GetMediaSources(...)` on the item itself
-        // (`BaseItem.GetMediaSources`, `BaseItem.cs:1156-1189`): every version
-        // in its group, each once, its own source first — so playing an
-        // alternate (or a part) by its own id defaults to that file, and a
-        // version's sources list the whole group.
-        let item_id = Uuid::parse_str(&item.id).unwrap_or(item_id);
-        let versions = crate::video_versions::VersionRows::load(
-            &crate::video_versions::RepositoryVersionReader(self.items.as_ref()),
-            &[&item],
-        )
-        .await?;
-        let group = versions.items_for_media_sources(&item);
-        let mut built: HashMap<Uuid, MediaSourceInfo> = HashMap::with_capacity(group.len());
-        for (row, _) in &group {
-            let Ok(row_id) = Uuid::parse_str(&row.id) else {
-                continue;
-            };
-            let streams = self.streams_dto(row_id).await?;
-            let attachments = self.get_media_attachments(row_id).await?;
-            built.insert(row_id, Self::static_source(row, streams, attachments));
-        }
-        let mut sources = versions.media_sources(&item, |row| {
-            Uuid::parse_str(&row.id)
-                .ok()
-                .and_then(|id| built.remove(&id))
-                .unwrap_or_else(|| Self::static_source(row, Vec::new(), Vec::new()))
-        });
-        // `GetStaticMediaSources(item, …, user)`: a version the user may not
-        // open is no source for them (`MediaSourceManager.cs:397-403`); the
-        // queried item itself always is.
-        if sources.len() > 1 {
-            let others: Vec<Uuid> = group
-                .iter()
-                .filter_map(|(row, _)| Uuid::parse_str(&row.id).ok())
-                .filter(|id| *id != item_id)
-                .collect();
-            if let Some(visible) = self.visible_versions(others, user_id).await? {
-                sources.retain(|s| {
-                    s.id.as_deref()
-                        .and_then(|id| Uuid::parse_str(id).ok())
-                        .is_none_or(|id| id == item_id || visible.contains(&id))
-                });
-            }
-        }
-        // `SetDefaultAudioAndSubtitleStreamIndices` (MediaSourceManager.cs:401):
-        // when a user was supplied, each source gets per-user audio/subtitle
-        // defaults based on their preferences and remembered selections.
-        if let Some(uid) = user_id {
-            for source in &mut sources {
-                self.set_default_audio_and_subtitle_stream_indices(&item, source, uid)
-                    .await?;
-            }
-        }
-        // `GetStaticMediaSources(item, enablePathSubstitution, user)`'s tail
-        // (v10.11.8 MediaSourceManager.cs:355-372): when a user was supplied,
-        // the policy decides `SupportsTranscoding` and (for video)
-        // `SupportsDirectStream`. `user` is null on the anonymous paths
-        // (`GET /Videos/{id}/stream`), and there the sources stay as built.
-        self.apply_playback_permissions(&mut sources, item_id, item.media_type.as_deref(), user_id)
-            .await?;
-        // `SetAlternateVersionResumeStates` (`MediaSourceManager.cs:420`), for
-        // a user, when there are versions: one batched user-data read.
-        if let (Some(user_id), Some(user_data)) = (user_id, self.user_data.as_ref())
-            && sources.len() > 1
-            && item.primary_version_id.is_none()
-        {
-            let ids: Vec<Uuid> = sources
-                .iter()
-                .filter_map(|s| s.id.as_deref().and_then(|id| Uuid::parse_str(id).ok()))
-                .collect();
-            let data = user_data.get_user_data_batch(&ids, user_id).await?;
-            crate::video_versions::put_resumed_version_first(&item, &mut sources, |id| {
-                data.get(&id)
-            });
-        }
-        if enable_path_substitution {
-            self.substitute_paths(&mut sources).await?;
-        }
-        Ok(sources)
+        self.static_sources(item_id, None, enable_path_substitution, user_id, None)
+            .await
     }
 
     async fn open_live_stream(
@@ -3457,7 +3538,7 @@ mod tests {
         // alternate, the PRIMARY's sources lead with the alternate; asked
         // for the alternate itself, its own source stays first either way.
         let user = Uuid::from_u128(0x103);
-        crate::test_support::seed_user(&db, user).await;
+        let user_row = crate::test_support::seed_user(&db, user).await;
         let user_data = user_data_manager(&db);
         user_data
             .save_user_data(
@@ -3489,6 +3570,16 @@ mod tests {
             ),
             a,
             "and it is the default the client plays"
+        );
+        // The PlaybackInfo handler's form, over the rows it has already read: the same sources.
+        let item_row = crate::test_support::fetch_item(&db, id).await;
+        assert_eq!(
+            mgr.get_playback_media_sources_for(&item_row, Some(&user_row), user, false, false)
+                .await
+                .unwrap(),
+            mgr.get_playback_media_sources(id, user, false, false)
+                .await
+                .unwrap()
         );
         assert_eq!(
             first(mgr.get_static_media_sources(id, false, None).await.unwrap()),
