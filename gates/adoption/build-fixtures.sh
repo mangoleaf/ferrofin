@@ -21,7 +21,9 @@
 #   media-messy/                   a hard-linked copy of media/ plus a link per file a seeded item needs; only the
 #                                  messy rows and their oracle mount it, so the clean rows' media is untouched
 #   jellyfin-10.11.11-scale/       a copy of 10.11.11 whose media items are cloned by SQL up to 40,000
-#                                  (scale.py: scale.json); no oracle, no scan, no file written
+#                                  (scale.py: scale.json); no oracle, no scan
+#   media-scale/                   a hard-linked copy of media/ plus a link at each clone's path; only the
+#                                  scale row mounts it
 # Existing fixtures and oracles are kept; synthetic.py refuses fixtures from an older recipe, so
 # build into a new DIR after changing it. DIR must be on a local disk. An interrupted oracle build
 # can leave a copy under DIR/work/oracle-* (or messy-oracle-*); work/ is scratch and may be deleted

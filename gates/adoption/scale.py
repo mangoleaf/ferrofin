@@ -15,12 +15,12 @@ Needs Python 3.11 or newer (RFC 3339 stamps with nanoseconds, sqlite3 limits).
 
 Cloning: the library of a scanned synthetic fixture is repeated, item by item, until the database
 holds ITEMS rows of BaseItems, so no 40,000 media files are needed. A clone is a media item (a movie,
-an episode, a song) with a new id, a path of its own that no file has, and a copy of every row that
-hangs off its template: streams, chapters, attachments, trickplay, segments, images, providers,
+an episode, a song) with a new id, a path of its own (in the tree the scale row mounts, SCALE_MEDIA,
+a hard link to a template file of the same name and grandparent folder), and a copy of every row
+that hangs off its template: streams, chapters, attachments, trickplay, segments, images, providers,
 metadata fields, ancestors, item values, people and, for one clone in USERDATA_EVERY, the play state
 of every user the fixture holds play state for. Item values and people are shared, as they are in a
-real library. Scan cost at scale belongs to the benchmark corpus, so nothing here scans and no file
-is written.
+real library. Scan cost at scale belongs to the benchmark corpus, so nothing here scans.
 
 Measuring (recorded, not gated: thresholds come from the first runs): the container's cgroup keeps
 its own memory peak, which counts the page cache of the files the boot reads and writes, so the
@@ -121,6 +121,35 @@ def templates(conn):
         'AND "PrimaryVersionId" IS NULL AND ("ExtraType" IS NULL OR "ExtraType" = 0) ORDER BY "Id"', TEMPLATE_TYPES)
     names = [column[0] for column in cursor.description]
     return [dict(zip(names, row)) for row in cursor.fetchall()]
+
+
+#: The media tree the scale row mounts as /media: a hard-linked copy of the fixtures' own, plus, at
+#: each clone's path, a link to its template's file. A 10.11 database's adoption removes an item whose
+#: file is gone under a readable library location (Jellyfin 12's MigrateLinkedChildren, and Ferrofin's
+#: port of it), so every clone needs a file; hard links cost no data.
+SCALE_MEDIA = "media-scale"
+
+
+def link_clone_files(root, clone_paths, template_paths):
+    """Build `root`/SCALE_MEDIA from `root`/media: each clone path (a container path under /media) a
+    hard link to a template file with its grandparent folder and file name (clone_path keeps both;
+    which template, when two share them, does not matter: the sweep only asks that a file is there).
+    Built beside and renamed into place, so a partial tree is never mounted."""
+    by_place = {(os.path.dirname(os.path.dirname(path)), os.path.basename(path)): path for path in template_paths}
+    tree, partial = root / SCALE_MEDIA, root / (SCALE_MEDIA + ".partial")
+    for leftover in (tree, partial):
+        shutil.rmtree(leftover, ignore_errors=True)
+    shutil.copytree(root / "media", partial, copy_function=os.link)
+    for path in clone_paths:
+        template = by_place.get((os.path.dirname(os.path.dirname(path)), os.path.basename(path)))
+        if template is None or not (path.startswith("/media/") and template.startswith("/media/")):
+            raise CheckError(f"scale media: no template file under /media/ for the clone {path}")
+        source, target = partial / template.removeprefix("/media/"), partial / path.removeprefix("/media/")
+        if not source.is_file():
+            raise CheckError(f"scale media: the template file {template} is not in {root / 'media'}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.link(source, target)
+    partial.rename(tree)
 
 
 def clone_path(path, number):
@@ -257,16 +286,21 @@ def build(root, items=ITEMS):
         shutil.copytree(source, target)
         db = target / "data/jellyfin.db"
         with closing(sqlite3.connect(db)) as conn:
+            template_paths = [template["Path"] for template in templates(conn)]
             conn.execute("PRAGMA foreign_keys = OFF")
             with conn:
                 added = clone_items(conn, items)
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            clone_paths = [path for (path,) in conn.execute(
+                f'SELECT "Path" FROM "BaseItems" WHERE "Path" LIKE \'{CLONE_MARK}\'')]
+        link_clone_files(root, clone_paths, template_paths)
         save(target / "scale.json", {"version": 1, "source": source_name, "items": items, "added": added,
                                      "userdata_every": USERDATA_EVERY, "database_bytes": db.stat().st_size})
     except BaseException:
         # The copy is this step's own scratch; a failure must not strand the clean fixtures.
         shutil.rmtree(target, ignore_errors=True)
         shutil.rmtree(target.parent / (target.name + "-cache"), ignore_errors=True)
+        shutil.rmtree(root / (SCALE_MEDIA + ".partial"), ignore_errors=True)
         raise
     print(f"{name} built: {added['BaseItems']} items cloned, " + ", ".join(
         f"{table} {rows}" for table, rows in sorted(added.items()) if table != "BaseItems"), flush=True)
