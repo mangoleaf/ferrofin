@@ -384,8 +384,11 @@ shell-tests:
   stage: test
   image: alpine:3.22
   before_script:
-    # Adoption checks invoke Python and use Pillow to validate preserved artwork.
-    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml
+    # Adoption checks invoke Python, with Pillow to validate preserved artwork and PyICU for the
+    # CleanValue check. The gates' scripts need findmnt (the network-filesystem refusal) and GNU
+    # coreutils (realpath -m, tail --pid, truncate's size suffixes), which the Alpine image lacks;
+    # GitHub's Ubuntu runner has them.
+    - apk add --no-cache bash bats shellcheck sqlite git jq curl python3 py3-pillow py3-yaml py3-icu findmnt coreutils
   script:
     - shellcheck -x scripts/version.sh scripts/ci-config-check.sh scripts/coverage-gate.sh gates/lib.sh gates/adoption/lib.sh gates/adoption/run.sh gates/adoption/smoke.sh gates/adoption/build-fixtures.sh
     - shellcheck -x -s bash scripts/tests/version.bats scripts/tests/ci-config-check.bats scripts/tests/coverage-gate.bats gates/adoption/tests/adoption.bats
