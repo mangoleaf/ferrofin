@@ -19,7 +19,7 @@ adoption_fixtures_dir() {
   local fixtures key
   fixtures=$(gates_dir "$1" fixtures) || return 2
   key=$(set -o pipefail; cd "$(dirname "${BASH_SOURCE[0]}")" && cat synthetic.py synthetic_media.py synthetic_fixture.py \
-    preservation.py user_accounts.py smoke.sh build-fixtures.sh messy.py scale.py 2>/dev/null | sha256sum) \
+    preservation.py user_accounts.py metadata.py smoke.sh build-fixtures.sh messy.py scale.py 2>/dev/null | sha256sum) \
     || { echo "$1: cannot read the fixture builders in gates/adoption/" >&2; return 2; }
   printf '%s/adoption-%s\n' "$fixtures" "${key:0:12}"
 }

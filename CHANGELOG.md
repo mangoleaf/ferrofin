@@ -37,6 +37,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Take the copies made before migrating or adopting with `VACUUM INTO` when another process
   is reading or writing the database, instead of a file copy that missed what was still in
   the write-ahead log
+- On a database adopted from Jellyfin 10.11, remove once the items whose file or library is
+  gone, as Jellyfin 12's `MigrateLinkedChildren` does, with its guards for unmounted media
+  folders; play state moves to the placeholder item
 
 ### Tooling
 - `gates/adoption/run.sh` stops at once when terminated, under bash 5.2 too (a TERM was

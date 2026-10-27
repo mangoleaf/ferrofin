@@ -22,6 +22,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use uuid::Uuid;
 
+use ferrofin_model::entities_media::VirtualFolderInfo;
+use ferrofin_traits::library::{LibraryManager, VirtualFolderManager};
+use ferrofin_traits::options::DeleteOptions;
 use ferrofin_traits::persistence::{ItemRekey, ItemUserWeight};
 use ferrofin_traits::system::PathManager;
 
@@ -1627,6 +1630,405 @@ pub async fn run_rekey_pathless_playlists(
         );
     }
     Ok(())
+}
+
+/// The extension of the database snapshot [`sweep_missing_items`] takes
+/// (`jellyfin.db.pre-missing-items`).
+const SWEEP_SNAPSHOT_EXTENSION: &str = "db.pre-missing-items";
+
+/// How many items [`stale_file_items`] checks between progress lines
+/// (upstream's `FileCheckProgressLogStep`): a check on offline storage can
+/// block for the mount timeout.
+const FILE_CHECK_PROGRESS_STEP: usize = 10_000;
+
+/// How many items [`delete_swept`] deletes between progress lines
+/// (upstream's `DeleteProgressLogStep`).
+const DELETE_PROGRESS_STEP: usize = 25;
+
+/// What [`sweep_missing_items`] deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SweptItems {
+    /// Items whose `TopParentId` named no stored item.
+    pub deleted_libraries: usize,
+    /// Items whose file was gone, or whose path was outside every library
+    /// location.
+    pub stale: usize,
+}
+
+/// Jellyfin 12.0's last two item sweeps, for a database adopted from 10.11
+/// (owner decision on gl-521): `MigrateLinkedChildren.
+/// CleanupItemsFromDeletedLibraries` and `CleanupStaleFileEntries`
+/// (`Jellyfin.Server/Migrations/Routines/20260113120000_MigrateLinkedChildren.cs:353-565`
+/// at v12.2), in that order, after the version cleanups
+/// [`rehome_local_versions`] ports. Jellyfin runs them once, when it
+/// upgrades a 10.11 database; here they run once per database whose
+/// adoption record names a 10.11 release, an install whose adoption an
+/// earlier Ferrofin recorded included.
+///
+/// - **Deleted libraries:** every item whose `TopParentId` names no stored
+///   item and no library on disk. The library definitions are read first:
+///   that listing restores a library's missing `CollectionFolder` row, which
+///   an install an earlier Ferrofin adopted can lack while its items name
+///   it. Ids are compared parsed, so a `TopParentId` stored in another
+///   spelling of a stored id is kept (EF compares the text).
+/// - **Stale files:** every non-folder, non-virtual item with a path that,
+///   expanded, is not under the internal metadata directory and is under a
+///   library location that exists and lists an entry, where no file or
+///   folder is at the path. An item outside every location goes too, but
+///   only while every location lists an entry, and never one under a library
+///   whose definition folder (`{user views}/{name}`) is gone: both look
+///   the same as storage that failed to mount. An item under a location that
+///   is missing, empty or fails on its first listing is kept. Paths compare
+///   as `StartsWith(…, OrdinalIgnoreCase)`. Unlike upstream, whose
+///   `File.Exists || Directory.Exists` reads an I/O error as a missing file,
+///   an item whose path cannot be checked is kept (owner decision on gl-951,
+///   2026-10-27): a transient storage error never removes it.
+///
+/// Each item goes through the library manager's delete (`LibraryManager.
+/// DeleteItem` with `DeleteFileLocation = false`: no media file is touched),
+/// which takes its descendants and owned extras, keeps its play state on the
+/// placeholder item with a retention date and removes its metadata folders
+/// and extracted data. A delete that fails is logged and skipped, as
+/// upstream does; so is one the library manager refuses, unlike upstream (it
+/// never deletes a root, a library's own folder, a view or a by-name item).
+/// Before the first delete, the database file is copied once
+/// to `<db>.pre-missing-items`, as before a table-rebuilding migration.
+///
+/// # Errors
+/// Returns [`ServiceError`] if a query fails or the library definitions
+/// cannot be read; the sweep is not marked done then, and the next boot
+/// runs it again.
+pub async fn sweep_missing_items(
+    db: &Database,
+    library: &dyn LibraryManager,
+    virtual_folders: &dyn VirtualFolderManager,
+    paths: &VirtualPathExpander,
+    internal_metadata: &str,
+    user_views: &str,
+) -> Result<SweptItems, ServiceError> {
+    const KEY: &str = "missing_item_sweeps_v12";
+    let Some(adoption) = db.adoption_state().await.map_err(meta_err)? else {
+        return Ok(SweptItems::default());
+    };
+    if !adoption.generation.starts_with("10.11.") || !once(db, KEY).await? {
+        return Ok(SweptItems::default());
+    }
+    let folders = virtual_folders.get_virtual_folders().await?;
+    let orphaned = items_from_deleted_libraries(db, &folders).await?;
+    let deleted_libraries =
+        delete_swept(db, library, &orphaned, "items from deleted libraries").await?;
+    let missing = stale_file_items(db, &folders, paths, internal_metadata, user_views).await?;
+    let stale = delete_swept(db, library, &missing, "items with missing files").await?;
+    done(db, KEY).await?;
+    Ok(SweptItems {
+        deleted_libraries,
+        stale,
+    })
+}
+
+/// [`sweep_missing_items`] and its log lines, for the composition root.
+///
+/// # Errors
+/// Returns [`ServiceError`] if the sweep fails.
+pub async fn run_sweep_missing_items(
+    db: &Database,
+    library: &dyn LibraryManager,
+    virtual_folders: &dyn VirtualFolderManager,
+    paths: &VirtualPathExpander,
+    internal_metadata: &str,
+    user_views: &str,
+) -> Result<(), ServiceError> {
+    let swept = sweep_missing_items(
+        db,
+        library,
+        virtual_folders,
+        paths,
+        internal_metadata,
+        user_views,
+    )
+    .await?;
+    if swept.deleted_libraries > 0 {
+        tracing::info!(
+            items = swept.deleted_libraries,
+            "removed items from deleted libraries"
+        );
+    }
+    if swept.stale > 0 {
+        tracing::info!(
+            items = swept.stale,
+            "removed items whose files are gone or outside every library location"
+        );
+    }
+    Ok(())
+}
+
+/// The items `CleanupItemsFromDeletedLibraries` deletes: those whose
+/// `TopParentId` names no stored item and none of `folders`, each with its
+/// stored path.
+async fn items_from_deleted_libraries(
+    db: &Database,
+    folders: &[VirtualFolderInfo],
+) -> Result<Vec<(Uuid, Option<String>)>, ServiceError> {
+    let rows: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as(r#"SELECT "Id", "TopParentId", "Path" FROM "BaseItems""#)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+    let stored: BTreeSet<Uuid> = rows
+        .iter()
+        .filter_map(|(id, _, _)| Uuid::parse_str(id).ok())
+        .chain(
+            folders
+                .iter()
+                .filter_map(|folder| Uuid::parse_str(folder.item_id.as_deref()?).ok()),
+        )
+        .collect();
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id, top, path)| {
+            let top = Uuid::parse_str(top.as_deref()?).ok()?;
+            let id = Uuid::parse_str(&id).ok()?;
+            if stored.contains(&top) {
+                return None;
+            }
+            tracing::debug!(item_id = %id, path = ?path, top_parent_id = %top, "removing item: its library is gone");
+            Some((id, path))
+        })
+        .collect())
+}
+
+/// The items `CleanupStaleFileEntries` deletes from the stored ones, with
+/// `folders` the library definitions on disk: see [`sweep_missing_items`].
+/// The file checks run on the blocking pool.
+async fn stale_file_items(
+    db: &Database,
+    folders: &[VirtualFolderInfo],
+    paths: &VirtualPathExpander,
+    internal_metadata: &str,
+    user_views: &str,
+) -> Result<Vec<(Uuid, Option<String>)>, ServiceError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT "Id", "Path" FROM "BaseItems"
+           WHERE "Path" IS NOT NULL AND "Path" <> '' AND NOT "IsFolder" AND NOT "IsVirtualItem""#,
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let in_missing_libraries = items_in_missing_libraries(db, folders, paths, user_views).await?;
+    let locations: Vec<String> = folders
+        .iter()
+        .flat_map(|folder| folder.locations.iter().cloned())
+        .collect();
+    let rows: Vec<(String, String, String)> = rows
+        .into_iter()
+        .map(|(id, stored)| {
+            let path = paths.expand(&stored);
+            (id, stored, path)
+        })
+        .collect();
+    let internal_metadata = upper_invariant(internal_metadata);
+    tokio::task::spawn_blocking(move || {
+        stale_among(&rows, &locations, &internal_metadata, &in_missing_libraries)
+    })
+    .await
+    .map_err(|err| ServiceError::Backend(format!("checking items for missing files: {err}")))
+}
+
+/// Whether a library location's listing yields a readable first entry: an
+/// empty folder, or one whose first entry fails to read (a share that opens
+/// but errors on listing, a stale NFS handle), looks like storage that did
+/// not mount, and its items are kept.
+fn lists_an_entry<T>(mut entries: impl Iterator<Item = std::io::Result<T>>) -> bool {
+    matches!(entries.next(), Some(Ok(_)))
+}
+
+/// [`stale_file_items`]' decision over `rows` (`Id`, stored path, expanded
+/// path): the library `locations`, the upper-cased internal metadata
+/// directory, and the items under a library whose definition is gone.
+fn stale_among(
+    rows: &[(String, String, String)],
+    locations: &[String],
+    internal_metadata: &str,
+    in_missing_libraries: &BTreeSet<Uuid>,
+) -> Vec<(Uuid, Option<String>)> {
+    let (mut accessible, mut inaccessible) = (Vec::new(), Vec::new());
+    for location in locations {
+        if std::fs::read_dir(location).is_ok_and(lists_an_entry) {
+            accessible.push(upper_invariant(location));
+        } else {
+            tracing::warn!(
+                path = %location,
+                "library location is inaccessible or empty; skipping file existence checks for items under it"
+            );
+            inaccessible.push(upper_invariant(location));
+        }
+    }
+    let can_remove_unrooted = inaccessible.is_empty() && !accessible.is_empty();
+    let under = |path: &str, roots: &[String]| roots.iter().any(|root| path.starts_with(root));
+    let (mut stale, mut unrooted) = (Vec::new(), 0usize);
+    let (mut skipped_unrooted, mut skipped_missing_library, mut unreadable) =
+        (0usize, 0usize, 0usize);
+    tracing::info!(total = rows.len(), "checking items for missing files");
+    for (checked, (id, stored, path)) in rows.iter().enumerate() {
+        if checked > 0 && checked % FILE_CHECK_PROGRESS_STEP == 0 {
+            tracing::debug!(
+                checked,
+                total = rows.len(),
+                stale = stale.len(),
+                "checking for missing files"
+            );
+        }
+        let Ok(item) = Uuid::parse_str(id) else {
+            continue;
+        };
+        let folded = upper_invariant(path);
+        if folded.starts_with(internal_metadata) {
+            continue;
+        }
+        if under(&folded, &accessible) {
+            // A folder covers a DVD or Blu-ray rip stored by its folder. Only a
+            // path the filesystem reports absent goes: an I/O error keeps the item.
+            match Path::new(path).try_exists() {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(item_id = %item, path = %path, "removing item: its file no longer exists");
+                    stale.push((item, Some(stored.clone())));
+                }
+                Err(err) => {
+                    tracing::debug!(item_id = %item, path = %path, %err, "keeping item: its path could not be checked");
+                    unreadable += 1;
+                }
+            }
+        } else if !under(&folded, &inaccessible) {
+            if in_missing_libraries.contains(&item) {
+                skipped_missing_library += 1;
+            } else if can_remove_unrooted {
+                tracing::debug!(item_id = %item, path = %path, "removing item: its path is outside every library location");
+                stale.push((item, Some(stored.clone())));
+                unrooted += 1;
+            } else {
+                skipped_unrooted += 1;
+            }
+        }
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            items = unreadable,
+            "keeping items whose path could not be checked (an I/O error under a readable library location)"
+        );
+    }
+    if skipped_missing_library > 0 {
+        tracing::warn!(
+            items = skipped_missing_library,
+            "keeping items whose library definition is missing; restore the definition or recreate the library"
+        );
+    }
+    if skipped_unrooted > 0 {
+        tracing::warn!(
+            items = skipped_unrooted,
+            unavailable_locations = inaccessible.len(),
+            "keeping items outside every library location while a location is unavailable or none resolved"
+        );
+    }
+    if !stale.is_empty() {
+        tracing::info!(items = stale.len(), unrooted, "found stale items to remove");
+    }
+    stale
+}
+
+/// `MigrateLinkedChildren.GetItemsInMissingLibraries`: the items whose
+/// ancestors include a library (`CollectionFolder` row) whose definition
+/// folder, `{user views}/{name}` for a name in `folders`, is gone.
+async fn items_in_missing_libraries(
+    db: &Database,
+    folders: &[VirtualFolderInfo],
+    paths: &VirtualPathExpander,
+    user_views: &str,
+) -> Result<BTreeSet<Uuid>, ServiceError> {
+    let live: BTreeSet<String> = folders
+        .iter()
+        .filter_map(|folder| folder.name.as_deref())
+        .map(|name| upper_invariant(&Path::new(user_views).join(name).to_string_lossy()))
+        .collect();
+    let libraries: Vec<(String, String)> = sqlx::query_as(
+        r#"SELECT "Id", "Path" FROM "BaseItems" WHERE "Type" = ?1 AND "Path" IS NOT NULL"#,
+    )
+    .bind(
+        stored_type_name(BaseItemKind::CollectionFolder).ok_or_else(|| {
+            ServiceError::Backend("no stored type name for CollectionFolder".to_owned())
+        })?,
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    let missing: Vec<String> = libraries
+        .into_iter()
+        .filter(|(_, path)| !live.contains(&upper_invariant(&paths.expand(path))))
+        .map(|(id, _)| id)
+        .collect();
+    if missing.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    tracing::warn!(
+        libraries = missing.len(),
+        path = %user_views,
+        "library definitions known to the database are not in the user views folder"
+    );
+    let missing =
+        serde_json::to_string(&missing).map_err(|e| ServiceError::Backend(e.to_string()))?;
+    let items: Vec<String> = sqlx::query_scalar(
+        r#"SELECT "ItemId" FROM "AncestorIds" WHERE "ParentItemId" IN (SELECT value FROM json_each(?1))"#,
+    )
+    .bind(missing)
+    .fetch_all(db.pool())
+    .await
+    .map_err(db_err)?;
+    Ok(items
+        .iter()
+        .filter_map(|id| Uuid::parse_str(id).ok())
+        .collect())
+}
+
+/// Deletes `items` (each with its stored path, for the log) through the
+/// library manager as `MigrateLinkedChildren.DeleteItems` does, after the
+/// sweep's database snapshot. Returns how many deletes succeeded; `what`
+/// names the set in the progress lines.
+async fn delete_swept(
+    db: &Database,
+    library: &dyn LibraryManager,
+    items: &[(Uuid, Option<String>)],
+    what: &str,
+) -> Result<usize, ServiceError> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    if let Some(backup) = db
+        .snapshot_once(SWEEP_SNAPSHOT_EXTENSION)
+        .await
+        .map_err(meta_err)?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before removing items whose library or file is gone"
+        );
+    }
+    let options = DeleteOptions {
+        delete_file_location: false,
+        delete_from_external_provider: false,
+    };
+    let mut deleted = 0;
+    for (index, (id, _path)) in items.iter().enumerate() {
+        if index > 0 && index % DELETE_PROGRESS_STEP == 0 {
+            tracing::debug!(what, done = index, total = items.len(), "removing items");
+        }
+        match library.delete_item(*id, &options).await {
+            Ok(()) => deleted += 1,
+            Err(err) => {
+                tracing::warn!(item_id = %id, %err, what, "skipping an item: delete failed");
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 /// Where a re-keyed row's id-named folders live.
@@ -5364,5 +5766,456 @@ mod tests {
         assert_eq!(moved, 1, "the next boot runs it again");
         let to = derive_item_id_with(&mode, BaseItemKind::Playlist, &folder).expect("id");
         assert_eq!(stored_path(&db, to).await, Some(Some(folder)));
+    }
+
+    /// A database adopted from `generation` (none: not adopted) with one
+    /// library, "Movies", whose location holds `Here.mkv`, and its library
+    /// definitions and internal metadata folder in a temporary directory.
+    struct SweepFixture {
+        db: Database,
+        tmp: tempfile::TempDir,
+        library: std::sync::Arc<dyn LibraryManager>,
+        user: Uuid,
+    }
+
+    impl SweepFixture {
+        async fn new(generation: Option<&str>) -> Self {
+            Self::over(test_db().await, generation).await
+        }
+
+        /// [`Self::new`] over `db` (a file-backed database for the snapshot).
+        async fn over(db: Database, generation: Option<&str>) -> Self {
+            if let Some(generation) = generation {
+                db.record_adoption(generation).await.expect("record");
+            }
+            let user = Uuid::new_v4();
+            seed_user(&db, user).await;
+            let fixture = Self {
+                library: crate::test_support::library_manager_over(db.clone()),
+                db,
+                tmp: tempfile::tempdir().expect("tmp"),
+                user,
+            };
+            let location = fixture.location("movies");
+            std::fs::create_dir_all(&location).expect("location");
+            std::fs::write(Path::new(&location).join("Here.mkv"), b"").expect("file");
+            fixture.define("Movies", &location);
+            fixture
+        }
+
+        fn path(&self, relative: &str) -> String {
+            self.tmp
+                .path()
+                .join(relative)
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        fn location(&self, name: &str) -> String {
+            self.path(&format!("media/{name}"))
+        }
+
+        fn views(&self) -> String {
+            self.path("root/default")
+        }
+
+        /// A library definition folder `name` with one shortcut to `location`.
+        fn define(&self, name: &str, location: &str) {
+            let folder = Path::new(&self.views()).join(name);
+            std::fs::create_dir_all(&folder).expect("definition");
+            std::fs::write(folder.join(format!("{name}.mblink")), location).expect("shortcut");
+        }
+
+        /// A movie at `path`, with the fixture user's play state.
+        async fn movie(&self, path: &str) -> Uuid {
+            let id = Uuid::new_v4();
+            seed_item(&self.db, id, BaseItemKind::Movie).await;
+            set_path(&self.db, id, path).await;
+            seed_user_data(&self.db, self.user, id, true, None).await;
+            id
+        }
+
+        async fn sweep(&self) -> SweptItems {
+            self.sweep_with(&VirtualPathExpander::identity()).await
+        }
+
+        async fn sweep_with(&self, paths: &VirtualPathExpander) -> SweptItems {
+            let folders =
+                crate::virtual_folder_manager::FerrofinVirtualFolderManager::new(self.views());
+            sweep_missing_items(
+                &self.db,
+                self.library.as_ref(),
+                &folders,
+                paths,
+                &self.path("metadata"),
+                &self.views(),
+            )
+            .await
+            .expect("sweep")
+        }
+    }
+
+    /// The play state stored under `item`'s key on `item` and on the placeholder.
+    async fn play_state(db: &Database, item: Uuid) -> (i64, i64) {
+        let mut counts = [0, 0];
+        for (count, on) in counts
+            .iter_mut()
+            .zip([guid_to_db(item), PLACEHOLDER_ID.to_owned()])
+        {
+            *count = sqlx::query_scalar::<_, i64>(
+                r#"SELECT COUNT(*) FROM "UserData" WHERE "ItemId" = ?1 AND "CustomDataKey" = ?2"#,
+            )
+            .bind(on)
+            .bind(item.to_string())
+            .fetch_one(db.pool())
+            .await
+            .expect("count");
+        }
+        (counts[0], counts[1])
+    }
+
+    #[tokio::test]
+    async fn a_10_11_adoption_removes_an_item_whose_file_is_gone_and_keeps_its_play_state() {
+        let f = SweepFixture::new(Some("10.11.11")).await;
+        let movies = f.location("movies");
+        let gone = f.movie(&format!("{movies}/Gone (2001)/Gone.mkv")).await;
+        let here = f.movie(&format!("{movies}/Here.mkv")).await;
+        let poster = f.movie(&f.path("metadata/library/ab/poster.jpg")).await;
+        // `StartsWith(…, OrdinalIgnoreCase)`: otherwise it is outside every location.
+        let shouted = f.movie(&f.path("METADATA/library/cd/poster.jpg")).await;
+        let disc = f.movie(&movies).await;
+
+        assert_eq!(
+            f.sweep().await,
+            SweptItems {
+                deleted_libraries: 0,
+                stale: 1
+            }
+        );
+        assert!(!exists(&f.db, gone).await, "its file is gone");
+        assert_eq!(
+            play_state(&f.db, gone).await,
+            (0, 1),
+            "kept on the placeholder by its key"
+        );
+        for kept in [here, poster, shouted, disc] {
+            assert!(
+                exists(&f.db, kept).await,
+                "a file, internal metadata or a folder stays"
+            );
+        }
+
+        // Once per database.
+        let again = f.movie(&format!("{movies}/Also Gone.mkv")).await;
+        assert_eq!(f.sweep().await, SweptItems::default());
+        assert!(exists(&f.db, again).await);
+    }
+
+    #[tokio::test]
+    async fn only_a_10_11_adoption_is_swept() {
+        for generation in [None, Some("12.0.0"), Some("12.2.0")] {
+            let f = SweepFixture::new(generation).await;
+            let gone = f.movie(&format!("{}/Gone.mkv", f.location("movies"))).await;
+            assert_eq!(f.sweep().await, SweptItems::default(), "{generation:?}");
+            assert!(exists(&f.db, gone).await, "{generation:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_location_keeps_its_items_and_every_unrooted_one() {
+        let f = SweepFixture::new(Some("10.11.8")).await;
+        // A library whose location is not mounted, and one whose location is empty.
+        f.define("Shows", &f.location("shows"));
+        std::fs::create_dir_all(f.location("music")).expect("empty");
+        f.define("Music", &f.location("music"));
+        let gone = f.movie(&format!("{}/Gone.mkv", f.location("movies"))).await;
+        let unmounted = f
+            .movie(&format!("{}/Show/S01E01.mkv", f.location("shows")))
+            .await;
+        let empty = f
+            .movie(&format!("{}/Album/01.flac", f.location("music")))
+            .await;
+        let unrooted = f.movie(&f.path("elsewhere/Old.mkv")).await;
+
+        assert_eq!(
+            f.sweep().await,
+            SweptItems {
+                deleted_libraries: 0,
+                stale: 1
+            }
+        );
+        assert!(!exists(&f.db, gone).await, "under a readable location");
+        for kept in [unmounted, empty, unrooted] {
+            assert!(exists(&f.db, kept).await);
+        }
+    }
+
+    #[test]
+    fn a_listing_whose_first_entry_fails_reads_as_unavailable() {
+        assert!(lists_an_entry([Ok::<(), std::io::Error>(())].into_iter()));
+        assert!(!lists_an_entry(std::iter::empty::<std::io::Result<()>>()));
+        // A share that opens but fails to list (a stale NFS handle).
+        assert!(!lists_an_entry(
+            [Err::<(), _>(std::io::Error::other("stale handle")), Ok(())].into_iter()
+        ));
+    }
+
+    /// Owner decision on gl-951: an I/O error is not a missing file. Unlike
+    /// upstream, the item stays.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_item_whose_path_cannot_be_checked_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = SweepFixture::new(Some("10.11.8")).await;
+        let movies = f.location("movies");
+        let locked = Path::new(&movies).join("Locked");
+        std::fs::create_dir_all(&locked).expect("locked");
+        std::fs::write(locked.join("Film.mkv"), b"").expect("file");
+        let film = f.movie(&locked.join("Film.mkv").to_string_lossy()).await;
+        let gone = f.movie(&format!("{movies}/Gone.mkv")).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("lock");
+        let swept = f.sweep().await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+
+        assert_eq!(
+            swept,
+            SweptItems {
+                deleted_libraries: 0,
+                stale: 1
+            }
+        );
+        assert!(exists(&f.db, film).await, "its path could not be checked");
+        assert!(!exists(&f.db, gone).await);
+    }
+
+    #[tokio::test]
+    async fn a_removed_item_keeps_its_file_and_folders_and_virtual_items_are_not_swept() {
+        let f = SweepFixture::new(Some("10.11.8")).await;
+        let movies = f.location("movies");
+        // Outside every location with its file still there: the item goes, the file stays.
+        std::fs::create_dir_all(f.path("elsewhere")).expect("elsewhere");
+        let old = f.path("elsewhere/Old.mkv");
+        std::fs::write(&old, b"media").expect("file");
+        let unrooted = f.movie(&old).await;
+        let folder = Uuid::new_v4();
+        seed_folder_item(&f.db, folder, BaseItemKind::Folder, "Gone Folder", None).await;
+        set_path(&f.db, folder, &format!("{movies}/Gone Folder")).await;
+        let virtual_item = f.movie(&format!("{movies}/Virtual.mkv")).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsVirtualItem" = 1 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(virtual_item))
+            .execute(f.db.writer())
+            .await
+            .expect("virtual");
+
+        assert_eq!(
+            f.sweep().await,
+            SweptItems {
+                deleted_libraries: 0,
+                stale: 1
+            }
+        );
+        assert!(!exists(&f.db, unrooted).await);
+        assert_eq!(
+            std::fs::read(&old).expect("file"),
+            b"media",
+            "no media file is touched"
+        );
+        assert!(exists(&f.db, folder).await, "a folder is not swept");
+        assert!(
+            exists(&f.db, virtual_item).await,
+            "a virtual item is not swept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removal_snapshots_the_database_first_and_keeps_an_earlier_copy() {
+        for earlier in [false, true] {
+            let dir = tempfile::tempdir().expect("db dir");
+            let f = SweepFixture::over(
+                open_file_db(dir.path(), "jellyfin.db").await,
+                Some("10.11.8"),
+            )
+            .await;
+            let snapshot = dir.path().join("jellyfin.db.pre-missing-items");
+            if earlier {
+                std::fs::write(&snapshot, b"an interrupted boot's copy").expect("earlier");
+            }
+            let gone = f.movie(&format!("{}/Gone.mkv", f.location("movies"))).await;
+
+            assert_eq!(f.sweep().await.stale, 1, "earlier: {earlier}");
+            assert!(!exists(&f.db, gone).await);
+            if earlier {
+                assert_eq!(
+                    std::fs::read(&snapshot).expect("snapshot"),
+                    b"an interrupted boot's copy",
+                    "an existing copy is never overwritten"
+                );
+            } else {
+                // The copy is the database before the removal: the item is in it.
+                let copy =
+                    sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", snapshot.display()))
+                        .await
+                        .expect("open the copy");
+                let rows: i64 =
+                    sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Id" = ?1"#)
+                        .bind(guid_to_db(gone))
+                        .fetch_one(&copy)
+                        .await
+                        .expect("count");
+                assert_eq!(rows, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_under_the_metadata_directory_is_kept_through_its_token() {
+        let f = SweepFixture::new(Some("10.11.8")).await;
+        let poster = f.movie("%MetadataPath%/library/ab/poster.jpg").await;
+        let paths = std::sync::Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            f.path("data"),
+            "log",
+            "config",
+            "cache",
+            "web",
+        ));
+        paths.set_internal_metadata_path(Some(&f.path("metadata")));
+        // Unexpanded, the stored path would read as outside every location.
+        assert_eq!(
+            f.sweep_with(&VirtualPathExpander::from_paths(paths)).await,
+            SweptItems::default()
+        );
+        assert!(exists(&f.db, poster).await);
+    }
+
+    #[tokio::test]
+    async fn an_unrooted_item_goes_unless_its_library_definition_is_gone() {
+        let f = SweepFixture::new(Some("10.11.8")).await;
+        let unrooted = f.movie(&f.path("elsewhere/Old.mkv")).await;
+        // A library the database knows whose definition folder is gone: its
+        // location resolves nowhere, so its items read as unrooted.
+        let gone_library = Uuid::new_v4();
+        seed_folder_item(
+            &f.db,
+            gone_library,
+            BaseItemKind::CollectionFolder,
+            "Gone",
+            None,
+        )
+        .await;
+        set_path(&f.db, gone_library, &format!("{}/Gone", f.views())).await;
+        let in_gone_library = f.movie(&f.path("old-media/Kept.mkv")).await;
+        sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+            .bind(guid_to_db(in_gone_library))
+            .bind(guid_to_db(gone_library))
+            .execute(f.db.writer())
+            .await
+            .expect("ancestor");
+
+        assert_eq!(
+            f.sweep().await,
+            SweptItems {
+                deleted_libraries: 0,
+                stale: 1
+            }
+        );
+        assert!(!exists(&f.db, unrooted).await, "every location is readable");
+        assert_eq!(play_state(&f.db, unrooted).await, (0, 1));
+        assert!(
+            exists(&f.db, in_gone_library).await,
+            "its library definition is what went"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_item_whose_top_parent_is_gone_is_removed_with_its_children() {
+        let f = SweepFixture::new(Some("10.11.8")).await;
+        let folder = Uuid::new_v4();
+        seed_folder_item(&f.db, folder, BaseItemKind::Folder, "Movies", None).await;
+        let (orphan, kept) = (Uuid::new_v4(), Uuid::new_v4());
+        crate::test_support::seed_top_parented_item(
+            &f.db,
+            orphan,
+            BaseItemKind::Series,
+            "Old",
+            Uuid::new_v4(),
+        )
+        .await;
+        crate::test_support::seed_top_parented_item(
+            &f.db,
+            kept,
+            BaseItemKind::Series,
+            "Kept",
+            folder,
+        )
+        .await;
+        let season = Uuid::new_v4();
+        seed_folder_item(
+            &f.db,
+            season,
+            BaseItemKind::Season,
+            "Season 1",
+            Some(orphan),
+        )
+        .await;
+        // A view the library manager never deletes: logged and skipped.
+        let view = Uuid::new_v4();
+        crate::test_support::seed_top_parented_item(
+            &f.db,
+            view,
+            BaseItemKind::UserView,
+            "Old",
+            Uuid::new_v4(),
+        )
+        .await;
+        // An item of a library on disk whose `CollectionFolder` row is missing
+        // (an install an earlier Ferrofin adopted): the listing restores the
+        // row, so its items are not of a deleted library.
+        let folders = crate::virtual_folder_manager::FerrofinVirtualFolderManager::new(f.views());
+        let movies = folders.get_virtual_folders().await.expect("folders")[0]
+            .item_id
+            .clone()
+            .expect("library id");
+        let in_live_library = Uuid::new_v4();
+        crate::test_support::seed_top_parented_item(
+            &f.db,
+            in_live_library,
+            BaseItemKind::Series,
+            "Live",
+            Uuid::parse_str(&movies).expect("id"),
+        )
+        .await;
+
+        assert_eq!(
+            f.sweep().await,
+            SweptItems {
+                deleted_libraries: 1,
+                stale: 0
+            }
+        );
+        assert!(!exists(&f.db, orphan).await);
+        assert!(!exists(&f.db, season).await, "its children go with it");
+        for kept in [kept, view, in_live_library] {
+            assert!(exists(&f.db, kept).await);
+        }
+        assert_eq!(
+            f.sweep().await,
+            SweptItems::default(),
+            "done, the refused delete included"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_library_location_keeps_every_item() {
+        let f = SweepFixture::new(Some("10.11.8")).await;
+        std::fs::remove_dir_all(Path::new(&f.views()).join("Movies")).expect("undefine");
+        let gone = f.movie(&format!("{}/Gone.mkv", f.location("movies"))).await;
+        let unrooted = f.movie(&f.path("elsewhere/Old.mkv")).await;
+
+        assert_eq!(f.sweep().await, SweptItems::default());
+        assert!(
+            exists(&f.db, gone).await,
+            "outside every location, and none resolved"
+        );
+        assert!(exists(&f.db, unrooted).await);
     }
 }

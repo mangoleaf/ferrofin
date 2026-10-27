@@ -302,7 +302,9 @@ def seed_case_duplicates(conn, manifest):
     a music artist. The pairs are read by lower-cased name, not by id: a server may re-key a person."""
     person = first(conn, 'SELECT "Id", "Name", "Path" FROM "BaseItems" WHERE "Type" = ? AND ' + original("BaseItems") + ' ORDER BY "Id" LIMIT 1',
                    (PERSON_TYPE,), "person")
-    peoples = first(conn, 'SELECT "Id", "Name" FROM "Peoples" WHERE ' + original("Peoples") + ' ORDER BY "Id" LIMIT 1', (), "people row")
+    # By name, not by id: Jellyfin gives a Peoples row a random id, so the first by id differs per build.
+    peoples = first(conn, 'SELECT "Id", "Name", "PersonType" FROM "Peoples" WHERE ' + original("Peoples") +
+                    ' ORDER BY "Name", "PersonType", "Id" LIMIT 1', (), "people row")
     link = first(conn, 'SELECT "ItemId", "Role" FROM "PeopleBaseItemMap" WHERE "PeopleId" = ? ORDER BY "ItemId" LIMIT 1',
                  (peoples[0],), "movie linked to a person")
     artist = first(conn, 'SELECT "Id", "Name", "Path" FROM "BaseItems" WHERE "Type" = ? AND ' + original("BaseItems") + ' ORDER BY "Id" LIMIT 1',
@@ -330,7 +332,7 @@ def seed_case_duplicates(conn, manifest):
         "Id": spelled(artist[0], twin), "Name": artist[1].upper(), "CleanName": artist[1].lower(), "SortName": artist[1].upper(),
         "PresentationUniqueKey": twin.hex, "Path": f"{os.path.dirname(artist[2])}/{artist[1].upper()}"}, "music artist")
     return {"movie": uuid.UUID(link[0]).hex,
-            "keys": {"person_item_ascii": person[1].lower(), "people_ascii": peoples[1].lower(),
+            "keys": {"person_item_ascii": person[1].lower(), "people_ascii": peoples[1].lower(), "people_type": peoples[2],
                      "unicode": UNICODE_PEOPLE["small"], "artist": artist[1].lower()}}
 
 
@@ -522,10 +524,10 @@ def guid_casing_state(conn, entry):
     return state
 
 
-def named(conn, table, kind, key):
-    """The rows of `table` (of Type `kind` when it has one) whose name lower-cases to `key`: the ids
+def named(conn, table, kind, key, column="Type"):
+    """The rows of `table` (of `column` `kind` when it has one) whose name lower-cases to `key`: the ids
     of those rows. Lower-cased here, not in SQL, whose lower() leaves an accented capital alone."""
-    where, params = ('"Type" = ?', (kind,)) if kind else ("1 = 1", ())
+    where, params = (f'"{column}" = ?', (kind,)) if kind else ("1 = 1", ())
     return [ident for ident, name in conn.execute(f'SELECT "Id", "Name" FROM "{table}" WHERE {where}', params)
             if name is not None and name.lower() == key]
 
@@ -538,7 +540,11 @@ def case_duplicates_state(conn, entry):
         return sum(count_where(conn, "PeopleBaseItemMap", f'{stored_hex("ItemId")} = ? AND "PeopleId" = ?', (movie, row))
                    for row in people)
 
-    ascii_people, unicode_people = named(conn, "Peoples", None, keys["people_ascii"]), named(conn, "Peoples", None, keys["unicode"])
+    # The ASCII pair counts rows of its own person type: the same name may be credited with another
+    # type too, which no merge folds into it (MergeDuplicatePeople groups by name and type).
+    ascii_people = named(conn, "Peoples", keys["people_type"], keys["people_ascii"], column="PersonType")
+    # Every type: both unicode rows are copies of one seeded row, and no other type bears the name.
+    unicode_people = named(conn, "Peoples", None, keys["unicode"])
     return {"person_item_ascii": len(named(conn, "BaseItems", PERSON_TYPE, keys["person_item_ascii"])),
             "people_ascii": {"rows": len(ascii_people), "links": links(ascii_people)},
             "unicode": {"items": len(named(conn, "BaseItems", PERSON_TYPE, keys["unicode"])),
@@ -654,10 +660,8 @@ DIVERGENCES = {
                               "primary_n32": {"owner": "null", "primary": "n32lower->item"}},
                              "0045 re-spells an owner in another case and nulls a 32-character one; 12.2 keeps them as written"),
     # MergeDuplicatePeople and MergeDuplicateMusicArtists (12.0) run once per adoption in Ferrofin, so a
-    # case-only pair on a 12.x database is merged (people grouped by lower-cased name and type, which
-    # is why the ASCII people group ends with two rows: the fixture already holds a third row of that
-    # name with another type, which the seeder does not write and the merge leaves alone).
-    ("case_duplicates", "12.x"): ({"person_item_ascii": 1, "people_ascii": {"rows": 2, "links": 2},
+    # case-only pair on a 12.x database is merged (people grouped by lower-cased name and type).
+    ("case_duplicates", "12.x"): ({"person_item_ascii": 1, "people_ascii": {"rows": 1, "links": 1},
                                   "unicode": {"items": 1, "peoples": 1, "links": 1}, "artists": 1},
                                  "Ferrofin merges case-only duplicates at adoption; 12.2 does not re-run its routines on 12.x"),
     # Migration 0044 deletes AncestorIds rows naming an item that is not there (what the key's cascade

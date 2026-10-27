@@ -258,7 +258,9 @@ class Api:
             # Consume the results so download/decode failures reach the caller.
             list(pool.map(check, sample))
 
-    def scan(self, timeout, interval=2):
+    def scan(self, timeout, interval=2, trigger=None):
+        """Start a library scan and wait until it has completed. trigger: what starts it instead of
+        POST /Library/Refresh (a request that queues the scan itself); its result is returned."""
         deadline = time.monotonic() + timeout
 
         def task():
@@ -280,7 +282,7 @@ class Api:
             pause()
             before = task()
         previous = before.get("LastExecutionResult")
-        self.request("/Library/Refresh", method="POST")
+        started = trigger() if trigger else self.request("/Library/Refresh", method="POST")
         while True:
             current = task()
             result = current.get("LastExecutionResult")
@@ -288,7 +290,7 @@ class Api:
             if current.get("State") == "Idle" and result and result != previous:
                 if result.get("Status") != "Completed":
                     raise CheckError("library scan did not complete successfully")
-                return
+                return started
             pause()
 
 

@@ -226,6 +226,27 @@ class NewShapeSeeders(Scratch):
         self.assertEqual(conn.execute("SELECT Path FROM BaseItems WHERE Name = 'SYNTHETIC SOLOIST'").fetchone()[0],
                          "/media/music/SYNTHETIC SOLOIST")
 
+    def test_the_people_pair_counts_rows_of_its_own_type(self):
+        # The same name credited with another type is no part of the pair: no merge folds it in,
+        # so which Peoples row the seed copies cannot change what a merge leaves.
+        entry, wanted = self.seed("case_duplicates")
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO Peoples (Id, Name, PersonType) VALUES (?, 'Synthetic Actor', 'Director')",
+                         (str(uuid.uuid4()).upper(),))
+        self.assertEqual(messy.read_state(self.db, wanted)["case_duplicates"]["people_ascii"], {"rows": 2, "links": 2})
+
+    def test_the_people_row_copied_is_the_first_by_name_not_by_id(self):
+        # Jellyfin gives Peoples rows random ids: a linked row whose name sorts first and whose id
+        # sorts last is the one copied, so every build of the fixture seeds the same person.
+        first_by_name = "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("INSERT INTO Peoples VALUES (?, 'Aardvark Actor', 'Actor')", (first_by_name,))
+            conn.execute("INSERT INTO PeopleBaseItemMap VALUES (?, ?, 'Support', 1, 1)", (ITEM, first_by_name))
+        self.seed("case_duplicates")
+        names = {name for (name,) in self.conn().execute("SELECT Name FROM Peoples")}
+        self.assertIn("AARDVARK ACTOR", names)
+        self.assertNotIn("SYNTHETIC ACTOR", names)
+
     def test_the_pairs_are_read_by_name_so_a_re_keyed_row_still_counts(self):
         entry, wanted = self.seed("case_duplicates")
         with closing(sqlite3.connect(self.db)) as conn, conn:

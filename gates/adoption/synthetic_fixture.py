@@ -47,6 +47,8 @@ SEGMENT_PROVIDER = "Intro Skipper"
 # MediaSegmentType: (type, start seconds, end seconds) on the locked movie.
 SEGMENTS = ((5, 0, 30), (4, 570, 600))
 TICKS = 10_000_000
+#: How much of a refused request's response body its error keeps.
+REASON_BYTES = 200
 
 
 class Api:
@@ -78,7 +80,10 @@ class Api:
             time.sleep(1)
         if code not in allowed:
             route = re.sub(r"/[0-9a-fA-F-]{32,36}(?=/|$)", "/<id>", path)
-            raise CheckError(f"synthetic fixture {method} {route} returned {code}")
+            # The query and the body name what was refused (synthetic data only); Jellyfin logs
+            # the exception behind a bare "Error processing request." in the server log.
+            raise CheckError(f"synthetic fixture {method} {route} returned {code} "
+                             f"(query {sorted(query)}, body {payload[:REASON_BYTES]!r})")
         if code >= 400:
             return {"status": code}
         return payload if binary else json.loads(payload) if payload else None
@@ -245,8 +250,12 @@ def seed(base):
         "Users": [{"UserId": child["Id"], "CanEdit": False}], "IsPublic": False})["Id"]
     private_playlist = api.post("/Playlists", {"Name": "Synthetic private playlist", "MediaType": "Video",
         "Ids": [movie, movies["Amber Harbor"]["Id"]], "UserId": adult, "IsPublic": False})["Id"]
-    collection = api.post("/Collections", name="Synthetic collection", ids=",".join(
-        [movies["Amber Harbor"]["Id"], movie]), isLocked="true")["Id"]
+    # The first collection creates the Collections library, and AddVirtualFolder queues a library
+    # scan for it in the background (CollectionManager.EnsureLibraryFolder). That scan can remove a
+    # collection created after it listed the folder, so the next one waits for it to finish.
+    collection = api.scan(300, interval=1, trigger=lambda: api.post(
+        "/Collections", name="Synthetic collection", ids=",".join([movies["Amber Harbor"]["Id"], movie]),
+        isLocked="true"))["Id"]
     # The initial full collection refresh can reload an empty collection.xml.
     # The normal add-members action settles membership after creation finishes.
     api.post(f"/Collections/{collection}/Items", ids=",".join([movies["Amber Harbor"]["Id"], movie]))

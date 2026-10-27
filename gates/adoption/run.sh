@@ -385,9 +385,13 @@ for spec in "${MESSY_TABLE[@]}"; do
 done
 # The scale fixture (scale.py): the clean 10.11.11 library cloned up to 40,000 items by SQL. The same
 # image adopts a fresh copy, and the run records what that cost (recorded, not gated). No scan
-# runs and no HTTP probe is compared: the clones have no files, so only the boot, the file's
-# integrity, a quiet second boot, the table digests and the survival of every cloned item are
-# checked. The disk it needs is checked first; a run that fills the disk takes the host with it.
+# runs and no HTTP probe is compared: the clones' files are hard links to their templates', so only
+# the boot, the file's integrity, a quiet second boot, the table digests and the survival of every
+# cloned item are checked. The disk it needs is checked first; a run that fills the disk takes the
+# host with it. It mounts media-scale (scale.py: the shared tree plus a link at each clone's path,
+# which the adoption's stale-file sweep looks for), else the shared tree of an older fixture directory.
+SCALE_MEDIA=("${MEDIA[@]}")
+[ ! -d "$FIXTURES/media-scale" ] || SCALE_MEDIA=(-v "$FIXTURES/media-scale:/media:ro")
 # expected generation|fixture directory|host port
 SCALE_TABLE=(
   "10.11.11|jellyfin-10.11.11-scale|18079"
@@ -426,7 +430,7 @@ for spec in "${SCALE_TABLE[@]}"; do
     -e FERROFIN_DATA_DIR=/config -e FERROFIN_CACHE_DIR=/cache \
     -e HTTP_PROXY=http://127.0.0.1:9 -e HTTPS_PROXY=http://127.0.0.1:9 \
     -e ALL_PROXY=http://127.0.0.1:9 -e NO_PROXY=127.0.0.1,localhost \
-    -v "$dst:/config" -v "$dst-cache:/cache" "${MEDIA[@]}" "$IMAGE" >/dev/null
+    -v "$dst:/config" -v "$dst-cache:/cache" "${SCALE_MEDIA[@]}" "$IMAGE" >/dev/null
   # Disk and memory are sampled from the start of the first boot until it has settled.
   python3 "$HERE/scale.py" sample "$name" "$dst" "$dst.samples.json" & sampler=$!
   why=(); mark_from=0

@@ -217,6 +217,10 @@ class BuildTest(unittest.TestCase):
         library(source / "data/jellyfin.db")
         (source / "synthetic-ready.json").write_text("{}")
         self.target = self.root / scale.DERIVED[0]
+        # The templates' files, which each clone's file links to.
+        for path in ("movies/Alpha/Alpha.mkv", "movies/Beta/Beta.mkv", "shows/Show/S01/E01.mkv"):
+            (self.root / "media" / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / "media" / path).write_bytes(b"media")
 
     def tearDown(self):
         self.dir.cleanup()
@@ -228,6 +232,20 @@ class BuildTest(unittest.TestCase):
         manifest = json.loads((self.target / "scale.json").read_text())
         self.assertEqual((manifest["items"], manifest["source"], manifest["added"]["BaseItems"]), (100, "jellyfin-10.11.11", 95))
         self.assertEqual(os.stat(self.target / "scale.json").st_mode & 0o777, 0o600)
+
+    def test_every_clone_has_a_file_linked_to_its_templates(self):
+        # Adopting a 10.11 database removes an item whose file is gone under a readable location.
+        scale.build(self.root, 100)
+        tree = self.root / scale.SCALE_MEDIA
+        paths = [path for (path,) in rows(self.target / "data/jellyfin.db",
+                                          f"SELECT Path FROM BaseItems WHERE Path LIKE '{scale.CLONE_MARK}'")]
+        self.assertEqual(len(paths), 95)
+        for path in paths:
+            self.assertTrue((tree / path.removeprefix("/media/")).is_file(), path)
+        self.assertEqual(os.stat(tree / "movies/scale-00001/Alpha.mkv").st_ino,
+                         os.stat(self.root / "media/movies/Alpha/Alpha.mkv").st_ino)
+        self.assertTrue((tree / "shows/Show/S01/E01.mkv").is_file(), "the shared tree is copied too")
+        self.assertFalse((self.root / (scale.SCALE_MEDIA + ".partial")).exists())
 
     def test_a_built_fixture_is_kept_and_an_unbuilt_source_is_named(self):
         scale.build(self.root, 100)
