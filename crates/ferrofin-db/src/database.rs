@@ -3562,6 +3562,12 @@ mod tests {
         sqlx::Connection::close(conn).await.expect("close");
     }
 
+    /// Every migration's version, in order. Not `1..=head`: the numbers may skip
+    /// one that an open change has taken and has not merged yet.
+    fn chain_versions() -> Vec<i64> {
+        MIGRATOR.iter().map(|m| m.version).collect()
+    }
+
     async fn recorded_versions(db: &Database) -> Vec<i64> {
         sqlx::query_scalar(r#"SELECT version FROM "_sqlx_migrations" ORDER BY version"#)
             .fetch_all(db.pool())
@@ -3681,9 +3687,7 @@ mod tests {
 
         // Shape migrations baselined, everything else actually applied.
         let versions = recorded_versions(&db).await;
-        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
-        let recorded = i64::try_from(versions.len()).expect("small count");
-        assert_eq!(recorded, head, "every migration recorded");
+        assert_eq!(versions, chain_versions(), "every migration recorded");
         assert!(versions.contains(&7));
         assert!(versions.contains(&32) && versions.contains(&33));
         // 0032 EXECUTED here (the 10.11.8 shape had to be converged), so the
@@ -4614,8 +4618,7 @@ mod tests {
             .expect("adoption succeeds");
 
         let versions = recorded_versions(&db).await;
-        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
-        assert_eq!(i64::try_from(versions.len()).expect("small"), head);
+        assert_eq!(versions, chain_versions());
         assert!(versions.contains(&32), "0032 baselined");
         assert!(versions.contains(&33), "0033 executed");
         // 0032 was baselined, never run: no rebuild happened, no snapshot.
@@ -4767,11 +4770,7 @@ mod tests {
         let db = Database::connect_sized(&url, Some(2))
             .await
             .expect("boot after the crash completes the chain");
-        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
-        assert_eq!(
-            i64::try_from(recorded_versions(&db).await.len()).expect("small"),
-            head
-        );
+        assert_eq!(recorded_versions(&db).await, chain_versions());
         // No second adoption happened: no safety copy was taken by the gate.
         assert!(!path.with_extension("db.pre-ferrofin").exists());
         assert_eq!(
