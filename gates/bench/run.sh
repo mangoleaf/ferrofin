@@ -30,6 +30,7 @@ CALLER=$PWD
 cd "$(dirname "$0")/../.."
 # shellcheck source=gates/lib.sh
 source gates/lib.sh
+gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/lib.sh, gl-968)
 
 # ── tunables (§2) ──────────────────────────────────────────────────────────
 WARMUP_S=${WARMUP_S:-30}        # discarded seconds at the same rate before each window
@@ -347,6 +348,7 @@ stop_sampler() {
 cleanup() {
   local rc=$? cid deadline cleanup_rc=0
   set +e
+  gates_ack   # before TERM gets its default action back: no TERM is sent again after it
   trap - EXIT INT TERM
   [ -z "$CURRENT_PHASE" ] || state "$CURRENT_PHASE" failed "interrupted or aborted (exit $rc)"
   state cleanup running
@@ -616,8 +618,11 @@ PY_ISOLATION
 rc=0; SERVER_PID=""
 # shellcheck disable=SC2317,SC2329  # only reachable through phase/isolated_phase/trap dispatch; SC2317 before 0.11
 interrupt_run() {
+  gates_ack
   trap - INT TERM
-  if [ -n "$SERVER_PID" ]; then kill -TERM "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" || true; fi
+  # the server's shell had the TERM too (gates_supervise sends it to the whole worker group) and may have
+  # dropped it under bash 5.2: gates_stop sends it again until it lands
+  [ -z "$SERVER_PID" ] || gates_stop "$SERVER_PID"
   exit 130
 }
 trap interrupt_run INT TERM

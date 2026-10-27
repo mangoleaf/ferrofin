@@ -41,6 +41,7 @@ START_EPOCH=$(date +%s)
 source gates/lib.sh          # the output root and the local-disk check
 # shellcheck source=gates/parity/lib.sh
 source gates/parity/lib.sh   # READY_TIMEOUT_S, HTTP_TIMEOUT_S, CLEANUP_TIMEOUT_S, KILL_GRACE_S, POLL_S, and the readiness check
+gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/lib.sh, gl-968)
 
 PARITY_CAP_S=${PARITY_CAP_S:-7200}
 PARITY_REQUEST_TIMEOUT=${PARITY_REQUEST_TIMEOUT:-30}
@@ -146,6 +147,7 @@ cleanup() {   # the EXIT trap: stops what runs, removes the containers, and make
   set +e
   trap - EXIT
   trap '' INT TERM HUP   # a second signal must not abort the teardown
+  gates_ack
   # Stop whatever is still running first: a boot in progress, the comparison.
   for job in $(jobs -p); do kill "$job" 2>/dev/null; done
   wait 2>/dev/null

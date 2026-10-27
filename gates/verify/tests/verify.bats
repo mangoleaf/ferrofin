@@ -444,7 +444,7 @@ real_item_untouched() {
 
 # token_hidden <pid>: the script's command line (read while it runs) names the script and not
 # the token, and no request so far carried the token in its URL.
-token_hidden() {
+token_hidden() {   # $1 is the supervisor (gates_supervise); its worker has the same arguments
   local cmdline=
   for _ in $(seq 1 100); do
     cmdline=$(tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null) || break
@@ -655,15 +655,35 @@ wait_for_refreshes() {
 
 @test "run: SIGINT mid-run exits 130 after the cleanup" {
   interrupted_run
+  worker=$(pgrep -P "$pid")   # the check goes to a worker in a session of its own (gates_supervise)
+  [ -n "$worker" ]
   kill -INT "$pid"
   status=0
   wait "$pid" || status=$?
   set +m
   [ "$status" -eq 130 ]
+  [ -z "$(pgrep -s "$worker")" ]
   [ "$(grep -c -- "$FERROFIN_TOKEN" requests.log)" = 0 ]
   grep -q 'scratch files removed' run.log
   [ -z "$(ls -A lib/scratch)" ]
   [ -z "$(ls -A work)" ]
+  real_item_untouched
+}
+
+@test "run: a TERM to its process group exits 143 after the cleanup, leaving nothing of the check's own session" {
+  interrupted_run
+  worker=$(pgrep -P "$pid")   # the check goes to a worker in a session of its own (gates_supervise)
+  [ -n "$worker" ]
+  kill -TERM -- "-$pid"
+  status=0
+  wait "$pid" || status=$?
+  set +m
+  [ "$status" -eq 143 ]
+  [ "$(grep -c -- "$FERROFIN_TOKEN" requests.log)" = 0 ]
+  grep -q 'scratch files removed' run.log
+  [ -z "$(ls -A lib/scratch)" ]
+  [ -z "$(ls -A work)" ]
+  [ -z "$(pgrep -s "$worker")" ]
   real_item_untouched
 }
 
@@ -672,7 +692,7 @@ wait_for_refreshes() {
   interrupted_run '.[2].hold = true'
   kill -INT "$pid"
   wait_for_refreshes 3
-  [ -n "$(ls -A work)" ]
+  compgen -G 'work/tmp.*' >/dev/null   # the check's own directory (beside it, its supervisor's)
   kill -INT "$pid"
   status=0
   wait "$pid" || status=$?

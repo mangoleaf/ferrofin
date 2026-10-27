@@ -28,6 +28,7 @@ cd "$(dirname "$0")/../.." || exit 2
 . gates/lib.sh
 # shellcheck source=gates/verify/lib.sh
 . gates/verify/lib.sh   # verify_combine, verify_finish
+gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/lib.sh, gl-968)
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; }
 die() { echo "verify: $*" >&2; exit 2; }
@@ -81,6 +82,7 @@ AUTH='MediaBrowser Client="gates", Device="gates", DeviceId="gates-verify", Vers
 cleanup() {   # only the container this run made (its id in the cidfile): never another run's of the same name
   local rc=$?
   trap '' INT TERM HUP
+  gates_ack
   if [ -s "$SECRETS/cid" ]; then
     dock logs "$(cat "$SECRETS/cid")" > "$OUT/server.log" 2>&1
     dock rm -f "$(cat "$SECRETS/cid")" >/dev/null 2>&1

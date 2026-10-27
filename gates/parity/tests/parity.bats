@@ -484,3 +484,20 @@ containers_gone() { # no container left in the fake docker, no server process le
   grep -q '^rm -f parity-ferrofin' "$FAKE_STATE/calls"
   containers_gone
 }
+
+@test "run.sh: a TERM to run.sh alone, not its group, does the same and leaves nothing of the run's own session" {
+  PARITY_CAP_S=300 setsid "$PARITY/run.sh" --testdata td --out out --oracle "$PIN" --ferrofin ferrofin:slow &
+  leader=$!
+  echo "$leader" > "$TMP/leader"
+  for _ in $(seq 1 60); do [ -f out/ferrofin/boot.json ] && [ -f out/oracle/boot.json ] && break; sleep 0.5; done
+  [ -f out/oracle/boot.json ]
+  sleep 1
+  worker=$(pgrep -P "$leader")   # the run goes to a worker in a session of its own (gates_supervise)
+  [ -n "$worker" ]
+  kill -TERM "$leader"
+  status=0; wait "$leader" || status=$?
+  [ "$status" -eq 143 ]
+  grep -q "RUN FAILED" out/report.html
+  containers_gone
+  [ -z "$(pgrep -s "$worker")" ]
+}
