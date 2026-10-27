@@ -4869,8 +4869,9 @@ mod tests {
         .execute(db.pool())
         .await
         .expect("program insert under FK enforcement");
-        // The cascade works through the CORRECT target: deleting the tuner
-        // clears its channel, and the channel its programme.
+        // Deleting the tuner leaves its channel for the guide refresh to prune
+        // (0046), and the programme key cascades through the CORRECT target:
+        // deleting the channel clears its programme.
         sqlx::query(r#"DELETE FROM "FerrofinLiveTvTunerHosts" WHERE "Id" = 't-fk'"#)
             .execute(db.pool())
             .await
@@ -4881,8 +4882,19 @@ mod tests {
         )
         .fetch_one(db.pool())
         .await
+        .expect("tuner delete audit");
+        assert_eq!(left, 2, "a tuner's delete leaves its channel and programme");
+        sqlx::query(r#"DELETE FROM "FerrofinLiveTvChannels" WHERE "Id" = 'c-fk'"#)
+            .execute(db.pool())
+            .await
+            .expect("channel delete");
+        let left: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM "FerrofinLiveTvPrograms" WHERE "Id"='p-fk'"#,
+        )
+        .fetch_one(db.pool())
+        .await
         .expect("cascade audit");
-        assert_eq!(left, 0, "delete must cascade tuner → channel → programme");
+        assert_eq!(left, 0, "delete must cascade channel → programme");
     }
 
     #[tokio::test]

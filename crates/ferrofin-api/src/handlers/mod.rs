@@ -1311,8 +1311,17 @@ pub const VERIFIED: &[Verified] = &[
                (ListingsBackend::of, provider_channels) → schedules_direct/mod.rs \
                SchedulesDirect::get_lineups (ListingsManager.GetLineups, \
                XmlTvListingsProvider.GetLineups, SchedulesDirect.GetHeadends)",
-        date: "2026-10-21",
+        date: "2026-10-24",
         divergences: &[
+            "An XMLTV guide declaring an encoding name the WHATWG labels know but .NET's \
+         encoding table does not (iso8859-9, iso88599, x-cp1254, …) is decoded by the \
+         WHATWG encoding; upstream's XmlReader refuses the name, so the guide is unreadable \
+         and Lineups answers 500. Fix path: gl-939.",
+            "An XMLTV guide using an undeclared namespace prefix is read, where upstream's \
+         XmlReader refuses it (500); a <tv> that held programmes but no channel, followed by \
+         something not well-formed, is unreadable here (500) where upstream's GetChannels \
+         stops at </tv> and answers []; and prefixed channel elements are matched by local \
+         name. Fix path: gl-942.",
             "A blank id is a 404 whatever the type; upstream calls \
          GetProvider(type).GetLineups(null, …), which is a 404 for an unknown type but \
          dereferences the null provider (500) for xmltv and SchedulesDirect. Jellyfin bug \
@@ -1321,6 +1330,36 @@ pub const VERIFIED: &[Verified] = &[
          headends query; upstream concatenates them raw, so a value holding `&` or `#` \
          changes the query. Jellyfin bug not ported.",
         ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/LiveTv/TunerHosts",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "AddTunerHost",
+        ferrofin: "handlers/live_tv.rs add_tuner_host → ferrofin-livetv manager.rs \
+               save_tuner_host (tuner_host::find_host, guide_repository::existing_config_id, \
+               TunerHost::validate, guide_repository::store_tuner_host), then \
+               queue_guide_refresh (TunerHostManager.SaveTunerHost, M3UTunerHost.Validate, \
+               HdHomerunHost.Validate)",
+        date: "2026-10-24",
+        divergences: &[
+            "An M3U tuner without a Url, or with a null one, is a 400; upstream's \
+         M3uParser.GetListingsStream dereferences the null Url and answers a \
+         NullReferenceException 500. Jellyfin bug not ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "delete",
+        path: "/LiveTv/TunerHosts",
+        upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
+        upstream_method: "DeleteTunerHost",
+        ferrofin: "handlers/live_tv.rs delete_tuner_host → ferrofin-livetv manager.rs \
+               delete_tuner_host, then queue_guide_refresh → refresh_guide's clean_database \
+               prune (TunerHostManager.DeleteTunerHost, GuideManager.CleanDatabase)",
+        date: "2026-10-24",
+        divergences: &[],
         refs: &[],
     },
     Verified {
