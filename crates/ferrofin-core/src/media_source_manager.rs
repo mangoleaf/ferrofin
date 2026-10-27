@@ -3086,7 +3086,7 @@ mod tests {
             PermissionKind::EnablePlaybackRemuxing,
             PermissionKind::EnableVideoPlaybackTranscoding,
         ] {
-            crate::user_entity_ext::set_permission(db.pool(), &user.id, kind, false)
+            crate::user_entity_ext::set_permission(&db, &user.id, kind, false)
                 .await
                 .expect("revoke");
         }
@@ -3122,7 +3122,7 @@ mod tests {
         assert!(granted[0].supports_transcoding);
 
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user.id,
             PermissionKind::EnablePlaybackRemuxing,
             false,

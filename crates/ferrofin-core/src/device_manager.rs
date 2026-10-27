@@ -749,7 +749,7 @@ mod tests {
 
         // Granting EnableAllDevices re-opens it.
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user.id,
             PermissionKind::EnableAllDevices,
             true,
@@ -819,7 +819,7 @@ mod tests {
 
         // Only the explicitly enabled device becomes visible.
         crate::user_entity_ext::set_preference(
-            db.pool(),
+            &db,
             &user.id,
             PreferenceKind::EnabledDevices,
             &["dev-mid".to_owned()],
@@ -849,7 +849,7 @@ mod tests {
 
         // `EnableAllDevices` opens all three, still newest-activity first.
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user.id,
             PermissionKind::EnableAllDevices,
             true,
@@ -878,7 +878,7 @@ mod tests {
         assert!(ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")).is_empty());
 
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user.id,
             PermissionKind::IsAdministrator,
             true,
@@ -930,7 +930,7 @@ mod tests {
             .expect("options");
 
         crate::user_entity_ext::set_permission(
-            db.pool(),
+            &db,
             &user_a.id,
             PermissionKind::IsAdministrator,
             true,
