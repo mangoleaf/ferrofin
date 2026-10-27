@@ -1094,7 +1094,18 @@ pub(crate) fn append_predicates(qb: &mut QueryBuilder<Sqlite>, filter: &Internal
 
     // IsVirtualItem also covers IsMissing (C# `filter.IsVirtualItem ?? filter.IsMissing`).
     if let Some(virt) = filter.is_virtual_item.or(filter.is_missing) {
-        qb.push(r#" AND bi."IsVirtualItem" = "#).push_bind(virt);
+        // A search matches by name, which no index serves, and its `isMissing=false`
+        // (jellyfin-web sends it) pulled the type-and-library probe onto the
+        // `TopParentId`-led `IsVirtualItem` index: 12 ms against 8 ms on
+        // `IX_BaseItems_Type_TopParentId_StartDate` on the benchmark corpus (gl-976). The
+        // `+` keeps the equality off the index; plan pinned by
+        // `a_search_probes_type_and_library_not_the_virtual_item_index`.
+        qb.push(if non_blank(filter.search_term.as_ref()).is_some() {
+            r#" AND +bi."IsVirtualItem" = "#
+        } else {
+            r#" AND bi."IsVirtualItem" = "#
+        })
+        .push_bind(virt);
     }
 
     if let Some(special) = filter.is_special_season {
@@ -3559,6 +3570,63 @@ mod tests {
             "{plan:#?}"
         );
         assert!(!plan.iter().any(|d| d.starts_with("SCAN bi")), "{plan:#?}");
+    }
+
+    /// A search with jellyfin-web's `isMissing=false` probes its types and libraries through
+    /// `IX_BaseItems_Type_TopParentId_StartDate`, as before `IsMissing` became an
+    /// `IsVirtualItem` filter: on the `TopParentId`-led `IsVirtualItem` index the benchmark's
+    /// search page took 12 ms against 8 (gl-976).
+    #[tokio::test]
+    async fn a_search_probes_type_and_library_not_the_virtual_item_index() {
+        use sqlx::{Execute, Row};
+        let db = crate::test_support::test_db().await;
+        let filter = InternalItemsQuery {
+            search_term: Some("crimson".to_owned()),
+            is_missing: Some(false),
+            recursive: true,
+            include_item_types: vec![
+                BaseItemKind::Movie,
+                BaseItemKind::Series,
+                BaseItemKind::Episode,
+            ],
+            top_parent_ids: vec![uuid::Uuid::from_u128(0x8691), uuid::Uuid::from_u128(0x8692)],
+            limit: Some(800),
+            ..InternalItemsQuery::default()
+        };
+        let mut builder = super::build_query(&filter, super::QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan: Vec<String> = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain query plan")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect();
+        assert!(
+            plan.iter()
+                .any(|d| d.contains("USING INDEX IX_BaseItems_Type_TopParentId_StartDate")),
+            "{plan:#?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|d| d.contains("IX_BaseItems_TopParentId_Type_IsVirtualItem")),
+            "{plan:#?}"
+        );
+        // Without a search term the equality is not pinned: no other query's plan moves.
+        let browse = InternalItemsQuery {
+            search_term: None,
+            ..filter
+        };
+        let sql = super::build_query(&browse, super::QueryShape::FullRows).into_sql();
+        let sql = sql.as_str();
+        assert!(
+            sql.contains(r#" AND bi."IsVirtualItem" = "#)
+                && !sql.contains(r#"+bi."IsVirtualItem""#),
+            "{sql}"
+        );
     }
 
     /// The `ItemValues` sort keys (`OrderMapper`'s `Artist`, `AlbumArtist`,
