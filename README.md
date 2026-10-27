@@ -236,6 +236,84 @@ Withheld, because the servers did different work or the evidence is incomplete:
 
 Source: detached-5112240e1923-20261026-0101/bench, detached-5112240e1923-20261026-0151/bench, detached-5112240e1923-20261026-0219/bench; commit `5112240e`, image `sha256:673a122ff717`, fixture `4b217db66afc`. The full tables are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md); what each number means is in [`gates/bench/README.md`](gates/bench/README.md).
 
+### Against the previous release
+
+Ferrofin **v1.4.0** against **Ferrofin v1.3.2** (`ghcr.io/mangoleaf/ferrofin:v1.3.2`) in the release's A/B gate (3 interleaved pairs on one host, 2026-10-27): of 62 gated cells, **4 improved**, 47 are within noise and **7 regressed**, and 4 could not be compared (it blocks like a regression); **11 gated cells blocked the release**.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/previous-release-dark.svg">
+  <img alt="Ferrofin v1.4.0 against Ferrofin v1.3.2, the release A/B gate: of 62 gated cells, 4 improved, 47 within noise, 7 regressed, 4 not comparable." src="docs/results/v1.4.0/previous-release.svg">
+</picture>
+
+<details><summary>Against Ferrofin v1.3.2: every gated cell</summary>
+
+| Cell | Previous | Candidate | Change | Verdict |
+|---|---|---|---|---|
+| loaded/endpoints/detail:item | 1.54 ms | 1.97 ms | +27.9% | within noise |
+| loaded/endpoints/detail:similar | 4.50 ms | 4.49 ms | -0.1% | within noise |
+| loaded/endpoints/home:latest-movies | 7.63 ms | 4.91 ms | -35.7% | improved |
+| loaded/endpoints/home:latest-music | 3.91 ms | 2.96 ms | -24.1% | improved |
+| loaded/endpoints/home:latest-shows | 8.62 ms | 9.80 ms | +13.8% | within noise |
+| loaded/endpoints/home:nextup | 9.42 ms | 10.9 ms | +15.8% | regressed |
+| loaded/endpoints/home:resume-audio | 5.71 ms | 5.84 ms | +2.2% | within noise |
+| loaded/endpoints/home:resume-book | 1.21 ms | 1.56 ms | +28.8% | within noise |
+| loaded/endpoints/home:resume-video | 6.98 ms | 7.49 ms | +7.2% | within noise |
+| loaded/endpoints/home:views | 1.70 ms | 2.53 ms | +48.9% | regressed |
+| loaded/endpoints/movies:items | 10.7 ms | 11.7 ms | +10.2% | within noise |
+| loaded/endpoints/playback:intros | 1.42 ms | 1.46 ms | +2.6% | within noise |
+| loaded/endpoints/playback:playbackinfo | 1.16 ms | 1.57 ms | +35.9% | within noise |
+| loaded/endpoints/playback:playing | 2.74 ms | 2.74 ms | -0.1% | within noise |
+| loaded/endpoints/playback:segments | 1.83 ms | 1.84 ms | +0.5% | within noise |
+| loaded/endpoints/search:artists | 1.81 ms | 1.72 ms | -4.6% | within noise |
+| loaded/endpoints/search:items | 18.5 ms | 19.6 ms | +6.3% | within noise |
+| loaded/endpoints/search:persons | — | — | — | not comparable: responses differ from the baseline's |
+| loaded/endpoints/search:programs | 1.07 ms | 1.30 ms | +21.8% | within noise |
+| loaded/endpoints/search:videos | 5.86 ms | 5.69 ms | -2.9% | within noise |
+| loaded/endpoints/series:episodes | 0.85 ms | 1.38 ms | +61.9% | regressed |
+| loaded/endpoints/series:item | 1.70 ms | 2.83 ms | +66.4% | regressed |
+| loaded/endpoints/series:seasons | 1.41 ms | 1.57 ms | +12.0% | within noise |
+| loaded/endpoints/series:similar | 3.44 ms | 3.46 ms | +0.5% | within noise |
+| loaded/screens/detail | 6.00 ms | 6.00 ms | +0.0% | within noise |
+| loaded/screens/home | 12.0 ms | 14.0 ms | +16.7% | within noise |
+| loaded/screens/movies | 13.0 ms | 14.0 ms | +7.7% | within noise |
+| loaded/screens/playback | 7.00 ms | 8.00 ms | +14.3% | within noise |
+| loaded/screens/search | — | — | — | not comparable: responses differ from the baseline's |
+| loaded/screens/series | 5.00 ms | 6.00 ms | +20.0% | within noise |
+| memory/peak under load | 226 MiB | 238 MiB | +5.1% | within noise |
+| memory/steady idle | 165 MiB | 175 MiB | +6.2% | within noise |
+| unloaded/endpoints/detail:item | 1.60 ms | 1.99 ms | +24.8% | within noise |
+| unloaded/endpoints/detail:similar | 4.57 ms | 4.52 ms | -1.2% | within noise |
+| unloaded/endpoints/home:latest-movies | 7.95 ms | 5.02 ms | -36.9% | improved |
+| unloaded/endpoints/home:latest-music | 4.03 ms | 3.01 ms | -25.3% | improved |
+| unloaded/endpoints/home:latest-shows | 9.00 ms | 9.81 ms | +9.0% | within noise |
+| unloaded/endpoints/home:nextup | 9.66 ms | 11.0 ms | +13.8% | within noise |
+| unloaded/endpoints/home:resume-audio | 5.85 ms | 5.93 ms | +1.3% | within noise |
+| unloaded/endpoints/home:resume-book | 1.24 ms | 1.55 ms | +25.2% | within noise |
+| unloaded/endpoints/home:resume-video | 7.11 ms | 7.54 ms | +6.1% | within noise |
+| unloaded/endpoints/home:views | 1.66 ms | 2.57 ms | +55.3% | regressed |
+| unloaded/endpoints/movies:items | 10.9 ms | 12.0 ms | +10.1% | within noise |
+| unloaded/endpoints/playback:intros | 1.46 ms | 1.42 ms | -2.8% | within noise |
+| unloaded/endpoints/playback:playbackinfo | 1.21 ms | 1.69 ms | +39.0% | within noise |
+| unloaded/endpoints/playback:playing | 2.74 ms | 2.60 ms | -5.2% | within noise |
+| unloaded/endpoints/playback:segments | 1.85 ms | 1.82 ms | -1.6% | within noise |
+| unloaded/endpoints/search:artists | 1.79 ms | 1.66 ms | -6.9% | within noise |
+| unloaded/endpoints/search:items | 18.9 ms | 19.8 ms | +4.6% | within noise |
+| unloaded/endpoints/search:persons | — | — | — | not comparable: responses differ from the baseline's |
+| unloaded/endpoints/search:programs | 1.15 ms | 1.32 ms | +15.4% | within noise |
+| unloaded/endpoints/search:videos | 5.97 ms | 5.71 ms | -4.3% | within noise |
+| unloaded/endpoints/series:episodes | 0.85 ms | 1.36 ms | +60.5% | regressed |
+| unloaded/endpoints/series:item | 1.75 ms | 2.86 ms | +63.1% | regressed |
+| unloaded/endpoints/series:seasons | 1.45 ms | 1.59 ms | +10.2% | within noise |
+| unloaded/endpoints/series:similar | 3.55 ms | 3.54 ms | -0.3% | within noise |
+| unloaded/screens/detail | 6.00 ms | 6.50 ms | +8.3% | within noise |
+| unloaded/screens/home | 13.0 ms | 14.0 ms | +7.7% | within noise |
+| unloaded/screens/movies | 13.0 ms | 14.0 ms | +7.7% | within noise |
+| unloaded/screens/playback | 7.00 ms | 7.50 ms | +7.1% | within noise |
+| unloaded/screens/search | — | — | — | not comparable: responses differ from the baseline's |
+| unloaded/screens/series | 5.50 ms | 6.00 ms | +9.1% | within noise |
+
+</details>
+
 ### Adopting an existing Jellyfin database
 
 Each supported Jellyfin version and upgrade route, adopted in place by Ferrofin **v1.4.0** (commit `5112240e1923`) in a local gates session on 2026-10-26: **13 of 14 passed**. Adoption is one-way; see [Migrating from Jellyfin](#migrating-from-jellyfin).

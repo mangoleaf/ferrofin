@@ -1,4 +1,650 @@
 {
+ "ab": {
+  "blocking": [
+   "loaded/endpoints/home:nextup",
+   "loaded/endpoints/home:views",
+   "loaded/endpoints/search:persons",
+   "loaded/endpoints/series:episodes",
+   "loaded/endpoints/series:item",
+   "loaded/screens/search",
+   "unloaded/endpoints/home:views",
+   "unloaded/endpoints/search:persons",
+   "unloaded/endpoints/series:episodes",
+   "unloaded/endpoints/series:item",
+   "unloaded/screens/search"
+  ],
+  "cells": [
+   {
+    "a_median": 1.5384845,
+    "b_median": 1.9681875,
+    "cell": "loaded/endpoints/detail:item",
+    "kind": "endpoints",
+    "pct": 27.930278140598748,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 4.4978715000000005,
+    "b_median": 4.494801000000001,
+    "cell": "loaded/endpoints/detail:similar",
+    "kind": "endpoints",
+    "pct": -0.06826562297299409,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 7.63421,
+    "b_median": 4.908025,
+    "cell": "loaded/endpoints/home:latest-movies",
+    "kind": "endpoints",
+    "pct": -35.71011276870822,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "improved"
+   },
+   {
+    "a_median": 3.906859,
+    "b_median": 2.964874,
+    "cell": "loaded/endpoints/home:latest-music",
+    "kind": "endpoints",
+    "pct": -24.11105698977106,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "improved"
+   },
+   {
+    "a_median": 8.6168465,
+    "b_median": 9.802582,
+    "cell": "loaded/endpoints/home:latest-shows",
+    "kind": "endpoints",
+    "pct": 13.760666387639606,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 9.419824,
+    "b_median": 10.911233,
+    "cell": "loaded/endpoints/home:nextup",
+    "kind": "endpoints",
+    "pct": 15.832663115574125,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "regressed"
+   },
+   {
+    "a_median": 5.713784,
+    "b_median": 5.842028,
+    "cell": "loaded/endpoints/home:resume-audio",
+    "kind": "endpoints",
+    "pct": 2.24446706420823,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.209794,
+    "b_median": 1.558151,
+    "cell": "loaded/endpoints/home:resume-book",
+    "kind": "endpoints",
+    "pct": 28.79473695521717,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 6.981401,
+    "b_median": 7.487538,
+    "cell": "loaded/endpoints/home:resume-video",
+    "kind": "endpoints",
+    "pct": 7.249791266824522,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.6984810000000001,
+    "b_median": 2.529544,
+    "cell": "loaded/endpoints/home:views",
+    "kind": "endpoints",
+    "pct": 48.92977902019509,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "regressed"
+   },
+   {
+    "a_median": 10.661304999999999,
+    "b_median": 11.7456585,
+    "cell": "loaded/endpoints/movies:items",
+    "kind": "endpoints",
+    "pct": 10.170926542294783,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.42305,
+    "b_median": 1.4606405,
+    "cell": "loaded/endpoints/playback:intros",
+    "kind": "endpoints",
+    "pct": 2.6415445697621367,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.158194,
+    "b_median": 1.5744245000000001,
+    "cell": "loaded/endpoints/playback:playbackinfo",
+    "kind": "endpoints",
+    "pct": 35.93789123411105,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.7427,
+    "b_median": 2.740285,
+    "cell": "loaded/endpoints/playback:playing",
+    "kind": "endpoints",
+    "pct": -0.08805191964123149,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.8312765,
+    "b_median": 1.8401265,
+    "cell": "loaded/endpoints/playback:segments",
+    "kind": "endpoints",
+    "pct": 0.48326945712458086,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.805359,
+    "b_median": 1.722132,
+    "cell": "loaded/endpoints/search:artists",
+    "kind": "endpoints",
+    "pct": -4.609997236006796,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 18.464639,
+    "b_median": 19.636573,
+    "cell": "loaded/endpoints/search:items",
+    "kind": "endpoints",
+    "pct": 6.346909896261716,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": null,
+    "b_median": null,
+    "cell": "loaded/endpoints/search:persons",
+    "kind": "endpoints",
+    "pct": null,
+    "reason": "responses differ from the baseline's",
+    "unit": "ms",
+    "verdict": "not comparable"
+   },
+   {
+    "a_median": 1.0683539999999998,
+    "b_median": 1.300759,
+    "cell": "loaded/endpoints/search:programs",
+    "kind": "endpoints",
+    "pct": 21.753557341480466,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 5.857374999999999,
+    "b_median": 5.6873515,
+    "cell": "loaded/endpoints/search:videos",
+    "kind": "endpoints",
+    "pct": -2.9027251968671846,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 0.851438,
+    "b_median": 1.3786114999999999,
+    "cell": "loaded/endpoints/series:episodes",
+    "kind": "endpoints",
+    "pct": 61.91566502787048,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "regressed"
+   },
+   {
+    "a_median": 1.7017965,
+    "b_median": 2.8310205,
+    "cell": "loaded/endpoints/series:item",
+    "kind": "endpoints",
+    "pct": 66.354819744899,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "regressed"
+   },
+   {
+    "a_median": 1.405096,
+    "b_median": 1.5730594999999998,
+    "cell": "loaded/endpoints/series:seasons",
+    "kind": "endpoints",
+    "pct": 11.95388073128099,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 3.4396125,
+    "b_median": 3.4560205,
+    "cell": "loaded/endpoints/series:similar",
+    "kind": "endpoints",
+    "pct": 0.477030479450816,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 6,
+    "b_median": 6,
+    "cell": "loaded/screens/detail",
+    "kind": "screens",
+    "pct": 0.0,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 12,
+    "b_median": 14,
+    "cell": "loaded/screens/home",
+    "kind": "screens",
+    "pct": 16.666666666666664,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 13,
+    "b_median": 14,
+    "cell": "loaded/screens/movies",
+    "kind": "screens",
+    "pct": 7.6923076923076925,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 7,
+    "b_median": 8,
+    "cell": "loaded/screens/playback",
+    "kind": "screens",
+    "pct": 14.285714285714285,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": null,
+    "b_median": null,
+    "cell": "loaded/screens/search",
+    "kind": "screens",
+    "pct": null,
+    "reason": "responses differ from the baseline's",
+    "unit": "ms",
+    "verdict": "not comparable"
+   },
+   {
+    "a_median": 5,
+    "b_median": 6,
+    "cell": "loaded/screens/series",
+    "kind": "screens",
+    "pct": 20.0,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 225.984375,
+    "b_median": 237.55859375,
+    "cell": "memory/peak under load",
+    "kind": "memory",
+    "pct": 5.121689829219387,
+    "reason": null,
+    "unit": "MiB",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 164.6484375,
+    "b_median": 174.9296875,
+    "cell": "memory/steady idle",
+    "kind": "memory",
+    "pct": 6.2443653618030845,
+    "reason": null,
+    "unit": "MiB",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.5960830000000001,
+    "b_median": 1.992706,
+    "cell": "unloaded/endpoints/detail:item",
+    "kind": "endpoints",
+    "pct": 24.84977285015879,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 4.5732975,
+    "b_median": 4.518623,
+    "cell": "unloaded/endpoints/detail:similar",
+    "kind": "endpoints",
+    "pct": -1.1955159269651703,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 7.945669,
+    "b_median": 5.015288,
+    "cell": "unloaded/endpoints/home:latest-movies",
+    "kind": "endpoints",
+    "pct": -36.8802299718249,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "improved"
+   },
+   {
+    "a_median": 4.032349,
+    "b_median": 3.013992,
+    "cell": "unloaded/endpoints/home:latest-music",
+    "kind": "endpoints",
+    "pct": -25.25468405636516,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "improved"
+   },
+   {
+    "a_median": 9.004743,
+    "b_median": 9.811483500000001,
+    "cell": "unloaded/endpoints/home:latest-shows",
+    "kind": "endpoints",
+    "pct": 8.959061907707992,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 9.657332,
+    "b_median": 10.986575,
+    "cell": "unloaded/endpoints/home:nextup",
+    "kind": "endpoints",
+    "pct": 13.764081011194396,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 5.852843999999999,
+    "b_median": 5.927059,
+    "cell": "unloaded/endpoints/home:resume-audio",
+    "kind": "endpoints",
+    "pct": 1.2680160277636068,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.237854,
+    "b_median": 1.550026,
+    "cell": "unloaded/endpoints/home:resume-book",
+    "kind": "endpoints",
+    "pct": 25.218806095064515,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 7.110231499999999,
+    "b_median": 7.544188,
+    "cell": "unloaded/endpoints/home:resume-video",
+    "kind": "endpoints",
+    "pct": 6.103268226920611,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.655486,
+    "b_median": 2.571037,
+    "cell": "unloaded/endpoints/home:views",
+    "kind": "endpoints",
+    "pct": 55.30406176796421,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "regressed"
+   },
+   {
+    "a_median": 10.917781000000002,
+    "b_median": 12.01651,
+    "cell": "unloaded/endpoints/movies:items",
+    "kind": "endpoints",
+    "pct": 10.063665867633713,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.4644555000000001,
+    "b_median": 1.4233805,
+    "cell": "unloaded/endpoints/playback:intros",
+    "kind": "endpoints",
+    "pct": -2.8047967316180102,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.2144944999999998,
+    "b_median": 1.688644,
+    "cell": "unloaded/endpoints/playback:playbackinfo",
+    "kind": "endpoints",
+    "pct": 39.040893145255104,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 2.7435665,
+    "b_median": 2.60077,
+    "cell": "unloaded/endpoints/playback:playing",
+    "kind": "endpoints",
+    "pct": -5.204776337661224,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.851782,
+    "b_median": 1.823062,
+    "cell": "unloaded/endpoints/playback:segments",
+    "kind": "endpoints",
+    "pct": -1.550938501400277,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 1.787307,
+    "b_median": 1.6643355,
+    "cell": "unloaded/endpoints/search:artists",
+    "kind": "endpoints",
+    "pct": -6.880267351943456,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 18.90785,
+    "b_median": 19.7811515,
+    "cell": "unloaded/endpoints/search:items",
+    "kind": "endpoints",
+    "pct": 4.618724498025953,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": null,
+    "b_median": null,
+    "cell": "unloaded/endpoints/search:persons",
+    "kind": "endpoints",
+    "pct": null,
+    "reason": "responses differ from the baseline's",
+    "unit": "ms",
+    "verdict": "not comparable"
+   },
+   {
+    "a_median": 1.1470470000000001,
+    "b_median": 1.323518,
+    "cell": "unloaded/endpoints/search:programs",
+    "kind": "endpoints",
+    "pct": 15.384809863937555,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 5.9691215,
+    "b_median": 5.7148365000000005,
+    "cell": "unloaded/endpoints/search:videos",
+    "kind": "endpoints",
+    "pct": -4.26000710489809,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 0.850198,
+    "b_median": 1.364245,
+    "cell": "unloaded/endpoints/series:episodes",
+    "kind": "endpoints",
+    "pct": 60.46203354983191,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "regressed"
+   },
+   {
+    "a_median": 1.7530065000000001,
+    "b_median": 2.8594910000000002,
+    "cell": "unloaded/endpoints/series:item",
+    "kind": "endpoints",
+    "pct": 63.119246848200504,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "regressed"
+   },
+   {
+    "a_median": 1.44588,
+    "b_median": 1.5929145,
+    "cell": "unloaded/endpoints/series:seasons",
+    "kind": "endpoints",
+    "pct": 10.169204913270807,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 3.5477735,
+    "b_median": 3.5387779999999998,
+    "cell": "unloaded/endpoints/series:similar",
+    "kind": "endpoints",
+    "pct": -0.25355339059836135,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 6,
+    "b_median": 6.5,
+    "cell": "unloaded/screens/detail",
+    "kind": "screens",
+    "pct": 8.333333333333332,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 13,
+    "b_median": 14,
+    "cell": "unloaded/screens/home",
+    "kind": "screens",
+    "pct": 7.6923076923076925,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 13,
+    "b_median": 14,
+    "cell": "unloaded/screens/movies",
+    "kind": "screens",
+    "pct": 7.6923076923076925,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": 7,
+    "b_median": 7.5,
+    "cell": "unloaded/screens/playback",
+    "kind": "screens",
+    "pct": 7.142857142857142,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   },
+   {
+    "a_median": null,
+    "b_median": null,
+    "cell": "unloaded/screens/search",
+    "kind": "screens",
+    "pct": null,
+    "reason": "responses differ from the baseline's",
+    "unit": "ms",
+    "verdict": "not comparable"
+   },
+   {
+    "a_median": 5.5,
+    "b_median": 6,
+    "cell": "unloaded/screens/series",
+    "kind": "screens",
+    "pct": 9.090909090909092,
+    "reason": null,
+    "unit": "ms",
+    "verdict": "within noise"
+   }
+  ],
+  "source": {
+   "candidate": "ferrofin:v1.3.2-2091-8f052092",
+   "commit": "8f052092",
+   "date": "2026-10-27",
+   "pairs": 3,
+   "previous": "ghcr.io/mangoleaf/ferrofin:v1.3.2",
+   "session": "detached-8f052092ca2f-20261027-1135"
+  },
+  "verdict": "blocked"
+ },
  "adoption": {
   "rows": [
    {
