@@ -100,12 +100,15 @@ was removed. Ferrofin now does the same, once, on the first boot of a database a
 A root, a library's own folder, a view or a by-name item is never removed this way: it is
 kept, with a warning in the boot log.
 
-Items under a media folder that is missing or empty are kept: that looks the same as storage
-that did not mount. Play state recorded for a removed item moves to the placeholder item, as
+Items under a media folder that is missing, empty or fails to list are kept: that looks the
+same as storage that did not mount. So is an item whose path cannot be checked because of a
+read error, where Jellyfin would remove it. Play state recorded for a removed item moves to the placeholder item, as
 in Jellyfin. No media file is touched. The boot log counts what it removed, and lists each
 item at debug level. Before the first removal it snapshots the database to
 `jellyfin.db.pre-missing-items`, unless that file is already there from an interrupted
-earlier boot. Before this release, these items stayed until a library scan removed them.
+earlier boot. That copy is the database Ferrofin had already adopted, so restoring it brings
+the removed items back in Ferrofin; it is not a way back to Jellyfin, which is the
+`jellyfin.db.pre-ferrofin` copy taken at adoption (adoption is one-way). Before this release, these items stayed until a library scan removed them.
 
 ## Unreleased — user and policy saves need a complete body
 

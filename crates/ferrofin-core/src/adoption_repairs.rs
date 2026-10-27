@@ -1678,8 +1678,11 @@ pub struct SweptItems {
 ///   only while every location lists an entry, and never one under a library
 ///   whose definition folder (`{user views}/{name}`) is gone: both look
 ///   the same as storage that failed to mount. An item under a location that
-///   is missing or empty is kept. Paths compare as `StartsWith(…,
-///   OrdinalIgnoreCase)`.
+///   is missing, empty or fails on its first listing is kept. Paths compare
+///   as `StartsWith(…, OrdinalIgnoreCase)`. Unlike upstream, whose
+///   `File.Exists || Directory.Exists` reads an I/O error as a missing file,
+///   an item whose path cannot be checked is kept (owner decision on gl-951,
+///   2026-10-27): a transient storage error never removes it.
 ///
 /// Each item goes through the library manager's delete (`LibraryManager.
 /// DeleteItem` with `DeleteFileLocation = false`: no media file is touched),
@@ -1785,7 +1788,11 @@ async fn items_from_deleted_libraries(
         .filter_map(|(id, top, path)| {
             let top = Uuid::parse_str(top.as_deref()?).ok()?;
             let id = Uuid::parse_str(&id).ok()?;
-            (!stored.contains(&top)).then_some((id, path))
+            if stored.contains(&top) {
+                return None;
+            }
+            tracing::debug!(item_id = %id, path = ?path, top_parent_id = %top, "removing item: its library is gone");
+            Some((id, path))
         })
         .collect())
 }
@@ -1827,6 +1834,14 @@ async fn stale_file_items(
     .map_err(|err| ServiceError::Backend(format!("checking items for missing files: {err}")))
 }
 
+/// Whether a library location's listing yields a readable first entry: an
+/// empty folder, or one whose first entry fails to read (a share that opens
+/// but errors on listing, a stale NFS handle), looks like storage that did
+/// not mount, and its items are kept.
+fn lists_an_entry<T>(mut entries: impl Iterator<Item = std::io::Result<T>>) -> bool {
+    matches!(entries.next(), Some(Ok(_)))
+}
+
 /// [`stale_file_items`]' decision over `rows` (`Id`, stored path, expanded
 /// path): the library `locations`, the upper-cased internal metadata
 /// directory, and the items under a library whose definition is gone.
@@ -1838,9 +1853,7 @@ fn stale_among(
 ) -> Vec<(Uuid, Option<String>)> {
     let (mut accessible, mut inaccessible) = (Vec::new(), Vec::new());
     for location in locations {
-        let lists_an_entry =
-            std::fs::read_dir(location).is_ok_and(|mut entries| entries.next().is_some());
-        if lists_an_entry {
+        if std::fs::read_dir(location).is_ok_and(lists_an_entry) {
             accessible.push(upper_invariant(location));
         } else {
             tracing::warn!(
@@ -1853,11 +1866,12 @@ fn stale_among(
     let can_remove_unrooted = inaccessible.is_empty() && !accessible.is_empty();
     let under = |path: &str, roots: &[String]| roots.iter().any(|root| path.starts_with(root));
     let (mut stale, mut unrooted) = (Vec::new(), 0usize);
-    let (mut skipped_unrooted, mut skipped_missing_library) = (0usize, 0usize);
+    let (mut skipped_unrooted, mut skipped_missing_library, mut unreadable) =
+        (0usize, 0usize, 0usize);
     tracing::info!(total = rows.len(), "checking items for missing files");
     for (checked, (id, stored, path)) in rows.iter().enumerate() {
         if checked > 0 && checked % FILE_CHECK_PROGRESS_STEP == 0 {
-            tracing::info!(
+            tracing::debug!(
                 checked,
                 total = rows.len(),
                 stale = stale.len(),
@@ -1872,10 +1886,18 @@ fn stale_among(
             continue;
         }
         if under(&folded, &accessible) {
-            // A folder covers a DVD or Blu-ray rip stored by its folder.
-            if !Path::new(path).exists() {
-                tracing::debug!(item_id = %item, path = %path, "removing item: its file no longer exists");
-                stale.push((item, Some(stored.clone())));
+            // A folder covers a DVD or Blu-ray rip stored by its folder. Only a
+            // path the filesystem reports absent goes: an I/O error keeps the item.
+            match Path::new(path).try_exists() {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(item_id = %item, path = %path, "removing item: its file no longer exists");
+                    stale.push((item, Some(stored.clone())));
+                }
+                Err(err) => {
+                    tracing::debug!(item_id = %item, path = %path, %err, "keeping item: its path could not be checked");
+                    unreadable += 1;
+                }
             }
         } else if !under(&folded, &inaccessible) {
             if in_missing_libraries.contains(&item) {
@@ -1888,6 +1910,12 @@ fn stale_among(
                 skipped_unrooted += 1;
             }
         }
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            items = unreadable,
+            "keeping items whose path could not be checked (an I/O error under a readable library location)"
+        );
     }
     if skipped_missing_library > 0 {
         tracing::warn!(
@@ -1989,11 +2017,10 @@ async fn delete_swept(
         delete_from_external_provider: false,
     };
     let mut deleted = 0;
-    for (index, (id, path)) in items.iter().enumerate() {
+    for (index, (id, _path)) in items.iter().enumerate() {
         if index > 0 && index % DELETE_PROGRESS_STEP == 0 {
-            tracing::info!(what, done = index, total = items.len(), "removing items");
+            tracing::debug!(what, done = index, total = items.len(), "removing items");
         }
-        tracing::debug!(item_id = %id, path = ?path, what, "removing item");
         match library.delete_item(*id, &options).await {
             Ok(()) => deleted += 1,
             Err(err) => {
@@ -5753,7 +5780,11 @@ mod tests {
 
     impl SweepFixture {
         async fn new(generation: Option<&str>) -> Self {
-            let db = test_db().await;
+            Self::over(test_db().await, generation).await
+        }
+
+        /// [`Self::new`] over `db` (a file-backed database for the snapshot).
+        async fn over(db: Database, generation: Option<&str>) -> Self {
             if let Some(generation) = generation {
                 db.record_adoption(generation).await.expect("record");
             }
@@ -5805,13 +5836,17 @@ mod tests {
         }
 
         async fn sweep(&self) -> SweptItems {
+            self.sweep_with(&VirtualPathExpander::identity()).await
+        }
+
+        async fn sweep_with(&self, paths: &VirtualPathExpander) -> SweptItems {
             let folders =
                 crate::virtual_folder_manager::FerrofinVirtualFolderManager::new(self.views());
             sweep_missing_items(
                 &self.db,
                 self.library.as_ref(),
                 &folders,
-                &VirtualPathExpander::identity(),
+                paths,
                 &self.path("metadata"),
                 &self.views(),
             )
@@ -5913,6 +5948,143 @@ mod tests {
         for kept in [unmounted, empty, unrooted] {
             assert!(exists(&f.db, kept).await);
         }
+    }
+
+    #[test]
+    fn a_listing_whose_first_entry_fails_reads_as_unavailable() {
+        assert!(lists_an_entry([Ok::<(), std::io::Error>(())].into_iter()));
+        assert!(!lists_an_entry(std::iter::empty::<std::io::Result<()>>()));
+        // A share that opens but fails to list (a stale NFS handle).
+        assert!(!lists_an_entry(
+            [Err::<(), _>(std::io::Error::other("stale handle")), Ok(())].into_iter()
+        ));
+    }
+
+    /// Owner decision on gl-951: an I/O error is not a missing file. Unlike
+    /// upstream, the item stays.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_item_whose_path_cannot_be_checked_is_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = SweepFixture::new(Some("10.11.8")).await;
+        let movies = f.location("movies");
+        let locked = Path::new(&movies).join("Locked");
+        std::fs::create_dir_all(&locked).expect("locked");
+        std::fs::write(locked.join("Film.mkv"), b"").expect("file");
+        let film = f.movie(&locked.join("Film.mkv").to_string_lossy()).await;
+        let gone = f.movie(&format!("{movies}/Gone.mkv")).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("lock");
+        let swept = f.sweep().await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+
+        assert_eq!(
+            swept,
+            SweptItems {
+                deleted_libraries: 0,
+                stale: 1
+            }
+        );
+        assert!(exists(&f.db, film).await, "its path could not be checked");
+        assert!(!exists(&f.db, gone).await);
+    }
+
+    #[tokio::test]
+    async fn a_removed_item_keeps_its_file_and_folders_and_virtual_items_are_not_swept() {
+        let f = SweepFixture::new(Some("10.11.8")).await;
+        let movies = f.location("movies");
+        // Outside every location with its file still there: the item goes, the file stays.
+        std::fs::create_dir_all(f.path("elsewhere")).expect("elsewhere");
+        let old = f.path("elsewhere/Old.mkv");
+        std::fs::write(&old, b"media").expect("file");
+        let unrooted = f.movie(&old).await;
+        let folder = Uuid::new_v4();
+        seed_folder_item(&f.db, folder, BaseItemKind::Folder, "Gone Folder", None).await;
+        set_path(&f.db, folder, &format!("{movies}/Gone Folder")).await;
+        let virtual_item = f.movie(&format!("{movies}/Virtual.mkv")).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "IsVirtualItem" = 1 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(virtual_item))
+            .execute(f.db.writer())
+            .await
+            .expect("virtual");
+
+        assert_eq!(
+            f.sweep().await,
+            SweptItems {
+                deleted_libraries: 0,
+                stale: 1
+            }
+        );
+        assert!(!exists(&f.db, unrooted).await);
+        assert_eq!(
+            std::fs::read(&old).expect("file"),
+            b"media",
+            "no media file is touched"
+        );
+        assert!(exists(&f.db, folder).await, "a folder is not swept");
+        assert!(
+            exists(&f.db, virtual_item).await,
+            "a virtual item is not swept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_removal_snapshots_the_database_first_and_keeps_an_earlier_copy() {
+        for earlier in [false, true] {
+            let dir = tempfile::tempdir().expect("db dir");
+            let f = SweepFixture::over(
+                open_file_db(dir.path(), "jellyfin.db").await,
+                Some("10.11.8"),
+            )
+            .await;
+            let snapshot = dir.path().join("jellyfin.db.pre-missing-items");
+            if earlier {
+                std::fs::write(&snapshot, b"an interrupted boot's copy").expect("earlier");
+            }
+            let gone = f.movie(&format!("{}/Gone.mkv", f.location("movies"))).await;
+
+            assert_eq!(f.sweep().await.stale, 1, "earlier: {earlier}");
+            assert!(!exists(&f.db, gone).await);
+            if earlier {
+                assert_eq!(
+                    std::fs::read(&snapshot).expect("snapshot"),
+                    b"an interrupted boot's copy",
+                    "an existing copy is never overwritten"
+                );
+            } else {
+                // The copy is the database before the removal: the item is in it.
+                let copy =
+                    sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", snapshot.display()))
+                        .await
+                        .expect("open the copy");
+                let rows: i64 =
+                    sqlx::query_scalar(r#"SELECT COUNT(*) FROM "BaseItems" WHERE "Id" = ?1"#)
+                        .bind(guid_to_db(gone))
+                        .fetch_one(&copy)
+                        .await
+                        .expect("count");
+                assert_eq!(rows, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_under_the_metadata_directory_is_kept_through_its_token() {
+        let f = SweepFixture::new(Some("10.11.8")).await;
+        let poster = f.movie("%MetadataPath%/library/ab/poster.jpg").await;
+        let paths = std::sync::Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
+            f.path("data"),
+            "log",
+            "config",
+            "cache",
+            "web",
+        ));
+        paths.set_internal_metadata_path(Some(&f.path("metadata")));
+        // Unexpanded, the stored path would read as outside every location.
+        assert_eq!(
+            f.sweep_with(&VirtualPathExpander::from_paths(paths)).await,
+            SweptItems::default()
+        );
+        assert!(exists(&f.db, poster).await);
     }
 
     #[tokio::test]
