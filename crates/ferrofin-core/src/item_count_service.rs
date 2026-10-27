@@ -1114,7 +1114,6 @@ impl ItemCountService for FerrofinItemCountService {
         Ok(out)
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn get_child_count_batch(
         &self,
         parent_ids: &[Uuid],
@@ -1123,11 +1122,26 @@ impl ItemCountService for FerrofinItemCountService {
         if parent_ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let user = match user_id {
+            Some(id) => crate::item_repository::query_user(&self.db, id).await?,
+            None => None,
+        };
+        self.get_child_count_batch_for(parent_ids, user.as_ref())
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn get_child_count_batch_for(
+        &self,
+        parent_ids: &[Uuid],
+        user: Option<&UserEntity>,
+    ) -> Result<HashMap<Uuid, i32>, ServiceError> {
+        if parent_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
         let mut access_filter = InternalItemsQuery::default();
-        if let Some(id) = user_id
-            && let Some(user) = crate::item_repository::query_user(&self.db, id).await?
-        {
-            access_filter.set_user(user);
+        if let Some(user) = user {
+            access_filter.set_user(user.clone());
         }
         let has_user = access_filter.user.is_some();
         // `includeVirtual`: missing episodes count for no user, or for one

@@ -3963,7 +3963,7 @@ impl FerrofinDtoService {
             HashMap::new()
         } else {
             self.item_counts
-                .get_child_count_batch(&distinct, Uuid::parse_str(&user.id).ok())
+                .get_child_count_batch_for(&distinct, Some(user))
                 .await?
         };
         let mut out: HashMap<Uuid, i32> = with_sources
