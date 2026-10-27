@@ -334,6 +334,19 @@ pub trait MediaSegmentManager: Send + Sync {
         filter_by_provider: bool,
     ) -> Result<Vec<MediaSegmentDto>, ServiceError>;
 
+    /// [`Self::get_segments`] for an item the caller has already read, as upstream's
+    /// `GetSegmentsAsync(BaseItem item, …)` takes it: its row is not read again.
+    async fn get_item_segments(
+        &self,
+        item: &BaseItemEntity,
+        type_filter: Option<&[MediaSegmentType]>,
+        filter_by_provider: bool,
+    ) -> Result<Vec<MediaSegmentDto>, ServiceError> {
+        let id = Uuid::parse_str(&item.id)
+            .map_err(|_| ServiceError::invalid_input("the item's id is not a GUID"))?;
+        self.get_segments(id, type_filter, filter_by_provider).await
+    }
+
     /// Whether any segments are stored for the item.
     async fn has_segments(&self, item_id: Uuid) -> Result<bool, ServiceError>;
 
