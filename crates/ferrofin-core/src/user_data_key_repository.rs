@@ -202,6 +202,25 @@ fn resolve_series<'a>(
     None
 }
 
+/// [`key_rows`]' read: the items, the series/season chain an episode or season walks for its key,
+/// and their provider ids, joined through `BaseItemProviders`' primary key (one row per provider).
+pub(crate) const KEY_ROWS_SQL: &str = r#"WITH RECURSIVE identity_ids("Id", "WalkParents") AS (
+               SELECT "Id", CASE WHEN "Type" IN (?2, ?3)
+                   AND ("SeriesId" IS NULL OR "SeriesId" = ?4) THEN 1 ELSE 0 END
+               FROM "BaseItems" WHERE "Id" IN (SELECT value FROM json_each(?1))
+               UNION
+               SELECT parent."Id", 1 FROM identity_ids AS current
+               JOIN "BaseItems" AS child ON child."Id" = current."Id"
+               JOIN "BaseItems" AS parent ON parent."Id" = upper(child."ParentId")
+               WHERE current."WalkParents" = 1 AND child."Type" <> ?5
+           )
+           SELECT b."Id", b."Type", b."IndexNumber", b."ParentIndexNumber", b."Name", b."Album",
+                  b."AlbumArtists", b."SeriesId", b."ExtraType", b."RunTimeTicks",
+                  b."EpisodeTitle", b."IsSeries", b."ParentId", p."ProviderId", p."ProviderValue"
+           FROM "BaseItems" AS b
+           LEFT JOIN "BaseItemProviders" AS p ON p."ItemId" = b."Id"
+           WHERE b."Id" IN (SELECT "Id" FROM identity_ids)"#;
+
 /// Only the identity fields, excluding large Data blobs and artwork metadata.
 type RawKeyRow = (
     String,
@@ -217,6 +236,8 @@ type RawKeyRow = (
     Option<String>,
     bool,
     Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 #[allow(
@@ -231,55 +252,34 @@ async fn key_rows(
         return Ok(std::collections::HashMap::new());
     }
     let json = serde_json::to_string(ids).map_err(|e| ServiceError::Backend(e.to_string()))?;
-    let raw: Vec<RawKeyRow> = sqlx::query_as(
-        r#"WITH RECURSIVE identity_ids("Id", "WalkParents") AS (
-               SELECT "Id", CASE WHEN "Type" IN (?2, ?3)
-                   AND ("SeriesId" IS NULL OR "SeriesId" = ?4) THEN 1 ELSE 0 END
-               FROM "BaseItems" WHERE "Id" IN (SELECT value FROM json_each(?1))
-               UNION
-               SELECT parent."Id", 1 FROM identity_ids AS current
-               JOIN "BaseItems" AS child ON child."Id" = current."Id"
-               JOIN "BaseItems" AS parent ON parent."Id" = upper(child."ParentId")
-               WHERE current."WalkParents" = 1 AND child."Type" <> ?5
-           )
-           SELECT "Id", "Type", "IndexNumber", "ParentIndexNumber", "Name", "Album",
-                  "AlbumArtists", "SeriesId", "ExtraType", "RunTimeTicks",
-                  "EpisodeTitle", "IsSeries", "ParentId"
-           FROM "BaseItems" WHERE "Id" IN (SELECT "Id" FROM identity_ids)"#,
-    )
-    .bind(&json)
-    .bind(BaseItemKind::Episode.stored_type_name())
-    .bind(BaseItemKind::Season.stored_type_name())
-    .bind(guid_to_db(Uuid::nil()))
-    .bind(BaseItemKind::Series.stored_type_name())
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(db_err)?;
-    let provider_ids: Vec<&str> = raw
-        .iter()
-        .filter_map(|row| {
-            let kind = kind_from_type_name(&row.1).unwrap_or(BaseItemKind::Folder);
-            uses_provider_ids(kind).then_some(row.0.as_str())
-        })
-        .collect();
-    let mut providers: std::collections::HashMap<String, Vec<(String, String)>> =
-        std::collections::HashMap::new();
-    if !provider_ids.is_empty() {
-        let json = serde_json::to_string(&provider_ids)
-            .map_err(|e| ServiceError::Backend(e.to_string()))?;
-        let values: Vec<(String, String, String)> = sqlx::query_as(
-            r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
-               WHERE "ItemId" IN (SELECT value FROM json_each(?1))"#,
-        )
-        .bind(json)
+    let raw: Vec<RawKeyRow> = sqlx::query_as(KEY_ROWS_SQL)
+        .bind(&json)
+        .bind(BaseItemKind::Episode.stored_type_name())
+        .bind(BaseItemKind::Season.stored_type_name())
+        .bind(guid_to_db(Uuid::nil()))
+        .bind(BaseItemKind::Series.stored_type_name())
         .fetch_all(&mut *conn)
         .await
         .map_err(db_err)?;
-        for (id, provider, value) in values {
-            providers.entry(id).or_default().push((provider, value));
+    // One row per (item, provider), with the providers joined in the same read: only kinds keyed
+    // by their provider ids keep them.
+    let mut providers: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    let mut items: std::collections::HashMap<String, RawKeyRow> =
+        std::collections::HashMap::with_capacity(raw.len());
+    for mut row in raw {
+        let kind = kind_from_type_name(&row.1).unwrap_or(BaseItemKind::Folder);
+        if let (Some(provider), Some(value)) = (row.13.take(), row.14.take())
+            && uses_provider_ids(kind)
+        {
+            providers
+                .entry(row.0.clone())
+                .or_default()
+                .push((provider, value));
         }
+        items.entry(row.0.clone()).or_insert(row);
     }
-    let mut result = std::collections::HashMap::with_capacity(raw.len());
+    let mut result = std::collections::HashMap::with_capacity(items.len());
     for (
         id,
         type_name,
@@ -294,7 +294,9 @@ async fn key_rows(
         episode_title,
         is_series,
         parent_id,
-    ) in raw
+        _,
+        _,
+    ) in items.into_values()
     {
         let item_id = Uuid::parse_str(&id).map_err(|e| ServiceError::Backend(e.to_string()))?;
         let provider = |want: &str| {
@@ -334,4 +336,41 @@ async fn key_rows(
         result.insert(id, row);
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::test_db;
+
+    /// The items, their walk and their providers come in one read, the providers through
+    /// `BaseItemProviders`' key, never a scan (`EXPLAIN QUERY PLAN`).
+    #[tokio::test]
+    async fn the_key_read_joins_the_providers_by_their_key() {
+        let db = test_db().await;
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {KEY_ROWS_SQL}"
+        )))
+        .bind(r#"["x"]"#)
+        .bind("a")
+        .bind("b")
+        .bind("c")
+        .bind("d")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let steps: Vec<&str> = plan.iter().map(|row| row.3.as_str()).collect();
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.starts_with("SEARCH p USING") && s.contains("(ItemId=?)")),
+            "{steps:?}"
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|s| s.starts_with("SCAN p") || s.starts_with("SCAN b")),
+            "{steps:?}"
+        );
+    }
 }

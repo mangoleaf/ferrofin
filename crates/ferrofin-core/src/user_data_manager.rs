@@ -1496,32 +1496,27 @@ impl UserDataManager for FerrofinUserDataManager {
         item_ids: &[Uuid],
         user_id: Uuid,
     ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
-        let mut map = self.stored_user_data_dtos(item_ids, user_id).await?;
-        // Items without a stored row get the empty-row DTO keyed by their first
-        // user-data key (`GetUserDataBatch`'s `keys[0]`, `UserDataManager.cs:251`),
-        // derived for all of them in one batch. An id with no item row keeps
-        // the id as its key.
-        let mut unwritten: Vec<String> = item_ids
-            .iter()
-            .filter(|id| !map.contains_key(id))
-            .map(|&id| guid_to_db(id))
+        let rows = self.stored_user_data_rows(item_ids, user_id).await?;
+        // Every item's current keys in one batch, for the page: a stored row is picked by them,
+        // and an item without one gets the empty-row DTO keyed by its first
+        // (`GetUserDataBatch`'s `keys[0]`, `UserDataManager.cs:251`). An id with no item row
+        // keeps the id as its key.
+        let mut ids: Vec<String> = item_ids.iter().map(|&id| guid_to_db(id)).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let keys = if ids.is_empty() {
+            HashMap::new()
+        } else {
+            self.current_keys(&ids).await?
+        };
+        let mut map: HashMap<Uuid, UserItemDataDto> = Self::preferred_rows(rows, &keys)
+            .into_iter()
+            .map(|(id, row)| (id, to_dto(&row, id)))
             .collect();
-        unwritten.sort_unstable();
-        unwritten.dedup();
-        if unwritten.is_empty() {
-            return Ok(map);
-        }
-        let mut conn = self.db.pool().acquire().await.map_err(db_err)?;
-        let first_keys: HashMap<String, String> =
-            crate::user_data_key_repository::load_keys_for_items(&mut conn, &unwritten)
-                .await?
-                .into_iter()
-                .filter_map(|(id, keys)| Some((id, keys.into_iter().next()?)))
-                .collect();
         for &item_id in item_ids {
             map.entry(item_id).or_insert_with(|| {
                 let mut row = Self::empty_row(item_id, user_id);
-                if let Some(first) = first_keys.get(&guid_to_db(item_id)) {
+                if let Some(first) = keys.get(&guid_to_db(item_id)).and_then(|keys| keys.first()) {
                     row.custom_data_key.clone_from(first);
                 }
                 to_dto(&row, item_id)
@@ -1872,21 +1867,6 @@ impl FerrofinUserDataManager {
         Ok(map)
     }
 
-    /// Id-only reads resolve current keys once per page through the existing
-    /// metadata/provider batch seam, matching per-item selection without an N+1.
-    async fn stored_user_data_dtos(
-        &self,
-        item_ids: &[Uuid],
-        user_id: Uuid,
-    ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
-        Ok(self
-            .stored_preferred_rows(item_ids, user_id)
-            .await?
-            .into_iter()
-            .map(|(id, row)| (id, to_dto(&row, id)))
-            .collect())
-    }
-
     /// The row [`Self::read_row`] would pick for each of `item_ids`, in two
     /// reads for the whole set; an item with no stored row is absent.
     async fn stored_preferred_rows(
@@ -1899,14 +1879,32 @@ impl FerrofinUserDataManager {
             return Ok(HashMap::new());
         }
         let ids: Vec<_> = rows.keys().copied().map(guid_to_db).collect();
+        let keys = self.current_keys(&ids).await?;
+        Ok(Self::preferred_rows(rows, &keys))
+    }
+
+    /// Each item's current user-data keys (`GetUserDataKeys`), by its stored id, for the whole
+    /// set at once.
+    async fn current_keys(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, Vec<String>>, ServiceError> {
         let mut connection = self.db.pool().acquire().await.map_err(db_err)?;
-        let keys: HashMap<_, _> =
-            crate::user_data_key_repository::load_keys_for_items(&mut connection, &ids)
+        Ok(
+            crate::user_data_key_repository::load_keys_for_items(&mut connection, ids)
                 .await?
                 .into_iter()
-                .collect();
-        Ok(rows
-            .into_iter()
+                .collect(),
+        )
+    }
+
+    /// The row [`Self::read_row`] would pick among each item's stored `rows`, by its current
+    /// `keys` (its own id when it has none).
+    fn preferred_rows(
+        rows: HashMap<Uuid, Vec<UserDataEntity>>,
+        keys: &HashMap<String, Vec<String>>,
+    ) -> HashMap<Uuid, UserDataEntity> {
+        rows.into_iter()
             .filter_map(|(id, candidates)| {
                 let own = [id.to_string()];
                 let current = keys
@@ -1914,7 +1912,7 @@ impl FerrofinUserDataManager {
                     .map_or(own.as_slice(), Vec::as_slice);
                 Self::preferred_row(&candidates, current).map(|row| (id, row))
             })
-            .collect())
+            .collect()
     }
 }
 
