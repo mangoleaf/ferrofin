@@ -2938,14 +2938,12 @@ impl LibraryManager for FerrofinLibraryManager {
         &self,
         items: &[BaseItemEntity],
     ) -> Result<HashMap<Uuid, Vec<Uuid>>, ServiceError> {
+        // The snapshot, not `get_virtual_folders`: that rebuilds every library's
+        // full listing (its image and existence reads included) for one option.
         let folders = if items.iter().any(|item| item.type_.ends_with(".Series")) {
-            if let Some(folders) = &self.virtual_folders {
-                folders.get_virtual_folders().await?
-            } else {
-                Vec::new()
-            }
+            self.configured_libraries().await?
         } else {
-            Vec::new()
+            Arc::from([])
         };
         let grouped_series: Vec<Uuid> = items
             .iter()

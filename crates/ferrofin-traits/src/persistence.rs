@@ -2025,6 +2025,17 @@ pub trait ItemCountService: Send + Sync {
         user_id: Option<Uuid>,
     ) -> Result<HashMap<Uuid, i32>, ServiceError>;
 
+    /// [`Self::get_child_count_batch`] for a user the caller has already read:
+    /// the same counts, without reading the user's row again.
+    async fn get_child_count_batch_for(
+        &self,
+        parent_ids: &[Uuid],
+        user: Option<&UserEntity>,
+    ) -> Result<HashMap<Uuid, i32>, ServiceError> {
+        let user_id = user.and_then(|user| Uuid::parse_str(&user.id).ok());
+        self.get_child_count_batch(parent_ids, user_id).await
+    }
+
     /// How many LINKED children each of `parent_ids` has — C#
     /// `Folder.LinkedChildren.Length`, the playlist-entry / merged-version edge
     /// list, not the hierarchical `ParentId` children.

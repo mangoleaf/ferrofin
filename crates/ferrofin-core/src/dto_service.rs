@@ -3963,7 +3963,7 @@ impl FerrofinDtoService {
             HashMap::new()
         } else {
             self.item_counts
-                .get_child_count_batch(&distinct, Uuid::parse_str(&user.id).ok())
+                .get_child_count_batch_for(&distinct, Some(user))
                 .await?
         };
         let mut out: HashMap<Uuid, i32> = with_sources
@@ -4443,20 +4443,30 @@ impl FerrofinDtoService {
                 if (want_sources || !resume_candidates.is_empty())
                     && groups.ids().next().is_some() =>
             {
-                // The page's own rows as well, since a group's winner may be
-                // the queried video itself: every media row for the sources,
-                // only the resume candidates otherwise.
-                let page: Vec<Uuid> = if want_sources {
-                    media_ids.clone()
+                // With the sources, every media row on the page and every
+                // version read, since a group's winner may be the queried video
+                // itself. Without them, only what `resume_user_data` reads: the
+                // whole group of each candidate that has one. A video standing
+                // alone is never asked about.
+                let mut wanted: Vec<Uuid> = if want_sources {
+                    media_ids.iter().copied().chain(groups.ids()).collect()
                 } else {
-                    resume_candidates.iter().map(|item| row_id(item)).collect()
+                    resume_candidates
+                        .iter()
+                        .map(|item| groups.all_version_ids(item))
+                        .filter(|group| group.len() > 1)
+                        .flatten()
+                        .collect()
                 };
-                let mut wanted: Vec<Uuid> = page.into_iter().chain(groups.ids()).collect();
                 wanted.sort_unstable();
                 wanted.dedup();
-                self.user_data
-                    .get_user_data_batch(&wanted, parse_user_id(&user.id)?)
-                    .await?
+                if wanted.is_empty() {
+                    HashMap::new()
+                } else {
+                    self.user_data
+                        .get_user_data_batch(&wanted, parse_user_id(&user.id)?)
+                        .await?
+                }
             }
             _ => HashMap::new(),
         };
@@ -6674,6 +6684,127 @@ mod tests {
             .await
             .unwrap();
         assert!(dtos[0].user_data.is_none());
+    }
+
+    /// [`FakeUserData`], recording every id `get_user_data_batch` is asked for.
+    #[derive(Default)]
+    struct RecordingUserData(std::sync::Mutex<Vec<Uuid>>);
+
+    #[async_trait]
+    impl UserDataManager for RecordingUserData {
+        async fn save_user_data(
+            &self,
+            user_id: Uuid,
+            item_id: Uuid,
+            user_data: &ferrofin_model::dto::UpdateUserItemDataDto,
+        ) -> Result<(), ServiceError> {
+            FakeUserData
+                .save_user_data(user_id, item_id, user_data)
+                .await
+        }
+        async fn get_user_data_dto(
+            &self,
+            item_id: Uuid,
+            user_id: Uuid,
+        ) -> Result<Option<UserItemDataDto>, ServiceError> {
+            FakeUserData.get_user_data_dto(item_id, user_id).await
+        }
+        async fn get_user_data_batch(
+            &self,
+            item_ids: &[Uuid],
+            user_id: Uuid,
+        ) -> Result<std::collections::HashMap<Uuid, UserItemDataDto>, ServiceError> {
+            self.0.lock().unwrap().extend_from_slice(item_ids);
+            FakeUserData.get_user_data_batch(item_ids, user_id).await
+        }
+        async fn update_play_state(
+            &self,
+            user_id: Uuid,
+            item_id: Uuid,
+            reported_position_ticks: Option<i64>,
+        ) -> Result<bool, ServiceError> {
+            FakeUserData
+                .update_play_state(user_id, item_id, reported_position_ticks)
+                .await
+        }
+        async fn mark_played(
+            &self,
+            user_id: Uuid,
+            item_id: Uuid,
+            date_played: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<UserItemDataDto, ServiceError> {
+            FakeUserData
+                .mark_played(user_id, item_id, date_played)
+                .await
+        }
+        async fn mark_unplayed(
+            &self,
+            user_id: Uuid,
+            item_id: Uuid,
+        ) -> Result<UserItemDataDto, ServiceError> {
+            FakeUserData.mark_unplayed(user_id, item_id).await
+        }
+        async fn reset_playback_stream_selections(
+            &self,
+            user_id: Uuid,
+            item_id: Uuid,
+        ) -> Result<(), ServiceError> {
+            FakeUserData
+                .reset_playback_stream_selections(user_id, item_id)
+                .await
+        }
+    }
+
+    /// `GetResumeUserDataBatch` reads the user data of the page's grouped
+    /// videos and their versions only: a video standing alone has no version
+    /// to resume from, so its id is not asked for again.
+    #[tokio::test]
+    async fn the_version_resume_reads_only_grouped_videos() {
+        let db = test_db().await;
+        let (primary, alternate, lone) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, name, path) in [
+            (primary, "Movie", "/Movies/Movie/Movie.mkv"),
+            (alternate, "Movie", "/Movies/Movie/Movie - 4K.mkv"),
+            (lone, "Other", "/Movies/Other/Other.mkv"),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            row.media_type = Some("Video".to_owned());
+            crate::test_support::save_item(&db, &row).await;
+        }
+        link_alternate_version(&db, alternate, primary).await;
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_data = Arc::new(RecordingUserData::default());
+        let svc = FerrofinDtoService::new(
+            db.clone(),
+            "server-1".into(),
+            Arc::new(FakeLibrary::default()),
+            user_data.clone(),
+            Arc::new(FakeCounts::default()),
+            Arc::new(FakeImages),
+            Arc::new(FakeSources {
+                stored_alternates: Some(db.clone()),
+                ..FakeSources::default()
+            }),
+            Arc::new(FakeChapters),
+            Arc::new(FakeTrickplay),
+        );
+        let page = [fetch_item(&db, primary).await, fetch_item(&db, lone).await];
+        // No `MediaSources`, as the grid asks: with them every media row is read.
+        let options = DtoOptions {
+            fields: vec![],
+            ..DtoOptions::default()
+        };
+        svc.get_base_item_dtos(&page, &options, Some(&user), None, true)
+            .await
+            .unwrap();
+        let asked = user_data.0.lock().unwrap().clone();
+        assert!(
+            asked.contains(&primary) && asked.contains(&alternate),
+            "{asked:?}"
+        );
+        assert!(!asked.contains(&lone), "{asked:?}");
     }
 
     /// v12 assigns `Chapters` outside the `item is Video` block

@@ -519,9 +519,8 @@ impl FerrofinSimilarItemsManager {
     /// sorts local and remote providers as ONE list. Reads the library exactly
     /// once, and not at all when no compiled provider serves this kind.
     async fn similarity_plan(&self, seed: &BaseItemEntity, kind: BaseItemKind) -> SimilarityPlan {
-        // Resolving the library reads the filesystem, so narrow to the
-        // providers that could serve this kind at all first — most kinds have
-        // none, and those must not pay for a `get_virtual_folders` call.
+        // Narrow to the providers that could serve this kind at all first —
+        // most kinds have none, and those must not resolve the library.
         let (Some(library), false) = (self.library.as_ref(), self.remote.is_empty()) else {
             return SimilarityPlan::local_only();
         };
@@ -533,7 +532,9 @@ impl FerrofinSimilarItemsManager {
         let Some(type_name) = seed.type_.rsplit('.').next() else {
             return SimilarityPlan::local_only();
         };
-        let Ok(folders) = library.get_virtual_folders().await else {
+        // The snapshot, not `get_virtual_folders`: that rebuilds every
+        // library's full listing (its image and existence reads included).
+        let Ok(folders) = library.library_folders().await else {
             return SimilarityPlan::local_only();
         };
         // The seed's library: its location's (or, on a row an older scan
