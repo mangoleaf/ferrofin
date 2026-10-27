@@ -371,8 +371,9 @@ class PublishTests(unittest.TestCase):
         doc = publish.summarise("v1.4.0", self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)]), str(s))
         self.assertEqual(publish.summary_problems(doc), [])
         adoption = doc["adoption"]
+        started = json.loads((s / "adoption" / "result.json").read_text())["started"]   # the run's own start, not today's
         self.assertEqual(adoption["source"], {"session": s.name, "commit": "5112240e1923cdc9", "image_digest": "sha256:img",
-                                              "oracle": "12.2", "date": "2026-10-26"})
+                                              "oracle": "12.2", "date": started[:10]})
         self.assertEqual([(r["fixture"], r["verdict"]) for r in adoption["rows"]],
                          [(f, v) for f, _, _, v, _ in ADOPTION])
         self.assertEqual(len(adoption["rows"][2]["reason"]), publish.REASON_CHARS)   # the full reason is in the session's report
