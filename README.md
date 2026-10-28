@@ -238,7 +238,7 @@ Source: detached-5112240e1923-20261026-0101/bench, detached-5112240e1923-2026102
 
 ### Against the previous release
 
-Ferrofin **v1.4.0** against **Ferrofin v1.3.2** (`ghcr.io/mangoleaf/ferrofin:v1.3.2`) in the release's A/B gate (3 interleaved pairs on one host, 2026-10-27): of 62 gated cells, **4 improved**, 47 are within noise and **7 regressed**, and 4 could not be compared (it blocks like a regression); **11 gated cells blocked the release**.
+Ferrofin **v1.4.0** against **Ferrofin v1.3.2** (`ghcr.io/mangoleaf/ferrofin:v1.3.2`) in the release's A/B gate (3 interleaved pairs on one host, 2026-10-27): of 62 gated cells, **4 improved**, 47 are within noise and **7 regressed**, and 4 could not be compared (it blocks like a regression); **11 gated cells blocked the release**. The graph draws the cells that improved or regressed; every cell is in the table under it.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/previous-release-dark.svg">
@@ -323,9 +323,11 @@ Each supported Jellyfin version and upgrade route, adopted in place by Ferrofin 
   <img alt="Adopting an existing Jellyfin database: every supported version and route: 13 of 14 passed; jellyfin-10.11.11-messy failed." src="docs/results/v1.4.0/adoption.svg">
 </picture>
 
+A *path* row is a database the official Jellyfin images built along one supported upgrade route (or a fresh install); a *messy* row also carries rows long-lived databases accumulate that no API can produce; the *scale* row clones a library to about 40,000 items. *Detected as* is the Jellyfin version Ferrofin must identify the database as (releases that share a migration set share one).
+
 <details><summary>Adoption: every row</summary>
 
-| Jellyfin database | Kind | Checked at | Result | Why |
+| Jellyfin database | Kind | Detected as | Result | Why |
 |---|---|---|---|---|
 | jellyfin-10.11.8 | path | 10.11.8 | passed |  |
 | jellyfin-10.11.9 | path | 10.11.8 | passed |  |
@@ -346,16 +348,16 @@ Each supported Jellyfin version and upgrade route, adopted in place by Ferrofin 
 
 ### Answering like Jellyfin
 
-The parity gate replays the **2,353** requests jellyfin-web makes against Jellyfin 12.2.0 and Ferrofin **v1.4.0** (commit `5112240e`, a local gates session on 2026-10-26) and compares the answers. Of the 2,307 it could compare, **1,242 are identical** and **1,051 differ in accepted ways** (each recorded with its reason in the parity ledger); **2 are filed as issues** and **12 are new**. 46 were not compared because Jellyfin itself failed them.
+The parity gate replays the **2,353** requests jellyfin-web makes against Jellyfin 12.2.0 and Ferrofin **v1.4.0** (commit `5112240e`, a local gates session on 2026-10-26) and compares the answers. Of the 2,307 it could compare, **1,242 are identical** and **1,051 differ in known ways** (the parity ledger links each to its issue, or to the reason it is accepted); **2 are filed as issues** and **12 are new**. 46 were not compared because Jellyfin itself failed them. **The parity gate did not pass** (new differences): 14 requests differ in ways the ledger does not cover yet.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/parity-dark.svg">
-  <img alt="Answering jellyfin-web like Jellyfin 12.2.0: of 2353 requests, 1242 identical, 1051 accepted differences, 2 filed as issues, 12 new differences, 46 not compared (Jellyfin failed them)." src="docs/results/v1.4.0/parity.svg">
+  <img alt="Answering jellyfin-web like Jellyfin 12.2.0: of 2353 requests, 1242 identical, 1051 known differences, 2 filed as issues, 12 new differences, 46 not compared (Jellyfin failed them)." src="docs/results/v1.4.0/parity.svg">
 </picture>
 
 <details><summary>Parity: every API area</summary>
 
-| Area | Requests | Identical | Accepted | Filed | New | Not compared |
+| Area | Requests | Identical | Known | Filed | New | Not compared |
 |---|---|---|---|---|---|---|
 | /Items | 490 | 151 | 333 | 0 | 1 | 5 |
 | /Artists | 408 | 407 | 1 | 0 | 0 | 0 |

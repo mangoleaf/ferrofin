@@ -3,11 +3,15 @@
 and its graphs drawn from those files alone.
 
     publish.py summarise --version vX.Y.Z --bench RUN RUN RUN [--session DIR] [--ab DIR] [--out DIR]
+                         [--measured-before-tag]
         DIR/<version>/summary.json (DIR defaults to docs/results) from the result.json of three or more
         Jellyfin-comparison benchmark runs the operator names and, with --session, the adoption and parity
         results of that gates session (both required), and with --ab, the release A/B gate's verdict cells
         against the previous release: only the numbers the README shows, each with its source. Nothing is picked
-        automatically, and every input is a local run.
+        automatically, and every input is a local run. The release's tag must exist in this checkout, and every
+        result must record the tag's commit (the harness checkout's HEAD when it ran): results of an earlier
+        commit (a release re-cut after its runs) are refused unless --measured-before-tag says so, and the
+        README then says it in one line.
     publish.py readme [--check] [--results DIR] [--readme README.md]
         draw every graph of the newest DIR/*/summary.json into DIR/<version>/ (a light and a dark SVG
         each) and replace the generated Results block of README.md. The same files give byte-identical
@@ -27,6 +31,7 @@ import math
 import os
 import re
 import statistics
+import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -220,8 +225,13 @@ def adoption_summary(session, bench_commit=None, publishing=True):
 
 
 #: A parity request's outcome, as gates/parity/diff.py counts it, and how the README names it.
-PARITY_OUTCOMES = {"identical": "identical", "accepted": "accepted differences", "filed": "filed as issues",
+PARITY_OUTCOMES = {"identical": "identical", "accepted": "known differences", "filed": "filed as issues",
                    "new": "new differences", "oracle_failed": "not compared (Jellyfin failed them)"}
+#: What the parity graph's legend calls each outcome: a known difference is one the ledger links to its issue
+#: or its accepted reason; filed and new are both differences the ledger does not cover yet; a request Jellyfin
+#: failed (an error, or an area stock Jellyfin does not have), or a write step after one, is not compared.
+PARITY_LEGEND = {"identical": "identical", "accepted": "known (in ledger)", "filed": "filed, not in ledger",
+                 "new": "new", "oracle_failed": "Jellyfin failed"}
 #: How many API areas the parity graph draws, busiest first; the rest are one "other areas" bar.
 PARITY_AREAS = 12
 
@@ -267,7 +277,7 @@ def parity_summary(session, commit, publishing=True):
 
 #: How an A/B verdict reads in the README, and the colour of its bar.
 AB_VERDICTS = {"improved": ("improved", "ferrofin"), "within noise": ("within noise", "jellyfin"),
-               "regressed": ("regressed", "FAIL"), "not comparable": ("not comparable", "SKIP")}
+               "regressed": ("regressed", "FAIL"), "not comparable": ("not comparable", "INCOMPLETE")}
 
 
 def ab_summary(path):
@@ -300,8 +310,26 @@ def ab_summary(path):
             "verdict": doc["verdict"], "blocking": detail.get("blocking", []), "cells": cells}
 
 
-def summarise(version, bench_runs, session=None, ab=None):
-    """The summary file of release `version`."""
+def tag_commit(version, repo=ROOT):
+    """The commit the release tag `version` names in `repo`, or None when the checkout has no such tag."""
+    out = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", f"refs/tags/{version}^{{commit}}"],
+                         capture_output=True, text=True, check=False)
+    return out.stdout.strip() or None
+
+
+def measured_commits(doc):
+    """`[(what, commit)]`: the commit each published result of a summary measured."""
+    out = [("the benchmark runs", doc["bench"]["source"]["commit"])]
+    out += [(what, doc[key]["source"].get("commit")) for key, what in
+            (("ab", "the A/B gate"), ("adoption", "the adoption gate"), ("parity", "the parity gate")) if key in doc]
+    return out
+
+
+def summarise(version, bench_runs, session=None, ab=None, tag=None, before_tag=False):
+    """The summary file of release `version`. With `tag` (the commit the release tag names), refused when a
+    result records another commit, unless `before_tag` publishes them as measured before the tag. A result's
+    commit is the harness checkout's HEAD when it ran, so it names the image's code only when the image was
+    built from that same checkout (RELEASE.md, step 2)."""
     if not re.fullmatch(r"v\d+\.\d+\.\d+", version):
         raise Refused(f"{version!r} is not a release version (vX.Y.Z)")
     if len({os.path.realpath(r) for r in bench_runs}) < len(bench_runs):
@@ -315,6 +343,13 @@ def summarise(version, bench_runs, session=None, ab=None):
         out["parity"] = parity_summary(session, out["bench"]["source"]["commit"])
     if ab:
         out["ab"] = ab_summary(ab)
+    if tag:
+        other = [(what, c) for what, c in measured_commits(out) if not same_commit(c, tag)]
+        if other and not before_tag:
+            raise Refused(f"{other[0][0]} measured {str(other[0][1] or '')[:12] or 'an unrecorded commit'}, but the {version} tag is {tag[:12]}: run the "
+                          "publication inputs again on the tag's commit, or pass --measured-before-tag to publish them "
+                          "labelled as measured before it")
+        out["tag"] = {"commit": tag}
     return out
 
 
@@ -387,6 +422,8 @@ def summary_problems(doc):
             for a in parity["areas"]:
                 if not isinstance(a, dict) or sum(a.get(k, 0) for k in PARITY_OUTCOMES) != a.get("requests") or not a.get("requests"):
                     out.append(f"a parity area is not shaped as expected: {str(a)[:80]}")
+    if "tag" in doc and not (isinstance(doc["tag"], dict) and isinstance(doc["tag"].get("commit"), str) and doc["tag"]["commit"]):
+        out.append("tag is not an object with the tag's commit")
     if "adoption" in doc:
         adoption = doc["adoption"]
         if not isinstance(adoption, dict) or not isinstance(adoption.get("source"), dict) or not isinstance(adoption.get("rows"), list):
@@ -550,7 +587,7 @@ def status_graph(title, rows, caption, theme_name, alt=""):
     row_h, y0 = 24, 62
     end = y0 + row_h * len(rows)
     body = [text(0, y0 - 10, "Jellyfin database", 11, "muted", theme=t), text(left + 10, y0 - 10, "kind", 11, "muted", theme=t),
-            text(left + 90, y0 - 10, "checked at schema of", 11, "muted", theme=t), text(WIDTH - 4, y0 - 10, "result", 11, "muted", "end", theme=t)]
+            text(left + 90, y0 - 10, "detected as", 11, "muted", theme=t), text(WIDTH - 4, y0 - 10, "result", 11, "muted", "end", theme=t)]
     for n, (name, r) in enumerate(zip(names, rows)):
         y = y0 + n * row_h
         body.append(f"<line x1='0' y1='{y - 4:.1f}' x2='{WIDTH}' y2='{y - 4:.1f}' stroke='{t['grid']}' stroke-width='1'/>")
@@ -575,12 +612,13 @@ def parity_rows(areas):
 
 def parity_graph(title, parity, caption, theme_name, alt=""):
     """One stacked bar per API area, its length the requests sent there, split by outcome: identical,
-    accepted differences, filed, new and not compared, with the area's share answered identically or
-    with an accepted difference at the right."""
+    known differences, filed, new and not compared, with how many of its requests were answered identically
+    at the right (`parity_label`)."""
     t = STYLE[theme_name]
     rows = parity_rows(parity["areas"])
+    labels = [parity_label(r) for r in rows]   # what is drawn after each bar, measured whole for the margin
     left = label_width([r["area"] for r in rows]) + 14
-    right = 150
+    right = label_width(labels, 11) + 12
     plot = WIDTH - left - right
     top = max(r["requests"] for r in rows)
     step = nice_step(top)
@@ -594,7 +632,7 @@ def parity_graph(title, parity, caption, theme_name, alt=""):
         body.append(f"<line x1='{tx:.1f}' y1='{y0 - 6}' x2='{tx:.1f}' y2='{end:.1f}' stroke='{t['grid']}' stroke-width='1'/>")
         body.append(text(tx, end + 15, f"{i * step:g}", 11, "muted", "middle", theme=t))
     body.append(text(left + plot / 2, end + 32, "requests jellyfin-web makes, by API area", 12, "muted", "middle", theme=t))
-    for n, r in enumerate(rows):
+    for n, (r, label) in enumerate(zip(rows, labels)):
         y = y0 + n * row_h
         body.append(text(left - 10, y + bar_h - 3, r["area"], 12, anchor="end", theme=t))
         at = left
@@ -603,15 +641,28 @@ def parity_graph(title, parity, caption, theme_name, alt=""):
             if width > 0:
                 body.append(f"<rect x='{at:.1f}' y='{y:.1f}' width='{width:.1f}' height='{bar_h}' fill='{t[key]}'/>")
                 at += width
-        compared = r["requests"] - r["oracle_failed"]
-        alike = r["identical"] + r["accepted"]
-        # rounded down, so an area reads 100% only when every compared request is alike
-        share = (("100" if alike == compared else f"{math.floor(1000 * alike / compared) / 10:g}") + "% alike"
-                 if compared else "not compared")
-        body.append(text(at + 5, y + bar_h - 3, f"{r['requests']}  ·  {share}", 11, "muted", theme=t))
+        body.append(text(at + 5, y + bar_h - 3, label, 11, "muted", theme=t))
     body.append(caption_lines(caption, end + 54, t))
-    legend = tuple((k, PARITY_OUTCOMES[k].split(" (")[0]) for k in PARITY_OUTCOMES)
-    return frame(title, end + 76, "".join(body), theme_name, legend, alt)
+    return frame(title, end + 76, "".join(body), theme_name, tuple(PARITY_LEGEND.items()), alt)
+
+
+def parity_label(row):
+    """What an area's bar says: how many of its requests were answered identically, and, so a segment too
+    thin to see is still read, how many differ in ways the ledger does not cover and how many were not
+    compared."""
+    untracked = row["filed"] + row["new"]
+    return (f"{row['identical']} of {row['requests']} identical" + (f"  ·  {untracked} not in ledger" if untracked else "")
+            + (f"  ·  {row['oracle_failed']} Jellyfin failed" if row["oracle_failed"] else ""))
+
+
+def parity_verdict(parity):
+    """The parity gate's verdict as one README sentence: it passes only when the ledger covers every difference."""
+    c = parity["counts"]
+    if parity["verdict"] == "pass":
+        return "**The parity gate passed**: the ledger covers every difference."
+    untracked = c["filed"] + c["new"]
+    return (f"**The parity gate did not pass** ({md(parity['verdict'])}): {untracked} "
+            f"request{'s differ' if untracked != 1 else ' differs'} in ways the ledger does not cover yet.")
 
 
 def parity_section(parity, version, rel, results_dir):
@@ -629,15 +680,15 @@ def parity_section(parity, version, rel, results_dir):
              f"The parity gate replays the **{parity['sent']:,}** requests jellyfin-web makes against {src['oracle']} and "
              f"Ferrofin **{version}** (commit `{src['commit'][:12]}`, a local gates session on {src['date']}) and compares the "
              f"answers. Of the {compared:,} it could compare, **{c['identical']:,} are identical** and **{c['accepted']:,} differ "
-             "in accepted ways** (each recorded with its reason in the parity ledger); "
+             "in known ways** (the parity ledger links each to its issue, or to the reason it is accepted); "
              f"**{c['filed']} {'is filed as an issue' if c['filed'] == 1 else 'are filed as issues'}** and "
              f"**{c['new']} {'is' if c['new'] == 1 else 'are'} new**. {c['oracle_failed']} "
              f"{'was' if c['oracle_failed'] == 1 else 'were'} not compared because Jellyfin itself failed "
-             f"{'it' if c['oracle_failed'] == 1 else 'them'}.\n",
+             f"{'it' if c['oracle_failed'] == 1 else 'them'}. " + parity_verdict(parity) + "\n",
              f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel}/parity-dark.svg">\n'
              f'  <img alt="{html.escape(alt)}" src="{rel}/parity.svg">\n</picture>\n',
              "<details><summary>Parity: every API area</summary>\n",
-             "| Area | Requests | Identical | Accepted | Filed | New | Not compared |", "|---|---|---|---|---|---|---|"]
+             "| Area | Requests | Identical | Known | Filed | New | Not compared |", "|---|---|---|---|---|---|---|"]
     lines += [f"| {md(a['area'])} | {a['requests']} | " + " | ".join(str(a[k]) for k in PARITY_OUTCOMES) + " |"
               for a in parity["areas"]]
     lines += ["", f"Filed as issues: {md(issues)}." if issues else "", "\n</details>\n"]
@@ -655,29 +706,45 @@ def ab_ratio(cell):
 
 
 def ab_graph(title, cells, previous, caption, theme_name, alt=""):
-    """One bar per gated cell from 1× on a log axis, its colour its verdict (improved, within noise,
-    regressed), the biggest gain first; each bar carries its multiple and the two medians."""
+    """One bar splitting every gated cell by verdict; then one bar per cell that improved or regressed from 1×
+    on a log axis, coloured by its verdict, the biggest gain first, each with its multiple and the two medians;
+    then each cell that could not be compared, named because it blocks like a regression. The cells within
+    noise are counted, not drawn: the README's table lists every cell."""
     t = STYLE[theme_name]
-    rows = sorted(((c, ab_ratio(c)) for c in cells if c["verdict"] != "not comparable" and ab_ratio(c)),
+    rows = sorted(((c, ab_ratio(c)) for c in cells if c["verdict"] in ("improved", "regressed") and ab_ratio(c)),
                   key=lambda cr: (-cr[1], cr[0]["cell"]))
+    unjudged = sorted(c["cell"] for c in cells if c["verdict"] == "not comparable")
     notes = [f"{speedup_text(r, c['unit'])}  ·  {value_text(c['b_median'], c['unit'])} vs {value_text(c['a_median'], c['unit'])}"
              f"  ·  {c['verdict']}" for c, r in rows]   # what is drawn after each bar, measured whole for the margin
-    left = label_width([c["cell"] for c, _ in rows]) + 14
-    right = label_width(notes, 11) + 12
+    unjudged_note = "not comparable: blocks like a regression"
+    left = label_width([c["cell"] for c, _ in rows] + unjudged) + 14
+    right = label_width(notes + ([unjudged_note] if unjudged else []), 11) + 12
     plot = WIDTH - left - right
     lo, hi = min([r for _, r in rows] + [1.0]), max([r for _, r in rows] + [1.0])
     lo_exp = min(math.floor(math.log2(lo)), -1) if lo < 1 else 0
     hi_exp = max(math.ceil(math.log2(hi)), 1)
     x = lambda v: left + plot * (math.log2(v) - lo_exp) / (hi_exp - lo_exp)
-    row_h, bar_h, y0 = 22, 14, 60
-    end = y0 + row_h * len(rows)
-    body = []
-    for e in range(lo_exp, hi_exp + 1):
-        tx = x(2 ** e)
-        body.append(f"<line x1='{tx:.1f}' y1='{y0 - 6}' x2='{tx:.1f}' y2='{end:.1f}' stroke='{t['grid' if e else 'muted']}' stroke-width='1'/>")
-        body.append(text(tx, end + 15, f"{2 ** e:g}×", 11, "muted", "middle", theme=t))
-    body.append(text(left + plot / 2, end + 32, f"times better than {previous} (median, log scale; right of 1× is better)",
-                     12, "muted", "middle", theme=t))
+    row_h, bar_h, top = 22, 14, 60
+    y0 = top + 3 * row_h   # the summary bar, its counts, then the cells
+    end = y0 + row_h * (len(rows) + len(unjudged))
+    count = {v: sum(c["verdict"] == v for c in cells) for v in AB_VERDICTS}
+    body, at = [], 0.0
+    for verdict, n in count.items():
+        if n:
+            width = WIDTH * n / len(cells)
+            body.append(f"<rect x='{at:.1f}' y='{top}' width='{width:.1f}' height='{bar_h}' fill='{t[AB_VERDICTS[verdict][1]]}'/>")
+            at += width
+    body.append(text(0, top + bar_h + 15, f"{len(cells)} gated cell{'s' if len(cells) != 1 else ''}: " + "  ·  ".join(
+        f"{n} {AB_VERDICTS[v][0]}" for v, n in count.items() if n), 11, "muted", theme=t))
+    axis = 0
+    if rows:   # an axis only when a bar stands on it
+        axis = 32
+        for e in range(lo_exp, hi_exp + 1):
+            tx = x(2 ** e)
+            body.append(f"<line x1='{tx:.1f}' y1='{y0 - 6}' x2='{tx:.1f}' y2='{end:.1f}' stroke='{t['grid' if e else 'muted']}' stroke-width='1'/>")
+            body.append(text(tx, end + 15, f"{2 ** e:g}×", 11, "muted", "middle", theme=t))
+        body.append(text(left + plot / 2, end + 32, f"times better than {previous} (median, log scale; right of 1× is better)",
+                         12, "muted", "middle", theme=t))
     for n, ((c, r), note) in enumerate(zip(rows, notes)):
         y = y0 + n * row_h
         a, b = sorted((x(1), x(r)))
@@ -685,9 +752,13 @@ def ab_graph(title, cells, previous, caption, theme_name, alt=""):
         body.append(text(left - 10, y + bar_h - 3, c["cell"], 12, anchor="end", theme=t))
         body.append(f"<rect x='{a:.1f}' y='{y:.1f}' width='{max(b - a, 1):.1f}' height='{bar_h}' rx='2' fill='{t[colour]}'/>")
         body.append(text(max(b, x(1)) + 5, y + bar_h - 3, note, 11, "muted", theme=t))
-    body.append(caption_lines(caption, end + 54, t))
-    legend = tuple((AB_VERDICTS[v][1], AB_VERDICTS[v][0]) for v in ("improved", "within noise", "regressed"))
-    return frame(title, end + 76, "".join(body), theme_name, legend, alt)
+    for n, cell in enumerate(unjudged, len(rows)):
+        y = y0 + n * row_h
+        body.append(text(left - 10, y + bar_h - 3, cell, 12, anchor="end", theme=t))
+        body.append(text((x(1) if rows else left) + 5, y + bar_h - 3, unjudged_note, 11, "muted", theme=t))
+    body.append(caption_lines(caption, end + axis + 22, t))
+    legend = tuple((colour, word) for word, colour in AB_VERDICTS.values())
+    return frame(title, end + axis + 44, "".join(body), theme_name, legend, alt)
 
 
 def release_name(ref):
@@ -716,7 +787,8 @@ def ab_section(ab, version, rel, results_dir):
              f"Ferrofin **{version}** against **{previous}** (`{src['previous']}`) in the release's A/B gate ({src['pairs'] or '?'} "
              f"interleaved pairs on one host, {src['date']}): of {len(cells)} gated cells, **{count['improved']} improved**, "
              f"{count['within noise']} {'is' if count['within noise'] == 1 else 'are'} within noise and "
-             f"**{count['regressed']} regressed**{unjudged}{blocks}.\n",
+             f"**{count['regressed']} regressed**{unjudged}{blocks}. The graph draws the cells that improved or "
+             "regressed; every cell is in the table under it.\n",
              f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel}/previous-release-dark.svg">\n'
              f'  <img alt="{html.escape(alt)}" src="{rel}/previous-release.svg">\n</picture>\n',
              f"<details><summary>Against {md(previous)}: every gated cell</summary>\n",
@@ -751,8 +823,12 @@ def adoption_section(adoption, version, rel, results_dir):
              "[Migrating from Jellyfin](#migrating-from-jellyfin).\n",
              f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel}/adoption-dark.svg">\n'
              f'  <img alt="{html.escape(alt)}" src="{rel}/adoption.svg">\n</picture>\n',
+             "A *path* row is a database the official Jellyfin images built along one supported upgrade route (or a "
+             "fresh install); a *messy* row also carries rows long-lived databases accumulate that no API can produce; "
+             "the *scale* row clones a library to about 40,000 items. *Detected as* is the Jellyfin version Ferrofin must "
+             "identify the database as (releases that share a migration set share one).\n",
              "<details><summary>Adoption: every row</summary>\n",
-             "| Jellyfin database | Kind | Checked at | Result | Why |", "|---|---|---|---|---|"]
+             "| Jellyfin database | Kind | Detected as | Result | Why |", "|---|---|---|---|---|"]
     lines += [f"| {md(r['fixture'])} | {md(r['kind'])} | {md(r['expected'])} | {VERDICT_WORDS[r['verdict']]} | {md(r['reason'])} |"
               for r in rows]
     lines += ["\n</details>\n"]
@@ -1002,6 +1078,14 @@ def render(results_dir, readme_text, readme_dir=ROOT):
     files, block = {}, []
     src = bench["source"]
     block.append(f"{BEGIN} — do not edit by hand. Regenerate with: make publish-results (gates/publish.py) -->")
+    before, measured = [], measured_commits(latest) if "tag" in latest else []
+    for _, c in measured:
+        if not same_commit(c, latest["tag"]["commit"]) and not any(same_commit(c, b) for b in before):
+            before.append(str(c or "") or "unrecorded")
+    if before:
+        block.append(f"> Measured before the {version} tag: results below come from commit{'s' if len(before) > 1 else ''} "
+                     f"{' and '.join(f'`{c[:12]}`' for c in before)}, not the tag's (`{latest['tag']['commit'][:12]}`). "
+                     "Each section names the commit it measured.\n")
     block.append("### Speed and memory against Jellyfin\n")
     block.append(f"Ferrofin **{version}** against **{src['oracle']}**: the median of {src['run_count']} runs on one host "
                  f"({host_text(src['host_class'])}), each server alone in its container, over the same library, "
@@ -1088,6 +1172,8 @@ def main(argv):
     s.add_argument("--session", metavar="DIR", help="the release's gates session: its adoption status")
     s.add_argument("--ab", metavar="DIR", help="the release's A/B gate session: its verdicts against the previous release")
     s.add_argument("--out", default=os.path.join(ROOT, "docs", "results"))
+    s.add_argument("--measured-before-tag", action="store_true",
+                   help="publish results of a commit other than the tag's (a release re-cut after its runs), labelled so")
     r = sub.add_parser("readme")
     r.add_argument("--check", action="store_true")
     r.add_argument("--results", default=os.path.join(ROOT, "docs", "results"))
@@ -1095,7 +1181,13 @@ def main(argv):
     args = parser.parse_args(argv)
     try:
         if args.command == "summarise":
-            doc = summarise(args.version, args.bench, args.session, args.ab)
+            if not re.fullmatch(r"v\d+\.\d+\.\d+", args.version):
+                raise Refused(f"{args.version!r} is not a release version (vX.Y.Z)")
+            tag = tag_commit(args.version)
+            if not tag:
+                raise Refused(f"this checkout has no {args.version} tag: results are published after the tag "
+                              "(RELEASE.md, step 6); fetch the tags, or tag the release first")
+            doc = summarise(args.version, args.bench, args.session, args.ab, tag, args.measured_before_tag)
             path = os.path.join(args.out, args.version, "summary.json")
             write_json(path, doc)
             print(path)

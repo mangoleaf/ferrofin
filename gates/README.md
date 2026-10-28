@@ -112,7 +112,7 @@ release that stays in the repository, `docs/results/<version>/summary.json`. The
 local runs it is made from; nothing is picked automatically, and nothing here runs a gate:
 
 ```bash
-make publish-results VERSION=v1.4.0 SESSION="$FERROFIN_GATES_DIR/runs/<session>" BENCH="<run> <run> <run>" [AB=<A/B session>]
+make publish-results VERSION=v1.4.0 SESSION="$FERROFIN_GATES_DIR/runs/<session>" BENCH="<run> <run> <run>" [AB=<A/B session>] [MEASURED_BEFORE_TAG=1]
 ```
 
 That runs [`publish.py`](publish.py) twice:
@@ -124,6 +124,11 @@ That runs [`publish.py`](publish.py) twice:
   It refuses fewer than three Jellyfin-comparison runs, and runs of different images, hosts or fixtures. It
   also refuses a session of uncommitted code, one that measured another commit than the runs, and one
   whose adoption ran nothing or whose parity run is missing or did not send every request it planned.
+  The release's tag must exist in the checkout, and every result must record the tag's commit. A result
+  records the commit of the harness checkout it ran from, so build the image from that same checkout. A
+  release re-cut after its runs is published by running them again on the new commit. With
+  `MEASURED_BEFORE_TAG=1` (`--measured-before-tag`), the earlier commit's results are published anyway,
+  and the README's Results block opens by saying which commit they measured.
 - `readme` draws every graph of the newest summary into `docs/results/<version>/`, a light and a dark SVG
   each, and replaces the block between the `BEGIN`/`END GENERATED RESULTS` markers in `README.md`. The same
   summary files give byte-identical output, and `publish.py readme --check` exits 1 when the block or the
