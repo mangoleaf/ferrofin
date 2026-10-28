@@ -225,8 +225,13 @@ def adoption_summary(session, bench_commit=None, publishing=True):
 
 
 #: A parity request's outcome, as gates/parity/diff.py counts it, and how the README names it.
-PARITY_OUTCOMES = {"identical": "identical", "accepted": "accepted differences", "filed": "filed as issues",
+PARITY_OUTCOMES = {"identical": "identical", "accepted": "known differences", "filed": "filed as issues",
                    "new": "new differences", "oracle_failed": "not compared (Jellyfin failed them)"}
+#: What the parity graph's legend calls each outcome: a known difference is one the ledger links to its issue
+#: or its accepted reason; filed and new are both differences the ledger does not cover yet; a request Jellyfin
+#: failed (an error, or an area stock Jellyfin does not have), or a write step after one, is not compared.
+PARITY_LEGEND = {"identical": "identical", "accepted": "known (in ledger)", "filed": "filed, not in ledger",
+                 "new": "new", "oracle_failed": "Jellyfin failed"}
 #: How many API areas the parity graph draws, busiest first; the rest are one "other areas" bar.
 PARITY_AREAS = 12
 
@@ -272,7 +277,7 @@ def parity_summary(session, commit, publishing=True):
 
 #: How an A/B verdict reads in the README, and the colour of its bar.
 AB_VERDICTS = {"improved": ("improved", "ferrofin"), "within noise": ("within noise", "jellyfin"),
-               "regressed": ("regressed", "FAIL"), "not comparable": ("not comparable", "SKIP")}
+               "regressed": ("regressed", "FAIL"), "not comparable": ("not comparable", "INCOMPLETE")}
 
 
 def ab_summary(path):
@@ -582,7 +587,7 @@ def status_graph(title, rows, caption, theme_name, alt=""):
     row_h, y0 = 24, 62
     end = y0 + row_h * len(rows)
     body = [text(0, y0 - 10, "Jellyfin database", 11, "muted", theme=t), text(left + 10, y0 - 10, "kind", 11, "muted", theme=t),
-            text(left + 90, y0 - 10, "checked at schema of", 11, "muted", theme=t), text(WIDTH - 4, y0 - 10, "result", 11, "muted", "end", theme=t)]
+            text(left + 90, y0 - 10, "detected as", 11, "muted", theme=t), text(WIDTH - 4, y0 - 10, "result", 11, "muted", "end", theme=t)]
     for n, (name, r) in enumerate(zip(names, rows)):
         y = y0 + n * row_h
         body.append(f"<line x1='0' y1='{y - 4:.1f}' x2='{WIDTH}' y2='{y - 4:.1f}' stroke='{t['grid']}' stroke-width='1'/>")
@@ -607,12 +612,13 @@ def parity_rows(areas):
 
 def parity_graph(title, parity, caption, theme_name, alt=""):
     """One stacked bar per API area, its length the requests sent there, split by outcome: identical,
-    accepted differences, filed, new and not compared, with the area's share answered identically or
-    with an accepted difference at the right."""
+    known differences, filed, new and not compared, with how many of its requests were answered identically
+    at the right (`parity_label`)."""
     t = STYLE[theme_name]
     rows = parity_rows(parity["areas"])
+    labels = [parity_label(r) for r in rows]   # what is drawn after each bar, measured whole for the margin
     left = label_width([r["area"] for r in rows]) + 14
-    right = 150
+    right = label_width(labels, 11) + 12
     plot = WIDTH - left - right
     top = max(r["requests"] for r in rows)
     step = nice_step(top)
@@ -626,7 +632,7 @@ def parity_graph(title, parity, caption, theme_name, alt=""):
         body.append(f"<line x1='{tx:.1f}' y1='{y0 - 6}' x2='{tx:.1f}' y2='{end:.1f}' stroke='{t['grid']}' stroke-width='1'/>")
         body.append(text(tx, end + 15, f"{i * step:g}", 11, "muted", "middle", theme=t))
     body.append(text(left + plot / 2, end + 32, "requests jellyfin-web makes, by API area", 12, "muted", "middle", theme=t))
-    for n, r in enumerate(rows):
+    for n, (r, label) in enumerate(zip(rows, labels)):
         y = y0 + n * row_h
         body.append(text(left - 10, y + bar_h - 3, r["area"], 12, anchor="end", theme=t))
         at = left
@@ -635,15 +641,18 @@ def parity_graph(title, parity, caption, theme_name, alt=""):
             if width > 0:
                 body.append(f"<rect x='{at:.1f}' y='{y:.1f}' width='{width:.1f}' height='{bar_h}' fill='{t[key]}'/>")
                 at += width
-        compared = r["requests"] - r["oracle_failed"]
-        alike = r["identical"] + r["accepted"]
-        # rounded down, so an area reads 100% only when every compared request is alike
-        share = (("100" if alike == compared else f"{math.floor(1000 * alike / compared) / 10:g}") + "% alike"
-                 if compared else "not compared")
-        body.append(text(at + 5, y + bar_h - 3, f"{r['requests']}  ·  {share}", 11, "muted", theme=t))
+        body.append(text(at + 5, y + bar_h - 3, label, 11, "muted", theme=t))
     body.append(caption_lines(caption, end + 54, t))
-    legend = tuple((k, PARITY_OUTCOMES[k].split(" (")[0]) for k in PARITY_OUTCOMES)
-    return frame(title, end + 76, "".join(body), theme_name, legend, alt)
+    return frame(title, end + 76, "".join(body), theme_name, tuple(PARITY_LEGEND.items()), alt)
+
+
+def parity_label(row):
+    """What an area's bar says: how many of its requests were answered identically, and, so a segment too
+    thin to see is still read, how many differ in ways the ledger does not cover and how many were not
+    compared."""
+    untracked = row["filed"] + row["new"]
+    return (f"{row['identical']} of {row['requests']} identical" + (f"  ·  {untracked} not in ledger" if untracked else "")
+            + (f"  ·  {row['oracle_failed']} Jellyfin failed" if row["oracle_failed"] else ""))
 
 
 def parity_verdict(parity):
@@ -671,7 +680,7 @@ def parity_section(parity, version, rel, results_dir):
              f"The parity gate replays the **{parity['sent']:,}** requests jellyfin-web makes against {src['oracle']} and "
              f"Ferrofin **{version}** (commit `{src['commit'][:12]}`, a local gates session on {src['date']}) and compares the "
              f"answers. Of the {compared:,} it could compare, **{c['identical']:,} are identical** and **{c['accepted']:,} differ "
-             "in accepted ways** (each recorded with its reason in the parity ledger); "
+             "in known ways** (the parity ledger links each to its issue, or to the reason it is accepted); "
              f"**{c['filed']} {'is filed as an issue' if c['filed'] == 1 else 'are filed as issues'}** and "
              f"**{c['new']} {'is' if c['new'] == 1 else 'are'} new**. {c['oracle_failed']} "
              f"{'was' if c['oracle_failed'] == 1 else 'were'} not compared because Jellyfin itself failed "
@@ -679,7 +688,7 @@ def parity_section(parity, version, rel, results_dir):
              f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel}/parity-dark.svg">\n'
              f'  <img alt="{html.escape(alt)}" src="{rel}/parity.svg">\n</picture>\n',
              "<details><summary>Parity: every API area</summary>\n",
-             "| Area | Requests | Identical | Accepted | Filed | New | Not compared |", "|---|---|---|---|---|---|---|"]
+             "| Area | Requests | Identical | Known | Filed | New | Not compared |", "|---|---|---|---|---|---|---|"]
     lines += [f"| {md(a['area'])} | {a['requests']} | " + " | ".join(str(a[k]) for k in PARITY_OUTCOMES) + " |"
               for a in parity["areas"]]
     lines += ["", f"Filed as issues: {md(issues)}." if issues else "", "\n</details>\n"]
@@ -697,29 +706,45 @@ def ab_ratio(cell):
 
 
 def ab_graph(title, cells, previous, caption, theme_name, alt=""):
-    """One bar per gated cell from 1× on a log axis, its colour its verdict (improved, within noise,
-    regressed), the biggest gain first; each bar carries its multiple and the two medians."""
+    """One bar splitting every gated cell by verdict; then one bar per cell that improved or regressed from 1×
+    on a log axis, coloured by its verdict, the biggest gain first, each with its multiple and the two medians;
+    then each cell that could not be compared, named because it blocks like a regression. The cells within
+    noise are counted, not drawn: the README's table lists every cell."""
     t = STYLE[theme_name]
-    rows = sorted(((c, ab_ratio(c)) for c in cells if c["verdict"] != "not comparable" and ab_ratio(c)),
+    rows = sorted(((c, ab_ratio(c)) for c in cells if c["verdict"] in ("improved", "regressed") and ab_ratio(c)),
                   key=lambda cr: (-cr[1], cr[0]["cell"]))
+    unjudged = sorted(c["cell"] for c in cells if c["verdict"] == "not comparable")
     notes = [f"{speedup_text(r, c['unit'])}  ·  {value_text(c['b_median'], c['unit'])} vs {value_text(c['a_median'], c['unit'])}"
              f"  ·  {c['verdict']}" for c, r in rows]   # what is drawn after each bar, measured whole for the margin
-    left = label_width([c["cell"] for c, _ in rows]) + 14
-    right = label_width(notes, 11) + 12
+    unjudged_note = "not comparable: blocks like a regression"
+    left = label_width([c["cell"] for c, _ in rows] + unjudged) + 14
+    right = label_width(notes + ([unjudged_note] if unjudged else []), 11) + 12
     plot = WIDTH - left - right
     lo, hi = min([r for _, r in rows] + [1.0]), max([r for _, r in rows] + [1.0])
     lo_exp = min(math.floor(math.log2(lo)), -1) if lo < 1 else 0
     hi_exp = max(math.ceil(math.log2(hi)), 1)
     x = lambda v: left + plot * (math.log2(v) - lo_exp) / (hi_exp - lo_exp)
-    row_h, bar_h, y0 = 22, 14, 60
-    end = y0 + row_h * len(rows)
-    body = []
-    for e in range(lo_exp, hi_exp + 1):
-        tx = x(2 ** e)
-        body.append(f"<line x1='{tx:.1f}' y1='{y0 - 6}' x2='{tx:.1f}' y2='{end:.1f}' stroke='{t['grid' if e else 'muted']}' stroke-width='1'/>")
-        body.append(text(tx, end + 15, f"{2 ** e:g}×", 11, "muted", "middle", theme=t))
-    body.append(text(left + plot / 2, end + 32, f"times better than {previous} (median, log scale; right of 1× is better)",
-                     12, "muted", "middle", theme=t))
+    row_h, bar_h, top = 22, 14, 60
+    y0 = top + 3 * row_h   # the summary bar, its counts, then the cells
+    end = y0 + row_h * (len(rows) + len(unjudged))
+    count = {v: sum(c["verdict"] == v for c in cells) for v in AB_VERDICTS}
+    body, at = [], 0.0
+    for verdict, n in count.items():
+        if n:
+            width = WIDTH * n / len(cells)
+            body.append(f"<rect x='{at:.1f}' y='{top}' width='{width:.1f}' height='{bar_h}' fill='{t[AB_VERDICTS[verdict][1]]}'/>")
+            at += width
+    body.append(text(0, top + bar_h + 15, f"{len(cells)} gated cell{'s' if len(cells) != 1 else ''}: " + "  ·  ".join(
+        f"{n} {AB_VERDICTS[v][0]}" for v, n in count.items() if n), 11, "muted", theme=t))
+    axis = 0
+    if rows:   # an axis only when a bar stands on it
+        axis = 32
+        for e in range(lo_exp, hi_exp + 1):
+            tx = x(2 ** e)
+            body.append(f"<line x1='{tx:.1f}' y1='{y0 - 6}' x2='{tx:.1f}' y2='{end:.1f}' stroke='{t['grid' if e else 'muted']}' stroke-width='1'/>")
+            body.append(text(tx, end + 15, f"{2 ** e:g}×", 11, "muted", "middle", theme=t))
+        body.append(text(left + plot / 2, end + 32, f"times better than {previous} (median, log scale; right of 1× is better)",
+                         12, "muted", "middle", theme=t))
     for n, ((c, r), note) in enumerate(zip(rows, notes)):
         y = y0 + n * row_h
         a, b = sorted((x(1), x(r)))
@@ -727,9 +752,13 @@ def ab_graph(title, cells, previous, caption, theme_name, alt=""):
         body.append(text(left - 10, y + bar_h - 3, c["cell"], 12, anchor="end", theme=t))
         body.append(f"<rect x='{a:.1f}' y='{y:.1f}' width='{max(b - a, 1):.1f}' height='{bar_h}' rx='2' fill='{t[colour]}'/>")
         body.append(text(max(b, x(1)) + 5, y + bar_h - 3, note, 11, "muted", theme=t))
-    body.append(caption_lines(caption, end + 54, t))
-    legend = tuple((AB_VERDICTS[v][1], AB_VERDICTS[v][0]) for v in ("improved", "within noise", "regressed"))
-    return frame(title, end + 76, "".join(body), theme_name, legend, alt)
+    for n, cell in enumerate(unjudged, len(rows)):
+        y = y0 + n * row_h
+        body.append(text(left - 10, y + bar_h - 3, cell, 12, anchor="end", theme=t))
+        body.append(text((x(1) if rows else left) + 5, y + bar_h - 3, unjudged_note, 11, "muted", theme=t))
+    body.append(caption_lines(caption, end + axis + 22, t))
+    legend = tuple((colour, word) for word, colour in AB_VERDICTS.values())
+    return frame(title, end + axis + 44, "".join(body), theme_name, legend, alt)
 
 
 def release_name(ref):
@@ -758,7 +787,8 @@ def ab_section(ab, version, rel, results_dir):
              f"Ferrofin **{version}** against **{previous}** (`{src['previous']}`) in the release's A/B gate ({src['pairs'] or '?'} "
              f"interleaved pairs on one host, {src['date']}): of {len(cells)} gated cells, **{count['improved']} improved**, "
              f"{count['within noise']} {'is' if count['within noise'] == 1 else 'are'} within noise and "
-             f"**{count['regressed']} regressed**{unjudged}{blocks}.\n",
+             f"**{count['regressed']} regressed**{unjudged}{blocks}. The graph draws the cells that improved or "
+             "regressed; every cell is in the table under it.\n",
              f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel}/previous-release-dark.svg">\n'
              f'  <img alt="{html.escape(alt)}" src="{rel}/previous-release.svg">\n</picture>\n',
              f"<details><summary>Against {md(previous)}: every gated cell</summary>\n",
@@ -793,8 +823,12 @@ def adoption_section(adoption, version, rel, results_dir):
              "[Migrating from Jellyfin](#migrating-from-jellyfin).\n",
              f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel}/adoption-dark.svg">\n'
              f'  <img alt="{html.escape(alt)}" src="{rel}/adoption.svg">\n</picture>\n',
+             "A *path* row is a database the official Jellyfin images built along one supported upgrade route (or a "
+             "fresh install); a *messy* row also carries rows long-lived databases accumulate that no API can produce; "
+             "the *scale* row clones a library to about 40,000 items. *Detected as* is the Jellyfin version Ferrofin must "
+             "identify the database as (releases that share a migration set share one).\n",
              "<details><summary>Adoption: every row</summary>\n",
-             "| Jellyfin database | Kind | Checked at | Result | Why |", "|---|---|---|---|---|"]
+             "| Jellyfin database | Kind | Detected as | Result | Why |", "|---|---|---|---|---|"]
     lines += [f"| {md(r['fixture'])} | {md(r['kind'])} | {md(r['expected'])} | {VERDICT_WORDS[r['verdict']]} | {md(r['reason'])} |"
               for r in rows]
     lines += ["\n</details>\n"]
