@@ -42,7 +42,7 @@ publish-results:
 	$(if $(call cli,VERSION),,$(error VERSION=vX.Y.Z is required))
 	$(if $(call cli,SESSION),,$(error SESSION=DIR is required: the release's gates session, for its adoption and parity))
 	$(if $(call cli,BENCH),,$(error BENCH="RUN RUN RUN" is required: three or more Jellyfin-comparison runs))
-	python3 gates/publish.py summarise --version '$(VERSION)' --session '$(SESSION)' --bench $(BENCH) $(if $(call cli,AB),--ab '$(AB)')
+	python3 gates/publish.py summarise --version '$(VERSION)' --session '$(SESSION)' --bench $(BENCH) $(if $(call cli,AB),--ab '$(AB)') $(if $(call cli,MEASURED_BEFORE_TAG),--measured-before-tag)
 	python3 gates/publish.py readme
 
 # The gates' own tests, which need no docker, server or fixtures: shellcheck, the bats tests and the
