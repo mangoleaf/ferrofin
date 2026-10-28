@@ -290,6 +290,23 @@ pub trait LibraryManager: Send + Sync {
         Ok(Some(item))
     }
 
+    /// [`Self::get_item_by_id_for_user`], with the rows its visibility check read: the
+    /// item's chain through `ParentId`, `OwnerId`, `ChannelId`, `SeasonId` and `SeriesId`,
+    /// item included, as [`Self::get_item_by_id`] returns them. A caller that wants a row
+    /// of that chain, such as a season's series, takes it from here instead of reading
+    /// it again, and reads it only when it is absent. The chain's order is unspecified,
+    /// and it is empty when the check read none: a user-less request, and this default.
+    async fn get_item_by_id_for_user_with_chain(
+        &self,
+        id: Uuid,
+        user: Option<&UserEntity>,
+    ) -> Result<Option<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+        Ok(self
+            .get_item_by_id_for_user(id, user)
+            .await?
+            .map(|item| (item, Vec::new())))
+    }
+
     /// `BaseItem.ContainingFolderPath`: the folder a folder content-type
     /// override for `item` is keyed on. That is the item's own path for a
     /// folder, a disc rip that is no placeholder and a by-name item, a
