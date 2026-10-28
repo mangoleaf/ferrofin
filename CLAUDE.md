@@ -37,7 +37,7 @@ Consequences you must respect:
 
 ## Workspace layout
 
-Rust workspace, edition 2024, toolchain pinned to **1.98.1** (stable). Library crates in
+Rust workspace, edition 2024, toolchain pinned to **1.99.1** (stable). Library crates in
 `crates/`, the server binary in `apps/`.
 
 ```

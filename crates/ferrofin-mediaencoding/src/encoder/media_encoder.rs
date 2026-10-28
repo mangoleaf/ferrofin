@@ -1448,7 +1448,7 @@ mod tests {
             self.runs.fetch_add(1, Ordering::SeqCst);
             let hang = self
                 .hangs
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok();
             if hang {
                 let _abandoned = Abandoned(Arc::clone(&self.abandoned));

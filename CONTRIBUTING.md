@@ -8,7 +8,7 @@ By contributing you agree your work is licensed under the same terms.
 
 ## Development setup
 
-Rust workspace, edition 2024, toolchain pinned to **1.98.1** (stable — see
+Rust workspace, edition 2024, toolchain pinned to **1.99.1** (stable — see
 `rust-toolchain.toml`, which rustup honors automatically).
 
 ```bash
