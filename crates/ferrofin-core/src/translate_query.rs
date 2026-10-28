@@ -490,6 +490,17 @@ pub(crate) fn build_latest_movies_query(filter: &InternalItemsQuery) -> QueryBui
 /// when there is one, as the lightweight `(Id, SeriesName, DateCreated,
 /// SeasonId, SeriesId)` projection, newest first (`DateCreated DESC, Id
 /// DESC`). `series_names` must not be empty.
+///
+/// The `IsPlayed` filter tests each row with [`push_leaf_is_played_per_row`]
+/// (gl-978): these rows are the newest series' episodes since the cutoff,
+/// usually a handful, and the list form rebuilt the user's whole watch history
+/// to test them. The statement alone, on copies of the bench corpus database,
+/// list form against per row: 0.32 ms against 0.03 for 19 tested rows and a
+/// 4,031-row history; level at some 600 tested rows; and, across the three
+/// histories measured (4,031, 855 and no rows), 9.1-10.2 ms against
+/// 10.6-11.5 at 7,490 (sixteen series of some 470 episodes each, all added
+/// within a day). The shorter the history, the sooner per row stops paying.
+/// Step 1 ranges over the whole library and keeps the list form.
 #[must_use]
 pub(crate) fn build_latest_tv_episodes_query(
     filter: &InternalItemsQuery,
@@ -503,7 +514,21 @@ pub(crate) fn build_latest_tv_episodes_query(
            FROM "BaseItems" AS bi WHERE bi."Id" <> "#,
     );
     qb.push_bind(PLACEHOLDER_ID);
-    append_predicates(&mut qb, filter);
+    let without_played = InternalItemsQuery {
+        is_played: None,
+        ..filter.clone()
+    };
+    append_predicates(&mut qb, &without_played);
+    if let (Some(user_id), Some(want)) = (filter.user_id(), filter.is_played) {
+        qb.push(if want { " AND " } else { " AND NOT " });
+        push_is_played_with(
+            &mut qb,
+            "bi",
+            &guid_to_db(user_id),
+            filter,
+            push_leaf_is_played_per_row,
+        );
+    }
     qb.push(r#" AND bi."SeriesName" IN ("#);
     let mut names = qb.separated(", ");
     for name in series_names {
@@ -2183,10 +2208,22 @@ pub(crate) fn push_is_played(
     user_id: &str,
     filter: &InternalItemsQuery,
 ) {
+    push_is_played_with(qb, alias, user_id, filter, push_leaf_is_played);
+}
+
+/// [`push_is_played`] with `leaf` testing a leaf's own state:
+/// [`push_leaf_is_played`] or [`push_leaf_is_played_per_row`], the same rule.
+fn push_is_played_with(
+    qb: &mut QueryBuilder<Sqlite>,
+    alias: &str,
+    user_id: &str,
+    filter: &InternalItemsQuery,
+    leaf: fn(&mut QueryBuilder<Sqlite>, &str, &str),
+) {
     qb.push(format!(r#"((+{alias}."IsFolder" = 1 AND NOT "#));
     push_has_unplayed_leaf(qb, alias, user_id, filter);
     qb.push(format!(r#") OR (+{alias}."IsFolder" = 0 AND "#));
-    push_leaf_is_played(qb, alias, user_id);
+    leaf(qb, alias, user_id);
     qb.push("))");
 }
 
@@ -2241,16 +2278,17 @@ fn push_version_group_played(qb: &mut QueryBuilder<Sqlite>, user_id: &str) {
 /// `IX_BaseItems_PrimaryVersionId`. Nothing is built from the user's whole
 /// watch history.
 ///
-/// Only for a row set anchored on one folder's closure,
-/// [`build_leaf_played_and_total_query`]'s: there the lists cost more to build
-/// than the leaves cost to test. Each statement run alone, outside the server,
-/// on a copy of the bench corpus database (a 4,031-row history): for a 39-leaf
-/// series the list-form played count took 0.33 ms, and one statement counting
-/// both this way 0.06 ms. On folders of 3,001 and 7,490 leaves the one
-/// statement measured within 5 % in either form, since reading the closure is
-/// most of its cost; what those folders gain is reading it once, not twice.
-/// The `IsPlayed` filter and sort keys keep the list form, which suits the
-/// large result sets they range over.
+/// Only for small anchored row sets, where the lists cost more to build than
+/// the rows cost to test: one folder's closure
+/// ([`build_leaf_played_and_total_query`]) and the newest series' recent
+/// episodes ([`build_latest_tv_episodes_query`]). Each statement run alone,
+/// outside the server, on a copy of the bench corpus database (a 4,031-row
+/// history): for a 39-leaf series the list-form played count took 0.33 ms,
+/// and one statement counting both this way 0.06 ms. On folders of 3,001 and
+/// 7,490 leaves the one statement measured within 5 % in either form, since
+/// reading the closure is most of its cost; what those folders gain is
+/// reading it once, not twice. The `IsPlayed` filter and sort keys elsewhere
+/// keep the list form, which suits the large result sets they range over.
 fn push_leaf_is_played_per_row(qb: &mut QueryBuilder<Sqlite>, alias: &str, user_id: &str) {
     qb.push(format!(
         r#"(EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = {alias}."Id" AND ud."UserId" = "#
