@@ -2091,7 +2091,7 @@ async fn get_items_resolves_the_artist_album_and_studio_names() {
     )
     .await;
     assert_eq!(blank.studio_ids, [kept]);
-    assert!(blank.artist_ids.is_empty());
+    assert!(blank.artist_ids.is_empty(), "{:?}", blank.artist_ids);
 }
 
 /// An artist's albums asked for with no `sortBy` come newest first, then by
@@ -2598,8 +2598,16 @@ async fn get_items_forwards_the_stream_language_filters_but_the_user_route_drops
     assert!(query.include_owned_items);
 
     let query = run(format!("/Users/{USER_ID}/Items?{filters}")).await;
-    assert!(query.audio_languages.is_empty());
-    assert!(query.subtitle_languages.is_empty());
+    assert!(
+        query.audio_languages.is_empty(),
+        "{:?}",
+        query.audio_languages
+    );
+    assert!(
+        query.subtitle_languages.is_empty(),
+        "{:?}",
+        query.subtitle_languages
+    );
     assert_eq!(query.has_subtitles, Some(true));
     // `hasSubtitles` alone still reads media streams.
     assert!(query.include_owned_items);
@@ -2891,7 +2899,7 @@ async fn intros_are_empty() {
     let (status, body) = send("GET", &format!("/Items/{ITEM_ID}/Intros"), Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
-    assert!(result.items.is_empty());
+    assert!(result.items.is_empty(), "{:?}", result.items);
 }
 
 #[tokio::test]
@@ -2904,7 +2912,7 @@ async fn critic_reviews_are_empty() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
-    assert!(result.items.is_empty());
+    assert!(result.items.is_empty(), "{:?}", result.items);
 }
 
 #[tokio::test]
@@ -2960,7 +2968,11 @@ async fn theme_media_combines_songs_and_videos() {
     let result: AllThemeMediaResult = serde_json::from_slice(&body).expect("all theme media");
     assert_eq!(result.theme_songs_result.result.items[0].id, SONG_ID);
     assert_eq!(result.theme_videos_result.result.items[0].id, VIDEO_ID);
-    assert!(result.soundtrack_songs_result.result.items.is_empty());
+    assert!(
+        result.soundtrack_songs_result.result.items.is_empty(),
+        "{:?}",
+        result.soundtrack_songs_result.result.items
+    );
 }
 
 #[tokio::test]

@@ -464,7 +464,8 @@ async fn environment_drives_parent_and_default_browser() {
 
     let (ns, nsb) = get(full_state(), "/Environment/NetworkShares").await;
     assert_eq!(ns, StatusCode::OK);
-    assert!(json(&nsb).as_array().unwrap().is_empty());
+    let shares = json(&nsb);
+    assert!(shares.as_array().unwrap().is_empty(), "{shares}");
 }
 
 #[tokio::test]
@@ -500,5 +501,6 @@ async fn environment_routes_require_an_administrator_once_setup_is_complete() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(json(&body).as_array().unwrap().is_empty());
+    let shares = json(&body);
+    assert!(shares.as_array().unwrap().is_empty(), "{shares}");
 }

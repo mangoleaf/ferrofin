@@ -288,7 +288,7 @@ mod tests {
     #[test]
     fn axum_routes_are_deduped_and_nonempty() {
         let routes = axum_routes();
-        assert!(!routes.is_empty());
+        assert!(!routes.is_empty(), "{routes:?}");
         let mut sorted = routes.clone();
         sorted.dedup();
         assert_eq!(sorted.len(), routes.len(), "route table has duplicates");

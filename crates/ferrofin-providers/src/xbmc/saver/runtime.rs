@@ -472,7 +472,7 @@ mod tests {
             &item,
             r#"<!DOCTYPE movie [<!ENTITY custom "value">]><movie><extra>&custom;</extra></movie>"#,
         );
-        assert!(writer.finish().is_empty());
+        assert_eq!(writer.finish(), "");
     }
 
     #[test]

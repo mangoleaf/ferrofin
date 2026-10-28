@@ -981,7 +981,8 @@ async fn lyrics_remote_search_is_empty_list() {
     let (status, body) = call(app, "GET", &format!("/Audio/{ITEM_ID}/RemoteSearch/Lyrics")).await;
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(v.as_array().unwrap().is_empty());
+    let items = v.as_array().unwrap();
+    assert!(items.is_empty(), "{items:?}");
 }
 
 #[tokio::test]

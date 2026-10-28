@@ -3246,7 +3246,8 @@ mod tests {
             Some("https://image.tmdb.org/t/p/original/bp.jpg")
         );
         assert!(hits[1].profile_url.is_none());
-        assert!(client.search_person("  ").await.is_empty());
+        let people = client.search_person("  ").await;
+        assert!(people.is_empty(), "{people:?}");
 
         let person = client.person_lookup(287, None).await.expect("lookup");
         assert_eq!(person.name.as_deref(), Some("Brad Pitt"));
@@ -3567,8 +3568,10 @@ mod tests {
 
     #[test]
     fn map_cast_no_cast_yields_nothing() {
-        assert!(map_aggregate_cast(Vec::new(), &cast_config(10)).is_empty());
-        assert!(map_cast(Vec::new(), &cast_config(10)).is_empty());
+        let found = map_aggregate_cast(Vec::new(), &cast_config(10));
+        assert!(found.is_empty(), "{found:?}");
+        let found = map_cast(Vec::new(), &cast_config(10));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `TmdbSeriesProvider.GetPersons` (v12.2): the whole run's cast from

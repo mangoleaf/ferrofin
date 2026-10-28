@@ -1210,7 +1210,7 @@ async fn user_scoped_intros_returns_empty_query_result() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
-    assert!(result.items.is_empty());
+    assert!(result.items.is_empty(), "{:?}", result.items);
     // The alias must be indistinguishable from the modern query form on the wire.
     let (modern_status, modern_body) = send(
         "GET",
@@ -2332,11 +2332,12 @@ async fn resume_confines_an_unscoped_request_to_the_users_remaining_root_folders
     )
     .await;
     let query = recorded.expect("ran");
-    assert!(query.ancestor_ids.is_empty());
+    assert!(query.ancestor_ids.is_empty(), "{:?}", query.ancestor_ids);
     assert_eq!(query.parent_id, RESUME_MOVIES_ID);
     // …and so does a user with no excludes.
     let (_, _, recorded) = send_resume(Vec::new(), "/UserItems/Resume").await;
-    assert!(recorded.expect("ran").ancestor_ids.is_empty());
+    let ancestor_ids = recorded.expect("ran").ancestor_ids;
+    assert!(ancestor_ids.is_empty(), "{ancestor_ids:?}");
 }
 
 /// v12 ItemsController.cs:963-976: `excludeActiveSessions` drops every
@@ -2356,7 +2357,8 @@ async fn resume_excludes_every_version_of_what_the_users_sessions_play() {
 
     // Off by default.
     let (_, _, recorded) = send_resume(Vec::new(), "/UserItems/Resume").await;
-    assert!(recorded.expect("ran").exclude_item_ids.is_empty());
+    let exclude_item_ids = recorded.expect("ran").exclude_item_ids;
+    assert!(exclude_item_ids.is_empty(), "{exclude_item_ids:?}");
 }
 
 /// `AddAdditionalDtoOptions` reaches the projection: `enableImages=false`

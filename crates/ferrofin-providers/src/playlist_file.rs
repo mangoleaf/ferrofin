@@ -473,7 +473,8 @@ mod tests {
 
     #[test]
     fn an_unknown_extension_reads_nothing() {
-        assert!(read_playlist_file("/m/l.txt", "a.flac\n").is_empty());
+        let found = read_playlist_file("/m/l.txt", "a.flac\n");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

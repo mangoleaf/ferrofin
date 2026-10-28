@@ -1224,7 +1224,8 @@ async fn by_name_browses_honour_requested_fields() {
         );
     }
     // Absent `fields` ⇒ the base DTO, as `new DtoOptions { Fields = [] }`.
-    assert!(options_for("/Genres").await.fields.is_empty());
+    let fields = options_for("/Genres").await.fields;
+    assert!(fields.is_empty(), "{fields:?}");
 }
 
 #[tokio::test]

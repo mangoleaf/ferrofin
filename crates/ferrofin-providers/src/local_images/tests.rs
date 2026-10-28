@@ -153,7 +153,7 @@ fn empty_files_are_ignored() {
     let mut fs = FakeDirectoryService::new();
     fs.empty_file("/media/movie", "poster.png");
     let images = LocalImageProvider::get_images(&folder_item(ImageItemKind::Movie), &fs);
-    assert!(images.is_empty());
+    assert!(images.is_empty(), "{images:?}");
 }
 
 #[test]
@@ -417,7 +417,8 @@ fn collection_folder_reads_its_locations_without_their_subfolders() {
     let mut fs = FakeDirectoryService::new();
     fs.dir("/media/movies", "Heat (1995)")
         .file("/media/movies/Heat (1995)", "poster.png");
-    assert!(CollectionFolderLocalImageProvider::get_images(&item, &fs).is_empty());
+    let images = CollectionFolderLocalImageProvider::get_images(&item, &fs);
+    assert!(images.is_empty(), "{images:?}");
 }
 
 #[test]
@@ -430,7 +431,7 @@ fn internal_metadata_provider_scans_given_path() {
 
     // Empty path -> no images.
     let none = InternalMetadataFolderImageProvider::get_images(&item, "", &fs);
-    assert!(none.is_empty());
+    assert!(none.is_empty(), "{none:?}");
 
     assert!(!InternalMetadataFolderImageProvider::supports(
         &ImageItem::new(ImageItemKind::Photo)
@@ -513,7 +514,8 @@ fn fs_directory_service_memoizes_missing_directories() {
     let path = base.to_string_lossy().into_owned();
 
     let service = FsDirectoryService::new();
-    assert!(service.file_system_entries(&path).is_empty());
+    let file_system_entries = service.file_system_entries(&path);
+    assert!(file_system_entries.is_empty(), "{file_system_entries:?}");
 
     std::fs::create_dir_all(&base).expect("create temp dir");
     std::fs::write(base.join("a.png"), b"x").expect("write a");

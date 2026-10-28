@@ -2042,7 +2042,7 @@ mod tests {
             .unwrap()
             .0;
         assert!(!info.is_enabled);
-        assert!(info.services.is_empty());
+        assert!(info.services.is_empty(), "{:?}", info.services);
     }
 
     #[tokio::test]
@@ -2154,17 +2154,15 @@ mod tests {
     async fn discover_tuners_hands_the_manager_the_upstream_budget() {
         let fake = std::sync::Arc::new(FakeLiveTv::default());
         let state = fake_state().with_live_tv(fake.clone());
-        assert!(
-            discover_tuners(
-                admin_auth(),
-                State(state),
-                Query(DiscoverTunersQuery::default())
-            )
-            .await
-            .unwrap()
-            .0
-            .is_empty()
-        );
+        let found = discover_tuners(
+            admin_auth(),
+            State(state),
+            Query(DiscoverTunersQuery::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(
             *fake.discovery_duration_ms.lock().expect("lock"),
             Some(TUNER_DISCOVERY_DURATION_MS)
@@ -2186,7 +2184,7 @@ mod tests {
         let found = discover_tuners(admin_auth(), State(state), Query(query))
             .await
             .expect("discover");
-        assert!(found.0.is_empty());
+        assert!(found.0.is_empty(), "{:?}", found.0);
         assert_eq!(*fake.discovery_new_only.lock().expect("lock"), Some(true));
     }
 
@@ -2209,17 +2207,15 @@ mod tests {
                 .is_empty(),
             "the default fake advertises no tuner host types"
         );
-        assert!(
-            discover_tuners(
-                admin_auth(),
-                State(smoke.clone()),
-                Query(DiscoverTunersQuery::default())
-            )
-            .await
-            .expect("discover")
-            .0
-            .is_empty()
-        );
+        let found = discover_tuners(
+            admin_auth(),
+            State(smoke.clone()),
+            Query(DiscoverTunersQuery::default()),
+        )
+        .await
+        .expect("discover")
+        .0;
+        assert!(found.is_empty(), "{found:?}");
         // No listings provider is configured, and `ListingsManager.GetLineups`
         // then throws `ResourceNotFoundException` — a 404, not an empty list.
         assert_eq!(
@@ -2230,32 +2226,30 @@ mod tests {
             axum::http::StatusCode::NOT_FOUND
         );
         let state = fake_state();
-        assert!(
-            get_recordings(
-                State(state.clone()),
-                auth(),
-                Query(RecordingsQuery::default())
-            )
-            .await
-            .unwrap()
-            .0
-            .items
-            .is_empty()
-        );
-        assert!(
-            get_recording_folders(
-                State(state.clone()),
-                auth(),
-                Query(LiveTvUserQuery::default())
-            )
-            .await
-            .unwrap()
-            .0
-            .items
-            .is_empty()
-        );
-        assert!(get_recording_groups(auth()).await.0.items.is_empty());
-        assert!(get_recordings_series(auth()).await.0.items.is_empty());
+        let items = get_recordings(
+            State(state.clone()),
+            auth(),
+            Query(RecordingsQuery::default()),
+        )
+        .await
+        .unwrap()
+        .0
+        .items;
+        assert!(items.is_empty(), "{items:?}");
+        let items = get_recording_folders(
+            State(state.clone()),
+            auth(),
+            Query(LiveTvUserQuery::default()),
+        )
+        .await
+        .unwrap()
+        .0
+        .items;
+        assert!(items.is_empty(), "{items:?}");
+        let items = get_recording_groups(auth()).await.0.items;
+        assert!(items.is_empty(), "{items:?}");
+        let items = get_recordings_series(auth()).await.0.items;
+        assert!(items.is_empty(), "{items:?}");
         assert_eq!(
             get_timers(State(state.clone()), auth(), Query(TimersQuery::default()))
                 .await
@@ -3232,7 +3226,7 @@ mod tests {
         assert!(options.add_current_program);
         assert!(!query.enable_favorite_sorting, "contract default is false");
         assert_eq!(query.channel_type, None);
-        assert!(query.sort_by.is_empty());
+        assert!(query.sort_by.is_empty(), "{:?}", query.sort_by);
         assert!(options.enable_user_data);
         assert!(options.enable_images);
     }
@@ -3240,7 +3234,7 @@ mod tests {
     #[tokio::test]
     async fn programs_query_defaults_to_unfiltered_start_date_order() {
         let query = recorded_programs_query("/LiveTv/Programs").await;
-        assert!(query.channel_ids.is_empty());
+        assert!(query.channel_ids.is_empty(), "{:?}", query.channel_ids);
         assert!(query.min_start_date.is_none());
         assert!(query.limit.is_none());
         // The manager's "unless something else was specified" fallback.
@@ -3424,7 +3418,8 @@ mod tests {
         // channel filter is *unfiltered* — Jellyfin answers the whole guide.
         let body = programs_body(r#"{"ChannelIds":",,"}"#);
         assert_eq!(body.channel_ids, Some(Vec::new()));
-        assert!(body.into_parts().0.channel_ids.is_empty());
+        let channel_ids = body.into_parts().0.channel_ids;
+        assert!(channel_ids.is_empty(), "{channel_ids:?}");
     }
 
     #[test]

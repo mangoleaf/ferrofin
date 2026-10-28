@@ -1101,7 +1101,7 @@ async fn head_item_image_is_ok_without_body() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "{body:?}");
 }
 
 #[tokio::test]
@@ -2046,7 +2046,7 @@ async fn legacy_user_image_routes_forward() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "{body:?}");
     let (status, body) = send(
         &s,
         "HEAD",
@@ -2055,7 +2055,7 @@ async fn legacy_user_image_routes_forward() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "{body:?}");
 }
 
 #[tokio::test]

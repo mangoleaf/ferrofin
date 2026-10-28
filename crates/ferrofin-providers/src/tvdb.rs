@@ -1894,7 +1894,8 @@ mod tests {
         // No /login route → token() fails → every call returns None/empty.
         let server = MockServer::start(vec![("/search", "{}".to_owned())]).await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
-        assert!(c.search("x", None, "en", &[]).await.is_empty());
+        let results = c.search("x", None, "en", &[]).await;
+        assert!(results.is_empty(), "{results:?}");
         assert!(c.series_details(1, "usa").await.is_none());
     }
 
@@ -2111,6 +2112,7 @@ mod tests {
             assert_eq!((images[0].width, images[0].height), (Some(800), Some(0)));
         }
         assert!(client.artwork_types.lock().unwrap().is_some());
-        assert!(client.season_images(5, "official", 99).await.is_empty());
+        let season_images = client.season_images(5, "official", 99).await;
+        assert!(season_images.is_empty(), "{season_images:?}");
     }
 }

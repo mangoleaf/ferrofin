@@ -2494,7 +2494,11 @@ mod tests {
         assert_eq!(internal.subtitle_languages, ["fre"]);
         let internal = bind("audioLanguages=eng&AudioLanguages=ger");
         assert_eq!(internal.audio_languages, ["eng", "ger"]);
-        assert!(internal.subtitle_languages.is_empty());
+        assert!(
+            internal.subtitle_languages.is_empty(),
+            "{:?}",
+            internal.subtitle_languages
+        );
     }
 
     /// The filters `TranslateQuery` already applies reach it from the URL
@@ -2585,7 +2589,11 @@ mod tests {
         };
         apply_media_stream_filter_rules(&mut contradicting);
         assert_eq!(contradicting.has_subtitles, Some(false));
-        assert!(contradicting.subtitle_languages.is_empty());
+        assert!(
+            contradicting.subtitle_languages.is_empty(),
+            "{:?}",
+            contradicting.subtitle_languages
+        );
         assert!(contradicting.include_owned_items);
     }
 
