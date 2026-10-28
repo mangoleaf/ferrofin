@@ -2124,11 +2124,15 @@ impl FerrofinStreamStatePlanner {
             push_split(&mut args, "-c:a");
             args.push(audio_encoder.clone());
             let source_container = state.input_container.as_deref().unwrap_or_default();
+            // Without upstream's `-copyts` (see `-output_ts_offset` below), a
+            // seeked segment's packets count from the input seek, and so must
+            // the copied-audio trim.
             if let Some(bsf) =
                 ferrofin_mediaencoding::encoding_helper::bitstream::audio_bit_stream_arguments(
                     state,
                     segment_container,
                     source_container,
+                    segment_seek_ticks.unwrap_or(0),
                     caps.ffmpeg_version(),
                 )
             {
@@ -6209,6 +6213,59 @@ mod tests {
                 "{vf}"
             );
         }
+    }
+
+    /// `GetCopiedAudioTrimBsf` cuts copied audio at the seek on the source's
+    /// timeline, which upstream's `-copyts` keeps. These jobs pass no
+    /// `-copyts`, so the packets the filter sees count from the input seek:
+    /// the cutoff is the requested start less that seek, 0 unless the seek
+    /// was clamped before the end, where upstream also cuts the audio up to
+    /// the requested start (gl-1018: cut at the absolute 150 s, a seek
+    /// to 2:30 dropped every audio packet and fMP4 segments came out empty).
+    #[rstest::rstest]
+    #[case::seek(50, 150, "150", "0.000")]
+    #[case::clamped_before_the_end(1799, 5398, "5395", "3.000")]
+    #[tokio::test]
+    async fn the_copied_audio_trim_counts_from_the_input_seek(
+        #[case] segment: i32,
+        #[case] start_secs: i64,
+        #[case] output_offset: &str,
+        #[case] cutoff: &str,
+    ) {
+        let src = source("abc", vec![video_stream("hevc"), audio_stream("ac3")]);
+        let p = planner_over_caps(
+            Arc::new(FakeMediaSources {
+                sources: vec![src],
+                live_streams: HashMap::new(),
+            }),
+            false,
+            FfmpegCapabilities::builder()
+                .ffmpeg_version(FfmpegVersion::new(5, 0))
+                .build(),
+            EncodingOptions::default(),
+        );
+        let mut req = request("abc");
+        req.video_codec = Some("h264".to_owned());
+        req.audio_codec = Some("ac3".to_owned());
+        req.current_runtime_ticks = start_secs * TICKS_PER_SECOND;
+
+        let plan = p
+            .plan(&req, false, Some(segment), PlaylistKind::Vod)
+            .await
+            .unwrap();
+
+        let args = &plan.arguments;
+        assert!(args.windows(2).any(|w| w == ["-c:a", "copy"]), "{args:?}");
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-output_ts_offset", output_offset]),
+            "{args:?}"
+        );
+        let trim = format!("noise=drop='lt(pts*tb\\,{cutoff})'");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-bsf:a" && w[1] == trim),
+            "{args:?}"
+        );
     }
 
     /// `GetFastSeekCommandLineParameter`'s arithmetic: the remux offset is
