@@ -32,8 +32,8 @@ use crate::aggregate_folder::RootFolderIds;
 use crate::db_error::db_err;
 use crate::item_type_lookup::stored_type_name;
 use crate::translate_query::{
-    ALTERNATE_VERSION_HIDDEN, QueryShape, TopParentTerm, append_parental_restrictions, build_query,
-    push_access_filter,
+    ALTERNATE_VERSION_HIDDEN, QueryShape, TopParentTerm, append_parental_restrictions,
+    build_leaf_played_and_total_query, build_query, push_access_filter,
 };
 
 /// Re-opens a bound aggregate and lets `push` add predicates before its
@@ -281,24 +281,13 @@ impl FerrofinItemCountService {
         self
     }
 
-    /// `COUNT(*)` over the rows an already-resolved `filter` matches (its
-    /// preferences and `DescendantOfId` roots loaded) — ungrouped, and with no
-    /// library scope added (unlike [`ItemCountService::get_count`]).
-    async fn count_rows(&self, filter: &InternalItemsQuery) -> Result<i32, ServiceError> {
-        let mut qb = build_query(filter, QueryShape::Count);
-        let count: i64 = qb
-            .build_query_scalar::<i64>()
-            .fetch_one(self.db.pool())
-            .await
-            .map_err(db_err)?;
-        Ok(i32::try_from(count).unwrap_or(i32::MAX))
-    }
-
     /// The countable leaves (`IsCountableLeaf`: neither a folder nor virtual)
     /// below `parent_id`'s closure and links, with `filter`'s preferences and
-    /// the `DescendantOfId` roots resolved — the statement
+    /// the `DescendantOfId` roots resolved — the row set
     /// [`ItemCountService::get_played_and_total_count_from_linked_children`]
-    /// counts twice (total, then played).
+    /// counts, total and played in one statement
+    /// ([`build_leaf_played_and_total_query`]): ungrouped, and with no library
+    /// scope added (unlike [`ItemCountService::get_count`]).
     async fn countable_leaves_query(
         &self,
         filter: &InternalItemsQuery,
@@ -968,29 +957,31 @@ impl ItemCountService for FerrofinItemCountService {
     /// closure), kept to the countable leaves (`IsCountableLeaf`: neither a
     /// folder nor virtual) and access-filtered for the filter's user. Rows, not
     /// titles, and no library scope: the caller's `InternalItemsQuery(user)`
-    /// names no top parents. Played is the leaf `IsPlayed` predicate (the port
-    /// of `BuildLeafIsPlayedFilter`), where upstream's per-item path uses
-    /// `IsPlayedBy`: the two agree on primary versions, but an alternate
-    /// version listed on its own (its primary in another library, or gone)
-    /// also counts as played here through its primary or a sibling.
+    /// names no top parents. Total and played are counted in one statement,
+    /// as `GetPlayedAndTotalCountFromQuery` (`:735-749`) counts them, the
+    /// played state tested on each leaf. Played is the leaf rule of the
+    /// `IsPlayed` predicate (the port of `BuildLeafIsPlayedFilter`), where
+    /// upstream's per-item path uses `IsPlayedBy`: the two agree on primary
+    /// versions, but an alternate version listed on its own (its primary in
+    /// another library, or gone) also counts as played here through its
+    /// primary or a sibling.
     async fn get_played_and_total_count_from_linked_children(
         &self,
         filter: &InternalItemsQuery,
         parent_id: Uuid,
     ) -> Result<PlayedAndTotal, ServiceError> {
-        // Resolved once for both counts.
         let leaves = self.countable_leaves_query(filter, parent_id).await?;
-        let total = self.count_rows(&leaves).await?;
-        if leaves.user.is_none() || total == 0 {
-            return Ok(PlayedAndTotal { played: 0, total });
-        }
-        let played = self
-            .count_rows(&InternalItemsQuery {
-                is_played: Some(true),
-                ..leaves
-            })
-            .await?;
-        Ok(PlayedAndTotal { played, total })
+        // Both counts in one statement over one closure, as upstream's
+        // `GetPlayedAndTotalCountFromQuery` counts them.
+        let (total, played): (i64, i64) = build_leaf_played_and_total_query(&leaves)
+            .build_query_as()
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(PlayedAndTotal {
+            played: i32::try_from(played).unwrap_or(i32::MAX),
+            total: i32::try_from(total).unwrap_or(i32::MAX),
+        })
     }
 
     async fn get_played_and_total_count_batch(
@@ -2289,6 +2280,93 @@ mod tests {
                 service.get_total_count(&filter, series).await.unwrap(),
                 total
             );
+        }
+    }
+
+    /// The per-item counts read the leaf rule the `IsPlayed` filter reads, v12
+    /// `BuildLeafIsPlayedFilter`: a leaf is played by a row of its own, as the
+    /// primary of a group one of whose versions was played, or as a version
+    /// listed on its own (its primary in another library) whose primary or a
+    /// sibling version was played. An alternate hidden behind its primary in
+    /// the same library is no leaf of its own (`ApplyAccessFiltering`).
+    #[tokio::test]
+    async fn the_per_item_count_reads_the_version_group_played_state() {
+        use crate::test_support::{
+            link_alternate_version, seed_library_over, seed_named_user, seed_top_parented_item,
+        };
+        let db = test_db().await;
+        let other_library = Uuid::from_u128(0x0980_0B00);
+        let series = Uuid::from_u128(0x0980_1000);
+        seed_folder_item(&db, series, BaseItemKind::Series, "Show", None).await;
+        let id = |n: u128| Uuid::from_u128(0x0980_2000 + n);
+        let (own, primary, hidden, listed, listed_too, unplayed) =
+            (id(1), id(2), id(3), id(4), id(5), id(6));
+        let leaves = [own, primary, hidden, listed, listed_too, unplayed];
+        for leaf in leaves {
+            seed_item(&db, leaf, BaseItemKind::Episode).await;
+        }
+        let mut library = vec![series];
+        library.extend(leaves);
+        seed_library_over(&db, &library).await;
+        // The primaries of the two listed versions, and the sibling of the
+        // second, live in another library.
+        let (elsewhere, elsewhere_too, sibling) = (id(7), id(8), id(9));
+        for (item, name) in [
+            (elsewhere, "elsewhere"),
+            (elsewhere_too, "elsewhere too"),
+            (sibling, "sibling"),
+        ] {
+            seed_top_parented_item(&db, item, BaseItemKind::Episode, name, other_library).await;
+        }
+        for leaf in leaves {
+            sqlx::query(r#"INSERT INTO "AncestorIds" ("ItemId", "ParentItemId") VALUES (?1, ?2)"#)
+                .bind(guid_to_db(leaf))
+                .bind(guid_to_db(series))
+                .execute(db.writer())
+                .await
+                .expect("ancestor");
+        }
+        for (version, of) in [
+            (hidden, primary),
+            (listed, elsewhere),
+            (listed_too, elsewhere_too),
+            (sibling, elsewhere_too),
+        ] {
+            link_alternate_version(&db, version, of).await;
+        }
+        let user_id = Uuid::from_u128(0x0980_0001);
+        let user = seed_user(&db, user_id).await;
+        for item in [own, hidden, elsewhere, sibling] {
+            seed_user_data(&db, user_id, item, true, None).await;
+        }
+        let stranger = seed_named_user(&db, Uuid::from_u128(0x0980_0002), "stranger").await;
+
+        let service = svc(&db);
+        for (viewer, played) in [(user, 4), (stranger, 0)] {
+            let mut filter = InternalItemsQuery::default();
+            filter.set_user(viewer);
+            let counts = service
+                .get_played_and_total_count(&filter, series)
+                .await
+                .expect("played/total");
+            assert_eq!((counts.played, counts.total), (played, 5));
+            // The same leaves through the `IsPlayed` filter's list form.
+            let leaves = service
+                .countable_leaves_query(&filter, series)
+                .await
+                .unwrap();
+            let filtered: i64 = build_query(
+                &InternalItemsQuery {
+                    is_played: Some(true),
+                    ..leaves
+                },
+                QueryShape::Count,
+            )
+            .build_query_scalar()
+            .fetch_one(db.pool())
+            .await
+            .expect("filtered count");
+            assert_eq!(filtered, i64::from(played), "the filter's rule");
         }
     }
 
@@ -4798,11 +4876,40 @@ mod tests {
         }
     }
 
+    /// `EXPLAIN QUERY PLAN` of a built statement, its binds included, as the
+    /// `detail` column of each step in outer-to-inner order.
+    async fn built_plan(db: &Database, mut builder: QueryBuilder<Sqlite>) -> Vec<String> {
+        use sqlx::Row;
+        let mut built = builder.build();
+        let args = built.take_arguments().unwrap().unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN {}", built.sql().as_str());
+        sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect()
+    }
+
+    /// The countable leaves below one folder read by id, as
+    /// [`ItemCountService::get_played_and_total_count_from_linked_children`]
+    /// resolves them for a user.
+    async fn per_item_leaves(db: &Database) -> InternalItemsQuery {
+        let mut filter = InternalItemsQuery::default();
+        filter.set_user(seed_user(db, Uuid::from_u128(0xD0F0)).await);
+        svc(db)
+            .countable_leaves_query(&filter, Uuid::from_u128(0xD0F1))
+            .await
+            .unwrap()
+    }
+
     /// A folder read by id (no page to batch) counts its leaves through
     /// [`ItemCountService::get_played_and_total_count_from_linked_children`]:
-    /// two `build_query` counts over the `DescendantOfId` set with
-    /// `IsFolder = 0`. Both must be driven by that descendant set, reaching
-    /// `BaseItems` by id. Left to itself SQLite drives them from
+    /// one statement over the `DescendantOfId` set with `IsFolder = 0`
+    /// ([`build_leaf_played_and_total_query`]). It must be driven by that
+    /// descendant set, reaching `BaseItems` by id, and so must an `IsPlayed`
+    /// filter over the same set. Left to itself SQLite drives them from
     /// `IX_BaseItems_IsFolder_…` (`IsFolder=?`) — every non-folder row in the
     /// library, each probed against the set: ~10 ms per count for one series
     /// on the bench library, ~0.05 ms driven by the set. The linked
@@ -4811,14 +4918,8 @@ mod tests {
     /// libraries.
     #[tokio::test]
     async fn descendant_leaf_counts_drive_from_the_descendant_set() {
-        use sqlx::Row;
         let db = test_db().await;
-        let mut filter = InternalItemsQuery::default();
-        filter.set_user(seed_user(&db, Uuid::from_u128(0xD0F0)).await);
-        let leaves = svc(&db)
-            .countable_leaves_query(&filter, Uuid::from_u128(0xD0F1))
-            .await
-            .unwrap();
+        let leaves = per_item_leaves(&db).await;
         let played = InternalItemsQuery {
             is_played: Some(true),
             ..leaves.clone()
@@ -4837,23 +4938,19 @@ mod tests {
             limit: Some(100),
             ..leaves.clone()
         };
-        for (label, query, shape) in [
-            ("total", &leaves, QueryShape::Count),
-            ("played", &played, QueryShape::Count),
-            ("browse", &browse, QueryShape::FullRows),
-            ("browse count", &browse, QueryShape::GroupedCount),
+        for (label, builder) in [
+            (
+                "played and total",
+                build_leaf_played_and_total_query(&leaves),
+            ),
+            ("played filter", build_query(&played, QueryShape::Count)),
+            ("browse", build_query(&browse, QueryShape::FullRows)),
+            (
+                "browse count",
+                build_query(&browse, QueryShape::GroupedCount),
+            ),
         ] {
-            let mut builder = build_query(query, shape);
-            let mut built = builder.build();
-            let args = built.take_arguments().unwrap().unwrap();
-            let sql = format!("EXPLAIN QUERY PLAN {}", built.sql().as_str());
-            let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
-                .fetch_all(db.pool())
-                .await
-                .unwrap()
-                .iter()
-                .map(|row| row.get::<String, _>("detail"))
-                .collect::<Vec<_>>();
+            let plan = built_plan(&db, builder).await;
             assert!(
                 !plan.iter().any(|s| s.contains("IsFolder=?")),
                 "{label} must not walk the IsFolder index: {plan:#?}"
@@ -4881,6 +4978,37 @@ mod tests {
                 "{label} must be driven through the primary key: {plan:#?}"
             );
         }
+    }
+
+    /// The per-item count tests each leaf's played state with seeks of its
+    /// own, never through lists built from the user's whole watch history:
+    /// every `UserData` step names the row's item (`ItemId=?`) and every
+    /// version step seeks the partial `IX_BaseItems_PrimaryVersionId`. As
+    /// uncorrelated lists (the `IsPlayed` filter's form, `push_leaf_is_played`)
+    /// SQLite materializes the user's played rows, 4,031 on the bench corpus,
+    /// to test a series of 39 leaves: 0.33 ms for the played count alone,
+    /// against 0.06 ms for this one statement counting both.
+    #[tokio::test]
+    async fn the_per_item_count_tests_each_leaf_not_the_watch_history() {
+        let db = test_db().await;
+        let leaves = per_item_leaves(&db).await;
+        let plan = built_plan(&db, build_leaf_played_and_total_query(&leaves)).await;
+        let user_data: Vec<&String> = plan.iter().filter(|s| s.contains(" ud ")).collect();
+        assert!(
+            !user_data.is_empty()
+                && user_data
+                    .iter()
+                    .all(|s| s.starts_with("SEARCH ud ") && s.contains("ItemId=?")),
+            "every UserData read must seek the leaf's own rows: {plan:#?}"
+        );
+        let versions: Vec<&String> = plan.iter().filter(|s| s.contains(" v ")).collect();
+        assert!(
+            !versions.is_empty()
+                && versions.iter().all(|s| {
+                    s.starts_with("SEARCH v USING ") && s.contains("(PrimaryVersionId=?)")
+                }),
+            "every version read must seek its group: {plan:#?}"
+        );
     }
 
     /// Adds a FURTHER `UserData` row for `(item, user)` under its own
