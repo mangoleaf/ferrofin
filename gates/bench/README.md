@@ -1,8 +1,8 @@
 # Benchmark methodology
 
 This directory produces the comparison table in the root README: Ferrofin against
-Jellyfin 12.2 and Ferrofin, on identical test data, on one host. It also holds the
-[release gate](#release-gate), which compares Ferrofin with its previous release. Archived runs retain
+the Jellyfin release the branch pins (`UPSTREAM_TAG`), on identical test data, on one host.
+It also holds the [release gate](#release-gate), which compares Ferrofin with its previous release. Archived runs retain
 their recorded labels and raw measurements. Re-rendering archived results applies the current
 validation rules: previously published cells can become flagged (including archived
 Ferrofin detail/playback responses missing `IsOriginal`/`LocalizedOriginal`). Review
