@@ -1337,10 +1337,10 @@ mod tests {
         assert_eq!(cfg.bind_addr.to_string(), DEFAULT_BIND_ADDR);
         assert_eq!(cfg.log_level, DEFAULT_LOG_LEVEL);
         assert_eq!(cfg.admin_user, DEFAULT_ADMIN_USER);
-        assert!(cfg.admin_password.is_empty());
+        assert_eq!(cfg.admin_password, "");
         assert!(cfg.published_url.is_none());
-        assert!(cfg.base_url.is_empty());
-        assert!(cfg.library_roots.is_empty());
+        assert_eq!(cfg.base_url, "");
+        assert!(cfg.library_roots.is_empty(), "{:?}", cfg.library_roots);
         assert!(cfg.ffmpeg_path.is_none());
         // With no XDG/HOME the system location is used.
         assert_eq!(cfg.data_dir, PathBuf::from(SYSTEM_DATA_DIR));

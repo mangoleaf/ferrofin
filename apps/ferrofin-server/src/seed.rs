@@ -188,7 +188,7 @@ mod tests {
         assert!(policy.enable_remote_control_of_other_users);
         assert!(policy.enable_user_preference_access);
         assert_eq!(policy.login_attempts_before_lockout, -1);
-        assert!(!policy.authentication_provider_id.is_empty());
+        assert_ne!(policy.authentication_provider_id, "");
 
         let authed = users
             .authenticate_user("boss", "s3cret-pass", "", true)

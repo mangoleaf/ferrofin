@@ -976,7 +976,7 @@ mod tests {
         let mut read = Vec::new();
         let mut chunks = 0;
         while let Some(chunk) = opened.body.next_chunk().await.expect("chunk") {
-            assert!(!chunk.is_empty());
+            assert!(!chunk.is_empty(), "{chunk:?}");
             read.extend_from_slice(&chunk);
             chunks += 1;
         }
@@ -1183,7 +1183,7 @@ mod tests {
             .await
             .expect("gunzip")
         {
-            assert!(!chunk.is_empty());
+            assert!(!chunk.is_empty(), "{chunk:?}");
             text.extend(chunk);
         }
         assert_eq!(text, b"<tv><channel id=\"a\"/></tv>");

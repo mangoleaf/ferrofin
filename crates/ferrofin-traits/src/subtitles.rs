@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn search_request_default_is_empty() {
         let r = SubtitleSearchRequest::default();
-        assert!(r.language.is_empty());
+        assert_eq!(r.language, "");
         assert!(r.is_perfect_match.is_none());
         assert!(!r.is_automated);
         assert!(r.search_all_providers.is_none());
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn response_default_is_empty() {
         let r = SubtitleResponse::default();
-        assert!(r.content.is_empty());
+        assert!(r.content.is_empty(), "{:?}", r.content);
         assert!(!r.is_forced);
         assert!(!r.is_hearing_impaired);
     }

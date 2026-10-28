@@ -2544,7 +2544,8 @@ async fn movie_metadata_survives_provider_outage(h: &Harness) {
     })
     .await;
     let before = h.item(&alpha).await;
-    assert!(!before["People"].as_array().expect("cast").is_empty());
+    let people = before["People"].as_array().expect("cast");
+    assert!(!people.is_empty(), "{people:?}");
     assert!(before["ImageTags"]["Primary"].is_string());
     let name = before["Name"].as_str().expect("movie name");
     let stored = h.writes.row(name).await;
@@ -2631,7 +2632,9 @@ async fn movie_metadata_survives_provider_outage(h: &Harness) {
 /// refreshes, deletion, disabled providers, and provider outages over real HTTP.
 #[allow(clippy::too_many_lines)]
 async fn subtitles_are_downloaded_during_scan(h: &Harness) {
-    assert!(of(&h.providers.all(), "opensubtitles").is_empty());
+    let provider_calls = h.providers.all();
+    let found = of(&provider_calls, "opensubtitles");
+    assert!(found.is_empty(), "{found:?}");
     h.post(
         "/Plugins/4a3f8e216c944d17a2b80f5e9c3d7a10/Configuration",
         Some(&json!({"Username":"test", "Password":"test"})),
@@ -2702,7 +2705,8 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
         let mark = h.mark().await;
         h.refresh(library, mode, mode == "FullRefresh").await;
         let seen = h.settle(mark, &[("api", 1.0)]).await;
-        assert!(of(&seen.requests, "opensubtitles").is_empty());
+        let found = of(&seen.requests, "opensubtitles");
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(std::fs::read(&english).unwrap(), content);
         if mode == "Default" {
             assert!(
@@ -2749,7 +2753,8 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "FullRefresh", false).await;
     let disabled = h.settle(mark, &[("api", 1.0)]).await;
-    assert!(of(&disabled.requests, "opensubtitles").is_empty());
+    let found = of(&disabled.requests, "opensubtitles");
+    assert!(found.is_empty(), "{found:?}");
 
     options["DisabledSubtitleFetchers"] = json!([]);
     h.post(
@@ -2778,8 +2783,9 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "Default", false).await;
     let quiet = h.settle(mark, &[("api", 1.0)]).await;
-    assert!(of(&quiet.requests, "opensubtitles").is_empty());
-    assert!(quiet.spawns.is_empty());
+    let found = of(&quiet.requests, "opensubtitles");
+    assert!(found.is_empty(), "{found:?}");
+    assert!(quiet.spawns.is_empty(), "{:?}", quiet.spawns);
     for mode in ["ValidationOnly", "None"] {
         set_mtime(&movie, 5);
         let mark = h.mark().await;
@@ -2802,7 +2808,8 @@ async fn subtitle_probe_failure_is_quiet(h: &Harness) {
     h.refresh(&id, "FullRefresh", false).await;
     let seen = h.settle(mark, &[("api", 1.0)]).await;
     assert!(seen.probes.get("failed").copied().unwrap_or_default() > 0.0);
-    assert!(of(&seen.requests, "opensubtitles").is_empty());
+    let found = of(&seen.requests, "opensubtitles");
+    assert!(found.is_empty(), "{found:?}");
     assert_eq!(
         std::fs::read(movie.with_extension("eng.srt")).unwrap(),
         before
@@ -2843,7 +2850,8 @@ async fn omdb_works_without_an_operator_key(h: &Harness) {
     h.refresh(library, "FullRefresh", false).await;
     let seen = h.settle(mark, &[("api", 1.0)]).await;
     assert_eq!(of(&seen.requests, "omdb").len(), 1);
-    assert!(of(&seen.requests, "tmdb").is_empty());
+    let found = of(&seen.requests, "tmdb");
+    assert!(found.is_empty(), "{found:?}");
     let id = h.id(&movie).await;
     let dto = h.item(&id).await;
     assert_eq!(dto["Overview"], "Fetched with the shared key.");
@@ -2862,7 +2870,8 @@ async fn omdb_works_without_an_operator_key(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "FullRefresh", true).await;
     let disabled = h.settle(mark, &[("api", 1.0)]).await;
-    assert!(of(&disabled.requests, "omdb").is_empty());
+    let found = of(&disabled.requests, "omdb");
+    assert!(found.is_empty(), "{found:?}");
 }
 
 /// External identities, newly mapped fields, artwork order and quiet rescans

@@ -7090,13 +7090,8 @@ mod tests {
         )
         .with_users(users);
         // `IsLiveTvEnabled`: the permission alone is not enough — a tuner host must exist.
-        assert!(
-            mgr.get_live_tv_info()
-                .await
-                .expect("info")
-                .enabled_users
-                .is_empty()
-        );
+        let enabled_users = mgr.get_live_tv_info().await.expect("info").enabled_users;
+        assert!(enabled_users.is_empty(), "{enabled_users:?}");
         mgr.save_tuner_host(TunerHostInfo {
             type_: Some("m3u".to_owned()),
             url: Some("http://tuner/playlist.m3u".to_owned()),
@@ -7139,7 +7134,8 @@ mod tests {
         assert!(mgr.has_tuner_hosts());
 
         mgr.delete_tuner_host(&id).await.expect("delete");
-        assert!(mgr.get_tuner_hosts().await.expect("list2").is_empty());
+        let tuner_hosts = mgr.get_tuner_hosts().await.expect("list2");
+        assert!(tuner_hosts.is_empty(), "{tuner_hosts:?}");
         assert!(
             !mgr.has_tuner_hosts(),
             "deleting the last host hides the task again"
@@ -7453,7 +7449,8 @@ mod tests {
         let id = saved.id.clone().expect("id");
         assert_eq!(mgr.get_listing_providers().await.expect("list").len(), 1);
         mgr.delete_listing_provider(&id).await.expect("delete");
-        assert!(mgr.get_listing_providers().await.expect("list2").is_empty());
+        let listing_providers = mgr.get_listing_providers().await.expect("list2");
+        assert!(listing_providers.is_empty(), "{listing_providers:?}");
     }
 
     /// `XmlTvListingsProvider.Validate` (v12.2 :333-349): a local guide path
@@ -7476,7 +7473,8 @@ mod tests {
             .await
             .expect_err("refused");
         assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
-        assert!(mgr.get_listing_providers().await.expect("list").is_empty());
+        let listing_providers = mgr.get_listing_providers().await.expect("list");
+        assert!(listing_providers.is_empty(), "{listing_providers:?}");
 
         let guide = dir.path().join("guide.xml");
         std::fs::write(&guide, XMLTV).expect("write");
@@ -7544,7 +7542,8 @@ mod tests {
             .await
             .expect_err("refused");
         assert!(matches!(err, ServiceError::NotFound(_)), "{err:?}");
-        assert!(mgr.get_tuner_hosts().await.expect("list").is_empty());
+        let tuner_hosts = mgr.get_tuner_hosts().await.expect("list");
+        assert!(tuner_hosts.is_empty(), "{tuner_hosts:?}");
     }
 
     /// `ListingsManager.SaveListingProvider`'s id rule: a posted id matching a
@@ -7977,7 +7976,8 @@ mod tests {
             .id
             .unwrap();
         mgr.delete_tuner_host(&host_id).await.expect("del host");
-        assert!(mgr.get_tuner_hosts().await.expect("h2").is_empty());
+        let tuner_hosts = mgr.get_tuner_hosts().await.expect("h2");
+        assert!(tuner_hosts.is_empty(), "{tuner_hosts:?}");
         assert_eq!(
             mgr.get_channels(&LiveTvChannelQuery::default(), &DtoOptions::default())
                 .await
@@ -8421,17 +8421,21 @@ mod tests {
         let mgr = &lab.mgr;
         mgr.refresh_guide().await.expect("refresh");
         assert_eq!(stored_channel_items(mgr).await.len(), 2);
-        assert!(!stored_program_items(mgr).await.is_empty());
+        let found = stored_program_items(mgr).await;
+        assert!(!found.is_empty(), "{found:?}");
 
         mgr.delete_tuner_host(lab.tuner.id.as_deref().expect("tuner id"))
             .await
             .expect("delete");
         // The delete leaves the items to the refresh, as upstream's does.
         assert_eq!(stored_channel_items(mgr).await.len(), 2);
-        assert!(!stored_program_items(mgr).await.is_empty());
+        let found = stored_program_items(mgr).await;
+        assert!(!found.is_empty(), "{found:?}");
         mgr.refresh_guide().await.expect("refresh after the delete");
-        assert!(stored_channel_items(mgr).await.is_empty());
-        assert!(stored_program_items(mgr).await.is_empty());
+        let found = stored_channel_items(mgr).await;
+        assert!(found.is_empty(), "{found:?}");
+        let found = stored_program_items(mgr).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// A channel that left the lineup and comes back gets its users' data
@@ -9327,11 +9331,13 @@ mod tests {
             )
         );
         // An unknown id is not a channel.
+        let channel_media_sources = mgr
+            .get_channel_media_sources(Uuid::from_u128(0xdead))
+            .await
+            .expect("sources");
         assert!(
-            mgr.get_channel_media_sources(Uuid::from_u128(0xdead))
-                .await
-                .expect("sources")
-                .is_empty()
+            channel_media_sources.is_empty(),
+            "{channel_media_sources:?}"
         );
     }
 
@@ -9699,7 +9705,7 @@ mod tests {
         let timer = timer_from_defaults(&defaults);
 
         let id = mgr.create_timer(timer.clone()).await.expect("create");
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
         let error = mgr
             .create_timer(timer.clone())
             .await
@@ -9713,7 +9719,7 @@ mod tests {
         mgr.cancel_timer(&id).await.expect("cancel");
         assert!(mgr.get_timer(&id).await.expect("get").is_none());
         let again = mgr.create_timer(timer).await.expect("re-create");
-        assert!(!again.is_empty());
+        assert_ne!(again, "");
         mgr.cancel_timer(&again).await.expect("cancel");
     }
 
@@ -9758,15 +9764,14 @@ mod tests {
 
         // Nothing is recording yet, so `isActive=true` is empty and
         // `isScheduled=true` is everything.
-        assert!(
-            mgr.get_timers_matching(&ferrofin_model::live_tv::TimerQuery {
+        let timers_matching = mgr
+            .get_timers_matching(&ferrofin_model::live_tv::TimerQuery {
                 is_active: Some(true),
                 ..ferrofin_model::live_tv::TimerQuery::default()
             })
             .await
-            .expect("timers")
-            .is_empty()
-        );
+            .expect("timers");
+        assert!(timers_matching.is_empty(), "{timers_matching:?}");
         assert_eq!(
             mgr.get_timers_matching(&ferrofin_model::live_tv::TimerQuery {
                 is_scheduled: Some(true),
@@ -9871,11 +9876,10 @@ mod tests {
             released.is_some(),
             "the capture must be released, not orphaned"
         );
+        let active_recording_paths = mgr.active_recording_paths().await.expect("paths");
         assert!(
-            mgr.active_recording_paths()
-                .await
-                .expect("paths")
-                .is_empty()
+            active_recording_paths.is_empty(),
+            "{active_recording_paths:?}"
         );
         // `finish_capture` releases the active entry before `settle_timer`
         // finishes the async database writes. Wait for that second phase too:
@@ -10426,7 +10430,7 @@ mod tests {
         };
 
         let id = mgr.create_timer(timer).await.expect("create");
-        assert!(!id.is_empty());
+        assert_ne!(id, "");
         let timers = mgr.get_timers().await.expect("list");
         assert_eq!(timers.len(), 1);
         assert_eq!(timers[0].base.channel_id, ch);
@@ -10436,7 +10440,8 @@ mod tests {
         assert_eq!(got.base.id.as_deref(), Some(id.as_str()));
 
         mgr.cancel_timer(&id).await.expect("cancel");
-        assert!(mgr.get_timers().await.expect("list2").is_empty());
+        let timers = mgr.get_timers().await.expect("list2");
+        assert!(timers.is_empty(), "{timers:?}");
     }
 
     /// A guide whose one channel airs the same title several times in the
@@ -10549,7 +10554,8 @@ mod tests {
         );
 
         mgr.cancel_series_timer(&st_id).await.expect("cancel st");
-        assert!(all_series_timers(&mgr).await.is_empty());
+        let found = all_series_timers(&mgr).await;
+        assert!(found.is_empty(), "{found:?}");
         assert!(
             mgr.get_timers().await.expect("t2").is_empty(),
             "cancelling a series timer drops its timers"
@@ -10873,7 +10879,8 @@ mod tests {
                 .await
                 .expect("delete timer row");
         }
-        assert!(mgr.get_timers().await.expect("t").is_empty());
+        let found = mgr.get_timers().await.expect("t");
+        assert!(found.is_empty(), "{found:?}");
 
         // A refresh alone brings them back — no client call, no edit.
         mgr.refresh_guide().await.expect("second refresh");
@@ -11132,7 +11139,8 @@ mod tests {
             .await
             .expect_err("no programme");
         assert!(matches!(err, ServiceError::InvalidInput(_)));
-        assert!(all_series_timers(&mgr).await.is_empty());
+        let found = all_series_timers(&mgr).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `UpdateSeriesTimerAsync` copies a fixed whitelist and no-ops on an id
@@ -11281,15 +11289,17 @@ mod tests {
             ["aa-120", "aa-60"]
         );
         // A lone showing is not a duplicate…
-        assert!(duplicate_showings_to_cancel(&[showing("aa", 0)]).is_empty());
+        let found = duplicate_showings_to_cancel(&[showing("aa", 0)]);
+        assert!(found.is_empty(), "{found:?}");
         // …a blank ShowId groups nothing (upstream skips the empty key)…
-        assert!(duplicate_showings_to_cancel(&[showing("", 0), showing("", 60)]).is_empty());
+        let found = duplicate_showings_to_cancel(&[showing("", 0), showing("", 60)]);
+        assert!(found.is_empty(), "{found:?}");
         // …and neither does one ending "0000" (jellyfin/jellyfin#5856).
-        assert!(
-            duplicate_showings_to_cancel(&[showing("ab0000", 0), showing("ab0000", 60)]).is_empty()
-        );
+        let found = duplicate_showings_to_cancel(&[showing("ab0000", 0), showing("ab0000", 60)]);
+        assert!(found.is_empty(), "{found:?}");
         // Different programmes never suppress each other.
-        assert!(duplicate_showings_to_cancel(&[showing("aa", 0), showing("bb", 60)]).is_empty());
+        let found = duplicate_showings_to_cancel(&[showing("aa", 0), showing("bb", 60)]);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `AlphanumericComparator.CompareValues`, against the C# as the oracle.
@@ -11740,7 +11750,7 @@ mod tests {
         let kept = crate::guide_repository::test_support::channel_dates(&mgr.db)
             .await
             .expect("read");
-        assert!(!kept.is_empty());
+        assert!(!kept.is_empty(), "{kept:?}");
         assert!(
             kept.iter().all(|d| d == "2000-01-01 00:00:00.0000000"),
             "refresh must not restamp DateCreated: {kept:?}"
@@ -11834,16 +11844,14 @@ mod tests {
         );
         // News/Sports are channel *tags* upstream never writes: true matches
         // nothing, false everything — even though Channel One airs news.
-        assert!(
-            names(
-                with(LiveTvChannelQuery {
-                    is_news: Some(true),
-                    ..LiveTvChannelQuery::default()
-                })
-                .await
-            )
-            .is_empty()
+        let found = names(
+            with(LiveTvChannelQuery {
+                is_news: Some(true),
+                ..LiveTvChannelQuery::default()
+            })
+            .await,
         );
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(
             with(LiveTvChannelQuery {
                 is_news: Some(false),
@@ -12248,16 +12256,13 @@ mod tests {
         mgr.delete_listing_provider(&provider_id.to_ascii_uppercase())
             .await
             .expect("delete provider");
-        assert!(
-            mgr.get_listing_providers()
-                .await
-                .expect("providers")
-                .is_empty()
-        );
+        let listing_providers = mgr.get_listing_providers().await.expect("providers");
+        assert!(listing_providers.is_empty(), "{listing_providers:?}");
         mgr.delete_tuner_host(&tuner_id.to_ascii_uppercase())
             .await
             .expect("delete tuner");
-        assert!(mgr.get_tuner_hosts().await.expect("hosts").is_empty());
+        let tuner_hosts = mgr.get_tuner_hosts().await.expect("hosts");
+        assert!(tuner_hosts.is_empty(), "{tuner_hosts:?}");
     }
 
     #[tokio::test]
@@ -12400,11 +12405,9 @@ mod tests {
             .await
             .expect("re-post");
         mgr.refresh_guide().await.expect("queued refresh");
-        assert!(
-            mgr.get_listing_providers().await.expect("p")[0]
-                .channel_mappings
-                .is_empty()
-        );
+        let providers = mgr.get_listing_providers().await.expect("p");
+        let channel_mappings = &providers[0].channel_mappings;
+        assert!(channel_mappings.is_empty(), "{channel_mappings:?}");
         assert_eq!(
             crate::guide_repository::all_program_ids(&mgr.db)
                 .await
@@ -12430,11 +12433,9 @@ mod tests {
             .await
             .expect("unmap");
         mgr.refresh_guide().await.expect("queued refresh");
-        assert!(
-            mgr.get_listing_providers().await.expect("p")[0]
-                .channel_mappings
-                .is_empty()
-        );
+        let providers = mgr.get_listing_providers().await.expect("p");
+        let channel_mappings = &providers[0].channel_mappings;
+        assert!(channel_mappings.is_empty(), "{channel_mappings:?}");
         assert_eq!(
             crate::guide_repository::all_program_ids(&mgr.db)
                 .await
@@ -12719,12 +12720,10 @@ mod tests {
             .await
             .expect("delete");
         mgr.refresh_guide().await.expect("refresh");
-        assert!(
-            crate::guide_repository::all_program_ids(&mgr.db)
-                .await
-                .expect("ids")
-                .is_empty()
-        );
+        let found = crate::guide_repository::all_program_ids(&mgr.db)
+            .await
+            .expect("ids");
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(
             crate::guide_repository::channel_rows(&mgr.db)
                 .await
@@ -12783,12 +12782,10 @@ mod tests {
             .expect("channels");
         assert_eq!(before.len(), 2);
         let kept_id = before[0].id.clone();
-        assert!(
-            !crate::guide_repository::all_program_ids(&mgr.db)
-                .await
-                .expect("ids")
-                .is_empty()
-        );
+        let found = crate::guide_repository::all_program_ids(&mgr.db)
+            .await
+            .expect("ids");
+        assert!(!found.is_empty(), "{found:?}");
 
         // The playlist now carries only the first channel; the second must go.
         fetcher.0.lock().unwrap().insert(
@@ -13219,7 +13216,8 @@ mod tests {
             crate::dvr_repository::test_support::corrupt_timer_data(&mgr.db, &id)
                 .await
                 .expect("corrupt");
-            assert!(mgr.all_timers().await.expect("list").is_empty());
+            let all_timers = mgr.all_timers().await.expect("list");
+            assert!(all_timers.is_empty(), "{all_timers:?}");
             let logs = CapturedLogs::default();
             let guard = logs.install();
 
@@ -13404,9 +13402,11 @@ mod tests {
             let logs = CapturedLogs::default();
             let guard = logs.install();
 
-            assert!(mgr.all_timers().await.expect("list").is_empty());
+            let all_timers = mgr.all_timers().await.expect("list");
+            assert!(all_timers.is_empty(), "{all_timers:?}");
             assert!(mgr.get_timer(&id).await.expect("get").is_none());
-            assert!(mgr.all_timers().await.expect("list").is_empty());
+            let all_timers = mgr.all_timers().await.expect("list");
+            assert!(all_timers.is_empty(), "{all_timers:?}");
             let warns = logs.lines_at("WARN", &id);
             assert_eq!(warns.len(), 1, "{warns:?}");
             assert!(warns[0].contains("FerrofinLiveTvTimers"), "{warns:?}");
@@ -13415,7 +13415,8 @@ mod tests {
             mgr.persist_timer(&timer).await.expect("repair");
             assert_eq!(mgr.all_timers().await.expect("list").len(), 1);
             corrupt().await;
-            assert!(mgr.all_timers().await.expect("list").is_empty());
+            let all_timers = mgr.all_timers().await.expect("list");
+            assert!(all_timers.is_empty(), "{all_timers:?}");
             drop(guard);
             assert_eq!(logs.lines_at("WARN", &id).len(), 2, "broken again is news");
         })
@@ -13601,13 +13602,10 @@ mod tests {
             let logs = CapturedLogs::default();
             let guard = logs.install();
             for _ in 0..2 {
-                assert!(mgr.get_tuner_hosts().await.expect("tuners").is_empty());
-                assert!(
-                    mgr.get_listing_providers()
-                        .await
-                        .expect("providers")
-                        .is_empty()
-                );
+                let tuner_hosts = mgr.get_tuner_hosts().await.expect("tuners");
+                assert!(tuner_hosts.is_empty(), "{tuner_hosts:?}");
+                let listing_providers = mgr.get_listing_providers().await.expect("providers");
+                assert!(listing_providers.is_empty(), "{listing_providers:?}");
                 assert!(
                     mgr.stored_series_timer(&series)
                         .await

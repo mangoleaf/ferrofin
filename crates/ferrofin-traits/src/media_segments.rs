@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn provider_info_default_is_empty() {
         let p = MediaSegmentProviderInfo::default();
-        assert!(p.name.is_empty());
-        assert!(p.id.is_empty());
+        assert_eq!(p.name, "");
+        assert_eq!(p.id, "");
     }
 }

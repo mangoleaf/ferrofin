@@ -903,7 +903,11 @@ mod tests {
         .expect("program");
         assert_eq!(program.program_id.as_deref(), Some("12"));
         assert_eq!(program.duration, 1_800);
-        assert!(program.audio_properties.is_empty());
+        assert!(
+            program.audio_properties.is_empty(),
+            "{:?}",
+            program.audio_properties
+        );
         assert_eq!(program.new, None);
 
         let images: Vec<ShowImagesDto> = serde_json::from_str(

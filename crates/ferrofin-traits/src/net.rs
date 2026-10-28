@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn default_request_context_is_empty() {
         let ctx = RequestContext::default();
-        assert!(ctx.headers.is_empty());
+        assert!(ctx.headers.is_empty(), "{:?}", ctx.headers);
         assert_eq!(ctx.query_string, None);
         assert_eq!(ctx.remote_endpoint, None);
     }

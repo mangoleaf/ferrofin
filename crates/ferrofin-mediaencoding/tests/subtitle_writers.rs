@@ -394,7 +394,7 @@ fn ssa_load_bad_timecode_counts_error() {
     for load in [ssa::load_ass, ssa::load_ssa] {
         let mut s = Subtitle::new();
         assert_eq!(load(&mut s, &input), 1);
-        assert!(s.paragraphs.is_empty());
+        assert!(s.paragraphs.is_empty(), "{:?}", s.paragraphs);
     }
 }
 
@@ -453,7 +453,8 @@ fn json_writer_emits_track_events_envelope() {
 fn json_writer_empty_subtitle_has_empty_events() {
     let v: serde_json::Value =
         serde_json::from_str(&json_writer::to_text(&Subtitle::new())).unwrap();
-    assert!(v["TrackEvents"].as_array().unwrap().is_empty());
+    let track_events = v["TrackEvents"].as_array().unwrap();
+    assert!(track_events.is_empty(), "{track_events:?}");
 }
 
 // -- Extension-keyed parser ------------------------------------------------

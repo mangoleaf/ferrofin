@@ -1549,7 +1549,7 @@ mod tests {
     fn parse_where_rejecting_everything_still_reports_channels_and_errors() {
         let all = parse_xmltv(SAMPLE);
         let none = parse_xmltv_where(SAMPLE, |_| false);
-        assert!(none.programmes.is_empty());
+        assert!(none.programmes.is_empty(), "{:?}", none.programmes);
         assert_eq!(none.channels, all.channels);
         assert_eq!(none.error, None);
 
@@ -1689,8 +1689,8 @@ mod tests {
     #[test]
     fn empty_document_is_empty_guide() {
         let g = parse_xmltv("");
-        assert!(g.channels.is_empty());
-        assert!(g.programmes.is_empty());
+        assert!(g.channels.is_empty(), "{:?}", g.channels);
+        assert!(g.programmes.is_empty(), "{:?}", g.programmes);
         assert!(
             g.error.is_some(),
             "an empty body is an error, not an empty guide"
@@ -1795,7 +1795,7 @@ mod tests {
         );
         assert_eq!(g.error, None);
         assert!(g.channels.is_empty(), "no <tv>, no guide");
-        assert!(g.programmes.is_empty());
+        assert!(g.programmes.is_empty(), "{:?}", g.programmes);
     }
 
     /// `ReadToDescendant("channel")` looks inside `<tv>` and `ReadToFollowing`
@@ -1868,7 +1868,7 @@ mod tests {
         );
         assert!(g.error.is_some());
         assert_eq!(g.channels.len(), 1, "read before the error");
-        assert!(g.programmes.is_empty());
+        assert!(g.programmes.is_empty(), "{:?}", g.programmes);
 
         let g = parse_xmltv(
             r#"<tv><programme start="20260725060000" channel="a"><title>T</title><icon src="http://x/a.png?a=1&b=2"/></programme></tv>"#,
@@ -2003,7 +2003,7 @@ mod programme_child_tests {
              <review><title>nested</title><icon src=\"http://x/r.png\"/></review>",
         );
         assert_eq!((p.desc, p.sub_title), (None, None));
-        assert!(p.categories.is_empty());
+        assert!(p.categories.is_empty(), "{:?}", p.categories);
         assert_eq!((p.year, p.episode_num), (None, None));
         assert!(!p.is_live);
         assert_eq!(p.icon, None);

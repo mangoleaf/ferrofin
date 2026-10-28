@@ -229,7 +229,11 @@ mod tests {
         assert!(opts.requires_auto_orientation);
         assert_eq!(opts.item_id, Uuid::nil());
         assert_eq!(opts.quality, 0);
-        assert!(opts.supported_output_formats.is_empty());
+        assert!(
+            opts.supported_output_formats.is_empty(),
+            "{:?}",
+            opts.supported_output_formats
+        );
     }
 
     #[test]
@@ -312,7 +316,7 @@ mod tests {
     #[test]
     fn collage_default_is_empty() {
         let c = ImageCollageOptions::default();
-        assert!(c.input_paths.is_empty());
+        assert!(c.input_paths.is_empty(), "{:?}", c.input_paths);
         assert_eq!(c.width, 0);
         assert_eq!(c.output_path, "");
     }

@@ -181,7 +181,7 @@ async fn download_and_read(cache: &XmlTvCache, url: String) -> usize {
     assert_eq!(guide.error, None);
     assert_eq!(guide.channels.len(), 1);
     assert_eq!(guide.channels[0].display_name, "Big One");
-    assert!(guide.programmes.is_empty());
+    assert!(guide.programmes.is_empty(), "{:?}", guide.programmes);
     held
 }
 

@@ -3144,7 +3144,7 @@ mod tests {
             items: Vec::new(),
         };
         assert_eq!(rec.baseline_item_name, "Because you watched");
-        assert!(rec.items.is_empty());
+        assert!(rec.items.is_empty(), "{:?}", rec.items);
     }
 
     /// The server a guard case runs against: `administrators` administrators
