@@ -47,7 +47,7 @@ workflow:
 # Pinned jellyfin-web version — single source of truth. web-image builds
 # ci:web-$JELLYFIN_WEB_VERSION; the service image pulls it via WEB_IMAGE.
 variables:
-  JELLYFIN_WEB_VERSION: "12.2"
+  JELLYFIN_WEB_VERSION: "12.4"
 
 # ---------------------------------------------------------------------------
 # request-release — the manual release GATE. It has NO needs and lives in .pre,
