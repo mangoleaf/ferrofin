@@ -466,7 +466,7 @@ shm /dev/shm tmpfs rw,nosuid,nodev,noexec,relatime,size=65536k 0 0
         // The live call: never empty, every entry an existing directory, and the
         // root is present (it is a mount on every Unix).
         let drives = FerrofinFileSystem::new().get_drives();
-        assert!(!drives.is_empty());
+        assert!(!drives.is_empty(), "{drives:?}");
         assert!(drives.iter().all(|d| Path::new(&d.path).is_dir()));
         assert!(drives.iter().all(|d| d.name == d.path));
         assert!(drives.iter().any(|d| d.path == "/"));

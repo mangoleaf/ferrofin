@@ -7455,13 +7455,11 @@ mod tests {
                 .bind(kind).bind(path).execute(db.writer()).await.unwrap();
         }
         for index in [-1, 3, i32::MAX] {
-            assert!(
-                store
-                    .delete_item_image(item, ImageType::Backdrop, Some(index))
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+            let removed_paths = store
+                .delete_item_image(item, ImageType::Backdrop, Some(index))
+                .await
+                .unwrap();
+            assert!(removed_paths.is_empty(), "{removed_paths:?}");
         }
         assert_eq!(
             store
@@ -7495,13 +7493,11 @@ mod tests {
                 .unwrap(),
             ["first.png"]
         );
-        assert!(
-            store
-                .delete_item_image(item, ImageType::Backdrop, None)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let removed_paths = store
+            .delete_item_image(item, ImageType::Backdrop, None)
+            .await
+            .unwrap();
+        assert!(removed_paths.is_empty(), "{removed_paths:?}");
         assert_eq!(
             store
                 .delete_item_image(item, ImageType::Screenshot, Some(0))
@@ -10175,7 +10171,8 @@ mod tests {
         // Even a reordered list with duplicate paths is the same multiset.
         images.reverse();
         svc.save_item_images(item, &images).await.unwrap();
-        assert!(image_writes(&db).await.is_empty());
+        let found = image_writes(&db).await;
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(read().await, before);
         images.reverse();
 
@@ -10226,9 +10223,11 @@ mod tests {
         assert!(read().await.contains(&retained));
         svc.save_item_images(item, &[]).await.unwrap();
         assert_eq!(image_writes(&db).await.len(), 2);
-        assert!(read().await.is_empty());
+        let found = read().await;
+        assert!(found.is_empty(), "{found:?}");
         svc.save_item_images(item, &[]).await.unwrap();
-        assert!(image_writes(&db).await.is_empty());
+        let found = image_writes(&db).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// The images a save adds list in the order it was given them, after
@@ -12041,10 +12040,11 @@ mod tests {
         );
         // A location's folder is the TopParentId of what it holds; it is no
         // library, so it never stands in for one.
+        let collection_folder_ids =
+            scope(Uuid::from_u128(9), Some("/elsewhere/Show"), None).collection_folder_ids;
         assert!(
-            scope(Uuid::from_u128(9), Some("/elsewhere/Show"), None)
-                .collection_folder_ids
-                .is_empty()
+            collection_folder_ids.is_empty(),
+            "{collection_folder_ids:?}"
         );
     }
 
@@ -13167,7 +13167,8 @@ mod tests {
         };
         assert_eq!(found(vec![library, physical]).await, vec![0x1, 0x2, 0x3]);
         assert_eq!(found(vec![library]).await, vec![0x1]);
-        assert!(found(Vec::new()).await.is_empty());
+        let ids = found(Vec::new()).await;
+        assert!(ids.is_empty(), "{ids:?}");
     }
 
     /// `library_top_parents`: an adopted library (a collection folder whose
@@ -14069,7 +14070,8 @@ mod tests {
                 && row.path.as_deref() == Some("/media/Show/S1/e1.mkv")),
             "each row in full"
         );
-        assert!(svc.deletion_closure(&[]).await.expect("empty").is_empty());
+        let deletion_closure = svc.deletion_closure(&[]).await.expect("empty");
+        assert!(deletion_closure.is_empty(), "{deletion_closure:?}");
         assert!(
             crate::test_support::fetch_item_opt(&db, series)
                 .await

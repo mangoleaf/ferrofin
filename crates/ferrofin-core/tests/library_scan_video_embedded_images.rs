@@ -255,6 +255,7 @@ async fn the_library_checkbox_and_type_limits_gate_the_extraction() {
     })
     .await;
     off.scanner.scan_all().await.unwrap();
-    assert!(images(&off).await.is_empty());
+    let found = images(&off).await;
+    assert!(found.is_empty(), "{found:?}");
     assert!(off.encoder.extractions.lock().unwrap().is_empty());
 }

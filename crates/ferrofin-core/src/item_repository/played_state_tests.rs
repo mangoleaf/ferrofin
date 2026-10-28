@@ -723,10 +723,12 @@ async fn a_by_name_artist_reads_its_own_played_state() {
     };
     let unplayed = artists(false).await;
     assert_eq!(unplayed.len(), 1, "the unplayed artist is listed");
-    assert!(artists(true).await.is_empty());
+    let found = artists(true).await;
+    assert!(found.is_empty(), "{found:?}");
 
     let artist = Uuid::parse_str(&unplayed[0]).expect("artist id");
     seed_user_data(&db, user_id, artist, true, None).await;
-    assert!(artists(false).await.is_empty());
+    let found = artists(false).await;
+    assert!(found.is_empty(), "{found:?}");
     assert_eq!(artists(true).await, unplayed, "its own played row decides");
 }

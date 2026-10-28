@@ -287,7 +287,7 @@ mod tests {
             false,
         )
         .await;
-        assert!(more.is_empty());
+        assert!(more.is_empty(), "{more:?}");
         assert_eq!(requests.lock().unwrap().len(), 3);
     }
 
@@ -345,7 +345,7 @@ mod tests {
             true,
         )
         .await;
-        assert!(images.is_empty());
+        assert!(images.is_empty(), "{images:?}");
         assert!(
             !requests
                 .lock()

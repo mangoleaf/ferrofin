@@ -2793,15 +2793,13 @@ mod tests {
         );
         mgr.remove_media_path("Root", "/").await.unwrap();
         let folders = mgr.get_virtual_folders().await.unwrap();
-        assert!(folders[0].locations.is_empty());
         assert!(
-            folders[0]
-                .library_options
-                .as_ref()
-                .unwrap()
-                .path_infos
-                .is_empty()
+            folders[0].locations.is_empty(),
+            "{:?}",
+            folders[0].locations
         );
+        let path_infos = &folders[0].library_options.as_ref().unwrap().path_infos;
+        assert!(path_infos.is_empty(), "{path_infos:?}");
     }
 
     #[tokio::test]
@@ -2837,7 +2835,11 @@ mod tests {
             options.metadata_savers.as_deref(),
             Some(&["Nfo".to_owned()][..])
         );
-        assert!(options.disabled_local_metadata_readers.is_empty());
+        assert!(
+            options.disabled_local_metadata_readers.is_empty(),
+            "{:?}",
+            options.disabled_local_metadata_readers
+        );
         // The nested per-type table with its own lists and ImageOption entries.
         assert_eq!(options.type_options.len(), 1);
         let series = &options.type_options[0];
@@ -3232,7 +3234,11 @@ mod tests {
 
         mgr.remove_media_path("Home", &media).await.expect("remove");
         let folders = mgr.get_virtual_folders().await.expect("list");
-        assert!(folders[0].locations.is_empty());
+        assert!(
+            folders[0].locations.is_empty(),
+            "{:?}",
+            folders[0].locations
+        );
         assert_eq!(
             path_infos(&folders),
             [format!("{metadata}/library")],
@@ -3612,8 +3618,10 @@ mod tests {
     #[tokio::test]
     async fn missing_root_lists_empty() {
         let (_tmp, mgr) = manager();
-        assert!(mgr.get_virtual_folders().await.unwrap().is_empty());
-        assert!(mgr.get_physical_paths().await.unwrap().is_empty());
+        let virtual_folders = mgr.get_virtual_folders().await.unwrap();
+        assert!(virtual_folders.is_empty(), "{virtual_folders:?}");
+        let physical_paths = mgr.get_physical_paths().await.unwrap();
+        assert!(physical_paths.is_empty(), "{physical_paths:?}");
     }
 
     #[tokio::test]
@@ -3735,7 +3743,8 @@ mod tests {
             .await
             .unwrap();
         mgr.remove_virtual_folder("Lib").await.unwrap();
-        assert!(mgr.get_virtual_folders().await.unwrap().is_empty());
+        let virtual_folders = mgr.get_virtual_folders().await.unwrap();
+        assert!(virtual_folders.is_empty(), "{virtual_folders:?}");
     }
 
     #[tokio::test]
@@ -3901,11 +3910,9 @@ mod tests {
         mgr.remove_media_path("Lib", &media.replace("Élan", "élan"))
             .await
             .unwrap();
-        assert!(
-            mgr.get_virtual_folders().await.unwrap()[0]
-                .locations
-                .is_empty()
-        );
+        let folders = mgr.get_virtual_folders().await.unwrap();
+        let locations = &folders[0].locations;
+        assert!(locations.is_empty(), "{locations:?}");
     }
 
     /// A case-only rename that differs in a non-ASCII letter is case-only as
@@ -3942,7 +3949,8 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(mgr.get_virtual_folders().await.unwrap().is_empty());
+        let virtual_folders = mgr.get_virtual_folders().await.unwrap();
+        assert!(virtual_folders.is_empty(), "{virtual_folders:?}");
         let media = media_dir(&tmp, "media");
         mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&media)))
             .await

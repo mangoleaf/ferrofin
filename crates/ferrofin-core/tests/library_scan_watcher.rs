@@ -531,7 +531,9 @@ async fn a_removed_episode_prunes_exactly_its_rows() {
             .await
             .expect("count");
     assert_eq!(streams, 0, "its streams went with it");
-    assert!(series_requests(&fx.tmdb.take()).is_empty());
+    let requests = fx.tmdb.take();
+    let found = series_requests(&requests);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 /// A removed season folder prunes its whole subtree — the season and its
@@ -615,7 +617,9 @@ async fn a_new_season_folder_creates_the_season_and_its_episodes() {
         after[&series_id].4, before[&series_id].4,
         "the series is not refreshed"
     );
-    assert!(series_requests(&fx.tmdb.take()).is_empty());
+    let requests = fx.tmdb.take();
+    let found = series_requests(&requests);
+    assert!(found.is_empty(), "{found:?}");
 
     // Another new season, with the series' folder mtime moved: still not
     // refreshed.
@@ -626,7 +630,9 @@ async fn a_new_season_folder_creates_the_season_and_its_episodes() {
     assert_eq!(outcome.created, 2, "{outcome:?}");
     assert_eq!(outcome.updated, 0, "{outcome:?}");
     assert_eq!(fx.rows().await[&series_id].4, after[&series_id].4);
-    assert!(series_requests(&fx.tmdb.take()).is_empty());
+    let requests = fx.tmdb.take();
+    let found = series_requests(&requests);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 /// A provider names the series (TMDb answers "Show" for the folder "Flat"):
@@ -1377,7 +1383,7 @@ async fn retention_move_back_preserves_the_latest_state(#[case] destination_firs
     .fetch_all(fx.db.pool())
     .await
     .unwrap();
-    assert!(!rows.is_empty());
+    assert!(!rows.is_empty(), "{rows:?}");
     assert!(rows.iter().all(|row| *row == (false, true, None)));
     let retained: i64 =
         sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinUserDataRetentionSnapshots""#)

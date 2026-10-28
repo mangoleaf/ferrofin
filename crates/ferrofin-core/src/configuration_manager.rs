@@ -2954,7 +2954,7 @@ mod tests {
     fn no_configuration_means_setup_was_never_completed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let files = startup_wizard_completed_files(&tmp.path().join("config")).expect("read");
-        assert!(files.is_empty());
+        assert!(files.is_empty(), "{files:?}");
     }
 
     #[rstest::rstest]

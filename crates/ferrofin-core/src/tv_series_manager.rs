@@ -1336,7 +1336,7 @@ mod tests {
             )
             .await
             .expect("next up");
-        assert!(result.items.is_empty());
+        assert!(result.items.is_empty(), "{:?}", result.items);
         assert_eq!(result.total_record_count, 0);
 
         let keys_query = next_up

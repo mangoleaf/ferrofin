@@ -1470,8 +1470,16 @@ mod tests {
         );
         let request = first.last_request.lock().unwrap().clone().unwrap();
         assert!(!request.is_automated);
-        assert!(request.disabled_lyric_fetchers.is_empty());
-        assert!(request.lyric_fetcher_order.is_empty());
+        assert!(
+            request.disabled_lyric_fetchers.is_empty(),
+            "{:?}",
+            request.disabled_lyric_fetchers
+        );
+        assert!(
+            request.lyric_fetcher_order.is_empty(),
+            "{:?}",
+            request.lyric_fetcher_order
+        );
         options.disabled_lyric_fetchers.clear();
         folders
             .update_library_options("Z inner", &options)
@@ -1511,12 +1519,8 @@ mod tests {
             .unwrap();
         *first.last_request.lock().unwrap() = None;
         *second.last_request.lock().unwrap() = None;
-        assert!(
-            mgr.search_lyrics_automatically(item_id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let lyrics = mgr.search_lyrics_automatically(item_id).await.unwrap();
+        assert!(lyrics.is_empty(), "{lyrics:?}");
         assert!(first.last_request.lock().unwrap().is_none());
         assert!(second.last_request.lock().unwrap().is_none());
     }
@@ -2217,12 +2221,8 @@ mod tests {
             1
         );
         // …but nothing else.
-        assert!(
-            mgr.get_supported_providers(movie_id)
-                .await
-                .expect("movie")
-                .is_empty()
-        );
+        let supported_providers = mgr.get_supported_providers(movie_id).await.expect("movie");
+        assert!(supported_providers.is_empty(), "{supported_providers:?}");
     }
 
     /// A [`SelfWriteGuard`] recording each call, in order.
@@ -2292,7 +2292,8 @@ mod tests {
             save_targets(media, false, Some(meta), "lrc"),
             [PathBuf::from("/meta/library/ab/abcd/song.lrc")]
         );
-        assert!(save_targets(media, true, Some(meta), "x/../../../evil").is_empty());
+        let found = save_targets(media, true, Some(meta), "x/../../../evil");
+        assert!(found.is_empty(), "{found:?}");
         // Each target is checked against its own folder: `..` stops at the
         // root, so the same name stays inside `/` but leaves the metadata folder.
         assert_eq!(
@@ -2771,12 +2772,8 @@ mod tests {
     async fn no_item_store_reads_empty() {
         let mgr = FerrofinLyricManager::new();
         assert!(mgr.get_lyrics(Uuid::new_v4()).await.expect("get").is_none());
-        assert!(
-            mgr.search_lyrics(Uuid::new_v4())
-                .await
-                .expect("search")
-                .is_empty()
-        );
+        let lyrics = mgr.search_lyrics(Uuid::new_v4()).await.expect("search");
+        assert!(lyrics.is_empty(), "{lyrics:?}");
         // A pathless item cannot be written to or deleted from.
         assert!(
             mgr.save_lyric(Uuid::new_v4(), "lrc", "x".as_bytes())

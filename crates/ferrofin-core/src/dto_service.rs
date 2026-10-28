@@ -12166,7 +12166,11 @@ mod tests {
             ferrofin_model::media_info::MediaProtocol::File
         );
         assert!(source.is_infinite_stream, "no runtime → infinite");
-        assert!(source.media_streams.is_empty());
+        assert!(
+            source.media_streams.is_empty(),
+            "{:?}",
+            source.media_streams
+        );
         assert_eq!(source.path, None);
     }
 

@@ -284,7 +284,8 @@ async fn a_scan_records_the_shortcut_and_its_remote_target_without_probing_it() 
         h.data("Remote (2020)").await["ShortcutPath"],
         "http://origin.example/stream/movie.mp4"
     );
-    assert!(h.probed().is_empty());
+    let probed = h.probed();
+    assert!(probed.is_empty(), "{probed:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

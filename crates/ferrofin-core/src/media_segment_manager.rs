@@ -917,12 +917,11 @@ mod tests {
         assert!(mgr.is_type_supported(audio).await.unwrap());
         assert!(mgr.is_type_supported(audiobook).await.unwrap());
         assert!(!mgr.is_type_supported(Uuid::new_v4()).await.unwrap());
-        assert!(
-            mgr.get_supported_providers(episode)
-                .await
-                .expect("providers")
-                .is_empty()
-        );
+        let supported_providers = mgr
+            .get_supported_providers(episode)
+            .await
+            .expect("providers");
+        assert!(supported_providers.is_empty(), "{supported_providers:?}");
         // An install with no registered producer runs none.
         assert_eq!(
             mgr.run_segment_providers(episode, false)
@@ -1125,12 +1124,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(mgr.get_segments(item, None, true).await.unwrap().len(), 3);
-        assert!(
-            mgr.get_segments(item, Some(&[]), false)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let segments = mgr.get_segments(item, Some(&[]), false).await.unwrap();
+        assert!(segments.is_empty(), "{segments:?}");
         options.disabled_media_segment_providers = vec!["bEtA".to_owned()];
         options.media_segment_provider_order = vec!["Alpha".to_owned(), "Gamma".to_owned()];
         folders
@@ -1161,7 +1156,8 @@ mod tests {
             .unwrap();
         assert_eq!(mgr.run_segment_providers(item, true).await.unwrap(), 0);
         assert_eq!(mgr.get_segments(item, None, false).await.unwrap().len(), 4);
-        assert!(mgr.get_segments(item, None, true).await.unwrap().is_empty());
+        let segments = mgr.get_segments(item, None, true).await.unwrap();
+        assert!(segments.is_empty(), "{segments:?}");
     }
 
     #[tokio::test]
@@ -1194,11 +1190,8 @@ mod tests {
         let overwritten = mgr.get_segments(item, None, false).await.unwrap();
         assert_eq!(overwritten.len(), 1);
         assert_ne!(overwritten[0].id, first[0].id);
-        assert!(
-            good.requests.lock().unwrap()[2]
-                .existing_segments
-                .is_empty()
-        );
+        let existing_segments = good.requests.lock().unwrap()[2].existing_segments.clone();
+        assert!(existing_segments.is_empty(), "{existing_segments:?}");
         good.output.lock().unwrap().clear();
         mgr.run_segment_providers(item, false).await.unwrap();
         assert!(!mgr.has_segments(item).await.unwrap());
@@ -1361,18 +1354,16 @@ mod tests {
         );
         plugins.enable_plugin(id).await.unwrap();
         restarted.delete_segments(item).await.unwrap();
-        assert!(
-            cached
-                .get_segments(
-                    &ferrofin_model::media_segments::MediaSegmentGenerationRequest {
-                        item_id: item,
-                        existing_segments: Vec::new()
-                    }
-                )
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let segments = cached
+            .get_segments(
+                &ferrofin_model::media_segments::MediaSegmentGenerationRequest {
+                    item_id: item,
+                    existing_segments: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(segments.is_empty(), "{segments:?}");
     }
 
     #[tokio::test]
@@ -1521,13 +1512,11 @@ mod tests {
             .delete_provider_segments(item, "IntroSkipper", None)
             .await
             .unwrap();
-        assert!(
-            !restarted
-                .get_producer_segments(item, "IntroSkipper")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let producer_segments = restarted
+            .get_producer_segments(item, "IntroSkipper")
+            .await
+            .unwrap();
+        assert!(!producer_segments.is_empty(), "{producer_segments:?}");
         restarted
             .delete_all_producer_segments("IntroSkipper", None)
             .await

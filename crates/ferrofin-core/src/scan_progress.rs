@@ -458,7 +458,8 @@ mod tests {
         tokio::task::yield_now().await;
         worker.abort();
         assert!(worker.await.unwrap_err().is_cancelled());
-        assert!(tracker.libraries().is_empty());
+        let libraries = tracker.libraries();
+        assert!(libraries.is_empty(), "{libraries:?}");
         let next = tracker.begin([library]);
         next.started().await;
         let states: Vec<_> = lock(&seen)
@@ -508,7 +509,8 @@ mod tests {
         }
         parent.finalizing();
         parent.finish(true).await;
-        assert!(tracker.libraries().is_empty());
+        let libraries = tracker.libraries();
+        assert!(libraries.is_empty(), "{libraries:?}");
         let empty = tracker.begin([b]);
         empty.planned([]);
         empty.finalizing();
@@ -636,7 +638,8 @@ mod tests {
             ScanPhase::Finalizing
         );
         drop(run);
-        assert!(tracker.libraries().is_empty());
+        let libraries = tracker.libraries();
+        assert!(libraries.is_empty(), "{libraries:?}");
         let next = tracker.begin([library]);
         assert_eq!(tracker.library(library).unwrap().completed, 0);
         drop(next);
@@ -656,6 +659,7 @@ mod tests {
         assert_eq!(tracker.library(a).unwrap().phase, ScanPhase::Planning);
         assert_eq!(tracker.libraries().len(), 2);
         drop(second);
-        assert!(tracker.libraries().is_empty());
+        let libraries = tracker.libraries();
+        assert!(libraries.is_empty(), "{libraries:?}");
     }
 }

@@ -2267,7 +2267,11 @@ mod tests {
             .expect("dto")
             .policy
             .expect("policy");
-        assert!(read.access_schedules.is_empty());
+        assert!(
+            read.access_schedules.is_empty(),
+            "{:?}",
+            read.access_schedules
+        );
         assert_eq!(read.enabled_folders, vec![Uuid::from_u128(0xF3)]);
         assert!(read.enable_all_folders);
     }

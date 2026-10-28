@@ -292,7 +292,8 @@ async fn a_pls_is_no_track_and_a_playlist_folder_holds_no_items() {
     assert_eq!(road_trip.media_type.as_deref(), Some("Unknown"));
     assert!(!road_trip.is_in_mixed_folder);
     assert_eq!(road_trip.date_modified, None, "a folder has no mtime");
-    assert!(f.members(ROAD_TRIP).await.is_empty());
+    let members = f.members(ROAD_TRIP).await;
+    assert!(members.is_empty(), "{members:?}");
     let inside = f.id(BaseItemKind::Audio, "Road Trip [playlist]/x.mp3");
     assert!(f.row(inside).await.is_none(), "nothing in it is an item");
     assert!(
@@ -346,7 +347,8 @@ async fn a_rescan_follows_the_file() {
             .await
             .is_none()
     );
-    assert!(f.members(ALBUM_M3U).await.is_empty());
+    let members = f.members(ALBUM_M3U).await;
+    assert!(members.is_empty(), "{members:?}");
 }
 
 /// An older scan walked through a folder that is neither artist nor album
@@ -618,7 +620,8 @@ async fn a_playlist_folder_reads_its_playlist_xml_when_it_changes() {
     // and is not read again after.
     edit(&["missing.mp3"]);
     f.scan().await;
-    assert!(f.members(ROAD_TRIP).await.is_empty());
+    let members = f.members(ROAD_TRIP).await;
+    assert!(members.is_empty(), "{members:?}");
     let saved = f
         .row(f.id(BaseItemKind::Playlist, ROAD_TRIP))
         .await

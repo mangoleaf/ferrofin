@@ -1488,7 +1488,8 @@ async fn a_primarys_metadata_reaches_its_versions_and_parts_once() {
         }
     };
     assert_eq!(ids(version.id.clone()).await, ids(primary.id.clone()).await);
-    assert!(!ids(primary.id.clone()).await.is_empty());
+    let found = ids(primary.id.clone()).await;
+    assert!(!found.is_empty(), "{found:?}");
     let genre_links: i64 = sqlx::query_scalar(
         r#"SELECT COUNT(*) FROM "ItemValuesMap" m JOIN "ItemValues" v
            ON v."ItemValueId" = m."ItemValueId" WHERE m."ItemId" = ? AND v."Type" = 2"#,
@@ -1668,13 +1669,11 @@ async fn a_restricted_user_gets_no_parts_of_a_movie_rated_above_them() {
         1
     );
     let restricted = user_row(Some(13)).await;
-    assert!(
-        manager
-            .get_additional_parts(&primary, Some(&restricted))
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let additional_parts = manager
+        .get_additional_parts(&primary, Some(&restricted))
+        .await
+        .unwrap();
+    assert!(additional_parts.is_empty(), "{additional_parts:?}");
 }
 
 /// A local version with an NFO of its own keeps what its NFO says until

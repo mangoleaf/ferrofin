@@ -263,7 +263,8 @@ async fn a_lone_video_is_its_own_only_source() {
         ids(&rows.items_for_media_sources(&solo)),
         vec![row_id(&solo)]
     );
-    assert!(rows.local_version_ids(&solo).is_empty());
+    let local_version_ids = rows.local_version_ids(&solo);
+    assert!(local_version_ids.is_empty(), "{local_version_ids:?}");
 }
 
 #[rstest]

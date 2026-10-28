@@ -2530,7 +2530,8 @@ mod tests {
             error.to_string().contains("could not save the triggers"),
             "{error}"
         );
-        assert!(mgr.get("counting").expect("info").triggers.is_empty());
+        let triggers = mgr.get("counting").expect("info").triggers;
+        assert!(triggers.is_empty(), "{triggers:?}");
         assert!(super::lock(&mgr.stored_overrides).is_empty());
     }
 
@@ -2583,7 +2584,8 @@ mod tests {
         }));
 
         // Defaults are empty (CountingTask uses the trait default).
-        assert!(mgr.get("counting").expect("info").triggers.is_empty());
+        let found = mgr.get("counting").expect("info").triggers;
+        assert!(found.is_empty(), "{found:?}");
 
         let triggers = vec![TaskTriggerInfo {
             type_: TaskTriggerInfoType::IntervalTrigger,

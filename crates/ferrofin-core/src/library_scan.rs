@@ -24339,7 +24339,8 @@ mod tests {
         let scanner = scanner.with_tvdb(Arc::new(
             ferrofin_providers::TvdbClient::new().with_base_url(&base),
         ));
-        assert!(scanner.tvdb_child_images(&episode, &cache).await.is_empty());
+        let tvdb_child_images = scanner.tvdb_child_images(&episode, &cache).await;
+        assert!(tvdb_child_images.is_empty(), "{tvdb_child_images:?}");
         assert!(requests.lock().unwrap().is_empty());
         cache.item_provider_ids.insert(
             "SERIES".to_owned(),
@@ -25186,8 +25187,10 @@ mod tests {
                 "{movie}"
             );
         }
-        assert!(embedded_image_types(&stored("Audio.Audio")).is_empty());
-        assert!(embedded_image_types(&stored("TV.Series")).is_empty());
+        let found = embedded_image_types(&stored("Audio.Audio"));
+        assert!(found.is_empty(), "{found:?}");
+        let found = embedded_image_types(&stored("TV.Series"));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[allow(clippy::too_many_lines)]
@@ -26264,7 +26267,8 @@ mod tests {
             [Tmdb, Tvdb],
             "Identify's provider first"
         );
-        assert!(scanner.remote_sources(default, "Audio", None).is_empty());
+        let remote_sources = scanner.remote_sources(default, "Audio", None);
+        assert!(remote_sources.is_empty(), "{remote_sources:?}");
         let tvdb_first = tvdb_first_options();
         let saved = super::FetcherPolicy {
             options: Some(&tvdb_first),
@@ -26714,7 +26718,7 @@ mod tests {
             },
             "Movie",
         );
-        assert!(images.is_empty());
+        assert!(images.is_empty(), "{images:?}");
     }
 
     /// Serves `manifest` for `thumbs.txt` requests and `image` for everything
@@ -27461,13 +27465,8 @@ mod tests {
             let row = items.retrieve_item(id).await.unwrap().unwrap();
             assert!(row.date_last_refreshed.is_some(), "{:?} stamped", row.name);
         }
-        assert!(
-            items
-                .get_image_infos(unknown_id)
-                .await
-                .expect("images")
-                .is_empty()
-        );
+        let image_infos = items.get_image_infos(unknown_id).await.expect("images");
+        assert!(image_infos.is_empty(), "{image_infos:?}");
 
         // Idempotent: a second pass leaves the single image row in place.
         scanner
@@ -29362,7 +29361,7 @@ mod tests {
 
         let images = LibraryScanner::series_tmdb_images(&tmdb, &series, &mut cache, None).await;
 
-        assert!(images.is_empty());
+        assert!(images.is_empty(), "{images:?}");
         assert_eq!(
             all.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -31497,11 +31496,8 @@ mod tests {
             9,
             "an item without library options allows all embedded subtitles"
         );
-        assert!(
-            super::LibraryScanner::apply_probe(&mut row, None, false, policy)
-                .streams
-                .is_empty()
-        );
+        let streams = super::LibraryScanner::apply_probe(&mut row, None, false, policy).streams;
+        assert!(streams.is_empty(), "{streams:?}");
     }
 
     #[tokio::test]
@@ -31574,9 +31570,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(rows.streams.is_empty());
+        assert!(rows.streams.is_empty(), "{:?}", rows.streams);
         scanner.persist_probe_rows(id, &rows, None).await.unwrap();
-        assert!(streams.get_media_streams(&query).await.unwrap().is_empty());
+        let media_streams = streams.get_media_streams(&query).await.unwrap();
+        assert!(media_streams.is_empty(), "{media_streams:?}");
     }
 
     /// `FFProbeVideoInfo.Fetch` (`FFProbeVideoInfo.cs:263-266`): a video's
@@ -31798,7 +31795,7 @@ mod tests {
         assert_eq!(kept.merged, recorded);
         assert!(!kept.changed);
         let dropped = settle(&mut cache, true, &[]);
-        assert!(dropped.merged.is_empty());
+        assert!(dropped.merged.is_empty(), "{:?}", dropped.merged);
         assert!(dropped.drops_stored && dropped.changed);
         let replaced = settle(&mut cache, true, &[("Tmdb".to_owned(), "603".to_owned())]);
         assert_eq!(replaced.merged, [("Tmdb".to_owned(), "603".to_owned())]);
@@ -34039,7 +34036,8 @@ mod tests {
         library.scanner(&base).scan_all().await.unwrap();
         library.mark_probed().await;
         library.set_cast(&[]).await;
-        assert!(library.cast().await.is_empty());
+        let cast = library.cast().await;
+        assert!(cast.is_empty(), "{cast:?}");
 
         library.scanner(&base).scan_all().await.unwrap();
 
@@ -34417,7 +34415,7 @@ mod tests {
                 &mut cache,
             )
             .await;
-        assert!(images.is_empty());
+        assert!(images.is_empty(), "{images:?}");
         assert_eq!(requests.lock().unwrap().len(), usize::from(replace));
     }
 
@@ -35351,7 +35349,7 @@ mod tests {
         let none = scanner
             .extract_embedded_cover(track_id, &track, &streams[..1])
             .await;
-        assert!(none.is_empty());
+        assert!(none.is_empty(), "{none:?}");
     }
 
     use crate::media_stream_repository::FerrofinMediaStreamRepository;
@@ -37908,7 +37906,8 @@ mod tests {
             serde_json::from_str(changes.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(changes.lock().unwrap().len(), 2, "a save is announced");
         assert_eq!(saved["ItemsUpdated"].as_array().unwrap().len(), 1);
-        assert!(saved["ItemsAdded"].as_array().unwrap().is_empty());
+        let items_added = saved["ItemsAdded"].as_array().unwrap();
+        assert!(items_added.is_empty(), "{items_added:?}");
 
         // Delete a movie → the next scan announces the removal.
         std::fs::remove_file(movies.join("Dune (2021).mkv")).unwrap();
@@ -37917,7 +37916,8 @@ mod tests {
         let third: serde_json::Value =
             serde_json::from_str(changes.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(third["ItemsRemoved"].as_array().unwrap().len(), 1);
-        assert!(third["ItemsAdded"].as_array().unwrap().is_empty());
+        let items_added = third["ItemsAdded"].as_array().unwrap();
+        assert!(items_added.is_empty(), "{items_added:?}");
     }
 
     // `POST /Items/{id}/Refresh` on one library must not scan the other three:
@@ -38255,7 +38255,8 @@ mod tests {
             !stems("/movies/Heat 2 (2027).nfo").contains(&"Heat".to_owned()),
             "a space is no separator: another title"
         );
-        assert!(stems("/").is_empty());
+        let found = stems("/");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -38993,7 +38994,7 @@ mod tests {
             .find(|i| i.image_type == ImageType::Primary)
             .expect("library tile image row");
         let bytes = std::fs::read(&primary.path).expect("tile file on disk");
-        assert!(!bytes.is_empty());
+        assert!(!bytes.is_empty(), "{bytes:?}");
         assert_eq!(primary.width, 960);
         assert_eq!(primary.height, 540);
     }
@@ -41968,7 +41969,8 @@ mod chapter_image_refresh_tests {
             )
             .await
             .unwrap();
-        assert!(repo.get_chapters(id).await.unwrap().is_empty());
+        let chapters = repo.get_chapters(id).await.unwrap();
+        assert!(chapters.is_empty(), "{chapters:?}");
         assert!(
             Path::new(saved[0].image_path.as_deref().unwrap()).exists(),
             "source's empty chapter set returns before image cleanup"
@@ -42209,7 +42211,8 @@ mod chapter_image_refresh_tests {
             )
             .await
             .unwrap();
-        assert!(repo.get_chapters(id).await.unwrap().is_empty());
+        let chapters = repo.get_chapters(id).await.unwrap();
+        assert!(chapters.is_empty(), "{chapters:?}");
         duration.store(12, Ordering::Relaxed);
         scanner
             .persist_video_chapters(
@@ -42345,12 +42348,8 @@ mod chapter_image_refresh_tests {
         }
         for runtime in [None, Some(0)] {
             fixture.video.run_time_ticks = runtime;
-            assert!(
-                scanner
-                    .video_chapters(&fixture.video, &probe)
-                    .unwrap()
-                    .is_empty()
-            );
+            let video_chapters = scanner.video_chapters(&fixture.video, &probe).unwrap();
+            assert!(video_chapters.is_empty(), "{video_chapters:?}");
         }
         fixture.video.run_time_ticks = Some(12 * 3600 * 10_000_000);
         assert_eq!(

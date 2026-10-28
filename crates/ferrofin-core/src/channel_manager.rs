@@ -72,12 +72,8 @@ mod tests {
     #[tokio::test]
     async fn everything_is_empty() {
         let mgr = FerrofinChannelManager::new();
-        assert!(
-            mgr.get_channel_features(None)
-                .await
-                .expect("features")
-                .is_empty()
-        );
+        let channel_features = mgr.get_channel_features(None).await.expect("features");
+        assert!(channel_features.is_empty(), "{channel_features:?}");
         assert_eq!(
             mgr.get_channels(&ChannelQuery::default())
                 .await

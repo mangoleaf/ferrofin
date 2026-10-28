@@ -189,7 +189,8 @@ mod tests {
         assert_eq!(one.expect("present").name.as_deref(), Some("Outro"));
 
         mgr.delete_chapter_data(item).await.expect("delete");
-        assert!(mgr.get_chapters(item).await.expect("get").is_empty());
+        let chapters = mgr.get_chapters(item).await.expect("get");
+        assert!(chapters.is_empty(), "{chapters:?}");
     }
 
     #[tokio::test]

@@ -3443,12 +3443,8 @@ mod tests {
         )
         .await
         .expect("hide home tile");
-        assert!(
-            mgr.get_user_views(user_id)
-                .await
-                .expect("home views")
-                .is_empty()
-        );
+        let user_views = mgr.get_user_views(user_id).await.expect("home views");
+        assert!(user_views.is_empty(), "{user_views:?}");
         assert_eq!(
             mgr.get_media_folders(user_id)
                 .await
@@ -3669,8 +3665,10 @@ mod tests {
             exclude_item_types_for(&[], &[]),
             LATEST_EXCLUDED_BY_NAME_KINDS.to_vec()
         );
-        assert!(exclude_item_types_for(&[BaseItemKind::Movie], &[]).is_empty());
-        assert!(exclude_item_types_for(&[], &[MediaType::Video]).is_empty());
+        let found = exclude_item_types_for(&[BaseItemKind::Movie], &[]);
+        assert!(found.is_empty(), "{found:?}");
+        let found = exclude_item_types_for(&[], &[MediaType::Video]);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[tokio::test]

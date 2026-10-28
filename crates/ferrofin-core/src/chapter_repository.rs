@@ -209,6 +209,7 @@ mod tests {
         assert!(repo.get_chapter(item, 9).await.expect("miss").is_none());
 
         repo.delete_chapters(item).await.expect("delete");
-        assert!(repo.get_chapters(item).await.expect("get").is_empty());
+        let chapters = repo.get_chapters(item).await.expect("get");
+        assert!(chapters.is_empty(), "{chapters:?}");
     }
 }

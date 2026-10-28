@@ -535,7 +535,8 @@ async fn a_librarys_unticked_music_fetchers_ask_nothing() {
     assert!(fx.row(fx.album_id()).await.date_last_refreshed.is_some());
     assert!(fx.row(fx.artist_id()).await.date_last_refreshed.is_some());
     fx.scan_with(&replace_all()).await;
-    assert!(fx.music.take().is_empty());
+    let music_requests = fx.music.take();
+    assert!(music_requests.is_empty(), "{music_requests:?}");
 }
 
 /// Owner decision D1: a music provider that FAILS leaves the item

@@ -428,7 +428,8 @@ mod tests {
         let (tmp, _, fs, cache) = cache();
         let missing = tmp.path().join("later").to_string_lossy().into_owned();
         assert!(cache.try_get_file_system_entries(&missing).is_err());
-        assert!(cache.get_file_system_entries(&missing).is_empty());
+        let file_system_entries = cache.get_file_system_entries(&missing);
+        assert!(file_system_entries.is_empty(), "{file_system_entries:?}");
         std::fs::create_dir(&missing).unwrap();
         assert!(cache.try_get_file_system_entries(&missing).is_ok());
         assert_eq!(fs.listings(), 3);

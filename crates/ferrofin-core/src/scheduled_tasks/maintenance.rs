@@ -1028,7 +1028,8 @@ mod tests {
         let task = CleanActivityLogTask::new(config, activity.clone());
         assert_eq!(task.key(), "CleanActivityLog");
         assert_eq!(task.category(), "Maintenance");
-        assert!(task.default_triggers().is_empty());
+        let default_triggers = task.default_triggers();
+        assert!(default_triggers.is_empty(), "{default_triggers:?}");
 
         task.execute(&TaskProgress::default()).await.expect("run");
         let before = activity
@@ -1300,7 +1301,8 @@ mod tests {
         let task = MoveTrickplayImagesTask::new(trickplay);
         assert_eq!(task.key(), "MoveTrickplayImages");
         assert_eq!(task.name(), "Migrate Trickplay Image Location");
-        assert!(task.default_triggers().is_empty());
+        let default_triggers = task.default_triggers();
+        assert!(default_triggers.is_empty(), "{default_triggers:?}");
 
         // No stored trickplay rows: one empty page, clean completion.
         let progress = TaskProgress::default();

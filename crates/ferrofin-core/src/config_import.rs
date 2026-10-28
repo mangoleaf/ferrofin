@@ -638,7 +638,8 @@ mod tests {
         // `SortRemoveWords` defaults to ["the", "a", "an"], so an operator who
         // emptied it must not have it handed back.
         assert_eq!(default_server_configuration().sort_remove_words.len(), 3);
-        assert!(imported_system().sort_remove_words.is_empty());
+        let sort_remove_words = imported_system().sort_remove_words;
+        assert!(sort_remove_words.is_empty(), "{sort_remove_words:?}");
     }
 
     #[test]
@@ -810,7 +811,11 @@ mod tests {
         let options = import_system(xml).metadata_options;
         assert_eq!(options.len(), 1);
         assert_eq!(options[0].item_type.as_deref(), Some("MusicVideo"));
-        assert!(options[0].disabled_metadata_fetchers.is_empty());
+        assert!(
+            options[0].disabled_metadata_fetchers.is_empty(),
+            "{:?}",
+            options[0].disabled_metadata_fetchers
+        );
     }
 
     #[test]

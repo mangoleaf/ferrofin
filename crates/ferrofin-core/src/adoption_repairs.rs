@@ -3286,7 +3286,8 @@ mod tests {
                 .expect("again"),
             0
         );
-        assert!(links(&db).await.is_empty());
+        let found = links(&db).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `MigrateLinkedChildren.ResolveChildId`: a cached `ItemId` counts only
@@ -5424,12 +5425,10 @@ mod tests {
             date_texts(&db, &ids[0]).await,
             [Some(text.to_owned()), Some(text.to_owned())]
         );
-        assert!(
-            conflicting_groups(&db, ("", ""), REPAIR_PARTITION)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let found = conflicting_groups(&db, ("", ""), REPAIR_PARTITION)
+            .await
+            .unwrap();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// One instant written two ways — EF trims fraction zeros, Ferrofin
@@ -5536,7 +5535,8 @@ mod tests {
             .unwrap();
         assert_eq!(harmonize_in_partitions(&db, 1).await.unwrap(), 1);
         assert!(db.meta_get(HARMONIZE_KEY).await.unwrap().is_some());
-        assert!(fossils().await.is_empty());
+        let found = fossils().await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// A file-backed database is copied to `<db>.pre-harmonize` before a

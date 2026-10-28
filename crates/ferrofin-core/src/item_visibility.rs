@@ -1442,7 +1442,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(visible.is_empty());
+        assert!(visible.is_empty(), "{visible:?}");
     }
 
     #[tokio::test]
