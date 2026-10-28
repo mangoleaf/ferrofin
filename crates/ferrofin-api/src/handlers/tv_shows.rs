@@ -219,7 +219,10 @@ struct NextUpParams {
     #[serde(default)]
     enable_user_data: Option<bool>,
     /// Only consider episodes aired on or after this cutoff.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time"
+    )]
     next_up_date_cutoff: Option<chrono::DateTime<chrono::Utc>>,
     /// Whether to compute the total record count (defaults `true`).
     #[serde(default)]

@@ -729,6 +729,8 @@ impl SessionManager for RecordingSessions {
 #[derive(Default)]
 struct RecordingUserData {
     played: Arc<Mutex<Vec<Uuid>>>,
+    /// The `datePlayed` each `mark_played` call received.
+    dates_played: Arc<Mutex<Vec<Option<chrono::DateTime<chrono::Utc>>>>>,
     unplayed: Arc<Mutex<Vec<Uuid>>>,
 }
 
@@ -738,9 +740,10 @@ impl UserDataManager for RecordingUserData {
         &self,
         user_id: Uuid,
         item_id: Uuid,
-        _date_played: Option<chrono::DateTime<chrono::Utc>>,
+        date_played: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<UserItemDataDto, ServiceError> {
         self.played.lock().unwrap().push(user_id);
+        self.dates_played.lock().unwrap().push(date_played);
         Ok(data_dto(item_id, true))
     }
     async fn mark_unplayed(
@@ -1470,6 +1473,61 @@ async fn mark_played_returns_dto_and_hits_user_data() {
     let dto: UserItemDataDto = serde_json::from_slice(&body).expect("dto");
     assert!(dto.played);
     assert_eq!(user_data.played.lock().unwrap().as_slice(), &[USER_ID]);
+}
+
+/// `datePlayed` binds through `LegacyDateTimeModelBinder`: the compact
+/// `yyyyMMddHHmmss` form as UTC, else ASP.NET's default `DateTime` binder,
+/// where EF's `ToUniversalTime` reads an offset-less value as server time.
+#[tokio::test]
+async fn mark_played_binds_legacy_and_offsetless_dates_played() {
+    if ferrofin_api::test_support::rerun_in_time_zone(
+        "mark_played_binds_legacy_and_offsetless_dates_played",
+    ) {
+        return;
+    }
+    let played = |query: &'static str| async move {
+        let (sessions, user_data) = recording();
+        let (status, body) = send(
+            state(sessions, user_data.clone()),
+            "POST",
+            &format!("/UserPlayedItems/{ITEM_ID}?{query}"),
+            Body::empty(),
+        )
+        .await;
+        let dates = user_data.dates_played.lock().unwrap().clone();
+        (status, body, dates)
+    };
+    // The offset-less forms are Asia/Kolkata (+05:30) wall time.
+    for (query, expected) in [
+        ("datePlayed=20261028123456", "2026-10-28T12:34:56Z"),
+        ("datePlayed=2026-10-28T12:34:56Z", "2026-10-28T12:34:56Z"),
+        ("datePlayed=2026-10-28T12:34:56", "2026-10-28T07:04:56Z"),
+        ("datePlayed=2026-10-28", "2026-10-27T18:30:00Z"),
+    ] {
+        let (status, body, dates) = played(query).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{query}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(
+            dates,
+            vec![Some(expected.parse().expect("date"))],
+            "{query}"
+        );
+    }
+    // The compact form is exact: no fourteenth digit, no leap second, no
+    // padding (the default binder then cannot read the digits either).
+    for query in [
+        "datePlayed=2026102812345",
+        "datePlayed=20261028123460",
+        "datePlayed=%2020261028123456",
+    ] {
+        let (status, _, dates) = played(query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+        assert!(dates.is_empty(), "{query}");
+    }
 }
 
 #[tokio::test]

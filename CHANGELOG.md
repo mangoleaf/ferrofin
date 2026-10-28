@@ -695,6 +695,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
+- The web client's Next Up row loads again: jellyfin-web 12.x sends `nextUpDateCutoff` as a
+  bare date, which Ferrofin answered with a `400`. Every `DateTime` query parameter now binds
+  as Jellyfin's does: a date or an offset-less date-time is accepted and read as server
+  time (`nextUpDateCutoff`, activity-log `minDate`/`maxDate`, `datePlayed`, and the
+  `GET /LiveTv/Programs` window, which read such values as UTC before), and `datePlayed` also accepts
+  the legacy `yyyyMMddHHmmss` form as UTC
 - Seeking or resuming an HLS stream whose video is transcoded and audio copied (an HEVC
   movie on an H.264-only client) plays again: the copied-audio trim cut at the absolute
   seek time on timestamps that start at the seek, so every audio packet was dropped, fMP4
