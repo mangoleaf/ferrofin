@@ -316,6 +316,44 @@ pub fn build_query(filter: &InternalItemsQuery, shape: QueryShape) -> QueryBuild
     qb
 }
 
+/// v12.2 `GetPlayedAndTotalCountFromQuery` (`ItemCountService.cs:735-749`)
+/// over the rows `filter` matches: `SELECT COUNT(*), <played count>` in one
+/// statement over the row set of [`QueryShape::Count`] (ungrouped, no order),
+/// each row's played state tested beside it as upstream's
+/// `Select(IsPlayedBy(userId))` and `Count(isPlayed => isPlayed)` test it.
+/// The played test is [`push_leaf_is_played_per_row`], the leaf rule of the
+/// `IsPlayed` filter (`BuildLeafIsPlayedFilter`) rather than `IsPlayedBy`, as
+/// the per-item count has always read it. With no user on `filter`, nothing is
+/// played.
+///
+/// For the per-item folder counts, whose `filter` holds countable leaves
+/// (`IsFolder = false`) below one anchored `DescendantOfId` closure: the test
+/// is never a folder's roll-up.
+#[must_use]
+pub(crate) fn build_leaf_played_and_total_query(
+    filter: &InternalItemsQuery,
+) -> QueryBuilder<Sqlite> {
+    debug_assert!(
+        filter.is_folder == Some(false) && filter.descendant_of_id.is_some(),
+        "the per-item count's row set: countable leaves below one folder"
+    );
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT COUNT(*), ");
+    match filter.user_id() {
+        Some(user_id) => {
+            qb.push("COUNT(CASE WHEN ");
+            push_leaf_is_played_per_row(&mut qb, "bi", &guid_to_db(user_id));
+            qb.push(" THEN 1 END)");
+        }
+        None => {
+            qb.push("0");
+        }
+    }
+    qb.push(r#" FROM "BaseItems" AS bi WHERE bi."Id" <> "#)
+        .push_bind(PLACEHOLDER_ID);
+    append_predicates(&mut qb, filter);
+    qb
+}
+
 /// A grouped movie grid currently sorts full rows (including metadata blobs)
 /// before discarding OFFSET rows. Sort only keys, then hydrate the final page.
 /// Keep other orderings on their existing plans: search, random and user-data
@@ -2159,6 +2197,8 @@ pub(crate) fn push_is_played(
 /// queries, so this is what lets the version that was actually watched mark
 /// the title played. Same uncorrelated-`IN` shape as
 /// [`push_user_data_exists`]: each list is materialized once per statement.
+/// [`push_leaf_is_played_per_row`] tests the same rule one row at a time; a
+/// change to the rule changes both.
 fn push_leaf_is_played(qb: &mut QueryBuilder<Sqlite>, alias: &str, user_id: &str) {
     qb.push(format!(
         r#"({alias}."Id" IN (SELECT ud."ItemId" FROM "UserData" ud WHERE ud."UserId" = "#
@@ -2177,9 +2217,54 @@ fn push_leaf_is_played(qb: &mut QueryBuilder<Sqlite>, alias: &str, user_id: &str
 /// version group holding a played row of the user's, whichever version
 /// carries it.
 fn push_played_groups(qb: &mut QueryBuilder<Sqlite>, user_id: &str) {
-    qb.push(r#"(SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."UserId" = "#)
+    qb.push(
+        r#"(SELECT v."PrimaryVersionId" FROM "BaseItems" v WHERE v."PrimaryVersionId" IS NOT NULL AND "#,
+    );
+    push_version_group_played(qb, user_id);
+    qb.push(")");
+}
+
+/// The test `playedGroupIds` puts on each version `v` of v12
+/// `BuildLeafIsPlayedFilter`: the user has a played row on the version or on
+/// its primary.
+fn push_version_group_played(qb: &mut QueryBuilder<Sqlite>, user_id: &str) {
+    qb.push(r#"EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."UserId" = "#)
         .push_bind(user_id.to_owned())
-        .push(r#" AND ud."Played" = 1 AND (ud."ItemId" = v."Id" OR ud."ItemId" = v."PrimaryVersionId")))"#);
+        .push(r#" AND ud."Played" = 1 AND (ud."ItemId" = v."Id" OR ud."ItemId" = v."PrimaryVersionId"))"#);
+}
+
+/// [`push_leaf_is_played`]'s rule (v12 `BuildLeafIsPlayedFilter`: a played
+/// row of its own, the primary of a played group, or a version of one) tested
+/// on the one row `alias`. Each `x IN (SELECT …)` arm is written as the
+/// semi-join it is, a correlated `EXISTS`, so a row costs a few seeks: its own
+/// `(UserId, Played, ItemId)` rows, and its version group through the partial
+/// `IX_BaseItems_PrimaryVersionId`. Nothing is built from the user's whole
+/// watch history.
+///
+/// Only for a row set anchored on one folder's closure,
+/// [`build_leaf_played_and_total_query`]'s: there the lists cost more to build
+/// than the leaves cost to test. Each statement run alone, outside the server,
+/// on a copy of the bench corpus database (a 4,031-row history): for a 39-leaf
+/// series the list-form played count took 0.33 ms, and one statement counting
+/// both this way 0.06 ms. On folders of 3,001 and 7,490 leaves the one
+/// statement measured within 5 % in either form, since reading the closure is
+/// most of its cost; what those folders gain is reading it once, not twice.
+/// The `IsPlayed` filter and sort keys keep the list form, which suits the
+/// large result sets they range over.
+fn push_leaf_is_played_per_row(qb: &mut QueryBuilder<Sqlite>, alias: &str, user_id: &str) {
+    qb.push(format!(
+        r#"(EXISTS (SELECT 1 FROM "UserData" ud WHERE ud."ItemId" = {alias}."Id" AND ud."UserId" = "#
+    ))
+    .push_bind(user_id.to_owned())
+    .push(format!(
+        r#" AND ud."Played" = 1) OR EXISTS (SELECT 1 FROM "BaseItems" v WHERE v."PrimaryVersionId" = {alias}."Id" AND "#
+    ));
+    push_version_group_played(qb, user_id);
+    qb.push(format!(
+        r#") OR ({alias}."PrimaryVersionId" IS NOT NULL AND EXISTS (SELECT 1 FROM "BaseItems" v WHERE v."PrimaryVersionId" = {alias}."PrimaryVersionId" AND "#
+    ));
+    push_version_group_played(qb, user_id);
+    qb.push(")))");
 }
 
 /// The ids [`push_leaf_is_played`] holds for, as one uncorrelated list: the
