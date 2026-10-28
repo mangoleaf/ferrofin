@@ -152,8 +152,16 @@ fn build_video_item_simple_test(
         }
     } else if play_method == Some(PlayMethod::Transcode) {
         assert!(stream_info.container.is_some());
-        assert!(!stream_info.video_codecs.is_empty());
-        assert!(!stream_info.audio_codecs.is_empty());
+        assert!(
+            !stream_info.video_codecs.is_empty(),
+            "{:?}",
+            stream_info.video_codecs
+        );
+        assert!(
+            !stream_info.audio_codecs.is_empty(),
+            "{:?}",
+            stream_info.audio_codecs
+        );
 
         if transcode_protocol == "http" {
             assert_eq!(

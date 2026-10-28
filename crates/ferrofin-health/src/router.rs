@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(body["status"], "ok");
         // The baked build identity is always present and non-empty — the
         // benchmark harness aborts a run when it can't verify the binary.
-        assert!(!body["build"].as_str().unwrap().is_empty());
+        assert_ne!(body["build"].as_str().unwrap(), "");
         assert_eq!(body["build"], crate::build_version());
     }
 

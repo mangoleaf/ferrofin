@@ -105,14 +105,14 @@ mod tests {
     #[test]
     fn get_mime_type_valid_valid() {
         for format in ALL_FORMATS {
-            assert!(!format.mime_type().is_empty());
+            assert_ne!(format.mime_type(), "");
         }
     }
 
     #[test]
     fn get_extension_valid_valid() {
         for format in ALL_FORMATS {
-            assert!(!format.extension().is_empty());
+            assert_ne!(format.extension(), "");
         }
     }
 

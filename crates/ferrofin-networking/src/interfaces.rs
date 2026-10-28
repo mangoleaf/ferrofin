@@ -119,7 +119,8 @@ mod tests {
 
     #[test]
     fn loopback_fallback_respects_enabled_families() {
-        assert!(loopbacks(false, false).is_empty());
+        let found = loopbacks(false, false);
+        assert!(found.is_empty(), "{found:?}");
         let v4 = loopbacks(true, false);
         assert_eq!(v4.len(), 1);
         assert!(v4[0].address.is_ipv4());
@@ -188,7 +189,8 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[1].subnet.prefix_length, 64);
         assert_eq!(result[1].address.to_string(), "fd00::2");
-        assert!(map_interfaces(vec![v4.clone(), v6.clone()], false, false, |_| true).is_empty());
+        let found = map_interfaces(vec![v4.clone(), v6.clone()], false, false, |_| true);
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(map_interfaces(vec![v4, v6], false, true, |_| true).len(), 1);
     }
 

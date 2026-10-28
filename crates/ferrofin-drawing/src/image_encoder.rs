@@ -1171,11 +1171,11 @@ mod tests {
             enc.get_image_size(&input).await.expect("probe in"),
             ImageDimensions::new(200, 100)
         );
-        assert!(
-            !enc.get_image_blur_hash(4, 3, &input)
+        assert_ne!(
+            enc.get_image_blur_hash(4, 3, &input)
                 .await
-                .expect("blurhash")
-                .is_empty()
+                .expect("blurhash"),
+            ""
         );
         let options = ImageProcessingOptions {
             max_width: Some(100),

@@ -35,7 +35,7 @@ fn test_false_positives() {
         &strs(&["Bad Boys (2006).mkv", "Bad Boys (2007).mkv"]),
         &options,
     );
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn test_false_positives2() {
     let options = NamingOptions::new();
     let result =
         stack_resolver::resolve_files(&strs(&["Bad Boys 2006.mkv", "Bad Boys 2007.mkv"]), &options);
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]
@@ -51,14 +51,14 @@ fn test_false_positives3() {
     let options = NamingOptions::new();
     let result =
         stack_resolver::resolve_files(&strs(&["300 (2006).mkv", "300 (2007).mkv"]), &options);
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]
 fn test_false_positives4() {
     let options = NamingOptions::new();
     let result = stack_resolver::resolve_files(&strs(&["300 2006.mkv", "300 2007.mkv"]), &options);
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]
@@ -71,7 +71,7 @@ fn test_false_positives5() {
         ]),
         &options,
     );
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn test_false_positives6() {
         ]),
         &options,
     );
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn resolve_files_given_part_in_middle_of_name_returns_no_stack() {
         ]),
         &options,
     );
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn resolve_files_file_names_with_missing_part_type_returns_no_stack() {
         ]),
         &options,
     );
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]
@@ -208,7 +208,7 @@ fn test_missing_parttype() {
         &strs(&["300a.mkv", "300b.mkv", "300c.mkv", "300-trailer.mkv"]),
         &options,
     );
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]
@@ -306,7 +306,7 @@ fn test_names_without_parts() {
         ]),
         &options,
     );
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]

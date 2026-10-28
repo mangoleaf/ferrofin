@@ -818,7 +818,7 @@ async fn analysis_capabilities_cap_resolve_and_extract() {
         assert!(err.contains("no such"), "{err}");
         // Happy path: resolved via the library, decoded by the stub.
         let chunk = extract_audio(&cx, MEM, &window(10)).expect("extract");
-        assert!(!chunk.samples.is_empty());
+        assert!(!chunk.samples.is_empty(), "{:?}", chunk.samples);
         assert_eq!(chunk.spec.sample_rate, 11_025);
 
         // Frames: per-call cap, then a clamped happy path.
@@ -1039,7 +1039,11 @@ async fn loaded_producer_uses_display_name_library_gate_and_registered_namespace
         ferrofin_wasm::capabilities::SegmentWriteOutcome::PolicySkipped
     );
     assert!(!manager.has_segments(item).await.unwrap());
-    assert!(manager.registered_segment_providers().is_empty());
+    let registered_segment_providers = manager.registered_segment_providers();
+    assert!(
+        registered_segment_providers.is_empty(),
+        "{registered_segment_providers:?}"
+    );
     options.disabled_media_segment_providers.clear();
     folders
         .update_library_options("Movies", &options)
@@ -1107,13 +1111,8 @@ async fn loaded_producer_uses_display_name_library_gate_and_registered_namespace
     .await
     .unwrap()
     .unwrap();
-    assert!(
-        manager
-            .get_segments(item, None, true)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let segments = manager.get_segments(item, None, true).await.unwrap();
+    assert!(segments.is_empty(), "{segments:?}");
     assert_eq!(
         manager.get_segments(item, None, false).await.unwrap()[0].end_ticks,
         100,

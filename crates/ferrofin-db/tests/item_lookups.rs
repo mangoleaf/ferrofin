@@ -88,11 +88,10 @@ async fn provider_ids_come_back_per_item_and_skip_items_without_any() {
     );
 
     // An empty id list is a no-op, not a malformed `IN ()`.
+    let provider_ids_for_items = db.provider_ids_for_items(&[]).await.expect("empty lookup");
     assert!(
-        db.provider_ids_for_items(&[])
-            .await
-            .expect("empty lookup")
-            .is_empty()
+        provider_ids_for_items.is_empty(),
+        "{provider_ids_for_items:?}"
     );
 }
 
@@ -279,12 +278,11 @@ async fn rows_of_type_match_the_stored_type_exactly() {
             Some(r#"{"PhysicalLocationsList":["/media/movies"]}"#.to_owned()),
         )]
     );
-    assert!(
-        db.rows_of_type("MediaBrowser.Controller.Entities.Nothing")
-            .await
-            .expect("unknown type")
-            .is_empty()
-    );
+    let rows_of_type = db
+        .rows_of_type("MediaBrowser.Controller.Entities.Nothing")
+        .await
+        .expect("unknown type");
+    assert!(rows_of_type.is_empty(), "{rows_of_type:?}");
 }
 
 #[tokio::test]

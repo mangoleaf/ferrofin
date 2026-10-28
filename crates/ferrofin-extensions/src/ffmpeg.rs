@@ -1076,7 +1076,8 @@ mod tests {
         );
         let invalid = "[blackdetect @ 0000000000000000] black_start:3.04\n\
                        [blackdetect @ 0000000000000000] black_start:9 black_end:8 black_duration:1\n";
-        assert!(parse_black_intervals(invalid).is_empty());
+        let found = parse_black_intervals(invalid);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `TestParseKeyframeVisuals_*`.

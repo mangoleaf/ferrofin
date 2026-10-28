@@ -240,7 +240,7 @@ mod tests {
             .flat_map(|e| e.tasks(&cx))
             .map(|t| t.key().to_owned())
             .collect();
-        assert!(!expected.is_empty());
+        assert!(!expected.is_empty(), "{expected:?}");
 
         let tasks = FerrofinTaskManager::new();
         register_tasks(&extensions, &cx, &tasks);

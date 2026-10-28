@@ -20,7 +20,8 @@ async fn db() -> Database {
 async fn tuner_hosts_upsert_by_id_and_drive_the_count() {
     let db = db().await;
     assert_eq!(db.live_tv_tuner_count().await.expect("count"), 0);
-    assert!(db.live_tv_tuner_hosts().await.expect("hosts").is_empty());
+    let live_tv_tuner_hosts = db.live_tv_tuner_hosts().await.expect("hosts");
+    assert!(live_tv_tuner_hosts.is_empty(), "{live_tv_tuner_hosts:?}");
 
     db.upsert_live_tv_tuner_host("B", "http://b/playlist.m3u", "m3u", "{}")
         .await
@@ -56,17 +57,17 @@ async fn tuner_hosts_upsert_by_id_and_drive_the_count() {
 
     db.delete_all_live_tv_tuner_hosts().await.expect("clear");
     assert_eq!(db.live_tv_tuner_count().await.expect("count"), 0);
-    assert!(db.live_tv_tuner_hosts().await.expect("hosts").is_empty());
+    let live_tv_tuner_hosts = db.live_tv_tuner_hosts().await.expect("hosts");
+    assert!(live_tv_tuner_hosts.is_empty(), "{live_tv_tuner_hosts:?}");
 }
 
 #[tokio::test]
 async fn listing_providers_upsert_by_id() {
     let db = db().await;
+    let live_tv_listing_providers = db.live_tv_listing_providers().await.expect("empty");
     assert!(
-        db.live_tv_listing_providers()
-            .await
-            .expect("empty")
-            .is_empty()
+        live_tv_listing_providers.is_empty(),
+        "{live_tv_listing_providers:?}"
     );
 
     db.upsert_live_tv_listing_provider("P2", "xmltv", "/guide/b.xml", "{}")

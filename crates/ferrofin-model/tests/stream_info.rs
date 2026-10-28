@@ -56,7 +56,7 @@ fn subtitle_delivery_method_name(v: SubtitleDeliveryMethod) -> &'static str {
 /// Verbatim port of the 10.6 `LegacyStreamInfo.ToUrl_Original` builder.
 #[allow(clippy::too_many_lines)]
 fn to_url_original(item: &StreamInfo, base_url: &str, access_token: Option<&str>) -> String {
-    assert!(!base_url.is_empty());
+    assert_ne!(base_url, "");
 
     let mut list: Vec<(String, String)> = Vec::new();
 

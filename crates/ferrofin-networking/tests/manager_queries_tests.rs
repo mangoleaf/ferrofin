@@ -40,7 +40,8 @@ fn get_loopbacks_empty_when_both_disabled() {
         ..Default::default()
     };
     let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES);
-    assert!(nm.get_loopbacks().is_empty());
+    let loopbacks = nm.get_loopbacks();
+    assert!(loopbacks.is_empty(), "{loopbacks:?}");
 }
 
 #[test]
@@ -154,7 +155,11 @@ fn published_server_urls_exposes_internal_overrides() {
         ..Default::default()
     };
     let nm = NetworkManager::with_defaults(conf, MOCK_INTERFACES);
-    assert!(!nm.published_server_urls().is_empty());
+    let published_server_urls = nm.published_server_urls();
+    assert!(
+        !published_server_urls.is_empty(),
+        "{published_server_urls:?}"
+    );
     assert!(
         nm.published_server_urls()
             .iter()

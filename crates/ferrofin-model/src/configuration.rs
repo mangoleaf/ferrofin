@@ -1592,7 +1592,7 @@ mod tests {
         assert!(cfg.remember_subtitle_selections);
         assert!(cfg.enable_next_episode_auto_play);
         assert_eq!(cfg.subtitle_mode, SubtitlePlaybackMode::Default);
-        assert!(cfg.grouped_folders.is_empty());
+        assert!(cfg.grouped_folders.is_empty(), "{:?}", cfg.grouped_folders);
     }
 
     #[test]
@@ -1674,8 +1674,16 @@ mod tests {
         assert_eq!(json["SimilarItemProviders"], serde_json::json!([]));
         assert_eq!(json["SimilarItemProviderOrder"], serde_json::json!([]));
         let back: TypeOptions = serde_json::from_str(r#"{"Type":"Movie"}"#).unwrap();
-        assert!(back.similar_item_providers.is_empty());
-        assert!(back.similar_item_provider_order.is_empty());
+        assert!(
+            back.similar_item_providers.is_empty(),
+            "{:?}",
+            back.similar_item_providers
+        );
+        assert!(
+            back.similar_item_provider_order.is_empty(),
+            "{:?}",
+            back.similar_item_provider_order
+        );
     }
 
     #[test]
@@ -1866,7 +1874,8 @@ mod tests {
             json["TypeOptions"][0]["MetadataFetchers"][0]["DefaultEnabled"],
             true
         );
-        assert!(json["MetadataSavers"].as_array().unwrap().is_empty());
+        let metadata_savers = json["MetadataSavers"].as_array().unwrap();
+        assert!(metadata_savers.is_empty(), "{metadata_savers:?}");
         let back: LibraryOptionsResultDto = serde_json::from_value(json).unwrap();
         assert_eq!(dto, back);
     }
@@ -1886,7 +1895,7 @@ mod tests {
         let opts: TypeOptions = serde_json::from_value(body).unwrap();
         assert_eq!(opts.type_.as_deref(), Some("Series"));
         assert_eq!(opts.metadata_fetchers, ["TheMovieDb"]);
-        assert!(opts.image_options.is_empty());
+        assert!(opts.image_options.is_empty(), "{:?}", opts.image_options);
 
         // And the full LibraryOptions wrapper with such a TypeOptions array must deserialize too.
         let lib = serde_json::json!({
@@ -1898,6 +1907,10 @@ mod tests {
         });
         let parsed: LibraryOptions = serde_json::from_value(lib).unwrap();
         assert_eq!(parsed.type_options.len(), 1);
-        assert!(parsed.type_options[0].image_options.is_empty());
+        assert!(
+            parsed.type_options[0].image_options.is_empty(),
+            "{:?}",
+            parsed.type_options[0].image_options
+        );
     }
 }

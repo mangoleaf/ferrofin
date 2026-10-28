@@ -61,7 +61,11 @@ mod tests {
         let caps = ClientCapabilities::default();
         assert!(!caps.supports_media_control);
         assert!(caps.supports_persistent_identifier);
-        assert!(caps.playable_media_types.is_empty());
+        assert!(
+            caps.playable_media_types.is_empty(),
+            "{:?}",
+            caps.playable_media_types
+        );
     }
 
     #[test]
