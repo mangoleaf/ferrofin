@@ -557,6 +557,16 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `FERROFIN_ROW_CACHE_TTL_SECS` and `FERROFIN_AUTH_CACHE_TTL_SECS`
   (5–300, default 30) bound how long a change made outside the server, in the database
   itself, goes unseen
+- The libraries' physical folders and `Enabled` option come from that same in-memory library
+  set, and the Live TV view is found among the views the user scope has already read. The
+  home screen's `/Users/{id}/Views` resolved a library's physical folders three times and
+  looked the Live TV view up once, a statement each, and read every library's options file;
+  every query scoped to the user's libraries read the files and the Live TV view too. On the
+  benchmark corpus (release builds before and after, requests interleaved) the views went
+  from 21 statements to 17, as in 1.3.2, and from 1.11 to 0.95 ms. A library's options file
+  or row edited outside the server is now seen by these reads within
+  `FERROFIN_ROW_CACHE_TTL_SECS`, as the per-item check already saw it; changes made through
+  the server still apply on the next request
 - A folder's played and total leaf counts read one folder at a time (a series' or season's
   detail page, a box set or playlist, a plain folder, and any folder a list page's batch
   leaves out) are one statement, as Jellyfin counts them, and test each leaf's played state
