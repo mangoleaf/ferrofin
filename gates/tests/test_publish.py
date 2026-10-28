@@ -434,11 +434,12 @@ class PublishTests(unittest.TestCase):
         files, readme = publish.render(str(self.published([doc])), README, str(self.root))
         graph = files[next(p for p in files if p.endswith("/parity.svg"))]
         ET.fromstring(graph)
-        for text in ("/Items", "9  ·  100% alike", "/Intros", "not compared", f"fill='{publish.STYLE['light']['new']}'",
+        for text in ("/Items", ">6 of 9 identical<", ">0 of 1 identical  ·  1 Jellyfin failed<", ">0 of 1 identical  ·  1 not in ledger<",
+                     ">known (in ledger)<", f"fill='{publish.STYLE['light']['new']}'",
                      "against Jellyfin 12.2.0, gates session"):
             self.assertIn(text, graph)
         for text in ("### Answering like Jellyfin", "replays the **12** requests", "**6 are identical**",
-                     "**3 differ in accepted ways**", "**1 is filed as an issue** and **1 is new**",
+                     "**3 differ in known ways**", "**1 is filed as an issue** and **1 is new**",
                      "1 was not compared because Jellyfin itself failed it", "| /Items | 9 | 6 | 3 | 0 | 0 | 0 |",
                      "Filed as issues: gl-832.", 'srcset="docs/results/v1.4.0/parity-dark.svg"'):
             self.assertIn(text, readme)
@@ -534,10 +535,18 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(len(rows), publish.PARITY_AREAS + 1)
         self.assertEqual((rows[-1]["area"], rows[-1]["requests"]), ("3 other areas", 18 + 17 + 16))
 
-    def test_an_area_reads_100_percent_alike_only_when_every_compared_request_is(self):
+    def test_an_area_says_how_many_of_its_requests_are_identical_and_names_the_thin_segments(self):
         parity = {"areas": [{"area": "/Items", "requests": 490, "identical": 151, "accepted": 333, "filed": 0, "new": 1,
-                             "oracle_failed": 5}]}
-        self.assertIn("490  ·  99.7% alike", publish.parity_graph("t", parity, "c", "light"))
+                             "oracle_failed": 5},
+                            {"area": "/Shows", "requests": 325, "identical": 76, "accepted": 249, "filed": 0, "new": 0,
+                             "oracle_failed": 0}]}
+        graph = publish.parity_graph("t", parity, "c", "light")
+        self.assertIn(">151 of 490 identical  ·  1 not in ledger  ·  5 Jellyfin failed<", graph)
+        self.assertIn(">76 of 325 identical<", graph)   # a known difference is not counted as alike
+        self.assertNotIn("alike", graph)
+        widest = max(float(x) + len(t) * int(size) * 0.58
+                     for x, size, t in re.findall(r"<text x='([\d.]+)'[^>]*font-size='(\d+)'[^>]*>([^<]*)</text>", graph))
+        self.assertLessEqual(widest, publish.WIDTH)   # the labels and the legend fit (by the same width estimate)
 
     def test_a_session_without_a_parity_result_or_one_that_compared_nothing_is_refused(self):
         runs = self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)])
@@ -587,21 +596,29 @@ class PublishTests(unittest.TestCase):
         files, readme = publish.render(str(self.published([doc])), README, str(self.root))
         graph = files[next(p for p in files if p.endswith("/previous-release.svg"))]
         ET.fromstring(graph)
-        # every comparable gated cell, the biggest gain first; the ramp ceiling is better when higher
-        order = [graph.index(f">{cell}<") for cell in ("loaded/screens/home", "loaded/endpoints/items", "loaded/screens/movies",
-                                                         "memory/peak under load")]
+        # a bar of every gated cell by verdict, then each cell that improved or regressed, the biggest gain first
+        self.assertIn(">5 gated cells: 2 improved  ·  1 within noise  ·  1 regressed  ·  1 not comparable<", graph)
+        order = [graph.index(f">{cell}<") for cell in ("loaded/screens/home", "loaded/endpoints/items", "memory/peak under load")]
         self.assertEqual(order, sorted(order))
+        self.assertNotIn(">loaded/screens/movies<", graph)   # within noise: counted and in the table, not drawn
+        self.assertIn(">loaded/screens/search<", graph)   # not comparable blocks like a regression: named
+        self.assertIn(">not comparable: blocks like a regression<", graph)
+        quiet = publish.ab_graph("t", [AB_VERDICTS["loaded/screens/movies"] | {"cell": "loaded/screens/movies"}], "v1.3.2", "c", "light")
+        ET.fromstring(quiet)
+        self.assertIn(">1 gated cell: 1 within noise<", quiet)
+        self.assertNotIn("times better", quiet)   # no bar, so no axis
         self.assertIn("2.0× faster  ·  10.0 ms vs 20.0 ms  ·  improved", graph)
         self.assertIn("1.2× heavier  ·  125 MiB vs 100 MiB  ·  regressed", graph)
         self.assertIn(f"fill='{publish.STYLE['light']['FAIL']}'", graph)   # the regression in its own colour
-        self.assertNotIn("loaded/screens/search<", graph)   # not comparable: listed below, not drawn
         self.assertNotIn("loaded/endpoints/x", graph)   # not gated
         self.assertIn(">Ferrofin v1.4.0 against Ferrofin v1.3.2<", graph)
         widest = max(float(x) + len(t) * 11 * 0.58 for x, t in re.findall(r"<text x='([\d.]+)'[^>]*font-size='11'[^>]*>([^<]*)</text>", graph))
         self.assertLessEqual(widest, publish.WIDTH)   # every bar's note fits the graph (by the same width estimate)
         for text in ("### Against the previous release", "**Ferrofin v1.3.2** (`ghcr.io/mangoleaf/ferrofin:v1.3.2`)", "3 interleaved pairs",
                      "of 5 gated cells, **2 improved**, 1 is within noise and **1 regressed**, and 1 could not be compared "
-                     "(it blocks like a regression); **1 gated cell blocked the release**",
+                     "(it blocks like a regression); **1 gated cell blocked the release**. The graph draws the cells "
+                     "that improved or regressed; every cell is in the table under it.",
+                     "| loaded/screens/movies | 10.0 ms | 10.2 ms | +2.0% | within noise |",
                      "| memory/peak under load | 100 MiB | 125 MiB | +25.0% | regressed |",
                      "| loaded/screens/search | — | — | — | not comparable: other work |",
                      'srcset="docs/results/v1.4.0/previous-release-dark.svg"'):
