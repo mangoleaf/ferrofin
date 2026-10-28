@@ -192,7 +192,10 @@ from.
    adoption status and parity overview, and its benchmark is the first Jellyfin comparison), then
    two more `make run-bench IMAGE=<candidate>` sessions for the second and third comparison. They
    are publication inputs only: their numbers never decide a release, and parity is not a gate
-   here. Keep the three session folders for step 6.
+   here. Keep the three session folders for step 6. Build `<candidate>` and run every one of these
+   sessions, and the A/B gate, from a checkout of the frozen head: a result records the commit
+   its harness checkout was at, not the image's, and step 6 publishes only results that
+   record the tag's commit.
 
    **Validate adoption.** The evidence is a green run of the `Adoption` workflow
    (`.github/workflows/adoption.yml`) on the frozen release commit. It builds the image from
@@ -238,6 +241,12 @@ from.
    (release branch → `main`), or to `main` for a patch release. CI's `benchmark-report` job fails
    when the block or the graphs differ from what the committed summary files give, so never edit
    them by hand.
+
+   `publish.py summarise` refuses results whose recorded commit is not the one the tag names,
+   and needs the tag in the local checkout (`git fetch github --tags`). When the release was
+   re-cut after step 2's publication inputs ran, run them again on the tag's commit before
+   publishing. Labelling the old commit's results with `MEASURED_BEFORE_TAG=1` is a last resort
+   the owner agrees to.
 
 The workflow needs the repository secret `RELEASE_TOKEN`: a fine-grained personal
 access token for this repository with **Contents: read and write**. Tags pushed with the

@@ -346,7 +346,7 @@ Each supported Jellyfin version and upgrade route, adopted in place by Ferrofin 
 
 ### Answering like Jellyfin
 
-The parity gate replays the **2,353** requests jellyfin-web makes against Jellyfin 12.2.0 and Ferrofin **v1.4.0** (commit `5112240e`, a local gates session on 2026-10-26) and compares the answers. Of the 2,307 it could compare, **1,242 are identical** and **1,051 differ in accepted ways** (each recorded with its reason in the parity ledger); **2 are filed as issues** and **12 are new**. 46 were not compared because Jellyfin itself failed them.
+The parity gate replays the **2,353** requests jellyfin-web makes against Jellyfin 12.2.0 and Ferrofin **v1.4.0** (commit `5112240e`, a local gates session on 2026-10-26) and compares the answers. Of the 2,307 it could compare, **1,242 are identical** and **1,051 differ in accepted ways** (each recorded with its reason in the parity ledger); **2 are filed as issues** and **12 are new**. 46 were not compared because Jellyfin itself failed them. **The parity gate did not pass** (new differences): 14 requests differ in ways the ledger does not cover yet.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/parity-dark.svg">
