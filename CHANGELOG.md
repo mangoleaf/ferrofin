@@ -110,6 +110,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   release (`oracle.py matches`). `oracle.py check` no longer takes `--gate`
 
 ### Parity
+- Bundle jellyfin-web 12.4 (was 12.2) in the image: the library editor shows an error when
+  the library options cannot be saved, Delete All on the Devices page removes every device
+  but the current one (it tried to remove only the current one), library lists refresh
+  whenever the server reports a played-state change, including one made in another client,
+  a library page takes the library's name as its title, the suggestions view's section
+  headers no longer link to a broken list, the audio normalization setting shows outside
+  iOS again, and `@jellyfin/sdk` 1.0.2 no longer opens the socket without a session
 - `POST /LiveTv/TunerHosts` with the id of a configured tuner in another case keeps the id
   as posted, as Jellyfin's `config.TunerHosts[index] = info` does, renaming the tuner and
   its channels' link to it (channel ids and their user data do not change); an id padded
