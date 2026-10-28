@@ -695,6 +695,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
+- Seeking or resuming an HLS stream whose video is transcoded and audio copied (an HEVC
+  movie on an H.264-only client) plays again: the copied-audio trim cut at the absolute
+  seek time on timestamps that start at the seek, so every audio packet was dropped, fMP4
+  segments came out empty ("Source error" in Jellyfin for Android) and TS segments had no
+  audio. The cut now counts from the seek, and the audio starts with the video
 - A Live TV tuner, guide provider, series timer or timer whose stored settings no longer
   parse is logged (a warning naming its table and id, once) instead of vanishing silently,
   and a `livetv.json` that cannot be read or parsed logs a warning naming it once per change
