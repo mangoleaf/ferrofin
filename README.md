@@ -456,7 +456,8 @@ This publishes the port on loopback only, because a fresh server's `admin` accou
 password (see [below](#first-start-the-passwordless-admin)). Open `http://localhost:8096/web`
 on the Docker host and finish the setup wizard. Then recreate the container with
 `-p 8096:8096` so that other devices can reach it. For a headless install, add
-`-e FERROFIN_ADMIN_PASSWORD=…` to seed the password before you publish the port.
+`-e FERROFIN_ADMIN_PASSWORD='<choose-a-password>'` to seed the password; the port can then be
+published on all interfaces from the start.
 
 `:latest` follows final releases only, never a release candidate. Adoption and the database
 migrations are one-way, so re-pulling `:latest` and recreating the container upgrades the
@@ -488,7 +489,7 @@ disables transcoding):
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
 ```
 
-#### First start: the passwordless admin
+### First start: the passwordless admin
 
 On a fresh database Ferrofin seeds an `admin` user **with no password**, as Jellyfin does,
 and logs a warning: the setup wizard at `/web` sets the password. Until it does, anyone who
@@ -561,6 +562,9 @@ support for every 10.11.x or 12.x release.
 > If you decide to go back to Jellyfin, restore that backup. Anything that happened in
 > Ferrofin after the switch (watch state, new users, playlists) stays in Ferrofin.
 
+Existing Ferrofin databases upgrade in place across releases; steps that need operator
+action are listed in [`docs/UPGRADING.md`](docs/UPGRADING.md).
+
 ### Items whose files are gone (10.11 databases)
 
 On the first boot of a database adopted from Jellyfin 10.11, Ferrofin removes the items whose
@@ -572,9 +576,6 @@ placeholder, as in Jellyfin, and no media file is touched. Before the first remo
 snapshots the database to `jellyfin.db.pre-missing-items`. Restoring that copy brings the items
 back in Ferrofin; it is not a way back to Jellyfin, which is `jellyfin.db.pre-ferrofin`. The
 details are in [`docs/UPGRADING.md`](docs/UPGRADING.md).
-
-Existing Ferrofin databases upgrade in place across releases; steps that need operator
-action are listed in [`docs/UPGRADING.md`](docs/UPGRADING.md).
 
 ## Plugins: the one deliberate divergence
 
