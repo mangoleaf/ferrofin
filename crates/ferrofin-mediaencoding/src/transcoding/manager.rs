@@ -2441,7 +2441,8 @@ mod start_ffmpeg_tests {
             .unwrap();
 
         // Registration counts as recent activity: nothing to reap yet.
-        assert!(m.reap_idle_jobs().await.is_empty());
+        let reaped = m.reap_idle_jobs().await;
+        assert!(reaped.is_empty(), "{reaped:?}");
         assert_eq!(m.active_job_count(), 1);
 
         // Expire the idle window (a fake clock via ping_timeout_ms = -1, which
@@ -2454,7 +2455,8 @@ mod start_ffmpeg_tests {
         let guard = m
             .begin_request_guard(&handle.path, handle.job_type)
             .expect("job registered");
-        assert!(m.reap_idle_jobs().await.is_empty());
+        let reaped = m.reap_idle_jobs().await;
+        assert!(reaped.is_empty(), "{reaped:?}");
         drop(guard);
 
         // The guard drop restarted the countdown; re-expire and reap.
@@ -2593,7 +2595,8 @@ mod start_ffmpeg_tests {
             Some(HLS_PING_TIMEOUT_MS),
             "ping restored the job-type default timeout"
         );
-        assert!(m.reap_idle_jobs().await.is_empty());
+        let reaped = m.reap_idle_jobs().await;
+        assert!(reaped.is_empty(), "{reaped:?}");
         assert_eq!(m.active_job_count(), 1);
 
         // Re-expire WITHOUT a ping: the countdown runs out and the job dies.
@@ -2719,7 +2722,8 @@ mod start_ffmpeg_tests {
             let mut jobs = m.jobs.lock().unwrap();
             jobs[0].ping_timeout_ms = 60_000;
         }
-        assert!(m.reap_idle_jobs().await.is_empty());
+        let reaped = m.reap_idle_jobs().await;
+        assert!(reaped.is_empty(), "{reaped:?}");
         assert_eq!(m.active_job_count(), 1);
 
         // The playlist file itself resolves to the same job...

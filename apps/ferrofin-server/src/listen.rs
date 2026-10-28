@@ -278,7 +278,8 @@ mod tests {
             plan_addresses(None, 80, &[any6]),
             ["[::]:80".parse::<SocketAddr>().unwrap()]
         );
-        assert!(plan_addresses(None, 8096, &[]).is_empty());
+        let found = plan_addresses(None, 8096, &[]);
+        assert!(found.is_empty(), "{found:?}");
         // A link-local IPv6 address binds on its interface.
         let link_local = interface("fe80::1".parse().unwrap(), 3);
         let planned = plan_addresses(None, 8096, &[link_local]);

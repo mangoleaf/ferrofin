@@ -431,7 +431,8 @@ async fn extract_all_noop_when_nothing_extractable() {
     let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
 
     encoder.extract_all_extractable_subtitles(&source).await;
-    assert!(recorder.calls().is_empty());
+    let calls = recorder.calls();
+    assert!(calls.is_empty(), "{calls:?}");
 }
 
 /// Wraps an `Arc<RecordingIo>` so the encoder can own an `I: SubtitleIo` while
@@ -591,7 +592,7 @@ fn filter_events_wraps_an_extreme_offset_as_unchecked_csharp_arithmetic_does() {
         ..Subtitle::default()
     };
     filter_events(&mut s, i64::MIN, 0, false);
-    assert!(s.paragraphs.is_empty());
+    assert!(s.paragraphs.is_empty(), "{:?}", s.paragraphs);
 }
 
 #[test]
@@ -997,7 +998,8 @@ async fn a_cache_whose_source_is_missing_is_kept() {
     let encoder = SubtitleEncoder::new(SubtitleEditParser::new(), ArcIo(recorder.clone()));
 
     encoder.extract_all_extractable_subtitles(&source).await;
-    assert!(recorder.calls().is_empty());
+    let calls = recorder.calls();
+    assert!(calls.is_empty(), "{calls:?}");
 }
 
 /// `ConvertTextSubtitleToSrt`: a sidecar the parser cannot read is converted

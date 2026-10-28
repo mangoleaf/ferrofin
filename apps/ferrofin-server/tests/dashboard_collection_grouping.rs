@@ -385,7 +385,8 @@ async fn live_collection_flags_and_request_overrides_reach_real_folder_queries()
     assert_eq!(names(&page), ["Video collection"]);
     assert_eq!(page["TotalRecordCount"], 3);
     let beyond = get(&router, token, &format!("{base}&startIndex=99&limit=1")).await;
-    assert!(names(&beyond).is_empty());
+    let found = names(&beyond);
+    assert!(found.is_empty(), "{found:?}");
     assert_eq!(beyond["TotalRecordCount"], 3);
     assert_eq!(
         names(&get(&router, token, &format!("{base}&nameStartsWith=A")).await),
@@ -452,7 +453,9 @@ async fn live_collection_flags_and_request_overrides_reach_real_folder_queries()
     let plain_page = get(&router, token, &format!("{plain}&startIndex=1&limit=1")).await;
     assert_eq!(names(&plain_page), ["Charlie video"]);
     assert_eq!(plain_page["TotalRecordCount"], 3);
-    assert!(names(&get(&router, token, &format!("{plain}&nameStartsWith=A")).await).is_empty());
+    let starts_with_a = get(&router, token, &format!("{plain}&nameStartsWith=A")).await;
+    let found = names(&starts_with_a);
+    assert!(found.is_empty(), "{found:?}");
     let collection_browse = get(
         &router,
         token,

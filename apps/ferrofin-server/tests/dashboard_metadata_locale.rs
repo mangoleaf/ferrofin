@@ -541,13 +541,8 @@ async fn saved_locales_change_provider_requests_without_restarting() {
             1,
             "{available}"
         );
-        assert!(
-            api.get(&format!("/Items/{id}/Images"))
-                .await
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
+        let images = api.get(&format!("/Items/{id}/Images")).await;
+        assert!(images.as_array().unwrap().is_empty(), "{images}");
     }
     tv_options["TypeOptions"][1]["ImageFetchers"] = json!(["TheTVDB"]);
     api.post(
@@ -620,7 +615,7 @@ async fn verify_root_library_location(api: &Api) {
         .unwrap();
     assert_eq!(root["Locations"], json!(["/"]));
     assert_eq!(root["LibraryOptions"]["PathInfos"][0]["Path"], "/");
-    assert!(!root["ItemId"].as_str().unwrap().is_empty());
+    assert_ne!(root["ItemId"].as_str().unwrap(), "");
     api.client
         .delete(format!(
             "{}/Library/VirtualFolders/Paths?name=Root-fixture&path=%2F&refreshLibrary=false",
@@ -3683,7 +3678,8 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
                 "/Items?parentId={season_id}&includeItemTypes=Movie"
             ))
             .await;
-        assert!(names(&wrong_kind).is_empty());
+        let found = names(&wrong_kind);
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(wrong_kind["TotalRecordCount"], 0);
         let descending = api
             .get(&format!(
@@ -3733,12 +3729,13 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
             ),
             ["Other"]
         );
+        let episodes = api
+            .get(&format!("/Shows/{series_id}/Episodes?season=99"))
+            .await;
         assert!(
-            api.get(&format!("/Shows/{series_id}/Episodes?season=99"))
-                .await["Items"]
-                .as_array()
-                .unwrap()
-                .is_empty()
+            episodes["Items"].as_array().unwrap().is_empty(),
+            "{}",
+            episodes["Items"]
         );
         let all = api.get(&format!("/Shows/{series_id}/Episodes")).await;
         assert_eq!(

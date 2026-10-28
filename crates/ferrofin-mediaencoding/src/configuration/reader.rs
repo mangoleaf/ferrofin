@@ -205,6 +205,7 @@ pub(crate) mod tests {
             warnings.iter().all(|line| line.contains("reader=\"test\"")),
             "{warnings:#?}"
         );
-        assert!(logs.lines_at("ERROR").is_empty());
+        let lines = logs.lines_at("ERROR");
+        assert!(lines.is_empty(), "{lines:?}");
     }
 }

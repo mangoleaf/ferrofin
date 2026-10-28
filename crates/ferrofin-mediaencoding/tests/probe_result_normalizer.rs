@@ -167,7 +167,7 @@ fn get_media_info_metadata_success() {
     assert!(!audio2.is_original);
     assert_eq!(audio2.audio_spatial_format(), AudioSpatialFormat::Dtsx);
 
-    assert!(res.chapters.is_empty());
+    assert!(res.chapters.is_empty(), "{:?}", res.chapters);
     assert_eq!(res.overview.as_deref(), Some("Just color bars"));
 }
 

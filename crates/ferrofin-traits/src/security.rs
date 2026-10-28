@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn provider_result_default_is_empty() {
         let r = ProviderAuthenticationResult::default();
-        assert!(r.username.is_empty());
+        assert_eq!(r.username, "");
         assert_eq!(r.display_name, None);
     }
 

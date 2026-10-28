@@ -937,7 +937,8 @@ mod tests {
         assert_eq!(ex_io.working_dir.lock().unwrap().as_deref(), Some("/cache"));
         // The media names the batch dump's files, so a cancelled run has none
         // it could delete.
-        assert!(ex_io.outputs().is_empty());
+        let outputs = ex_io.outputs();
+        assert!(outputs.is_empty(), "{outputs:?}");
     }
 
     /// The batch dump used to collapse every run of whitespace in the whole

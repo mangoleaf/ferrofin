@@ -889,7 +889,11 @@ mod tests {
         assert!(!q.skip_deserialization);
         assert_eq!(q.parent_id, Uuid::nil());
         // dto_options defaults to all-fields.
-        assert!(!q.dto_options.fields.is_empty());
+        assert!(
+            !q.dto_options.fields.is_empty(),
+            "{:?}",
+            q.dto_options.fields
+        );
         // A fresh query has no narrowing filters.
         assert!(!q.has_filters());
     }

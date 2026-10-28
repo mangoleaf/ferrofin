@@ -883,8 +883,8 @@ scale=1280:trunc(1280/dar/2)*2"
                 "format=yuv420p".to_owned(),
             ]
         );
-        assert!(chain.sub.is_empty());
-        assert!(chain.overlay.is_empty());
+        assert!(chain.sub.is_empty(), "{:?}", chain.sub);
+        assert!(chain.overlay.is_empty(), "{:?}", chain.overlay);
     }
 
     #[rstest]
@@ -961,8 +961,8 @@ scale=1280:trunc(1280/dar/2)*2"
         };
         let chain = sw_vid_filter_chain(&input);
         assert_eq!(chain.main.last().unwrap(), "subtitles=f='/media/a.ass'");
-        assert!(chain.sub.is_empty());
-        assert!(chain.overlay.is_empty());
+        assert!(chain.sub.is_empty(), "{:?}", chain.sub);
+        assert!(chain.overlay.is_empty(), "{:?}", chain.overlay);
     }
 
     #[test]

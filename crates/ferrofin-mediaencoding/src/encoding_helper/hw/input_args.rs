@@ -562,7 +562,7 @@ mod tests {
             "-init_hw_device cuda=cu:0 -filter_hw_device cu -hwaccel cuda \
              -hwaccel_output_format cuda -noautorotate -hwaccel_flags +unsafe_output -threads 1"
         );
-        assert!(out.env.is_empty());
+        assert!(out.env.is_empty(), "{:?}", out.env);
     }
 
     #[test]
@@ -748,7 +748,7 @@ mod tests {
         let s = stream("h264", "yuv420p");
         let out = args_for(&ctx(&caps, &options, &s), "copy", node());
         assert_eq!(out.args, "");
-        assert!(out.env.is_empty());
+        assert!(out.env.is_empty(), "{:?}", out.env);
     }
 
     #[test]
@@ -933,7 +933,7 @@ mod tests {
             false,
         );
         assert_eq!(out.args, "");
-        assert!(out.env.is_empty());
+        assert!(out.env.is_empty(), "{:?}", out.env);
     }
 
     #[test]

@@ -671,7 +671,7 @@ async fn a_burned_ass_track_reads_the_fonts_its_file_ships_from_the_cache() {
              &playSessionId=burn-ass&subtitleStreamIndex={ass}&subtitleMethod=Encode"
         ))
         .await;
-    assert!(!body.is_empty());
+    assert!(!body.is_empty(), "{body:?}");
 
     // The fonts were dumped one by one to paths of the server's choosing, as
     // a path-shaped name requires, and both landed in one cache folder.

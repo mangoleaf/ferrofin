@@ -945,12 +945,10 @@ mod tests {
                 .unwrap()
         );
         store.set_excluded(season, item, true).await.unwrap();
+        let segments_unless_excluded = store.segments_unless_excluded(item).await.unwrap();
         assert!(
-            store
-                .segments_unless_excluded(item)
-                .await
-                .unwrap()
-                .is_empty()
+            segments_unless_excluded.is_empty(),
+            "{segments_unless_excluded:?}"
         );
         assert_eq!(store.segments(item).await.unwrap().len(), 1);
         store.set_excluded(season, item, false).await.unwrap();

@@ -2765,7 +2765,7 @@ mod tests {
         let r = NextUpEpisodeBatchResult::default();
         assert!(r.last_watched.is_none());
         assert!(r.next_up.is_none());
-        assert!(r.specials.is_empty());
+        assert!(r.specials.is_empty(), "{:?}", r.specials);
         assert!(r.user_data.is_empty());
         let ud = NextUpEpisodeUserData::default();
         assert!(!ud.played);
