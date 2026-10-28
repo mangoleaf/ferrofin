@@ -369,49 +369,61 @@ impl AudioNormalizationTask {
         base: f64,
         span: f64,
     ) -> Result<(), ServiceError> {
-        let albums = self
-            .library
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::MusicAlbum],
-                recursive: true,
-                ancestor_ids: folder_ids.to_vec(),
-                ..InternalItemsQuery::default()
-            })
-            .await?;
-        let total = albums.len().max(1);
-        for (index, album) in albums.iter().enumerate() {
-            if album.lufs.is_none()
-                && album.normalization_gain.is_none()
-                && let Ok(album_id) = Uuid::parse_str(&album.id)
-            {
-                let tracks = self
-                    .library
-                    .get_item_list(&InternalItemsQuery {
-                        include_item_types: vec![BaseItemKind::Audio],
-                        recursive: true,
-                        ancestor_ids: vec![album_id],
-                        ..InternalItemsQuery::default()
-                    })
-                    .await?;
-                let track_paths: Vec<String> = tracks
-                    .iter()
-                    .filter_map(|track| track.path.as_deref())
-                    .filter(|path| crate::media_info_resolver::is_file_protocol(path))
-                    .map(str::to_owned)
-                    .collect();
-                // Album gain is useless for single-track albums (upstream skip).
-                if track_paths.len() > 1 {
-                    tracing::info!(
-                        album = album.name.as_deref().unwrap_or_default(),
-                        "calculating album LUFS"
-                    );
-                    if let Some(lufs) = self.measure_album(&album.id, &track_paths).await? {
-                        self.save_lufs(&album.id, lufs).await?;
-                    }
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::MusicAlbum],
+            recursive: true,
+            ancestor_ids: folder_ids.to_vec(),
+            ..InternalItemsQuery::default()
+        };
+        let total = self.library.get_count(&query).await?.max(0);
+        let mut done = 0i32;
+        let mut start_index = 0i32;
+        while start_index < total {
+            let albums = page(&self.library, &query, start_index).await?;
+            if albums.is_empty() {
+                break;
+            }
+            for album in &albums {
+                done += 1;
+                self.normalize_album(album).await?;
+                progress.report(base + span * f64::from(done) / f64::from(total.max(1)));
+            }
+            start_index += PAGE_SIZE;
+        }
+        Ok(())
+    }
+
+    /// Measures one album's LUFS over its tracks, unless it already has one.
+    async fn normalize_album(&self, album: &BaseItemEntity) -> Result<(), ServiceError> {
+        if album.lufs.is_none()
+            && album.normalization_gain.is_none()
+            && let Ok(album_id) = Uuid::parse_str(&album.id)
+        {
+            let tracks = self
+                .library
+                .get_item_list(&InternalItemsQuery {
+                    include_item_types: vec![BaseItemKind::Audio],
+                    recursive: true,
+                    ancestor_ids: vec![album_id],
+                    ..InternalItemsQuery::default()
+                })
+                .await?;
+            let track_paths: Vec<String> = tracks
+                .iter()
+                .filter_map(|track| track.path.as_deref())
+                .filter(|path| crate::media_info_resolver::is_file_protocol(path))
+                .map(str::to_owned)
+                .collect();
+            // Album gain is useless for single-track albums (upstream skip).
+            if track_paths.len() > 1 {
+                tracing::info!(
+                    album = album.name.as_deref().unwrap_or_default(),
+                    "calculating album LUFS"
+                );
+                if let Some(lufs) = self.measure_album(&album.id, &track_paths).await? {
+                    self.save_lufs(&album.id, lufs).await?;
                 }
             }
-            #[allow(clippy::cast_precision_loss)]
-            progress.report(base + span * ((index + 1) as f64 / total as f64));
         }
         Ok(())
     }
@@ -460,27 +472,33 @@ impl AudioNormalizationTask {
         base: f64,
         span: f64,
     ) -> Result<(), ServiceError> {
-        let tracks = self
-            .library
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::Audio],
-                recursive: true,
-                ancestor_ids: folder_ids.to_vec(),
-                ..InternalItemsQuery::default()
-            })
-            .await?;
-        let total = tracks.len().max(1);
-        for (index, track) in tracks.iter().enumerate() {
-            if track.lufs.is_none()
-                && track.normalization_gain.is_none()
-                && let Some(path) = track.path.clone()
-                && crate::media_info_resolver::is_file_protocol(&path)
-                && let Some(lufs) = self.measure(vec!["-i".to_owned(), path]).await?
-            {
-                self.save_lufs(&track.id, lufs).await?;
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Audio],
+            recursive: true,
+            ancestor_ids: folder_ids.to_vec(),
+            ..InternalItemsQuery::default()
+        };
+        let total = self.library.get_count(&query).await?.max(0);
+        let mut done = 0i32;
+        let mut start_index = 0i32;
+        while start_index < total {
+            let tracks = page(&self.library, &query, start_index).await?;
+            if tracks.is_empty() {
+                break;
             }
-            #[allow(clippy::cast_precision_loss)]
-            progress.report(base + span * ((index + 1) as f64 / total as f64));
+            for track in &tracks {
+                done += 1;
+                if track.lufs.is_none()
+                    && track.normalization_gain.is_none()
+                    && let Some(path) = track.path.clone()
+                    && crate::media_info_resolver::is_file_protocol(&path)
+                    && let Some(lufs) = self.measure(vec!["-i".to_owned(), path]).await?
+                {
+                    self.save_lufs(&track.id, lufs).await?;
+                }
+                progress.report(base + span * f64::from(done) / f64::from(total.max(1)));
+            }
+            start_index += PAGE_SIZE;
         }
         Ok(())
     }
@@ -654,17 +672,6 @@ impl ScheduledTask for ChapterImagesTask {
     }
     async fn execute(&self, progress: &TaskProgress) -> Result<(), ServiceError> {
         let folders = self.folders.get_virtual_folders().await?;
-        let videos = self
-            .library
-            .get_item_list(&InternalItemsQuery {
-                media_types: vec![MediaType::Video],
-                is_folder: Some(false),
-                is_virtual_item: Some(false),
-                include_owned_items: true,
-                recursive: true,
-                ..InternalItemsQuery::default()
-            })
-            .await?;
 
         // Failure history: videos whose extraction failed before are skipped
         // until their file changes (the key embeds the mtime).
@@ -708,25 +715,45 @@ impl ScheduledTask for ChapterImagesTask {
             );
         }
 
-        let total = videos.len().max(1);
-        for (index, video) in videos.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
-            progress.report(100.0 * (index as f64) / total as f64);
-            let Some(path) = video.path.as_deref().filter(|path| !path.is_empty()) else {
-                continue;
-            };
-            let modified = crate::chapter_image_extractor::date_modified_ticks(video.date_modified);
-            let history_key = format!("{path}{modified}").to_lowercase();
-            // Source records extraction failures, not repository/service
-            // errors: those fail the run and blocklist nothing. Only an
-            // attempted extraction can fail, so a key is never appended twice.
-            let success = self
-                .refresh_video(video, !failed.contains(&history_key))
-                .await?;
-            if !success {
-                append_failure_history(&fail_history_path, &history_key)?;
-                failed.insert(history_key);
+        // Every video, enabled library or not: a disabled one still has its
+        // image paths reconciled and its unused images pruned.
+        let query = InternalItemsQuery {
+            media_types: vec![MediaType::Video],
+            is_folder: Some(false),
+            is_virtual_item: Some(false),
+            include_owned_items: true,
+            recursive: true,
+            ..InternalItemsQuery::default()
+        };
+        let total = self.library.get_count(&query).await?.max(0);
+        let mut done = 0i32;
+        let mut start_index = 0i32;
+        while start_index < total {
+            let videos = page(&self.library, &query, start_index).await?;
+            if videos.is_empty() {
+                break;
             }
+            for video in &videos {
+                progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
+                done += 1;
+                let Some(path) = video.path.as_deref().filter(|path| !path.is_empty()) else {
+                    continue;
+                };
+                let modified =
+                    crate::chapter_image_extractor::date_modified_ticks(video.date_modified);
+                let history_key = format!("{path}{modified}").to_lowercase();
+                // Source records extraction failures, not repository/service
+                // errors: those fail the run and blocklist nothing. Only an
+                // attempted extraction can fail, so a key is never appended twice.
+                let success = self
+                    .refresh_video(video, !failed.contains(&history_key))
+                    .await?;
+                if !success {
+                    append_failure_history(&fail_history_path, &history_key)?;
+                    failed.insert(history_key);
+                }
+            }
+            start_index += PAGE_SIZE;
         }
         progress.report(100.0);
         Ok(())
@@ -1077,36 +1104,42 @@ impl ScheduledTask for SubtitleDownloadTask {
         }
         // `SubtitleScheduledTask.cs:97-107`: a movie's alternate versions are
         // candidates too (`IncludeOwnedItems`).
-        let videos = self
-            .library
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
-                media_types: vec![MediaType::Video],
-                is_virtual_item: Some(false),
-                source_types: vec![SourceType::Library],
-                recursive: true,
-                include_owned_items: true,
-                ..InternalItemsQuery::default()
-            })
-            .await?;
-        let total = videos.len().max(1);
-        for (index, video) in videos.iter().enumerate() {
-            #[allow(clippy::cast_precision_loss)]
-            progress.report(100.0 * (index as f64) / total as f64);
-            let Some(options) = ferrofin_model::entities_media::owning_library(
-                &folders,
-                video.top_parent_id.as_deref(),
-                video.path.as_deref(),
-            )
-            .and_then(|folder| folder.library_options.as_ref()) else {
-                continue;
-            };
-            if !self.downloader.is_task_candidate(video, options).await? {
-                continue;
+        let query = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Episode, BaseItemKind::Movie],
+            media_types: vec![MediaType::Video],
+            is_virtual_item: Some(false),
+            source_types: vec![SourceType::Library],
+            recursive: true,
+            include_owned_items: true,
+            ..InternalItemsQuery::default()
+        };
+        let total = self.library.get_count(&query).await?.max(0);
+        let mut done = 0i32;
+        let mut start_index = 0i32;
+        while start_index < total {
+            let videos = page(&self.library, &query, start_index).await?;
+            if videos.is_empty() {
+                break;
             }
-            self.downloader
-                .download_missing(video, options, &crate::ScanCancel::new())
-                .await;
+            for video in &videos {
+                progress.report(100.0 * f64::from(done) / f64::from(total.max(1)));
+                done += 1;
+                let Some(options) = ferrofin_model::entities_media::owning_library(
+                    &folders,
+                    video.top_parent_id.as_deref(),
+                    video.path.as_deref(),
+                )
+                .and_then(|folder| folder.library_options.as_ref()) else {
+                    continue;
+                };
+                if !self.downloader.is_task_candidate(video, options).await? {
+                    continue;
+                }
+                self.downloader
+                    .download_missing(video, options, &crate::ScanCancel::new())
+                    .await;
+            }
+            start_index += PAGE_SIZE;
         }
         progress.report(100.0);
         Ok(())
@@ -2159,6 +2192,159 @@ mod tests {
         }
     }
 
+    /// A [`LibraryManager`] over the real one that refuses to return more than
+    /// one page of items from a single list query. The long-running tasks run
+    /// ffmpeg or network work per item, so a task that loads the whole library
+    /// at once holds every row for hours; over this fake it fails instead.
+    struct OnePageAtATime(Arc<dyn LibraryManager>);
+
+    #[async_trait]
+    impl LibraryManager for OnePageAtATime {
+        async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+            self.0.get_item_by_id(id).await
+        }
+        async fn query_items(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<ferrofin_model::querying::QueryResult<BaseItemEntity>, ServiceError> {
+            self.0.query_items(query).await
+        }
+        async fn get_item_ids(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<Vec<Uuid>, ServiceError> {
+            self.0.get_item_ids(query).await
+        }
+        async fn get_item_list(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            let items = self.0.get_item_list(query).await?;
+            if items.len() > usize::try_from(PAGE_SIZE).expect("page size") {
+                return Err(ServiceError::backend(format!(
+                    "{} items in one list: page the query",
+                    items.len()
+                )));
+            }
+            Ok(items)
+        }
+        async fn get_latest_item_list(
+            &self,
+            query: &InternalItemsQuery,
+            collection_type: ferrofin_model::data::CollectionType,
+        ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            self.0.get_latest_item_list(query, collection_type).await
+        }
+        async fn create_items(
+            &self,
+            items: &[BaseItemEntity],
+            parent_id: Option<Uuid>,
+        ) -> Result<(), ServiceError> {
+            self.0.create_items(items, parent_id).await
+        }
+        async fn update_items(
+            &self,
+            items: &[BaseItemEntity],
+            parent_id: Option<Uuid>,
+        ) -> Result<(), ServiceError> {
+            self.0.update_items(items, parent_id).await
+        }
+        async fn delete_item(
+            &self,
+            id: Uuid,
+            options: &ferrofin_traits::options::DeleteOptions,
+        ) -> Result<(), ServiceError> {
+            self.0.delete_item(id, options).await
+        }
+        async fn get_people(
+            &self,
+            query: &ferrofin_traits::options::InternalPeopleQuery,
+        ) -> Result<Vec<ferrofin_db::entities::base_items::PeopleEntity>, ServiceError> {
+            self.0.get_people(query).await
+        }
+        async fn get_people_names(
+            &self,
+            query: &ferrofin_traits::options::InternalPeopleQuery,
+        ) -> Result<Vec<String>, ServiceError> {
+            self.0.get_people_names(query).await
+        }
+        async fn get_count(&self, query: &InternalItemsQuery) -> Result<i32, ServiceError> {
+            self.0.get_count(query).await
+        }
+        async fn get_item_counts(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<ferrofin_model::dto::ItemCounts, ServiceError> {
+            self.0.get_item_counts(query).await
+        }
+        async fn get_genres(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            self.0.get_genres(query).await
+        }
+        async fn get_studios(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            self.0.get_studios(query).await
+        }
+        async fn get_artists(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            self.0.get_artists(query).await
+        }
+        async fn get_music_genres(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            self.0.get_music_genres(query).await
+        }
+        async fn get_album_artists(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<
+            ferrofin_model::querying::QueryResult<ferrofin_traits::persistence::ItemWithCounts>,
+            ServiceError,
+        > {
+            self.0.get_album_artists(query).await
+        }
+        async fn get_query_filters_legacy(
+            &self,
+            query: &InternalItemsQuery,
+        ) -> Result<ferrofin_model::querying::QueryFiltersLegacy, ServiceError> {
+            self.0.get_query_filters_legacy(query).await
+        }
+        async fn get_media_stream_languages(
+            &self,
+            stream_type: ferrofin_model::entities::MediaStreamType,
+            query: &InternalItemsQuery,
+        ) -> Result<Vec<String>, ServiceError> {
+            self.0.get_media_stream_languages(stream_type, query).await
+        }
+        async fn queue_library_scan(&self) -> Result<(), ServiceError> {
+            self.0.queue_library_scan().await
+        }
+    }
+
+    /// More items than one page holds, so a task walks past the first page.
+    fn past_one_page() -> usize {
+        usize::try_from(PAGE_SIZE).expect("page size") + 37
+    }
+
     // -- db seed helpers ----------------------------------------------------
 
     async fn set_path(db: &ferrofin_db::Database, id: Uuid, path: &str) {
@@ -2277,6 +2463,78 @@ mod tests {
         let calls = runner.calls.lock().expect("lock");
         assert_eq!(calls.len(), 3);
         assert!(calls[0].iter().any(|a| a == "concat"));
+    }
+
+    #[tokio::test]
+    async fn audio_normalization_pages_albums_and_tracks() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let library: Arc<dyn LibraryManager> =
+            Arc::new(OnePageAtATime(library_manager_over(db.clone())));
+
+        let folder = Uuid::from_u128(0xF0);
+        seed_item(&db, folder, BaseItemKind::Folder).await;
+        let count = past_one_page();
+        for n in 0..count {
+            let album = Uuid::from_u128(0x1000 + n as u128);
+            seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+            add_ancestor(&db, album, folder).await;
+            // Two tracks each, so every album gets its own concat run.
+            for side in 0..2u128 {
+                let track = Uuid::from_u128(0x10_0000 + 2 * n as u128 + side);
+                seed_item(&db, track, BaseItemKind::Audio).await;
+                let path = media.path().join(format!("{n}-{side}.flac"));
+                std::fs::write(&path, b"x").expect("write");
+                set_path(&db, track, &path.to_string_lossy()).await;
+                add_ancestor(&db, track, album).await;
+                add_ancestor(&db, track, folder).await;
+            }
+        }
+
+        let runner = Arc::new(FakeRunner {
+            stderr: "    I:         -21.5 LUFS\n".to_owned(),
+            calls: Mutex::new(Vec::new()),
+        });
+        let paths = Arc::new(crate::FerrofinServerApplicationPaths::new(
+            media.path().join("data"),
+            media.path().join("logs"),
+            media.path().join("config"),
+            media.path().join("cache"),
+            media.path().join("web"),
+        ));
+        let task = AudioNormalizationTask::new(
+            db.clone(),
+            library,
+            Arc::new(folder_with(
+                LibraryOptions {
+                    enable_lufs_scan: true,
+                    ..LibraryOptions::default()
+                },
+                Some(folder),
+                &media.path().to_string_lossy(),
+            )),
+            Arc::new(FakeEncoder {
+                fail_extract: false,
+            }),
+            runner.clone(),
+            paths,
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        // Every album past the first page measured too, then every track.
+        let measured: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "LUFS" IS NOT NULL AND "Type" LIKE '%MusicAlbum'"#,
+        )
+        .fetch_all(db.pool())
+        .await
+        .expect("query");
+        assert_eq!(measured.len(), count, "every album measured");
+        let calls = runner.calls.lock().expect("lock");
+        let concats = calls
+            .iter()
+            .filter(|c| c.iter().any(|a| a == "concat"))
+            .count();
+        assert_eq!((concats, calls.len()), (count, 3 * count));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2623,6 +2881,44 @@ mod tests {
         assert!(searches[0].is_automated);
         let downloads = subtitles.downloads.lock().expect("lock");
         assert_eq!(downloads.as_slice(), &[(movie, "sub-1".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn subtitle_download_pages_past_the_first_page() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        let library: Arc<dyn LibraryManager> =
+            Arc::new(OnePageAtATime(library_manager_over(db.clone())));
+
+        let count = past_one_page();
+        for n in 0..count {
+            let movie = Uuid::from_u128(0x1000 + n as u128);
+            seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+            let path = media.path().join(format!("{n}.mkv"));
+            std::fs::write(&path, b"x").expect("write");
+            set_path(&db, movie, &path.to_string_lossy()).await;
+            set_media_type(&db, movie, "Video").await;
+        }
+
+        let subtitles = Arc::new(FakeSubtitles::default());
+        let task = SubtitleDownloadTask::new(
+            library,
+            Arc::new(folder_with(
+                LibraryOptions {
+                    subtitle_download_languages: Some(vec!["eng".to_owned()]),
+                    ..LibraryOptions::default()
+                },
+                None,
+                &media.path().to_string_lossy(),
+            )),
+            Arc::new(crate::subtitle_downloader::SubtitleDownloader::new(
+                &(subtitles.clone() as Arc<dyn SubtitleManager>),
+                Arc::new(FakeStreams(Vec::new())),
+            )),
+        );
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        assert_eq!(subtitles.searches.lock().expect("lock").len(), count);
     }
 
     // -- Download missing lyrics ---------------------------------------------
@@ -3549,7 +3845,8 @@ mod tests {
     ) {
         let db = test_db().await;
         let media = tempfile::tempdir().expect("tempdir");
-        let library = library_manager_over(db.clone());
+        let library: Arc<dyn LibraryManager> =
+            Arc::new(OnePageAtATime(library_manager_over(db.clone())));
 
         let movie = Uuid::from_u128(0xC1);
         for (offset, file) in (0u128..).zip(files) {
@@ -3611,6 +3908,18 @@ mod tests {
             app_paths,
         );
         (media, movie, chapters, task)
+    }
+
+    #[tokio::test]
+    async fn chapter_images_page_past_the_first_page() {
+        let files: Vec<String> = (0..past_one_page()).map(|n| format!("{n}.mkv")).collect();
+        let names: Vec<&str> = files.iter().map(String::as_str).collect();
+        let (media, _movie, chapters, task) = chapter_task_fixture_for(false, &names).await;
+        task.execute(&TaskProgress::default()).await.expect("run");
+
+        let reads = chapters.reads.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(reads, files.len(), "every video was reconciled");
+        drop(media);
     }
 
     #[tokio::test]
