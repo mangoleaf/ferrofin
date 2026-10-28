@@ -864,6 +864,7 @@ mod tests {
 
     #[test]
     fn unique_names_empty_for_empty_mask() {
-        assert!(transcode_reasons_unique_names(TranscodeReasons::empty()).is_empty());
+        let found = transcode_reasons_unique_names(TranscodeReasons::empty());
+        assert!(found.is_empty(), "{found:?}");
     }
 }

@@ -1262,7 +1262,8 @@ mod tests {
             [Mode::Introduction]
         );
         // Without Chromaprint an intro can only be settled through chapters.
-        assert!(settle_modes(&states, &ids, &modes, false).is_empty());
+        let found = settle_modes(&states, &ids, &modes, false);
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(
             expand_settled(vec![Mode::Credits], true),
             [Mode::Credits, Mode::Preview]

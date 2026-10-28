@@ -81,7 +81,11 @@ fn test_letter_folders() {
         "/movies/M/Movie 7.mkv",
     ]);
     assert_eq!(result.len(), 7);
-    assert!(result[0].alternate_versions.is_empty());
+    assert!(
+        result[0].alternate_versions.is_empty(),
+        "{:?}",
+        result[0].alternate_versions
+    );
 }
 
 #[test]
@@ -114,7 +118,11 @@ fn test_multi_version_limit2() {
         "/movies/Mo/Movie 9.mkv",
     ]);
     assert_eq!(result.len(), 9);
-    assert!(result[0].alternate_versions.is_empty());
+    assert!(
+        result[0].alternate_versions.is_empty(),
+        "{:?}",
+        result[0].alternate_versions
+    );
 }
 
 #[test]
@@ -127,7 +135,11 @@ fn test_multi_version3() {
         "/movies/Movie/Movie 5.mkv",
     ]);
     assert_eq!(result.len(), 5);
-    assert!(result[0].alternate_versions.is_empty());
+    assert!(
+        result[0].alternate_versions.is_empty(),
+        "{:?}",
+        result[0].alternate_versions
+    );
 }
 
 #[test]
@@ -140,7 +152,11 @@ fn test_multi_version4() {
         "/movies/Iron Man/Iron Man (2011).mkv",
     ]);
     assert_eq!(result.len(), 5);
-    assert!(result[0].alternate_versions.is_empty());
+    assert!(
+        result[0].alternate_versions.is_empty(),
+        "{:?}",
+        result[0].alternate_versions
+    );
 }
 
 #[test]
@@ -265,7 +281,11 @@ fn test_multi_version9() {
         "/movies/Iron Man/Iron Man (2011).mkv",
     ]);
     assert_eq!(result.len(), 5);
-    assert!(result[0].alternate_versions.is_empty());
+    assert!(
+        result[0].alternate_versions.is_empty(),
+        "{:?}",
+        result[0].alternate_versions
+    );
 }
 
 #[test]
@@ -428,7 +448,7 @@ fn test_empty_list() {
     let options = NamingOptions::new();
     let resolver = VideoListResolver::new(&options);
     let result = resolver.resolve_simple(&[]);
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[test]
@@ -485,7 +505,11 @@ fn test_multi_version_episode_mixed_season_folder() {
         .iter()
         .find(|r| primary_path(r).contains("S01E02"))
         .unwrap();
-    assert!(e02.alternate_versions.is_empty());
+    assert!(
+        e02.alternate_versions.is_empty(),
+        "{:?}",
+        e02.alternate_versions
+    );
     let e03 = result
         .iter()
         .find(|r| primary_path(r).contains("S01E03"))
@@ -606,7 +630,11 @@ fn test_multi_version_episode_with_title_mixed_folder() {
         .iter()
         .find(|r| primary_path(r).contains("S01E03"))
         .unwrap();
-    assert!(e03.alternate_versions.is_empty());
+    assert!(
+        e03.alternate_versions.is_empty(),
+        "{:?}",
+        e03.alternate_versions
+    );
 }
 
 #[test]
@@ -717,7 +745,11 @@ fn test_multi_version_episode_with_additional_parts_and_multiple_episodes() {
         .iter()
         .find(|r| primary_path(r).contains("S01E02"))
         .unwrap();
-    assert!(e02.alternate_versions.is_empty());
+    assert!(
+        e02.alternate_versions.is_empty(),
+        "{:?}",
+        e02.alternate_versions
+    );
 }
 
 #[test]

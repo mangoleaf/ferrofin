@@ -1164,8 +1164,8 @@ mod tests {
         );
         assert_eq!(p.movie_categories.unwrap(), ["movie"]);
         assert!(p.id.is_none());
-        assert!(p.enabled_tuners.is_empty());
-        assert!(p.channel_mappings.is_empty());
+        assert!(p.enabled_tuners.is_empty(), "{:?}", p.enabled_tuners);
+        assert!(p.channel_mappings.is_empty(), "{:?}", p.channel_mappings);
     }
 
     #[test]

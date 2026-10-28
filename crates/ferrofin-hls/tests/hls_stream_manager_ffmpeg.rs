@@ -416,7 +416,7 @@ async fn concurrent_init_and_segment_requests_share_one_job() {
     assert!(init_bytes.len() > 8, "init is {} bytes", init_bytes.len());
     assert_eq!(&init_bytes[4..8], b"ftyp", "init is not an fMP4 header");
     let seg_bytes = std::fs::read(&seg0.path).expect("read seg0");
-    assert!(!seg_bytes.is_empty());
+    assert!(!seg_bytes.is_empty(), "{seg_bytes:?}");
 
     // Exactly one transcode job served both requests.
     let log = cache.join("out.log");

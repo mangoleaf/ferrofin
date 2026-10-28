@@ -73,8 +73,8 @@ fn media_source_info_default_matches_csharp_ctor() {
     assert!(!info.use_most_compatible_transcoding_profile);
     assert_eq!(info.type_, MediaSourceType::Default);
     assert_eq!(info.protocol, MediaProtocol::File);
-    assert!(info.media_streams.is_empty());
-    assert!(info.formats.is_empty());
+    assert!(info.media_streams.is_empty(), "{:?}", info.media_streams);
+    assert!(info.formats.is_empty(), "{:?}", info.formats);
 }
 
 // --- MediaSourceInfo.VideoStream -------------------------------------------

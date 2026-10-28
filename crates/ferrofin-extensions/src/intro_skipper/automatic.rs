@@ -332,7 +332,8 @@ mod tests {
             .execute(&TaskProgress::default())
             .await
             .expect("cache");
-        assert!(!cache_files(&h, EP_A).is_empty());
+        let found = cache_files(&h, EP_A);
+        assert!(!found.is_empty(), "{found:?}");
         h.task.items_changed(&[], &[EP_A], &[]).await;
         assert_eq!(queued(&h.task), (HashSet::from([SEASON]), true));
         IntroSkipperAnalysis::items_changed(&h.task, &[], &[], &[EP_A]).await;

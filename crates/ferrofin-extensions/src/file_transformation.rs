@@ -1025,7 +1025,8 @@ mod tests {
         let bytes = FileTransformationExtension.default_config();
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(v["DebugLoggingState"], "Disabled");
-        assert!(v["Transformations"].as_array().expect("array").is_empty());
+        let transformations = v["Transformations"].as_array().expect("array");
+        assert!(transformations.is_empty(), "{transformations:?}");
     }
 
     /// A callback endpoint answering each request with `status` and `body`,

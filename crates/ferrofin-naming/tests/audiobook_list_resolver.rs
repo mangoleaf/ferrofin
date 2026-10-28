@@ -39,7 +39,7 @@ fn test_stack_and_extras() {
     assert_eq!(result[0].name, "Harry Potter and the Deathly Hallows");
 
     assert_eq!(result[1].files.len(), 3);
-    assert!(result[1].extras.is_empty());
+    assert!(result[1].extras.is_empty(), "{:?}", result[1].extras);
     assert_eq!(result[1].name, "Batman");
 
     assert_eq!(result[2].files.len(), 1);
@@ -75,8 +75,16 @@ fn test_alternative_versions() {
 
     assert_eq!(result.len(), 5);
     assert_eq!(result[0].alternate_versions.len(), 1);
-    assert!(result[1].alternate_versions.is_empty());
-    assert!(result[2].alternate_versions.is_empty());
+    assert!(
+        result[1].alternate_versions.is_empty(),
+        "{:?}",
+        result[1].alternate_versions
+    );
+    assert!(
+        result[2].alternate_versions.is_empty(),
+        "{:?}",
+        result[2].alternate_versions
+    );
     assert_eq!(result[3].alternate_versions.len(), 2);
     let paths: Vec<&str> = result[3]
         .alternate_versions
@@ -150,7 +158,7 @@ fn test_without_folder() {
 fn test_empty() {
     let options = NamingOptions::new();
     let result = AudioBookListResolver::new(&options).resolve(&[]);
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 /// With no file named after the book (or `audiobook`), the main version is

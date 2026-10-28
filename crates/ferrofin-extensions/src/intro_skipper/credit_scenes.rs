@@ -840,7 +840,8 @@ mod tests {
                 )
             }));
         }
-        assert!(credit_scenes(&frames, (85, 96), 15, true).is_empty());
+        let found = credit_scenes(&frames, (85, 96), 15, true);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

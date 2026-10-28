@@ -1176,7 +1176,11 @@ mod tests {
     fn extension_default_config_round_trips() {
         let bytes = MergeVersionsExtension.default_config();
         let config: MergeVersionsConfig = serde_json::from_slice(&bytes).expect("valid JSON");
-        assert!(config.locations_excluded.is_empty());
+        assert!(
+            config.locations_excluded.is_empty(),
+            "{:?}",
+            config.locations_excluded
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
         assert!(
             v["LocationsExcluded"].as_array().expect("array").is_empty(),
@@ -2075,7 +2079,7 @@ mod tests {
         svc.merge_movies(Some(&sink)).await.expect("merge");
 
         let reported = reported.into_inner().unwrap();
-        assert!(!reported.is_empty());
+        assert!(!reported.is_empty(), "{reported:?}");
         assert_eq!(reported.last().copied(), Some(100.0));
     }
 

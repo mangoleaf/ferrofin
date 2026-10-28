@@ -1387,7 +1387,7 @@ mod tests {
             .get_image_blur_hash_sized("/a.png", ImageDimensions::new(0, 0))
             .await
             .expect("hash");
-        assert!(empty.is_empty());
+        assert_eq!(empty, "");
     }
 
     #[tokio::test]

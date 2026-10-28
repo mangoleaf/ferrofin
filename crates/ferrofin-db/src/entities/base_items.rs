@@ -598,6 +598,7 @@ mod tests {
     /// empty list rather than a placeholder entry.
     #[test]
     fn a_bare_row_has_no_item_values() {
-        assert!(item_values_of(&BaseItemEntity::default()).is_empty());
+        let found = item_values_of(&BaseItemEntity::default());
+        assert!(found.is_empty(), "{found:?}");
     }
 }

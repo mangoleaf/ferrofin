@@ -2074,7 +2074,7 @@ mod tests {
         let scan = scan_task(&h);
         assert_eq!(scan.key(), "TaskExtractMediaSegments");
         assert_eq!(scan.name(), "Media Segment Scan");
-        assert!(!scan.description().is_empty());
+        assert_ne!(scan.description(), "");
         assert_eq!(scan.category(), "Library");
         let triggers = scan.default_triggers();
         assert_eq!(triggers.len(), 1);
@@ -2343,7 +2343,8 @@ mod tests {
             usize::try_from(cleared.removed_cache_entries).unwrap(),
             cache
         );
-        assert!(h.actions.stored_item_ids().await.expect("ids").is_empty());
+        let stored_item_ids = h.actions.stored_item_ids().await.expect("ids");
+        assert!(stored_item_ids.is_empty(), "{stored_item_ids:?}");
         assert!(
             intros_of(&h.segments, EP_A).await.is_empty(),
             "republished as empty"
@@ -3049,7 +3050,8 @@ mod tests {
             .execute(&TaskProgress::default())
             .await
             .expect("failing pass");
-        assert!(h.actions.segments(EP_A).await.expect("tier").is_empty());
+        let segments = h.actions.segments(EP_A).await.expect("tier");
+        assert!(segments.is_empty(), "{segments:?}");
         assert!(intro_state(&h).await.episode_ids.is_empty());
 
         h.actions.set_read_only(false);
@@ -3070,7 +3072,8 @@ mod tests {
         // The fixture's shared region is ~49.5 s.
         let task = configured(&h, r#"{"MaximumIntroDuration":30}"#);
         task.execute(&TaskProgress::default()).await.expect("run");
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        let found = intros_of(&h.segments, EP_A).await;
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(intro_state(&h).await.episode_ids.len(), 2);
         let calls = h.calls.load(Ordering::SeqCst);
         task.execute(&TaskProgress::default()).await.expect("rerun");
@@ -3089,7 +3092,8 @@ mod tests {
         std::fs::remove_file(h.cache.path().join("media/s01e02.mkv")).expect("remove");
         h.task.execute(&TaskProgress::default()).await.expect("run");
         assert_eq!(h.calls.load(Ordering::SeqCst), 0);
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        let found = intros_of(&h.segments, EP_A).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// The only episode still needing analysis is compared with its analysed
@@ -3206,7 +3210,8 @@ mod tests {
     ) {
         let h = harness(episodes, enabled, "{}", with_fingerprinter).await;
         h.task.execute(&TaskProgress::default()).await.expect("run");
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        let found = intros_of(&h.segments, EP_A).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// A scheduled pass waits its turn behind one in flight (a rescan, say),
@@ -3237,7 +3242,8 @@ mod tests {
         .await;
         h.task.execute(&TaskProgress::default()).await.expect("run");
         assert_eq!(h.calls.load(Ordering::SeqCst), 0);
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        let found = intros_of(&h.segments, EP_A).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[tokio::test]
@@ -3271,7 +3277,8 @@ mod tests {
             ..h
         };
         h.task.execute(&TaskProgress::default()).await.expect("run");
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        let found = intros_of(&h.segments, EP_A).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// The support bundle's analysis half: the last queue's counts, the
@@ -3446,13 +3453,15 @@ mod tests {
                 "Intro Skipper"
             )
         );
-        assert!(clean.default_triggers().is_empty());
+        let default_triggers = clean.default_triggers();
+        assert!(default_triggers.is_empty(), "{default_triggers:?}");
         clean
             .execute(&TaskProgress::default())
             .await
             .expect("clean");
 
-        assert!(h.actions.segments(gone).await.expect("tier").is_empty());
+        let segments = h.actions.segments(gone).await.expect("tier");
+        assert!(segments.is_empty(), "{segments:?}");
         assert!(
             !h.actions
                 .stored_item_ids()
@@ -3613,13 +3622,8 @@ mod tests {
             .set_excluded(SEASON, EP_A, true)
             .await
             .expect("exclude");
-        assert!(
-            provider
-                .get_segments(&request(EP_A))
-                .await
-                .expect("get")
-                .is_empty()
-        );
+        let segments = provider.get_segments(&request(EP_A)).await.expect("get");
+        assert!(segments.is_empty(), "{segments:?}");
 
         let disabled = harness(&TWO_EPISODES, false, "{}", true).await;
         let provider = SegmentProvider {
