@@ -2,6 +2,7 @@
 //! The caller supplies a connection so recovery can resolve keys inside its
 //! write transaction, after metadata and provider IDs have been persisted.
 
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_traits::error::ServiceError;
@@ -111,19 +112,49 @@ pub(crate) async fn load_keys_for_items(
 }
 
 /// Resolve each child's actual Series once for a browse page, regardless of
-/// its own provider hydration. Empty/nil SeriesId follows the nearest Series
-/// parent; a nonempty missing/non-Series ID does not fall back to parents.
+/// its own provider hydration, keyed by the child's stored id. The children are
+/// the page's `Season` and `Episode` rows (the caller's filter). Empty/nil
+/// SeriesId follows the nearest Series parent; a nonempty missing/non-Series ID
+/// does not fall back to parents.
+///
+/// The page's rows are already read, so a child that names its series seeds the
+/// walk with that series instead of being read again; only a child without one
+/// is read, for its parents. One walk for the page (gl-982).
 pub(crate) async fn load_child_series_keys(
     conn: &mut sqlx::SqliteConnection,
-    ids: &[String],
+    children: &[&BaseItemEntity],
 ) -> Result<std::collections::HashMap<String, Vec<String>>, ServiceError> {
-    let rows = identity_rows(conn, ids).await?;
-    Ok(ids
+    // (child, the series it names): `KeyRow`'s own reading of the stored `SeriesId`.
+    let pointers: Vec<(String, Option<String>)> = children
         .iter()
-        .filter_map(|id| {
-            let row = rows.get(id)?;
-            let series = resolve_series(row, &rows)?;
-            Some((id.clone(), user_data_keys(&series.as_source(), None)))
+        .filter_map(|child| {
+            let id = guid_to_db(Uuid::parse_str(&child.id).ok()?);
+            let series = child
+                .series_id
+                .as_deref()
+                .and_then(|series| Uuid::parse_str(series).ok())
+                .filter(|series| !series.is_nil())
+                .map(guid_to_db);
+            Some((id, series))
+        })
+        .collect();
+    let mut seeds: Vec<String> = pointers
+        .iter()
+        .map(|(id, series)| series.as_ref().unwrap_or(id).clone())
+        .collect();
+    seeds.sort_unstable();
+    seeds.dedup();
+    let rows = key_rows(conn, &seeds).await?;
+    Ok(pointers
+        .into_iter()
+        .filter_map(|(id, series)| {
+            let series = match series {
+                Some(series) => rows
+                    .get(&series)
+                    .filter(|row| row.kind == BaseItemKind::Series)?,
+                None => resolve_series(rows.get(&id)?, &rows)?,
+            };
+            Some((id, user_data_keys(&series.as_source(), None)))
         })
         .collect())
 }

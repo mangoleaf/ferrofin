@@ -385,8 +385,14 @@ impl DtoService for OkDto {
 ///
 /// `get_item_by_id` resolves the series (as a `Series`) and the season (as a
 /// `Season`); `get_item_list` echoes back either seasons or episodes depending
-/// on the query's `include_item_types`.
-struct StubLibrary;
+/// on the query's `include_item_types`. With `chain`, the visibility check of the
+/// season also hands back the series it read, as the core library's does.
+#[derive(Default)]
+struct StubLibrary {
+    chain: bool,
+    /// How many times `get_item_by_id` read the series.
+    series_reads: std::sync::atomic::AtomicUsize,
+}
 
 #[async_trait]
 impl LibraryManager for StubLibrary {
@@ -405,7 +411,27 @@ impl LibraryManager for StubLibrary {
         Ok(true)
     }
 
+    async fn get_item_by_id_for_user_with_chain(
+        &self,
+        id: Uuid,
+        user: Option<&UserEntity>,
+    ) -> Result<Option<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+        let Some(item) = self.get_item_by_id_for_user(id, user).await? else {
+            return Ok(None);
+        };
+        let chain = if self.chain && id == SEASON_ID {
+            vec![item.clone(), item_entity(SERIES_ID, "The Series", "Series")]
+        } else {
+            Vec::new()
+        };
+        Ok(Some((item, chain)))
+    }
+
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if id == SERIES_ID {
+            self.series_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(match id {
             _ if id == SERIES_ID => Some(item_entity(SERIES_ID, "The Series", "Series")),
             _ if id == SEASON_ID => Some(season_entity(SEASON_ID, 1)),
@@ -608,8 +634,13 @@ impl SimilarItemsManager for StubSimilar {
 
 /// Builds an [`AppState`] wired with the batch-8 stubs.
 fn state() -> AppState {
+    state_with(Arc::new(StubLibrary::default()))
+}
+
+/// [`state`] over the given library.
+fn state_with(library: Arc<StubLibrary>) -> AppState {
     AppState::new(
-        Arc::new(StubLibrary),
+        library,
         Arc::new(OkUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
@@ -646,7 +677,12 @@ fn state() -> AppState {
 
 /// Drives one authenticated GET request through the router.
 async fn get(uri: &str) -> (StatusCode, Vec<u8>) {
-    let router = create_router(state());
+    get_with(state(), uri).await
+}
+
+/// [`get`] against the given state.
+async fn get_with(state: AppState, uri: &str) -> (StatusCode, Vec<u8>) {
+    let router = create_router(state);
     let response = router
         .oneshot(
             Request::builder()
@@ -758,6 +794,34 @@ async fn episodes_by_season_id_resolves_season() {
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
     assert_eq!(result.items.len(), 3);
+}
+
+/// The season's visibility check already read its series (gl-982): the episodes come from
+/// that row, the same answer as without a chain, and the series is read once less.
+#[tokio::test]
+async fn episodes_by_season_id_take_the_series_from_the_visibility_chain() {
+    let mut runs = Vec::new();
+    for chain in [true, false] {
+        let library = Arc::new(StubLibrary {
+            chain,
+            ..StubLibrary::default()
+        });
+        let (status, body) = get_with(
+            state_with(Arc::clone(&library)),
+            &format!("/Shows/{SERIES_ID}/Episodes?seasonId={SEASON_ID}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("episodes");
+        assert_eq!(result.items.len(), 3, "chain {chain}");
+        let reads = library
+            .series_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        runs.push((body, reads));
+    }
+    let [(with_chain, chain_reads), (without, plain_reads)] = <[_; 2]>::try_from(runs).unwrap();
+    assert_eq!(with_chain, without, "the same response");
+    assert_eq!(plain_reads - chain_reads, 1, "the series is not read again");
 }
 
 #[tokio::test]
