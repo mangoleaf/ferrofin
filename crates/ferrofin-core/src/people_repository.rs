@@ -2865,7 +2865,7 @@ mod tests {
             ..Default::default()
         };
         let r = repo.get_people(&past).await.expect("past");
-        assert!(r.items.is_empty());
+        assert!(r.items.is_empty(), "{:?}", r.items);
         assert_eq!(
             r.total_record_count, 3,
             "total must survive an offset past the end"
@@ -3143,7 +3143,11 @@ mod tests {
             })
             .await
             .expect("past unnarrowed");
-        assert!(past_unnarrowed.items.is_empty());
+        assert!(
+            past_unnarrowed.items.is_empty(),
+            "{:?}",
+            past_unnarrowed.items
+        );
         assert_eq!(past_unnarrowed.total_record_count, 5);
 
         let past_narrowed = repo
@@ -3155,7 +3159,7 @@ mod tests {
             })
             .await
             .expect("past narrowed");
-        assert!(past_narrowed.items.is_empty());
+        assert!(past_narrowed.items.is_empty(), "{:?}", past_narrowed.items);
         assert_eq!(past_narrowed.total_record_count, 3);
     }
 
@@ -3359,7 +3363,7 @@ mod tests {
                 })
                 .await
                 .expect("past");
-            assert!(past.items.is_empty());
+            assert!(past.items.is_empty(), "{:?}", past.items);
             assert_eq!(past.total_record_count, 2, "past-the-end total");
         }
     }
@@ -3375,7 +3379,7 @@ mod tests {
             })
             .await
             .expect("page");
-        assert!(page.items.is_empty());
+        assert!(page.items.is_empty(), "{:?}", page.items);
         assert_eq!(page.total_record_count, 0);
     }
 
@@ -3906,7 +3910,7 @@ mod tests {
             },
         ] {
             let page = repo.get_people(&past_the_end).await.expect("past the end");
-            assert!(page.items.is_empty());
+            assert!(page.items.is_empty(), "{:?}", page.items);
             assert_eq!(page.total_record_count, 1);
         }
 

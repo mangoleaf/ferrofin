@@ -459,7 +459,8 @@ async fn additional_users_add_and_remove() {
         .iter()
         .find(|s| s.id.as_deref() == Some(&session_id))
         .unwrap();
-    assert!(s.additional_users.as_ref().unwrap().is_empty());
+    let additional_users = s.additional_users.as_ref().unwrap();
+    assert!(additional_users.is_empty(), "{additional_users:?}");
 }
 
 #[tokio::test]
@@ -543,7 +544,7 @@ async fn bus_connected_session_is_controllable_and_receives_play() {
         .get_sessions(user_id, None, None, Some(user_id), false)
         .await
         .unwrap();
-    assert!(listed.is_empty());
+    assert!(listed.is_empty(), "{listed:?}");
 
     // The `/socket` handler registers a sink on the bus for this session.
     let received = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -630,7 +631,7 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert!(!persisted.is_empty());
+    assert_ne!(persisted, "");
     assert_eq!(
         result.access_token.expose(),
         persisted.as_str(),
@@ -1092,7 +1093,7 @@ async fn report_session_ended_removes_the_session() {
         .get_sessions(Uuid::nil(), None, None, None, true)
         .await
         .unwrap();
-    assert!(sessions.is_empty());
+    assert!(sessions.is_empty(), "{sessions:?}");
 }
 
 /// A [`UserDataManager`](ferrofin_traits::library::UserDataManager) decorator
@@ -2748,7 +2749,8 @@ async fn casting_a_nonexistent_id_contributes_nothing() {
         .unwrap();
 
     // C# logs and drops the id rather than failing the whole command.
-    assert!(pushed_item_ids(&only_pushed_data(&received)).is_empty());
+    let found = pushed_item_ids(&only_pushed_data(&received));
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[tokio::test]
@@ -3304,27 +3306,24 @@ async fn shared_device_filter_uses_the_requested_user_and_device_access() {
             "API key filters by the named user's sharing preference"
         );
     }
-    assert!(
-        mgr.get_sessions(id, None, None, Some(Uuid::new_v4()), false)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let sessions = mgr
+        .get_sessions(id, None, None, Some(Uuid::new_v4()), false)
+        .await
+        .unwrap();
+    assert!(sessions.is_empty(), "{sessions:?}");
     set_permission(&db, &alice.id, PermissionKind::EnableAllDevices, false)
         .await
         .unwrap();
-    assert!(
-        mgr.get_sessions(id, None, None, Some(id), false)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        !mgr.get_sessions(Uuid::nil(), None, None, Some(id), true)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let sessions = mgr
+        .get_sessions(id, None, None, Some(id), false)
+        .await
+        .unwrap();
+    assert!(sessions.is_empty(), "{sessions:?}");
+    let sessions = mgr
+        .get_sessions(Uuid::nil(), None, None, Some(id), true)
+        .await
+        .unwrap();
+    assert!(!sessions.is_empty(), "{sessions:?}");
 }
 
 /// `SessionManager.GetProgressItem` (`SessionManager.cs:742-756`): playing a
@@ -3892,7 +3891,8 @@ async fn a_session_paused_past_the_threshold_is_told_to_stop() {
     // Paused nine minutes against a ten-minute threshold: nothing.
     paused_since(&mgr, &session_id, now - chrono::Duration::minutes(9)).await;
     mgr.check_for_inactive_streams(10, now).await;
-    assert!(playstates(&connection).is_empty());
+    let found = playstates(&connection);
+    assert!(found.is_empty(), "{found:?}");
 
     // Past it: one `Stop`, at the paused position, from the session's user.
     paused_since(&mgr, &session_id, now - chrono::Duration::minutes(11)).await;

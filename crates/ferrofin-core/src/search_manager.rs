@@ -757,7 +757,7 @@ mod tests {
             ..Default::default()
         };
         let hint = to_hint(&genre, &albums).expect("genre hint");
-        assert!(hint.artists.is_empty());
+        assert!(hint.artists.is_empty(), "{:?}", hint.artists);
         assert_eq!(hint.album, None);
         assert_eq!(hint.is_folder, None, "Genre : BaseItem, not Folder");
     }
@@ -805,7 +805,8 @@ mod tests {
             [0xC],
             "a parent with no row ends it"
         );
-        assert!(ids(row(0x3, None)).is_empty());
+        let found = ids(row(0x3, None));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// The hint-artwork fixture: a series (with a status, a Thumb and a

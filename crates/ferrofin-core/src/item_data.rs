@@ -1823,10 +1823,13 @@ mod tests {
 
     #[test]
     fn remote_trailers_read_tolerates_missing_and_malformed() {
-        assert!(read_remote_trailers(None).is_empty());
-        assert!(read_remote_trailers(Some("not json")).is_empty());
+        let found = read_remote_trailers(None);
+        assert!(found.is_empty(), "{found:?}");
+        let found = read_remote_trailers(Some("not json"));
+        assert!(found.is_empty(), "{found:?}");
         // Entries without a Url are dropped.
-        assert!(read_remote_trailers(Some(r#"{"RemoteTrailers":[{"Name":"x"}]}"#)).is_empty());
+        let found = read_remote_trailers(Some(r#"{"RemoteTrailers":[{"Name":"x"}]}"#));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -1877,7 +1880,8 @@ mod tests {
             round.get("DateLastSaved").and_then(Value::as_str),
             Some("2026-08-11T17:47:45.7268844Z")
         );
-        assert!(read_linked_children(&round).is_empty());
+        let found = read_linked_children(&round);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

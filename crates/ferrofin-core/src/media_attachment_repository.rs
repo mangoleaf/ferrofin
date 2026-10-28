@@ -185,7 +185,7 @@ mod tests {
             })
             .await
             .expect("all");
-        assert!(all.is_empty());
+        assert!(all.is_empty(), "{all:?}");
     }
 
     #[tokio::test]

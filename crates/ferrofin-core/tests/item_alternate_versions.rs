@@ -629,7 +629,8 @@ async fn a_tv_scan_groups_episode_versions_and_regroups_a_stored_group() {
             (Some(primary), Some(key(primary)))
         );
         assert_eq!(links_under(&db, primary).await, vec![(version, 2, 0)]);
-        assert!(links_under(&db, version).await.is_empty());
+        let found = links_under(&db, version).await;
+        assert!(found.is_empty(), "{found:?}");
     };
     grouped(db.clone()).await;
     // The group stored the other way round: the plain file leading.
@@ -757,7 +758,8 @@ async fn merge_versions_moves_linked_versions_and_reroutes_memberships() {
         version_of(&db, its_version).await,
         (Some(primary), Some(key(primary)))
     );
-    assert!(links_under(&db, merged).await.is_empty());
+    let found = links_under(&db, merged).await;
+    assert!(found.is_empty(), "{found:?}");
     assert_eq!(
         links_under(&db, primary).await,
         vec![

@@ -4719,7 +4719,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(beyond.total_record_count, 4);
-        assert!(beyond.items.is_empty());
+        assert!(beyond.items.is_empty(), "{:?}", beyond.items);
         // `AdjacentTo` trims the collapsed result: a substituted set has its
         // neighbours there, and a member the set replaced has none.
         let around = |id: Uuid| InternalItemsQuery {
@@ -4730,14 +4730,8 @@ mod tests {
             names(repository.get_items(&around(second_set)).await.unwrap()),
             ["Bravo movie", "Charlie set", "Series"]
         );
-        assert!(
-            repository
-                .get_items(&around(member))
-                .await
-                .unwrap()
-                .items
-                .is_empty()
-        );
+        let items = repository.get_items(&around(member)).await.unwrap().items;
+        assert!(items.is_empty(), "{items:?}");
         let alpha = InternalItemsQuery {
             name_starts_with: Some("A".into()),
             ..query.clone()
@@ -5250,11 +5244,8 @@ mod tests {
             ["Other"]
         );
         // Beta leads every album crediting Beta, so it appears on none.
-        assert!(
-            albums(&repository, by(|q| &mut q.contributing_artist_ids, beta))
-                .await
-                .is_empty()
-        );
+        let found = albums(&repository, by(|q| &mut q.contributing_artist_ids, beta)).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[tokio::test]
@@ -5323,7 +5314,8 @@ mod tests {
             include_item_types: vec![BaseItemKind::BoxSet],
             ..Default::default()
         };
-        assert!(repository.get_item_list(&query).await.unwrap().is_empty());
+        let item_list = repository.get_item_list(&query).await.unwrap();
+        assert!(item_list.is_empty(), "{item_list:?}");
         links
             .upsert_linked_child(collection, ids[0], 0)
             .await
@@ -5669,7 +5661,7 @@ mod tests {
             .get_items(&adjacent(Uuid::new_v4()))
             .await
             .unwrap();
-        assert!(missing.items.is_empty());
+        assert!(missing.items.is_empty(), "{:?}", missing.items);
         assert_eq!(missing.total_record_count, 0);
         // Paging applies to the trimmed set, and the total counts it.
         let paged = repository
@@ -5750,7 +5742,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(around_hidden.items.is_empty());
+        assert!(around_hidden.items.is_empty(), "{:?}", around_hidden.items);
     }
 
     async fn seed_descendant_link(db: &Database, parent: Uuid, child: Uuid, kind: i32) {
@@ -6036,11 +6028,9 @@ mod tests {
             linked_descendant_names(&repository, &linked_descendant_query(root)).await,
             ["Physical"]
         );
-        assert!(
-            linked_descendant_names(&repository, &linked_descendant_query(Uuid::new_v4()))
-                .await
-                .is_empty()
-        );
+        let found =
+            linked_descendant_names(&repository, &linked_descendant_query(Uuid::new_v4())).await;
+        assert!(found.is_empty(), "{found:?}");
         seed_descendant_link(&db, root, linked, 0).await;
         seed_descendant_link(&db, ordinary, linked, 0).await;
         assert_eq!(
@@ -7101,13 +7091,8 @@ mod tests {
             include_item_types: vec![BaseItemKind::Episode],
             ..InternalItemsQuery::default()
         };
-        assert!(
-            repository
-                .get_item_list(&direct)
-                .await
-                .expect("direct")
-                .is_empty()
-        );
+        let item_list = repository.get_item_list(&direct).await.expect("direct");
+        assert!(item_list.is_empty(), "{item_list:?}");
 
         // The library and its series both reach the episode recursively.
         for parent_id in [library, series] {
@@ -7163,13 +7148,11 @@ mod tests {
             .execute(db.writer())
             .await
             .expect("remove_from_collection");
-        assert!(
-            repository
-                .get_item_list(&query)
-                .await
-                .expect("browse after remove")
-                .is_empty()
-        );
+        let item_list = repository
+            .get_item_list(&query)
+            .await
+            .expect("browse after remove");
+        assert!(item_list.is_empty(), "{item_list:?}");
     }
 
     #[tokio::test]
@@ -7298,13 +7281,8 @@ mod tests {
             any_provider_id_equals: vec![("Tmdb".to_owned(), "0".to_owned())],
             ..InternalItemsQuery::default()
         };
-        assert!(
-            repository
-                .get_item_list(&miss)
-                .await
-                .expect("miss")
-                .is_empty()
-        );
+        let item_list = repository.get_item_list(&miss).await.expect("miss");
+        assert!(item_list.is_empty(), "{item_list:?}");
 
         // Multiple pairs are OR-ed: Tmdb 296 OR Tmdb 949 selects both movies.
         let both = InternalItemsQuery {
@@ -7406,7 +7384,7 @@ mod tests {
             .get_image_infos(Uuid::from_u128(0xDEAD))
             .await
             .expect("no images");
-        assert!(none.is_empty());
+        assert!(none.is_empty(), "{none:?}");
     }
 
     #[tokio::test]
@@ -8036,7 +8014,8 @@ mod tests {
         let real = repository.get_items(&with_studios(vec![acme])).await;
         assert_eq!(movies(real.expect("real studio")), ["One"]);
         let unknown = repository.get_items(&with_studios(vec![Uuid::nil()])).await;
-        assert!(movies(unknown.expect("unknown studio")).is_empty());
+        let found = movies(unknown.expect("unknown studio"));
+        assert!(found.is_empty(), "{found:?}");
 
         let all = repository
             .get_artists(&InternalItemsQuery::default())
@@ -8257,7 +8236,8 @@ mod tests {
         assert_eq!(names(or_greater("B")).await, ["Rock"]);
         assert_eq!(names(or_greater(" b")).await, ["Abba", "Rock"]);
         assert_eq!(names(less_than("B")).await, ["Abba"]);
-        assert!(names(less_than(" b")).await.is_empty());
+        let found = names(less_than(" b")).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// Gives the named rows a `SortName`/`CleanName` (the lowercased name) and
@@ -8513,27 +8493,15 @@ mod tests {
         assert_eq!(names, vec!["Alpha".to_owned(), "Zeta".to_owned()]);
 
         // The remaining name lists execute their SQL (empty result sets).
-        assert!(
-            repository
-                .get_studio_names()
-                .await
-                .expect("studios")
-                .is_empty()
-        );
-        assert!(
-            repository
-                .get_all_artist_names()
-                .await
-                .expect("artists")
-                .is_empty()
-        );
-        assert!(
-            repository
-                .get_music_genre_names()
-                .await
-                .expect("music genres")
-                .is_empty()
-        );
+        let studio_names = repository.get_studio_names().await.expect("studios");
+        assert!(studio_names.is_empty(), "{studio_names:?}");
+        let all_artist_names = repository.get_all_artist_names().await.expect("artists");
+        assert!(all_artist_names.is_empty(), "{all_artist_names:?}");
+        let music_genre_names = repository
+            .get_music_genre_names()
+            .await
+            .expect("music genres");
+        assert!(music_genre_names.is_empty(), "{music_genre_names:?}");
     }
 
     #[tokio::test]
@@ -8560,7 +8528,7 @@ mod tests {
         assert_eq!(filters.years, vec![1999]);
         assert_eq!(filters.official_ratings, vec!["PG-13".to_owned()]);
         assert_eq!(filters.genres, vec!["Comedy".to_owned()]);
-        assert!(filters.tags.is_empty());
+        assert!(filters.tags.is_empty(), "{:?}", filters.tags);
 
         // With no matching items the filters come back empty (early return).
         let none = InternalItemsQuery {
@@ -8666,12 +8634,13 @@ mod tests {
             include_item_types: vec![BaseItemKind::Book],
             ..Default::default()
         };
+        let media_stream_languages = repository
+            .get_media_stream_languages(&none, MediaStreamType::Audio)
+            .await
+            .expect("empty langs");
         assert!(
-            repository
-                .get_media_stream_languages(&none, MediaStreamType::Audio)
-                .await
-                .expect("empty langs")
-                .is_empty()
+            media_stream_languages.is_empty(),
+            "{media_stream_languages:?}"
         );
     }
 
@@ -8900,7 +8869,8 @@ mod tests {
             names(repository.get_genres(&set).await.expect("genres")).is_empty(),
             "a box set's linked member is not its child"
         );
-        assert!(audio(set).await.is_empty());
+        let found = audio(set).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// Upstream's `BaseItemRepositoryItemValueTests.GetTagNames_GroupsAndFiltersItemValues`
@@ -9707,7 +9677,7 @@ mod tests {
             .get_latest_item_list(&latest_tv_filter(0), CollectionType::tvshows)
             .await
             .expect("latest tvshows, none");
-        assert!(none.is_empty());
+        assert!(none.is_empty(), "{none:?}");
     }
 
     /// A Season card the user's parental limit hides is replaced by the
@@ -10166,12 +10136,13 @@ mod tests {
         assert_eq!(rows[0].id, guid_to_db(alt));
 
         // A nil primary short-circuits to empty without hitting the pool.
+        let items_by_primary_version = repository
+            .get_items_by_primary_version(Uuid::nil())
+            .await
+            .expect("nil");
         assert!(
-            repository
-                .get_items_by_primary_version(Uuid::nil())
-                .await
-                .expect("nil")
-                .is_empty()
+            items_by_primary_version.is_empty(),
+            "{items_by_primary_version:?}"
         );
 
         // The batch form groups alternates under their primary; primaries with
@@ -10838,7 +10809,11 @@ mod tests {
             .await
             .unwrap()
             .expect("library access restricts");
-        assert!(filter.exclude_inherited_tags.is_empty());
+        assert!(
+            filter.exclude_inherited_tags.is_empty(),
+            "{:?}",
+            filter.exclude_inherited_tags
+        );
         assert_eq!(filter.top_parent_ids, [first]);
     }
 
@@ -11368,7 +11343,8 @@ mod tests {
         )
         .await;
 
-        assert!(unscoped_names(&repository, &user).await.is_empty());
+        let found = unscoped_names(&repository, &user).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// Browsing a library on an adopted Jellyfin database.
@@ -13059,14 +13035,10 @@ mod tests {
                 "explicit IDs bypass the folders builder and retain the empty persisted view scope"
             );
             assert_eq!(result.total_record_count, 0);
-            assert!(repository.get_item_ids(&explicit).await.unwrap().is_empty());
-            assert!(
-                repository
-                    .fetch_id_clean_names(&explicit)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+            let item_ids = repository.get_item_ids(&explicit).await.unwrap();
+            assert!(item_ids.is_empty(), "{item_ids:?}");
+            let names = repository.fetch_id_clean_names(&explicit).await.unwrap();
+            assert!(names.is_empty(), "{names:?}");
         }
         let nil_adjacent = repository
             .get_items(&InternalItemsQuery {
@@ -13516,12 +13488,11 @@ mod folder_get_result_tests {
                 ..Default::default()
             },
         ] {
-            assert!(
-                repo.filter_folder_children(rows.clone(), &query)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+            let children = repo
+                .filter_folder_children(rows.clone(), &query)
+                .await
+                .unwrap();
+            assert!(children.is_empty(), "{children:?}");
         }
         let query = InternalItemsQuery {
             genres: vec!["CAFÉ".to_owned()],
@@ -13655,12 +13626,11 @@ mod folder_get_result_tests {
                 ..Default::default()
             },
         ] {
-            assert!(
-                repo.filter_folder_children(rows.clone(), &query)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+            let children = repo
+                .filter_folder_children(rows.clone(), &query)
+                .await
+                .unwrap();
+            assert!(children.is_empty(), "{children:?}");
         }
         assert_eq!(
             ids(&repo
@@ -14045,66 +14015,61 @@ mod folder_get_result_tests {
                 .unwrap()),
             [later, earlier]
         );
-        assert!(
-            repo.filter_folder_children(
+        let children = repo
+            .filter_folder_children(
                 rows.clone(),
                 &InternalItemsQuery {
                     media_types: vec![MediaType::Video],
                     ..Default::default()
-                }
+                },
             )
             .await
-            .unwrap()
-            .is_empty()
-        );
-        assert!(
-            repo.filter_folder_children(
+            .unwrap();
+        assert!(children.is_empty(), "{children:?}");
+        let children = repo
+            .filter_folder_children(
                 rows.clone(),
                 &InternalItemsQuery {
                     is_virtual_item: Some(true),
                     ..Default::default()
-                }
+                },
             )
             .await
-            .unwrap()
-            .is_empty()
-        );
-        assert!(
-            repo.filter_folder_children(
+            .unwrap();
+        assert!(children.is_empty(), "{children:?}");
+        let children = repo
+            .filter_folder_children(
                 rows.clone(),
                 &InternalItemsQuery {
                     is_folder: Some(false),
                     ..Default::default()
-                }
+                },
             )
             .await
-            .unwrap()
-            .is_empty()
-        );
-        assert!(
-            repo.filter_folder_children(
+            .unwrap();
+        assert!(children.is_empty(), "{children:?}");
+        let children = repo
+            .filter_folder_children(
                 rows.clone(),
                 &InternalItemsQuery {
                     include_item_types: vec![BaseItemKind::Movie],
                     ..Default::default()
-                }
+                },
             )
             .await
-            .unwrap()
-            .is_empty()
-        );
-        assert!(
-            repo.filter_folder_children(
+            .unwrap();
+        assert!(children.is_empty(), "{children:?}");
+        let children = repo
+            .filter_folder_children(
                 rows.clone(),
                 &InternalItemsQuery {
                     exclude_item_types: vec![BaseItemKind::Folder],
                     ..Default::default()
-                }
+                },
             )
             .await
-            .unwrap()
-            .is_empty()
-        );
+            .unwrap();
+        assert!(children.is_empty(), "{children:?}");
         assert_eq!(
             ids(&repo
                 .filter_folder_children(
@@ -14494,18 +14459,17 @@ mod folder_forced_sort_tests {
             .await
             .unwrap();
         assert_eq!(selected, [forced]);
-        assert!(
-            repo.filter_folder_children(
+        let children = repo
+            .filter_folder_children(
                 rows,
                 &InternalItemsQuery {
                     name_starts_with: Some("aaa".to_owned()),
                     ..Default::default()
-                }
+                },
             )
             .await
-            .unwrap()
-            .is_empty()
-        );
+            .unwrap();
+        assert!(children.is_empty(), "{children:?}");
     }
 
     #[test]

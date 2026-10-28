@@ -3361,7 +3361,8 @@ mod tests {
         );
         let task = KeyframeExtractionTask::with_extractors(library, vec![Arc::new(probe)]);
         assert_eq!(task.key(), "KeyframeExtraction");
-        assert!(task.default_triggers().is_empty());
+        let default_triggers = task.default_triggers();
+        assert!(default_triggers.is_empty(), "{default_triggers:?}");
         task.execute(&TaskProgress::default()).await.expect("run");
 
         assert_eq!(*log.lock().expect("log"), ["probe:fresh.mkv"]);
@@ -3370,13 +3371,8 @@ mod tests {
         assert_eq!(kept[0].total_duration, 42);
         assert_eq!(kept[0].keyframe_ticks.as_deref(), Some("[1,2,3]"));
         // The failed probe stored nothing for the new item.
-        assert!(
-            keyframes
-                .get_keyframe_data(fresh)
-                .await
-                .expect("read")
-                .is_empty()
-        );
+        let keyframe_data = keyframes.get_keyframe_data(fresh).await.expect("read");
+        assert!(keyframe_data.is_empty(), "{keyframe_data:?}");
     }
 
     /// A keyframe extractor that logs `name:file` for each call and answers

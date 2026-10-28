@@ -875,7 +875,8 @@ mod tests {
         device_at(&mgr, uid, "dev-a", now).await;
         device_at(&mgr, uid, "dev-b", now - chrono::Duration::hours(1)).await;
 
-        assert!(ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list")).is_empty());
+        let found = ids(&mgr.get_devices_for_user(Some(uid)).await.expect("list"));
+        assert!(found.is_empty(), "{found:?}");
 
         crate::user_entity_ext::set_permission(
             &db,

@@ -198,7 +198,8 @@ async fn a_move_is_announced_only_when_it_moves_an_entry() {
         .move_item(&n(playlist), &n(second), 1, owner)
         .await
         .expect("no-op move");
-    assert!(a.pushes().await.is_empty());
+    let pushes = a.pushes().await;
+    assert!(pushes.is_empty(), "{pushes:?}");
 
     let before = a.saved_at(playlist).await;
     a.mgr

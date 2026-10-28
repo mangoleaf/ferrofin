@@ -864,7 +864,8 @@ mod tests {
 
         add();
         tokio::time::sleep(Duration::from_secs(9)).await;
-        assert!(events.library_updates().is_empty());
+        let library_updates = events.library_updates();
+        assert!(library_updates.is_empty(), "{library_updates:?}");
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(events.library_updates().len(), 1, "a 10 s window");
 
@@ -1181,8 +1182,16 @@ mod tests {
 
         let delivered = audience.delivered.lock().expect("lock");
         assert_eq!(delivered.len(), 1);
-        assert!(delivered[0].1.items_added.is_empty());
-        assert!(delivered[0].1.folders_removed_from.is_empty());
+        assert!(
+            delivered[0].1.items_added.is_empty(),
+            "{:?}",
+            delivered[0].1.items_added
+        );
+        assert!(
+            delivered[0].1.folders_removed_from.is_empty(),
+            "{:?}",
+            delivered[0].1.folders_removed_from
+        );
         assert_eq!(delivered[0].1.items_removed.len(), 1);
     }
 
@@ -1400,6 +1409,7 @@ mod tests {
         genre.type_ = "MediaBrowser.Controller.Entities.Genre".to_owned();
         n.record_updated(&[genre]);
         tokio::time::sleep(Duration::from_secs(31)).await;
-        assert!(events.library_updates().is_empty());
+        let library_updates = events.library_updates();
+        assert!(library_updates.is_empty(), "{library_updates:?}");
     }
 }

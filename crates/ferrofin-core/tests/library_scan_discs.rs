@@ -519,13 +519,8 @@ async fn a_multi_disc_set_is_one_movie_whose_discs_have_no_rows() {
         f.store.clone(),
         Arc::new(ferrofin_core::FerrofinPeopleRepository::new(f.db.clone())),
     );
-    assert!(
-        manager
-            .get_additional_parts(&movie, None)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let additional_parts = manager.get_additional_parts(&movie, None).await.unwrap();
+    assert!(additional_parts.is_empty(), "{additional_parts:?}");
 
     let user = seed_user(&f.db).await;
     play(&f.db, &movie.id, user).await;

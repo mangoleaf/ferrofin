@@ -2496,13 +2496,8 @@ mod tests {
             .expect("no runtime ok");
 
         assert_eq!(r.extractor.calls(), 0);
-        assert!(
-            r.mgr
-                .get_trickplay_items(10, 0)
-                .await
-                .expect("items")
-                .is_empty()
-        );
+        let trickplay_items = r.mgr.get_trickplay_items(10, 0).await.expect("items");
+        assert!(trickplay_items.is_empty(), "{trickplay_items:?}");
     }
 
     #[tokio::test]

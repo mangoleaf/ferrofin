@@ -2142,6 +2142,6 @@ mod tests {
             series.next_up.as_ref().map(|e| e.id.clone()),
             Some(guid_to_db(e3))
         );
-        assert!(series.specials.is_empty());
+        assert!(series.specials.is_empty(), "{:?}", series.specials);
     }
 }

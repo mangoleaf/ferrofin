@@ -806,7 +806,8 @@ mod tests {
     #[case::video(BaseItemKind::Video)]
     fn a_video_at_the_root_names_no_folder(#[case] kind: BaseItemKind) {
         let item = row(kind, Some("/"));
-        assert!(delete_paths(&item, kind, "/").expect("paths").is_empty());
+        let found = delete_paths(&item, kind, "/").expect("paths");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `BaseItem.GetLocalMetadataFilesToDelete` (`BaseItem.cs:2606-2618`): a

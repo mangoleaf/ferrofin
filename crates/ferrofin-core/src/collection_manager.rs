@@ -2996,11 +2996,13 @@ mod tests {
             .expect("containing");
         assert_eq!(containing.len(), 1);
         assert_eq!(containing[0].id, created.id);
+        let collections_containing_item = mgr
+            .get_collections_containing_item(&user, Uuid::nil())
+            .await
+            .expect("nil");
         assert!(
-            mgr.get_collections_containing_item(&user, Uuid::nil())
-                .await
-                .expect("nil")
-                .is_empty()
+            collections_containing_item.is_empty(),
+            "{collections_containing_item:?}"
         );
 
         // C# resolves each set through `GetItemById<BoxSet>(id, user)`: a set
@@ -3025,7 +3027,7 @@ mod tests {
             .get_collections_containing_item(&user, movie_b)
             .await
             .expect("containing2");
-        assert!(containing.is_empty());
+        assert!(containing.is_empty(), "{containing:?}");
     }
 
     /// Issue #55: a box set or playlist takes the least restrictive rating of
@@ -3807,12 +3809,11 @@ mod tests {
         )
         .expect("uuid");
 
-        assert!(
-            mgr.get_playlist_items(playlist_id, alice)
-                .await
-                .expect("owner reads an empty playlist")
-                .is_empty()
-        );
+        let playlist_items = mgr
+            .get_playlist_items(playlist_id, alice)
+            .await
+            .expect("owner reads an empty playlist");
+        assert!(playlist_items.is_empty(), "{playlist_items:?}");
         assert!(matches!(
             mgr.get_playlist_items(playlist_id, Uuid::new_v4()).await,
             Err(ferrofin_traits::error::ServiceError::NotFound(_))
@@ -3932,12 +3933,8 @@ mod tests {
         .expect("uuid");
         let bob = Uuid::new_v4();
 
-        assert!(
-            mgr.get_playlist_shares(playlist_id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let playlist_shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
+        assert!(playlist_shares.is_empty(), "{playlist_shares:?}");
 
         // Add a share.
         mgr.add_user_to_shares(&PlaylistUserUpdateRequest {
@@ -3965,12 +3962,8 @@ mod tests {
         mgr.remove_user_from_shares(playlist_id, bob, &PlaylistUserPermissions::new(bob, false))
             .await
             .unwrap();
-        assert!(
-            mgr.get_playlist_shares(playlist_id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let playlist_shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
+        assert!(playlist_shares.is_empty(), "{playlist_shares:?}");
     }
 
     /// Shares keep the order they were given, as upstream's `Shares` list
@@ -4632,12 +4625,8 @@ mod tests {
 
         // Only `Data` holds the share now: the re-import must bring it back.
         crate::item_data::clear_playlist_shares(&db, playlist_id).await;
-        assert!(
-            mgr.get_playlist_shares(playlist_id)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let playlist_shares = mgr.get_playlist_shares(playlist_id).await.unwrap();
+        assert!(playlist_shares.is_empty(), "{playlist_shares:?}");
         crate::item_data::reconcile_playlist_permissions(&db)
             .await
             .expect("boot re-import");

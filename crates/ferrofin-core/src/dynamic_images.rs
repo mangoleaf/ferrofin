@@ -1817,7 +1817,8 @@ mod tests {
             DynamicImageKind::for_entity(&row),
             Some(DynamicImageKind::MusicArtist)
         );
-        assert!(ArtistSources::image_paths().is_empty());
+        let found = ArtistSources::image_paths();
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(
             fx.providers.refresh_item(&row, true).await.expect("artist"),
             ItemUpdateType::None

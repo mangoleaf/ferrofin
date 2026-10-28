@@ -832,7 +832,8 @@ mod tests {
         let fs = FakeFs::for_external_file("My.Video.srt", false);
         let resolver = resolver(DlnaProfileType::Subtitle, vec![MediaStream::default()], fs);
         let video = ExternalMediaTarget::for_file("https://url.com/My.Video.mkv", None);
-        assert!(resolver.get_external_files(&video).is_empty());
+        let external_files = resolver.get_external_files(&video);
+        assert!(external_files.is_empty(), "{external_files:?}");
     }
 
     // GetExternalFiles_MissingDirectory_DirectoryNotQueried
@@ -1017,7 +1018,7 @@ mod tests {
 
         let streams = resolver.get_external_streams(&video, 0).await;
 
-        assert!(streams.is_empty());
+        assert!(streams.is_empty(), "{streams:?}");
     }
 
     /// `GetExternalStreams_MergeMetadata_HandlesOverridesCorrectly_Data` — the
@@ -1567,7 +1568,11 @@ mod tests {
             ]
         );
         let remote = ExternalMediaTarget::for_file("https://host/Song.flac", None);
-        assert!(resolver.get_external_lyric_streams(&remote, 0).is_empty());
+        let external_lyric_streams = resolver.get_external_lyric_streams(&remote, 0);
+        assert!(
+            external_lyric_streams.is_empty(),
+            "{external_lyric_streams:?}"
+        );
     }
 
     #[rstest]

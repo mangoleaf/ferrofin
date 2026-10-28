@@ -603,7 +603,8 @@ mod tests {
             ..HostNetworkInfo::default()
         })
         .await;
-        assert!(at_base.warn_if_published_url_base_path_differs().is_empty());
+        let warnings = at_base.warn_if_published_url_base_path_differs();
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[tokio::test]
