@@ -52,6 +52,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 pedantic = { level = "warn", priority = -1 }
 # product names in docs (SQLite, ffmpeg, DLNA, …) trip doc_markdown — allow it
 doc_markdown = "allow"
+# Temporary: the test suites' emptiness asserts are being rewritten crate by crate
+# to show the value on failure; this allow goes once every crate is done.
+assert_is_empty = "allow"
 
 [workspace.dependencies]
 if-addrs = { version = "0.15.0", features = ["link-local"] }

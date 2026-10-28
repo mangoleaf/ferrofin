@@ -74,10 +74,10 @@ jobs:
         run: df -h /
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         # A master commit, deliberately without a ref comment: dtolnay rebuilds
-        # the 1.98.1 branch on every master merge (orphaning its SHAs) and moves
+        # the 1.99.1 branch on every master merge (orphaning its SHAs) and moves
         # master and v1, so any ref named here goes stale. The input picks Rust.
         with:
-          toolchain: 1.98.1 # = rust-toolchain.toml
+          toolchain: 1.99.1 # = rust-toolchain.toml
           components: rustfmt, clippy
       # rust-cache hashes every installed toolchain into its key, so the runner image's own
       # stable Rust would change every key (a cold cache) each time a new image ships.
@@ -132,7 +132,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         # Same master-commit pin as clippy (see the note there).
         with:
-          toolchain: 1.98.1 # = rust-toolchain.toml
+          toolchain: 1.99.1 # = rust-toolchain.toml
           # Builds the WASM example guest for the end-to-end plugin-host test.
           targets: wasm32-wasip2
       - run: rustup toolchain uninstall stable # keeps rust-cache's key stable (see clippy)
@@ -189,7 +189,7 @@ jobs:
       # as clippy (see the note there).
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         with:
-          toolchain: 1.98.1 # = rust-toolchain.toml
+          toolchain: 1.99.1 # = rust-toolchain.toml
       # Same release-tag pin as lint-tests (see the note there): never a per-tool tag.
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
@@ -277,10 +277,10 @@ jobs:
         run: df -h /
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         # A master commit, deliberately without a ref comment: dtolnay rebuilds
-        # the 1.98.1 branch on every master merge (orphaning its SHAs) and moves
+        # the 1.99.1 branch on every master merge (orphaning its SHAs) and moves
         # master and v1, so any ref named here goes stale. The input picks Rust.
         with:
-          toolchain: 1.98.1 # = rust-toolchain.toml
+          toolchain: 1.99.1 # = rust-toolchain.toml
           components: llvm-tools-preview
       - run: rustup toolchain uninstall stable # keeps rust-cache's key stable (see clippy)
       # Before rust-cache and install-action, so `sccache` is on PATH for any cargo they run.

@@ -46,7 +46,6 @@ pub type EventConsumer = Arc<dyn Fn(&str) -> EventFuture + Send + Sync + 'static
 
 /// A consumer future that is already finished — for a consumer that did all its
 /// work synchronously or spawned it.
-#[must_use]
 pub fn consumer_done() -> EventFuture {
     Box::pin(std::future::ready(Ok(())))
 }

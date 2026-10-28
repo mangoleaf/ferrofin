@@ -34,7 +34,7 @@ impl Budget {
     pub(super) fn try_acquire(self: &Arc<Self>) -> Option<Permit> {
         let extras = effective_limit((self.read)(), self.processors) - 1;
         self.extra_workers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < extras).then_some(active + 1)
             })
             .ok()
