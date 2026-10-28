@@ -31,10 +31,21 @@ broadcasts directly to Ferrofin:
 docker run -d --name ferrofin \
   --network host \
   -e FERROFIN_PUBLISHED_URL=http://192.168.1.10:8096 \
+  -e FERROFIN_ADMIN_PASSWORD='choose-a-password' \
   -v ferrofin-data:/data \
   -v /path/to/media:/media:ro \
   ghcr.io/mangoleaf/ferrofin:latest
 ```
+
+Host networking exposes port 8096 on every host interface as soon as the container starts.
+A fresh database's `admin` account has no password until the `/web` setup wizard sets one,
+so this example seeds it with `FERROFIN_ADMIN_PASSWORD`. The variable is only read when the
+first user is created, so you can remove it once that account exists. To use the wizard
+instead, run the [loopback-only quickstart](../README.md#quickstart) against the same
+`ferrofin-data` volume first and finish setup there, then remove that container and start
+this one.
+`:latest` follows final releases only. Pin `vX.Y.Z` for a long-running install, because
+adoption and migrations are one-way.
 
 Replace `192.168.1.10` with the host's LAN address. Leave TCP 8096 and UDP 7359 free
 on that host; another Jellyfin/Ferrofin instance cannot use the same discovery port.

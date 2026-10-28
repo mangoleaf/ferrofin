@@ -441,11 +441,23 @@ The same headline numbers for every release published so far (v1.4.0), each agai
 
 ```sh
 docker run -d --name ferrofin \
-  -p 8096:8096 \
+  -p 127.0.0.1:8096:8096 \
   -v ferrofin-data:/data \
   -v /path/to/media:/media:ro \
   ghcr.io/mangoleaf/ferrofin:latest
 ```
+
+This publishes the port on loopback only, because a fresh server's `admin` account has no
+password (see [below](#first-start-the-passwordless-admin)). Open `http://localhost:8096/web`
+on the Docker host and finish the setup wizard. Then recreate the container with
+`-p 8096:8096` so that other devices can reach it. For a headless install, add
+`-e FERROFIN_ADMIN_PASSWORD=…` to seed the password before you publish the port.
+
+`:latest` follows final releases only, never a release candidate. Adoption and the database
+migrations are one-way, so re-pulling `:latest` and recreating the container upgrades the
+install whether or not you planned to. For a long-running install, pin a release tag
+(`ghcr.io/mangoleaf/ferrofin:vX.Y.Z`, from the
+[releases page](https://github.com/mangoleaf/ferrofin/releases)) and upgrade on purpose.
 
 For automatic LAN server discovery, see [server discovery deployment](docs/SERVER_DISCOVERY.md).
 The TCP mapping above supports manual URL connections; it does not forward discovery broadcasts.
@@ -471,12 +483,14 @@ disables transcoding):
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
 ```
 
+#### First start: the passwordless admin
+
 On a fresh database Ferrofin seeds an `admin` user **with no password**, as Jellyfin does,
 and logs a warning: the setup wizard at `/web` sets the password. Until it does, anyone who
-can reach the server can sign in as that administrator, so keep it bound to loopback (or,
-for the container image, which listens on all interfaces, keep its port unpublished) until
-setup is done, or set `FERROFIN_ADMIN_PASSWORD` to seed the password for a headless
-install. Then:
+can reach the server can sign in as that administrator. Keep it bound to loopback until setup
+is done: that is `--bind 127.0.0.1` from source, and for the container image, which listens
+on all interfaces, the `-p 127.0.0.1:8096:8096` mapping in the Docker command above. For a
+headless install, set `FERROFIN_ADMIN_PASSWORD` to seed the password instead. Then:
 
 ```sh
 curl http://localhost:8096/System/Info/Public   # smoke test
