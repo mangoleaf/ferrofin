@@ -73,6 +73,14 @@ source in its total; the regex leaves only the crate's own files.
 Gate each crate on its own; don't pass multiple `-p` flags to one run (that
 checks the merged total and lets a weak crate hide behind a strong one).
 
+The gate reads coverage data with the toolchain's own `llvm-profdata` and `llvm-cov`,
+from the `llvm-tools-preview` component that `rust-toolchain.toml` (and `mise.toml`,
+if you use mise) installs with the pinned Rust. If you set `LLVM_PROFDATA` or
+`LLVM_COV`, point them at the toolchain's copies
+(`$(rustc --print sysroot)/lib/rustlib/<host-triple>/bin/`): Rust's LLVM major
+version moves with the toolchain, and a system `llvm-profdata` of another major
+version fails with "raw profile version mismatch".
+
 **Performance is measured per release, not per PR.** Body-diff correctness is not a
 latency signal: a large slowdown can land "green." So every release is benchmarked
 before it is tagged, and a regression blocks that release (see [`RELEASE.md`](RELEASE.md)).

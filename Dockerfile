@@ -15,7 +15,7 @@ ARG WEB_IMAGE=web-build
 ARG RUNTIME_IMAGE=runtime-build
 
 # ── jellyfin-web, built from source (skipped when CI passes WEB_IMAGE) ──
-ARG JELLYFIN_WEB_VERSION=12.2
+ARG JELLYFIN_WEB_VERSION=12.4
 FROM node:24-trixie AS web-source
 ARG JELLYFIN_WEB_VERSION
 # webpack's production build is memory-hungry; give Node headroom.
