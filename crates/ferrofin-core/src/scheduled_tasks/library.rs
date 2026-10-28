@@ -2475,8 +2475,10 @@ mod tests {
         let folder = Uuid::from_u128(0xF0);
         seed_item(&db, folder, BaseItemKind::Folder).await;
         let count = past_one_page();
+        let mut concat_lists = std::collections::BTreeSet::new();
         for n in 0..count {
             let album = Uuid::from_u128(0x1000 + n as u128);
+            concat_lists.insert(format!("{}.concat", guid_to_db(album)));
             seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
             add_ancestor(&db, album, folder).await;
             // Two tracks each, so every album gets its own concat run.
@@ -2521,20 +2523,16 @@ mod tests {
         );
         task.execute(&TaskProgress::default()).await.expect("run");
 
-        // Every album past the first page measured too, then every track.
-        let measured: Vec<(String,)> = sqlx::query_as(
-            r#"SELECT "Id" FROM "BaseItems" WHERE "LUFS" IS NOT NULL AND "Type" LIKE '%MusicAlbum'"#,
-        )
-        .fetch_all(db.pool())
-        .await
-        .expect("query");
-        assert_eq!(measured.len(), count, "every album measured");
+        // Every album past the first page measured over its own concat list, then every track.
         let calls = runner.calls.lock().expect("lock");
-        let concats = calls
+        let measured: std::collections::BTreeSet<String> = calls
             .iter()
-            .filter(|c| c.iter().any(|a| a == "concat"))
-            .count();
-        assert_eq!((concats, calls.len()), (count, 3 * count));
+            .flatten()
+            .filter_map(|arg| Path::new(arg).file_name()?.to_str().map(str::to_owned))
+            .filter(|name| name.ends_with(".concat"))
+            .collect();
+        assert_eq!(measured, concat_lists, "every album measured");
+        assert_eq!(calls.len(), 3 * count);
     }
 
     #[allow(clippy::too_many_lines)]
