@@ -157,11 +157,16 @@ jobs:
           set -eu
           img="ghcr.io/$GITHUB_REPOSITORY:$GITHUB_REF_NAME"
           docker pull "$img"
-          docker run -d --rm --name smoke -p 8096:8096 "$img"
+          docker run -d --name smoke -p 8096:8096 "$img"
+          # The server binds at once and answers 503 to everything but its probes until
+          # startup is done (/health/live is 200 from the first moment): wait for
+          # /health/ready before asking it for anything.
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8096/health/live > live.json 2>/dev/null; then break; fi
+            if curl -fsS -o /dev/null http://127.0.0.1:8096/health/ready 2>/dev/null; then break; fi
             sleep 1
           done
+          curl -fsS http://127.0.0.1:8096/health/ready > /dev/null || { echo "never became ready"; docker logs smoke; exit 1; }
+          curl -fsS http://127.0.0.1:8096/health/live > live.json
           cat live.json
           grep -q "\"build\":\"$GITHUB_REF_NAME\"" live.json || { echo "version mismatch"; docker logs smoke; exit 1; }
           curl -fsS -o /dev/null http://127.0.0.1:8096/web/ || { echo "/web not served"; docker logs smoke; exit 1; }
@@ -317,10 +322,13 @@ jobs:
               FERROFIN_WEB_DIR=/usr/share/jellyfin/web \
               /usr/bin/ferrofin-server --config /etc/ferrofin/config.toml --bind 127.0.0.1 --port 8096" \
               > /tmp/smoke.log 2>&1 &
+            # Ready, not live: until startup is done everything but the probes is 503.
             for _ in $(seq 1 30); do
-              if curl -fsS http://127.0.0.1:8096/health/live > /tmp/live.json 2>/dev/null; then break; fi
+              if curl -fsS -o /dev/null http://127.0.0.1:8096/health/ready 2>/dev/null; then break; fi
               sleep 1
             done
+            curl -fsS http://127.0.0.1:8096/health/ready > /dev/null || { echo "never became ready"; cat /tmp/smoke.log; exit 1; }
+            curl -fsS http://127.0.0.1:8096/health/live > /tmp/live.json
             cat /tmp/live.json
             curl -fsS -o /dev/null http://127.0.0.1:8096/web/ || { echo "/web not served"; cat /tmp/smoke.log; exit 1; }
             grep -Eq "libfdk_aac[=\":]+true" /tmp/smoke.log || { echo "server did not probe jellyfin-ffmpeg"; cat /tmp/smoke.log; exit 1; }
@@ -334,10 +342,14 @@ jobs:
           [ -x "$bin" ] || bin="$bin.exe"
           "$bin" --data-dir smoke-data --bind 127.0.0.1 --port 8096 > smoke.log 2>&1 &
           pid=$!
+          # Ready, not live: /health/live answers once the port binds, before the database
+          # is migrated, so only /health/ready shows the binary actually started.
           for _ in $(seq 1 30); do
-            if curl -fsS http://127.0.0.1:8096/health/live > live.json 2>/dev/null; then break; fi
+            if curl -fsS -o /dev/null http://127.0.0.1:8096/health/ready 2>/dev/null; then break; fi
             sleep 1
           done
+          curl -fsS http://127.0.0.1:8096/health/ready > /dev/null || { echo "never became ready"; kill "$pid" || true; cat smoke.log; exit 1; }
+          curl -fsS http://127.0.0.1:8096/health/live > live.json
           kill "$pid" || true
           cat live.json
           # /System/Info/Public reports the Jellyfin API version (10.11.8) for client
