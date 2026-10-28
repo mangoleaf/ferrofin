@@ -17,7 +17,7 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 from metadata import CheckError
-from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, PAGE_SIZE, UPGRADED_FROM_10, all_items, comparable,
+from preservation import (FROM_ORACLE, GENERATIONS, ORACLE, PAGE_SIZE, RUNS_12_2_ROUTINES, UPGRADED_FROM_10, all_items, comparable,
                           compare, expectation, normalize, run_matrix, seed_failures, seed_state, validate,
                           validate_oracle, validate_seed_state, same_artwork, verify_database)
 from synthetic import VERSIONS, FRESH_INSTALL
@@ -625,14 +625,14 @@ class SeededAdoptionTest(unittest.TestCase):
         self.sql(self.adopted, 'DELETE FROM LinkedChildren WHERE ParentId = ? AND SortOrder = 1',
                  str(uuid.UUID(pathless['id'])).upper())
         self.actual['linked_children']['pathless'] = pathless['members'][:1]
-        self.assertEqual(self.failures(), ['seeded pathless LinkedChildren differ from Jellyfin 12.2',
-                                           'seeded pathless LinkedChildren are served differently from Jellyfin 12.2'])
+        self.assertEqual(self.failures(), ['seeded pathless LinkedChildren differ from Jellyfin 12.4',
+                                           'seeded pathless LinkedChildren are served differently from Jellyfin 12.4'])
         self.state = dropped
         self.assertEqual(self.failures(), [])
         # A 12.x source holds the migrated members, so the container is checked there too.
         self.state = seed_state(self.oracle_db, self.seeds)
-        self.assertEqual(self.failures(), ['seeded pathless LinkedChildren differ from Jellyfin 12.2',
-                                           'seeded pathless LinkedChildren are served differently from Jellyfin 12.2'])
+        self.assertEqual(self.failures(), ['seeded pathless LinkedChildren differ from Jellyfin 12.4',
+                                           'seeded pathless LinkedChildren are served differently from Jellyfin 12.4'])
 
     def test_a_linked_child_resolved_unlike_jellyfin_12_2_fails(self):
         collection, playlist = (str(uuid.UUID(self.seeds['linked_children'][role]['id'])).upper()
@@ -646,14 +646,14 @@ class SeededAdoptionTest(unittest.TestCase):
                 self.adopted.unlink()
                 shutil.copyfile(self.oracle_db, self.adopted)
                 self.sql(self.adopted, statement, *args)
-                self.assertEqual(self.failures(), [f'seeded {failure} LinkedChildren differ from Jellyfin 12.2'])
+                self.assertEqual(self.failures(), [f'seeded {failure} LinkedChildren differ from Jellyfin 12.4'])
         shutil.copyfile(self.oracle_db, self.adopted)
         # Order is membership for a playlist.
         self.sql(self.adopted, 'UPDATE LinkedChildren SET SortOrder = 3 - SortOrder WHERE ParentId = ?', playlist)
-        self.assertEqual(self.failures(), ['seeded playlist LinkedChildren differ from Jellyfin 12.2'])
+        self.assertEqual(self.failures(), ['seeded playlist LinkedChildren differ from Jellyfin 12.4'])
         shutil.copyfile(self.oracle_db, self.adopted)
         self.actual['linked_children']['playlist'] = self.actual['linked_children']['playlist'][1:]
-        self.assertEqual(self.failures(), ['seeded playlist LinkedChildren are served differently from Jellyfin 12.2'])
+        self.assertEqual(self.failures(), ['seeded playlist LinkedChildren are served differently from Jellyfin 12.4'])
 
     def test_seeding_twice_changes_nothing(self):
         with closing(sqlite3.connect(self.source)) as conn:
@@ -702,18 +702,18 @@ class SeededAdoptionTest(unittest.TestCase):
             with self.subTest(rating=rating):
                 self.sql(self.adopted, 'UPDATE BaseItems SET InheritedParentalRatingValue = ? WHERE OfficialRating = ?',
                          value, rating)
-                self.assertEqual(self.failures(), ['seeded ratings differ from Jellyfin 12.2'])
+                self.assertEqual(self.failures(), ['seeded ratings differ from Jellyfin 12.4'])
                 self.sql(self.adopted, 'UPDATE BaseItems SET InheritedParentalRatingValue = ? WHERE OfficialRating = ?',
                          SCORES[rating][0], rating)
 
     def test_a_visibility_change_fails(self):
         self.actual['visibility'][USERS[2]].append(
             next(movie for movie, rating in self.seeds['ratings'].items() if rating == 'FSK 16'))
-        self.assertEqual(self.failures(), ['seeded rating visibility differs from Jellyfin 12.2'])
+        self.assertEqual(self.failures(), ['seeded rating visibility differs from Jellyfin 12.4'])
 
     def test_unharmonized_or_differently_harmonized_user_data_fails(self):
         self.sql(self.adopted, "UPDATE UserData SET Played = 0, PlaybackPositionTicks = 490 WHERE CustomDataKey = 'tt99999991'")
-        self.assertEqual(self.failures(), ['seeded conflicting user data differs from Jellyfin 12.2'])
+        self.assertEqual(self.failures(), ['seeded conflicting user data differs from Jellyfin 12.4'])
 
     def test_the_same_instant_written_differently_passes(self):
         self.sql(self.adopted, "UPDATE UserData SET LastPlayedDate = '2023-08-14 00:00:00.0000000' "
@@ -744,8 +744,10 @@ class SeededAdoptionTest(unittest.TestCase):
             with self.subTest(value=value):
                 self.sql(self.oracle_db, "UPDATE BaseItems SET InheritedParentalRatingValue = ? "
                          "WHERE OfficialRating = 'SAM 13'", value)
-                with self.assertRaisesRegex(CheckError, 'unscored'):
+                with self.assertRaisesRegex(CheckError, 'Jellyfin 12.4 left a seeded rating unscored'):
                     validate_oracle(self.oracle_db, self.manifest)
+                with self.assertRaisesRegex(CheckError, 'Jellyfin 12.3 left a seeded rating unscored'):
+                    validate_oracle(self.oracle_db, self.manifest, '12.3')
 
     def test_the_seed_state_records_what_each_release_left(self):
         self.assertEqual(self.state['ratings'], self.seeds['ratings'])
@@ -758,7 +760,10 @@ class SeededAdoptionTest(unittest.TestCase):
         oracle = seed_state(self.oracle_db, self.seeds)
         self.assertEqual((oracle['orphans'], oracle['history']), ([], 'placeholder'))
         self.assertEqual(oracle['linked_children'], {role: seed['members'] for role, seed in linked.items()})
-        validate_seed_state(oracle, self.seeds, '12.2')
+        # 12.2 and the releases after it that add no migration keep 12.2's routines' result.
+        self.assertEqual(RUNS_12_2_ROUTINES, ('12.2', '12.3', '12.4'))
+        for version in RUNS_12_2_ROUTINES:
+            validate_seed_state(oracle, self.seeds, version)
         # The state survives its JSON file unchanged.
         self.assertEqual(json.loads(json.dumps(oracle)), oracle)
 
@@ -770,7 +775,8 @@ class SeededAdoptionTest(unittest.TestCase):
             ('10.11.9', {**self.state, 'conflict': dict(list(self.state['conflict'].items())[:1])},
              'did not keep the seeded conflicting user data'),
             ('12.1', harmonized, 'changed the seeded conflicting user data'),
-            ('12.2', self.state, 'did not harmonize'),
+            ('12.2', self.state, 'Jellyfin 12.2 did not harmonize'),
+            ('12.4', self.state, 'Jellyfin 12.4 did not harmonize'),
         ]
         # A 10.11 save that re-caches a stale id from its path, and a 12.x that dropped a member.
         recached = copy.deepcopy(self.state)
@@ -796,11 +802,11 @@ class SeededAdoptionTest(unittest.TestCase):
 
     def test_a_seeded_movies_resume_membership_follows_the_oracle(self):
         self.actual['views'][USERS[2]]['resume'] = []
-        self.assertEqual(self.failures(), ['seeded movie resume differs from Jellyfin 12.2'])
+        self.assertEqual(self.failures(), ['seeded movie resume differs from Jellyfin 12.4'])
         self.actual = copy.deepcopy(self.oracle)
         # The unharmonized loser (position 490, unplayed) would make the conflict resumable.
         self.actual['views'][USERS[1]]['resume'].append(self.seeds['conflict']['item'])
-        self.assertEqual(self.failures(), ['seeded movie resume differs from Jellyfin 12.2'])
+        self.assertEqual(self.failures(), ['seeded movie resume differs from Jellyfin 12.4'])
 
     def test_the_chain_is_written_even_where_foreign_keys_are_enforced(self):
         source = self.dir / 'enforced.db'
@@ -848,9 +854,9 @@ class SeededAdoptionTest(unittest.TestCase):
         self.assertEqual(compare(comparable(expected, self.seeds, orphans), comparable(actual, self.seeds, orphans)),
                          ['views'])
 
-    def test_the_matrix_refuses_to_run_without_the_12_2_oracle(self):
+    def test_the_matrix_refuses_to_run_without_the_12_4_oracle(self):
         # Checked before any container starts or any fixture is copied.
-        with self.assertRaisesRegex(CheckError, 'oracle missing; build ' + ORACLE):
+        with self.assertRaisesRegex(CheckError, 'Jellyfin 12.4 oracle missing; build jellyfin-12.4-from-123 first'):
             run_matrix(self.dir, 'unused-image', None, 0)
         self.assertFalse((self.dir / 'work').exists())
 
@@ -860,7 +866,7 @@ class SeededAdoptionTest(unittest.TestCase):
         oracle.mkdir()
         (oracle / 'synthetic-ready.json').write_text(json.dumps({'recipe': recipe()}))
         (oracle / 'preservation.json').write_text('{}')
-        with self.assertRaisesRegex(CheckError, 'build jellyfin-12.2-from-10 first'):
+        with self.assertRaisesRegex(CheckError, 'build jellyfin-12.4-from-10 first'):
             run_matrix(self.dir, 'unused-image', None, 0)
         self.assertFalse((self.dir / 'work').exists())
 
@@ -945,10 +951,11 @@ class SeededAdoptionTest(unittest.TestCase):
             ready.mkdir()
             (ready / 'synthetic-ready.json').write_text(json.dumps({'recipe': recipe()}))
             (ready / 'preservation.json').write_text('{}')
-        (fresh,) = FRESH_INSTALL
-        run_matrix(self.dir, 'unused-image', fresh, 0)  # must not raise, must start no container
-        self.assertFalse((self.dir / 'work').exists())   # no copy of it was made, and nothing started a report
-        self.assertFalse((self.dir / fresh).exists())
+        for fresh in sorted(FRESH_INSTALL):
+            with self.subTest(fresh=fresh):
+                run_matrix(self.dir, 'unused-image', fresh, 0)  # must not raise, must start no container
+                self.assertFalse((self.dir / 'work').exists())   # no copy of it was made, and nothing started a report
+                self.assertFalse((self.dir / fresh).exists())
 
     def test_the_matrix_records_each_comparison_and_a_check_that_raises_before_it_goes_on(self):
         import adoption_report as report
@@ -971,20 +978,31 @@ class SeededAdoptionTest(unittest.TestCase):
     def test_every_release_maps_to_its_adopted_generation(self):
         self.assertEqual({version: GENERATIONS[version] for _, version, _ in VERSIONS},
                          {'10.11.8': '10.11.8', '10.11.9': '10.11.8', '10.11.10': '10.11.11',
-                          '10.11.11': '10.11.11', '12.0': '12.0.0', '12.1': '12.1.0', '12.2': '12.2.0'})
+                          '10.11.11': '10.11.11', '12.0': '12.0.0', '12.1': '12.1.0', '12.2': '12.2.0',
+                          # 12.3 and 12.4 record 12.2's id set
+                          '12.3': '12.2.0', '12.4': '12.2.0'})
 
-    def test_the_12_2_paths_upgrade_from_their_contract_parents(self):
+    def test_the_12_2_to_12_4_paths_upgrade_from_their_contract_parents(self):
         paths = {name: parent for name, _, parent in VERSIONS}
-        # The 12.2 upgrade routes derive from their contract parents; the fresh install
-        # (FRESH_INSTALL) is a first run with no parent.
+        versions = {name: version for name, version, _ in VERSIONS}
+        # The 12.2, 12.3 and 12.4 upgrade routes derive from their contract parents (12.3 on the
+        # fullest 12.2 route, 12.4 on that 12.3 one); each fresh install (FRESH_INSTALL) is a
+        # first run of its release with no parent.
         self.assertEqual({name: paths[name] for name in paths
-                          if name.startswith('jellyfin-12.2') and name not in FRESH_INSTALL},
+                          if name.startswith(('jellyfin-12.2', 'jellyfin-12.3', 'jellyfin-12.4'))
+                          and name not in FRESH_INSTALL},
                          {'jellyfin-12.2-from-10': 'jellyfin-10.11.8', 'jellyfin-12.2-from-12': 'jellyfin-12.0',
-                          'jellyfin-12.2-from-121': 'jellyfin-12.1-from-12'})
-        self.assertEqual({name: paths[name] for name in FRESH_INSTALL}, {'jellyfin-12.2-fresh': None})
+                          'jellyfin-12.2-from-121': 'jellyfin-12.1-from-12',
+                          'jellyfin-12.3-from-122': 'jellyfin-12.2-from-121', 'jellyfin-12.3-from-10': 'jellyfin-10.11.8',
+                          'jellyfin-12.4-from-123': 'jellyfin-12.3-from-122', 'jellyfin-12.4-from-10': 'jellyfin-10.11.8'})
+        self.assertEqual({name: (versions[name], paths[name]) for name in FRESH_INSTALL},
+                         {'jellyfin-12.2-fresh': ('12.2', None), 'jellyfin-12.3-fresh': ('12.3', None),
+                          'jellyfin-12.4-fresh': ('12.4', None)})
         names = [name for name, _, _ in VERSIONS]
         self.assertTrue(all(names.index(parent) < names.index(name) for name, parent in paths.items() if parent))
-        self.assertIn(ORACLE, paths)
+        # The seeds' oracle and the real upgrade from 10.11 are the latest release's.
+        self.assertEqual((versions[ORACLE], versions[UPGRADED_FROM_10]), ('12.4', '12.4'))
+        self.assertEqual((paths[ORACLE], paths[UPGRADED_FROM_10]), ('jellyfin-12.3-from-122', 'jellyfin-10.11.8'))
 
 
 class FreshInstallBuildTest(unittest.TestCase):
@@ -999,9 +1017,14 @@ class FreshInstallBuildTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
         (self.root / "media").mkdir()  # already generated, so build() does not invoke ffmpeg
-        (self.fresh,) = FRESH_INSTALL
 
     def test_a_fresh_install_is_built_without_seeds(self):
+        for name, version, _ in self.synthetic.VERSIONS:
+            if name in FRESH_INSTALL:
+                with self.subTest(fresh=name):
+                    self.build_fresh(name, version)
+
+    def build_fresh(self, fresh, version):
         api = MagicMock()
         api.login.return_value = api
         server = MagicMock()
@@ -1013,19 +1036,19 @@ class FreshInstallBuildTest(unittest.TestCase):
                 patch.object(self.synthetic, "require_populated") as require_populated, \
                 patch("preservation.snapshot", return_value={}), \
                 patch("preservation.validate"):
-            self.synthetic.build(self.root, self.fresh, 0)
-        config = self.root / self.fresh
-        seed.assert_called_once()                       # seeded through the 12.2 API
+            self.synthetic.build(self.root, fresh, 0)
+        config = self.root / fresh
+        seed.assert_called_once()                       # seeded through its release's API
         seed_database.assert_not_called()               # but none of the aged stopped-DB states
-        # 12.2 keeps linked children in their own table, so the 10.11 wait would never end;
+        # 12.x keeps linked children in their own table, so the 10.11 wait would never end;
         # only seed_database needs it.
         wait_for_live_members.assert_not_called()
         # Every digest table must hold rows, bar those only seed_database fills.
         require_populated.assert_called_once_with(config / "data/jellyfin.db", synthetic_fixture.SEEDED_ONLY)
         self.assertFalse((config / "seeds.json").exists())
         ready = json.loads((config / "synthetic-ready.json").read_text())
-        self.assertEqual(ready["fixture"], self.fresh)  # still a completed, usable fixture
-        self.assertEqual(ready["version"], "12.2")
+        self.assertEqual(ready["fixture"], fresh)  # still a completed, usable fixture
+        self.assertEqual(ready["version"], version)
 
 
 if __name__ == '__main__':

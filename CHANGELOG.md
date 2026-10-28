@@ -11,6 +11,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 ## [Unreleased]
 
 ### Database
+- Adopt Jellyfin 12.3 and 12.4 databases in place: neither release adds a migration, so each
+  records 12.2's migration-id set and adopts as generation `12.2.0`. The adoption suite gains
+  their routes (from 10.11.8, from the previous 12.x release, and a fresh install of each), checks
+  that each records its 12.2 counterpart's id set, and moves its smoke, seed and messy-shape
+  oracles to Jellyfin 12.4
 - Rebuild the Live TV channel table without its cascading key to the tuner hosts
   (migration 0046), keeping every channel and airing; the guide refresh removes a deleted
   tuner's channels
@@ -110,6 +115,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   release (`oracle.py matches`). `oracle.py check` no longer takes `--gate`
 
 ### Parity
+- Report Jellyfin version 12.4.0 (was 12.2.0) in `/System/Info` and `/System/Info/Public`,
+  built-in plugin versions and the plugin catalog's `targetAbi` filter: the newest Jellyfin
+  release Ferrofin adopts
 - Bundle jellyfin-web 12.4 (was 12.2) in the image: the library editor shows an error when
   the library options cannot be saved, Delete All on the Devices page removes every device
   but the current one (it tried to remove only the current one), library lists refresh

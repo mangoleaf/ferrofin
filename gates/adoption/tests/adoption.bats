@@ -247,11 +247,11 @@ copy_fixtures_dir() { # the copy's adoption_fixtures_dir (the same name: the cop
 }
 
 one_row_fixture() { # one_row_fixture <dir>: the smallest fixture run.sh adopts (one messy row)
-  mkdir -p "$1/oracle" "$1/media" "$1/jellyfin-12.2-messy/data"
-  smoke "$1/oracle/smoke-jellyfin-12.2.txt" 120
-  empty_adoption_db "$1/jellyfin-12.2-messy/data/jellyfin.db"
-  printf '{"lineage": "12.x", "shapes": {}}' > "$1/jellyfin-12.2-messy/messy.json"
-  printf '{"shapes": {}}' > "$1/jellyfin-12.2-messy/messy-oracle.json"
+  mkdir -p "$1/oracle" "$1/media" "$1/jellyfin-12.4-messy/data"
+  smoke "$1/oracle/smoke-jellyfin-12.4.txt" 120
+  empty_adoption_db "$1/jellyfin-12.4-messy/data/jellyfin.db"
+  printf '{"lineage": "12.x", "shapes": {}}' > "$1/jellyfin-12.4-messy/messy.json"
+  printf '{"shapes": {}}' > "$1/jellyfin-12.4-messy/messy-oracle.json"
 }
 
 bin_first() { # the fake binaries in $TMP/bin win over the real ones (a function: shellcheck reads a @test body as a subshell)
@@ -295,20 +295,20 @@ esac
 echo "unexpected docker $*" >&2; exit 99
 EOS
   chmod +x bin/docker; bin_first
-  run "$COPY/run.sh" --image any --only jellyfin-12.2-messy
+  run "$COPY/run.sh" --image any --only jellyfin-12.4-messy
   [ "$status" -eq 1 ]
   [ -f "$FERROFIN_GATES_DIR/work/adoption/report.html" ]
-  [ -d "$FERROFIN_GATES_DIR/work/adoption/jellyfin-12.2-messy" ]   # the copy, too
+  [ -d "$FERROFIN_GATES_DIR/work/adoption/jellyfin-12.4-messy" ]   # the copy, too
   [ ! -e "$dir/work" ]
   [ "$(find "$BATS_TEST_TMPDIR" -mindepth 1 -maxdepth 1 | wc -l)" -eq $((before + 1)) ]   # nothing new beside the root itself
   # --fixtures names the fixtures; the work directory stays the root's
   rm -rf "$FERROFIN_GATES_DIR/work"
-  run "$COPY/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  run "$COPY/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy
   [ "$status" -eq 1 ]
   [ -f "$FERROFIN_GATES_DIR/work/adoption/report.html" ]
   [ ! -e fixtures/work ]
   # ADOPTION_WORK_DIR names the work directory
-  ADOPTION_WORK_DIR="$TMP/mine" run "$COPY/run.sh" --image any --only jellyfin-12.2-messy
+  ADOPTION_WORK_DIR="$TMP/mine" run "$COPY/run.sh" --image any --only jellyfin-12.4-messy
   [ "$status" -eq 1 ]
   [ -f mine/report.html ]
   # FERROFIN_ADOPTION_FIXTURES names them as --fixtures does, for synthetic.py too
@@ -319,7 +319,7 @@ EOS
   [[ "$output" != *FERROFIN_GATES_DIR* ]]
   [[ "$output" == *"synthetic adoption failed"* ]]
   # without a root, --fixtures keeps its work beside it, as before the root existed
-  run "$COPY/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  run "$COPY/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy
   [ "$status" -eq 1 ]
   [ -f fixtures/work/run/report.html ]
 }
@@ -370,11 +370,11 @@ print(*sorted({c.value for c in ast.walk(fn) if isinstance(c, ast.Constant) and 
   fake_docker; mkdir fixtures
   run "$ADOPTION/run.sh" --fixtures fixtures --image any
   [ "$status" -eq 2 ]
-  [[ "$output" == *"oracle/smoke-jellyfin-12.2.txt missing"* ]]
+  [[ "$output" == *"oracle/smoke-jellyfin-12.4.txt missing"* ]]
 }
 
 @test "run.sh: a missing fixture is skipped, named, and does not fail the run" {
-  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 0 ]
   [ "${#lines[@]}" -eq 1 ]
@@ -385,47 +385,62 @@ print(*sorted({c.value for c in ast.walk(fn) if isinstance(c, ast.Constant) and 
   for f in jellyfin-10.11.8 jellyfin-10.11.9 jellyfin-10.11.10 jellyfin-10.11.11 jellyfin-12.0 jellyfin-12.1-from-10 jellyfin-12.1-from-12; do
     grep -q "|$f|" "$ADOPTION/run.sh"
   done
-  for f in jellyfin-12.2-from-10 jellyfin-12.2-from-12 jellyfin-12.2-from-121; do
+  # 12.3 and 12.4 record 12.2's id set, so every 12.2, 12.3 and 12.4 route adopts as 12.2.0
+  for f in jellyfin-12.2-from-10 jellyfin-12.2-from-12 jellyfin-12.2-from-121 jellyfin-12.3-from-122 jellyfin-12.3-from-10 \
+           jellyfin-12.4-from-123 jellyfin-12.4-from-10; do
     grep -q "\"12.2.0|$f|[0-9]*\"" "$ADOPTION/run.sh"
   done
-  # eleven paths, each on its own port
+  # seventeen paths, each on its own port
   run bash -c "grep -oE '^  \"[0-9.]+\\|jellyfin-[^|]+\\|[0-9]+\"' \"\$1\" | cut -d'|' -f3 | sort | uniq -d" _ "$ADOPTION/run.sh"
   [ -z "$output" ]
-  [ "$(grep -E '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh" | grep -vc -e '-messy|' -e '-scale|')" -eq 11 ]
+  [ "$(grep -E '^  "[0-9.]+\|jellyfin-' "$ADOPTION/run.sh" | grep -vc -e '-messy|' -e '-scale|')" -eq 17 ]
   # and the two messy copies and the scale copy, on ports of their own (the uniqueness check above covers them too)
   [ "$(grep -cE '^  "[0-9.]+\|jellyfin-[^|]*-messy\|' "$ADOPTION/run.sh")" -eq 2 ]
   [ "$(grep -cE '^  "[0-9.]+\|jellyfin-[^|]*-scale\|' "$ADOPTION/run.sh")" -eq 1 ]
 }
 
-@test "run.sh and build-fixtures.sh carry a fresh-install 12.2 row that adopts as 12.2.0" {
-  # The live row for a database created by a Jellyfin 12.2 first run (not upgraded from
-  # 10.11): run.sh adopts it as generation 12.2.0 against its own fresh-install 12.2 oracle,
-  # and build-fixtures.sh checks its fresh-install EF history id count (105, fewer than any
+@test "run.sh and build-fixtures.sh carry a fresh-install row of 12.2, 12.3 and 12.4 that adopts as 12.2.0" {
+  # The live rows for a database created by a first run of each release (not upgraded from
+  # 10.11): run.sh adopts each as generation 12.2.0 against a fresh-install oracle, and
+  # build-fixtures.sh checks its fresh-install EF history id count (105, fewer than any
   # upgrade route, which never records the retired 10.11-era routines).
-  grep -q "\"12.2.0|jellyfin-12.2-fresh|[0-9]*\"" "$ADOPTION/run.sh"
-  grep -q '("jellyfin-12.2-fresh", "12.2", None)' "$ADOPTION/synthetic.py"
+  for v in 12.2 12.3 12.4; do
+    grep -q "\"12.2.0|jellyfin-$v-fresh|[0-9]*\"" "$ADOPTION/run.sh"
+    grep -qF "(\"jellyfin-$v-fresh\", \"$v\", None)" "$ADOPTION/synthetic.py"
+    grep -q "$v-fresh:105" "$ADOPTION/build-fixtures.sh"
+  done
   grep -q 'FRESH_INSTALL' "$ADOPTION/synthetic.py"
-  grep -q '12.2-fresh:105' "$ADOPTION/build-fixtures.sh"
-  # A clean first-run install is a distinct library from the seeded routes, so it gets its own
-  # Jellyfin 12.2 oracle; build-fixtures.sh builds it and run.sh compares the fresh row to it.
+  # A clean first-run install is a distinct library from the seeded routes, so it gets an oracle
+  # of its own: build-fixtures.sh builds Jellyfin 12.4's (the default) and keeps 12.2's.
   grep -q '^build_oracle 12.2-fresh jellyfin-12.2-fresh [0-9]* jellyfin/jellyfin:12.2$' "$ADOPTION/build-fixtures.sh"
-  grep -q 'smoke-jellyfin-12.2-fresh.txt' "$ADOPTION/run.sh"
+  grep -q '^build_oracle 12.4-fresh jellyfin-12.4-fresh [0-9]* jellyfin/jellyfin:12.4$' "$ADOPTION/build-fixtures.sh"
   # build_oracle takes the image as a required 4th argument and threads it into the container,
-  # so the fresh oracle really is a 12.2 image's answers (not the non-existent :12.2-fresh tag).
+  # so the fresh oracle really is a 12.4 image's answers (not the non-existent :12.4-fresh tag).
   # The full build_oracle path needs a live Jellyfin (readiness probe + smoke.sh), so it is
   # exercised by the live build-fixtures.sh run in the Adoption workflow, not offline here.
   grep -qF "local version=\$1 source=\$FIXTURES/\$2 port=\$3 image=\$4" "$ADOPTION/build-fixtures.sh"
   grep -qF "\"\$image\"" "$ADOPTION/build-fixtures.sh"
 }
 
-@test "run.sh: the fresh-install row is skipped, named, when its own oracle is missing" {
-  # The shared 12.2 oracle present (so the run starts) but the fresh-install oracle absent:
-  # the fresh row alone is skipped and named, not compared against the wrong oracle.
-  fake_docker; mkdir -p fixtures/oracle fixtures/media fixtures/jellyfin-12.2-fresh/data
+@test "run.sh: a fresh-install row answers the oracle release's fresh-install oracle, and is skipped, named, without it" {
+  # The shared oracle present (so the run starts) but the fresh-install oracle absent: the
+  # fresh row alone is skipped and named, not compared against the wrong oracle. Every fresh
+  # row answers the --oracle release's fresh oracle; 12.1 has none, so it keeps 12.4's.
+  fake_docker; mkdir -p fixtures/oracle fixtures/media fixtures/jellyfin-12.2-fresh/data fixtures/jellyfin-12.3-fresh/data
+  smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
-  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-fresh
-  [ "$status" -eq 0 ]
-  [[ "${lines[0]}" == SKIP*12.2.0*jellyfin-12.2-fresh*"smoke-jellyfin-12.2-fresh.txt missing"* ]]
+  smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
+  for fresh in jellyfin-12.2-fresh jellyfin-12.3-fresh; do
+    run "$ADOPTION/run.sh" --fixtures fixtures --image any --only "$fresh"
+    [ "$status" -eq 0 ]
+    [[ "${lines[0]}" == SKIP*12.2.0*"$fresh"*"smoke-jellyfin-12.4-fresh.txt missing"* ]]
+    run "$ADOPTION/run.sh" --fixtures fixtures --image any --only "$fresh" --oracle 12.2
+    [ "$status" -eq 0 ]
+    [[ "${lines[0]}" == SKIP*12.2.0*"$fresh"*"smoke-jellyfin-12.2-fresh.txt missing"* ]]
+    run "$ADOPTION/run.sh" --fixtures fixtures --image any --only "$fresh" --oracle 12.1
+    [ "$status" -eq 0 ]
+    [[ "${lines[0]}" == SKIP*12.2.0*"$fresh"*"smoke-jellyfin-12.4-fresh.txt missing"* ]]
+  done
 }
 
 @test "run.sh: only a 10.11 source compares /Persons, and the whole smoke again, after the scan" {
@@ -442,30 +457,37 @@ print(*sorted({c.value for c in ast.walk(fn) if isinstance(c, ast.Constant) and 
   grep -qF "grep -q '\"ferrofin-server starting\"' \"\$dst.boot2.log\" || why+=(\"second boot log has no server start\")" "$ADOPTION/run.sh"
 }
 
-@test "run.sh: the oracle is Jellyfin 12.2 unless --oracle or ADOPTION_ORACLE picks 12.1" {
+@test "run.sh: the oracle is Jellyfin 12.4 unless --oracle or ADOPTION_ORACLE picks 12.1 or 12.2" {
   fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 2 ]
-  [[ "$output" == *"oracle/smoke-jellyfin-12.2.txt missing"* ]]
+  [[ "$output" == *"oracle/smoke-jellyfin-12.4.txt missing"* ]]
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0 --oracle 12.1
   [ "$status" -eq 0 ]
   [[ "${lines[0]}" == SKIP*jellyfin-12.0*"fixture missing" ]]
   ADOPTION_ORACLE=12.1 run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 0 ]
-  # the flag wins over the environment
-  ADOPTION_ORACLE=12.1 run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0 --oracle 12.2
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0 --oracle 12.2
   [ "$status" -eq 2 ]
   [[ "$output" == *"oracle/smoke-jellyfin-12.2.txt missing"* ]]
+  # the flag wins over the environment
+  ADOPTION_ORACLE=12.1 run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0 --oracle 12.4
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"oracle/smoke-jellyfin-12.4.txt missing"* ]]
 }
 
 @test "run.sh: an unknown oracle release is refused" {
   run "$ADOPTION/run.sh" --fixtures fixtures --oracle 12.0
   [ "$status" -eq 2 ]
-  [[ "$output" == *"--oracle must be 12.1 or 12.2, not '12.0'"* ]]
+  [[ "$output" == *"--oracle must be 12.1, 12.2 or 12.4, not '12.0'"* ]]
+  # 12.3 has fixtures but no oracle of its own: 12.4, the same server code, answers for it
+  run "$ADOPTION/run.sh" --fixtures fixtures --oracle 12.3
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--oracle must be 12.1, 12.2 or 12.4, not '12.3'"* ]]
 }
 
 @test "run.sh: refuses without the synthetic media" {
-  fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  fake_docker; mkdir -p fixtures/oracle; smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 2 ]
   [[ "$output" == *"fixtures/media missing"* ]]
@@ -487,7 +509,7 @@ fake_findmnt() { # fake_findmnt <fstype[,fstype…]> — every path reports thes
 
 @test "run.sh, build-fixtures.sh and synthetic.py refuse a network filesystem before creating anything" {
   fake_docker; fake_findmnt cifs
-  mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any
   [ "$status" -eq 2 ]
   [[ "$output" == *"network filesystem (cifs)"* ]]
@@ -504,12 +526,37 @@ fake_findmnt() { # fake_findmnt <fstype[,fstype…]> — every path reports thes
 
 # --- build-fixtures.sh ------------------------------------------------------------------
 
-@test "build-fixtures.sh: each 12.2 fixture is built by Jellyfin 12.2 on its contract parent" {
+@test "every oracle is the same release: the smoke, seeds' and messy-shape oracles and the preflight's default" {
+  # The latest release answers for every row; a bump that misses one place compares against two releases.
+  release=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import messy, preservation, synthetic
+v = {n: r for n, r, _ in synthetic.VERSIONS}
+assert messy.ORACLE_RELEASE == preservation.ORACLE_RELEASE, (messy.ORACLE_RELEASE, preservation.ORACLE_RELEASE)
+assert messy.ORACLE_IMAGE == "jellyfin/jellyfin:" + messy.ORACLE_RELEASE, messy.ORACLE_IMAGE
+assert v[preservation.ORACLE] == v[preservation.UPGRADED_FROM_10] == preservation.ORACLE_RELEASE
+assert v[dict((n, s) for n, s, _ in messy.DERIVED)[next(n for n, _, l in messy.DERIVED if l == "12.x")]] == messy.ORACLE_RELEASE
+print(messy.ORACLE_RELEASE)' "$ADOPTION")
+  [ "$release" = 12.4 ]
+  grep -qF "ORACLE_VERSION=\${ADOPTION_ORACLE:-$release}" "$ADOPTION/run.sh"
+  grep -qF "[ \"\$FRESH_VERSION\" != 12.1 ] || FRESH_VERSION=$release" "$ADOPTION/run.sh"
+  grep -qF "oracle/smoke-jellyfin-\${ADOPTION_ORACLE:-$release}.txt" "$ADOPTION/../run"
+  grep -qE "^build_oracle $release jellyfin-$release-from-[0-9]+ [0-9]+ jellyfin/jellyfin:$release\$" "$ADOPTION/build-fixtures.sh"
+  grep -qE "^build_oracle $release-fresh jellyfin-$release-fresh [0-9]+ jellyfin/jellyfin:$release\$" "$ADOPTION/build-fixtures.sh"
+}
+
+@test "build-fixtures.sh: each 12.2, 12.3 and 12.4 fixture is built by its release on its contract parent" {
   grep -q '("jellyfin-12.2-from-10", "12.2", "jellyfin-10.11.8")' "$ADOPTION/synthetic.py"
   grep -q '("jellyfin-12.2-from-12", "12.2", "jellyfin-12.0")' "$ADOPTION/synthetic.py"
   grep -q '("jellyfin-12.2-from-121", "12.2", "jellyfin-12.1-from-12")' "$ADOPTION/synthetic.py"
-  grep -q '^build_oracle 12.1 jellyfin-12.1-from-12 ' "$ADOPTION/build-fixtures.sh"
-  grep -q '^build_oracle 12.2 jellyfin-12.2-from-121 ' "$ADOPTION/build-fixtures.sh"
+  grep -q '("jellyfin-12.3-from-122", "12.3", "jellyfin-12.2-from-121")' "$ADOPTION/synthetic.py"
+  grep -q '("jellyfin-12.3-from-10", "12.3", "jellyfin-10.11.8")' "$ADOPTION/synthetic.py"
+  grep -q '("jellyfin-12.4-from-123", "12.4", "jellyfin-12.3-from-122")' "$ADOPTION/synthetic.py"
+  grep -q '("jellyfin-12.4-from-10", "12.4", "jellyfin-10.11.8")' "$ADOPTION/synthetic.py"
+  grep -q '^build_oracle 12.1 jellyfin-12.1-from-12 [0-9]* jellyfin/jellyfin:12.1$' "$ADOPTION/build-fixtures.sh"
+  grep -q '^build_oracle 12.2 jellyfin-12.2-from-121 [0-9]* jellyfin/jellyfin:12.2$' "$ADOPTION/build-fixtures.sh"
+  # the default oracle: the latest release, on its fullest upgrade route
+  grep -q '^build_oracle 12.4 jellyfin-12.4-from-123 [0-9]* jellyfin/jellyfin:12.4$' "$ADOPTION/build-fixtures.sh"
+  # every oracle on a port of its own
+  [ -z "$(grep -oE '^build_oracle [^ ]+ [^ ]+ [0-9]+' "$ADOPTION/build-fixtures.sh" | cut -d' ' -f4 | sort | uniq -d)" ]
 }
 
 built_fixtures() { # every fixture built at the current recipe, carrying its release's EF history id count
@@ -519,14 +566,15 @@ built_fixtures() { # every fixture built at the current recipe, carrying its rel
   PATH="$TMP/bin:$PATH"
   recipe=$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import synthetic; print(synthetic.recipe())' "$ADOPTION")
   for f in 10.11.8:68 10.11.9:68 10.11.10:71 10.11.11:71 12.0:102 12.1-from-10:104 12.1-from-12:105 \
-           12.2-from-10:107 12.2-from-12:108 12.2-from-121:109 12.2-fresh:105; do
+           12.2-from-10:107 12.2-from-12:108 12.2-from-121:109 12.2-fresh:105 \
+           12.3-from-122:109 12.3-from-10:107 12.3-fresh:105 12.4-from-123:109 12.4-from-10:107 12.4-fresh:105; do
     mkdir -p "fixtures/jellyfin-${f%:*}/data"
     printf '{"fixture": "jellyfin-%s", "recipe": "%s"}' "${f%:*}" "$recipe" > "fixtures/jellyfin-${f%:*}/synthetic-ready.json"
     sqlite3 "fixtures/jellyfin-${f%:*}/data/jellyfin.db" "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
       WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ${f#*:}) INSERT INTO __EFMigrationsHistory SELECT i, '9' FROM n;"
   done
   # the messy copies are built, so build-fixtures.sh's messy.py step finds nothing to do
-  for f in jellyfin-10.11.11-messy jellyfin-12.2-messy; do
+  for f in jellyfin-10.11.11-messy jellyfin-12.4-messy; do
     mkdir -p "fixtures/$f"; echo '{}' > "fixtures/$f/messy-oracle.json"
     python3 -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import messy; print(json.dumps({"shapes": {s: {} for s in messy.SHAPES}}))' \
       "$ADOPTION" > "fixtures/$f/messy.json"
@@ -558,23 +606,45 @@ EOS
   [[ "$output" != *"unexpected docker"* ]]
 }
 
-@test "build-fixtures.sh: with every fixture built it only dumps the 12.2 schema and diffs the other routes" {
+@test "build-fixtures.sh: a 12.3 or 12.4 fixture whose ids are not its 12.2 counterpart's fails the build" {
+  # The right count with one id swapped: a set the database gate would take for a new generation.
+  for f in 12.3-fresh:12.2-fresh 12.4-from-10:12.2-from-10 12.4-from-123:12.2-from-121; do
+    rm -rf fixtures; built_fixtures
+    sqlite3 "fixtures/jellyfin-${f%:*}/data/jellyfin.db" "UPDATE __EFMigrationsHistory SET MigrationId = 'SomethingNew' WHERE MigrationId = '1'"
+    run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"jellyfin-${f%:*} has other EF history ids than jellyfin-${f#*:}: a new generation"* ]]
+    [[ "$output" != *"unexpected docker"* ]]
+  done
+}
+
+@test "build-fixtures.sh: with every fixture built it only dumps the 12.2 to 12.4 schemas and diffs the other routes" {
   built_fixtures
-  for f in 12.2-from-10 12.2-from-12 12.2-from-121; do
+  for f in 12.2-from-10 12.2-from-12 12.2-from-121 12.3-from-122 12.3-from-10 12.4-from-123 12.4-from-10; do
     sqlite3 "fixtures/jellyfin-$f/data/jellyfin.db" 'CREATE TABLE t(a); CREATE INDEX i ON t(a) WHERE a IS NOT NULL;
       INSERT INTO t VALUES (1); ANALYZE; CREATE TABLE s(id INTEGER PRIMARY KEY AUTOINCREMENT); INSERT INTO s DEFAULT VALUES;'
   done
   sqlite3 fixtures/jellyfin-12.2-from-12/data/jellyfin.db 'CREATE INDEX extra ON t(a);'
-  # Every oracle present (the fresh-install one included) so build_oracle early-returns and the
-  # run touches no docker; the fresh fixture is left out of the schema diff, so it needs none of
-  # the t/s tables above.
-  smoke fixtures/oracle/smoke-jellyfin-12.1.txt 120; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
-  smoke fixtures/oracle/smoke-jellyfin-12.2-fresh.txt 120
+  sqlite3 fixtures/jellyfin-12.4-from-10/data/jellyfin.db 'CREATE INDEX extra ON t(a);'
+  # The fresh installs are diffed against 12.2's first run, not against the upgraded schema.
+  sqlite3 fixtures/jellyfin-12.4-fresh/data/jellyfin.db 'CREATE TABLE f(a);'
+  # Every oracle present (the fresh-install ones included) so build_oracle early-returns and the
+  # run touches no docker.
+  for o in 12.1 12.2 12.2-fresh 12.4 12.4-fresh; do smoke "fixtures/oracle/smoke-jellyfin-$o.txt" 120; done
   run "$ADOPTION/build-fixtures.sh" --fixtures fixtures
   [ "$status" -eq 0 ]
   [[ "$output" == *"jellyfin-12.2-schema.sql: 4 CREATE statements"* ]]
-  [[ "$output" == *"jellyfin-12.2-from-10: same schema"* ]]
-  [[ "$output" == *"jellyfin-12.2-from-12: schema DIFFERS"* ]]
+  [[ "$output" == *"jellyfin-12.2-from-10: same schema as jellyfin-12.2-schema.sql"* ]]
+  [[ "$output" == *"jellyfin-12.2-from-12: schema DIFFERS from jellyfin-12.2-schema.sql"* ]]
+  for f in 12.3-from-122 12.3-from-10 12.4-from-123; do
+    [[ "$output" == *"jellyfin-$f: same schema as jellyfin-12.2-schema.sql"* ]]
+  done
+  [[ "$output" == *"jellyfin-12.4-from-10: schema DIFFERS from jellyfin-12.2-schema.sql"* ]]
+  [[ "$output" == *"jellyfin-12.3-fresh: same schema as jellyfin-12.2-fresh"* ]]
+  [[ "$output" == *"jellyfin-12.4-fresh: schema DIFFERS from jellyfin-12.2-fresh"* ]]
+  # 12.3's and 12.4's own dumps are written beside 12.2's
+  cmp fixtures/jellyfin-12.3-schema.sql fixtures/jellyfin-12.2-schema.sql
+  cmp fixtures/jellyfin-12.4-schema.sql fixtures/jellyfin-12.2-schema.sql
   [[ "$output" != *"unexpected docker"* ]]
   grep -q 'WHERE a IS NOT NULL' fixtures/jellyfin-12.2-schema.sql
   # dump_schema strips every sqlite_stat* (stat1, and stat4 on a STAT4 build) and sqlite_sequence.
@@ -595,7 +665,7 @@ EOS
 @test "run.sh: an unreadable metadata baseline fails before starting a container" {
   fake_docker
   mkdir -p fixtures/oracle fixtures/media fixtures/jellyfin-12.0/data
-  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   printf 'not a database\n' > fixtures/jellyfin-12.0/data/jellyfin.db
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 1 ]
@@ -611,11 +681,11 @@ EOS
 }
 
 @test "run.sh: a broken or missing report module changes neither the verdict, the exit status nor the output" {
-  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
-  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
-  empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
-  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json
-  printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
+  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.4-messy/data
+  smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
+  empty_adoption_db fixtures/jellyfin-12.4-messy/data/jellyfin.db
+  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.4-messy/messy.json
+  printf '{"shapes": {}}' > fixtures/jellyfin-12.4-messy/messy-oracle.json
   cat > bin/docker <<'EOS'
 #!/usr/bin/env bash
 case "$1" in
@@ -625,7 +695,7 @@ esac
 echo "unexpected docker $*" >&2; exit 99
 EOS
   chmod +x bin/docker; bin_first
-  run --separate-stderr "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  run --separate-stderr "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy
   normal_status=$status; normal_output=$output
   [ "$normal_status" -eq 1 ]
   [ -f fixtures/work/run/report.html ]
@@ -635,13 +705,13 @@ EOS
   cp -r "$ADOPTION" copy; cp "$ADOPTION/../lib.sh" .   # the gates' shared library, one level up as in gates/
   printf 'raise SystemExit(7)\n' > copy/adoption_report.py
   rm -rf fixtures/work
-  run --separate-stderr copy/run.sh --fixtures fixtures --image any --only jellyfin-12.2-messy
+  run --separate-stderr copy/run.sh --fixtures fixtures --image any --only jellyfin-12.4-messy
   [ "$status" -eq "$normal_status" ]
   [ "$output" = "$normal_output" ]            # stdout is the same
   [[ "$stderr" == *"report: not written"* ]]   # and the missing page is said, on stderr
   [ ! -e fixtures/work/run/report.html ]
   rm copy/adoption_report.py; rm -rf fixtures/work
-  run --separate-stderr copy/run.sh --fixtures fixtures --image any --only jellyfin-12.2-messy
+  run --separate-stderr copy/run.sh --fixtures fixtures --image any --only jellyfin-12.4-messy
   [ "$status" -eq "$normal_status" ]
   [ "$output" = "$normal_output" ]
   [[ "$stderr" == *"report: not written"* ]]
@@ -679,14 +749,14 @@ EOS
   grep -qF 'tables_before, table_digests.snapshot(db, tables_before, reauthenticated=reauth))' "$ADOPTION/preservation.py"
 }
 
-@test "messy rows: each shape's seeder and end-state reader, and the comparison with Jellyfin 12.2's record" {
+@test "messy rows: each shape's seeder and end-state reader, and the comparison with the oracle release's record" {
   run python3 -m unittest discover -s "$BATS_TEST_DIRNAME" -p test_messy.py
   [ "$status" -eq 0 ]
 }
 
 # A messy fixture copy holding every shape, seeded by messy.py into a scratch database, with the
-# manifest and an oracle record saying Jellyfin 12.2 left each shape as the seeders read it.
-messy_fixture() { # messy_fixture <yes|no>: every shape seeded and recorded as Jellyfin 12.2 left it; "no" then loses the original of duplicate_paths
+# manifest and an oracle record saying Jellyfin 12.4 left each shape as the seeders read it.
+messy_fixture() { # messy_fixture <yes|no>: every shape seeded and recorded as Jellyfin 12.4 left it; "no" then loses the original of duplicate_paths
   mkdir -p messy
   python3 - "$ADOPTION" "$PWD/messy" "$1" <<'PY'
 import json, sqlite3, sys
@@ -708,7 +778,7 @@ if sys.argv[3] == "no":
 PY
 }
 
-@test "check_messy: a shape that ends as Jellyfin 12.2 left it says nothing" {
+@test "check_messy: a shape that ends as Jellyfin 12.4 left it says nothing" {
   messy_fixture yes
   run adoption_check_messy messy/jellyfin.db messy
   [ "$status" -eq 0 ]
@@ -718,7 +788,7 @@ PY
 @test "check_messy: a shape that ends differently names the shape and both states" {
   messy_fixture no
   run adoption_check_messy messy/jellyfin.db messy
-  [[ "$output" == "messy: duplicate_paths: "*"expected"*"Jellyfin 12.2"* ]]
+  [[ "$output" == "messy: duplicate_paths: "*"expected"*"Jellyfin 12.4"* ]]
 }
 
 @test "check_messy: a checker that cannot run is a reason, never a pass" {
@@ -729,12 +799,12 @@ PY
 }
 
 @test "run.sh: --only a clean fixture never reaches the messy rows, and a messy fixture that is not built is skipped and named" {
-  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "${#lines[@]}" -eq 1 ]
-  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy
   [ "$status" -eq 0 ]
-  [[ "${lines[0]}" == SKIP*12.2.0*jellyfin-12.2-messy*"fixture missing" ]]
+  [[ "${lines[0]}" == SKIP*12.2.0*jellyfin-12.4-messy*"fixture missing" ]]
 }
 
 # A database holding every table table_digests.py reads, with nothing in it.
@@ -763,11 +833,11 @@ empty_adoption_db() { # empty_adoption_db <file>
 }
 
 @test "run.sh: a messy fixture whose container exits fails at once, naming it, instead of waiting out the deadlines" {
-  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
-  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
-  empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
-  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json
-  printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
+  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.4-messy/data
+  smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
+  empty_adoption_db fixtures/jellyfin-12.4-messy/data/jellyfin.db
+  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.4-messy/messy.json
+  printf '{"shapes": {}}' > fixtures/jellyfin-12.4-messy/messy-oracle.json
   # image inspect succeeds; every container "has exited" (State.Running false); nothing else is asked
   cat > bin/docker <<'EOS'
 #!/usr/bin/env bash
@@ -779,24 +849,24 @@ echo "unexpected docker $*" >&2; exit 99
 EOS
   chmod +x bin/docker; bin_first
   start=$SECONDS
-  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy
   [ "$status" -eq 1 ]
-  [[ "$output" == FAIL*12.2.0*jellyfin-12.2-messy*"never became ready"*"second boot never ready"* ]]
+  [[ "$output" == FAIL*12.2.0*jellyfin-12.4-messy*"never became ready"*"second boot never ready"* ]]
   [[ "$output" == *"messy: "* ]]   # the shape checker ran and said why it could not pass
   [ $((SECONDS - start)) -lt 60 ]
   [[ "$output" != *"unexpected docker"* ]]
   # the report: every check's verdict was recorded, and the page says what failed and why
   work=fixtures/work/run
-  [ "$(jq -s '[.[] | select(.event == "row")] | .[0] | [.fixture, .kind, .expected, .verdict] | join(" ")' -r "$work/results.jsonl")" = "jellyfin-12.2-messy messy 12.2.0 FAIL" ]
+  [ "$(jq -s '[.[] | select(.event == "row")] | .[0] | [.fixture, .kind, .expected, .verdict] | join(" ")' -r "$work/results.jsonl")" = "jellyfin-12.4-messy messy 12.2.0 FAIL" ]
   [ "$(jq -s '[.[] | select(.event == "check" and .verdict == "FAIL")] | length' "$work/results.jsonl")" -ge 2 ]
-  grep -q "jellyfin-12.2-messy" "$work/report.html"
+  grep -q "jellyfin-12.4-messy" "$work/report.html"
   grep -q "never became ready" "$work/report.html"
-  grep -q "messy shapes end as Jellyfin 12.2 left them" "$work/report.html"
+  grep -q "messy shapes end as Jellyfin 12.4 left them" "$work/report.html"
   grep -q ">FAIL<" "$work/report.html"
 }
 
 @test "run.sh: a skipped fixture is a SKIP row in the report, which is written even when nothing ran" {
-  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.0
   [ "$status" -eq 0 ]
   [ "$(jq -r 'select(.event == "row") | [.fixture, .verdict, .detail] | join("|")' fixtures/work/run/results.jsonl)" = "jellyfin-12.0|SKIP|fixture missing" ]
@@ -807,11 +877,11 @@ EOS
 # session of its own; started_waiting_row sets $leader once the row has begun. The fake docker records its
 # session, the run's worker's (run.sh's own work runs there, gl-920), in docker.sid.
 started_waiting_row() {
-  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
-  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
-  empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
-  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json
-  printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
+  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.4-messy/data
+  smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
+  empty_adoption_db fixtures/jellyfin-12.4-messy/data/jellyfin.db
+  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.4-messy/messy.json
+  printf '{"shapes": {}}' > fixtures/jellyfin-12.4-messy/messy-oracle.json
   cat > bin/docker <<'EOS'
 #!/usr/bin/env bash
 read -r _ _ _ _ _ sid _ < /proc/$$/stat; echo "$sid" > "$PWD/docker.sid.$$"; mv "$PWD/docker.sid.$$" "$PWD/docker.sid"
@@ -822,7 +892,7 @@ esac
 echo "unexpected docker $*" >&2; exit 99
 EOS
   chmod +x bin/docker; bin_first
-  setsid "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy &
+  setsid "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy &
   leader=$!
   for _ in $(seq 1 40); do grep -q '"begin"' fixtures/work/run/results.jsonl 2>/dev/null && break; sleep 0.25; done
   grep -q '"begin"' fixtures/work/run/results.jsonl
@@ -857,7 +927,7 @@ stopped_within() {
   stopped_within 30
   [ "$status" -eq 143 ]
   grep -q "INCOMPLETE" fixtures/work/run/report.html
-  grep -q "jellyfin-12.2-messy" fixtures/work/run/report.html
+  grep -q "jellyfin-12.4-messy" fixtures/work/run/report.html
 }
 
 @test "run.sh: a TERM to run.sh alone stops everything the run started" {
@@ -882,11 +952,11 @@ stopped_within() {
 # A messy 12.x row for run.sh with a docker that logs its `run` arguments to $DOCKER_LOG and
 # whose server never answers: enough to reach the mount and the table baseline.
 logging_messy_row() { # logging_messy_row <source name or empty>
-  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.2-messy/data
-  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
-  empty_adoption_db fixtures/jellyfin-12.2-messy/data/jellyfin.db
-  printf '{"lineage": "12.x", "source": "%s", "shapes": {}}' "$1" > fixtures/jellyfin-12.2-messy/messy.json
-  printf '{"shapes": {}}' > fixtures/jellyfin-12.2-messy/messy-oracle.json
+  mkdir -p bin fixtures/oracle fixtures/media fixtures/jellyfin-12.4-messy/data
+  smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
+  empty_adoption_db fixtures/jellyfin-12.4-messy/data/jellyfin.db
+  printf '{"lineage": "12.x", "source": "%s", "shapes": {}}' "$1" > fixtures/jellyfin-12.4-messy/messy.json
+  printf '{"shapes": {}}' > fixtures/jellyfin-12.4-messy/messy-oracle.json
   cat > bin/docker <<'EOS'
 #!/usr/bin/env bash
 case "$1" in
@@ -901,31 +971,31 @@ EOS
 }
 
 @test "run.sh: the messy rows mount media-messy when it is built, the shared media otherwise" {
-  logging_messy_row jellyfin-12.2-from-121
-  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  logging_messy_row jellyfin-12.4-from-123
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy
   grep -q "$TMP/fixtures/media:/media:ro" "$DOCKER_LOG"          # a fixture directory built before media-messy existed
   [ "$(grep -c "media-messy" "$DOCKER_LOG")" = 0 ]
   mkdir fixtures/media-messy; : > "$DOCKER_LOG"
-  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy
   grep -q "$TMP/fixtures/media-messy:/media:ro" "$DOCKER_LOG"
   [ "$(grep -c "$TMP/fixtures/media:/media:ro" "$DOCKER_LOG")" = 0 ]
 }
 
 @test "run.sh: the messy rows' table baseline is the clean source fixture's, else the copy's" {
-  logging_messy_row jellyfin-12.2-from-121
-  mkdir -p fixtures/jellyfin-12.2-from-121/data
-  empty_adoption_db fixtures/jellyfin-12.2-from-121/data/jellyfin.db
-  sqlite3 fixtures/jellyfin-12.2-from-121/data/jellyfin.db "INSERT INTO ApiKeys (Id) VALUES (1)"
-  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
-  baseline=fixtures/work/run/jellyfin-12.2-messy.tables.json
+  logging_messy_row jellyfin-12.4-from-123
+  mkdir -p fixtures/jellyfin-12.4-from-123/data
+  empty_adoption_db fixtures/jellyfin-12.4-from-123/data/jellyfin.db
+  sqlite3 fixtures/jellyfin-12.4-from-123/data/jellyfin.db "INSERT INTO ApiKeys (Id) VALUES (1)"
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy
+  baseline=fixtures/work/run/jellyfin-12.4-messy.tables.json
   [ "$(jq '.tables.ApiKeys.rows | length' "$baseline")" = 1 ]          # the row only the clean source holds
-  [ ! -e fixtures/jellyfin-12.2-from-121/data/jellyfin.db-wal ]        # the fixture itself was not opened
-  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json   # no source named
-  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  [ ! -e fixtures/jellyfin-12.4-from-123/data/jellyfin.db-wal ]        # the fixture itself was not opened
+  printf '{"lineage": "12.x", "shapes": {}}' > fixtures/jellyfin-12.4-messy/messy.json   # no source named
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy
   [ "$(jq '.tables.ApiKeys.rows | length' "$baseline")" = 0 ]
-  rm -r fixtures/jellyfin-12.2-from-121
-  printf '{"lineage": "12.x", "source": "jellyfin-12.2-from-121", "shapes": {}}' > fixtures/jellyfin-12.2-messy/messy.json   # source gone
-  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.2-messy
+  rm -r fixtures/jellyfin-12.4-from-123
+  printf '{"lineage": "12.x", "source": "jellyfin-12.4-from-123", "shapes": {}}' > fixtures/jellyfin-12.4-messy/messy.json   # source gone
+  run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-12.4-messy
   [ "$(jq '.tables.ApiKeys.rows | length' "$baseline")" = 0 ]
 }
 
@@ -959,7 +1029,7 @@ scale_fixture() { # scale_fixture <directory>
 }
 
 @test "run.sh: the scale fixture is skipped, named, when it is not built, and --only a clean fixture never reaches it" {
-  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
   [ "$status" -eq 0 ]
   [[ "${lines[0]}" == SKIP*10.11.11*jellyfin-10.11.11-scale*"fixture missing" ]]
@@ -968,7 +1038,7 @@ scale_fixture() { # scale_fixture <directory>
 }
 
 @test "run.sh: the scale row refuses, naming the disk it needs, before it copies or starts anything" {
-  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  fake_docker; mkdir -p fixtures/oracle fixtures/media; smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   scale_fixture fixtures/jellyfin-10.11.11-scale
   truncate -s 8T fixtures/jellyfin-10.11.11-scale/data/jellyfin.db   # a sparse database no disk has six times over
   run "$ADOPTION/run.sh" --fixtures fixtures --image any --only jellyfin-10.11.11-scale
@@ -980,7 +1050,7 @@ scale_fixture() { # scale_fixture <directory>
 
 @test "run.sh: a scale fixture whose container exits fails at once, saying which numbers were not measured" {
   mkdir -p bin fixtures/oracle fixtures/media
-  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   scale_fixture fixtures/jellyfin-10.11.11-scale
   cat > bin/docker <<'EOS'
 #!/usr/bin/env bash
@@ -1002,7 +1072,7 @@ EOS
 
 @test "run.sh: the scale row gives up on a server that never answers after ADOPTION_SCALE_TIMEOUT, on both boots" {
   mkdir -p bin fixtures/oracle fixtures/media
-  smoke fixtures/oracle/smoke-jellyfin-12.2.txt 120
+  smoke fixtures/oracle/smoke-jellyfin-12.4.txt 120
   scale_fixture fixtures/jellyfin-10.11.11-scale
   # the container stays up and never answers; without the limit the first wait alone is 30 minutes
   cat > bin/docker <<'EOS'

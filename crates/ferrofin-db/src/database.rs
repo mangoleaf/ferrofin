@@ -1420,7 +1420,8 @@ pub struct JellyfinGeneration {
 /// on every path, as must the Ferrofin-own `0035`–`0038`. A 12.x generation
 /// matches both an upgraded install and a fresh one (see
 /// [`JellyfinGeneration::optional_ids`]); `0041` gives a fresh install the one
-/// index it lacks.
+/// index it lacks. Releases that share a set share the name: 10.11.9 logs
+/// `10.11.8`, and 12.3 and 12.4, which add no migration, log `12.2.0`.
 pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 5] = [
     JellyfinGeneration {
         name: "10.11.8",
@@ -4080,11 +4081,22 @@ mod tests {
     /// `20260910…` (108), and 12.1-from-12.0 → 12.2 keeps both (109). All four
     /// are the 12.2 generation, and `0040` is baselined: the database already has
     /// the partial `OwnerId` pair.
+    ///
+    /// Jellyfin 12.3 and 12.4 add no EF migration and no code routine (`v12.2`
+    /// to `v12.4` changes no `Migrations/` file), so a database they upgrade
+    /// keeps the set of the route it came by: 12.3 on the 12.1-from-12.0 → 12.2
+    /// database and 12.4 on that 12.3 one keep 109 ids, and either release
+    /// straight from 10.11 keeps 107, as the adoption fixtures record. Releases
+    /// sharing a set share the logged generation, so each adopts as `12.2.0`.
     #[rstest::rstest]
     #[case::from_10_11(false, false, 107)]
     #[case::from_12_0(true, false, 108)]
     #[case::from_12_1_of_10_11(false, true, 108)]
     #[case::from_12_1_of_12_0(true, true, 109)]
+    #[case::jellyfin_12_3_from_12_2(true, true, 109)]
+    #[case::jellyfin_12_3_from_10_11(false, false, 107)]
+    #[case::jellyfin_12_4_from_12_3(true, true, 109)]
+    #[case::jellyfin_12_4_from_10_11(false, false, 107)]
     #[tokio::test]
     async fn adopts_a_jellyfin_12_2_database_on_every_upgrade_route(
         #[case] passed_through_12_0: bool,
@@ -4506,11 +4518,15 @@ mod tests {
     /// A fresh 12.x install records only the routines its code base still has, so
     /// it lacks the retired 10.11-era ids every upgraded database carries, and its
     /// schema lacks `IX_CustomItemDisplayPreferences_UserId`. It is still its own
-    /// generation, and `0041` gives it the index.
+    /// generation, and `0041` gives it the index. A fresh 12.3 or 12.4 install
+    /// records 12.2's fresh set and schema (neither release adds a migration), so
+    /// it adopts as `12.2.0`.
     #[rstest::rstest]
     #[case::fresh_12_0("12.0.0", SCHEMA_12_0, &FRESH_12_0)]
     #[case::fresh_12_1("12.1.0", SCHEMA_12_0, &FRESH_12_1)]
     #[case::fresh_12_2("12.2.0", SCHEMA_12_2, &FRESH_12_2)]
+    #[case::fresh_12_3("12.2.0", SCHEMA_12_2, &FRESH_12_2)]
+    #[case::fresh_12_4("12.2.0", SCHEMA_12_2, &FRESH_12_2)]
     #[tokio::test]
     async fn adopts_a_fresh_jellyfin_12_x_install(
         #[case] generation: &str,
