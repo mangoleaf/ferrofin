@@ -1,6 +1,7 @@
 //! The [`Database`] connection handle — a [`sqlx::SqlitePool`] wrapper.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -13,6 +14,17 @@ use crate::error::Result;
 /// `sqlx::migrate!()` reads the directory at **compile time**, so building
 /// this crate needs no live database or `DATABASE_URL`.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// The version of the last migration in this build's chain: a database
+/// migrated past it was written by a newer build, and this one cannot open it
+/// (`MIGRATOR.run` refuses applied versions it does not know).
+#[must_use]
+pub fn schema_head() -> i64 {
+    MIGRATOR
+        .iter()
+        .last()
+        .map_or(0, |migration| migration.version)
+}
 
 /// A `BaseItems` row projected down to what the inherited-images walk and
 /// the Episode/Season/Audio parent blocks of the DTO service read off a
@@ -49,7 +61,8 @@ pub struct ImageParentRow {
 
 /// A handle to Ferrofin's SQLite database, wrapping two connection pools: a
 /// multi-connection **reader** pool ([`Database::pool`]) and a
-/// single-connection **writer** pool ([`Database::writer`]).
+/// single-connection **writer** pool ([`Database::writer`]), plus a private
+/// one-connection pool for [`Database::snapshot_to`].
 ///
 /// SQLite under WAL serves many concurrent readers but exactly one writer at a
 /// time. Funnelling every write through a 1-connection pool turns would-be
@@ -64,6 +77,16 @@ pub struct ImageParentRow {
 pub struct Database {
     pool: SqlitePool,
     writer: SqlitePool,
+    /// One connection, opened on first use, for [`Database::snapshot_to`], so
+    /// a long `VACUUM INTO` holds neither the writer nor a reader slot and
+    /// [`Database::close`] still waits for it.
+    snapshotter: SqlitePool,
+    /// One snapshot or one vacuum-and-checkpoint pass at a time
+    /// ([`Database::try_maintenance_turn`]), shared by every clone.
+    maintenance: Arc<tokio::sync::Mutex<()>>,
+    /// The cross-request caches of policy and library rows ([`crate::row_cache`]), shared by
+    /// every clone.
+    rows: Arc<crate::row_cache::RowCache>,
     /// The on-disk database file, when file-backed (`None` for in-memory).
     /// Lets [`Database::run_migrations`] snapshot the file before a
     /// table-rebuild migration.
@@ -102,7 +125,7 @@ impl Database {
         // SQLITE_BUSY failures for every in-flight request (a real
         // mid-playback black-screen). The maintenance task now also skips the
         // vacuum during playback; the long timeout is the second seatbelt.
-        configure_sqlite_for_concurrency();
+        init_sqlite();
         let read_options = SqliteConnectOptions::from_str(url)?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
@@ -142,11 +165,15 @@ impl Database {
             let mut conn = write_options.clone().foreign_keys(false).connect().await?;
             crate::normalized_usernames::preflight(&mut conn).await?;
             adopt_jellyfin_database(&mut conn, path).await?;
-            backup_before_rebuild(&mut conn, path).await?;
+            let snapshot = backup_before_migrations(&mut conn, path).await?;
             MIGRATOR.run(&mut conn).await?;
+            log_dangling_row_cleanup(&mut conn).await?;
             crate::normalized_usernames::repair(&mut conn).await?;
             foreign_key_check(&mut conn).await?;
             sqlx::Connection::close(conn).await?;
+            if let Some(snapshot) = snapshot {
+                discard_snapshot(&snapshot);
+            }
         }
         Self::connect_with(read_options, write_options, pool_size, file_path).await
     }
@@ -164,7 +191,7 @@ impl Database {
         // Same process-wide setup as the file-backed path: without it this
         // pool's connection would have no `ferrofin_random()` and every
         // random-ordered query would fail with "no such function".
-        configure_sqlite_for_concurrency();
+        init_sqlite();
         let options = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -173,14 +200,19 @@ impl Database {
         // Reader and writer are the SAME 1-connection pool: a second pool
         // would open its own, empty in-memory database.
         let writer = pool.clone();
+        let snapshotter = pool.clone();
         Ok(Self {
             pool,
             writer,
+            snapshotter,
+            maintenance: Arc::default(),
+            rows: Arc::new(crate::row_cache::RowCache::new()),
             file_path: None,
         })
     }
 
-    /// Builds the reader + writer pools from fully-formed connect options.
+    /// Builds the reader, writer and snapshot pools from fully-formed connect
+    /// options.
     ///
     /// `pool_size` `None` selects [`default_pool_size`] for the reader pool;
     /// the writer pool is always exactly one connection (SQLite allows one
@@ -194,6 +226,9 @@ impl Database {
         file_path: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         let max_connections = pool_size.unwrap_or_else(default_pool_size);
+        let snapshotter = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(read_options.clone());
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .connect_with(read_options)
@@ -213,6 +248,9 @@ impl Database {
         Ok(Self {
             pool,
             writer,
+            snapshotter,
+            maintenance: Arc::default(),
+            rows: Arc::new(crate::row_cache::RowCache::new()),
             file_path,
         })
     }
@@ -230,10 +268,16 @@ impl Database {
         // this pass is then a no-op. It remains the real migration path for
         // the in-memory test database, whose single shared connection cannot
         // go stale.
-        if let Some(path) = &self.file_path {
-            let mut conn = self.writer.acquire().await?;
-            backup_before_rebuild(&mut conn, path).await?;
-        }
+        // No foreign-key check here before the snapshot is deleted: a
+        // file-backed database reaches this point already migrated and checked,
+        // so it has nothing pending and gets no snapshot.
+        let snapshot = match &self.file_path {
+            Some(path) => {
+                let mut conn = self.writer.acquire().await?;
+                backup_before_migrations(&mut conn, path).await?
+            }
+            None => None,
+        };
         // One-time on the fresh/upgrade path: which schema head we brought the DB
         // to. `MIGRATOR.run` is idempotent, so this logs the target head, not
         // necessarily a newly-applied set.
@@ -256,6 +300,9 @@ impl Database {
                 .await?;
             run?;
             crate::normalized_usernames::repair(&mut conn).await?;
+        }
+        if let Some(snapshot) = snapshot {
+            discard_snapshot(&snapshot);
         }
         tracing::info!(
             migrations = MIGRATOR.iter().count(),
@@ -281,6 +328,85 @@ impl Database {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Turns on this handle's cross-request row caches ([`crate::row_cache`]), for every clone,
+    /// with entries kept for `ttl` ([`crate::row_cache::ROW_CACHE_TTL`] by default). The
+    /// composition root does, once; until then every read goes to the database.
+    pub fn enable_row_cache(&self, ttl: std::time::Duration) {
+        self.rows.enable(ttl);
+    }
+
+    /// Whether [`Database::enable_row_cache`] has run.
+    #[must_use]
+    pub fn row_cache_enabled(&self) -> bool {
+        self.rows.enabled()
+    }
+
+    /// A user's `Permissions` and `Preferences` rows, from the cross-request cache or, on a miss,
+    /// the database ([`crate::row_cache`]).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if a read fails.
+    pub async fn user_policy(
+        &self,
+        user_id: &str,
+    ) -> Result<Arc<crate::row_cache::UserPolicyRows>> {
+        if let Some(hit) = self.rows.policy(user_id) {
+            return Ok(hit);
+        }
+        let generation = self.rows.policy_generation();
+        let permissions =
+            sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Permissions" WHERE "UserId" = ?"#)
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let preferences =
+            sqlx::query_as(r#"SELECT "Kind", "Value" FROM "Preferences" WHERE "UserId" = ?"#)
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let rows = crate::row_cache::UserPolicyRows {
+            permissions,
+            preferences,
+        };
+        Ok(self.rows.put_policy(generation, user_id, rows))
+    }
+
+    /// Drops `user_id`'s cached policy rows. Called after a committed write to that user's
+    /// `Permissions`, `Preferences` or `Users` row.
+    pub fn invalidate_user_policy(&self, user_id: &str) {
+        self.rows.invalidate_policy(Some(user_id));
+    }
+
+    /// Drops every user's cached policy rows, after a write that touched several users.
+    pub fn invalidate_all_user_policies(&self) {
+        self.rows.invalidate_policy(None);
+    }
+
+    /// The cached library set, when one is live ([`crate::row_cache`]).
+    #[must_use]
+    pub fn cached_libraries(&self) -> Option<Arc<crate::row_cache::LibrarySet>> {
+        self.rows.libraries()
+    }
+
+    /// Starts reading the library set: take it before reading the rows and options, and
+    /// [`store`](crate::row_cache::LibraryLoad::store) what was read. While it is held, any item
+    /// write keeps what it read out of the cache.
+    pub fn begin_library_load(&self) -> crate::row_cache::LibraryLoad<'_> {
+        self.rows.begin_library_load()
+    }
+
+    /// Drops the cached library set. Called after a committed write that adds, removes, renames
+    /// or edits a library, its row or its options.
+    pub fn invalidate_libraries(&self) {
+        self.rows.invalidate_libraries();
+    }
+
+    /// Called after a committed write to the `BaseItems` rows `ids` (stored GUID form): drops the
+    /// cached library set if one of them is a library row.
+    pub fn note_items_written<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        self.rows.note_items_written(ids);
     }
 
     /// Counts library items grouped by their stored (C#) `Type` name.
@@ -337,10 +463,14 @@ impl Database {
         Ok(())
     }
 
-    /// A display-preferences row's `HomeSection` children, ordered by `Order`.
+    /// A display-preferences row's `HomeSection` children, ordered by `Order`,
+    /// then `Id`.
     ///
     /// Stands in for EF's `.Include(e => e.HomeSections)` eager-load, which the
-    /// flat `sqlx` seam has no equivalent for.
+    /// flat `sqlx` seam has no equivalent for. A Jellyfin database holds several
+    /// rows per `Order` (upstream's save never deletes the old ones), loaded in
+    /// `Id` order, so the newest comes last and wins where a caller keys them by
+    /// `Order`, as upstream's `GET /DisplayPreferences` does.
     ///
     /// # Errors
     ///
@@ -353,7 +483,7 @@ impl Database {
             r#"SELECT "Id", "DisplayPreferencesId", "Order", "Type"
                FROM "HomeSection"
                WHERE "DisplayPreferencesId" = ?1
-               ORDER BY "Order""#,
+               ORDER BY "Order", "Id""#,
         )
         .bind(display_preferences_id)
         .fetch_all(&self.pool)
@@ -581,6 +711,37 @@ impl Database {
         Ok(out)
     }
 
+    /// The `OriginalLanguage` of each of `ids` that has one, as `(Id,
+    /// OriginalLanguage)` pairs in the stored GUID form.
+    ///
+    /// One query for a page of episodes, whose default audio stream follows
+    /// `GetInheritedOriginalLanguage()` — the SERIES' original language when
+    /// the episode has none of its own (v12.2
+    /// MediaBrowser.Controller/Entities/TV/Episode.cs:157-160).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails.
+    pub async fn item_original_languages(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                r#"SELECT "Id", "OriginalLanguage" FROM "BaseItems"
+                   WHERE "Id" IN ({placeholders}) AND "OriginalLanguage" IS NOT NULL"#,
+            );
+            let mut query = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
+            for id in chunk {
+                query = query.bind(id);
+            }
+            out.extend(query.fetch_all(self.pool()).await?);
+        }
+        Ok(out)
+    }
+
     /// How many alternate-version rows point at each of `primary_ids` through
     /// `PrimaryVersionId`, keyed by the primary's id in its stored (uppercase,
     /// hyphenated) GUID form. Primaries with no alternate are absent.
@@ -712,8 +873,9 @@ impl Database {
 
     /// `Playlist.OwnerUserId` of each of the playlists among `ids` (stored
     /// GUID form) that has an owner: `(PlaylistId, OwnerUserId)` from
-    /// `FerrofinPlaylists`. A playlist with no owner (made through an API key)
-    /// and an id that is no playlist are absent.
+    /// `FerrofinPlaylists`. A playlist with no owner (an older build's
+    /// user-less API-key create, or a `Data` naming none) and an id that is
+    /// no playlist are absent.
     ///
     /// # Errors
     ///
@@ -777,6 +939,31 @@ impl Database {
         }))
     }
 
+    /// Whether Jellyfin's `__EFMigrationsHistory` records `migration_id`, i.e.
+    /// Jellyfin already ran that routine here before Ferrofin adopted the
+    /// database. Always `false` on a Ferrofin-native database, which has no
+    /// such table (adoption keeps it untouched).
+    ///
+    /// # Errors
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the query fails.
+    pub async fn jellyfin_migration_applied(&self, migration_id: &str) -> Result<bool> {
+        let exists: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '__EFMigrationsHistory'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        if exists.is_none() {
+            return Ok(false);
+        }
+        let applied: Option<i64> = sqlx::query_scalar(
+            r#"SELECT 1 FROM "__EFMigrationsHistory" WHERE "MigrationId" = ?1 LIMIT 1"#,
+        )
+        .bind(migration_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(applied.is_some())
+    }
+
     /// Plants an adoption record as the gate would — for tests of the boot
     /// repairs that key on it (an in-memory database never goes through the
     /// gate).
@@ -824,7 +1011,23 @@ impl Database {
         &self.writer
     }
 
-    /// Closes both pools, waiting for checked-out connections to be returned.
+    /// Checks that a reader connection can be had and answers a query: the
+    /// `/health` and `/health/ready` probe (upstream
+    /// `DbContextFactoryHealthCheck`, which asks `CanConnectAsync`). It never
+    /// touches the writer, so a long write cannot fail it. It waits at most
+    /// the reader pool's acquire timeout, which is not set here (sqlx's
+    /// default, 30 s).
+    ///
+    /// # Errors
+    ///
+    /// Returns the error when no connection can be acquired (the pool is
+    /// closed, or saturated past its acquire timeout) or the query fails.
+    pub async fn can_connect(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Closes every pool, waiting for checked-out connections to be returned.
     ///
     /// The composition root calls this when a server lifetime ends so that an
     /// in-process restart reopens the file with NO connection from the previous
@@ -833,6 +1036,7 @@ impl Database {
     pub async fn close(&self) {
         self.pool.close().await;
         self.writer.close().await;
+        self.snapshotter.close().await;
     }
 
     /// Whether [`Database::close`] has run.
@@ -847,15 +1051,44 @@ impl Database {
     /// WAL-mode database, which a checkpoint can tear mid-read. `dest` must not
     /// exist.
     ///
+    /// It runs on the snapshot pool's one connection. `VACUUM INTO` needs only
+    /// a read transaction, and holding a writer or reader connection for the
+    /// whole copy would queue every write behind it (the writer pool has one
+    /// connection) or, on a one-connection reader pool, every read. The cost
+    /// is a WAL that cannot be checkpointed back to empty until the snapshot's
+    /// read transaction ends, so the copy waits for, and then holds, the
+    /// maintenance turn ([`Database::try_maintenance_turn`]).
+    ///
     /// # Errors
     /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the statement fails
     /// (including when `dest` already exists).
     pub async fn snapshot_to(&self, dest: &std::path::Path) -> Result<()> {
-        let dest = dest.to_string_lossy().replace('\'', "''");
-        sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{dest}'")))
-            .execute(&self.writer)
+        let _turn = if let Ok(turn) = Arc::clone(&self.maintenance).try_lock_owned() {
+            turn
+        } else {
+            // A vacuum of a large database can take minutes: say why the
+            // backup is not copying yet.
+            tracing::info!("database snapshot waiting for database maintenance to finish");
+            Arc::clone(&self.maintenance).lock_owned().await
+        };
+        sqlx::query(sqlx::AssertSqlSafe(vacuum_into(dest)))
+            .execute(&self.snapshotter)
             .await?;
         Ok(())
+    }
+
+    /// The database's maintenance turn when it is free, `None` while a
+    /// snapshot or another maintenance pass holds it. A vacuum and a truncating checkpoint
+    /// (`OptimizeDatabaseTask`) take it for their whole pass, and
+    /// [`Database::snapshot_to`] waits for it. A snapshot holds a read
+    /// transaction for the whole copy. A truncating checkpoint would wait
+    /// for that read through the busy timeout while holding the one writer,
+    /// and every write would queue behind it. A vacuum would grow the WAL
+    /// by the database's size, which no checkpoint can reclaim until the
+    /// snapshot ends.
+    #[must_use]
+    pub fn try_maintenance_turn(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        Arc::clone(&self.maintenance).try_lock_owned().ok()
     }
 
     /// Snapshots a file-backed database once, before a boot repair rewrites
@@ -866,17 +1099,32 @@ impl Database {
     /// in-memory database or when that snapshot already exists (an earlier
     /// boot's, the file as it was before the first attempt).
     ///
+    /// The snapshot is written under a temporary name and only renamed into
+    /// place once it is complete and on disk ([`publish_snapshot`]), so an
+    /// existing one is never a copy a full disk or a kill cut short. Something
+    /// other than a file on the snapshot's name (a directory) is no snapshot:
+    /// the rename onto it fails, and so does the repair, rather than run with
+    /// none.
+    ///
     /// # Errors
-    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the snapshot fails.
+    /// Returns [`DbError::Sqlx`](crate::DbError::Sqlx) if the snapshot fails,
+    /// or [`DbError::Backup`](crate::DbError::Backup) if it cannot be flushed
+    /// or renamed into place.
     pub async fn snapshot_once(&self, extension: &str) -> Result<Option<std::path::PathBuf>> {
         let Some(path) = &self.file_path else {
             return Ok(None);
         };
         let backup = path.with_extension(extension);
-        if backup.exists() {
+        if backup.is_file() {
+            log_kept_snapshot(&backup);
             return Ok(None);
         }
-        self.snapshot_to(&backup).await?;
+        let partial = start_snapshot(&backup)?;
+        let written = match self.snapshot_to(&partial).await {
+            Ok(()) => publish_snapshot(&partial, &backup),
+            Err(error) => Err(error),
+        };
+        abandon_on_error(&partial, written)?;
         Ok(Some(backup))
     }
 }
@@ -1167,8 +1415,8 @@ pub struct JellyfinGeneration {
 /// generation already has; `0030` (the `NormalizedUsername` column and index)
 /// is baselined wherever the database already owns it, `0032` (the 12.0
 /// shape) for 12.0, 12.1 and 12.2, and `0040` (12.2's partial `OwnerId`
-/// indexes) for 12.2 only. `0031`, `0033`, `0034`, `0039`, `0041` and `0042` are
-/// never baselined: they are data-only or Ferrofin-side convergence and must run
+/// indexes) for 12.2 only. `0031`, `0033`, `0034`, `0039`, `0041`, `0042` and
+/// `0043` are never baselined: they are data-only or Ferrofin-side convergence and must run
 /// on every path, as must the Ferrofin-own `0035`–`0038`. A 12.x generation
 /// matches both an upgraded install and a fresh one (see
 /// [`JellyfinGeneration::optional_ids`]); `0041` gives a fresh install the one
@@ -1337,16 +1585,13 @@ async fn adopt_jellyfin_database(
         return Err(unsupported_generation(&applied));
     };
 
-    // One-time safety copy, WAL folded in first so the file is complete.
-    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&mut *conn)
-        .await?;
+    // One-time safety copy. An earlier boot's is kept: it is complete, and it
+    // is the file as that boot found it.
     let backup = path.with_extension("db.pre-ferrofin");
-    if !backup.exists() {
-        std::fs::copy(path, &backup).map_err(|source| crate::DbError::Backup {
-            path: backup.display().to_string(),
-            source,
-        })?;
+    if backup.is_file() {
+        log_kept_snapshot(&backup);
+    } else {
+        copy_database_file(conn, path, &backup).await?;
     }
 
     // Baseline + adoption record, atomically: a crash between the two would
@@ -1410,65 +1655,263 @@ const ADOPTION_TABLE_DDL: &str = r#"CREATE TABLE IF NOT EXISTS "FerrofinAdoption
 )"#;
 
 /// The migrations that rebuild Jellyfin-owned tables (the 12-step SQLite
-/// table-rebuild dance): `0007` (10.11.8 shape) and `0032` (12.0 shape). Each
-/// gets a file snapshot before it first applies — see [`backup_before_rebuild`].
-const REBUILD_MIGRATIONS: &[i64] = &[7, 32];
+/// table-rebuild dance): `0007` (10.11.8 shape) and `0032` (12.0 shape), plus
+/// `0044`, which deletes the rows of deleted users outright. The snapshot taken
+/// before one of them first applies is kept for good — see
+/// [`backup_before_migrations`].
+const REBUILD_MIGRATIONS: &[i64] = &[7, 32, 44];
 
-/// Snapshots the database file before a table-rebuilding migration first
-/// applies.
+/// Snapshots the database file before the migration chain applies anything,
+/// and returns the snapshot the caller deletes once the boot has passed.
 ///
-/// A rebuild drops and recreates `BaseItems`/`Users`/… — the riskiest thing a
-/// migration does (one such rebuild once cascade-deleted every user's data,
-/// `cbc983f`) — so an existing file-backed database is copied aside once
-/// (`<db>.pre-00NN`, for the highest [`REBUILD_MIGRATIONS`] entry not yet
-/// recorded) before it runs. Fresh databases (no `_sqlx_migrations` yet) and
-/// databases already past every rebuild are left alone.
-async fn backup_before_rebuild(
+/// Jellyfin copies its database aside whenever a migration is pending and
+/// deletes the copy once they all applied
+/// (`JellyfinMigrationService.PrepareSystemForMigration` and
+/// `CleanupSystemAfterMigration`). So does this, on an existing file-backed
+/// database (a fresh one, with no `_sqlx_migrations` yet, has nothing to keep):
+/// - Before a [`REBUILD_MIGRATIONS`] entry, the riskiest thing a migration does
+///   (one such rebuild once cascade-deleted every user's data, `cbc983f`), the
+///   copy is kept for good as the way back: `<db>.pre-00NN`, named after the
+///   first one still to run, so it is the file as it was before any of them
+///   touched it. A copy that cannot be written refuses the open.
+/// - Otherwise the copy is `<db>.pre-<first pending version>`, returned for the
+///   caller to delete once this boot's migrations and [`foreign_key_check`]
+///   passed; a boot that fails keeps it. Upstream stops its startup when that
+///   copy fails; this only warns, so a full disk never blocks an upgrade (owner
+///   decision, 2026-10-25).
+///
+/// The first attempt wins: an existing snapshot of that name is kept as an
+/// earlier boot left it (complete, see [`publish_snapshot`]), because a retry
+/// after a boot that committed part of the chain must not replace the file as
+/// it was before it. A boot that keeps failing therefore writes one copy, not
+/// one per attempt.
+async fn backup_before_migrations(
     conn: &mut sqlx::SqliteConnection,
     path: &std::path::Path,
-) -> Result<()> {
+) -> Result<Option<std::path::PathBuf>> {
     let has_history: Option<i64> = sqlx::query_scalar(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
     )
     .fetch_optional(&mut *conn)
     .await?;
     if has_history.is_none() {
-        return Ok(()); // fresh database — nothing worth snapshotting
+        return Ok(None); // fresh database — nothing worth snapshotting
     }
-    // Name the snapshot after the FIRST rebuild that will run: that is the
-    // file as it was before any rebuild touched it, which is the one to
-    // restore from.
-    let mut pending: Option<i64> = None;
-    for &version in REBUILD_MIGRATIONS {
-        let applied: Option<i64> =
-            sqlx::query_scalar("SELECT 1 FROM \"_sqlx_migrations\" WHERE version = ?1")
-                .bind(version)
-                .fetch_optional(&mut *conn)
-                .await?;
-        if applied.is_none() {
-            pending = Some(version);
-            break;
+    let applied: std::collections::HashSet<i64> =
+        sqlx::query_scalar(r#"SELECT version FROM "_sqlx_migrations""#)
+            .fetch_all(&mut *conn)
+            .await?
+            .into_iter()
+            .collect();
+    let Some(first) = MIGRATOR
+        .iter()
+        .map(|m| m.version)
+        .find(|version| !applied.contains(version))
+    else {
+        return Ok(None);
+    };
+    let rebuild = REBUILD_MIGRATIONS
+        .iter()
+        .copied()
+        .find(|version| !applied.contains(version));
+    let version = rebuild.unwrap_or(first);
+    let backup = path.with_extension(format!("db.pre-{version:04}"));
+    if backup.is_file() {
+        log_kept_snapshot(&backup);
+        return Ok(None);
+    }
+    match copy_database_file(conn, path, &backup).await {
+        Ok(()) if rebuild.is_some() => {
+            tracing::info!(
+                backup = %backup.display(),
+                migration = version,
+                "database snapshot taken before a table-rebuilding or row-deleting migration"
+            );
+            Ok(None)
+        }
+        Ok(()) => {
+            tracing::info!(
+                backup = %backup.display(),
+                migration = version,
+                "database snapshot taken before migrating"
+            );
+            Ok(Some(backup))
+        }
+        Err(error) if rebuild.is_some() => Err(error),
+        Err(error) => {
+            // Nothing was on the name before this attempt, so a file there now
+            // is a copy whose rename went through before a later step failed;
+            // nothing would ever delete it.
+            if backup.is_file() {
+                let _ = std::fs::remove_file(&backup);
+            }
+            tracing::warn!(
+                backup = %backup.display(),
+                migration = version,
+                error = %error,
+                "could not snapshot the database before migrating; migrating without that copy"
+            );
+            Ok(None)
         }
     }
-    let Some(version) = pending else {
-        return Ok(());
-    };
-    // Fold the WAL into the main file so a plain file copy is a complete,
-    // consistent snapshot (startup: no other writers yet).
-    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&mut *conn)
-        .await?;
-    let backup = path.with_extension(format!("db.pre-{version:04}"));
-    std::fs::copy(path, &backup).map_err(|source| crate::DbError::Backup {
+}
+
+/// Deletes the snapshot [`backup_before_migrations`] took for this boot, once
+/// the migrations and the integrity check passed, as Jellyfin's
+/// `CleanupSystemAfterMigration` does. A file that will not go is left for the
+/// operator, with a warning.
+fn discard_snapshot(snapshot: &std::path::Path) {
+    match std::fs::remove_file(snapshot) {
+        Ok(()) => tracing::info!(
+            backup = %snapshot.display(),
+            "database migrated: deleted the snapshot taken before it"
+        ),
+        Err(error) => tracing::warn!(
+            backup = %snapshot.display(),
+            error = %error,
+            "database migrated, but the snapshot taken before it could not be deleted"
+        ),
+    }
+}
+
+/// Copies the database file to `backup`, on the migration connection before
+/// the pools open.
+///
+/// The write-ahead log is folded into the main file first, so a byte-for-byte
+/// copy is complete. That checkpoint cannot finish while another process holds
+/// a read transaction on the file (Jellyfin still running on it, a database
+/// browser, the previous pod of a rolling update): `wal_checkpoint` then
+/// reports itself busy instead of failing, and a file copy would miss the
+/// commits still in the log. The copy is then a `VACUUM INTO`, which reads one
+/// consistent view, log included, and waits for no other process; a warning
+/// says why. Refusing the boot instead could leave a rolling update waiting
+/// forever on a pod that never becomes ready (owner decision, 2026-10-25).
+async fn copy_database_file(
+    conn: &mut sqlx::SqliteConnection,
+    path: &std::path::Path,
+    backup: &std::path::Path,
+) -> Result<()> {
+    let partial = start_snapshot(backup)?;
+    let written = async {
+        // (busy, frames in the log, frames checkpointed); both counts are -1
+        // when the database is not in WAL mode.
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_one(&mut *conn)
+                .await?;
+        if busy == 0 && log == checkpointed {
+            std::fs::copy(path, &partial).map_err(|source| crate::DbError::Backup {
+                path: backup.display().to_string(),
+                source,
+            })?;
+        } else {
+            tracing::warn!(
+                database = %path.display(),
+                backup = %backup.display(),
+                log_frames = log,
+                checkpointed_frames = checkpointed,
+                "another process has the database open, so its write-ahead log could not be folded in: copying it with VACUUM INTO instead"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(vacuum_into(&partial)))
+                .execute(&mut *conn)
+                .await?;
+        }
+        publish_snapshot(&partial, backup)
+    }
+    .await;
+    abandon_on_error(&partial, written)
+}
+
+/// The temporary name a snapshot is written under until it is complete
+/// (`backup` with `.partial` appended), after removing whatever an earlier,
+/// interrupted attempt left there.
+fn start_snapshot(backup: &std::path::Path) -> Result<std::path::PathBuf> {
+    let mut partial = backup.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
+    // Removed, or nothing there: either way the name is free.
+    match std::fs::remove_file(&partial) {
+        Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+            Err(crate::DbError::Backup {
+                path: partial.display().to_string(),
+                source,
+            })
+        }
+        _ => Ok(partial),
+    }
+}
+
+/// Gives a complete snapshot its name: flushes `partial` to disk (SQLite does
+/// not sync a `VACUUM INTO` file, and a plain copy sits in the page cache),
+/// renames it to `backup` and flushes the directory, so the name survives a
+/// crash. Until then only `partial` exists, so a snapshot that a full disk or a
+/// kill cut short is never taken for a complete one: the next attempt removes
+/// it and starts over.
+fn publish_snapshot(partial: &std::path::Path, backup: &std::path::Path) -> Result<()> {
+    let failed = |source| crate::DbError::Backup {
         path: backup.display().to_string(),
         source,
-    })?;
+    };
+    // A handle opened for writing: Windows will not flush a read-only one.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(partial)
+        .and_then(|file| file.sync_all())
+        .map_err(failed)?;
+    std::fs::rename(partial, backup).map_err(failed)?;
+    sync_parent_dir(backup).map_err(failed)
+}
+
+/// Passes `written` through, removing the half-written `partial` first when
+/// it failed: a copy cut short by a full disk must not keep holding the space
+/// the migrations after it need.
+fn abandon_on_error(partial: &std::path::Path, written: Result<()>) -> Result<()> {
+    if written.is_err()
+        && let Err(error) = std::fs::remove_file(partial)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(
+            path = %partial.display(),
+            error = %error,
+            "could not remove a half-written database snapshot"
+        );
+    }
+    written
+}
+
+/// Flushes the directory holding `path`, so a rename into it survives a crash.
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Only Unix can open a directory to flush it; elsewhere the rename is left to
+/// the filesystem.
+#[cfg(not(unix))]
+fn sync_parent_dir(_: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Says that a snapshot an earlier boot took was kept, so the log never passes
+/// it off as a copy of the database as it is now. It is trusted by its name,
+/// even if it is another database's that was moved into this folder (owner
+/// decision, 2026-10-25).
+fn log_kept_snapshot(backup: &std::path::Path) {
     tracing::info!(
         backup = %backup.display(),
-        migration = version,
-        "database snapshot taken before a schema-rebuild migration"
+        "kept the database snapshot an earlier boot took; it is the file as that boot found it, not a copy taken now"
     );
-    Ok(())
+}
+
+/// The `VACUUM INTO` statement that writes a copy of the database to `dest`,
+/// its quotes doubled for the SQL string literal.
+fn vacuum_into(dest: &std::path::Path) -> String {
+    let dest = dest.to_string_lossy().replace('\'', "''");
+    format!("VACUUM INTO '{dest}'")
 }
 
 /// What a database file records about the migrations applied to it, as read
@@ -1505,6 +1948,8 @@ pub async fn inspect_migration_history(path: &std::path::Path) -> Result<Migrati
     if !path.try_exists().map_err(sqlx::Error::Io)? {
         return Ok(MigrationHistory::Missing);
     }
+    // On a set-up server this is the first SQLite open of the process.
+    init_sqlite();
     let mut conn = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
@@ -1572,17 +2017,57 @@ async fn applied_migration_count(conn: &mut sqlx::SqliteConnection) -> Result<i6
 /// crash window. The scan is **O(rows × foreign keys)** — measured at 0.14 s
 /// on a real 42k-item, 250 MB library — noise against a cold start.
 async fn foreign_key_check(conn: &mut sqlx::SqliteConnection) -> Result<()> {
-    let violations = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_all(&mut *conn)
-        .await?
-        .len();
-    if violations > 0 {
-        tracing::error!(
-            violations,
-            "foreign-key violations after migration — database integrity is compromised"
-        );
-        return Err(crate::DbError::MigrationIntegrity { violations });
+    // Rows of `foreign_key_check` are (table, rowid, parent, fkid); count them per table.
+    let rows: Vec<(String, String)> =
+        sqlx::query_as(r#"SELECT "table", "parent" FROM pragma_foreign_key_check"#)
+            .fetch_all(&mut *conn)
+            .await?;
+    if rows.is_empty() {
+        return Ok(());
     }
+    let mut per_table = std::collections::BTreeMap::<String, usize>::new();
+    for (table, parent) in &rows {
+        *per_table.entry(format!("{table} → {parent}")).or_default() += 1;
+    }
+    let tables = per_table
+        .iter()
+        .map(|(table, n)| format!("{table}: {n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(crate::DbError::MigrationIntegrity {
+        violations: rows.len(),
+        tables,
+    })
+}
+
+/// Logs what migration `0044` deleted: the rows of users that no longer exist
+/// and `AncestorIds` rows naming missing items, counted per table in the
+/// temporary table the migration leaves on this connection (present only on
+/// the boot that applied it). Drops that table.
+async fn log_dangling_row_cleanup(conn: &mut sqlx::SqliteConnection) -> Result<()> {
+    let present: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM temp.sqlite_master WHERE name = 'FerrofinDanglingRowCleanup'",
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if present.is_none() {
+        return Ok(());
+    }
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        r#"SELECT "Table", "Rows" FROM temp."FerrofinDanglingRowCleanup" WHERE "Rows" > 0"#,
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for (table, rows) in counts {
+        tracing::info!(
+            table,
+            rows,
+            "removed rows of a deleted user or item left behind by an earlier server"
+        );
+    }
+    sqlx::query(r#"DROP TABLE temp."FerrofinDanglingRowCleanup""#)
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 
@@ -1718,20 +2203,28 @@ const MMAP_SIZE_BYTES: i64 = 0x7FFF_0000;
 /// sort on the global PRNG mutex.
 ///
 /// Must run before the first connection is opened — `sqlite3_config` fails once
-/// SQLite has initialized, which is why this is a process-wide `Once` on the
-/// connect path rather than per-pool setup. A failure is not fatal: it means
-/// SQLite was already initialized and we keep the default behaviour.
-fn configure_sqlite_for_concurrency() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+/// SQLite has initialized, which is why this is a process-wide one-shot on the
+/// connect path rather than per-pool setup. Every path in this crate that opens
+/// SQLite calls it first, and the server calls it before anything else at boot;
+/// any new raw open (a `SqliteConnectOptions` connect) must call it first too.
+/// A failure is not fatal: SQLite was already initialized and keeps its default
+/// allocator bookkeeping, which is logged as a warning because it brings the
+/// capacity cliff back.
+///
+/// Returns whether `MEMSTATUS` was turned off (the answer of the first call).
+pub fn init_sqlite() -> bool {
+    static MEMSTATUS_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MEMSTATUS_OFF.get_or_init(|| {
         // SAFETY: `sqlite3_config` is only unsafe because it must not race with
-        // an initialized library or a live connection. The `Once` plus its
-        // placement before the first pool open give that ordering.
+        // an initialized library or a live connection. The `OnceLock` serializes
+        // callers of this function; ordering against other SQLite use rests on
+        // every opener calling it first, and `serve_once` calling it before any
+        // other boot work.
         let rc = unsafe {
             libsqlite3_sys::sqlite3_config(libsqlite3_sys::SQLITE_CONFIG_MEMSTATUS, 0_i32)
         };
         if rc != libsqlite3_sys::SQLITE_OK {
-            tracing::debug!(
+            tracing::warn!(
                 rc,
                 "sqlite3_config(MEMSTATUS, 0) declined — SQLite was already \
                  initialized; keeping default allocator bookkeeping"
@@ -1742,7 +2235,8 @@ fn configure_sqlite_for_concurrency() {
         // once that has happened.
         crate::sqlite_random::register_random_function();
         crate::sqlite_casing::register();
-    });
+        rc == libsqlite3_sys::SQLITE_OK
+    })
 }
 
 #[cfg(test)]
@@ -1779,6 +2273,333 @@ mod tests {
         assert_eq!(
             memory.snapshot_once("db.pre-rehome").await.expect("memory"),
             None
+        );
+    }
+
+    /// An existing repair snapshot is kept as an earlier boot left it, and
+    /// something other than a file on its name fails the repair instead of
+    /// letting it run with no snapshot.
+    #[tokio::test]
+    async fn a_repair_snapshot_keeps_an_earlier_one_and_refuses_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let db = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrate");
+        let earlier = dir.path().join("jellyfin.db.pre-rehome");
+        std::fs::write(&earlier, b"an earlier boot's snapshot").expect("earlier");
+        assert_eq!(db.snapshot_once("db.pre-rehome").await.expect("kept"), None);
+        assert!(
+            std::fs::read(&earlier).expect("read") == b"an earlier boot's snapshot",
+            "an earlier boot's snapshot is left as it was"
+        );
+
+        std::fs::create_dir(dir.path().join("jellyfin.db.pre-harmonize")).expect("squat");
+        let err = db
+            .snapshot_once("db.pre-harmonize")
+            .await
+            .expect_err("a directory is no snapshot");
+        assert!(
+            matches!(&err, crate::DbError::Backup { path, .. } if path.ends_with("jellyfin.db.pre-harmonize")),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.path()
+                .join("jellyfin.db.pre-harmonize.partial")
+                .exists()
+        );
+    }
+
+    /// A kill during a repair snapshot leaves a truncated file, but only under
+    /// its temporary name: the final name is given to complete snapshots only,
+    /// so the next attempt is not fooled, removes the leftover and starts over.
+    #[tokio::test]
+    async fn an_interrupted_repair_snapshot_is_redone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let db = Database::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrate");
+        let partial = dir.path().join("jellyfin.db.pre-rehome.partial");
+        std::fs::write(&partial, b"SQLite format 3\0cut short").expect("leftover");
+
+        let written = db.snapshot_once("db.pre-rehome").await.expect("snapshot");
+        assert_eq!(written, Some(dir.path().join("jellyfin.db.pre-rehome")));
+        assert!(!partial.exists(), "the interrupted attempt is removed");
+        assert_eq!(
+            newest_migration(&dir.path().join("jellyfin.db.pre-rehome")).await,
+            MIGRATOR.iter().last().map(|m| m.version),
+            "the snapshot is a complete copy of the database"
+        );
+    }
+
+    /// The newest migration the database file at `path` records, read-only:
+    /// a file that opens and answers this is a complete database.
+    async fn newest_migration(path: &std::path::Path) -> Option<i64> {
+        use sqlx::ConnectOptions as _;
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .connect()
+            .await
+            .expect("open the snapshot");
+        let ok: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&mut conn)
+            .await
+            .expect("integrity_check");
+        assert_eq!(ok, "ok", "{} is not intact", path.display());
+        let newest = sqlx::query_scalar(r#"SELECT MAX(version) FROM "_sqlx_migrations""#)
+            .fetch_one(&mut conn)
+            .await
+            .expect("newest migration");
+        sqlx::Connection::close(conn).await.expect("close");
+        newest
+    }
+
+    /// A copy taken while another process holds a read transaction misses no
+    /// commit. The checkpoint cannot fold the write-ahead log into the file
+    /// then (it reports itself busy rather than failing), so a file copy would
+    /// lack the commit made after that reader began; the copy is a
+    /// `VACUUM INTO` instead.
+    #[tokio::test]
+    async fn a_copy_taken_while_another_process_reads_has_every_commit() {
+        use sqlx::ConnectOptions as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        // No busy timeout: the checkpoint gives up at once instead of after 30 s.
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::ZERO);
+        let mut conn = options.clone().connect().await.expect("connect");
+        sqlx::raw_sql("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .execute(&mut conn)
+            .await
+            .expect("seed");
+        let mut reader = options.connect().await.expect("reader");
+        sqlx::raw_sql("BEGIN; SELECT COUNT(*) FROM t;")
+            .execute(&mut reader)
+            .await
+            .expect("read transaction");
+        sqlx::query("INSERT INTO t VALUES (2)")
+            .execute(&mut conn)
+            .await
+            .expect("a commit the reader's view predates");
+        let (_, log, checkpointed): (i64, i64, i64) =
+            sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
+                .fetch_one(&mut conn)
+                .await
+                .expect("checkpoint");
+        assert!(log > checkpointed, "the reader keeps a commit in the WAL");
+
+        let backup = dir.path().join("jellyfin.db.pre-0007");
+        copy_database_file(&mut conn, &path, &backup)
+            .await
+            .expect("copy");
+        sqlx::raw_sql("COMMIT;")
+            .execute(&mut reader)
+            .await
+            .expect("end the read");
+
+        let mut copy = SqliteConnectOptions::new()
+            .filename(&backup)
+            .read_only(true)
+            .connect()
+            .await
+            .expect("open the copy");
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM t")
+            .fetch_one(&mut copy)
+            .await
+            .expect("count");
+        assert_eq!(rows, 2, "the copy must hold the commit still in the WAL");
+        assert!(!dir.path().join("jellyfin.db.pre-0007.partial").exists());
+    }
+
+    /// Seeds a database file with every migration up to `last` applied and
+    /// recorded, with foreign keys off as on the real migration connection,
+    /// and returns its `sqlite://` url.
+    async fn seed_database_through(path: &std::path::Path, last: i64) -> String {
+        use sqlx::ConnectOptions as _;
+        use sqlx::migrate::Migrate as _;
+        init_sqlite(); // the chain calls Ferrofin's SQL functions (0031: `ferrofin_clean_value`)
+        let mut conn = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(false)
+            .connect()
+            .await
+            .expect("open seed db");
+        conn.ensure_migrations_table(&MIGRATOR.table_name)
+            .await
+            .expect("migrations table");
+        for m in MIGRATOR.iter().filter(|m| m.version <= last) {
+            sqlx::raw_sql(m.sql.clone())
+                .execute(&mut conn)
+                .await
+                .unwrap_or_else(|e| panic!("apply migration {}: {e}", m.version));
+            sqlx::query(
+                "INSERT INTO _sqlx_migrations \
+                 (version, description, installed_on, success, checksum, execution_time) \
+                 VALUES (?1, ?2, CURRENT_TIMESTAMP, TRUE, ?3, 0)",
+            )
+            .bind(m.version)
+            .bind(&*m.description)
+            .bind(&*m.checksum)
+            .execute(&mut conn)
+            .await
+            .expect("record migration");
+        }
+        sqlx::Connection::close(conn).await.expect("close");
+        format!("sqlite://{}", path.display())
+    }
+
+    /// The newest migration and the one before it: an upgrade from the second
+    /// to the first has no table rebuild to run.
+    fn last_two_migrations() -> (i64, i64) {
+        let versions: Vec<i64> = MIGRATOR.iter().map(|m| m.version).collect();
+        let [.., previous, head] = versions[..] else {
+            panic!("the chain has two migrations");
+        };
+        assert!(
+            REBUILD_MIGRATIONS
+                .iter()
+                .all(|&rebuild| rebuild <= previous),
+            "the newest migration is a table rebuild, so no upgrade through the real chain \
+             takes the snapshot these tests check: they need another way in"
+        );
+        (previous, head)
+    }
+
+    /// Jellyfin snapshots its database before any pending migration, not only
+    /// before a table rebuild, so a boot whose migrations end in a refused open
+    /// always leaves a copy to restore: here an upgrade that runs only the
+    /// newest migration, then fails the foreign-key check.
+    #[tokio::test]
+    async fn a_failed_upgrade_keeps_a_snapshot_even_without_a_rebuild() {
+        use sqlx::ConnectOptions as _;
+        let (previous, head) = last_two_migrations();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let url = seed_database_through(&path, previous).await;
+        let mut conn = SqliteConnectOptions::from_str(&url)
+            .expect("options")
+            .foreign_keys(false)
+            .connect()
+            .await
+            .expect("connect with enforcement off");
+        sqlx::query(
+            r#"INSERT INTO "BaseItemProviders" ("ItemId","ProviderId","ProviderValue")
+               VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff','Tmdb','1')"#,
+        )
+        .execute(&mut conn)
+        .await
+        .expect("plant a provider id whose item does not exist");
+        sqlx::Connection::close(conn).await.expect("close");
+
+        let err = Database::connect_sized(&url, Some(1))
+            .await
+            .expect_err("a foreign-key violation must refuse the open");
+        assert!(
+            matches!(err, crate::DbError::MigrationIntegrity { .. }),
+            "unexpected error: {err}"
+        );
+        let snapshot = path.with_extension(format!("db.pre-{head:04}"));
+        assert_eq!(
+            newest_migration(&snapshot).await,
+            Some(previous),
+            "the snapshot is the database as it was before the upgrade"
+        );
+    }
+
+    /// Before an ordinary migration the copy is complete, named after the first
+    /// pending migration, and handed back for the caller to delete.
+    #[tokio::test]
+    async fn an_ordinary_migration_gets_a_snapshot_for_the_boot_to_delete() {
+        use sqlx::ConnectOptions as _;
+        let (previous, head) = last_two_migrations();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let url = seed_database_through(&path, previous).await;
+        let mut conn = SqliteConnectOptions::from_str(&url)
+            .expect("options")
+            .journal_mode(SqliteJournalMode::Wal)
+            .connect()
+            .await
+            .expect("connect");
+
+        let snapshot = backup_before_migrations(&mut conn, &path)
+            .await
+            .expect("snapshot");
+        sqlx::Connection::close(conn).await.expect("close");
+        let expected = path.with_extension(format!("db.pre-{head:04}"));
+        assert_eq!(snapshot.as_deref(), Some(expected.as_path()));
+        assert_eq!(
+            newest_migration(&expected).await,
+            Some(previous),
+            "the snapshot is the database before the pending migration"
+        );
+    }
+
+    /// Like Jellyfin's, the snapshot before an ordinary migration is deleted
+    /// once the boot has passed, so upgrades do not pile copies up. (That one
+    /// is taken at all is
+    /// `an_ordinary_migration_gets_a_snapshot_for_the_boot_to_delete`'s and
+    /// `a_failed_upgrade_keeps_a_snapshot_even_without_a_rebuild`'s to show.)
+    #[tokio::test]
+    async fn an_upgrade_that_passes_deletes_its_snapshot() {
+        let (previous, head) = last_two_migrations();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let url = seed_database_through(&path, previous).await;
+
+        let db = Database::connect_sized(&url, Some(1))
+            .await
+            .expect("upgrade");
+        let at: i64 = sqlx::query_scalar(r#"SELECT MAX(version) FROM "_sqlx_migrations""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("version");
+        assert_eq!(at, head, "migrated to head");
+        let snapshot = path.with_extension(format!("db.pre-{head:04}"));
+        assert!(!snapshot.exists(), "the snapshot is deleted after the boot");
+        assert!(
+            !path
+                .with_extension(format!("db.pre-{head:04}.partial"))
+                .exists()
+        );
+    }
+
+    /// The snapshot before an ordinary migration is an extra: one that cannot
+    /// be written (a full disk; here a directory squatting on its name) warns
+    /// and lets the upgrade go on, unlike the one kept before a table rebuild
+    /// (owner decision, 2026-10-25).
+    #[tokio::test]
+    async fn an_unwritable_snapshot_before_an_ordinary_migration_does_not_stop_the_upgrade() {
+        let (previous, head) = last_two_migrations();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let url = seed_database_through(&path, previous).await;
+        let squatter = path.with_extension(format!("db.pre-{head:04}"));
+        std::fs::create_dir(&squatter).expect("squat on the snapshot");
+
+        let db = Database::connect_sized(&url, Some(1))
+            .await
+            .expect("the upgrade goes on without the snapshot");
+        let at: i64 = sqlx::query_scalar(r#"SELECT MAX(version) FROM "_sqlx_migrations""#)
+            .fetch_one(db.pool())
+            .await
+            .expect("version");
+        assert_eq!(at, head, "migrated to head");
+        assert!(squatter.is_dir(), "the squatting directory is left alone");
+        assert!(
+            !path
+                .with_extension(format!("db.pre-{head:04}.partial"))
+                .exists(),
+            "the half-written copy does not keep holding the disk"
         );
     }
 
@@ -2373,6 +3194,54 @@ mod tests {
             .expect("version");
         assert_eq!(at, 6, "the schema must be untouched after a refused open");
         sqlx::Connection::close(conn).await.expect("close");
+        assert!(
+            !path.with_extension("db.pre-0007.partial").exists(),
+            "the half-written copy does not keep holding the disk"
+        );
+    }
+
+    /// A retried upgrade keeps the snapshot its first attempt took before the
+    /// table rebuilds: that attempt may have committed part of the chain, so
+    /// the file now is not the file as it was. Only a complete snapshot ever
+    /// has the final name, so keeping it is safe.
+    #[tokio::test]
+    async fn a_retried_upgrade_keeps_the_snapshot_its_first_attempt_took() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let url = seed_pre_0007_database(&path).await;
+        let first = path.with_extension("db.pre-0007");
+        std::fs::write(&first, b"the first attempt's copy").expect("an earlier snapshot");
+
+        Database::connect_sized(&url, Some(1))
+            .await
+            .expect("upgrade");
+        // `assert!`, not `assert_eq!`: a replaced snapshot is a whole database.
+        assert!(
+            std::fs::read(&first).expect("read") == b"the first attempt's copy",
+            "a retry must not replace the first attempt's snapshot"
+        );
+    }
+
+    /// The snapshot before a table rebuild is taken through its temporary
+    /// name: what an interrupted attempt left there is removed, and the
+    /// snapshot is the complete database as it was before the rebuild.
+    #[tokio::test]
+    async fn the_pre_rebuild_snapshot_is_complete_and_replaces_an_interrupted_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ferrofin.db");
+        let url = seed_pre_0007_database(&path).await;
+        let partial = path.with_extension("db.pre-0007.partial");
+        std::fs::write(&partial, b"SQLite format 3\0cut short").expect("leftover");
+
+        Database::connect_sized(&url, Some(1))
+            .await
+            .expect("upgrade");
+        assert!(!partial.exists(), "the interrupted attempt is removed");
+        assert_eq!(
+            newest_migration(&path.with_extension("db.pre-0007")).await,
+            Some(6),
+            "the snapshot is the database before 0007"
+        );
     }
 
     /// The seatbelt on the `foreign_keys = OFF` migration connection: a boot
@@ -2394,23 +3263,27 @@ mod tests {
             .connect()
             .await
             .expect("connect with enforcement off");
-        // `AccessSchedules`, not `Permissions`: 0032 ports 12.0's
-        // RemoveOrphanedUserPermissionsAndPreferences and would legitimately
-        // delete an orphaned permission row before the check ever saw it.
+        // A provider id of a missing item: no migration removes it (0044
+        // deletes only the rows of missing users and `AncestorIds` of missing
+        // items), so it reaches the check.
         sqlx::query(
-            r#"INSERT INTO "AccessSchedules" ("Id","DayOfWeek","EndHour","StartHour","UserId")
-               VALUES (99,0,23.0,1.0,'ffffffff-ffff-ffff-ffff-ffffffffffff')"#,
+            r#"INSERT INTO "BaseItemProviders" ("ItemId","ProviderId","ProviderValue")
+               VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff','Tmdb','1')"#,
         )
         .execute(&mut conn)
         .await
-        .expect("plant an access schedule whose user does not exist");
+        .expect("plant a provider id whose item does not exist");
         sqlx::Connection::close(conn).await.expect("close");
 
         let err = Database::connect_sized(&url, Some(1))
             .await
             .expect_err("a foreign-key violation after migrating must refuse the open");
         assert!(
-            matches!(err, crate::DbError::MigrationIntegrity { violations: 1 }),
+            matches!(
+                &err,
+                crate::DbError::MigrationIntegrity { violations: 1, tables }
+                    if tables == "BaseItemProviders → BaseItems: 1"
+            ),
             "unexpected error: {err}"
         );
     }
@@ -2552,6 +3425,42 @@ mod tests {
         }
     }
 
+    /// `jellyfin_migration_applied` reads Jellyfin's own history: false with no
+    /// `__EFMigrationsHistory` (a Ferrofin-native database) or for an id the
+    /// table does not hold, true for one it does.
+    #[rstest::rstest]
+    #[case::no_history_table(None, false)]
+    #[case::another_id(Some("20260910120000_MigrateRatingLevels"), false)]
+    #[case::recorded(Some("20260915120000_MigrateRatingLevels"), true)]
+    #[tokio::test]
+    async fn jellyfin_migration_applied_reads_the_ef_history(
+        #[case] recorded: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        let db = Database::connect_in_memory()
+            .await
+            .expect("in-memory connect");
+        if let Some(id) = recorded {
+            sqlx::query(
+                r#"CREATE TABLE "__EFMigrationsHistory" ("MigrationId" TEXT, "ProductVersion" TEXT)"#,
+            )
+            .execute(db.writer())
+            .await
+            .expect("history table");
+            sqlx::query(r#"INSERT INTO "__EFMigrationsHistory" VALUES (?1, '10.0.0')"#)
+                .bind(id)
+                .execute(db.writer())
+                .await
+                .expect("history row");
+        }
+        assert_eq!(
+            db.jellyfin_migration_applied("20260915120000_MigrateRatingLevels")
+                .await
+                .expect("history read"),
+            expected
+        );
+    }
+
     #[tokio::test]
     async fn in_memory_writer_and_reader_share_one_database() {
         let db = Database::connect_in_memory()
@@ -2653,6 +3562,12 @@ mod tests {
         sqlx::Connection::close(conn).await.expect("close");
     }
 
+    /// Every migration's version, in order. Not `1..=head`: the numbers may skip
+    /// one that an open change has taken and has not merged yet.
+    fn chain_versions() -> Vec<i64> {
+        MIGRATOR.iter().map(|m| m.version).collect()
+    }
+
     async fn recorded_versions(db: &Database) -> Vec<i64> {
         sqlx::query_scalar(r#"SELECT version FROM "_sqlx_migrations" ORDER BY version"#)
             .fetch_all(db.pool())
@@ -2698,10 +3613,11 @@ mod tests {
         assert!(by_name("12.0.0").baselined_versions.contains(&30));
         assert!(by_name("12.2.0").baselined_versions.contains(&30));
         // Retention (`0035`), intro skipper (`0036`–`0038`), the duplicate-index
-        // drop (`0039`), the fresh-install convergence (`0041`) and the orphan
-        // clean-up (`0042`) run on every path.
+        // drop (`0039`), the fresh-install convergence (`0041`), the orphan
+        // clean-up (`0042`) and the by-name `IsFolder` repair (`0043`) run on
+        // every path.
         for generation in &JELLYFIN_GENERATIONS {
-            for version in [35, 36, 37, 38, 39, 41, 42] {
+            for version in [35, 36, 37, 38, 39, 41, 42, 43] {
                 assert!(
                     !generation.baselined_versions.contains(&version),
                     "{}: {version:04} must run on every path",
@@ -2718,6 +3634,46 @@ mod tests {
         }
     }
 
+    /// A retried adoption keeps the `.pre-ferrofin` copy its first attempt
+    /// took, and one cut short (only ever under its temporary name) is redone.
+    #[tokio::test]
+    async fn a_retried_adoption_keeps_its_first_copy_and_redoes_an_interrupted_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture(&path, &JELLYFIN_10_11_8_MIGRATIONS).await;
+        let copy = path.with_extension("db.pre-ferrofin");
+        std::fs::write(&copy, b"the first attempt's copy").expect("an earlier copy");
+        let url = format!("sqlite://{}", path.display());
+        drop(Database::connect_sized(&url, Some(1)).await.expect("adopt"));
+        assert!(
+            std::fs::read(&copy).expect("read") == b"the first attempt's copy",
+            "a retry must not replace the first attempt's copy"
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        seed_jellyfin_fixture(&path, &JELLYFIN_10_11_8_MIGRATIONS).await;
+        let partial = path.with_extension("db.pre-ferrofin.partial");
+        std::fs::write(&partial, b"SQLite format 3\0cut short").expect("leftover");
+        let url = format!("sqlite://{}", path.display());
+        drop(Database::connect_sized(&url, Some(1)).await.expect("adopt"));
+        assert!(!partial.exists(), "the interrupted attempt is removed");
+        let ef_rows: i64 = {
+            use sqlx::ConnectOptions as _;
+            let mut conn = SqliteConnectOptions::new()
+                .filename(path.with_extension("db.pre-ferrofin"))
+                .read_only(true)
+                .connect()
+                .await
+                .expect("open the copy");
+            sqlx::query_scalar(r#"SELECT COUNT(*) FROM "__EFMigrationsHistory""#)
+                .fetch_one(&mut conn)
+                .await
+                .expect("the copy is the unadopted database")
+        };
+        assert_eq!(ef_rows, 68);
+    }
+
     #[tokio::test]
     async fn adopts_a_jellyfin_10_11_8_database_in_place() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2731,9 +3687,7 @@ mod tests {
 
         // Shape migrations baselined, everything else actually applied.
         let versions = recorded_versions(&db).await;
-        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
-        let recorded = i64::try_from(versions.len()).expect("small count");
-        assert_eq!(recorded, head, "every migration recorded");
+        assert_eq!(versions, chain_versions(), "every migration recorded");
         assert!(versions.contains(&7));
         assert!(versions.contains(&32) && versions.contains(&33));
         // 0032 EXECUTED here (the 10.11.8 shape had to be converged), so the
@@ -3664,8 +4618,7 @@ mod tests {
             .expect("adoption succeeds");
 
         let versions = recorded_versions(&db).await;
-        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
-        assert_eq!(i64::try_from(versions.len()).expect("small"), head);
+        assert_eq!(versions, chain_versions());
         assert!(versions.contains(&32), "0032 baselined");
         assert!(versions.contains(&33), "0033 executed");
         // 0032 was baselined, never run: no rebuild happened, no snapshot.
@@ -3817,11 +4770,7 @@ mod tests {
         let db = Database::connect_sized(&url, Some(2))
             .await
             .expect("boot after the crash completes the chain");
-        let head = MIGRATOR.iter().last().map_or(0, |m| m.version);
-        assert_eq!(
-            i64::try_from(recorded_versions(&db).await.len()).expect("small"),
-            head
-        );
+        assert_eq!(recorded_versions(&db).await, chain_versions());
         // No second adoption happened: no safety copy was taken by the gate.
         assert!(!path.with_extension("db.pre-ferrofin").exists());
         assert_eq!(
@@ -3920,8 +4869,9 @@ mod tests {
         .execute(db.pool())
         .await
         .expect("program insert under FK enforcement");
-        // The cascade works through the CORRECT target: deleting the tuner
-        // clears its channel, and the channel its programme.
+        // Deleting the tuner leaves its channel for the guide refresh to prune
+        // (0046), and the programme key cascades through the CORRECT target:
+        // deleting the channel clears its programme.
         sqlx::query(r#"DELETE FROM "FerrofinLiveTvTunerHosts" WHERE "Id" = 't-fk'"#)
             .execute(db.pool())
             .await
@@ -3932,8 +4882,19 @@ mod tests {
         )
         .fetch_one(db.pool())
         .await
+        .expect("tuner delete audit");
+        assert_eq!(left, 2, "a tuner's delete leaves its channel and programme");
+        sqlx::query(r#"DELETE FROM "FerrofinLiveTvChannels" WHERE "Id" = 'c-fk'"#)
+            .execute(db.pool())
+            .await
+            .expect("channel delete");
+        let left: i64 = sqlx::query_scalar(
+            r#"SELECT count(*) FROM "FerrofinLiveTvPrograms" WHERE "Id"='p-fk'"#,
+        )
+        .fetch_one(db.pool())
+        .await
         .expect("cascade audit");
-        assert_eq!(left, 0, "delete must cascade tuner → channel → programme");
+        assert_eq!(left, 0, "delete must cascade channel → programme");
     }
 
     #[tokio::test]

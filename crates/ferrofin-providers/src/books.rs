@@ -19,7 +19,8 @@
 //! its first page in name order (`ComicImageProvider`), or the EPUB's declared
 //! cover (`EpubImageProvider`).
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::Path;
 
@@ -32,19 +33,18 @@ use crate::xbmc::xml_reader::XmlCursor;
 /// (`ComicImageProvider._comicBookExtensions`).
 pub const COMIC_EXTENSIONS: [&str; 4] = ["cb7", "cbr", "cbt", "cbz"];
 
-/// The archive extensions this port can actually open — ZIP, and only ZIP.
-///
-/// `.cbr` is RAR, `.cb7` is 7z and `.cbt` is tar; none has a maintained
-/// pure-Rust reader worth a dependency for a cover image, so all three are
-/// recognized as comics (so the file is still a Book) but yield no embedded
-/// metadata or cover.
-const READABLE_ARCHIVE_EXTENSIONS: [&str; 1] = ["cbz"];
-
 /// The largest single archive entry this module will decompress into memory.
 ///
 /// A cover page or an OPF document is kilobytes; the cap is what stops a
 /// malicious `.cbz`/`.epub` from turning a scan into an OOM abort.
 const MAX_ARCHIVE_ENTRY_BYTES: u64 = 128 * 1024 * 1024;
+
+/// A tar block, the size of a tar header and of the head [`read_comic_cover`]
+/// sniffs the archive format from.
+const TAR_BLOCK_BYTES: usize = 512;
+
+/// A tar header's checksum field.
+const TAR_CHECKSUM_FIELD: std::ops::Range<usize> = 148..156;
 
 /// The image extensions a comic page may have, for the cover extractor.
 const PAGE_EXTENSIONS: [&str; 6] = ["png", "jpeg", "jpg", "webp", "bmp", "gif"];
@@ -226,14 +226,79 @@ fn read_comic_metadata(path: &str) -> Option<BookMetadata> {
 fn read_sidecar(path: &str, stem_extensions: &[&str], fixed_names: &[&str]) -> Option<String> {
     let file = Path::new(path);
     let dir = file.parent()?;
-    for extension in stem_extensions {
-        if let Ok(xml) = std::fs::read_to_string(file.with_extension(extension)) {
-            return Some(xml);
-        }
-    }
-    fixed_names
+    let bytes = stem_extensions
         .iter()
-        .find_map(|name| std::fs::read_to_string(dir.join(name)).ok())
+        .map(|extension| file.with_extension(extension))
+        .chain(fixed_names.iter().map(|name| dir.join(name)))
+        .find_map(|candidate| std::fs::read(candidate).ok())?;
+    decode_xml(&bytes)
+}
+
+/// Decodes an XML document as `XmlReader`/`XmlDocument.Load` do
+/// (`XmlTextReaderImpl.DetectEncoding`): a UTF-32 or UTF-16 byte-order mark,
+/// or a leading `<` in one of those encodings, picks the encoding; then a
+/// UTF-8 BOM; otherwise the `<?xml … encoding="…"?>` declaration does, and
+/// without one it is UTF-8. Bytes invalid in that encoding, or an unknown
+/// declared encoding, fail the read as `XmlException` does.
+///
+/// `encoding_rs` follows WHATWG labels, so a declared `ISO-8859-1` decodes as
+/// windows-1252; the two differ only in 0x80–0x9F (C1 controls upstream,
+/// punctuation here). The unusual-octet UCS-4 orders (2143, 3412) are not
+/// recognised and read as UTF-8.
+fn decode_xml(bytes: &[u8]) -> Option<String> {
+    use encoding_rs::{UTF_8, UTF_16BE, UTF_16LE};
+    // UTF-32LE's BOM and leading `<` start like UTF-16LE's, so they come first.
+    let (encoding, body) = match bytes {
+        [0xFF, 0xFE, 0x00, 0x00, rest @ ..] => return decode_utf32(rest, u32::from_le_bytes),
+        [0x00, 0x00, 0xFE, 0xFF, rest @ ..] => return decode_utf32(rest, u32::from_be_bytes),
+        [b'<', 0x00, 0x00, 0x00, ..] => return decode_utf32(bytes, u32::from_le_bytes),
+        [0x00, 0x00, 0x00, b'<', ..] => return decode_utf32(bytes, u32::from_be_bytes),
+        [0xFF, 0xFE, rest @ ..] => (UTF_16LE, rest),
+        [0xFE, 0xFF, rest @ ..] => (UTF_16BE, rest),
+        [b'<', 0x00, ..] => (UTF_16LE, bytes),
+        [0x00, b'<', ..] => (UTF_16BE, bytes),
+        [0xEF, 0xBB, 0xBF, rest @ ..] => (UTF_8, rest),
+        _ => match declared_xml_encoding(bytes) {
+            Some(label) => (encoding_rs::Encoding::for_label(label)?, bytes),
+            None => (UTF_8, bytes),
+        },
+    };
+    encoding
+        .decode_without_bom_handling_and_without_replacement(body)
+        .map(std::borrow::Cow::into_owned)
+}
+
+/// Strict UTF-32 in `unit`'s byte order (`encoding_rs` has none): an invalid
+/// code point or a partial unit fails the read.
+fn decode_utf32(bytes: &[u8], unit: fn([u8; 4]) -> u32) -> Option<String> {
+    let (units, tail) = bytes.as_chunks::<4>();
+    if !tail.is_empty() {
+        return None;
+    }
+    units
+        .iter()
+        .map(|&quad| char::from_u32(unit(quad)))
+        .collect()
+}
+
+/// The `encoding` label of a leading `<?xml … ?>` declaration, if it has one.
+/// A `<?xml-stylesheet …?>` instruction is not a declaration.
+fn declared_xml_encoding(bytes: &[u8]) -> Option<&[u8]> {
+    let declaration = bytes.strip_prefix(b"<?xml")?;
+    if !declaration.first()?.is_ascii_whitespace() {
+        return None;
+    }
+    let declaration = &declaration[..declaration.windows(2).position(|w| w == b"?>")?];
+    let key: &[u8] = b"encoding";
+    let at = declaration.windows(key.len()).position(|w| w == key)?;
+    let value = declaration[at + key.len()..]
+        .trim_ascii_start()
+        .strip_prefix(b"=")?
+        .trim_ascii_start();
+    let (&quote, value) = value
+        .split_first()
+        .filter(|(q, _)| matches!(q, b'"' | b'\''))?;
+    Some(&value[..value.iter().position(|&b| b == quote)?])
 }
 
 /// An EPUB's metadata: the OPF the container points at.
@@ -377,6 +442,7 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
     let mut titles: Vec<(Option<String>, String)> = Vec::new();
     let mut refinements: Vec<(String, String, String)> = Vec::new();
     let mut calibre_title_sort: Option<String> = None;
+    let mut first_seen = HashSet::new();
     let Ok(mut cursor) = XmlCursor::new(xml) else {
         return None;
     };
@@ -406,6 +472,7 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
                 &mut book,
                 &mut refinements,
                 &mut calibre_title_sort,
+                &mut first_seen,
             ) {
                 continue;
             }
@@ -424,7 +491,17 @@ pub fn parse_opf(xml: &str) -> Option<BookMetadata> {
         let local = name.rsplit(':').next().unwrap_or(&name).to_owned();
         let value = cursor.read_element_content_as_string();
         let value = value.trim();
-        if value.is_empty() {
+        // `ReadStringInto` is `SelectSingleNode`: only the first element of
+        // each of these counts, and a blank one leaves its field unset.
+        let single = match local.as_str() {
+            "description" | "publisher" | "language" | "date" => Some(local.clone()),
+            "identifier" => scheme
+                .as_deref()
+                .and_then(opf_identifier_key)
+                .map(|key| format!("identifier:{key}")),
+            _ => None,
+        };
+        if single.is_some_and(|key| !first_seen.insert(key)) || value.is_empty() {
             continue;
         }
         match local.as_str() {
@@ -486,30 +563,24 @@ fn read_opf_meta(
     book: &mut BookMetadata,
     refinements: &mut Vec<(String, String, String)>,
     calibre_title_sort: &mut Option<String>,
+    first_seen: &mut HashSet<String>,
 ) -> bool {
-    let meta_name = cursor.get_attribute("name").unwrap_or_default().to_owned();
+    let meta_name = cursor
+        .get_attribute("name")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let content = cursor
         .get_attribute("content")
         .unwrap_or_default()
         .to_owned();
-    match meta_name.to_ascii_lowercase().as_str() {
+    // Each of these is read with `SelectSingleNode` too: the first `<meta>`
+    // of the name only, whatever its content.
+    let first = meta_name.starts_with("calibre:") && first_seen.insert(format!("meta:{meta_name}"));
+    match meta_name.as_str() {
+        _ if !first => {}
         "calibre:series" => book.series_name = non_empty(Some(content)),
-        // Calibre writes this as a float (`1.0`); C# rounds via
-        // `Convert.ToInt32(Convert.ToDouble(value))`.
-        "calibre:series_index" => {
-            book.index_number = content
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .map(f64::round)
-                .filter(|v| v.is_finite() && v.abs() <= f64::from(i32::MAX))
-                .map(|v| {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let rounded = v as i32;
-                    rounded
-                });
-        }
-        "calibre:rating" => book.community_rating = content.trim().parse().ok(),
+        "calibre:series_index" => book.index_number = calibre_int(&content),
+        "calibre:rating" => book.community_rating = calibre_int(&content).map(f64::from),
         // OPF 2.0's sort title.
         "calibre:title_sort" => *calibre_title_sort = non_empty(Some(content)),
         _ => {}
@@ -544,6 +615,24 @@ fn title_with_id(titles: &[(Option<String>, String)], id: &str) -> Option<String
         .map(|(_, text)| text.clone())
 }
 
+/// A Calibre `<meta content>` number as `ReadInt32AttributeInto` stores it:
+/// `Convert.ToInt32(Convert.ToDouble(value))`, which rounds half to even
+/// (Calibre writes floats, `1.0`). `None` when it does not parse or does not
+/// fit, where C# throws and the field stays unset.
+fn calibre_int(content: &str) -> Option<i32> {
+    content
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .map(f64::round_ties_even)
+        .filter(|v| v.is_finite() && v.abs() <= f64::from(i32::MAX))
+        .map(|v| {
+            #[allow(clippy::cast_possible_truncation)]
+            let rounded = v as i32;
+            rounded
+        })
+}
+
 /// The `ProviderIds` key an OPF `opf:scheme` maps to, or `None` for a scheme
 /// Jellyfin does not record.
 fn opf_identifier_key(scheme: &str) -> Option<&'static str> {
@@ -555,48 +644,19 @@ fn opf_identifier_key(scheme: &str) -> Option<&'static str> {
     }
 }
 
-/// A ComicBookInfo credit role as a `PersonKind` name — port of C#'s
-/// `Enum.TryParse<PersonKind>(role)` with its `Unknown` fallback and the
-/// explicit `"Colorer"` → `Colorist` special case.
+/// A ComicBookInfo credit role as a `PersonKind` name — port of
+/// `ComicBookInfoProvider`'s case-sensitive `Enum.TryParse(person.Role, out
+/// PersonKind)` with its `Unknown` fallback, then the `"Colorer"` → `Colorist`
+/// special case, which ignores case (`StringComparison.OrdinalIgnoreCase`).
 fn person_kind(role: &str) -> String {
-    if role.eq_ignore_ascii_case("Colorer") {
-        return "Colorist".to_owned();
-    }
-    PERSON_KINDS
-        .iter()
-        .find(|kind| kind.eq_ignore_ascii_case(role))
-        .map_or_else(|| "Unknown".to_owned(), |kind| (*kind).to_owned())
+    let kind = if role.eq_ignore_ascii_case("Colorer") {
+        ferrofin_model::data::PersonKind::Colorist
+    } else {
+        ferrofin_model::json::enums::try_parse(role, false)
+            .unwrap_or(ferrofin_model::data::PersonKind::Unknown)
+    };
+    kind.json_name().into_owned()
 }
-
-/// The `PersonKind` names `Enum.TryParse` accepts, from
-/// `Jellyfin.Data/Enums/PersonKind.cs`.
-const PERSON_KINDS: [&str; 25] = [
-    "Unknown",
-    "Actor",
-    "Director",
-    "Composer",
-    "Writer",
-    "GuestStar",
-    "Producer",
-    "Conductor",
-    "Lyricist",
-    "Arranger",
-    "Engineer",
-    "Mixer",
-    "Remixer",
-    "Creator",
-    "Artist",
-    "AlbumArtist",
-    "Author",
-    "Illustrator",
-    "Penciller",
-    "Inker",
-    "Colorist",
-    "Letterer",
-    "CoverArtist",
-    "Editor",
-    "Translator",
-];
 
 /// The person kind an OPF `opf:role` MARC relator marks — port of
 /// `OpfReader.GetRole`, including its default-to-`Author` fallthrough.
@@ -719,43 +779,201 @@ pub fn read_book_cover(path: &str) -> Option<(String, Vec<u8>)> {
     read_comic_cover(path)
 }
 
-/// A comic archive's cover: an entry named `cover.<ext>`, else its first page
-/// in name order (`ComicImageProvider`). `None` for an archive type this port
-/// cannot open (see [`READABLE_ARCHIVE_EXTENSIONS`]) or one with no image.
+/// A comic archive's cover (`ComicImageProvider`): an entry named
+/// `cover.<ext>`, else its first page in key order ([`pick_cover`]). The
+/// archive is opened as what its content is — ZIP, 7z or tar — whatever its
+/// comic extension says. `None` for anything else, a RAR archive included,
+/// or an archive with no image.
 #[must_use]
 pub fn read_comic_cover(path: &str) -> Option<(String, Vec<u8>)> {
-    let extension = extension_of(path);
-    if !READABLE_ARCHIVE_EXTENSIONS.contains(&extension.as_str()) {
+    use std::io::{Read as _, Seek as _};
+    if !COMIC_EXTENSIONS.contains(&extension_of(path).as_str()) {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut head = Vec::with_capacity(TAR_BLOCK_BYTES);
+    (&mut file)
+        .take(TAR_BLOCK_BYTES as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    file.rewind().ok()?;
+    match archive_format(&head)? {
+        ArchiveFormat::Zip => zip_cover(file),
+        ArchiveFormat::SevenZip => seven_zip_cover(file),
+        ArchiveFormat::Tar => tar_cover(file),
+        // TODO(parity, open work item — NOT an accepted divergence; gl-747):
+        // SharpCompress reads RAR4 and RAR5, and no pure-Rust reader does;
+        // which reader Ferrofin takes is the owner's decision. Un-defer path:
+        // the chosen reader lists the entries for `pick_cover` and reads the
+        // chosen one through `read_stream_capped`, with a RAR fixture test.
+        ArchiveFormat::Rar => {
+            tracing::debug!(
+                path,
+                "cover not read: RAR comic archives are not supported yet"
+            );
+            None
+        }
+    }
+}
+
+/// What a comic archive really is, read from its first bytes as
+/// SharpCompress's `ArchiveFactory` reads it, whatever its extension says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveFormat {
+    Zip,
+    SevenZip,
+    Rar,
+    Tar,
+}
+
+/// The format `head` (an archive's first 512 bytes, or all of a shorter one)
+/// opens with: the ZIP, 7z and RAR signatures, else a tar header block.
+fn archive_format(head: &[u8]) -> Option<ArchiveFormat> {
+    if [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"]
+        .iter()
+        .any(|signature| head.starts_with(*signature))
+    {
+        Some(ArchiveFormat::Zip)
+    } else if head.starts_with(b"7z\xBC\xAF\x27\x1C") {
+        Some(ArchiveFormat::SevenZip)
+    } else if head.starts_with(b"Rar!\x1A\x07") {
+        Some(ArchiveFormat::Rar)
+    } else if is_tar_header(head) {
+        Some(ArchiveFormat::Tar)
+    } else {
+        None
+    }
+}
+
+/// Whether `head` starts with a tar header block: its checksum field holds
+/// the sum of the block's bytes, with the field itself read as spaces
+/// (`TarArchive.IsTarFile` reads a header and checks it). Old v7 archives
+/// carry no `ustar` magic, so the checksum is what identifies a tar.
+fn is_tar_header(head: &[u8]) -> bool {
+    let Some(block) = head.get(..TAR_BLOCK_BYTES) else {
+        return false;
+    };
+    let stored = std::str::from_utf8(&block[TAR_CHECKSUM_FIELD])
+        .ok()
+        .map(|field| field.trim_matches(|c: char| c == '\0' || c == ' '))
+        .and_then(|field| u32::from_str_radix(field, 8).ok());
+    let sum: u32 = block
+        .iter()
+        .enumerate()
+        .map(|(i, byte)| {
+            if TAR_CHECKSUM_FIELD.contains(&i) {
+                u32::from(b' ')
+            } else {
+                u32::from(*byte)
+            }
+        })
+        .sum();
+    stored == Some(sum)
+}
+
+/// The cover of a ZIP comic ([`pick_cover`]).
+fn zip_cover(file: std::fs::File) -> Option<(String, Vec<u8>)> {
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let names: Vec<String> = (0..archive.len())
-        .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_owned()))
+        .filter_map(|i| archive.by_index(i).ok()?.name().ok().map(Cow::into_owned))
         .collect();
-    // C# `FindCoverEntryInArchiveAsync` looks for an entry literally named
-    // `cover.<ext>` first, in ITS extension order, and only then falls back to
-    // the first image in name order. Skipping that pass hands back page 001 for
-    // every comic that names its cover explicitly.
-    let explicit = PAGE_EXTENSIONS.iter().find_map(|ext| {
-        names
-            .iter()
-            .find(|n| *n == &format!("cover.{ext}"))
-            .cloned()
-    });
-    let first = if let Some(cover) = explicit {
-        cover
-    } else {
-        let mut pages: Vec<&String> = names
-            .iter()
-            .filter(|name| PAGE_EXTENSIONS.contains(&extension_of(name).as_str()))
-            .collect();
-        pages.sort();
-        pages.into_iter().next()?.clone()
-    };
-    let mut entry = archive.by_name(&first).ok()?;
+    let cover = pick_cover(&names)?;
+    let mut entry = archive.by_name(&cover).ok()?;
     let bytes = read_capped(&mut entry)?;
-    Some((first, bytes))
+    Some((cover, bytes))
+}
+
+/// The cover of a 7z comic ([`pick_cover`]). Entries are decoded in archive
+/// order, as a solid archive requires, so each one before the cover is read
+/// through and discarded: the decoder does not skip what is left unread.
+/// That costs CPU, never memory, for whatever comes before the cover, as
+/// SharpCompress's decoding does.
+fn seven_zip_cover(file: std::fs::File) -> Option<(String, Vec<u8>)> {
+    let mut reader =
+        sevenz_rust2::ArchiveReader::new(file, sevenz_rust2::Password::empty()).ok()?;
+    let names: Vec<String> = reader
+        .archive()
+        .files
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+    let cover = pick_cover(&names)?;
+    let mut bytes = None;
+    reader
+        .for_each_entries(|entry, data| {
+            if entry.name == cover {
+                bytes = read_stream_capped(&entry.name, entry.size, data, MAX_ARCHIVE_ENTRY_BYTES);
+                return Ok(false);
+            }
+            std::io::copy(data, &mut std::io::sink())?;
+            Ok(true)
+        })
+        .ok()?;
+    Some((cover, bytes?))
+}
+
+/// The cover of a tar comic ([`pick_cover`]): one pass lists the entries, a
+/// second reads the chosen one.
+fn tar_cover(mut file: std::fs::File) -> Option<(String, Vec<u8>)> {
+    use std::io::Seek as _;
+    let key = |entry: &tar::Entry<'_, &std::fs::File>| {
+        String::from_utf8_lossy(&entry.path_bytes()).into_owned()
+    };
+    let names: Vec<String> = tar::Archive::new(&file)
+        .entries()
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| key(&entry)))
+        .collect();
+    let cover = pick_cover(&names)?;
+    file.rewind().ok()?;
+    let mut archive = tar::Archive::new(&file);
+    let entry = archive
+        .entries()
+        .ok()?
+        .filter_map(Result::ok)
+        .find(|entry| key(entry) == cover)?;
+    let size = entry.size();
+    let bytes = read_stream_capped(&cover, size, entry, MAX_ARCHIVE_ENTRY_BYTES)?;
+    Some((cover, bytes))
+}
+
+/// `ComicImageProvider.FindCoverEntryInArchiveAsync`: the entry named exactly
+/// `cover.<ext>`, trying the cover extensions in their order; else the first
+/// image entry in the order LINQ's `OrderBy(x => x.Key)` gives
+/// ([`dotnet_key_order`]). Skipping the first pass hands back page 001 for
+/// every comic that names its cover.
+fn pick_cover(names: &[String]) -> Option<String> {
+    let explicit = PAGE_EXTENSIONS.iter().find_map(|ext| {
+        let wanted = format!("cover.{ext}");
+        names.iter().find(|name| **name == wanted)
+    });
+    explicit
+        .or_else(|| {
+            names
+                .iter()
+                .filter(|name| PAGE_EXTENSIONS.contains(&extension_of(name).as_str()))
+                .min_by(|a, b| dotnet_key_order(a, b))
+        })
+        .cloned()
+}
+
+/// The order .NET's culture-aware default comparer gives two keys,
+/// approximated: case is ignored first, then at the first letter that
+/// differs only in case the lower-case one comes first (ICU's tertiary
+/// order), then ordinal. Punctuation and digits keep their code-point order,
+/// where ICU weighs punctuation first.
+fn dotnet_key_order(a: &str, b: &str) -> std::cmp::Ordering {
+    a.to_lowercase()
+        .cmp(&b.to_lowercase())
+        .then_with(|| {
+            a.chars()
+                .zip(b.chars())
+                .find(|(x, y)| x != y)
+                .map_or(std::cmp::Ordering::Equal, |(x, y)| {
+                    y.is_lowercase().cmp(&x.is_lowercase())
+                })
+        })
+        .then_with(|| a.cmp(b))
 }
 
 /// The EPUB's declared cover image (`EpubImageProvider`).
@@ -764,11 +982,18 @@ pub fn read_epub_cover(path: &str) -> Option<(String, Vec<u8>)> {
     let opf_path = read_epub_content_path(path)?;
     let opf = read_archive_entry_text(path, &opf_path.to_lowercase())?;
     // C# `ReadCoverPath` probes in order: a manifest item with
-    // `properties="cover-image"` (the EPUB 3 way), then id `cover-image`,
-    // then id `cover`, and only then `<meta name="cover" content="…"/>`.
+    // `properties="cover-image"` (the EPUB 3 way), then the image with id
+    // `cover` (its `id='*cover-image'` probe is a literal that never
+    // matches), and only then `<meta name="cover" content="…"/>`: the image
+    // at `Images/<content>`, else the manifest item with that id.
     let href = epub_manifest_href_by_property(&opf, "cover-image")
         .or_else(|| epub_manifest_href(&opf, "cover"))
-        .or_else(|| epub_cover_id(&opf).and_then(|id| epub_manifest_href(&opf, &id)))?;
+        .or_else(|| {
+            epub_cover_id(&opf).and_then(|content| {
+                epub_manifest_image_at(&opf, &format!("Images/{content}"))
+                    .or_else(|| epub_manifest_href(&opf, &content))
+            })
+        })?;
     // Manifest hrefs are relative to the OPF's own directory.
     let root = Path::new(&opf_path)
         .parent()
@@ -833,6 +1058,27 @@ fn epub_manifest_href_by_property(opf: &str, property: &str) -> Option<String> {
     None
 }
 
+/// `href` when a manifest image item has exactly that `href`
+/// (`//opf:item[@href='…']` with an image media type).
+fn epub_manifest_image_at(opf: &str, href: &str) -> Option<String> {
+    let Ok(mut cursor) = XmlCursor::new(opf) else {
+        return None;
+    };
+    while !cursor.eof() {
+        if cursor.is_element()
+            && cursor.name().eq_ignore_ascii_case("item")
+            && cursor.get_attribute("href") == Some(href)
+            && cursor
+                .get_attribute("media-type")
+                .is_some_and(is_image_media_type)
+        {
+            return Some(href.to_owned());
+        }
+        cursor.read();
+    }
+    None
+}
+
 /// Whether a manifest `media-type` names an image — C# `IsValidImage`.
 fn is_image_media_type(media_type: &str) -> bool {
     media_type.trim().to_ascii_lowercase().starts_with("image/")
@@ -865,17 +1111,19 @@ fn epub_manifest_href(opf: &str, id: &str) -> Option<String> {
 
 /// One archive entry's bytes, matched case-insensitively by name.
 fn read_archive_entry_bytes(path: &str, wanted_lower: &str) -> Option<Vec<u8>> {
-    if !READABLE_ARCHIVE_EXTENSIONS.contains(&extension_of(path).as_str())
-        && extension_of(path) != "epub"
-    {
+    // Embedded metadata is read from ZIP only, as upstream's
+    // `InternalComicInfoProvider` and `ComicBookInfoProvider` read `.cbz`
+    // through `ZipFile`; only the cover extractor opens the other formats.
+    if !matches!(extension_of(path).as_str(), "cbz" | "epub") {
         return None;
     }
     let file = std::fs::File::open(path).ok()?;
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let index = (0..archive.len()).find(|i| {
-        archive
-            .by_index(*i)
-            .is_ok_and(|e| e.name().to_lowercase() == wanted_lower)
+        archive.by_index(*i).is_ok_and(|e| {
+            e.name()
+                .is_ok_and(|name| name.to_lowercase() == wanted_lower)
+        })
     })?;
     let mut entry = archive.by_index(index).ok()?;
     read_capped(&mut entry)
@@ -899,13 +1147,29 @@ fn read_capped_to(
     entry: &mut zip::read::ZipFile<'_, impl std::io::Read>,
     cap: u64,
 ) -> Option<Vec<u8>> {
-    let name = entry.name().to_owned();
+    // Only names the entry in a log line: an undecodable name is shown lossily.
+    let name = entry.name().map_or_else(
+        |_| String::from_utf8_lossy(entry.name_raw()).into_owned(),
+        Cow::into_owned,
+    );
+    let size = entry.size();
+    read_stream_capped(&name, size, entry, cap)
+}
+
+/// Reads the archive entry `name` from `stream`, at most `cap` bytes, whatever
+/// the archive format; `declared` is the size its header claims.
+fn read_stream_capped(
+    name: &str,
+    declared: u64,
+    stream: impl std::io::Read,
+    cap: u64,
+) -> Option<Vec<u8>> {
     // The declared size is still worth honouring as a capacity hint and as a
     // cheap early-out, but only ever as a hint.
-    if entry.size() > cap {
+    if declared > cap {
         tracing::warn!(
             entry = name,
-            size = entry.size(),
+            size = declared,
             "archive entry is implausibly large; skipping"
         );
         return None;
@@ -913,10 +1177,10 @@ fn read_capped_to(
     // The capacity hint is bounded by the cap as well as by the declared size,
     // so a lying header cannot make this allocate more than one capped read
     // could ever fill.
-    let hint = usize::try_from(entry.size().min(cap)).unwrap_or_default();
+    let hint = usize::try_from(declared.min(cap)).unwrap_or_default();
     let mut bytes = Vec::with_capacity(hint);
     // One byte past the cap is enough to tell "at the limit" from "over it".
-    entry
+    stream
         .take(cap.saturating_add(1))
         .read_to_end(&mut bytes)
         .ok()?;
@@ -930,10 +1194,10 @@ fn read_capped_to(
     Some(bytes)
 }
 
-/// One archive entry as UTF-8 text.
+/// One archive entry as XML text, decoded as [`decode_xml`] does.
 fn read_archive_entry_text(path: &str, wanted_lower: &str) -> Option<String> {
     let bytes = read_archive_entry_bytes(path, wanted_lower)?;
-    String::from_utf8(bytes).ok()
+    decode_xml(&bytes)
 }
 
 /// A zip archive's comment, where ComicBookInfo stores its JSON.
@@ -1248,6 +1512,91 @@ mod tests {
         );
     }
 
+    /// `OpfReader.ReadStringInto` is `SelectSingleNode`: the first element of
+    /// a kind in document order, and nothing at all when that one is blank or
+    /// (a date) does not parse — never a later one.
+    #[test]
+    fn only_the_first_single_valued_element_counts() {
+        let book = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+                <metadata>
+                  <dc:title>T</dc:title>
+                  <dc:description>First.</dc:description>
+                  <dc:description>Second.</dc:description>
+                  <dc:publisher>Print House</dc:publisher>
+                  <dc:publisher>Ebook House</dc:publisher>
+                  <dc:language>en</dc:language>
+                  <dc:language>fr</dc:language>
+                  <dc:date opf:event="publication">1996-02-01</dc:date>
+                  <dc:date opf:event="conversion">2021-03-09T18:31:22+00:00</dc:date>
+                  <dc:identifier opf:scheme="ISBN">9780000000001</dc:identifier>
+                  <dc:identifier opf:scheme="ISBN">9780000000002</dc:identifier>
+                </metadata>
+              </package>"#,
+        )
+        .expect("metadata");
+        assert_eq!(book.overview.as_deref(), Some("First."));
+        assert_eq!(book.studios, ["Print House"]);
+        assert_eq!(book.language.as_deref(), Some("en"));
+        assert_eq!(book.production_year, Some(1996));
+        assert_eq!(book.provider_ids["ISBN"], "9780000000001");
+
+        let book = parse_opf(
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>T</dc:title>
+                <dc:description>  </dc:description>
+                <dc:description>Later.</dc:description>
+                <dc:date>not a date</dc:date>
+                <dc:date>1965</dc:date>
+              </package>"#,
+        )
+        .expect("metadata");
+        assert_eq!(book.overview, None, "a blank first description");
+        assert_eq!(book.production_year, None, "an unparseable first date");
+    }
+
+    /// `ReadInt32AttributeInto` stores `Convert.ToInt32(Convert.ToDouble(…))`,
+    /// which rounds half to even, for the series index and the rating alike.
+    #[rstest::rstest]
+    #[case("2.5", Some(2))]
+    #[case("0.5", Some(0))]
+    #[case("1.5", Some(2))]
+    #[case("3.49", Some(3))]
+    #[case("1.0", Some(1))]
+    #[case("x", None)]
+    fn calibre_numbers_round_half_to_even(#[case] content: &str, #[case] expected: Option<i32>) {
+        let book = parse_opf(&format!(
+            r#"<package><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+                <meta name="calibre:series_index" content="{content}"/>
+                <meta name="calibre:rating" content="{content}"/></package>"#
+        ))
+        .expect("metadata");
+        assert_eq!(book.index_number, expected);
+        assert_eq!(book.community_rating, expected.map(f64::from));
+    }
+
+    /// The Calibre `<meta>` values are each read with `SelectSingleNode` too:
+    /// a later meta of the same name never replaces, or clears, the first.
+    #[test]
+    fn only_the_first_calibre_meta_of_a_name_counts() {
+        let book = parse_opf(
+            r#"<package><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">T</dc:title>
+                <meta name="calibre:series" content="First Saga"/>
+                <meta name="calibre:series" content="Second Saga"/>
+                <meta name="calibre:series_index" content="1"/>
+                <meta name="calibre:series_index" content="2"/>
+                <meta name="calibre:rating" content="8"/>
+                <meta name="calibre:rating" content="x"/>
+                <meta name="calibre:title_sort" content="First, The"/>
+                <meta name="calibre:title_sort" content="Second, The"/></package>"#,
+        )
+        .expect("metadata");
+        assert_eq!(book.series_name.as_deref(), Some("First Saga"));
+        assert_eq!(book.index_number, Some(1));
+        assert_eq!(book.community_rating, Some(8.0));
+        assert_eq!(book.sort_name.as_deref(), Some("First, The"));
+    }
+
     #[test]
     fn a_bare_year_date_still_yields_a_production_year() {
         let book = parse_opf(
@@ -1292,6 +1641,22 @@ mod tests {
         // A real PersonKind survives, "Colorer" is normalized, and anything
         // Enum.TryParse would reject becomes Unknown rather than a raw string.
         assert_eq!(kinds, ["Penciller", "Colorist", "Unknown"]);
+    }
+
+    /// `ComicBookInfoProvider` parses the role with the case-sensitive
+    /// `Enum.TryParse(person.Role, out PersonKind)`, and only the `Colorer`
+    /// special case ignores case (`StringComparison.OrdinalIgnoreCase`).
+    #[test]
+    fn comic_book_info_roles_parse_case_sensitively() {
+        let book = parse_comic_book_info(
+            r#"{"ComicBookInfo/1.0":{"title":"T","credits":[
+                {"person":"A","role":"penciller"},
+                {"person":"B","role":"colorer"},
+                {"person":"C","role":"CoverArtist"}]}}"#,
+        )
+        .expect("metadata");
+        let kinds: Vec<&str> = book.people.iter().map(|(_, k)| k.as_str()).collect();
+        assert_eq!(kinds, ["Unknown", "Colorist", "CoverArtist"]);
     }
 
     #[test]
@@ -1742,15 +2107,216 @@ mod tests {
         assert_eq!(bytes, b"cover bytes");
     }
 
+    /// `ReadCoverPath`: a `<meta name="cover">` holding a file name finds the
+    /// manifest image at `Images/<name>` before looking the value up as an id.
     #[test]
-    fn an_unreadable_archive_format_yields_nothing() {
-        // .cbr is RAR: recognized as a comic, but nothing is extracted.
+    fn an_epub_cover_meta_can_name_the_file_under_images() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "book.epub",
+            &[
+                (
+                    "META-INF/container.xml",
+                    br#"<container><rootfiles>
+                          <rootfile full-path="OEBPS/content.opf"/>
+                        </rootfiles></container>"#,
+                ),
+                (
+                    "OEBPS/content.opf",
+                    br#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                          <metadata>
+                            <dc:title>T</dc:title>
+                            <meta name="cover" content="front.jpg"/>
+                          </metadata>
+                          <manifest>
+                            <item id="img1" href="Images/front.jpg" media-type="image/jpeg"/>
+                          </manifest>
+                        </package>"#,
+                ),
+                ("OEBPS/Images/front.jpg", b"front bytes"),
+            ],
+            None,
+        );
+        let (name, bytes) = read_book_cover(&path).expect("cover");
+        assert_eq!(name, "Images/front.jpg");
+        assert_eq!(bytes, b"front bytes");
+    }
+
+    #[test]
+    fn a_rar_comic_yields_no_metadata() {
+        // `InternalComicInfoProvider` reads ZIP only, so a real RAR `.cbr`
+        // has no embedded metadata.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("x.cbr");
         std::fs::write(&path, b"Rar!\x1a\x07\x00").expect("write");
         let path = path.to_string_lossy().into_owned();
         assert!(read_book_metadata(&path).is_none());
-        assert!(read_book_cover(&path).is_none());
+    }
+
+    /// Writes a tar archive of `(name, bytes)` entries and returns its path.
+    fn write_tar(dir: &tempfile::TempDir, name: &str, entries: &[(&str, &[u8])]) -> String {
+        let path = dir.path().join(name);
+        let mut builder = tar::Builder::new(std::fs::File::create(&path).expect("create tar"));
+        for (entry, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, entry, *bytes)
+                .expect("append entry");
+        }
+        builder.finish().expect("finish tar");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// Writes a 7z archive of `(name, bytes)` entries and returns its path.
+    fn write_7z(dir: &tempfile::TempDir, name: &str, entries: &[(&str, &[u8])]) -> String {
+        let path = dir.path().join(name);
+        let mut writer =
+            sevenz_rust2::ArchiveWriter::new(std::fs::File::create(&path).expect("create 7z"))
+                .expect("7z writer");
+        for (entry, bytes) in entries {
+            writer
+                .push_archive_entry(sevenz_rust2::ArchiveEntry::new_file(entry), Some(*bytes))
+                .expect("push entry");
+        }
+        writer.finish().expect("finish 7z");
+        path.to_string_lossy().into_owned()
+    }
+
+    /// `ComicImageProvider` opens every comic extension with
+    /// `ArchiveFactory.OpenAsyncArchive`, which reads the archive's own
+    /// format from its content: a `.cbt` is read as tar, a `.cb7` as 7z, and
+    /// a misnamed `.cbr` holding a ZIP (or a `.cbz` holding a tar) as what it
+    /// is. `cover.<ext>` wins; else the first image in key order.
+    #[test]
+    fn every_comic_archive_is_opened_by_its_content() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pages: &[(&str, &[u8])] = &[("page002.jpg", b"two"), ("page001.jpg", b"one")];
+        let named: &[(&str, &[u8])] = &[("page001.jpg", b"one"), ("cover.png", b"cover")];
+        for (path, cover, bytes) in [
+            (
+                write_tar(&dir, "a.cbt", pages),
+                "page001.jpg",
+                b"one".as_slice(),
+            ),
+            (
+                write_tar(&dir, "b.cbt", named),
+                "cover.png",
+                b"cover".as_slice(),
+            ),
+            (
+                write_7z(&dir, "c.cb7", pages),
+                "page001.jpg",
+                b"one".as_slice(),
+            ),
+            (
+                write_7z(&dir, "d.cb7", named),
+                "cover.png",
+                b"cover".as_slice(),
+            ),
+            (
+                write_archive(&dir, "e.cbr", pages, None),
+                "page001.jpg",
+                b"one".as_slice(),
+            ),
+            (
+                write_tar(&dir, "f.cbz", named),
+                "cover.png",
+                b"cover".as_slice(),
+            ),
+        ] {
+            assert_eq!(
+                read_comic_cover(&path),
+                Some((cover.to_owned(), bytes.to_vec())),
+                "{path}"
+            );
+        }
+        // Not an archive at all, whatever its name: nothing.
+        let junk = dir.path().join("g.cbz");
+        std::fs::write(&junk, b"not an archive").expect("write");
+        assert!(read_comic_cover(&junk.to_string_lossy()).is_none());
+    }
+
+    /// A solid 7z decodes its entries in one stream, so the ones before the
+    /// cover are read through first; an empty entry has no stream at all.
+    #[test]
+    fn a_solid_7z_comic_yields_the_cover_after_other_pages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("solid.cb7");
+        let mut writer =
+            sevenz_rust2::ArchiveWriter::new(std::fs::File::create(&path).expect("create 7z"))
+                .expect("7z writer");
+        let entries: [(&str, &[u8]); 3] = [
+            ("page002.jpg", b"second page"),
+            ("blank.txt", b""),
+            ("page001.jpg", b"first page"),
+        ];
+        writer
+            .push_archive_entries(
+                entries
+                    .iter()
+                    .map(|(name, _)| sevenz_rust2::ArchiveEntry::new_file(name))
+                    .collect(),
+                entries
+                    .iter()
+                    .map(|(_, bytes)| sevenz_rust2::SourceReader::new(*bytes))
+                    .collect(),
+            )
+            .expect("solid block");
+        writer.finish().expect("finish 7z");
+        assert_eq!(
+            read_comic_cover(&path.to_string_lossy()),
+            Some(("page001.jpg".to_owned(), b"first page".to_vec()))
+        );
+    }
+
+    /// The per-entry cap holds for any archive's stream: a declared size
+    /// over it is refused unread, and so is a stream that runs past it
+    /// whatever size it declared.
+    #[test]
+    fn any_archive_stream_is_read_within_the_cap() {
+        let data = vec![7u8; 100];
+        assert_eq!(
+            read_stream_capped("x", 100, data.as_slice(), 100).map(|b| b.len()),
+            Some(100)
+        );
+        assert!(read_stream_capped("x", 101, data.as_slice(), 100).is_none());
+        assert!(read_stream_capped("x", 10, data.as_slice(), 64).is_none());
+    }
+
+    #[test]
+    fn keys_order_case_first_then_lower_case_then_ordinal() {
+        use std::cmp::Ordering::{Equal, Less};
+        assert_eq!(dotnet_key_order("page1.jpg", "Page2.jpg"), Less);
+        assert_eq!(dotnet_key_order("a.jpg", "A.jpg"), Less);
+        assert_eq!(dotnet_key_order("a.jpg", "a.jpg"), Equal);
+        // Equal keys: the first entry wins, as `OrderBy` keeps their order.
+        let names = vec!["dup.jpg".to_owned(), "dup.jpg".to_owned()];
+        assert_eq!(pick_cover(&names).as_deref(), Some("dup.jpg"));
+    }
+
+    /// The first-image fallback orders keys as LINQ's `OrderBy(x => x.Key)`
+    /// does, with .NET's culture-aware comparer: case is ignored first, and
+    /// on a tie the lower-case key comes first.
+    #[test]
+    fn pages_are_ordered_as_dotnet_orders_their_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (entries, cover) in [
+            (vec!["ZZ_scan.jpg", "page001.jpg"], "page001.jpg"),
+            (vec!["Page2.jpg", "page1.jpg"], "page1.jpg"),
+            (vec!["A.jpg", "a.jpg"], "a.jpg"),
+        ] {
+            let entries: Vec<(&str, &[u8])> =
+                entries.iter().map(|e| (*e, b"x".as_slice())).collect();
+            let path = write_archive(&dir, "order.cbz", &entries, None);
+            assert_eq!(
+                read_comic_cover(&path).map(|(name, _)| name).as_deref(),
+                Some(cover)
+            );
+        }
     }
 
     #[test]
@@ -1767,6 +2333,132 @@ mod tests {
         assert_eq!(
             read_book_metadata(&path).and_then(|b| b.name).as_deref(),
             Some("Dune")
+        );
+    }
+
+    /// `XmlDocument.Load` picks the encoding from a BOM, then from the XML
+    /// declaration; without either it is strict UTF-8 and the read fails.
+    #[rstest::rstest]
+    #[case::utf16_le_bom(
+        [&b"\xFF\xFE"[..], &"<package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>Café</dc:title></metadata></package>"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()]
+        .concat(),
+        Some("Café")
+    )]
+    #[case::declared_latin1(
+        b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>Caf\xE9</dc:title></metadata></package>".to_vec(),
+        Some("Café")
+    )]
+    #[case::undeclared_latin1(
+        b"<package xmlns:dc=\"http://purl.org/dc/elements/1.1/\"><metadata><dc:title>Caf\xE9</dc:title></metadata></package>".to_vec(),
+        None
+    )]
+    fn an_opf_sidecar_is_decoded_like_the_xml_reader(
+        #[case] bytes: Vec<u8>,
+        #[case] expected: Option<&str>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("dune.mobi"), b"book").expect("write");
+        std::fs::write(dir.path().join("dune.opf"), bytes).expect("write opf");
+        let path = dir.path().join("dune.mobi").to_string_lossy().into_owned();
+        assert_eq!(
+            read_book_metadata(&path).and_then(|b| b.name).as_deref(),
+            expected
+        );
+    }
+
+    /// `text` in UTF-16 or UTF-32, little- or big-endian, with an optional BOM.
+    fn wide(text: &str, width: usize, little_endian: bool, bom: bool) -> Vec<u8> {
+        let units: Vec<u32> = bom
+            .then_some(0xFEFF)
+            .into_iter()
+            .chain(text.chars().map(u32::from))
+            .collect();
+        units
+            .into_iter()
+            .flat_map(|unit| {
+                let bytes = if little_endian {
+                    unit.to_le_bytes().to_vec()
+                } else {
+                    unit.to_be_bytes().to_vec()
+                };
+                match (width, little_endian) {
+                    (2, true) => bytes[..2].to_vec(),
+                    (2, false) => bytes[2..].to_vec(),
+                    _ => bytes,
+                }
+            })
+            .collect()
+    }
+
+    const DOC: &str = "<a>Café</a>";
+
+    #[rstest::rstest]
+    #[case::utf8(DOC.as_bytes().to_vec(), Some(DOC))]
+    #[case::utf8_bom([&b"\xEF\xBB\xBF"[..], DOC.as_bytes()].concat(), Some(DOC))]
+    #[case::utf16_be_bom(wide(DOC, 2, false, true), Some(DOC))]
+    #[case::utf16_le_bomless(wide(DOC, 2, true, false), Some(DOC))]
+    #[case::utf16_be_bomless(wide(DOC, 2, false, false), Some(DOC))]
+    #[case::utf32_le_bom(wide(DOC, 4, true, true), Some(DOC))]
+    #[case::utf32_be_bom(wide(DOC, 4, false, true), Some(DOC))]
+    #[case::utf32_le_bomless(wide(DOC, 4, true, false), Some(DOC))]
+    #[case::utf32_partial_unit([wide(DOC, 4, true, true), vec![0]].concat(), None)]
+    #[case::single_quoted(
+        b"<?xml version='1.0' encoding = 'windows-1252' ?><a>Caf\xE9</a>".to_vec(),
+        Some("<?xml version='1.0' encoding = 'windows-1252' ?><a>Café</a>")
+    )]
+    #[case::unknown_label(b"<?xml version=\"1.0\" encoding=\"klingon\"?><a/>".to_vec(), None)]
+    #[case::unterminated_label(
+        b"<?xml version=\"1.0\" encoding=\"latin1?><a>Caf\xC3\xA9</a>".to_vec(),
+        Some("<?xml version=\"1.0\" encoding=\"latin1?><a>Café</a>")
+    )]
+    #[case::stylesheet_is_not_a_declaration(
+        b"<?xml-stylesheet encoding=\"latin1\"?><a>Caf\xC3\xA9</a>".to_vec(),
+        Some("<?xml-stylesheet encoding=\"latin1\"?><a>Café</a>")
+    )]
+    #[case::undeclared_invalid_utf8(b"<a>Caf\xE9</a>".to_vec(), None)]
+    #[case::empty(Vec::new(), Some(""))]
+    fn decode_xml_detects_the_encoding_like_xml_text_reader(
+        #[case] bytes: Vec<u8>,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(decode_xml(&bytes).as_deref(), expected);
+    }
+
+    /// `OpfProvider.GetXmlFile` takes the first OPF that exists; one that
+    /// fails to load does not fall through to `content.opf`.
+    #[test]
+    fn an_undecodable_opf_sidecar_does_not_fall_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("dune.mobi"), b"book").expect("write");
+        std::fs::write(dir.path().join("dune.opf"), b"<package>\xE9</package>").expect("bad opf");
+        std::fs::write(
+            dir.path().join("content.opf"),
+            r#"<package xmlns:dc="http://purl.org/dc/elements/1.1/">
+                 <metadata><dc:title>Dune</dc:title></metadata></package>"#,
+        )
+        .expect("content.opf");
+        let path = dir.path().join("dune.mobi").to_string_lossy().into_owned();
+        assert!(read_book_metadata(&path).is_none());
+    }
+
+    #[test]
+    fn a_comic_info_entry_declared_latin1_is_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_archive(
+            &dir,
+            "comic.cbz",
+            &[(
+                "ComicInfo.xml",
+                b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><ComicInfo><Title>Ast\xE9rix</Title></ComicInfo>",
+            )],
+            None,
+        );
+        assert_eq!(
+            read_book_metadata(&path).and_then(|b| b.name).as_deref(),
+            Some("Astérix")
         );
     }
 

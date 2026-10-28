@@ -12,6 +12,7 @@
 use tracing::{debug, error, info, trace, warn};
 use wasmtime::StoreLimits;
 use wasmtime::component::bindgen;
+use wasmtime_wasi::p2::bindings::clocks::monotonic_clock;
 
 /// The bindgen output — a generated module tree we cannot document item-by-
 /// item, hence the lint carve-outs (the WIT file carries the real docs).
@@ -54,7 +55,7 @@ pub struct HostState {
     pub memory_limit_bytes: usize,
     /// The shared blocking HTTP client behind `http-fetch` (per host, with
     /// the call timeout baked in at construction).
-    pub http: std::sync::Arc<reqwest::blocking::Client>,
+    pub http: std::sync::Arc<crate::capabilities::GuestHttp>,
     /// The per-call timeout, needed when `http-fetch` builds a one-off
     /// DNS-pinned client (the shared client's timeout is not readable).
     pub http_timeout: std::time::Duration,
@@ -82,6 +83,11 @@ pub struct HostState {
     pub collaborators: std::sync::Arc<std::sync::OnceLock<crate::capabilities::Collaborators>>,
     /// True when this guest call attempted a write suppressed by live segment policy.
     pub segment_policy_skipped: bool,
+    /// When the current guest call's time budget runs out, armed with the
+    /// epoch deadline (`runtime::arm_deadline`). Epoch checks only run in
+    /// wasm code, so WASI clock waits are capped at this instead
+    /// ([`DeadlineClocks`]).
+    pub call_deadline: std::time::Instant,
     /// The empty WASI context (see the struct docs).
     pub wasi: wasmtime_wasi::WasiCtx,
     /// The resource table WASI's generated bindings require.
@@ -91,6 +97,11 @@ pub struct HostState {
 impl HostState {
     /// The locked-down WASI context every plugin store gets: nothing
     /// attached, nothing inherited.
+    ///
+    /// Keep it that way: with no preopens, sockets or real stdio, the
+    /// `monotonic-clock` subscribes are the only waits a guest can reach, so
+    /// [`DeadlineClocks`] alone holds them to the call deadline. Granting any
+    /// I/O here adds pollables that can block past it.
     #[must_use]
     pub fn empty_wasi() -> wasmtime_wasi::WasiCtx {
         wasmtime_wasi::WasiCtxBuilder::new().build()
@@ -106,22 +117,130 @@ impl wasmtime_wasi::WasiView for HostState {
     }
 }
 
+/// `wasi:clocks/monotonic-clock` with every wait held to the guest call's
+/// deadline. Linked over wasmtime-wasi's own (which `subscribe`s for any
+/// duration, and waits forever on one it cannot represent): a guest blocked
+/// in `pollable.block`/`poll` is in host code, where the epoch deadline
+/// never fires. A wait is cut to the time left; once none is left, the
+/// subscribe traps, as the epoch would. That covers every wait only while
+/// the ctx grants no I/O ([`HostState::empty_wasi`]).
+pub struct DeadlineClocks;
+
+impl wasmtime::component::HasData for DeadlineClocks {
+    type Data<'a> = DeadlineClocksView<'a>;
+}
+
+impl DeadlineClocks {
+    /// The linker getter: the store's WASI clocks plus its call deadline.
+    pub fn view(state: &mut HostState) -> DeadlineClocksView<'_> {
+        let deadline = state.call_deadline;
+        DeadlineClocksView {
+            clocks: wasmtime_wasi::clocks::WasiClocksView::clocks(state),
+            deadline,
+        }
+    }
+}
+
+/// What [`DeadlineClocks`] hands each `monotonic-clock` call.
+pub struct DeadlineClocksView<'a> {
+    clocks: wasmtime_wasi::clocks::WasiClocksCtxView<'a>,
+    deadline: std::time::Instant,
+}
+
+impl DeadlineClocksView<'_> {
+    /// Nanoseconds left in the call's budget, or the trap once it is spent.
+    fn remaining_nanos(&self) -> wasmtime::Result<u64> {
+        let left = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(wasmtime::Error::msg(
+                "plugin call deadline exceeded while waiting on wasi:clocks",
+            ));
+        }
+        Ok(u64::try_from(left.as_nanos()).unwrap_or(u64::MAX))
+    }
+}
+
+impl monotonic_clock::Host for DeadlineClocksView<'_> {
+    fn now(&mut self) -> wasmtime::Result<monotonic_clock::Instant> {
+        monotonic_clock::Host::now(&mut self.clocks)
+    }
+
+    fn resolution(&mut self) -> wasmtime::Result<monotonic_clock::Duration> {
+        monotonic_clock::Host::resolution(&mut self.clocks)
+    }
+
+    fn subscribe_instant(
+        &mut self,
+        when: monotonic_clock::Instant,
+    ) -> wasmtime::Result<wasmtime::component::Resource<wasmtime_wasi::p2::DynPollable>> {
+        let latest =
+            monotonic_clock::Host::now(&mut self.clocks)?.saturating_add(self.remaining_nanos()?);
+        monotonic_clock::Host::subscribe_instant(&mut self.clocks, when.min(latest))
+    }
+
+    fn subscribe_duration(
+        &mut self,
+        when: monotonic_clock::Duration,
+    ) -> wasmtime::Result<wasmtime::component::Resource<wasmtime_wasi::p2::DynPollable>> {
+        let left = self.remaining_nanos()?;
+        monotonic_clock::Host::subscribe_duration(&mut self.clocks, when.min(left))
+    }
+}
+
 // The `types` interface carries only type definitions; its generated host
 // trait is empty but must still be implemented for the linker bound.
 impl types::Host for HostState {}
 
+/// The most of one guest log message written to the log, in bytes of the
+/// guest's text; the rest is cut (on a character boundary) and the cut noted,
+/// so one call cannot write megabytes into the log. The bound is on the input:
+/// escaping control characters can lengthen the logged line (`\u{1}` is six
+/// bytes). Candidate server setting; it ships as this constant (owner,
+/// 2026-10-24).
+const MAX_GUEST_LOG_MESSAGE_BYTES: usize = 8 * 1024;
+
+/// `message` as the log records it: whole when it fits in
+/// [`MAX_GUEST_LOG_MESSAGE_BYTES`], else its head and how long it was.
+fn guest_log_text(message: &str) -> std::borrow::Cow<'_, str> {
+    if message.len() <= MAX_GUEST_LOG_MESSAGE_BYTES {
+        return std::borrow::Cow::Borrowed(message);
+    }
+    let mut end = MAX_GUEST_LOG_MESSAGE_BYTES;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}… ({} bytes, truncated)",
+        &message[..end],
+        message.len()
+    ))
+}
+
 impl host::Host for HostState {
     fn log(&mut self, level: types::LogLevel, message: String) {
-        // Guest text is data, not format: log it as a field so a malicious
-        // message can never smuggle formatting or fake fields into our lines.
+        // Guest text is data, not format. It is a field of its own: named
+        // `message`, it would be the event's message, which the text log
+        // writes raw (so a line break forged a line in the file behind
+        // `/System/Logs`) and which replaces the static text in JSON. Debug
+        // formatting quotes it and escapes line breaks, carriage returns and
+        // escape sequences.
         let plugin = self.plugin_name.as_str();
         let plugin_id = self.plugin_id.as_str();
+        let guest_message = guest_log_text(&message);
         match level {
-            types::LogLevel::Trace => trace!(plugin, plugin_id, message, "wasm plugin log"),
-            types::LogLevel::Debug => debug!(plugin, plugin_id, message, "wasm plugin log"),
-            types::LogLevel::Info => info!(plugin, plugin_id, message, "wasm plugin log"),
-            types::LogLevel::Warn => warn!(plugin, plugin_id, message, "wasm plugin log"),
-            types::LogLevel::Error => error!(plugin, plugin_id, message, "wasm plugin log"),
+            types::LogLevel::Trace => {
+                trace!(plugin, plugin_id, ?guest_message, "wasm plugin log");
+            }
+            types::LogLevel::Debug => {
+                debug!(plugin, plugin_id, ?guest_message, "wasm plugin log");
+            }
+            types::LogLevel::Info => info!(plugin, plugin_id, ?guest_message, "wasm plugin log"),
+            types::LogLevel::Warn => warn!(plugin, plugin_id, ?guest_message, "wasm plugin log"),
+            types::LogLevel::Error => {
+                error!(plugin, plugin_id, ?guest_message, "wasm plugin log");
+            }
         }
     }
 

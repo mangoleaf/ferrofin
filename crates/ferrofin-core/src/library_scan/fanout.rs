@@ -66,6 +66,8 @@ struct Seed<'a> {
     episode_folders: std::collections::HashMap<String, super::EpisodeFolder>,
     budget: Option<Arc<Budget>>,
     cancel: Option<super::ScanCancel>,
+    dirs: Option<Arc<super::DirectoryCache>>,
+    content_types: &'a [ferrofin_model::dto::NameValuePair],
 }
 
 impl<'a> Seed<'a> {
@@ -84,6 +86,8 @@ impl<'a> Seed<'a> {
             episode_folders: ctx.episode_folders.borrow().clone(),
             budget: ctx.fanout.clone(),
             cancel: ctx.cancel.clone(),
+            dirs: ctx.dirs.clone(),
+            content_types: ctx.content_types,
         }
     }
 
@@ -93,7 +97,8 @@ impl<'a> Seed<'a> {
     {
         let mut ctx = super::PlanCtx::new(naming, self.scope)
             .with_date_added(self.date_added)
-            .with_key_folders(self.key_folders);
+            .with_key_folders(self.key_folders)
+            .with_content_types(self.content_types);
         ctx.tv_library.set(self.tv_library);
         ctx.locations = self.locations;
         *ctx.direct_file_counts.borrow_mut() = self.direct_file_counts;
@@ -104,6 +109,7 @@ impl<'a> Seed<'a> {
         *ctx.episode_folders.borrow_mut() = self.episode_folders;
         ctx.fanout = self.budget;
         ctx.cancel = self.cancel;
+        ctx.dirs = self.dirs;
         ctx
     }
 }

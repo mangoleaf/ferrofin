@@ -54,12 +54,14 @@ pub trait LyricManager: Send + Sync {
     /// provider id is unknown or the provider has no such lyric.
     async fn get_remote_lyrics(&self, lyric_id: &str) -> Result<Option<LyricDto>, ServiceError>;
 
-    /// Saves caller-supplied lyric text for an audio item.
+    /// Saves a caller-supplied lyric file for an audio item — the stream
+    /// overload of `SaveLyricAsync`: `lyrics` is read as text (any byte-order
+    /// mark picks the encoding) and saved byte for byte.
     async fn save_lyric(
         &self,
         item_id: Uuid,
         format: &str,
-        lyrics: &str,
+        lyrics: &[u8],
     ) -> Result<Option<LyricDto>, ServiceError>;
 
     /// Deletes the lyrics stored for an audio item.

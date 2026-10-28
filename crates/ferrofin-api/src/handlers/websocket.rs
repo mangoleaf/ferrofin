@@ -6,16 +6,19 @@
 //! calls all succeeded. These routes are NOT part of the OpenAPI contract (Swagger
 //! doesn't describe WebSocket endpoints), so they are registered as extras.
 //!
-//! The socket accepts the upgrade, answers pings, sends periodic keep-alives,
-//! and — when the caller authenticates via the `api_key` query parameter —
-//! **registers a message sink** on the [`SessionMessageBus`] keyed by the
+//! The socket resolves its credentials as an HTTP request does (C#
+//! `WebSocketManager.WebSocketRequestHandler` → `AuthService.Authenticate`), so
+//! the Emby-era credential forms follow `EnableLegacyAuthorization` here too, and
+//! a request without valid credentials is refused with `403` before the upgrade.
+//! No route policy runs on it (remote access, access schedule), as upstream.
+//! It then answers pings, sends periodic keep-alives, and **registers a message
+//! sink** on the [`SessionMessageBus`] keyed by the
 //! caller's session id, so server→client pushes (SyncPlay commands/group updates
 //! and the remote-control `Play`/`Playstate`/`GeneralCommand` casts) reach this
 //! client. The session manager also treats a bus-registered session as having a
 //! live controller, which is what makes it appear in the cast-to-device menu
 //! (`GET /Sessions?ControllableByUserId=…` → `SupportsRemoteControl`). The sink
-//! is unregistered when the socket closes. An anonymous socket still holds open (keep-alive only), so a client
-//! that opens the socket before authenticating is never dropped.
+//! is unregistered when the socket closes.
 //!
 //! Closing the socket also **ends the session** when no other socket took its
 //! place -- the port of `WebSocketController.OnConnectionClosed` ->
@@ -27,13 +30,15 @@
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{RawQuery, State};
-use axum::http::HeaderMap;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use ferrofin_traits::options::AuthorizationInfo;
 use tokio::sync::mpsc;
 
+use crate::auth::AuthenticatedIdentity;
+use crate::error::ApiError;
 use crate::state::AppState;
 
 /// The server keep-alive interval advertised to the client, in seconds
@@ -116,119 +121,171 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 
 /// `GET /socket` — upgrade the connection to a WebSocket.
 ///
-/// jellyfin-web passes the access token as the `api_key` query parameter. We
-/// resolve it to the caller's session id (best-effort; an anonymous socket still
-/// upgrades) so the socket can register a delivery sink for server→client pushes.
+/// Port of `WebSocketManager.WebSocketRequestHandler`: the credentials are
+/// resolved as for any request — jellyfin-web sends `?ApiKey=`,
+/// jellyfin-sdk-kotlin an `Authorization: MediaBrowser` header — and a request
+/// they do not authenticate is the `SecurityException("Token is required")`
+/// upstream answers with `403`. No route policy runs, so remote access and the
+/// access schedule are not checked here. The authenticated token is then
+/// resolved to the caller's session so the socket can register a delivery sink
+/// for server→client pushes.
 async fn websocket_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    headers: HeaderMap,
-    RawQuery(query): RawQuery,
+    identity: Result<AuthenticatedIdentity, ApiError>,
 ) -> Response {
-    let caller = resolve_caller(&state, &headers, query.as_deref()).await;
+    let info = match identity {
+        Ok(AuthenticatedIdentity(info)) => info,
+        Err(e) if e.status() == axum::http::StatusCode::UNAUTHORIZED => {
+            return ApiError::Forbidden("Token is required".to_owned()).into_response();
+        }
+        Err(e) => return e.into_response(),
+    };
+    let caller = resolve_caller(&state, &info).await;
     ws.read_buffer_size(READ_BUFFER_BYTES)
         .on_upgrade(move |socket| handle_socket(socket, state, caller))
 }
 
 /// The resolved identity of an authenticated socket: its session id (the bus
-/// sink key) and the signed-in user (who the subscription streams answer for).
+/// sink key), the signed-in user (who the subscription streams answer for), and
+/// whether that caller is an administrator. The role is read once, at connect,
+/// as upstream reads the connection's `AuthorizationInfo` captured at upgrade.
 #[derive(Clone)]
 struct SocketCaller {
     session_id: String,
+    /// Nil for an API-key socket, whose session has no user.
     user_id: uuid::Uuid,
+    is_admin: bool,
+    /// The socket authenticated with an API key: its session has no user and
+    /// it sees every session (`SessionInfoWebSocketListener` applies no user
+    /// filter to an API key).
+    is_api_key: bool,
 }
 
-/// Why a socket ended up anonymous — kept distinct so the logs can tell
-/// "client never sent a token" (expected for pre-auth clients) from "a token
-/// was sent but didn't resolve" (bad client input, or a server bug that would
-/// silently drop SyncPlay/push delivery).
+/// Why an authenticated socket carries no session — kept distinct so the logs
+/// can tell an API key (expected) from a user token that didn't resolve (a
+/// server bug that would silently drop SyncPlay/push delivery).
 #[derive(Clone, Copy)]
-enum AnonymousReason {
-    /// No `api_key`/`ApiKey` query parameter and no token header.
-    NoToken,
+enum SessionlessReason {
+    /// An API-key socket's session could not be opened.
+    ApiKeySessionFailed,
     /// A token was presented but the session manager could not resolve it.
     TokenUnresolved,
     /// The token resolved to a session that carries no session id.
     SessionWithoutId,
 }
 
-impl AnonymousReason {
+impl SessionlessReason {
     /// The value logged in the `reason` field.
     fn as_str(self) -> &'static str {
         match self {
-            Self::NoToken => "no-token",
+            Self::ApiKeySessionFailed => "api-key-session-failed",
             Self::TokenUnresolved => "token-unresolved",
             Self::SessionWithoutId => "session-without-id",
         }
     }
 }
 
-/// Resolves the caller's session id from the socket's access token, or the
-/// reason the socket is anonymous.
+/// Resolves an authenticated socket's session, or the reason it has none.
 ///
-/// The WebSocket carries its token as the `api_key`/`ApiKey` query parameter (the
-/// Jellyfin convention) or, failing that, an `X-Emby-Token`/`X-MediaBrowser-Token`
-/// header. We resolve it straight through the session manager
-/// ([`get_session_by_authentication_token`]) rather than the general
-/// [`AuthService`], because the latter gates the lowercase `api_key` query
-/// parameter behind legacy-authorization config — which would silently drop the
-/// socket's session and its SyncPlay delivery. Passing an empty `device_id` lets
-/// the manager key the session off the token's own device, so the derived id
-/// matches the one the `/SyncPlay/*` handlers compute for the same client.
+/// The token is the one [`websocket_upgrade`] authenticated. It goes to the
+/// session manager ([`get_session_by_authentication_token`]) with an empty
+/// `device_id`, which keys the session off the token's own device, so the
+/// derived id matches the one the `/SyncPlay/*` handlers compute for the same
+/// client, and with the caller's address, which upstream's `GetSession` records
+/// on every connect (`GetNormalizedRemoteIP`).
+///
+/// An API key has no device row, so its socket gets the session upstream's
+/// `RequestHelpers.GetSession` logs for it instead: one with no user
+/// (`LogSessionActivity(client, version, deviceId, device, remoteIp, null)`),
+/// keyed by the client and device the auth layer filled in for the key.
+/// The key is upstream's `{appName}{deviceId}`, so a key whose name and
+/// supplied `DeviceId` equal a signed-in client's would share that client's
+/// session (and clear its user), exactly as upstream; without a supplied
+/// `DeviceId` the key's device is the server's system id, which no user
+/// session carries.
 ///
 /// [`get_session_by_authentication_token`]: ferrofin_traits::session::SessionManager::get_session_by_authentication_token
-/// [`AuthService`]: ferrofin_traits::net::AuthService
 async fn resolve_caller(
     state: &AppState,
-    headers: &HeaderMap,
-    query: Option<&str>,
-) -> Result<SocketCaller, AnonymousReason> {
-    let token = query_param(query, "api_key")
-        .or_else(|| query_param(query, "ApiKey"))
-        .or_else(|| header_token(headers))
-        .ok_or(AnonymousReason::NoToken)?;
+    info: &AuthorizationInfo,
+) -> Result<SocketCaller, SessionlessReason> {
+    if info.is_api_key {
+        let session = state
+            .sessions
+            .log_session_activity(
+                info.client.as_deref().unwrap_or_default(),
+                info.version.as_deref().unwrap_or_default(),
+                info.device_id.as_deref().unwrap_or_default(),
+                info.device.as_deref().unwrap_or_default(),
+                info.remote_endpoint.as_deref().unwrap_or_default(),
+                None,
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "websocket API-key session could not be opened");
+                SessionlessReason::ApiKeySessionFailed
+            })?;
+        let session_id = session.id.ok_or(SessionlessReason::SessionWithoutId)?;
+        // An API key is elevated (`is_administrator_identity`), so it may
+        // subscribe to the activity log as upstream's listener allows.
+        return Ok(SocketCaller {
+            session_id,
+            user_id: session.user_id,
+            is_admin: true,
+            is_api_key: true,
+        });
+    }
+    let token = info
+        .token
+        .as_ref()
+        .ok_or(SessionlessReason::TokenUnresolved)?;
     let session = state
         .sessions
-        .get_session_by_authentication_token(&token, "", "")
+        .get_session_by_authentication_token(
+            token.expose(),
+            "",
+            info.remote_endpoint.as_deref().unwrap_or_default(),
+        )
         .await
         .map_err(|e| {
             tracing::warn!(error = %e, "websocket token did not resolve to a session");
-            AnonymousReason::TokenUnresolved
+            SessionlessReason::TokenUnresolved
         })?;
-    let session_id = session.id.ok_or(AnonymousReason::SessionWithoutId)?;
+    let session_id = session.id.ok_or(SessionlessReason::SessionWithoutId)?;
+    // A failed policy lookup leaves the caller without the role: fail closed.
+    let is_admin = crate::auth::is_administrator_identity(state, info)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "websocket caller's role did not resolve");
+            false
+        });
     Ok(SocketCaller {
         session_id,
         user_id: session.user_id,
+        is_admin,
+        is_api_key: false,
     })
 }
 
-/// Reads a bare-token header (`X-Emby-Token` / `X-MediaBrowser-Token`).
-fn header_token(headers: &HeaderMap) -> Option<String> {
-    for name in ["x-emby-token", "x-mediabrowser-token"] {
-        if let Some(value) = headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .filter(|v| !v.is_empty())
-        {
-            return Some(value.to_owned());
-        }
+/// Whether `caller` may start the subscription `inbound` asks for.
+///
+/// Port of `ActivityLogWebSocketListener.Start`, which throws
+/// `AuthenticationException("Only admin users can retrieve the activity log.")`
+/// unless the caller is an API key or an administrator, the same role
+/// `GET /System/ActivityLog/Entries` demands. Upstream's connection logs the
+/// throw as a warning and stays open with the stream unarmed, as here. The
+/// other streams need only a session (`SessionInfoWebSocketListener` scopes
+/// what it sends; `ScheduledTasksWebSocketListener` has no check).
+fn may_subscribe(caller: &SocketCaller, inbound: Inbound) -> bool {
+    if matches!(inbound, Inbound::ActivityStart(_)) && !caller.is_admin {
+        tracing::warn!(
+            user_id = %caller.user_id,
+            "only admin users can retrieve the activity log"
+        );
+        return false;
     }
-    None
-}
-
-/// Extracts a query-string parameter case-insensitively, as Jellyfin does.
-/// Raw authentication reads join nonempty StringValues; scalar model binding's
-/// first-value rule does not apply. Decode each key and value exactly once.
-fn query_param(query: Option<&str>, key: &str) -> Option<String> {
-    let mut values = form_urlencoded::parse(query?.as_bytes())
-        .filter(|(k, v)| k.eq_ignore_ascii_case(key) && !v.is_empty())
-        .map(|(_, value)| value);
-    let mut value = values.next()?.into_owned();
-    for next in values {
-        value.push(',');
-        value.push_str(&next);
-    }
-    Some(value)
+    true
 }
 
 /// The action to take for one inbound frame — split out so the decision logic is
@@ -314,6 +371,22 @@ fn parse_inbound(text: &str) -> Option<Inbound> {
 /// malformed — jellyfin-web subscribes with "0,1500".
 const DEFAULT_STREAM_MILLIS: u64 = 1500;
 
+/// Fallback minimum period between pushes of a dashboard stream, used when the
+/// composition root does not configure one (chiefly unit tests). The server
+/// injects the operator-configured floor
+/// (`FERROFIN_WS_MIN_STREAM_PERIOD_MS`, default 100 ms) via
+/// [`crate::AppState::with_websocket_min_stream_period`]; this constant only
+/// backs a bare [`crate::AppState::new`] so client-chosen periods are floored
+/// even then.
+///
+/// The floor exists because Ferrofin drives these streams on a timer — each
+/// tick recomputes and sends the full snapshot — whereas upstream's
+/// `BasePeriodicWebSocketListener` is event-driven and sends only when a
+/// session/playback event fires (the client period is a debounce ceiling
+/// there, never a poll clock). Without a floor a client could ask for a 1 ms
+/// period and turn each tick into back-to-back `get_sessions`/activity work.
+pub(crate) const DEFAULT_WS_MIN_STREAM_PERIOD: Duration = Duration::from_millis(100);
+
 /// Parses the `"initialDelayMs,periodMs"` subscription payload (the C#
 /// `BasePeriodicWebSocketListener` Data convention) into the stream period.
 /// The initial delay is folded into the period (first send after one period).
@@ -387,9 +460,9 @@ type Registration = (
     ferrofin_traits::session_bus::SinkToken,
 );
 
-/// Registers an authenticated socket's push sink on the session bus, if the
-/// caller resolved to a session and a bus is wired. An anonymous socket (or a
-/// server with no bus) gets no registration and simply never receives pushes.
+/// Registers a socket's push sink on the session bus, if the caller resolved
+/// to a session and a bus is wired. A sessionless socket (or a server with no
+/// bus) gets no registration and simply never receives pushes.
 fn register_sink(
     state: &AppState,
     caller: Option<&SocketCaller>,
@@ -467,23 +540,23 @@ async fn say_goodbye(
     let _ = send_frame(socket, Message::Close(None), overflowed).await;
 }
 
-/// Holds a WebSocket open: register the caller's push sink (if authenticated),
+/// Holds a WebSocket open: register the caller's push sink (if it has a session),
 /// answer pings, forward server→client pushes, send a periodic keep-alive, and
 /// close cleanly — unregistering the sink — when the peer goes away.
 #[tracing::instrument(
     name = "ws_session",
     skip_all,
-    fields(session_id = caller.as_ref().map_or("anonymous", |c| c.session_id.as_str()))
+    fields(session_id = caller.as_ref().map_or("none", |c| c.session_id.as_str()))
 )]
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
-    caller: Result<SocketCaller, AnonymousReason>,
+    caller: Result<SocketCaller, SessionlessReason>,
 ) {
     let started = std::time::Instant::now();
     let mut close_all = CLOSE_ALL.subscribe();
     // `tx` feeds this socket; the bus holds a clone as the session's delivery
-    // sink. Keeping `tx` alive here also keeps `rx` open for anonymous sockets
+    // sink. Keeping `tx` alive here also keeps `rx` open for sessionless sockets
     // (no sink registered) so the forward branch stays pending rather than
     // closing the loop. The channel is bounded (see `PUSH_QUEUE_DEPTH`) so a
     // client that stops reading cannot make the server buffer without limit.
@@ -498,10 +571,13 @@ async fn handle_socket(
     // it wakes every `IntervalFactor * WebSocketLostTimeout` and only sends a
     // `ForceKeepAlive` to a socket that has been SILENT for longer than
     // `ForceKeepAliveFactor * WebSocketLostTimeout`, where "silent" is reset by
-    // the client's own `KeepAlive`. A socket past the full timeout leaves the
-    // watchlist (`RemoveWebSocket`) and is never prodded again — upstream does
-    // not close it either, which is the `// TODO: handle session relative to the
-    // lost webSocket` still standing at SessionWebSocketListener.cs:246.
+    // the client's own `KeepAlive`. A socket past the full timeout is lost:
+    // upstream removes it from the watchlist and disposes it (since 12.0-rc3,
+    // jellyfin/jellyfin#17079), which ends the receive, so its session and
+    // SyncPlay seat go with it. Here the loop ends and the teardown below runs.
+    // Every socket has a session upstream (`RequestHelpers.GetSession`), but a
+    // sessionless one here (see `resolve_caller`) is only dropped from the
+    // watch, as before: nothing told it to send `KeepAlive`.
     //
     // A fixed 60 s metronome — what this loop used to run — is neither: it kept
     // prodding a socket the client was actively talking on, and its cadence
@@ -519,9 +595,10 @@ async fn handle_socket(
     let open = greet_with_keep_alive(&mut socket, &overflowed, caller.is_some()).await;
 
     // The dashboard's periodic streams, armed by *Start subscription messages
-    // (each is `None` until subscribed). Only an authenticated socket may
-    // subscribe — the streams answer as the socket's user.
-    let mut streams = Streams::default();
+    // (each is `None` until subscribed). Only a socket with a session may
+    // subscribe — the streams answer as the socket's user — and the activity
+    // stream is an administrator's alone (`may_subscribe`).
+    let mut streams = Streams::new(state.websocket_min_stream_period);
     let mut task_updates = None;
 
     if open {
@@ -547,7 +624,7 @@ async fn handle_socket(
                     }
                     Action::Inbound(inbound) => {
                         log_task_subscription(inbound, caller.is_some());
-                        if caller.is_some() {
+                        if caller.as_ref().is_some_and(|c| may_subscribe(c, inbound)) {
                             let message = update_task_subscription(&state, inbound, &mut task_updates).await;
                             if !send_optional(&mut socket, message, &overflowed).await {
                                 break;
@@ -571,15 +648,15 @@ async fn handle_socket(
                     break;
                 },
                 _ = keepalive.tick(), if watched => {
-                    if !keep_alive_watchdog(
-                        &mut socket, &overflowed, last_keep_alive, &mut watched).await
+                    if !keep_alive_watchdog(&mut socket, &overflowed, last_keep_alive,
+                        caller.is_some(), &mut watched).await
                     {
                         break;
                     }
                 }
                 () = tick(&mut streams.sessions) => {
                     if let Some(c) = caller.as_ref()
-                        && let Some(msg) = sessions_message(&state, c.user_id).await
+                        && let Some(msg) = sessions_message(&state, c.user_id, c.is_api_key).await
                         && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
                     {
                         break;
@@ -616,10 +693,10 @@ async fn handle_socket(
 }
 
 /// Debug diagnostics for accepted and ignored task subscriptions.
-fn log_task_subscription(inbound: Inbound, authenticated: bool) {
+fn log_task_subscription(inbound: Inbound, session: bool) {
     if matches!(inbound, Inbound::TasksStart(_) | Inbound::TasksStop) {
         tracing::debug!(
-            authenticated,
+            session,
             subscribing = matches!(inbound, Inbound::TasksStart(_)),
             "dashboard task subscription requested"
         );
@@ -629,7 +706,7 @@ fn log_task_subscription(inbound: Inbound, authenticated: bool) {
 async fn unregister_socket(state: &AppState, registration: Option<Registration>) {
     if let Some((sid, bus, token)) = registration {
         end_session_if_last_socket(bus.as_ref(), &sid, token, || {
-            state.sessions.report_session_ended(&sid)
+            state.sessions.close_if_needed(&sid)
         })
         .await;
     }
@@ -649,11 +726,11 @@ async fn send_optional(
 
 /// The one `websocket connected` line, which says whether the socket carries a
 /// session and — when it does not — why not.
-fn log_connect(caller: Result<&SocketCaller, &AnonymousReason>, registered: bool) {
+fn log_connect(caller: Result<&SocketCaller, &SessionlessReason>, registered: bool) {
     match caller {
-        Ok(_) => tracing::info!(authenticated = registered, "websocket connected"),
+        Ok(_) => tracing::info!(session = registered, "websocket connected"),
         Err(reason) => tracing::info!(
-            authenticated = false,
+            session = false,
             reason = reason.as_str(),
             "websocket connected"
         ),
@@ -670,15 +747,15 @@ fn log_connect(caller: Result<&SocketCaller, &AnonymousReason>, registered: bool
 /// `[0.2, 48.0, 96.0, 144.1]`, Ferrofin at `[48.0, 96.1, 144.1]` — the same
 /// cadence, one frame short, every run.
 ///
-/// Only an authenticated socket is greeted, as upstream: `GetSession` runs
+/// Only a socket with a session is greeted, as upstream: `GetSession` runs
 /// before `KeepAliveWebSocket`, so a connection with no session never reaches
 /// the watchlist at all. Returns whether the socket is still usable.
 async fn greet_with_keep_alive(
     socket: &mut WebSocket,
     overflowed: &tokio::sync::Notify,
-    authenticated: bool,
+    has_session: bool,
 ) -> bool {
-    if !authenticated {
+    if !has_session {
         return true;
     }
     send_frame(
@@ -700,17 +777,26 @@ enum KeepAlive {
     /// so prompt it with another `ForceKeepAlive`.
     Prod,
     /// `lost` — silent past the whole `WebSocketLostTimeout`. Upstream drops it
-    /// from the watchlist (`RemoveWebSocket`) and does NOT close it: the
-    /// `// TODO: handle session relative to the lost webSocket` at :246 stands.
+    /// from the watchlist and disposes it (`KeepAliveSockets`, since 12.0-rc3),
+    /// so the socket closes and its session ends.
     Lost,
+    /// `lost`, but the socket has no session to end: it only leaves the watch.
+    /// Upstream gives every socket a session (an API key's has no user, which
+    /// Ferrofin ports too); a socket here is sessionless only when that failed
+    /// ([`SessionlessReason`]), and such a socket was never greeted.
+    Unwatch,
 }
 
 /// Classifies one watchdog tick. The two bands are half-open exactly as the C#
 /// writes them: `inactive` is `elapsed > force && elapsed < timeout`, `lost` is
 /// `elapsed >= timeout`, so a socket exactly at the timeout is lost, not prodded.
-fn keep_alive_action(silent_secs: f64) -> KeepAlive {
+fn keep_alive_action(silent_secs: f64, has_session: bool) -> KeepAlive {
     if silent_secs >= KEEPALIVE_LOST_SECS {
-        KeepAlive::Lost
+        if has_session {
+            KeepAlive::Lost
+        } else {
+            KeepAlive::Unwatch
+        }
     } else if silent_secs > KEEPALIVE_FORCE_AFTER_SECS {
         KeepAlive::Prod
     } else {
@@ -719,18 +805,26 @@ fn keep_alive_action(silent_secs: f64) -> KeepAlive {
 }
 
 /// One tick of `SessionWebSocketListener.KeepAliveSockets` for a single socket.
-/// Returns whether the socket loop should continue.
+/// Returns whether the socket loop should continue: a lost socket with a
+/// session ends it.
 async fn keep_alive_watchdog(
     socket: &mut WebSocket,
     overflowed: &tokio::sync::Notify,
     last_keep_alive: tokio::time::Instant,
+    has_session: bool,
     watched: &mut bool,
 ) -> bool {
-    match keep_alive_action(last_keep_alive.elapsed().as_secs_f64()) {
+    let silent_secs = last_keep_alive.elapsed().as_secs_f64();
+    match keep_alive_action(silent_secs, has_session) {
         KeepAlive::Quiet => true,
         KeepAlive::Lost => {
+            // Upstream: `Lost {0} WebSockets.` at Information.
+            tracing::info!(silent_s = silent_secs, "websocket keep-alive lost; closing");
+            false
+        }
+        KeepAlive::Unwatch => {
             *watched = false;
-            tracing::debug!("websocket keep-alive lost; no longer watched");
+            tracing::debug!("sessionless websocket keep-alive lost; no longer watched");
             true
         }
         KeepAlive::Prod => {
@@ -752,24 +846,31 @@ struct Streams {
     /// Only activity entries created after this instant are streamed (advanced
     /// on every send, so each entry is delivered once).
     activity_since: chrono::DateTime<chrono::Utc>,
+    /// The floor every armed stream's period is clamped up to (see
+    /// [`DEFAULT_WS_MIN_STREAM_PERIOD`]).
+    min_period: Duration,
 }
 
-impl Default for Streams {
-    fn default() -> Self {
+impl Streams {
+    /// A fresh, unsubscribed stream set whose periods are floored at
+    /// `min_period` (the operator-configured minimum stream period).
+    fn new(min_period: Duration) -> Self {
         Self {
             sessions: None,
             tasks: None,
             activity: None,
             activity_since: chrono::Utc::now(),
+            min_period,
         }
     }
-}
 
-impl Streams {
     /// Arms or cancels a stream for one subscription message.
     fn apply(&mut self, inbound: Inbound) {
+        // Floor the client-chosen period: a tiny period would otherwise make
+        // each tick recompute and resend the full snapshot back to back.
+        let min_period = self.min_period;
         let arm = |period: Duration| {
-            let mut interval = tokio::time::interval(period);
+            let mut interval = tokio::time::interval(period.max(min_period));
             // First send one period from now, not immediately.
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.reset();
@@ -814,11 +915,16 @@ fn envelope(message_type: &str, data: &serde_json::Value) -> String {
 }
 
 /// The `Sessions` stream payload: the session list as the subscribing user
-/// sees it (the session manager applies the caller's visibility).
-async fn sessions_message(state: &AppState, user_id: uuid::Uuid) -> Option<String> {
+/// sees it (the session manager applies the caller's visibility; an API key
+/// sees every session).
+async fn sessions_message(
+    state: &AppState,
+    user_id: uuid::Uuid,
+    is_api_key: bool,
+) -> Option<String> {
     let sessions = state
         .sessions
-        .get_sessions(user_id, None, None, None, false)
+        .get_sessions(user_id, None, None, None, is_api_key)
         .await
         .ok()?;
     Some(envelope("Sessions", &serde_json::to_value(sessions).ok()?))
@@ -982,13 +1088,40 @@ fn force_keep_alive_message() -> String {
 mod tests {
     use super::{
         Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_FORCE_AFTER_SECS, KEEPALIVE_LOST_SECS,
-        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, action_for, force_keep_alive_message,
-        header_token, keep_alive_ack, keep_alive_action, parse_inbound, push_sink, query_param,
-        visible_tasks,
+        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, SocketCaller, Streams, action_for,
+        force_keep_alive_message, keep_alive_ack, keep_alive_action, may_subscribe, parse_inbound,
+        push_sink, visible_tasks,
     };
     use axum::extract::ws::Message;
-    use axum::http::HeaderMap;
+    use std::time::Duration;
     use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn stream_period_is_floored_at_the_configured_minimum() {
+        // A hostile or misconfigured client asks for a 1 ms period on every
+        // stream; each must be clamped up to the floor so a tick cannot become
+        // back-to-back `get_sessions`/activity work.
+        let floor = Duration::from_millis(100);
+        let mut streams = Streams::new(floor);
+        streams.apply(Inbound::SessionsStart(Duration::from_millis(1)));
+        streams.apply(Inbound::TasksStart(Duration::from_millis(1)));
+        streams.apply(Inbound::ActivityStart(Duration::from_millis(1)));
+        assert_eq!(streams.sessions.as_ref().unwrap().period(), floor);
+        assert_eq!(streams.tasks.as_ref().unwrap().period(), floor);
+        assert_eq!(streams.activity.as_ref().unwrap().period(), floor);
+    }
+
+    #[tokio::test]
+    async fn stream_period_above_the_floor_is_left_untouched() {
+        // jellyfin-web subscribes with 1500 ms, comfortably above the floor, so
+        // the floor must not slow a well-behaved client down.
+        let mut streams = Streams::new(Duration::from_millis(100));
+        streams.apply(Inbound::SessionsStart(Duration::from_millis(1500)));
+        assert_eq!(
+            streams.sessions.as_ref().unwrap().period(),
+            Duration::from_millis(1500)
+        );
+    }
 
     #[tokio::test]
     async fn captured_transitions_precede_periodic_snapshots_and_stop_unsubscribes() {
@@ -1082,55 +1215,39 @@ mod tests {
         );
     }
 
+    /// Only the activity stream is an administrator's (`ActivityLogWebSocketListener`
+    /// is the one listener whose `Start` demands a role); the gate must not reach wider.
     #[test]
-    fn query_param_accepts_jellyfin_and_host_normalized_token_keys() {
-        let q = Some("deviceId=dev1&api_key=abc123&x=1");
-        assert_eq!(query_param(q, "api_key").as_deref(), Some("abc123"));
-        assert_eq!(query_param(q, "deviceId").as_deref(), Some("dev1"));
-        assert_eq!(query_param(q, "ApiKey"), None); // underscore is significant
-        for key in ["ApiKey", "apiKey", "apikey", "APIKEY"] {
-            let query = format!("deviceId=dev1&{key}=aBc123&x=1");
-            assert_eq!(
-                query_param(Some(&query), "ApiKey").as_deref(),
-                Some("aBc123")
-            );
+    fn only_the_activity_stream_needs_an_administrator() {
+        let caller = |is_admin| SocketCaller {
+            session_id: "s".to_owned(),
+            user_id: uuid::Uuid::nil(),
+            is_admin,
+            is_api_key: false,
+        };
+        let period = std::time::Duration::from_secs(1);
+        assert!(!may_subscribe(
+            &caller(false),
+            Inbound::ActivityStart(period)
+        ));
+        for inbound in [
+            Inbound::ActivityStart(period),
+            Inbound::ActivityStop,
+            Inbound::SessionsStart(period),
+            Inbound::TasksStart(period),
+        ] {
+            assert!(may_subscribe(&caller(true), inbound), "{inbound:?}");
+            if inbound != Inbound::ActivityStart(period) {
+                assert!(may_subscribe(&caller(false), inbound), "{inbound:?}");
+            }
         }
-        assert_eq!(query_param(Some("apiKey="), "ApiKey"), None);
-        assert_eq!(query_param(Some("api_key="), "api_key"), None); // empty value
-        assert_eq!(query_param(None, "api_key"), None);
-        assert_eq!(
-            query_param(Some("API_KEY=first&api_key=second"), "api_key").as_deref(),
-            Some("first,second")
-        );
-        assert_eq!(
-            query_param(Some("api_key=&api_key=second"), "api_key").as_deref(),
-            Some("second")
-        );
-        assert_eq!(
-            query_param(Some("api_key&api_key=second"), "api_key").as_deref(),
-            Some("second")
-        );
-        assert_eq!(query_param(Some("api_key=&api_key"), "api_key"), None);
-        assert_eq!(
-            query_param(
-                Some("%61pi_key=first%2526&API_KEY=second%2Bvalue"),
-                "api_key"
-            )
-            .as_deref(),
-            Some("first%26,second+value")
-        );
-        assert_eq!(
-            query_param(Some("%2561pi_key=ignored&api_key=second"), "api_key").as_deref(),
-            Some("second")
-        );
-    }
-
-    #[test]
-    fn header_token_reads_bare_token_headers() {
-        let mut h = HeaderMap::new();
-        assert_eq!(header_token(&h), None);
-        h.insert("X-Emby-Token", "tok-1".parse().unwrap());
-        assert_eq!(header_token(&h).as_deref(), Some("tok-1"));
+        // An API key is elevated, so `ActivityLogWebSocketListener` admits it.
+        let api_key = SocketCaller {
+            is_admin: true,
+            is_api_key: true,
+            ..caller(true)
+        };
+        assert!(may_subscribe(&api_key, Inbound::ActivityStart(period)));
     }
 
     #[test]
@@ -1312,6 +1429,31 @@ mod tests {
         );
     }
 
+    /// The last socket's close ends the session through `close_if_needed` (C#
+    /// `CloseIfNeededAsync`, which releases the session's live stream first),
+    /// never through `report_session_ended`, which is a logout's and releases
+    /// nothing. `FakeSessions` answers `close_if_needed` and leaves
+    /// `report_session_ended` unimplemented, so the panic is the assertion:
+    /// the test passes only if the close never reports a logout.
+    #[tokio::test]
+    async fn the_last_socket_close_closes_the_session_rather_than_logging_it_out() {
+        let state = crate::test_support::fake_state();
+        let bus = std::sync::Arc::new(FakeBus {
+            still_connected: false,
+            removed: std::sync::Mutex::new(Vec::new()),
+        });
+        let registration: super::Registration = (
+            "sess-1".to_owned(),
+            bus.clone() as std::sync::Arc<dyn ferrofin_traits::session_bus::SessionMessageBus>,
+            7,
+        );
+        super::unregister_socket(&state, Some(registration)).await;
+        assert_eq!(
+            *bus.removed.lock().expect("fake bus mutex"),
+            vec![("sess-1".to_owned(), 7)]
+        );
+    }
+
     /// The C# guard `if (!session.SessionControllers.Any(i => i.IsSessionActive))`:
     /// a stale socket closing after the client reconnected must not end the
     /// session out from under the live one.
@@ -1367,14 +1509,16 @@ mod tests {
         // `IntervalFactor * WebSocketLostTimeout`: the watchdog wakes far more
         // often than it speaks, so most ticks must be silent.
         for quiet in [0.0, 1.0, 12.0, 24.0, 44.9, KEEPALIVE_FORCE_AFTER_SECS] {
-            assert_eq!(keep_alive_action(quiet), KeepAlive::Quiet, "{quiet}");
+            assert_eq!(keep_alive_action(quiet, true), KeepAlive::Quiet, "{quiet}");
         }
         for prod in [45.1, 48.0, 59.9] {
-            assert_eq!(keep_alive_action(prod), KeepAlive::Prod, "{prod}");
+            assert_eq!(keep_alive_action(prod, true), KeepAlive::Prod, "{prod}");
         }
-        // `elapsed >= WebSocketLostTimeout` is `lost`, not one last prod.
+        // `elapsed >= WebSocketLostTimeout` is `lost`, not one last prod: a
+        // socket with a session closes, a sessionless one only leaves the watch.
         for lost in [KEEPALIVE_LOST_SECS, 60.1, 600.0] {
-            assert_eq!(keep_alive_action(lost), KeepAlive::Lost, "{lost}");
+            assert_eq!(keep_alive_action(lost, true), KeepAlive::Lost, "{lost}");
+            assert_eq!(keep_alive_action(lost, false), KeepAlive::Unwatch, "{lost}");
         }
         // ...and the bands are the C# factors of the one timeout the client is
         // told about in the `ForceKeepAlive` payload.

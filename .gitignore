@@ -6,8 +6,6 @@
 *.db
 *.db-shm
 *.db-wal
-# insta review leftovers
-*.snap.new
 # agent worktrees (can grow to tens of GB of checkouts + target dirs)
 **/.claude/worktrees/
 # per-machine Claude settings
@@ -40,9 +38,9 @@ suite.*/
 **/jellyfin-12.*/
 **/media-mounts.sh
 **/smoke-jellyfin-*.txt
-adoption/oracle/
-adoption/work/
-adoption/fixtures/
+gates/adoption/oracle/
+gates/adoption/work/
+gates/adoption/fixtures/
 **/*.metadata.json
 **/*.metadata-after-*.log
 **/*.watch-history.json
@@ -54,3 +52,15 @@ adoption/fixtures/
 **/FFmpeg.*.log
 **/*.smoke.txt
 **/*.smoke2.txt
+**/*.smoke-scan.txt
+
+# Parity replay output from before the output root (gates/lib.sh): reports and server logs, never committed.
+gates/parity/runs/
+
+# The gates lived at the root until they moved under gates/ (gl-912). An older checkout keeps
+# their data there (bench/testdata/ids.json holds credentials, run and adoption work dirs), so
+# the old roots stay ignored and none of it can be committed.
+/bench/
+/adoption/
+/parity/
+/verify/

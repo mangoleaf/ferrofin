@@ -42,7 +42,6 @@
 //! next episode whose source name equals the played version's. Until then the
 //! pick is always the primary episode row.
 
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -61,6 +60,7 @@ use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::persistence::{NextUpEpisodeBatchResult, NextUpService};
 use ferrofin_traits::tv::{NextUpQuery, TvSeriesManager};
+use ferrofin_util::stable_sort::stable_sort_by;
 
 use crate::item_type_lookup::kind_from_type_name;
 use crate::kinds;
@@ -335,8 +335,7 @@ fn determine_next_episode(
             // total order (an unnumbered episode compares equal to a special
             // that airs before an episode of its season while ordering
             // strictly against its numbered siblings). `slice::sort_by` may
-            // panic on such a comparator since Rust 1.81, so the handful of
-            // rows is insertion-sorted instead.
+            // panic on such a comparator since Rust 1.81.
             stable_sort_by(&mut considered, |a, b| a.0.compare(&b.0));
             let mut sorted: Box<dyn Iterator<Item = &BaseItemEntity>> =
                 Box::new(considered.into_iter().map(|(_, ep)| ep));
@@ -366,19 +365,6 @@ fn determine_next_episode(
     Some(next.clone())
 }
 
-/// A stable insertion sort that never panics, whatever the comparator does:
-/// LINQ's `OrderBy` semantics for a comparer that is not a total order. The
-/// inputs are a series' handful of positioned specials plus two rows.
-fn stable_sort_by<T>(items: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
-    for i in 1..items.len() {
-        let mut j = i;
-        while j > 0 && compare(&items[j - 1], &items[j]) == Ordering::Greater {
-            items.swap(j - 1, j);
-            j -= 1;
-        }
-    }
-}
-
 /// The date a pick is ordered by — `GetNextUpBatched`'s `lastWatchedDate`:
 /// `DateTime.MinValue` when the series has no last watched episode, else the
 /// most recently played version's `LastPlayedDate`, or `MinValue + 1 day` when
@@ -402,7 +388,7 @@ fn last_watched_date(result: &NextUpEpisodeBatchResult, rewatching: bool) -> Dat
 }
 
 /// Read source aired-order fields once per entity.
-fn aired_order(episode: &BaseItemEntity) -> AiredOrder {
+pub(crate) fn aired_order(episode: &BaseItemEntity) -> AiredOrder {
     let mut order = AiredOrder {
         season: episode.parent_index_number,
         episode: episode.index_number,

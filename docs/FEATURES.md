@@ -1,55 +1,51 @@
 # Feature status
 
+**Parity: 7 / 412 operations deep-verified against Jellyfin v12.2** (`ca0f16eb7c`), none
+owed a re-check against an earlier release, 0 subsystem rows (as of 2026-10-19; the
+`contract_superset` test prints the current line).
+**Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
+Ferrofin answers the way Jellyfin does (identical, an accepted difference, filed, new), by API
+area, is in the root README's [Results](../README.md#answering-like-jellyfin).
+
 Ferrofin implements the Jellyfin server API surface, not a subset of it. Every one of the
 **412 operations** in the vendored OpenAPI contract is wired to a real handler — there are
 **no `501` stubs**. What varies is verification depth and, for a handful of operations, how
 faithfully an edge case matches Jellyfin.
 
-These tiers were last derived from the v2 parity ledger, retired with the v2 suite on
-2026-09-02 (recoverable from git history). Verification tracking now lives in the source:
-`handlers::VERIFIED` beside `REAL_ROUTES`, validated and printed by
-`crates/ferrofin-api/tests/contract_superset.rs`, where **"deep verified" means the
-Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral
-equivalence** — the Jellyfin release each row was compared against is `UPSTREAM_TAG` /
-`UPSTREAM_COMMIT` in `crates/ferrofin-api/src/handlers/mod.rs`. That record is early:
-**7 of 412 operations** carry a row today, so the tiers below remain the honest picture and
-the `VERIFIED` count is the one that will replace them as it fills in.
+**"Deep verified" means the Ferrofin implementation was compared against the upstream
+Jellyfin C# for behavioral equivalence.** The record lives in the source:
+`handlers::VERIFIED` (one row per operation) and `handlers::VERIFIED_SUBSYSTEMS` (one row per
+shared subsystem, which operation rows reference) beside `REAL_ROUTES`, validated by
+`crates/ferrofin-api/tests/contract_superset.rs`, which prints the line above
+(`cargo test -p ferrofin-api --test contract_superset verified_rows -- --nocapture`). The
+release compared against is `UPSTREAM_TAG` / `UPSTREAM_COMMIT` in
+`crates/ferrofin-api/src/handlers/mod.rs`, the latest Jellyfin release when the release branch was
+cut (the branch keeps it until its release); rows compared
+against an earlier pin are listed in `VERIFIED_AGAINST_EARLIER_PIN` until re-checked.
 
-Separately, [`bench/`](../bench/README.md) compares response *shapes* against Jellyfin
+That record is early, so the tiers below remain the broader picture until its count
+replaces them. They were last derived from the v2 parity ledger, retired with the v2 suite
+on 2026-09-02 (recoverable from git history), which diffed responses at runtime against
+Jellyfin 10.11.8: a weaker bar than the C# comparison above.
+
+Transliterated upstream unit tests are a second measure: `scripts/transliteration-coverage.py`,
+with `FERROFIN_UPSTREAM_DIR` naming a Jellyfin checkout at `UPSTREAM_COMMIT`, prints per
+upstream test project the Ferrofin rstest cases that cite an upstream test next to that
+project's `[InlineData]` count (1,833 cases against 2,677 at v12.2, as of 2026-10-19).
+
+Separately, [`gates/bench/`](../gates/bench/README.md) compares response *shapes* against Jellyfin
 12.0-rc7 each run, on a generated library scanned by a real Jellyfin. That is supporting
 evidence, not the parity number — it covers 28 requests and only the fields those requests
 happen to exercise.
 
-Headline as of the last v2 run — note this table uses the **retired v2** definition of
-"deep-verified" (response + read-back diffed clean at runtime), which is a different and
-weaker bar than the C#-comparison definition above, and is why its count is so much larger
-than the 7 rows `VERIFIED` holds:
-
-| | ops | |
-|---|---:|---|
-| Wired to a real handler (`REAL`) | **412 / 412** | 100% |
-| `501` / hollow stubs | **0** | none |
-| Deep-verified vs Jellyfin 10.11.8 | **241** | response + read-back diffed clean |
-| Classified divergence | **146** | intentional, Jellyfin-bug-avoiding, or open work |
-| Untested | **25** | awaiting a parity leg on the current tree |
-
-Deep-verified means the response body **and** the persisted read-back were diffed against a
-real `jellyfin/jellyfin:10.11.8` server on identical inputs and matched (for binary/asset
-routes, the bytes were compared). Most of the rest are classified: a difference exists and
-has been reviewed — usually because Ferrofin is correct where Jellyfin has a known bug
-(see the "don't port Jellyfin bugs" policy), because the difference is a documented,
-bounded simplification, or because it is named open work still to be ported.
-
-The untested count is ops the harness had no measurement for. It is not a claim that
-they are broken, and not a claim that they are fine — it is the ledger refusing to carry a
-result forward from a tree that is no longer this one.
-
 ## Implemented & verified
 
-Deep-verified against a real Jellyfin server:
+Checked against a real Jellyfin server by the retired v2 runtime diff:
 
 - **Authentication & users** — `AuthenticateByName`, token auth, QuickConnect, API keys,
   password/policy management, user lockout, PBKDF2 hashes byte-compatible with Jellyfin.
+  As in Jellyfin 12, Emby-era credentials (`X-Emby-Authorization`, `X-Emby-Token`) need
+  `EnableLegacyAuthorization`, off by default ([UPGRADING.md](UPGRADING.md)).
 - **Library** — scan/refresh, **live filesystem watching** (inotify) with debounced,
   path-scoped ingest; virtual folders; item read + write/edit + delete (a delete removes the
   item's files exactly as Jellyfin does — a video's own folder, prefix-matched sidecars —
@@ -61,28 +57,56 @@ Deep-verified against a real Jellyfin server:
   `boxsets` is the one library type not resolved off disk (its members are curated through
   the collection API). A rescan reprocesses only what changed: see
   [What a library scan does](#what-a-library-scan-does) below, and
-  [`verify/`](../verify/README.md) to check it against any running server. Movie and
+  [`gates/verify/`](../gates/verify/README.md) to check it against any running server. Movie and
   episode probes download missing subtitles in the library's configured languages,
   respecting existing subtitles and provider settings.
 - **Browse & query** — the full `Items` query surface (filters, sorting, paging, fields),
   DTO shaping, genres/studios/persons/years, suggestions, InstantMix.
 - **Images** — item/user/artist images, all image types, resize/crop/format, blurhash tags,
-  the immutable-tagged-image caching contract.
+  the immutable-tagged-image caching contract. A user's profile image is stored where
+  Jellyfin stores it, `{config}/users/{Username}/profile{ext}`.
+  - **Accepted divergence (a fix, not a gap):** renaming a user moves their profile image
+    to the new name's folder. Jellyfin leaves it, so a new user who takes the old name
+    overwrites the renamed user's image on upload and deletes it on removal.
+  - **Accepted divergence (a fix, not a gap):** an item's images of one type (its
+    backdrops) list in the order they were added, and keep that order when the item is
+    saved again; a new one goes last. Jellyfin lists them by a random id it draws again on
+    every save, so its backdrop order reshuffles. An item adopted from Jellyfin can show
+    its backdrops in a different order once.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
   `Data`-JSON shape, the same source of truth Jellyfin itself reads.
+  - **Accepted divergence (a fix, not a gap):** a reorder counts positions among the members
+    the user can see, as Jellyfin's `MoveItemAsync` does, but Jellyfin anchors on the list
+    before the moved entry is taken out and lands it one place short when it moves down past
+    a member hidden from that user. Ferrofin puts it at the position asked for.
+  - **Accepted divergence (a fix, not a gap):** deleting a user hands over or deletes only
+    the playlists that user owned, once the delete has succeeded, and never hands one to a
+    user who no longer exists. Jellyfin also takes from their owners the playlists that were
+    shared with or open to the deleted user, skips one the user owned but could not see past
+    a parental limit, gives away or deletes the playlists even when it then refuses to delete
+    the last user or administrator, and can hand a playlist to a deleted user.
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
 - **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,
   HDR→SDR tonemap and subtitle compositing all run on the GPU where the driver supports
   it, with the pipeline chosen from a runtime probe of the device rather than from
   configuration. NVENC is verified on real hardware; VAAPI and QSV are verified against
-  the upstream argument shapes but **have not yet been run on an Intel or AMD GPU**.
+  the upstream argument shapes (except QSV's HLS keyframes, forced as IDR frames like
+  NVENC's) but **have not yet been run on an Intel or AMD GPU**.
   **AMF, VideoToolbox, RKMPP and V4L2M2M are not supported** — see the note in
   `CLAUDE.md`; selecting one falls back to a software transcode and logs a warning.
-- **Live TV** — M3U **and HDHomeRun** tuners + XMLTV guide, channels/programs, DB-backed
-  DVR timers & recordings. The HDHomeRun backend is a port of Jellyfin's `HdHomerunHost`:
+  - **Accepted divergence (a fix, not a gap):** Jellyfin puts the configured VAAPI device
+    path into the `-init_hw_device` string unquoted, so a path with a space or quote breaks
+    the command line. Ferrofin quotes such a path; an ordinary one (`/dev/dri/renderD128`)
+    is passed exactly as Jellyfin passes it.
+- **Live TV** — M3U **and HDHomeRun** tuners + XMLTV **and Schedules Direct** guides,
+  channels/programs, DB-backed DVR timers & recordings. The Schedules Direct provider is a
+  port of Jellyfin 12.2's `SchedulesDirect` (login, lineups, the station map, schedules,
+  program details and artwork, SD's error codes and daily limits); it is verified against
+  Jellyfin's own JSON fixtures and a fake SD API, and **has not been run against a real
+  Schedules Direct account**. The HDHomeRun backend is a port of Jellyfin's `HdHomerunHost`:
   `discover.json`/`lineup.json`, UDP device discovery, the per-channel HTTP stream with
   its transcode profiles, and the legacy binary control protocol. **No physical HDHomeRun
   has been run against it** — it is verified against Jellyfin's own JSON fixtures, against
@@ -93,8 +117,16 @@ Deep-verified against a real Jellyfin server:
   exercised end-to-end with a real tuner/guide by a human**; treat as less battle-tested
   than the rest of this list.
 - **SyncPlay** — groups, playback-command relay, time sync.
-- **Scheduled tasks** — all 20 of Jellyfin's scheduled tasks (including the Live TV
-  guide refresh and the hidden channel refresh) plus the trigger scheduler.
+- **Scheduled tasks** — 20 of Jellyfin's scheduled tasks (including the Live TV guide
+  refresh and the hidden channel refresh) plus the trigger scheduler. "Clean up
+  collections and playlists" is gone, as in Jellyfin 12, and Jellyfin 12's "Refresh
+  upcoming and missing episodes (TheMovieDb)" is there.
+- **Missing and unaired episodes** — the TMDb settings page's options from Jellyfin 12:
+  for the TV libraries opted in, a series refresh adds a virtual entry for each episode
+  TheMovieDb lists that has not aired yet and/or each aired one the library lacks (and a
+  virtual season when the library has nothing of a season), keeps them in step with
+  TheMovieDb, and removes them once a file arrives, they age out, or the option is turned
+  off. Off by default, as in Jellyfin.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
   - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half
@@ -102,10 +134,14 @@ Deep-verified against a real Jellyfin server:
     ffmpeg's expression parser rejects outright — so chapter and thumbnail images cannot
     be extracted for that layout there at all. Ferrofin emits the balanced form, the same
     shape Jellyfin's own half-side-by-side case already has.
+  - **Accepted divergence (a fix, not a gap):** Jellyfin passes every 3D scaler unquoted
+    (`-vf {3}`), and those graphs contain spaces, so the command line is split apart and
+    no 3D layout gets chapter or thumbnail images. Ferrofin quotes the filter graph.
 - **Photos & books** — a home-videos library resolves its images into `Photo` items with
   their EXIF read off the file (camera, exposure, GPS, orientation, date taken); a books
   library resolves `.epub`/`.cbz`/… into `Book` items with `ComicInfo`/`ComicBookInfo`/OPF
-  metadata and the cover extracted from the archive.
+  metadata and the cover extracted from the archive: a comic's from a ZIP, 7z or tar archive
+  whatever its extension (a RAR `.cbr` gets none yet).
 - **Item links & id fields** — the "Links" row (IMDb/TMDB/MusicBrainz/…) and the per-kind
   external-id fields the Identify dialog offers.
 - **Backup & restore.**
@@ -117,7 +153,7 @@ Wired and working, with a documented limitation or lighter verification:
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
-  providers (TMDB similar titles, ListenBrainz similar artists) run only for a library
+  providers (TMDB recommendations, ListenBrainz similar artists) run only for a library
   that ticked them under "Similarity providers", and resolve against items already in the
   library. The local scorer is a single query rather than upstream's six per-kind
   providers, which are identical in behaviour.
@@ -159,11 +195,20 @@ Wired and working, with a documented limitation or lighter verification:
     worth the dependency. `.cbz` and `.cbt` are fully read.
 - **Photo keywords** — the EXIF pass fills every field Jellyfin's does except `Genres` and
   `Tags`, which upstream aggregates from XMP/IPTC keywords.
-- **`collection.xml` / `playlist.xml` / `.m3u` playlist files** — the readers and writers are
-  ported and tested, but nothing calls them yet: Ferrofin creates collections and playlists as
-  pathless database rows, and its scanner resolves no collection/playlist *folders*, so there
-  is no on-disk file to read or write. Membership lives in `BaseItems."Data"` (Jellyfin's own
-  source of truth), which is what makes in-place adoption of a Jellyfin database work.
+- **Playlist files are read, never written** — a library scan makes a playlist of each
+  `.m3u`/`.m3u8`/`.pls`/`.wpl`/`.zpl` file in a music or untyped library and of each folder
+  named `… [playlist]` or holding a `playlist.xml` (members from the file, or from the
+  folder's `playlist.xml`), as Jellyfin's `PlaylistResolver` does. Of a folder's
+  `playlist.xml` only the members and the media type are read so far — its title, overview,
+  shares and lock are not — and Ferrofin does not write it back after a refresh, as Jellyfin
+  does where it saves XML metadata. Such a playlist belongs to nobody and is open to everyone,
+  so, as on Jellyfin, nobody may edit it and the file is never rewritten. Where Jellyfin 12.2
+  saves XML metadata into the library (a library whose metadata savers are unset), the
+  `<name>.xml` sidecar it writes beside a playlist file hides the file's entries and the
+  playlist stays empty; Ferrofin always reads the entries and never that sidecar.
+  `collection.xml` is still not read or written. A collection made in Ferrofin gets
+  Jellyfin's `{data}/collections/<name> [boxset]` folder (ones made before that stay
+  folderless), and its membership lives in the `LinkedChildren` table, as Jellyfin 12 keeps it.
 
 ## Not implemented (by design)
 
@@ -248,26 +293,29 @@ library's folders and processes a change once they have been quiet for
 `LibraryMonitorDelay` seconds. That is a server setting, 60 by default, with no field in
 jellyfin-web: it is set through `POST /System/Configuration`. The `*arr` webhooks
 (`POST /Library/Media/Updated`, `/Library/Series/Updated`, `/Library/Movies/Updated`) wait
-for the same delay, with or without real time monitoring (but see the Sonarr limit below).
+for the same delay, with or without real time monitoring. Sonarr and Radarr send camelCase
+keys (`{"updates":[{"path":…}]}`); request bodies bind in any letter case, as Jellyfin's do.
 Either way, as Jellyfin's `FileRefresher` does, the scan starts at the nearest item already
-in the library and runs **Scan for new and updated files** on it. For a new episode that is
-its season: the episode is added, the season (whose folder changed) is refreshed, the
-season's other episodes are checked but not probed or saved unless they changed too, and
-nothing else in the library is walked. The series' **Date Episode Added** moves at once,
+in the library and runs **Scan for new and updated files** on it. For a new episode in a
+season folder that is its season: the episode is added, the season (whose folder changed)
+is refreshed, the season's other episodes are checked but not probed or saved unless they
+changed too, and nothing else in the library is walked. For an episode in the series
+folder itself (no season folders) it is the series. The series' **Date Episode Added** moves at once,
 where Jellyfin waits for the series' own next refresh. Measured with every Series, Season
 and Episode downloader off: a new episode appears about `LibraryMonitorDelay` seconds after
 its file lands (5.1 s with a 5 s delay), and the scan itself takes about 50 ms. Provider
 requests come on top: the new episode's first refresh asks every checked downloader, and
 the season's folder change asks the season providers.
 
+### Accepted divergences (fixes, not gaps)
+
+- **An episode's season and episode numbers are read only from its path below the library
+  folder.** Jellyfin reads the whole path, so a folder above the library named like
+  `media-v12-2` or `disk1-2` puts an episode whose own name has no numbers (a bonus video,
+  say) into season 12 or 1. In Ferrofin that episode stays in the unnumbered season.
+
 ### Known limits
 
-- **Sonarr's notification is not read yet.** Sonarr sends camelCase keys
-  (`{"updates":[{"path":…}]}`), and Ferrofin binds only the PascalCase keys of Jellyfin's
-  API schema (`Updates`, `Path`). It answers `204` and scans nothing; Jellyfin binds the
-  keys in any letter case. Radarr shares Sonarr's code and is expected to send the same.
-  Until this is fixed, a library whose changes the watcher cannot see (a network share
-  written to by another host) is updated by scheduled scans only.
 - **A file that disappears takes its item's user data with it.** A deleted, renamed or moved
   file's item is removed with its watched state, resume position and favourite, and a
   renamed or moved file comes back as a new item. Jellyfin keeps that data for when the

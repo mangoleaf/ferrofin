@@ -10,6 +10,9 @@ use std::path::Path;
 /// is atomic. A failed write or rename leaves the previous file intact.
 /// Call from a blocking worker when used by an async service.
 ///
+/// The result is private (`0600` on Unix), for config and state files. A file
+/// written into a media folder uses [`atomic_write_media`].
+///
 /// # Errors
 ///
 /// Returns a filesystem error without truncating the destination.

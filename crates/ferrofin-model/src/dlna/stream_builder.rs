@@ -8,7 +8,9 @@
 use std::cmp::Ordering;
 
 use super::codec_profile::CodecProfile;
-use super::condition_processor::{ConditionProcessor, range_type_name, video_range_type_all_names};
+use super::condition_processor::{
+    ConditionProcessor, StreamBuilderError, range_type_name, video_range_type_all_names,
+};
 use super::device_profile::DeviceProfile;
 use super::direct_play_profile::DirectPlayProfile;
 use super::enums::{
@@ -86,9 +88,16 @@ impl<'a> StreamBuilder<'a> {
     }
 
     /// Gets the optimal video stream.
-    #[must_use]
-    pub fn get_optimal_video_stream(&self, options: &MediaOptions) -> Option<StreamInfo> {
-        validate_media_options(options, true);
+    ///
+    /// # Errors
+    ///
+    /// [`StreamBuilderError`] where upstream throws: options missing what the
+    /// negotiation needs, or a profile condition it cannot evaluate.
+    pub fn get_optimal_video_stream(
+        &self,
+        options: &MediaOptions,
+    ) -> Result<Option<StreamInfo>, StreamBuilderError> {
+        validate_media_options(options, true)?;
 
         let mut streams: Vec<StreamInfo> = Vec::new();
         for media_source in &options.media_sources {
@@ -102,22 +111,29 @@ impl<'a> StreamBuilder<'a> {
                 continue;
             }
 
-            let mut stream_info = self.build_video_item(media_source, options);
+            let mut stream_info = self.build_video_item(media_source, options)?;
             stream_info.device_id.clone_from(&options.device_id);
             stream_info.device_profile_id = options.profile.id.map(|id| id.as_simple().to_string());
             streams.push(stream_info);
         }
 
-        get_optimal_stream(
+        Ok(get_optimal_stream(
             streams,
             i64::from(options.get_max_bitrate(false).unwrap_or(0)),
-        )
+        ))
     }
 
     /// Gets the optimal audio stream.
-    #[must_use]
-    pub fn get_optimal_audio_stream(&self, options: &MediaOptions) -> Option<StreamInfo> {
-        validate_media_options(options, false);
+    ///
+    /// # Errors
+    ///
+    /// [`StreamBuilderError`] where upstream throws: options missing what the
+    /// negotiation needs, or a profile condition it cannot evaluate.
+    pub fn get_optimal_audio_stream(
+        &self,
+        options: &MediaOptions,
+    ) -> Result<Option<StreamInfo>, StreamBuilderError> {
+        validate_media_options(options, false)?;
 
         let mut streams: Vec<StreamInfo> = Vec::new();
         for media_source in &options.media_sources {
@@ -131,7 +147,7 @@ impl<'a> StreamBuilder<'a> {
                 continue;
             }
 
-            if let Some(mut stream_info) = self.build_audio_item(media_source, options) {
+            if let Some(mut stream_info) = self.build_audio_item(media_source, options)? {
                 stream_info.device_id.clone_from(&options.device_id);
                 stream_info.device_profile_id =
                     options.profile.id.map(|id| id.as_simple().to_string());
@@ -139,10 +155,10 @@ impl<'a> StreamBuilder<'a> {
             }
         }
 
-        get_optimal_stream(
+        Ok(get_optimal_stream(
             streams,
             i64::from(options.get_max_bitrate(true).unwrap_or(0)),
-        )
+        ))
     }
 
     /// `GetOptimalAudioStream(MediaSourceInfo, MediaOptions)`. Upstream throws
@@ -153,7 +169,7 @@ impl<'a> StreamBuilder<'a> {
         &self,
         item: &MediaSourceInfo,
         options: &MediaOptions,
-    ) -> Option<StreamInfo> {
+    ) -> Result<Option<StreamInfo>, StreamBuilderError> {
         // Working copy of the media source; the C# engine mutates `item`.
         let mut item = item.clone();
 
@@ -176,10 +192,12 @@ impl<'a> StreamBuilder<'a> {
                 None,
             );
             playlist_item.media_source = Some(item);
-            return Some(playlist_item);
+            return Ok(Some(playlist_item));
         }
 
-        let audio_stream = item.get_default_audio_stream(None)?.clone();
+        let Some(audio_stream) = item.get_default_audio_stream(None).cloned() else {
+            return Ok(None);
+        };
         let direct_play = self.get_audio_direct_play_profile(&item, &audio_stream, options);
         let mut transcode_reasons = direct_play.transcode_reasons;
 
@@ -192,7 +210,7 @@ impl<'a> StreamBuilder<'a> {
                 None,
                 false,
                 false,
-            );
+            )?;
             transcode_reasons |= audio_failure_reasons;
 
             if audio_failure_reasons.is_empty() {
@@ -204,7 +222,7 @@ impl<'a> StreamBuilder<'a> {
                     direct_play.profile.as_ref(),
                 );
                 playlist_item.media_source = Some(item);
-                return Some(playlist_item);
+                return Ok(Some(playlist_item));
             }
         }
 
@@ -246,7 +264,7 @@ impl<'a> StreamBuilder<'a> {
                 playlist_item.sub_protocol = item.transcoding_sub_protocol;
                 item.transcoding_container = Some(remux_container);
                 playlist_item.media_source = Some(item);
-                return Some(playlist_item);
+                return Ok(Some(playlist_item));
             }
 
             transcode_reasons |= TranscodeReasons::AUDIO_CODEC_NOT_SUPPORTED;
@@ -263,7 +281,7 @@ impl<'a> StreamBuilder<'a> {
 
         if let Some(transcoding_profile) = transcoding_profile {
             if !item.supports_transcoding {
-                return None;
+                return Ok(None);
             }
 
             set_stream_info_options_from_transcoding_profile(
@@ -281,7 +299,7 @@ impl<'a> StreamBuilder<'a> {
                 audio_stream.sample_rate,
                 audio_stream.bit_depth,
                 false,
-            );
+            )?;
             apply_transcoding_conditions(
                 &mut playlist_item,
                 &audio_transcoding_conditions,
@@ -326,7 +344,7 @@ impl<'a> StreamBuilder<'a> {
 
         playlist_item.transcode_reasons = transcode_reasons;
         playlist_item.media_source = Some(item);
-        Some(playlist_item)
+        Ok(Some(playlist_item))
     }
 
     /// `GetAudioDirectPlayProfile`: the audio profile the source plays under,
@@ -411,7 +429,11 @@ impl<'a> StreamBuilder<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn build_video_item(&self, item: &MediaSourceInfo, options: &MediaOptions) -> StreamInfo {
+    fn build_video_item(
+        &self,
+        item: &MediaSourceInfo,
+        options: &MediaOptions,
+    ) -> Result<StreamInfo, StreamBuilderError> {
         // Working copy of the media source; the C# engine mutates `item`.
         let mut item = item.clone();
 
@@ -526,6 +548,10 @@ impl<'a> StreamBuilder<'a> {
             is_eligible_for_direct_play = false;
         }
 
+        if is_manifest_container(item.container.as_deref()) {
+            is_eligible_for_direct_play = false;
+        }
+
         if bitrate_limit_exceeded {
             transcode_reasons = TranscodeReasons::CONTAINER_BITRATE_EXCEEDS_LIMIT;
         }
@@ -541,7 +567,7 @@ impl<'a> StreamBuilder<'a> {
                 subtitle_stream.as_ref(),
                 is_eligible_for_direct_play,
                 is_eligible_for_direct_stream,
-            );
+            )?;
             let direct_play = direct_play_info.play_method;
             transcode_reasons |= direct_play_info.transcode_reasons;
 
@@ -598,7 +624,7 @@ impl<'a> StreamBuilder<'a> {
                         direct_play_profile
                             .as_ref()
                             .and_then(|p| p.audio_codec.as_deref()),
-                    );
+                    )?;
                 }
 
                 if let Some(sub) = &subtitle_stream {
@@ -630,7 +656,7 @@ impl<'a> StreamBuilder<'a> {
                 video_stream.as_ref(),
                 audio_stream.as_ref(),
                 &playlist_item,
-            );
+            )?;
 
             if let (Some(transcoding_profile), Some(_play_method)) =
                 (transcoding_profile.as_ref(), play_method)
@@ -651,7 +677,7 @@ impl<'a> StreamBuilder<'a> {
                     Some(transcoding_profile.container.as_str()),
                     Some(transcoding_profile.video_codec.as_str()),
                     Some(transcoding_profile.audio_codec.as_str()),
-                );
+                )?;
 
                 playlist_item.play_method = PlayMethod::Transcode;
 
@@ -700,7 +726,7 @@ impl<'a> StreamBuilder<'a> {
         if let Some(ms) = playlist_item.media_source.as_mut() {
             ms.container = normalized_container;
         }
-        playlist_item
+        Ok(playlist_item)
     }
 
     fn get_video_transcode_profile(
@@ -710,9 +736,9 @@ impl<'a> StreamBuilder<'a> {
         video_stream: Option<&MediaStream>,
         audio_stream: Option<&MediaStream>,
         playlist_item: &StreamInfo,
-    ) -> (Option<TranscodingProfile>, Option<PlayMethod>) {
+    ) -> Result<(Option<TranscodingProfile>, Option<PlayMethod>), StreamBuilderError> {
         if !(item.supports_transcoding || item.supports_direct_stream) {
-            return (None, None);
+            return Ok((None, None));
         }
 
         let video_codec = video_stream.and_then(|v| v.codec.as_deref());
@@ -739,7 +765,7 @@ impl<'a> StreamBuilder<'a> {
                 && options.allow_video_stream_copy
                 && contains_container(Some(&transcoding_profile.video_codec), video_codec)
             {
-                let failures = self.get_compatibility_video_codec(options, item, container, vs);
+                let failures = self.get_compatibility_video_codec(options, item, container, vs)?;
                 rank_video = if failures.is_empty() { 1 } else { 2 };
             }
 
@@ -755,7 +781,7 @@ impl<'a> StreamBuilder<'a> {
                         Some(transcoding_audio_codec),
                         true,
                         false,
-                    );
+                    )?;
                     let mut ra = 3;
                     if failures.is_empty() {
                         ra = if audio_codec
@@ -790,10 +816,10 @@ impl<'a> StreamBuilder<'a> {
         // Stable sort by rank tuple (video, audio) ascending, preserving order.
         analyzed.sort_by(|a, b| a.2.cmp(&b.2).then(a.3.cmp(&b.3)));
 
-        analyzed
+        Ok(analyzed
             .into_iter()
             .next()
-            .map_or((None, None), |(p, m, _, _)| (Some(p), Some(m)))
+            .map_or((None, None), |(p, m, _, _)| (Some(p), Some(m))))
     }
 
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -808,7 +834,7 @@ impl<'a> StreamBuilder<'a> {
         container: Option<&str>,
         video_codec: Option<&str>,
         audio_codec: Option<&str>,
-    ) {
+    ) -> Result<(), StreamBuilderError> {
         let mut video_codecs: Vec<String> = split_owned(video_codec);
         if video_codecs.is_empty()
             && let Some(vs) = video_stream
@@ -889,20 +915,18 @@ impl<'a> StreamBuilder<'a> {
                     .unwrap_or(i32::MAX)
         });
 
-        let direct_audio_failures =
-            audio_stream_with_supported_codec
-                .as_ref()
-                .map_or(TranscodeReasons::empty(), |s| {
-                    self.get_compatibility_audio_codec(
-                        options,
-                        item,
-                        container.unwrap_or(""),
-                        s,
-                        None,
-                        true,
-                        false,
-                    )
-                });
+        let direct_audio_failures = match &audio_stream_with_supported_codec {
+            Some(s) => self.get_compatibility_audio_codec(
+                options,
+                item,
+                container.unwrap_or(""),
+                s,
+                None,
+                true,
+                false,
+            )?,
+            None => TranscodeReasons::empty(),
+        };
 
         playlist_item.transcode_reasons |= direct_audio_failures;
         if audio_stream.is_some() && audio_stream_with_supported_codec.is_none() {
@@ -998,41 +1022,39 @@ impl<'a> StreamBuilder<'a> {
 
         let video_codecs_snapshot = playlist_item.video_codecs.clone();
         let vc_refs: Vec<&str> = video_codecs_snapshot.iter().map(String::as_str).collect();
-        let applied_video_conditions: Vec<CodecProfile> = options
-            .profile
-            .codec_profiles
-            .iter()
-            .filter(|i| {
-                i.codec_type == CodecType::Video
-                    && i.contains_any_codec(&vc_refs, container, use_sub_container)
-                    && i.apply_conditions.iter().all(|apply| {
-                        ConditionProcessor::is_video_condition_satisfied(
-                            apply,
-                            width,
-                            height,
-                            bit_depth,
-                            video_bitrate,
-                            video_profile.as_deref(),
-                            video_range_type,
-                            video_level,
-                            Some(video_framerate),
-                            packet_length,
-                            timestamp,
-                            is_anamorphic,
-                            is_interlaced,
-                            ref_frames,
-                            num_streams,
-                            num_video_streams,
-                            num_audio_streams,
-                            video_codec_tag.as_deref(),
-                            is_avc,
-                            video_rotation,
-                        )
-                    })
-            })
-            .cloned()
-            .rev()
-            .collect();
+        let mut applied_video_conditions: Vec<CodecProfile> = Vec::new();
+        for i in &options.profile.codec_profiles {
+            if i.codec_type == CodecType::Video
+                && i.contains_any_codec(&vc_refs, container, use_sub_container)
+                && all_satisfied(&i.apply_conditions, |apply| {
+                    ConditionProcessor::is_video_condition_satisfied(
+                        apply,
+                        width,
+                        height,
+                        bit_depth,
+                        video_bitrate,
+                        video_profile.as_deref(),
+                        video_range_type,
+                        video_level,
+                        Some(video_framerate),
+                        packet_length,
+                        timestamp,
+                        is_anamorphic,
+                        is_interlaced,
+                        ref_frames,
+                        num_streams,
+                        num_video_streams,
+                        num_audio_streams,
+                        video_codec_tag.as_deref(),
+                        is_avc,
+                        video_rotation,
+                    )
+                })?
+            {
+                applied_video_conditions.push(i.clone());
+            }
+        }
+        applied_video_conditions.reverse();
 
         for condition in &applied_video_conditions {
             for transcoding_video_codec in &video_codecs_snapshot {
@@ -1082,28 +1104,26 @@ impl<'a> StreamBuilder<'a> {
 
         let audio_codecs_snapshot = playlist_item.audio_codecs.clone();
         let ac_refs: Vec<&str> = audio_codecs_snapshot.iter().map(String::as_str).collect();
-        let applied_audio_conditions: Vec<CodecProfile> = options
-            .profile
-            .codec_profiles
-            .iter()
-            .filter(|i| {
-                i.codec_type == CodecType::VideoAudio
-                    && i.contains_any_codec(&ac_refs, container, false)
-                    && i.apply_conditions.iter().all(|apply| {
-                        ConditionProcessor::is_video_audio_condition_satisfied(
-                            apply,
-                            audio_channels,
-                            input_audio_bitrate,
-                            input_audio_sample_rate,
-                            input_audio_bit_depth,
-                            audio_profile.as_deref(),
-                            is_secondary_audio,
-                        )
-                    })
-            })
-            .cloned()
-            .rev()
-            .collect();
+        let mut applied_audio_conditions: Vec<CodecProfile> = Vec::new();
+        for i in &options.profile.codec_profiles {
+            if i.codec_type == CodecType::VideoAudio
+                && i.contains_any_codec(&ac_refs, container, false)
+                && all_satisfied(&i.apply_conditions, |apply| {
+                    ConditionProcessor::is_video_audio_condition_satisfied(
+                        apply,
+                        audio_channels,
+                        input_audio_bitrate,
+                        input_audio_sample_rate,
+                        input_audio_bit_depth,
+                        audio_profile.as_deref(),
+                        is_secondary_audio,
+                    )
+                })?
+            {
+                applied_audio_conditions.push(i.clone());
+            }
+        }
+        applied_audio_conditions.reverse();
 
         for codec_profile in &applied_audio_conditions {
             for transcoding_audio_codec in &audio_codecs_snapshot {
@@ -1128,6 +1148,7 @@ impl<'a> StreamBuilder<'a> {
             let current_value = playlist_item.video_bitrate.unwrap_or(available);
             playlist_item.video_bitrate = Some(available.min(current_value).max(64_000));
         }
+        Ok(())
     }
 
     #[allow(
@@ -1145,51 +1166,51 @@ impl<'a> StreamBuilder<'a> {
         subtitle_stream: Option<&MediaStream>,
         is_eligible_for_direct_play: bool,
         is_eligible_for_direct_stream: bool,
-    ) -> DirectPlayInfo {
+    ) -> Result<DirectPlayInfo, StreamBuilderError> {
         if options.force_direct_play {
-            return DirectPlayInfo {
+            return Ok(DirectPlayInfo {
                 profile: None,
                 play_method: Some(PlayMethod::DirectPlay),
                 audio_stream_index: audio_stream.map(|a| a.index),
                 transcode_reasons: TranscodeReasons::empty(),
-            };
+            });
         }
         if options.force_direct_stream {
-            return DirectPlayInfo {
+            return Ok(DirectPlayInfo {
                 profile: None,
                 play_method: Some(PlayMethod::DirectStream),
                 audio_stream_index: audio_stream.map(|a| a.index),
                 transcode_reasons: TranscodeReasons::empty(),
-            };
+            });
         }
 
         let profile = &options.profile;
         let container = media_source.container.as_deref().unwrap_or("");
 
         let container_profile_reasons =
-            self.get_compatibility_container(options, media_source, container, video_stream);
+            self.get_compatibility_container(options, media_source, container, video_stream)?;
 
-        let video_codec_profile_reasons = video_stream.map_or(TranscodeReasons::empty(), |vs| {
-            self.get_compatibility_video_codec(options, media_source, container, vs)
-        });
+        let video_codec_profile_reasons = match video_stream {
+            Some(vs) => self.get_compatibility_video_codec(options, media_source, container, vs)?,
+            None => TranscodeReasons::empty(),
+        };
 
         // Audio candidate compatibility map.
-        let audio_stream_matches: Vec<(i32, TranscodeReasons)> = candidate_audio_streams
-            .iter()
-            .map(|a| {
-                (
-                    a.index,
-                    self.get_compatibility_audio_codec_direct(
-                        options,
-                        media_source,
-                        container,
-                        a,
-                        true,
-                        media_source.is_secondary_audio(a).unwrap_or(false),
-                    ),
-                )
-            })
-            .collect();
+        let mut audio_stream_matches: Vec<(i32, TranscodeReasons)> =
+            Vec::with_capacity(candidate_audio_streams.len());
+        for a in candidate_audio_streams {
+            audio_stream_matches.push((
+                a.index,
+                self.get_compatibility_audio_codec_direct(
+                    options,
+                    media_source,
+                    container,
+                    a,
+                    true,
+                    media_source.is_secondary_audio(a).unwrap_or(false),
+                )?,
+            ));
+        }
 
         let mut subtitle_profile_reasons = TranscodeReasons::empty();
         if let Some(sub) = subtitle_stream {
@@ -1311,12 +1332,12 @@ impl<'a> StreamBuilder<'a> {
         });
 
         if let Some(matched) = analyzed.iter().find(|a| a.play_method.is_some()) {
-            return DirectPlayInfo {
+            return Ok(DirectPlayInfo {
                 profile: Some(matched.profile.clone()),
                 play_method: matched.play_method,
                 audio_stream_index: matched.audio_stream_index,
                 transcode_reasons: matched.transcode_reason,
-            };
+            });
         }
 
         let mut failure_reasons = analyzed
@@ -1333,12 +1354,12 @@ impl<'a> StreamBuilder<'a> {
             failure_reasons = TranscodeReasons::DIRECT_PLAY_ERROR;
         }
 
-        DirectPlayInfo {
+        Ok(DirectPlayInfo {
             profile: None,
             play_method: None,
             audio_stream_index: None,
             transcode_reasons: failure_reasons,
-        }
+        })
     }
 
     #[allow(clippy::unused_self)]
@@ -1362,18 +1383,20 @@ impl<'a> StreamBuilder<'a> {
         media_source: &MediaSourceInfo,
         container: &str,
         video_stream: Option<&MediaStream>,
-    ) -> TranscodeReasons {
-        let profile = &options.profile;
-        let conditions: Vec<ProfileCondition> = profile
-            .container_profiles
-            .iter()
-            .filter(|cp| {
-                cp.profile_type == DlnaProfileType::Video
-                    && cp.contains_container(Some(container), false)
-            })
-            .flat_map(|cp| check_video_conditions(&cp.conditions, media_source, video_stream))
-            .collect();
-        aggregate_failure_conditions(&conditions)
+    ) -> Result<TranscodeReasons, StreamBuilderError> {
+        let mut conditions: Vec<ProfileCondition> = Vec::new();
+        for cp in &options.profile.container_profiles {
+            if cp.profile_type == DlnaProfileType::Video
+                && cp.contains_container(Some(container), false)
+            {
+                conditions.extend(check_video_conditions(
+                    &cp.conditions,
+                    media_source,
+                    video_stream,
+                )?);
+            }
+        }
+        Ok(aggregate_failure_conditions(&conditions))
     }
 
     #[allow(clippy::unused_self)]
@@ -1383,25 +1406,27 @@ impl<'a> StreamBuilder<'a> {
         media_source: &MediaSourceInfo,
         container: &str,
         video_stream: &MediaStream,
-    ) -> TranscodeReasons {
-        let profile = &options.profile;
+    ) -> Result<TranscodeReasons, StreamBuilderError> {
         let video_codec = video_stream.codec.as_deref();
-        let conditions: Vec<ProfileCondition> = profile
-            .codec_profiles
-            .iter()
-            .filter(|cp| {
-                cp.codec_type == CodecType::Video
-                    && cp.contains_codec(video_codec, Some(container), false)
-                    && check_video_conditions(
-                        &cp.apply_conditions,
-                        media_source,
-                        Some(video_stream),
-                    )
-                    .is_empty()
-            })
-            .flat_map(|cp| check_video_conditions(&cp.conditions, media_source, Some(video_stream)))
-            .collect();
-        aggregate_failure_conditions(&conditions)
+        let mut conditions: Vec<ProfileCondition> = Vec::new();
+        for cp in &options.profile.codec_profiles {
+            // `!CheckVideoConditions(ApplyConditions).Any()` stops at the first
+            // apply condition that fails.
+            if cp.codec_type == CodecType::Video
+                && cp.contains_codec(video_codec, Some(container), false)
+                && all_satisfied(
+                    &cp.apply_conditions,
+                    video_condition_check(media_source, Some(video_stream)),
+                )?
+            {
+                conditions.extend(check_video_conditions(
+                    &cp.conditions,
+                    media_source,
+                    Some(video_stream),
+                )?);
+            }
+        }
+        Ok(aggregate_failure_conditions(&conditions))
     }
 
     #[allow(clippy::too_many_arguments, clippy::unused_self)]
@@ -1414,7 +1439,7 @@ impl<'a> StreamBuilder<'a> {
         transcoding_audio_codec: Option<&str>,
         is_video: bool,
         is_secondary_audio: bool,
-    ) -> TranscodeReasons {
+    ) -> Result<TranscodeReasons, StreamBuilderError> {
         let profile = &options.profile;
         let audio_codec = transcoding_audio_codec.or(audio_stream.codec.as_deref());
         let audio_profile = audio_stream.profile.as_deref();
@@ -1434,7 +1459,7 @@ impl<'a> StreamBuilder<'a> {
                 audio_bit_depth,
                 audio_profile,
                 Some(is_secondary_audio),
-            )
+            )?
         } else {
             get_profile_conditions_for_audio(
                 &profile.codec_profiles,
@@ -1445,10 +1470,10 @@ impl<'a> StreamBuilder<'a> {
                 audio_sample_rate,
                 audio_bit_depth,
                 true,
-            )
+            )?
         };
 
-        aggregate_failure_conditions(&conditions)
+        Ok(aggregate_failure_conditions(&conditions))
     }
 
     fn get_compatibility_audio_codec_direct(
@@ -1459,7 +1484,7 @@ impl<'a> StreamBuilder<'a> {
         audio_stream: &MediaStream,
         is_video: bool,
         is_secondary_audio: bool,
-    ) -> TranscodeReasons {
+    ) -> Result<TranscodeReasons, StreamBuilderError> {
         let mut failures = self.get_compatibility_audio_codec(
             options,
             media_source,
@@ -1468,11 +1493,11 @@ impl<'a> StreamBuilder<'a> {
             None,
             is_video,
             is_secondary_audio,
-        );
+        )?;
         if audio_stream.is_external {
             failures |= TranscodeReasons::AUDIO_IS_EXTERNAL;
         }
-        failures
+        Ok(failures)
     }
 
     /// Determines the subtitle delivery profile for a subtitle stream.
@@ -1628,33 +1653,33 @@ fn sort_media_sources(mut streams: Vec<StreamInfo>, max_bitrate: i64) -> Vec<Str
     streams
 }
 
-fn validate_media_options(options: &MediaOptions, is_media_source: bool) {
-    if options.item_id.is_nil() {
-        assert!(
-            options.device_id.as_deref().is_some_and(|d| !d.is_empty()),
-            "DeviceId is required"
-        );
+/// `ValidateMediaOptions`: the `ArgumentException`s upstream throws for
+/// options the negotiation cannot run on. (`Profile` and `MediaSources` are
+/// never null here.)
+fn validate_media_options(
+    options: &MediaOptions,
+    is_media_source: bool,
+) -> Result<(), StreamBuilderError> {
+    if options.item_id.is_nil() && options.device_id.as_deref().is_none_or(str::is_empty) {
+        return Err(StreamBuilderError::InvalidOptions("DeviceId is required"));
     }
     if is_media_source {
-        if options.audio_stream_index.is_some() {
-            assert!(
-                options
-                    .media_source_id
-                    .as_deref()
-                    .is_some_and(|m| !m.is_empty()),
-                "MediaSourceId is required when a specific audio stream is requested"
-            );
+        let has_media_source_id = options
+            .media_source_id
+            .as_deref()
+            .is_some_and(|m| !m.is_empty());
+        if options.audio_stream_index.is_some() && !has_media_source_id {
+            return Err(StreamBuilderError::InvalidOptions(
+                "MediaSourceId is required when a specific audio stream is requested",
+            ));
         }
-        if options.subtitle_stream_index.is_some() {
-            assert!(
-                options
-                    .media_source_id
-                    .as_deref()
-                    .is_some_and(|m| !m.is_empty()),
-                "MediaSourceId is required when a specific subtitle stream is requested"
-            );
+        if options.subtitle_stream_index.is_some() && !has_media_source_id {
+            return Err(StreamBuilderError::InvalidOptions(
+                "MediaSourceId is required when a specific subtitle stream is requested",
+            ));
         }
     }
+    Ok(())
 }
 
 /// Normalizes input container into a single container.
@@ -1876,11 +1901,44 @@ fn set_stream_info_options_from_direct_play_profile(
         split_owned(direct_play_profile.and_then(|p| p.audio_codec.as_deref()));
 }
 
+/// `conditions.All(isSatisfied)`: whether every condition holds, stopping at
+/// the first that does not, so a later condition upstream would throw for is
+/// never reached either.
+fn all_satisfied(
+    conditions: &[ProfileCondition],
+    mut is_satisfied: impl FnMut(&ProfileCondition) -> Result<bool, StreamBuilderError>,
+) -> Result<bool, StreamBuilderError> {
+    for condition in conditions {
+        if !is_satisfied(condition)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `CheckVideoConditions`: the conditions `media_source` and its video stream
+/// fail, every condition evaluated.
 fn check_video_conditions(
     conditions: &[ProfileCondition],
     media_source: &MediaSourceInfo,
     video_stream: Option<&MediaStream>,
-) -> Vec<ProfileCondition> {
+) -> Result<Vec<ProfileCondition>, StreamBuilderError> {
+    let is_satisfied = video_condition_check(media_source, video_stream);
+    let mut failed = Vec::new();
+    for condition in conditions {
+        if !is_satisfied(condition)? {
+            failed.push(condition.clone());
+        }
+    }
+    Ok(failed)
+}
+
+/// `CheckVideoConditions`' test of one condition against `media_source` and
+/// its video stream, the values it reads taken once.
+fn video_condition_check<'a>(
+    media_source: &'a MediaSourceInfo,
+    video_stream: Option<&'a MediaStream>,
+) -> impl Fn(&ProfileCondition) -> Result<bool, StreamBuilderError> + 'a {
     let width = video_stream.and_then(|v| v.width);
     let height = video_stream.and_then(|v| v.height);
     let bit_depth = video_stream.and_then(|v| v.bit_depth);
@@ -1907,34 +1965,30 @@ fn check_video_conditions(
     let num_audio_streams = media_source.get_stream_count(MediaStreamType::Audio);
     let num_video_streams = media_source.get_stream_count(MediaStreamType::Video);
 
-    conditions
-        .iter()
-        .filter(|apply| {
-            !ConditionProcessor::is_video_condition_satisfied(
-                apply,
-                width,
-                height,
-                bit_depth,
-                video_bitrate,
-                video_profile.as_deref(),
-                video_range_type,
-                video_level,
-                Some(video_framerate),
-                packet_length,
-                timestamp,
-                is_anamorphic,
-                is_interlaced,
-                ref_frames,
-                num_streams,
-                num_video_streams,
-                num_audio_streams,
-                video_codec_tag.as_deref(),
-                is_avc,
-                video_rotation,
-            )
-        })
-        .cloned()
-        .collect()
+    move |condition| {
+        ConditionProcessor::is_video_condition_satisfied(
+            condition,
+            width,
+            height,
+            bit_depth,
+            video_bitrate,
+            video_profile.as_deref(),
+            video_range_type,
+            video_level,
+            Some(video_framerate),
+            packet_length,
+            timestamp,
+            is_anamorphic,
+            is_interlaced,
+            ref_frames,
+            num_streams,
+            num_video_streams,
+            num_audio_streams,
+            video_codec_tag.as_deref(),
+            is_avc,
+            video_rotation,
+        )
+    }
 }
 
 fn aggregate_failure_conditions(conditions: &[ProfileCondition]) -> TranscodeReasons {
@@ -1983,37 +2037,32 @@ fn get_profile_conditions_for_video_audio(
     audio_bit_depth: Option<i32>,
     audio_profile: Option<&str>,
     is_secondary_audio: Option<bool>,
-) -> Vec<ProfileCondition> {
-    codec_profiles
-        .iter()
-        .filter(|profile| {
-            profile.codec_type == CodecType::VideoAudio
-                && profile.contains_codec(codec, Some(container), false)
-                && profile.apply_conditions.iter().all(|apply| {
-                    ConditionProcessor::is_video_audio_condition_satisfied(
-                        apply,
-                        audio_channels,
-                        audio_bitrate,
-                        audio_sample_rate,
-                        audio_bit_depth,
-                        audio_profile,
-                        is_secondary_audio,
-                    )
-                })
-        })
-        .flat_map(|profile| profile.conditions.iter().cloned())
-        .filter(|condition| {
-            !ConditionProcessor::is_video_audio_condition_satisfied(
-                condition,
-                audio_channels,
-                audio_bitrate,
-                audio_sample_rate,
-                audio_bit_depth,
-                audio_profile,
-                is_secondary_audio,
-            )
-        })
-        .collect()
+) -> Result<Vec<ProfileCondition>, StreamBuilderError> {
+    let is_satisfied = |condition: &ProfileCondition| {
+        ConditionProcessor::is_video_audio_condition_satisfied(
+            condition,
+            audio_channels,
+            audio_bitrate,
+            audio_sample_rate,
+            audio_bit_depth,
+            audio_profile,
+            is_secondary_audio,
+        )
+    };
+    let mut failed = Vec::new();
+    for profile in codec_profiles {
+        if profile.codec_type == CodecType::VideoAudio
+            && profile.contains_codec(codec, Some(container), false)
+            && all_satisfied(&profile.apply_conditions, is_satisfied)?
+        {
+            for condition in &profile.conditions {
+                if !is_satisfied(condition)? {
+                    failed.push(condition.clone());
+                }
+            }
+        }
+    }
+    Ok(failed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2026,39 +2075,30 @@ fn get_profile_conditions_for_audio(
     audio_sample_rate: Option<i32>,
     audio_bit_depth: Option<i32>,
     check_conditions: bool,
-) -> Vec<ProfileCondition> {
-    let conditions = codec_profiles
-        .iter()
-        .filter(|profile| {
-            profile.codec_type == CodecType::Audio
-                && profile.contains_codec(codec, Some(container), false)
-                && profile.apply_conditions.iter().all(|apply| {
-                    ConditionProcessor::is_audio_condition_satisfied(
-                        apply,
-                        audio_channels,
-                        audio_bitrate,
-                        audio_sample_rate,
-                        audio_bit_depth,
-                    )
-                })
-        })
-        .flat_map(|profile| profile.conditions.iter().cloned());
-
-    if !check_conditions {
-        return conditions.collect();
+) -> Result<Vec<ProfileCondition>, StreamBuilderError> {
+    let is_satisfied = |condition: &ProfileCondition| {
+        ConditionProcessor::is_audio_condition_satisfied(
+            condition,
+            audio_channels,
+            audio_bitrate,
+            audio_sample_rate,
+            audio_bit_depth,
+        )
+    };
+    let mut conditions = Vec::new();
+    for profile in codec_profiles {
+        if profile.codec_type == CodecType::Audio
+            && profile.contains_codec(codec, Some(container), false)
+            && all_satisfied(&profile.apply_conditions, is_satisfied)?
+        {
+            for condition in &profile.conditions {
+                if !check_conditions || !is_satisfied(condition)? {
+                    conditions.push(condition.clone());
+                }
+            }
+        }
     }
-
-    conditions
-        .filter(|condition| {
-            !ConditionProcessor::is_audio_condition_satisfied(
-                condition,
-                audio_channels,
-                audio_bitrate,
-                audio_sample_rate,
-                audio_bit_depth,
-            )
-        })
-        .collect()
+    Ok(conditions)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2565,10 +2605,14 @@ fn get_external_subtitle_profile(
         if !profile.supports_language(subtitle_stream.language.as_deref()) {
             continue;
         }
+        // A client-rendered graphical (PGS or VobSub) stream is delivered
+        // External even with extraction off (jellyfin#17512).
         if !subtitle_stream.is_external
             && play_method == PlayMethod::Transcode
             && !transcoder_support
                 .can_extract_subtitles(subtitle_stream.codec.as_deref().unwrap_or(""))
+            && !subtitle_stream.is_pgs_subtitle_stream()
+            && !subtitle_stream.is_vob_sub_subtitle_stream()
         {
             continue;
         }
@@ -2685,6 +2729,14 @@ fn format_level(v: f64) -> String {
     format_f64(v)
 }
 
+/// A manifest (HLS/DASH) container is not a byte stream and cannot be direct-played.
+fn is_manifest_container(container: Option<&str>) -> bool {
+    const MANIFESTS: &[&str] = &["hls", "applehttp", "dash"];
+    let Some(c) = container else { return false };
+    c.split(',')
+        .any(|part| MANIFESTS.iter().any(|m| part.eq_ignore_ascii_case(m)))
+}
+
 // Keep the range-name helper referenced so it is not flagged unused.
 #[allow(dead_code)]
 const _RANGE_NAME_FN: fn(VideoRangeType) -> &'static str = range_type_name;
@@ -2692,3 +2744,25 @@ const _RANGE_NAME_FN: fn(VideoRangeType) -> &'static str = range_type_name;
 // Ordering import retained for clarity of intent in comparators.
 #[allow(dead_code)]
 const _ORDERING: Option<Ordering> = None;
+
+#[cfg(test)]
+mod tests {
+    use super::is_manifest_container;
+
+    #[test]
+    fn manifest_containers_detected() {
+        assert!(is_manifest_container(Some("hls")));
+        assert!(is_manifest_container(Some("HLS")));
+        assert!(is_manifest_container(Some("applehttp")));
+        assert!(is_manifest_container(Some("dash")));
+        assert!(is_manifest_container(Some("mp4,hls")));
+    }
+
+    #[test]
+    fn non_manifest_containers_not_flagged() {
+        assert!(!is_manifest_container(Some("mp4")));
+        assert!(!is_manifest_container(Some("mkv")));
+        assert!(!is_manifest_container(Some("ts")));
+        assert!(!is_manifest_container(None));
+    }
+}

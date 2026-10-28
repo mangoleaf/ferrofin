@@ -7,6 +7,11 @@ use std::time::Duration;
 
 use ferrofin_server::config::Config;
 
+#[path = "support/boot.rs"]
+mod boot;
+
+use boot::{STARTUP_DEADLINE, free_port, is_up, spawn_server};
+
 const ADMIN_USER: &str = "restart-admin";
 const ADMIN_PASSWORD: &str = "restart-pw";
 const CLIENT: &str =
@@ -23,114 +28,66 @@ const CLIENT: &str =
 /// instead of catching a bug. Do not tighten this to "something reasonable".
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 
-/// How long a server gets to bind and finish booting, for the same reason: the
-/// admin seed hashes a password before the listener opens, so "booting" is
-/// seconds of CPU, and a poll budget sized for a quiet laptop is exactly what
-/// fails on a loaded runner.
-const STARTUP_DEADLINE: Duration = Duration::from_mins(2);
-
 /// How long a set-up server gets to refuse a boot without its database. The
 /// refusal comes before the database, ffmpeg or the listener are touched, so
 /// it is quick; the bound only turns a regression that serves instead into a
 /// failure rather than a test that never ends.
 const REFUSAL_DEADLINE: Duration = Duration::from_mins(1);
 
-/// A port nobody is listening on right now (bind 0, read, release).
+/// Serializes the tests that create a backup.
 ///
-/// A probe, not a reservation: the listener closes before the server binds, so
-/// a test starting at the same moment can be handed the same port.
-/// [`spawn_server`] is what makes that survivable.
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
+/// `POST /Backup/Create` holds a process-global single permit
+/// (`BACKUP_IN_FLIGHT`, which bounds concurrent backups' memory), and a
+/// caller that loses the race gets `503`. `nextest` gives each test its own
+/// process and hides that; plain `cargo test` runs these servers as threads
+/// in one process, where the second backup is refused.
+static BACKUP_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The `ServerName` whoever is listening on `base` reports, if anyone is.
-async fn server_name_at(client: &reqwest::Client, base: &str) -> Option<String> {
-    let body: serde_json::Value = client
-        .get(format!("{base}/System/Info/Public"))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    body["ServerName"].as_str().map(str::to_owned)
-}
-
-/// Whether *this* test's server — not merely *a* server — answers on `base`.
+/// Waits until a new lifetime of this test's server answers on `base`.
 ///
-/// The identity check carries real weight: the tests in this file share an
-/// admin user, password and client id, so a sibling that won the race for the
-/// port would answer every request happily and the run would only fall over
-/// later, somewhere unrelated.
-async fn is_up(client: &reqwest::Client, base: &str, name: &str) -> bool {
-    server_name_at(client, base).await.as_deref() == Some(name)
-}
-
-async fn wait_until(client: &reqwest::Client, base: &str, name: &str, up: bool) {
+/// A restart cannot be watched as a down-window: the startup server binds the
+/// new lifetime's listener first, so the port is closed for a few milliseconds
+/// at most and a poll can miss it. The restart flag tells the lifetimes apart
+/// instead. The restart and restore endpoints set `HasPendingRestart` on the
+/// old lifetime before they answer, and every lifetime starts with it clear, so
+/// only the new one can name this server without a restart pending. A refused
+/// connection, the startup server's `503` and the old lifetime still draining
+/// all mean "not yet".
+async fn wait_for_new_lifetime(client: &reqwest::Client, base: &str, name: &str, token: &str) {
     let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
+    let mut last = String::from("no answer");
     while std::time::Instant::now() < deadline {
-        if is_up(client, base, name).await == up {
-            return;
+        match system_info(client, base, token).await {
+            Ok(info) if info["ServerName"] == name && info["HasPendingRestart"] == false => return,
+            Ok(info) => {
+                last = format!(
+                    "ServerName {}, HasPendingRestart {}",
+                    info["ServerName"], info["HasPendingRestart"]
+                );
+            }
+            Err(error) => last = error,
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!(
-        "server never became {}",
-        if up { "reachable" } else { "unreachable" }
-    );
+    panic!("no new lifetime of the server answered; last answer: {last}");
 }
 
-/// Start `run` on a free port and wait until this server answers there.
-///
-/// If the port went to somebody else between the probe and the bind, `run`
-/// returns an address-in-use error straight away; take another port rather than
-/// poll one that now belongs to another test.
-async fn spawn_server(
+/// `GET /System/Info`, or why there was nothing to read.
+async fn system_info(
     client: &reqwest::Client,
-    make_config: impl Fn(u16) -> Config,
-) -> (std::thread::JoinHandle<anyhow::Result<()>>, String, String) {
-    for _ in 0..5 {
-        let port = free_port();
-        let config = make_config(port);
-        let name = config.server_name.clone();
-        // `run`'s future trips rustc's higher-ranked `Send` inference under
-        // `tokio::spawn`; the binary drives it from `main`, so give it its own
-        // thread and runtime here too.
-        let server = std::thread::spawn(move || {
-            tokio::runtime::Runtime::new()
-                .expect("server runtime")
-                .block_on(ferrofin_server::run(config))
-        });
-        let base = format!("http://127.0.0.1:{port}");
-        let deadline = std::time::Instant::now() + STARTUP_DEADLINE;
-        let mut lost_the_port = false;
-        while std::time::Instant::now() < deadline {
-            if is_up(client, &base, &name).await {
-                return (server, base, name);
-            }
-            if server.is_finished() {
-                // Only a lost port is worth another try; any other exit (a
-                // refused boot, a panic) is the failure to report.
-                let outcome = server.join();
-                let port_taken = matches!(&outcome, Ok(Err(error)) if error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
-                }));
-                assert!(port_taken, "the server exited before serving: {outcome:?}");
-                lost_the_port = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(lost_the_port, "server never became reachable on {base}");
+    base: &str,
+    token: &str,
+) -> Result<serde_json::Value, String> {
+    let response = client
+        .get(format!("{base}/System/Info"))
+        .header("Authorization", format!("{CLIENT}, Token=\"{token}\""))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(response.status().to_string());
     }
-    panic!("no free port survived long enough to bind");
+    response.json().await.map_err(|error| error.to_string())
 }
 
 async fn token(client: &reqwest::Client, base: &str) -> String {
@@ -172,7 +129,7 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
         .expect("reserve discovery endpoint")
         .local_addr()
         .expect("discovery address");
-    let (server, base, name) = spawn_server(&client, |port| Config {
+    let (server, base, config) = spawn_server(&client, |port| Config {
         server_name: "ferrofin-restart".to_owned(),
         discovery_bind_addr: Some(discovery_addr),
         admin_user: ADMIN_USER.to_owned(),
@@ -183,6 +140,7 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
         ..Config::test_stub(tmp.path())
     })
     .await;
+    let name = config.server_name;
     let metrics = |client: &reqwest::Client| {
         let url = format!("{base}/metrics");
         let client = client.clone();
@@ -215,8 +173,7 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     let tok = token(&client, &base).await;
     let configuration = prepare_dashboard_restart(&client, &base, &tok).await;
     assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
-    wait_until(&client, &base, &name, false).await;
-    wait_until(&client, &base, &name, true).await;
+    wait_for_new_lifetime(&client, &base, &name, &tok).await;
     assert!(!server.is_finished(), "a restart must not exit the process");
     assert_dashboard_restarted(&client, &base, &tok, &configuration).await;
     assert_eq!(metrics(&client).await, 200, "/metrics survives the restart");
@@ -239,8 +196,7 @@ async fn restart_recreates_the_host_in_process_and_shutdown_exits() {
     assert!(status.is_success());
     assert_eq!(discover(discovery_addr).await, discovered);
     assert_eq!(post(&client, &base, "/System/Restart", &tok).await, 204);
-    wait_until(&client, &base, &name, false).await;
-    wait_until(&client, &base, &name, true).await;
+    wait_for_new_lifetime(&client, &base, &name, &tok).await;
     let released = std::net::UdpSocket::bind(discovery_addr)
         .expect("disabled lifetime does not bind discovery");
     drop(released);
@@ -365,12 +321,13 @@ async fn post_json(
 /// `RestoreBackupPath` sequence).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_restore_applies_on_the_in_process_restart() {
+    let _serial = BACKUP_SERIAL.lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
         .expect("client");
-    let (server, base, name) = spawn_server(&client, |port| Config {
+    let (server, base, config) = spawn_server(&client, |port| Config {
         server_name: "ferrofin-restore".to_owned(),
         admin_user: ADMIN_USER.to_owned(),
         admin_password: ADMIN_PASSWORD.to_owned(),
@@ -378,6 +335,7 @@ async fn backup_restore_applies_on_the_in_process_restart() {
         ..Config::test_stub(tmp.path())
     })
     .await;
+    let name = config.server_name;
     let tok = token(&client, &base).await;
 
     // A distinctive config value, backed up, then overwritten.
@@ -436,8 +394,8 @@ async fn backup_restore_applies_on_the_in_process_restart() {
     )
     .await;
     assert_eq!(st, 204);
-    wait_until(&client, &base, &name, false).await;
-    wait_until(&client, &base, &name, true).await;
+    // `tok` predates the backup, so the restored database still knows it.
+    wait_for_new_lifetime(&client, &base, &name, &tok).await;
     assert!(!server.is_finished(), "restore restarts in-process");
     let tok = token(&client, &base).await;
     assert_eq!(
@@ -462,12 +420,52 @@ async fn backup_restore_applies_on_the_in_process_restart() {
         .expect("run exits cleanly");
 }
 
+/// `Program.StartApp` checks the server's directories first (Ferrofin, once
+/// logging has started): a layout that points two of them at one directory stops the
+/// boot before a scheduled restore is applied or a database is opened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clashing_layout_stops_the_boot_before_the_restore_and_the_database() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut config = Config {
+        port: free_port(),
+        ..Config::test_stub(tmp.path())
+    };
+    config.cache_dir = config.data_dir.clone();
+    // `POST /Backup/Restore`'s marker, naming an archive the boot never reaches.
+    let pending = config.data_dir.join("data/backups/restore-pending");
+    std::fs::create_dir_all(pending.parent().expect("backups dir")).expect("mkdir");
+    std::fs::write(&pending, "never-applied.zip").expect("schedule a restore");
+    let database = config.database_path();
+
+    let refused = tokio::time::timeout(
+        REFUSAL_DEADLINE,
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Runtime::new()
+                .expect("server runtime")
+                .block_on(ferrofin_server::run(config))
+        }),
+    )
+    .await
+    .expect("a clashing layout must stop the boot, not serve")
+    .expect("server thread did not panic")
+    .expect_err("a clashing layout must not start");
+
+    let message = format!("{refused:#}");
+    assert!(
+        message.contains("Expected to find only .jellyfin-cache but found marker for"),
+        "{message}"
+    );
+    assert!(!database.exists(), "the refused start opened a database");
+    assert!(pending.is_file(), "the refused start applied the restore");
+}
+
 /// Jellyfin 12.2's start-over guard: a server that has been set up refuses to
 /// start once its database is gone — instead of creating an empty one and
 /// seeding a new administrator — and creates nothing; a scheduled restore that
 /// brings the database back starts it again, users and passwords intact.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_set_up_server_refuses_a_missing_database_until_a_restore_brings_it_back() {
+    let _serial = BACKUP_SERIAL.lock().await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
@@ -553,4 +551,55 @@ async fn a_set_up_server_refuses_a_missing_database_until_a_restore_brings_it_ba
         .expect("join task")
         .expect("server thread did not panic")
         .expect("run exits cleanly");
+}
+
+/// The shared boot helper (`support/boot.rs`) every real-server test uses: two
+/// servers configured alike, the second handed the port the first holds, and
+/// it comes up on another port rather than taking the first for its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_that_loses_its_port_retries_instead_of_attaching_to_the_holder() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("client");
+    let (first, first_base, first_config) = spawn_server(&client, |port| Config {
+        port,
+        ..Config::test_stub(&tmp.path().join("first"))
+    })
+    .await;
+    let handed_the_taken_port = std::sync::atomic::AtomicBool::new(false);
+    let (second, second_base, _) = spawn_server(&client, |port| Config {
+        port: if handed_the_taken_port.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            port
+        } else {
+            first_config.port
+        },
+        ..Config::test_stub(&tmp.path().join("second"))
+    })
+    .await;
+    assert_ne!(
+        second_base, first_base,
+        "attached to the server holding the port"
+    );
+
+    for (base, server) in [(first_base, first), (second_base, second)] {
+        let login: serde_json::Value = client
+            .post(format!("{base}/Users/AuthenticateByName"))
+            .header("Authorization", CLIENT)
+            .json(&serde_json::json!({"Username": "admin", "Pw": ""}))
+            .send()
+            .await
+            .expect("auth request")
+            .json()
+            .await
+            .expect("auth json");
+        let tok = login["AccessToken"].as_str().expect("access token");
+        assert_eq!(post(&client, &base, "/System/Shutdown", tok).await, 204);
+        tokio::task::spawn_blocking(move || server.join())
+            .await
+            .expect("join task")
+            .expect("server thread did not panic")
+            .expect("run exits cleanly");
+    }
 }

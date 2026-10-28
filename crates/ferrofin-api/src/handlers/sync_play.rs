@@ -18,23 +18,27 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use ferrofin_model::dto::SessionInfoDto;
 use ferrofin_model::sync_play::{
-    BufferRequestDto, GroupInfoDto, IgnoreWaitRequestDto, JoinGroupRequestDto,
-    MovePlaylistItemRequestDto, NewGroupRequestDto, NextItemRequestDto, PingRequestDto,
-    PlayRequestDto, PreviousItemRequestDto, QueueRequestDto, ReadyRequestDto,
+    BufferRequestDto, GROUP_NAME_MAX_UTF16_UNITS, GroupInfoDto, IgnoreWaitRequestDto,
+    JoinGroupRequestDto, MovePlaylistItemRequestDto, NewGroupRequestDto, NextItemRequestDto,
+    PingRequestDto, PlayRequestDto, PreviousItemRequestDto, QueueRequestDto, ReadyRequestDto,
     RemoveFromPlaylistRequestDto, SeekRequestDto, SetPlaylistItemRequestDto,
     SetRepeatModeRequestDto, SetShuffleModeRequestDto,
 };
 use ferrofin_model::users::SyncPlayUserAccessType;
 use ferrofin_traits::options::AuthorizationInfo;
-use ferrofin_traits::stubs::{PlaybackRequest, SyncPlayManager, SyncPlaySession};
+use ferrofin_traits::stubs::{
+    PlaybackRequest, SyncPlayManager, SyncPlayNowPlaying, SyncPlaySession,
+};
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::JsonBody;
+use crate::extract::{JsonBody, ProblemDetails};
 use crate::handlers::items::{resolve_user_opt, user_uuid};
 use crate::handlers::session_ctx::current_session;
 use crate::state::AppState;
@@ -59,6 +63,46 @@ async fn sync_play_session(
         session_id,
         user_id: session.user_id,
         user_name: session.user_name.unwrap_or_default(),
+    })
+}
+
+/// What the caller's session is playing: the `SessionInfo.FullNowPlayingItem`,
+/// `PlayState` and `NowPlayingQueue` that `Group.CreateGroup` seeds a new
+/// group from. `None` when nothing is playing, or the item is not in the
+/// library (upstream's `FullNowPlayingItem` is the library item).
+async fn now_playing(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    session_id: &str,
+) -> Result<Option<SyncPlayNowPlaying>, ApiError> {
+    // Always filtered by device: a caller without one only lists the sessions
+    // without one, never every session on the server.
+    let device_id = auth.device_id.as_deref().unwrap_or_default();
+    let sessions = state
+        .sessions
+        .get_sessions(Uuid::nil(), Some(device_id), None, None, true)
+        .await?;
+    Ok(sessions
+        .into_iter()
+        .find(|s| s.id.as_deref() == Some(session_id))
+        .and_then(now_playing_of))
+}
+
+/// The [`SyncPlayNowPlaying`] facts of one session, `None` when it plays
+/// nothing.
+fn now_playing_of(session: SessionInfoDto) -> Option<SyncPlayNowPlaying> {
+    let item_id = session.now_playing_item?.id;
+    let play_state = session.play_state.unwrap_or_default();
+    Some(SyncPlayNowPlaying {
+        item_id,
+        position_ticks: play_state.position_ticks,
+        is_paused: play_state.is_paused,
+        queue: session
+            .now_playing_queue
+            .unwrap_or_default()
+            .into_iter()
+            .map(|q| q.id)
+            .collect(),
     })
 }
 
@@ -162,15 +206,32 @@ async fn dispatch_with(
 // ── group lifecycle ────────────────────────────────────────────────────────
 
 /// `POST /SyncPlay/New` — create a group owned by the caller.
+///
+/// `NewGroupRequestDto.GroupName` carries `[StringLength(200)]`
+/// (GHSA-v2jv-54xj-h76w). Model validation runs after the authorization
+/// policy and before the action, on the name as sent (the controller trims it
+/// afterwards), counting UTF-16 code units as .NET string lengths do.
 async fn new_group(
     RequireAuth(auth): RequireAuth,
     State(state): State<AppState>,
     JsonBody(body): JsonBody<NewGroupRequestDto>,
-) -> Result<Json<GroupInfoDto>, ApiError> {
+) -> Result<Response, ApiError> {
     require_access(&state, &auth, SyncPlayAccess::CreateGroup).await?;
+    if body.group_name.encode_utf16().count() > GROUP_NAME_MAX_UTF16_UNITS {
+        return Ok(ProblemDetails::member_validation(
+            "GroupName",
+            "Group name must not exceed 200 characters.",
+        )
+        .into_response());
+    }
     let mgr = manager(&state)?;
     let session = sync_play_session(&state, &auth).await?;
-    Ok(Json(mgr.new_group(&session, &body.group_name).await?))
+    let playing = now_playing(&state, &auth, &session.session_id).await?;
+    Ok(Json(
+        mgr.new_group(&session, &body.group_name, playing.as_ref())
+            .await?,
+    )
+    .into_response())
 }
 
 /// `POST /SyncPlay/Join` — join an existing group.
@@ -507,4 +568,50 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route("/SyncPlay/SetRepeatMode", post(set_repeat_mode))
         .route("/SyncPlay/SetShuffleMode", post(set_shuffle_mode))
         .route("/SyncPlay/Ping", post(ping))
+}
+
+#[cfg(test)]
+mod tests {
+    use ferrofin_model::dto::{BaseItemDto, SessionInfoDto};
+    use ferrofin_model::session::{PlayerStateInfo, QueueItem};
+    use uuid::Uuid;
+
+    use super::now_playing_of;
+
+    #[test]
+    fn a_session_playing_nothing_seeds_nothing() {
+        assert_eq!(now_playing_of(SessionInfoDto::default()), None);
+    }
+
+    #[test]
+    fn a_playing_session_yields_its_item_play_state_and_queue() {
+        let (item, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let session = SessionInfoDto {
+            now_playing_item: Some(BaseItemDto {
+                id: item,
+                ..BaseItemDto::default()
+            }),
+            play_state: Some(PlayerStateInfo {
+                position_ticks: Some(42),
+                is_paused: true,
+                ..PlayerStateInfo::default()
+            }),
+            now_playing_queue: Some(vec![
+                QueueItem {
+                    id: other,
+                    ..QueueItem::default()
+                },
+                QueueItem {
+                    id: item,
+                    ..QueueItem::default()
+                },
+            ]),
+            ..SessionInfoDto::default()
+        };
+        let np = now_playing_of(session).unwrap();
+        assert_eq!(np.item_id, item);
+        assert_eq!(np.position_ticks, Some(42));
+        assert!(np.is_paused);
+        assert_eq!(np.queue, vec![other, item]);
+    }
 }

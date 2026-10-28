@@ -24,13 +24,17 @@
 //! (both are .NET-process-specific; compiled-in extensions register natively
 //! through the [`FileTransformationService`] trait instead).
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ferrofin_core::{PluginConfigPage, ScheduledTask};
 use ferrofin_traits::plugins::{
     FileTransformationService, FileTransformer, PluginDescriptor, PluginManager,
 };
+use ferrofin_traits::system::LocalApiAccess;
+use ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -96,7 +100,35 @@ impl Extension for FileTransformationExtension {
 struct Registration {
     id: Uuid,
     pattern: String,
+    /// `pattern` compiled once at registration (`None`: not a regex, so it
+    /// matches only exactly), instead of on every served `/web` file.
+    regex: Option<regex::Regex>,
     kind: TransformKind,
+}
+
+impl Registration {
+    fn new(id: Uuid, pattern: String, kind: TransformKind) -> Self {
+        let regex = regex::Regex::new(&pattern).ok();
+        Self {
+            id,
+            pattern,
+            regex,
+            kind,
+        }
+    }
+
+    /// Whether this registration applies to `path` ([`pattern_matches`]).
+    fn matches(&self, path: &str) -> bool {
+        pattern_matches(&self.pattern, self.regex.as_ref(), path)
+    }
+}
+
+/// Whether `pattern` matches `path`: exact (case-sensitive, like the
+/// upstream dictionary key) or as `regex`, the pattern compiled (`None`
+/// when it is not a regex). Port of the exact-`ContainsKey`-then-regex match
+/// in `NeedsTransformation`.
+fn pattern_matches(pattern: &str, regex: Option<&regex::Regex>, path: &str) -> bool {
+    pattern == path || regex.is_some_and(|r| r.is_match(path))
 }
 
 /// Hard cap on the number of live registrations — a runaway bound, not a
@@ -129,6 +161,18 @@ const MAX_PATTERN_LEN: usize = 1024;
 ///
 /// FLAGGED as a candidate setting — plausible range 256…8192, default 2048.
 const MAX_ENDPOINT_LEN: usize = 2048;
+
+/// The most the pipeline serves for one file, in bytes: a callback's answer
+/// is read no further, and a step whose output would pass it is skipped,
+/// leaving the contents as they were.
+///
+/// The pipeline runs on every anonymous `/web` GET of a matching file, so
+/// this bounds what one request can make the server allocate. jellyfin-web's
+/// bundles are a few MiB, far below it. Owner decision (gl-933, 2026-10-25):
+/// 16 MiB, one cap for the callback body and the pipeline's output, not a
+/// setting. An accepted hardening divergence: the plugin reads a callback's
+/// whole answer and applies every search/replace.
+const MAX_TRANSFORMED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Whether a registration may be admitted, given the registry's current
 /// contents. Refusals are logged and dropped (the upstream controller always
@@ -219,23 +263,34 @@ struct ServiceConfig {
 pub struct WebFileTransformationService {
     registrations: RwLock<Vec<Registration>>,
     plugins: Arc<dyn PluginManager>,
-    /// The server's own base URL (e.g. `http://127.0.0.1:8096`), for resolving
-    /// relative HTTP-callback endpoints — upstream resolves them against the
-    /// server's published URL.
-    base_url: String,
+    /// Where this server's API is reached locally (`GetApiUrlForLocalAccess()`),
+    /// for resolving relative HTTP-callback endpoints.
+    local_api: Arc<dyn LocalApiAccess>,
     http: reqwest::Client,
+    /// How long an HTTP-callback exchange may take, body included: the
+    /// plugin's `new HttpClient()` keeps .NET's default `Timeout`
+    /// ([`HTTP_CLIENT_DEFAULT_TIMEOUT`]; a test shortens it).
+    endpoint_timeout: Duration,
+    /// The registrations, by `(id, pattern)`, whose last callback failed.
+    /// The pipeline runs on every matching `/web` request, so a failure
+    /// warns the first time and logs at `debug` while it repeats; a success,
+    /// or removing the registration, clears it.
+    failing: Mutex<HashSet<(Uuid, String)>>,
 }
 
 impl WebFileTransformationService {
     /// Builds the service over the plugin manager (for the enabled gate and
-    /// the admin-defined transformations) and the server's own base URL.
+    /// the admin-defined transformations) and the host that says where this
+    /// server's API is reached locally.
     #[must_use]
-    pub fn new(plugins: Arc<dyn PluginManager>, base_url: String) -> Self {
+    pub fn new(plugins: Arc<dyn PluginManager>, local_api: Arc<dyn LocalApiAccess>) -> Self {
         Self {
             registrations: RwLock::new(Vec::new()),
             plugins,
-            base_url,
+            local_api,
             http: reqwest::Client::new(),
+            endpoint_timeout: HTTP_CLIENT_DEFAULT_TIMEOUT,
+            failing: Mutex::default(),
         }
     }
 
@@ -261,14 +316,10 @@ impl WebFileTransformationService {
             .unwrap_or_default()
     }
 
-    /// Whether `pattern` matches `path`: exact (case-sensitive, like the
-    /// upstream dictionary key) or as a regex. Port of the
-    /// exact-`ContainsKey`-then-regex match in `NeedsTransformation`.
-    fn pattern_matches(pattern: &str, path: &str) -> bool {
-        if pattern == path {
-            return true;
-        }
-        regex::Regex::new(pattern).is_ok_and(|r| r.is_match(path))
+    /// [`pattern_matches`] for an admin-defined pattern, compiled per call
+    /// (the configuration is read live on every request).
+    fn configured_matches(pattern: &str, path: &str) -> bool {
+        pattern_matches(pattern, regex::Regex::new(pattern).ok().as_ref(), path)
     }
 
     /// Strips the leading `/` (upstream `NormalizePath`).
@@ -277,33 +328,100 @@ impl WebFileTransformationService {
     }
 
     /// Invokes an HTTP-callback endpoint with `contents`, returning the
-    /// response body, or `None` (leaving the contents unchanged) on any
-    /// failure. Port of the endpoint branch of
+    /// response body, or why it failed (the caller leaves the contents
+    /// unchanged). Port of the endpoint branch of
     /// `TransformationHelper.ApplyTransformation`.
-    async fn call_endpoint(&self, endpoint: &str, contents: &str) -> Option<String> {
+    ///
+    /// A relative endpoint is a path on this server. The plugin sends it to
+    /// the server's `PublishedServerUrl` when one is set, else to
+    /// `http://localhost:{HttpPort}`; Ferrofin resolves it against the local
+    /// access URL over HTTP instead, which carries the base URL (without it
+    /// the request is redirected to the web client) and reaches a listener
+    /// pinned to one address. Plain HTTP, like the plugin's, because the
+    /// server's own certificate need not be one this client trusts. With
+    /// Require HTTPS on, the callback is redirected to HTTPS like any request,
+    /// as the plugin's is.
+    async fn call_endpoint(&self, endpoint: &str, contents: &str) -> Result<String, String> {
         let url = if endpoint.starts_with("http") {
             endpoint.to_owned()
         } else {
-            format!("{}/{}", self.base_url, endpoint.trim_start_matches('/'))
+            let base = self
+                .local_api
+                .get_http_api_url_for_local_access()
+                .await
+                .map_err(|e| format!("no local api url: {e}"))?;
+            format!("{base}/{}", endpoint.trim_start_matches('/'))
         };
+        // `PostAsync` reads the whole response before it returns, so the
+        // plugin's `HttpClient.Timeout` bounds the body read too.
         let response = self
             .http
             .post(&url)
+            .timeout(self.endpoint_timeout)
             .json(&serde_json::json!({ "contents": contents }))
             .send()
             .await;
         match response {
-            Ok(resp) => match resp.text().await {
-                Ok(text) => Some(text),
-                Err(e) => {
-                    tracing::warn!(url, error = %e, "transformation endpoint body read failed");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(url, error = %e, "transformation endpoint call failed");
-                None
+            // The plugin writes the body whatever the status; an error
+            // answer's body never replaces the file here (a plugin bug, not
+            // ported).
+            Ok(resp) if !resp.status().is_success() => {
+                Err(format!("answered {}", resp.status().as_u16()))
             }
+            Ok(resp) => read_capped(resp).await,
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Clears step `(id, pattern)`'s failure ([`Self::first_failure`]).
+    fn step_worked(&self, id: Uuid, pattern: &str) {
+        let mut failing = self.failing.lock().unwrap_or_else(PoisonError::into_inner);
+        if !failing.is_empty() {
+            failing.remove(&(id, pattern.to_owned()));
+        }
+    }
+
+    /// Records a failure of step `(id, pattern)` (a registration, or an
+    /// admin-defined search/replace), answering whether it is the first since
+    /// the step last worked: that one is a `warn`, a repeat a `debug`
+    /// (LOGGING.md §1).
+    fn first_failure(&self, id: Uuid, pattern: &str) -> bool {
+        self.failing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((id, pattern.to_owned()))
+    }
+
+    /// Logs once ([`Self::first_failure`]) that step `(id, pattern)` was
+    /// skipped because it would grow the file to `len` bytes, past
+    /// [`MAX_TRANSFORMED_BYTES`].
+    fn step_over_cap(&self, id: Uuid, pattern: &str, len: usize) {
+        if self.first_failure(id, pattern) {
+            tracing::warn!(
+                %id,
+                pattern,
+                len,
+                max = MAX_TRANSFORMED_BYTES,
+                "transformation would grow the file past the size cap; serving it without this step"
+            );
+        } else {
+            tracing::debug!(%id, pattern, len, "transformation skipped: past the size cap");
+        }
+    }
+
+    /// Logs registration `(id, pattern)`'s callback failure once
+    /// ([`Self::first_failure`]).
+    fn endpoint_failed(&self, id: Uuid, pattern: &str, endpoint: &str, error: &str) {
+        if self.first_failure(id, pattern) {
+            tracing::warn!(
+                %id,
+                pattern,
+                endpoint,
+                error,
+                "transformation endpoint failed; serving the file unchanged until it works"
+            );
+        } else {
+            tracing::debug!(%id, pattern, endpoint, error, "transformation endpoint failed");
         }
     }
 }
@@ -320,14 +438,14 @@ impl FileTransformationService for WebFileTransformationService {
             .read()
             .expect("registrations lock poisoned")
             .iter()
-            .any(|r| Self::pattern_matches(&r.pattern, path))
+            .any(|r| r.matches(path))
         {
             return true;
         }
         self.configured_transformations()
             .await
             .iter()
-            .any(|t| Self::pattern_matches(&t.filename_pattern, path))
+            .any(|t| Self::configured_matches(&t.filename_pattern, path))
     }
 
     async fn run_transformation(&self, path: &str, contents: String) -> String {
@@ -339,46 +457,80 @@ impl FileTransformationService for WebFileTransformationService {
         // Snapshot the matching registered pipeline steps (in registration
         // order — the upstream per-pattern pipeline), then the admin-defined
         // search/replace steps.
-        let steps: Vec<(Uuid, TransformStep)> = {
+        let steps: Vec<(Uuid, String, TransformStep)> = {
             let regs = self
                 .registrations
                 .read()
                 .expect("registrations lock poisoned");
             regs.iter()
-                .filter(|r| Self::pattern_matches(&r.pattern, &path))
+                .filter(|r| r.matches(&path))
                 .map(|r| {
                     let step = match &r.kind {
                         TransformKind::Builtin(t) => TransformStep::Builtin(Arc::clone(t)),
                         TransformKind::Endpoint(url) => TransformStep::Endpoint(url.clone()),
                     };
-                    (r.id, step)
+                    (r.id, r.pattern.clone(), step)
                 })
                 .collect()
         };
 
         let mut contents = contents;
-        for (id, step) in steps {
+        for (id, pattern, step) in steps {
             contents = match step {
-                TransformStep::Builtin(t) => t.transform(&path, contents).await,
-                TransformStep::Endpoint(url) => {
-                    if let Some(transformed) = self.call_endpoint(&url, &contents).await {
-                        transformed
-                    } else {
-                        tracing::warn!(%id, "transformation left contents unchanged");
+                TransformStep::Builtin(t) => {
+                    // ponytail: a copy of the file per in-process step, to
+                    // fall back to; a transformer that reported its growth
+                    // up front (as `LiteralTransform` computes it) would not
+                    // need it.
+                    let transformed = t.transform(&path, contents.clone()).await;
+                    if transformed.len() > MAX_TRANSFORMED_BYTES
+                        && transformed.len() > contents.len()
+                    {
+                        self.step_over_cap(id, &pattern, transformed.len());
                         contents
+                    } else {
+                        self.step_worked(id, &pattern);
+                        transformed
                     }
                 }
+                TransformStep::Endpoint(url) => match self.call_endpoint(&url, &contents).await {
+                    Ok(transformed) => {
+                        self.step_worked(id, &pattern);
+                        transformed
+                    }
+                    Err(error) => {
+                        self.endpoint_failed(id, &pattern, &url, &error);
+                        contents
+                    }
+                },
             };
         }
 
         // Admin-defined search/replace (skipped when either side is blank,
-        // matching `HandlePluginConfigTransformation`).
+        // matching `HandlePluginConfigTransformation`). A common search with
+        // a long replace multiplies the file, so one that would grow it past
+        // the cap is skipped.
         for t in self.configured_transformations().await {
-            if Self::pattern_matches(&t.filename_pattern, &path)
+            if Self::configured_matches(&t.filename_pattern, &path)
                 && !t.search_text.trim().is_empty()
                 && !t.replace_text.trim().is_empty()
             {
-                contents = contents.replace(&t.search_text, &t.replace_text);
+                let growth = t.replace_text.len().saturating_sub(t.search_text.len());
+                let grown = if growth == 0 {
+                    0
+                } else {
+                    contents
+                        .matches(t.search_text.as_str())
+                        .count()
+                        .saturating_mul(growth)
+                        .saturating_add(contents.len())
+                };
+                if grown > MAX_TRANSFORMED_BYTES {
+                    self.step_over_cap(t.id, &t.filename_pattern, grown);
+                } else {
+                    self.step_worked(t.id, &t.filename_pattern);
+                    contents = contents.replace(&t.search_text, &t.replace_text);
+                }
             }
         }
 
@@ -404,11 +556,11 @@ impl FileTransformationService for WebFileTransformationService {
             return;
         }
         tracing::info!(%id, pattern, "registered file transformation");
-        regs.push(Registration {
+        regs.push(Registration::new(
             id,
             pattern,
-            kind: TransformKind::Builtin(transformer),
-        });
+            TransformKind::Builtin(transformer),
+        ));
     }
 
     async fn add_endpoint_transformation(&self, id: Uuid, file_name_pattern: &str, endpoint: &str) {
@@ -424,11 +576,11 @@ impl FileTransformationService for WebFileTransformationService {
             return;
         }
         tracing::info!(%id, pattern, endpoint, "registered endpoint file transformation");
-        regs.push(Registration {
+        regs.push(Registration::new(
             id,
             pattern,
-            kind: TransformKind::Endpoint(endpoint.to_owned()),
-        });
+            TransformKind::Endpoint(endpoint.to_owned()),
+        ));
     }
 
     async fn remove_transformation(&self, id: Uuid) {
@@ -436,7 +588,43 @@ impl FileTransformationService for WebFileTransformationService {
             .write()
             .expect("registrations lock poisoned")
             .retain(|r| r.id != id);
+        self.failing
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(failed, _)| *failed != id);
     }
+}
+
+/// Reads a callback's answer, giving up before buffering more than
+/// [`MAX_TRANSFORMED_BYTES`]: at once for a `Content-Length` over it, else as
+/// the body streams in. Decoded as UTF-8, lossily, as `text()` decodes in
+/// this build (reqwest's `charset` feature is off); each invalid byte becomes
+/// a 3-byte U+FFFD, so the decoded text is held to the cap as well.
+async fn read_capped(mut resp: reqwest::Response) -> Result<String, String> {
+    let over_cap = || format!("answered more than the {MAX_TRANSFORMED_BYTES}-byte cap");
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_TRANSFORMED_BYTES as u64)
+    {
+        return Err(over_cap());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("body read failed: {e}"))?
+    {
+        if body.len() + chunk.len() > MAX_TRANSFORMED_BYTES {
+            return Err(over_cap());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8(body)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    if text.len() > MAX_TRANSFORMED_BYTES {
+        return Err(over_cap());
+    }
+    Ok(text)
 }
 
 /// A pipeline step snapshotted out of the registration lock (so the async
@@ -650,14 +838,39 @@ mod tests {
         }
     }
 
+    /// A host whose local API URL is fixed.
+    struct LocalApi(String);
+
+    #[async_trait]
+    impl LocalApiAccess for LocalApi {
+        /// The HTTPS address a server listening with HTTPS gives; nothing
+        /// listens there, so a callback sent to it fails.
+        async fn get_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+            Ok("https://127.0.0.1:1".to_owned())
+        }
+
+        async fn get_http_api_url_for_local_access(&self) -> Result<String, ServiceError> {
+            Ok(self.0.clone())
+        }
+    }
+
     fn service_with(ft_config: &str, enabled: bool) -> WebFileTransformationService {
+        service_at(ft_config, enabled, "http://127.0.0.1:0")
+    }
+
+    /// [`service_with`] on a server reached locally at `local_api_url`.
+    fn service_at(
+        ft_config: &str,
+        enabled: bool,
+        local_api_url: &str,
+    ) -> WebFileTransformationService {
         WebFileTransformationService::new(
             Arc::new(FakePlugins {
                 ft_config: ft_config.as_bytes().to_vec(),
                 is_config: b"{}".to_vec(),
                 enabled,
             }),
-            "http://127.0.0.1:0".to_owned(),
+            Arc::new(LocalApi(local_api_url.to_owned())),
         )
     }
 
@@ -685,6 +898,12 @@ mod tests {
         assert!(svc.needs_transformation("/main.jellyfin.bundle.js").await);
         assert!(svc.needs_transformation("123.chunk.js").await);
         assert!(!svc.needs_transformation("index.html").await);
+        // A pattern that is not a regex still matches its exact path, and
+        // only that.
+        svc.add_transformation(Uuid::from_u128(3), "a+(b.js", Arc::new(Upper))
+            .await;
+        assert!(svc.needs_transformation("a+(b.js").await);
+        assert!(!svc.needs_transformation("aa+(b.js").await);
         assert_eq!(
             svc.run_transformation("main.jellyfin.bundle.js", "abc".to_owned())
                 .await,
@@ -807,6 +1026,299 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(v["DebugLoggingState"], "Disabled");
         assert!(v["Transformations"].as_array().expect("array").is_empty());
+    }
+
+    /// A callback endpoint answering each request with `status` and `body`,
+    /// recording each request's head and body.
+    fn spawn_callback(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        spawn_responder(vec![answer(status, body)])
+    }
+
+    /// A `Content-Length` response with `status` and `body`.
+    fn answer(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A callback endpoint answering its n-th request with the raw response
+    /// `answers[n]` (the last one from then on), recording each request's
+    /// head and body.
+    fn spawn_responder<A: AsRef<[u8]> + Send + 'static>(
+        answers: Vec<A>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for (n, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                log.lock()
+                    .expect("lock")
+                    .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+                let response = &answers[n.min(answers.len() - 1)];
+                let _ = stream.write_all(response.as_ref());
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// A callback that answers with an error status leaves the file as it
+    /// was: its error body never replaces a served web file. The plugin at
+    /// `f4f01c3` writes the body whatever the status
+    /// (`TransformationHelper.ApplyTransformation`); serving a callback's error
+    /// page as a bundle is a plugin bug, not ported.
+    #[tokio::test]
+    async fn an_endpoint_error_leaves_the_contents_unchanged() {
+        let (base, seen) = spawn_callback("500 Internal Server Error", "oops");
+        let svc = service_with("{}", true);
+        svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", &format!("{base}/cb"))
+            .await;
+
+        let out = svc
+            .run_transformation("main.js", "original".to_owned())
+            .await;
+
+        assert_eq!(out, "original");
+        assert_eq!(
+            seen.lock().expect("lock").len(),
+            1,
+            "the endpoint was called"
+        );
+    }
+
+    /// An in-memory sink for a scoped `fmt` subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        /// How many lines were logged at `level` (`"WARN"`, `"DEBUG"`).
+        fn count(&self, level: &str) -> usize {
+            String::from_utf8_lossy(&self.0.lock().expect("logs"))
+                .lines()
+                .filter(|line| line.split_whitespace().nth(1) == Some(level))
+                .count()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The pipeline runs on every matching `/web` request, so a callback
+    /// that keeps failing warns once, then logs at `debug` until it has
+    /// worked again; a failure after that warns again.
+    #[tokio::test]
+    async fn a_failing_endpoint_warns_once_until_it_recovers() {
+        let logs = CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_env_filter("ferrofin_extensions=debug")
+                .finish(),
+        );
+        let fail = answer("500 Internal Server Error", "oops");
+        let (base, _) = spawn_responder(vec![
+            fail.clone(),
+            fail.clone(),
+            fail.clone(),
+            answer("200 OK", "patched"),
+            fail,
+        ]);
+        let svc = service_with("{}", true);
+        svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", &format!("{base}/cb"))
+            .await;
+        let serve = || svc.run_transformation("main.js", "original".to_owned());
+
+        for _ in 0..3 {
+            serve().await;
+        }
+        assert_eq!((logs.count("WARN"), logs.count("DEBUG")), (1, 2));
+        assert_eq!(serve().await, "patched");
+        serve().await;
+        assert_eq!(
+            (logs.count("WARN"), logs.count("DEBUG")),
+            (2, 2),
+            "a failure after a success warns again"
+        );
+    }
+
+    /// Past the output cap, a callback's answer is not read on: with a
+    /// `Content-Length` over it, or streaming past it without one, the file
+    /// is served as it was.
+    #[tokio::test]
+    async fn an_endpoint_answer_over_the_cap_leaves_the_contents_unchanged() {
+        let body = "x".repeat(MAX_TRANSFORMED_BYTES + 1);
+        for head in [format!("Content-Length: {}\r\n", body.len()), String::new()] {
+            let (base, seen) = spawn_responder(vec![format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n{head}Connection: close\r\n\r\n{body}"
+            )]);
+            let svc = service_with("{}", true);
+            svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", &format!("{base}/cb"))
+                .await;
+
+            let out = svc
+                .run_transformation("main.js", "original".to_owned())
+                .await;
+
+            assert_eq!(out, "original", "{head:?}");
+            assert_eq!(seen.lock().expect("lock").len(), 1);
+        }
+    }
+
+    /// An answer under the cap in bytes that decodes past it: every invalid
+    /// UTF-8 byte becomes a 3-byte U+FFFD.
+    #[tokio::test]
+    async fn an_endpoint_answer_that_decodes_past_the_cap_leaves_the_contents_unchanged() {
+        let body = vec![0xFF_u8; MAX_TRANSFORMED_BYTES / 2];
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let (base, _) = spawn_responder(vec![response]);
+        let svc = service_with("{}", true);
+        svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", &format!("{base}/cb"))
+            .await;
+
+        let out = svc
+            .run_transformation("main.js", "original".to_owned())
+            .await;
+
+        assert_eq!(out, "original");
+    }
+
+    /// A transformer that answers more than the output cap.
+    struct Huge;
+    #[async_trait]
+    impl FileTransformer for Huge {
+        async fn transform(&self, _path: &str, _contents: String) -> String {
+            "x".repeat(MAX_TRANSFORMED_BYTES + 1)
+        }
+    }
+
+    /// A step whose output would pass the cap is skipped and the rest still
+    /// run: an in-process transformer's answer, and an admin search/replace
+    /// whose replace text multiplies the file.
+    #[tokio::test]
+    async fn a_step_over_the_output_cap_is_skipped() {
+        let cfg = format!(
+            r#"{{"Transformations":[{{"Id":"00000000-0000-0000-0000-000000000001","FilenamePattern":"main.js","SearchText":"A","ReplaceText":"{}"}},{{"Id":"00000000-0000-0000-0000-000000000002","FilenamePattern":"main.js","SearchText":"B","ReplaceText":"c"}}]}}"#,
+            "y".repeat(1024)
+        );
+        let svc = service_with(&cfg, true);
+        svc.add_transformation(Uuid::from_u128(3), "main.js", Arc::new(Huge))
+            .await;
+        svc.add_transformation(Uuid::from_u128(4), "main.js", Arc::new(Upper))
+            .await;
+        // After `Upper`, 20 000 matches of a 1 KiB replace: about 20 MiB.
+        let input = format!("{}b", "a".repeat(20_000));
+
+        let out = svc.run_transformation("main.js", input).await;
+
+        assert_eq!(out, format!("{}c", "A".repeat(20_000)));
+    }
+
+    /// A callback endpoint that accepts each connection and reads the request,
+    /// then sends `head` (nothing when it is empty) and holds the connection
+    /// open without another byte.
+    async fn spawn_stalled_callback(head: &'static str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The plugin's `new HttpClient()` keeps .NET's 100 s `Timeout` over the
+    /// whole `PostAsync` (the body is read before it returns), so a callback
+    /// that never answers, or stops part-way through its body, leaves the file
+    /// as it was instead of holding the request for ever.
+    #[tokio::test]
+    async fn a_callback_that_never_finishes_leaves_the_contents_unchanged() {
+        for head in [
+            "",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 7\r\n\r\npat",
+        ] {
+            let base = spawn_stalled_callback(head).await;
+            let mut svc = service_with("{}", true);
+            svc.endpoint_timeout = Duration::from_millis(200);
+            svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", &format!("{base}/cb"))
+                .await;
+
+            let out = tokio::time::timeout(
+                Duration::from_secs(5),
+                svc.run_transformation("main.js", "original".to_owned()),
+            )
+            .await;
+
+            assert_eq!(
+                out.as_deref().ok(),
+                Some("original"),
+                "the callback must give up ({head:?})"
+            );
+        }
+    }
+
+    /// A relative endpoint is a path on this server, called through its local
+    /// access URL — base URL included — and its answer replaces the file.
+    #[tokio::test]
+    async fn a_relative_endpoint_is_called_through_the_local_api_url() {
+        let (base, seen) = spawn_callback("200 OK", "patched");
+        let svc = service_at("{}", true, &format!("{base}/jellyfin"));
+        svc.add_endpoint_transformation(Uuid::from_u128(1), "main.js", "/Plugin/Transform")
+            .await;
+
+        let out = svc
+            .run_transformation("main.js", "original".to_owned())
+            .await;
+
+        assert_eq!(out, "patched");
+        let seen = seen.lock().expect("lock");
+        assert!(
+            seen[0].starts_with("POST /jellyfin/Plugin/Transform HTTP/1.1"),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[0].contains(r#"{"contents":"original"}"#),
+            "{}",
+            seen[0]
+        );
     }
 
     /// The registry's length in a test (the field is private to this module).

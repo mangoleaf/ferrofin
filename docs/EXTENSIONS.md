@@ -109,7 +109,12 @@ source of truth). Install matches Jellyfin's repository flow: an admin adds a pl
 repository URL (Dashboard → Plugins → Repositories), picks the plugin from the catalog,
 and the server downloads, verifies, and stages it into `{data_dir}/plugins/`; a restart
 activates it (`SystemInfo.HasPendingRestart` flips true). Dropping the `.wasm` file into
-`{data_dir}/plugins/` by hand and restarting works identically (the dev/air-gapped path).
+`{data_dir}/plugins/` by hand and restarting works identically (the dev/air-gapped path),
+except that the load, not the repository, refuses a file whose id belongs to a compiled-in
+plugin (OpenSubtitles, the in-tree providers, the built-in extensions). Install and load
+share one check of what a component says about itself (its id, name, default configuration
+and provider name), so an artifact is never installed only to be skipped at boot for one of
+those.
 The repository install pipeline is deliberately strict, in order: the manifest's
 `targetAbi` must equal this server's plugin ABI; the download must be **HTTPS**
 (cleartext-to-loopback allowed only when the *configured repository* is itself loopback —
@@ -191,8 +196,11 @@ PCM, or ≤ 16 sampled stills ≤ 320 px per call. Fingerprinting, loudness, sil
 black-frame detection — and analyses nobody has written yet — are all guest code over
 these windows; extraction runs under a global decode budget (`FERROFIN_WASM_ANALYSIS_CONCURRENCY`,
 default a quarter of the cores) so plugin analysis never starves transcodes. Plugins that declare `scan-targets` are
-offered each new matching item exactly once by the "Plugin media analysis" dashboard
-task. Why a host-driven pass instead of each plugin polling `query-items` with its own
+offered each new matching item once by the "Plugin media analysis" dashboard
+task. When the plugin's circuit breaker stops a pass, the items it did not reach are
+offered after the restart, and an item sharing the cut-off item's creation time (or, on
+a first pass, an undated one) can be offered again, so analysis must be idempotent.
+Why a host-driven pass instead of each plugin polling `query-items` with its own
 cursor (which the 0.3 surface already allowed): the offer-once watermark lives under a
 `host:`-reserved state key a guest can neither read nor rewind (a self-managed cursor
 could be rewound to re-burn the shared decode budget), disabled plugins are centrally
@@ -212,10 +220,25 @@ plugins like Home Screen Sections possible):
   via plain `<script src>` tags, exactly like upstream `[AllowAnonymous]` plugin
   controllers); the caller's resolved identity (`user-id`, `is-admin`,
   `is-authenticated`) is forwarded — never a token — and the plugin gates its own
-  sensitive paths. Inbound bodies are capped at 1 MiB; a disabled plugin's URL space 404s.
+  sensitive paths. The identity has passed Jellyfin's default authorization policy: a
+  disabled account, a remote caller without remote access, or a user outside their access
+  schedule arrives as anonymous. Inbound bodies are capped at 1 MiB; a disabled plugin's
+  URL space 404s. Responses are served on the server's own origin, so the server owns the
+  headers that decide what a browser lets them do: every response carries
+  `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox allow-scripts
+  allow-forms allow-popups`, and the plugin's own `Set-Cookie`, `Clear-Site-Data`, CSP and
+  `X-Content-Type-Options` headers are dropped. An HTML page a plugin serves there runs in
+  an opaque origin and cannot read the server origin's stored tokens; assets and API
+  answers fetched by a settings page are unaffected.
+  Requests never wait for the plugin: together they may hold at most half of its queue
+  (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`), queued or running, and past that, or when the
+  queue is full, the server answers `503` at once. So a flood of anonymous requests cannot
+  starve the scans, tasks and events that share the queue.
 - **`web-transforms`** — declared literal search/replace patches the server applies to
   matching `/web` files while the plugin is enabled (capped: 16 per plugin, 256 KiB per
-  text). This is how a plugin injects its client-side hooks into jellyfin-web.
+  text; a blank search is refused, and a transform that would grow a file by more than
+  256 KiB leaves it unchanged). This is how a plugin injects its client-side hooks into
+  jellyfin-web.
 
 Plugins can also act as **metadata and artwork providers**. A plugin's `metadata-lookup`
 export is a **remote metadata provider folded at its configured rank**, exactly like the
@@ -255,8 +278,8 @@ A new library shows its downloaders in exactly this order and saves it, **with e
 plugin unticked**, as Jellyfin starts a plugin's provider: in a new library only
 TheMovieDb (not for seasons, episodes or music videos), TheTVDB, MusicBrainz and
 TheAudioDB are ticked for metadata, and only TheMovieDb (not for series, seasons, episodes
-or music videos), TheTVDB, TheAudioDB and the audio "Image Extractor" for images
-(`LibraryController.IsMetadataFetcherEnabledByDefault` /
+or music videos), TheTVDB, TheAudioDB, the audio "Image Extractor" and the video "Screen
+Grabber" for images (`LibraryController.IsMetadataFetcherEnabledByDefault` /
 `IsImageFetcherEnabledByDefault`). A plugin runs in such a library once the admin ticks it.
 
 **Check where your plugins sit in existing libraries.** jellyfin-web shows a downloader
@@ -287,10 +310,9 @@ unchecked never runs for its items. A plugin without `provider-info` appears in 
 it is asked about every item, ranked like a provider the admin left out of the order.
 A declared provider name that collides with a built-in fetcher or another loaded
 plugin (case-insensitively) is refused at load — it would ride that fetcher's
-checkbox/order and be impossible to toggle apart. So is "Screen Grabber", a name
-Jellyfin's new-library image allowlist ticks though Ferrofin registers no such
-provider: a plugin by that name would start ticked where every other plugin starts
-unticked.
+checkbox/order and be impossible to toggle apart. "Screen Grabber", the built-in frame
+grab, is one of those names; it is also on Jellyfin's new-library image allowlist, so a
+plugin by that name would start ticked where every other plugin starts unticked.
 
 The rank changes what a plugin's answer can do to the data, not what the plugin can do:
 the sandbox is the same (no filesystem, network only through `http-fetch` and the
@@ -353,7 +375,9 @@ and size-capped:
 
 Each plugin runs on its own runtime thread under an enforced
 per-call deadline (`FERROFIN_WASM_CALL_TIMEOUT_SECS`, default 30 s) and linear-memory cap
-(`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB). A trap or overrun fails that one call
+(`FERROFIN_WASM_MEMORY_LIMIT_MB`, default 128 MiB). The deadline also holds while the guest
+waits on a WASI clock (`std::thread::sleep`, `poll`): the wait is cut to the time the call
+has left. A trap or overrun fails that one call
 and the instance is rebuilt; three consecutive failures trip a circuit breaker that
 sidelines the plugin until restart. The server never goes down with a plugin.
 
@@ -382,7 +406,10 @@ removes the server-as-network-pivot risk; grant a specific trusted plugin privat
 access with `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` (comma-separated plugin UUIDs, or `*`).
 The private-address check also **pins the vetted address on the connection
 itself** (the request resolves to the address that was checked, not a second
-DNS answer), closing the classic DNS-rebinding TOCTOU. (Referencing plugins by
+DNS answer), closing the classic DNS-rebinding TOCTOU. When the server's
+environment sets an HTTP proxy (`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`), the proxy
+resolves the destination itself: the check then runs on the server's own DNS answer before
+the request is sent, and the pin covers the hosts the proxy settings exclude. (Referencing plugins by
 UUID in the allowlist is acknowledged UX debt — accepting plugin names is a
 planned improvement.)
 
@@ -390,8 +417,8 @@ planned improvement.)
 plugin's declared `web-transforms` rewrite served jellyfin-web files for all
 users — a strictly larger grant than settings pages (admin-only) or plugin
 routes (opt-in fetches). It is the single strongest reason to install only
-plugins you trust; a disabled plugin's transforms are not applied
-(restart-required, like everything decided at boot).
+plugins you trust; a disabled or uninstalled plugin's transforms stop
+applying at once, and enabling a plugin starts them, with no restart.
 
 **Settings pages are outside the sandbox.** A plugin's `config-pages` HTML/JS
 executes in the **admin's browser with the admin's session** — the same trust
@@ -419,6 +446,10 @@ Plugins receive server events (`LibraryChanged`, `PlaybackStart`, task completio
 through the `on-event` export via a bounded per-plugin queue
 (`FERROFIN_WASM_EVENT_QUEUE_CAPACITY`, default 256) — a slow guest loses events rather
 than slowing the server; the database, not the event stream, is the source of truth.
+`LibraryChanged` carries each batch of library changes the server announces (scans, metadata
+edits, deletions, playlists and collections), unfiltered by user, `LibraryUpdateDuration`
+seconds after the batch's first change, as Jellyfin's `LibraryChangedNotifier` sends its
+batches; a batch holds at most 2000 items.
 
 Authoring: any language that targets the WASM component model. **Start from the
 template**: [`ferrofin-plugin-template`](https://github.com/mangoleaf/ferrofin-plugin-template)
@@ -476,9 +507,8 @@ Two things to know:
 - **The opt-out is per plugin, by disabling it** (or removing the repository). Upstream
   honours an `AutoUpdate` flag in each installed plugin's manifest; Ferrofin's WASM
   artifacts carry no such manifest, so a disabled plugin is what the task skips. Disabling
-  takes effect live for tasks, providers and analysis, and keeps the plugin installed and
-  inert; a plugin's **web transforms** are wired at boot, so disarming those needs a
-  restart.
+  takes effect live for tasks, providers, analysis and the plugin's **web transforms**,
+  and keeps the plugin installed and inert.
 
 ## Roadmap
 

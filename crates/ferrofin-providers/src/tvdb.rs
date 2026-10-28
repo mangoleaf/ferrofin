@@ -8,7 +8,8 @@
 //! episodes, and people, and lists series artwork.
 //!
 //! Auth: `POST /login` with `{ apikey, pin }` returns a bearer token; the token
-//! is cached and re-fetched on demand. Every other call sends
+//! is cached and fetched again once it is older than the token max age
+//! ([`DEFAULT_TOKEN_MAX_AGE`]). Every other call sends
 //! `Authorization: Bearer <token>`.
 //!
 //! Faithful port notes (the C# is the oracle):
@@ -99,6 +100,13 @@ pub fn episode_lookup(
 /// `GetSeriesExtendedByIdAsync` the series record a season's id is read
 /// from (`:251-271`).
 pub const DEFAULT_CACHE_DURATION: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// How old the bearer token may get before the client logs in again, unless
+/// configured otherwise ([`TvdbClient::with_token_max_age`], the server's
+/// `FERROFIN_TVDB_TOKEN_DAYS`): the plugin's 25 days
+/// (`TvdbClientManager.LoginAsync`'s `IsTokenInvalid`), inside the month a
+/// TVDB v4 token is valid for.
+pub const DEFAULT_TOKEN_MAX_AGE: std::time::Duration = std::time::Duration::from_hours(25 * 24);
 
 /// `(series id, season type, season, episode)` → the episode's TVDB id and
 /// when it was resolved.
@@ -424,9 +432,12 @@ struct SearchItem {
     #[serde(alias = "tvdb_id")]
     tvdb_id: Option<String>,
     name: Option<String>,
-    year: Option<String>,
+    first_air_time: Option<String>,
     overview: Option<String>,
     image_url: Option<String>,
+    aliases: Option<Vec<String>>,
+    /// Language (ISO 639-2) → name.
+    translations: Option<std::collections::BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -672,7 +683,14 @@ pub struct TvdbClient {
     limiter: RateLimiter,
     api_key: SecretString,
     pin: Option<String>,
-    token: Mutex<Option<String>>,
+    /// The bearer token and when it was obtained, by the wall clock as the
+    /// plugin's `DateTime.UtcNow` (TheTVDB expires it by wall time, which a
+    /// monotonic clock stops counting while the host is suspended). A tokio
+    /// mutex, held across the `/login` request, so concurrent callers share
+    /// one login.
+    token: tokio::sync::Mutex<Option<(std::time::SystemTime, String)>>,
+    /// How old [`token`](Self::token) may get before a new login.
+    token_max_age: std::time::Duration,
     base_url: String,
     /// The episode ids [`episode_by_number`](Self::episode_by_number)
     /// resolved, kept for `cache_duration` as the
@@ -693,7 +711,10 @@ impl std::fmt::Debug for TvdbClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TvdbClient")
             .field("has_pin", &self.pin.is_some())
-            .field("has_token", &self.token.lock().is_ok_and(|t| t.is_some()))
+            .field(
+                "has_token",
+                &self.token.try_lock().is_ok_and(|t| t.is_some()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -725,7 +746,8 @@ impl TvdbClient {
             limiter: RateLimiter::new("tvdb"),
             api_key: SecretString::from(key.to_owned()),
             pin: (!pin.is_empty()).then(|| pin.to_owned()),
-            token: Mutex::new(None),
+            token: tokio::sync::Mutex::new(None),
+            token_max_age: DEFAULT_TOKEN_MAX_AGE,
             base_url: API_BASE.to_owned(),
             episode_ids: Mutex::new(EpisodeIdCache::new()),
             season_ids: Mutex::new(SeasonIdCache::new()),
@@ -743,6 +765,14 @@ impl TvdbClient {
         self
     }
 
+    /// Sets how old the bearer token may get before the client logs in again
+    /// ([`DEFAULT_TOKEN_MAX_AGE`] unless set).
+    #[must_use]
+    pub fn with_token_max_age(mut self, max_age: std::time::Duration) -> Self {
+        self.token_max_age = max_age;
+        self
+    }
+
     /// Points the client at a different API root (a mock server in tests).
     ///
     /// `pub`, matching `TmdbClient::with_base_url`: while this was
@@ -757,11 +787,16 @@ impl TvdbClient {
         self
     }
 
-    /// The cached bearer token, logging in on first use. Returns `None` if login
-    /// fails (the caller then yields no data — best-effort, like the plugin).
+    /// The cached bearer token, logging in on first use and again once it is
+    /// older than the token max age (the plugin's `LoginAsync`). The lock is
+    /// held across the login, so concurrent callers send one `/login`.
+    /// Returns `None` if login fails (the caller then yields no data —
+    /// best-effort, like the plugin).
     async fn token(&self) -> Option<String> {
-        if let Ok(guard) = self.token.lock()
-            && let Some(token) = guard.as_ref()
+        let mut guard = self.token.lock().await;
+        // A clock set back since the login (`elapsed` fails) renews too.
+        if let Some((obtained, token)) = guard.as_ref()
+            && obtained.elapsed().is_ok_and(|age| age < self.token_max_age)
         {
             return Some(token.clone());
         }
@@ -782,9 +817,7 @@ impl TvdbClient {
             .ok()?;
         let env: Envelope<LoginData> = resp.counted_json().await.ok()?;
         let token = env.data?.token;
-        if let Ok(mut guard) = self.token.lock() {
-            *guard = Some(token.clone());
-        }
+        *guard = Some((std::time::SystemTime::now(), token.clone()));
         Some(token)
     }
 
@@ -808,30 +841,98 @@ impl TvdbClient {
         env.data
     }
 
-    /// Searches TVDB for a series by name (optionally narrowed by year),
-    /// returning ranked candidates. Port of `FindSeries`.
-    pub async fn search(&self, name: &str, year: Option<i32>) -> Vec<TvdbSearchHit> {
-        let mut query = vec![
-            ("query", name.to_owned()),
+    /// Searches TVDB for a series by name. Port of the query, ranking and
+    /// filter of `TvdbSeriesProvider.FindSeries` and `FindSeriesInternal`;
+    /// each hit carries its Tvdb id only (upstream also reads every hit's
+    /// extended record for its IMDb, Zap2It and TMDb ids, which this does not):
+    ///
+    /// - the query is `name` parsed (`ParseName`: no trailing year, no release
+    ///   clutter) in its comparable form ([`comparable_name`]), five results,
+    ///   no year in the request — a `Show.2026` folder searches `show`;
+    /// - each hit's titles are its name in `language` (else its name) and its
+    ///   aliases, and its year is its first air date's;
+    /// - the hits are ranked: a title equal to `name`, then a title containing
+    ///   the parsed name, then the year parsed from `name`, then a title
+    ///   containing the comparable name, then TVDB's order;
+    /// - a known `year` drops every hit dated more than a year from it (a hit
+    ///   without a date is kept).
+    ///
+    /// `three_letter_names` are `language`'s ISO 639-2 codes
+    /// ([`three_letter_language_names`]), which the translations are keyed by.
+    pub async fn search(
+        &self,
+        name: &str,
+        year: Option<i32>,
+        language: &str,
+        three_letter_names: &[String],
+    ) -> Vec<TvdbSearchHit> {
+        let options = crate::provider_manager::naming_options();
+        let parsed = ferrofin_naming::video::video_resolver::clean_date_time(name, options);
+        let parsed_year = parsed.year;
+        let parsed_name =
+            ferrofin_naming::video::video_resolver::try_clean_string(Some(&parsed.name), options)
+                .unwrap_or(parsed.name);
+        let comparable = comparable_name(&parsed_name);
+        let query = vec![
+            ("query", comparable.clone()),
             ("type", "series".to_owned()),
-            ("limit", "10".to_owned()),
+            ("limit", "5".to_owned()),
         ];
-        if let Some(y) = year {
-            query.push(("year", y.to_string()));
-        }
         let items: Vec<SearchItem> = self.get("/search", &query).await.unwrap_or_default();
-        items
+        let mut ranked: Vec<(Vec<String>, TvdbSearchHit)> = items
             .into_iter()
             .filter_map(|it| {
                 let tvdb_id = it.tvdb_id.as_deref()?.parse::<i64>().ok()?;
-                let name = it.name?;
-                Some(TvdbSearchHit {
-                    tvdb_id,
-                    name,
-                    year: it.year.as_deref().and_then(|y| y.parse::<i32>().ok()),
-                    image_url: it.image_url,
-                    overview: it.overview,
-                })
+                let title = it
+                    .translations
+                    .as_ref()
+                    .and_then(|translations| {
+                        translations.iter().find_map(|(lang, title)| {
+                            translation_matches(lang, language, three_letter_names)
+                                .then(|| title.clone())
+                        })
+                    })
+                    .or(it.name)?;
+                let mut titles = vec![title.clone()];
+                titles.extend(it.aliases.unwrap_or_default());
+                // `DateTime.TryParse(First_air_time)`; never the `year` field.
+                let year = it.first_air_time.as_deref().and_then(year_of);
+                Some((
+                    titles,
+                    TvdbSearchHit {
+                        tvdb_id,
+                        name: title,
+                        year,
+                        image_url: it.image_url,
+                        overview: it.overview,
+                    },
+                ))
+            })
+            .collect();
+        let contains = |titles: &[String], needle: &str| {
+            let needle = needle.to_lowercase();
+            titles
+                .iter()
+                .any(|title| title.to_lowercase().contains(&needle))
+        };
+        // `OrderBy` … `ThenBy(list.IndexOf)`: a stable sort keeps TVDB's order.
+        ranked.sort_by_key(|(titles, hit)| {
+            (
+                !titles
+                    .iter()
+                    .any(|title| title.to_lowercase() == name.to_lowercase()),
+                !contains(titles, &parsed_name),
+                !(hit.year.is_some() && hit.year == parsed_year),
+                !contains(titles, &comparable),
+            )
+        });
+        ranked
+            .into_iter()
+            .map(|(_, hit)| hit)
+            .filter(|hit| match (year, hit.year) {
+                // "Allow one year tolerance".
+                (Some(year), Some(hit_year)) => (year - hit_year).abs() <= 1,
+                _ => true,
             })
             .collect()
     }
@@ -1172,6 +1273,32 @@ impl TvdbClient {
         let resp = crate::image_download::send(&self.http, url).await.ok()?;
         resp.counted_bytes().await.ok()
     }
+}
+
+/// `TvdbUtils.GetComparableName`: lower-cased (NFC), `", the"` and `"the "`
+/// removed, `&` spelled "and", modifier letters and non-spacing marks
+/// removed, and every run of non-word characters (and `_`) one space.
+///
+/// ACCEPTED DIVERGENCE (don't-port-bugs): upstream removes `"the "` inside a
+/// word too, so "Breathe Easy" searches as "brea easy"; here it must start a
+/// word.
+#[must_use]
+pub fn comparable_name(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    static THE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\bthe ").expect("valid regex"));
+    static MARKS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[\p{Lm}\p{Mn}]").expect("valid regex"));
+    static SEPARATORS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[\W\p{Pc}]+").expect("valid regex"));
+    let name = name
+        .to_lowercase()
+        .nfc()
+        .collect::<String>()
+        .replace(", the", "");
+    let name = THE.replace_all(&name, " ").replace('&', " and ");
+    let name = MARKS.replace_all(&name, "");
+    SEPARATORS.replace_all(&name, " ").trim().to_owned()
 }
 
 /// The four-digit year in a `YYYY-MM-DD` (or `YYYY…`) date string.
@@ -1598,7 +1725,7 @@ mod tests {
         // name is dropped.
         let items: Vec<SearchItem> = serde_json::from_str(
             r#"[
-              { "tvdb_id": "121361", "name": "Game of Thrones", "year": "2011", "image_url": "/p.jpg" },
+              { "tvdb_id": "121361", "name": "Game of Thrones", "first_air_time": "2011-04-17", "image_url": "/p.jpg" },
               { "name": "No Id" },
               { "tvdb_id": "abc", "name": "Bad Id" }
             ]"#,
@@ -1611,7 +1738,7 @@ mod tests {
                 Some(TvdbSearchHit {
                     tvdb_id,
                     name: it.name?,
-                    year: it.year.as_deref().and_then(|y| y.parse().ok()),
+                    year: it.first_air_time.as_deref().and_then(year_of),
                     image_url: it.image_url,
                     overview: it.overview,
                 })
@@ -1620,6 +1747,74 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].tvdb_id, 121_361);
         assert_eq!(hits[0].year, Some(2011));
+    }
+
+    #[rstest::rstest]
+    #[case::lower_cased("Show", "show")]
+    #[case::trailing_article(", The Show", "show")]
+    #[case::leading_article("The Show", "show")]
+    #[case::inner_article("Back to the Future", "back to future")]
+    #[case::article_inside_a_word_kept("Breathe Easy", "breathe easy")]
+    #[case::article_before_punctuation_kept("The-Show", "the show")]
+    #[case::trailing_article_kept("Kill the", "kill the")]
+    #[case::lone_article_kept("The", "the")]
+    #[case::ampersand("Law & Order", "law and order")]
+    #[case::punctuation_runs("Star Trek: The Next Generation", "star trek next generation")]
+    #[case::underscore("Mr_Robot", "mr robot")]
+    #[case::combining_mark("Cafe\u{301}", "café")]
+    fn comparable_name_follows_get_comparable_name(#[case] name: &str, #[case] expected: &str) {
+        assert_eq!(comparable_name(name), expected);
+    }
+
+    #[tokio::test]
+    async fn search_queries_the_bare_name_ranks_like_find_series_and_keeps_hits_within_a_year() {
+        use crate::mock_http::MockServer;
+        // Only the request FindSeriesInternal sends is answered: the year and
+        // the release clutter are parsed off the name and never sent.
+        let server = MockServer::start(vec![
+            ("/login", r#"{"data":{"token":"tok"}}"#.to_owned()),
+            (
+                "/search?query=show&type=series&limit=5",
+                r#"{"data":[
+                  {"tvdb_id":"1","name":"Unrelated","first_air_time":"2020-01-01"},
+                  {"tvdb_id":"2","name":"Show","first_air_time":"2025-12-31"},
+                  {"tvdb_id":"3","name":"Show Again"},
+                  {"tvdb_id":"4","name":"Show Later","year":"2028"},
+                  {"tvdb_id":"5","name":"Serie","translations":{"deu":"Serie","eng":"Show"}}
+                ]}"#
+                .to_owned(),
+            ),
+        ])
+        .await;
+        let c = TvdbClient::new().with_base_url(&server.base_url);
+        let english = vec!["eng".to_owned()];
+        let ids = |hits: Vec<TvdbSearchHit>| hits.iter().map(|h| h.tvdb_id).collect::<Vec<_>>();
+
+        // OrderBy: a title equal to the name (5's English name too), then a
+        // title containing it, then TVDB's order.
+        assert_eq!(
+            ids(c.search("Show", None, "en", &english).await),
+            [2, 5, 3, 4, 1]
+        );
+        // Without the language, 5 ranks by its own name.
+        assert_eq!(ids(c.search("Show", None, "", &[]).await), [2, 3, 4, 1, 5]);
+        // A year in the name is parsed off the query. No title equals the
+        // raw name, so the titles containing "Show" keep TVDB's order; the
+        // known year keeps the hits first aired within a year of it, and
+        // those with no first air date (4 has only TVDB's `year`).
+        assert_eq!(
+            ids(c
+                .search("Show.2026.1080p", Some(2026), "en", &english)
+                .await),
+            [2, 3, 4, 5]
+        );
+        let first = c.search("Show", None, "en", &english).await;
+        assert_eq!(first[1].name, "Show", "the hit carries its translated name");
+        assert_eq!(
+            first[0].year,
+            Some(2025),
+            "the year is the first air date's"
+        );
     }
 
     #[tokio::test]
@@ -1662,7 +1857,7 @@ mod tests {
         .await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
 
-        let hits = c.search("Game of Thrones", Some(2011)).await;
+        let hits = c.search("Game of Thrones", Some(2011), "en", &[]).await;
         assert_eq!(hits.first().map(|h| h.tvdb_id), Some(121_361));
 
         let d = c.series_details(121_361, "usa").await.expect("series");
@@ -1699,15 +1894,60 @@ mod tests {
         // No /login route → token() fails → every call returns None/empty.
         let server = MockServer::start(vec![("/search", "{}".to_owned())]).await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
-        assert!(c.search("x", None).await.is_empty());
+        assert!(c.search("x", None, "en", &[]).await.is_empty());
         assert!(c.series_details(1, "usa").await.is_none());
+    }
+
+    /// The bearer token is reused until it is older than the token max age
+    /// (the plugin's 25 days, `FERROFIN_TVDB_TOKEN_DAYS`), then the client
+    /// logs in again; concurrent callers share one login.
+    #[tokio::test]
+    async fn the_token_is_renewed_once_older_than_its_max_age() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let logins = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&logins);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let payload = if req.contains("/login") {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    r#"{"data":{"token":"tok"}}"#
+                } else {
+                    r#"{"data":{"name":"An episode"}}"#
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        let base = format!("http://{addr}");
+        let c = TvdbClient::new().with_base_url(&base);
+        let (a, b) = tokio::join!(c.episode_details(8), c.episode_details(9));
+        assert!(a.is_some() && b.is_some());
+        assert!(c.episode_details(8).await.is_some());
+        assert_eq!(logins.load(Ordering::SeqCst), 1, "one login, shared");
+        let c = TvdbClient::new()
+            .with_base_url(&base)
+            .with_token_max_age(std::time::Duration::ZERO);
+        for _ in 0..2 {
+            assert!(c.episode_details(8).await.is_some());
+        }
+        assert_eq!(logins.load(Ordering::SeqCst), 3, "an old token is renewed");
     }
 
     #[tokio::test]
     #[ignore = "hits the live TVDB API; run with --ignored"]
     async fn live_search_and_details_smoke() {
         let c = TvdbClient::new();
-        let hits = c.search("Game of Thrones", None).await;
+        let hits = c.search("Game of Thrones", None, "en", &[]).await;
         assert!(
             hits.iter().any(|h| h.tvdb_id == 121_361),
             "expected GoT (121361) in {hits:?}"

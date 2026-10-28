@@ -97,6 +97,10 @@ pub struct AuthenticationRequest {
 #[async_trait]
 pub trait SessionManager: Send + Sync {
     /// Records session activity for a client, returning the session DTO.
+    ///
+    /// `user` is `None` for an API-key caller, which upstream's
+    /// `RequestHelpers.GetSession` logs as a session with no user
+    /// (`LogSessionActivity(..., user: null)`).
     async fn log_session_activity(
         &self,
         app_name: &str,
@@ -104,7 +108,7 @@ pub trait SessionManager: Send + Sync {
         device_id: &str,
         device_name: &str,
         remote_endpoint: &str,
-        user: &UserEntity,
+        user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError>;
 
     /// Updates the reported device name of a session.
@@ -129,6 +133,14 @@ pub trait SessionManager: Send + Sync {
 
     /// Reports that a session has ended.
     async fn report_session_ended(&self, session_id: &str) -> Result<(), ServiceError>;
+
+    /// Ends a session whose last WebSocket closed (C#
+    /// `SessionManager.CloseIfNeededAsync`): the live stream it was playing is
+    /// released first, which [`report_session_ended`](Self::report_session_ended)
+    /// (a logout) does not do. The default only ends the session.
+    async fn close_if_needed(&self, session_id: &str) -> Result<(), ServiceError> {
+        self.report_session_ended(session_id).await
+    }
 
     /// Sends a general command to a controlled session.
     async fn send_general_command(
@@ -180,6 +192,14 @@ pub trait SessionManager: Send + Sync {
         message_type: SessionMessageType,
         data: &str,
     ) -> Result<(), ServiceError>;
+
+    /// Whether any session of `user_id` could receive a pushed message, so a
+    /// sender can skip building one nobody would hear (upstream's
+    /// `SendMessageToUserSessions` builds its data only when the user has a
+    /// session). The default answers `true`.
+    async fn has_listener_for_user(&self, _user_id: Uuid) -> bool {
+        true
+    }
 
     /// Sends a pre-serialized JSON message to every session with a signed-in
     /// user (the delivery target of Jellyfin's library/server notifiers, e.g.
@@ -308,7 +328,20 @@ pub trait SessionManager: Send + Sync {
         current_access_token: &str,
     ) -> Result<(), ServiceError>;
 
-    /// Closes the given live stream if no session still needs it.
+    /// Releases a viewer's hold on a live stream and closes the stream when
+    /// that release calls for it (C# `CloseLiveStreamIfNeededAsync`).
+    ///
+    /// `session_or_play_session_id` names the viewer, by either of its ids.
+    /// Which streams count as held comes from play-state reports that name a
+    /// `LiveStreamId`. Three cases:
+    /// - the id holds the stream: the viewer's hold (under both ids) is dropped
+    ///   and the stream is closed;
+    /// - the stream has holders but not this id: nothing is closed;
+    /// - the stream has no holder at all (no report named it, or its last
+    ///   holder already released): the stream is closed.
+    ///
+    /// Closing is one `MediaSourceManager::close_live_stream`, which lowers the
+    /// stream's consumer count; the tuner goes when the count reaches zero.
     async fn close_live_stream_if_needed(
         &self,
         live_stream_id: &str,

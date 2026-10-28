@@ -80,6 +80,15 @@ const TVDB_SEASON: &str = r#"{"data": {"id": 77, "translations": {"overviewTrans
 const TVDB_DVD_SEASON: &str = r#"{"data": {"id": 76, "translations": {"overviewTranslations": [
     {"language": "eng", "overview": "TVDB dvd season."}]}}}"#;
 
+/// TheMovieDb's posters for season 1, in TheMovieDb's own order: the German
+/// one first and best rated, then English, then French. Their files are
+/// requested from the stand-in's `/img` root, which answers each with a 404,
+/// so the scan tries every one and the request log shows its ranked order.
+const TMDB_SEASON_IMAGES: &str = r#"{"posters": [
+    {"file_path": "/season-de.jpg", "iso_639_1": "de", "vote_average": 9.5, "vote_count": 90},
+    {"file_path": "/season-en.jpg", "iso_639_1": "en", "vote_average": 7.0, "vote_count": 40},
+    {"file_path": "/season-fr.jpg", "iso_639_1": "fr", "vote_average": 5.0, "vote_count": 10}]}"#;
+
 /// How the stand-in answers TheMovieDb's series search and season.
 #[derive(Clone, Copy)]
 struct Answers {
@@ -95,7 +104,7 @@ const DEFAULT_ANSWERS: Answers = Answers {
 /// The stand-in's answer to request line `line`; `None` is a 404 (a miss,
 /// not a failure).
 fn answer(line: &str, answers: Answers) -> Option<&'static str> {
-    let routes: [(&str, &str); 14] = [
+    let routes: [(&str, &str); 15] = [
         ("/tvdb/login", r#"{"data": {"token": "tok"}}"#),
         (
             "/tvdb/search",
@@ -126,6 +135,7 @@ fn answer(line: &str, answers: Answers) -> Option<&'static str> {
             "/tmdb/tv/1399/season/1/episode/1",
             r#"{"credits": {"cast": [], "crew": []}}"#,
         ),
+        ("/tmdb/tv/1399/season/1/images", TMDB_SEASON_IMAGES),
         ("/tmdb/tv/1399/season/1?", answers.season),
         ("/tmdb/tv/1399?", TMDB_SERIES),
         // A biography, so the person is complete and not asked again.
@@ -259,7 +269,11 @@ impl Library {
         )
         .with_items(Arc::clone(&self.items))
         .with_metadata(
-            Arc::new(TmdbClient::new().with_base_url(&format!("{the_moviedb}/tmdb"))),
+            Arc::new(
+                TmdbClient::new()
+                    .with_base_url(&format!("{the_moviedb}/tmdb"))
+                    .with_image_root(&format!("{the_moviedb}/img")),
+            ),
             self.metadata.clone(),
         )
         .with_tvdb(Arc::new(
@@ -566,6 +580,40 @@ async fn a_season_asks_fanart_for_its_artwork_only_when_fanart_is_enabled() {
     assert_eq!(with_fanart, without + 1, "one more request, for the season");
 }
 
+/// A season's TheMovieDb posters are ranked like every other provider's
+/// images (`GetImages` → `OrderByLanguageDescending(preferredLanguage)`), not
+/// taken in TheMovieDb's order: a French library asks for the French poster
+/// before the better-rated German and English ones.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_season_takes_its_tmdb_poster_in_the_preferred_language_first() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(
+        tmp.path(),
+        LibraryOptions {
+            preferred_metadata_language: Some("fr".to_owned()),
+            ..LibraryOptions::default()
+        },
+    )
+    .await;
+    let (base, log) = spawn_providers(DEFAULT_ANSWERS);
+    library.scanner(&base).scan_all().await.expect("scan");
+    let posters: Vec<&str> = log
+        .lock()
+        .expect("log")
+        .iter()
+        .filter_map(|line| {
+            ["season-fr", "season-en", "season-de"]
+                .into_iter()
+                .find(|name| line.contains("/img/") && line.contains(name))
+        })
+        .collect();
+    assert_eq!(
+        posters,
+        ["season-fr", "season-en", "season-de"],
+        "preferred language, then English, then the rest — not TMDB's order"
+    );
+}
+
 /// TheMovieDb first, with no overview for the season: TheTVDB's translated
 /// overview fills it; TheMovieDb's air date stands.
 #[tokio::test(flavor = "multi_thread")]
@@ -822,4 +870,215 @@ async fn season_zero_uses_saved_name_and_keeps_name_locks(#[case] flat: bool) {
         Some("Mine"),
         "children use the locked season name"
     );
+}
+
+/// The episode's NFO: aired before TheMovieDb's season air date, in another
+/// year. A local reader runs before the remote providers, so the episode
+/// keeps it whatever TheMovieDb's episode says.
+const EARLY_EPISODE_NFO: &str = "<episodedetails><aired>2010-12-31</aired></episodedetails>";
+
+impl Library {
+    /// Gives the season's episode [`EARLY_EPISODE_NFO`].
+    fn date_the_episode_early(&self) {
+        std::fs::write(self.season_dir.join("Show S01E01.nfo"), EARLY_EPISODE_NFO)
+            .expect("episode nfo");
+    }
+
+    /// Stamps the season as refreshed now: no longer its first refresh.
+    async fn stamp_season_refresh(&self) {
+        sqlx::query(r#"UPDATE "BaseItems" SET "DateLastRefreshed" = ?1 WHERE "Id" = ?2"#)
+            .bind(ferrofin_db::store::datetime_to_db(chrono::Utc::now()))
+            .bind(ferrofin_db::store::guid_to_db(self.season_id))
+            .execute(self.db.writer())
+            .await
+            .expect("stamp the season");
+    }
+
+    /// The season's stored premiere day and production year.
+    async fn season_date(&self) -> (Option<String>, Option<i64>) {
+        let season = self.season().await;
+        (
+            season.premiere_date.map(|d| d.date_naive().to_string()),
+            season.production_year,
+        )
+    }
+}
+
+/// TheMovieDb's season air date, as a stored premiere day and year.
+fn tmdbs_date() -> (Option<String>, Option<i64>) {
+    (Some("2011-04-17".to_owned()), Some(2011))
+}
+
+/// The early episode's date, as a stored premiere day and year.
+fn episodes_date() -> (Option<String>, Option<i64>) {
+    (Some("2010-12-31".to_owned()), Some(2011 - 1))
+}
+
+/// `SeasonMetadataService.EnableUpdatingPremiereDateFromChildren`
+/// (`SeasonMetadataService.cs:46`): a full refresh of a season takes its
+/// premiere date and year from its earliest episode in `BeforeSave`, before
+/// the providers run (`MetadataService.cs:150,462-464`). "Search for missing
+/// metadata" only fills, so the episode's date stands over TheMovieDb's;
+/// "Replace all metadata" lets TheMovieDb's air date replace it; "Scan for new
+/// and updated files" is no full refresh, so the season keeps what it has.
+/// The first scan refreshes the season before its episode exists
+/// (`Series.RefreshAllMetadataInternal` refreshes the seasons first), so the
+/// season starts with TheMovieDb's date; it is stamped as refreshed, as a
+/// clean first scan leaves it (the stand-in's image 404s would not).
+#[rstest::rstest]
+#[case::missing("missing", episodes_date())]
+#[case::replace_all("replace", tmdbs_date())]
+#[case::scan("scan", tmdbs_date())]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_refresh_dates_a_season_from_its_earliest_episode(
+    #[case] choice: &str,
+    #[case] expected: (Option<String>, Option<i64>),
+) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(tmp.path(), LibraryOptions::default()).await;
+    library.date_the_episode_early();
+    let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
+    let scanner = library.scanner(&base);
+    scanner.scan_all().await.expect("first scan");
+    assert_eq!(library.season_date().await, tmdbs_date(), "first scan");
+    library.stamp_season_refresh().await;
+
+    scanner
+        .scan_with(None, &dashboard(choice))
+        .await
+        .expect("refresh");
+    assert_eq!(library.season_date().await, expected, "{choice}");
+}
+
+/// A library whose seasons run TheTVDB alone, which answers with no season
+/// date: the season has none after its first scan, and "Search for missing
+/// metadata" dates it from its episode.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tvdb_only_season_takes_its_episodes_date() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(tmp.path(), season_order(&[TVDB])).await;
+    library.date_the_episode_early();
+    let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
+    let scanner = library.scanner(&base);
+    scanner.scan_all().await.expect("first scan");
+    assert_eq!(library.season_date().await, (None, None), "first scan");
+
+    scanner
+        .scan_with(None, &dashboard("missing"))
+        .await
+        .expect("search for missing metadata");
+    assert_eq!(library.season_date().await, episodes_date());
+}
+
+/// `UpdateMetadataFromChildren` returns on `item.IsLocked`
+/// (`MetadataService.cs:457-460`): a locked season keeps its date.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_locked_season_keeps_its_date_on_a_full_refresh() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(tmp.path(), LibraryOptions::default()).await;
+    library.date_the_episode_early();
+    let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
+    let scanner = library.scanner(&base);
+    scanner.scan_all().await.expect("first scan");
+    library.set_season(r#""IsLocked" = 1"#).await;
+
+    scanner
+        .scan_with(None, &dashboard("missing"))
+        .await
+        .expect("search for missing metadata");
+    assert_eq!(library.season_date().await, tmdbs_date());
+}
+
+/// The other half of the gate, `updateType > None`: a new local season
+/// poster is an image update before `BeforeSave` (`ValidateImages`,
+/// `MetadataService.cs:123-143`), so even a "Scan for new and updated
+/// files" of a season refreshed before dates it from its episode.
+///
+/// The stand-in's image files all 404, which leaves the season's first
+/// refresh unstamped (so every scan would be another first refresh); the
+/// test stamps it, as a clean first scan would.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_season_poster_dates_the_season_from_its_episode() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(tmp.path(), LibraryOptions::default()).await;
+    library.date_the_episode_early();
+    let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
+    let scanner = library.scanner(&base);
+    scanner.scan_all().await.expect("first scan");
+    library.stamp_season_refresh().await;
+    scanner.scan_all().await.expect("quiet rescan");
+    assert_eq!(library.season_date().await, tmdbs_date(), "no image change");
+
+    std::fs::write(library.season_dir.join("poster.jpg"), b"jpeg").expect("poster");
+    scanner.scan_all().await.expect("rescan");
+    assert_eq!(library.season_date().await, episodes_date());
+}
+
+/// A season NFO that changed in the same scan as the new poster: upstream
+/// derives the date onto the season before its providers run, and the NFO's
+/// `<premiered>` then replaces it (`MergeBaseItemData`), so the NFO's date
+/// stands.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_season_nfos_date_stands_over_its_episodes_on_an_image_update() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(tmp.path(), LibraryOptions::default()).await;
+    library.date_the_episode_early();
+    let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
+    let scanner = library.scanner(&base);
+    scanner.scan_all().await.expect("first scan");
+    library.stamp_season_refresh().await;
+    // Saved well before the NFO is written, so its change monitor fires
+    // (`BaseNfoProvider.HasChanged` allows a few seconds of save tolerance).
+    library
+        .set_season(r#""DateLastSaved" = '2020-01-01 00:00:00.0000000'"#)
+        .await;
+
+    std::fs::write(
+        library.season_dir.join("season.nfo"),
+        "<season><premiered>2008-03-02</premiered></season>",
+    )
+    .expect("season nfo");
+    std::fs::write(library.season_dir.join("poster.jpg"), b"jpeg").expect("poster");
+    scanner.scan_all().await.expect("rescan");
+    assert_eq!(
+        library.season_date().await,
+        (Some("2008-03-02".to_owned()), Some(2008))
+    );
+}
+
+/// `Season.GetEpisodes` under "Display specials within seasons": a special
+/// that airs before season 1 is one of its episodes, so with the setting on
+/// its earlier date dates season 1; with it off, season 1's own episode does
+/// (`Series.FilterEpisodesBySeason`).
+#[rstest::rstest]
+#[case::specials_within(true, (Some("2009-06-01".to_owned()), Some(2009)))]
+#[case::specials_apart(false, episodes_date())]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_special_airing_within_a_season_dates_it_when_specials_show_there(
+    #[case] within: bool,
+    #[case] expected: (Option<String>, Option<i64>),
+) {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let library = Library::new(tmp.path(), LibraryOptions::default()).await;
+    library.date_the_episode_early();
+    let specials = library.season_dir.parent().expect("show").join("Season 0");
+    std::fs::create_dir_all(&specials).expect("specials folder");
+    std::fs::write(specials.join("Show S00E01.mkv"), b"special").expect("special");
+    std::fs::write(
+        specials.join("Show S00E01.nfo"),
+        "<episodedetails><aired>2009-06-01</aired>\
+         <airsbefore_season>1</airsbefore_season></episodedetails>",
+    )
+    .expect("special nfo");
+    let (base, _log) = spawn_providers(DEFAULT_ANSWERS);
+    let scanner = library
+        .scanner(&base)
+        .with_display_specials_within_seasons(move || within);
+    scanner.scan_all().await.expect("first scan");
+
+    scanner
+        .scan_with(None, &dashboard("missing"))
+        .await
+        .expect("search for missing metadata");
+    assert_eq!(library.season_date().await, expected);
 }

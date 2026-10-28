@@ -26,7 +26,8 @@ use std::fmt::Write as _;
 use ferrofin_model::configuration::{EncodingOptions, HlsAudioSeekStrategy};
 use ferrofin_model::data::VideoRangeType;
 use ferrofin_model::dlna::SubtitleDeliveryMethod;
-use ferrofin_model::entities::EncoderPreset;
+use ferrofin_model::dto::MediaSourceInfo;
+use ferrofin_model::entities::{EncoderPreset, MediaStreamType, VideoType};
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::session::TranscodeReasons;
 use ferrofin_traits::media_encoding::TranscodingJobType;
@@ -56,11 +57,17 @@ pub fn infer_audio_codec(container: &str) -> String {
         return "aac".to_owned();
     }
     let lower = container.to_ascii_lowercase();
+    #[allow(clippy::match_same_arms)]
     match lower.as_str() {
         "ogg" | "oga" | "ogv" | "webm" | "webma" => "opus".to_owned(),
         "m4a" | "m4b" | "mp4" | "mov" | "mkv" | "mka" => "aac".to_owned(),
         "ts" | "avi" | "flv" | "f4v" | "swf" => "mp3".to_owned(),
-        _ => lower,
+        // Containers whose name IS the codec they carry.
+        "aac" | "ac3" | "alac" | "dts" | "eac3" | "flac" | "mp2" | "mp3" | "opus" | "truehd"
+        | "vorbis" => lower,
+        // Anything else (manifests like m3u8/mpd in particular) is not an
+        // audio codec — never hand it to ffmpeg as an encoder.
+        _ => "aac".to_owned(),
     }
 }
 
@@ -270,11 +277,11 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
     ///
     /// Port of `GetVideoBitrateParam`: the `libx264`/`libx265` (`-maxrate`/
     /// `-bufsize`) and `libsvtav1` (`-b:v`/`-bufsize`) arms, plus the generic
-    /// fallback every encoder with no arm of its own takes — NVENC among them.
-    /// The remaining per-vendor arms (the `h264_qsv` minimum-bitrate clamp and
-    /// `-mbbrc`, and the vaapi/amf/videotoolbox rate-control shapes) are the
-    /// work items of the hardware-transcoding roadmap phases 4-7. Returns empty when no output
-    /// bitrate is set.
+    /// fallback every encoder with no arm of its own takes — NVENC among them —
+    /// and the QSV arm. `-mbbrc` is not here: v12.2 moved it into
+    /// `GetEncoderParam`. The VAAPI rate-control shapes
+    /// are not ported yet; AMF and VideoToolbox are out of scope. Returns empty
+    /// when no output bitrate is set.
     #[must_use]
     pub fn video_bitrate_param(&self, state: &EncodingJobInfo, video_codec: &str) -> String {
         let Some(mut bitrate) = state.output_video_bitrate else {
@@ -300,13 +307,6 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
         }
 
         if eq_any(video_codec, &["h264_qsv", "hevc_qsv", "av1_qsv"]) {
-            // MacroBlock-level rate control, for subjective quality. AV1 QSV
-            // does not take it.
-            let mbbrc = if eq_any(video_codec, &["h264_qsv", "hevc_qsv"]) {
-                " -mbbrc 1"
-            } else {
-                ""
-            };
             // Some weaker H.264 hardware decoders need a strict CPB, so the
             // buffer optimisation is withheld below level 5.1.
             let factor = if state
@@ -329,7 +329,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             let init_occupancy = clamp(i64::from(bitrate) * i64::from(factor));
             let bufsize = clamp(i64::from(bitrate) * 2 * i64::from(factor));
             return format!(
-                "{mbbrc} -b:v {bitrate} -maxrate {maxrate} \
+                " -b:v {bitrate} -maxrate {maxrate} \
                  -rc_init_occupancy {init_occupancy} -bufsize {bufsize}"
             );
         }
@@ -364,8 +364,9 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             }
 
             if let Some(b) = bitrate {
+                let compensated = bit_depth_compensated_bitrate(b, stream, 8);
                 let input_codec = stream.codec.as_deref().unwrap_or_default();
-                let mut scaled = scale_bitrate(b, input_codec, output_video_codec);
+                let mut scaled = scale_bitrate(compensated, input_codec, output_video_codec);
                 if let Some(req) = request.video_bit_rate {
                     scaled = min(scaled, req);
                 }
@@ -446,19 +447,42 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
 
     // ----- quality param (software path) -------------------------------------
 
-    /// Builds the software `-preset`/`-crf`/`-profile`/`-level`/codec-opts
-    /// quality argument for `video_encoder`.
+    /// Builds the encoder's quality argument for `video_encoder`: preset,
+    /// CRF or bitrate, `-r`, profile, level and the codec-specific options.
     ///
-    /// Port of the **software slice** of `GetVideoQualityParam`. The hardware
-    /// low-power/i915-workaround preamble belongs to the hardware-transcoding roadmap phases
-    /// 4-5 — low-power covers vaapi and qsv, and the `-async_depth 1` i915
-    /// workaround is qsv-only (it is inert when the
-    /// hardware-acceleration type is `none`, i.e. the software path); the
-    /// libx264/libx265/libsvtav1 preset, CRF, profile, level, and codec-specific
-    /// option strings are ported verbatim.
+    /// Port of `GetVideoQualityParam` minus its hardware low-power and i915
+    /// preamble, which the planner emits from the concrete capabilities
+    /// (`hw::quality::hardware_quality_preamble`). It reads the capabilities
+    /// this helper was built with; see [`Self::video_quality_param_with`] for
+    /// a job whose VAAPI driver was probed later.
     #[must_use]
     pub fn video_quality_param(
         &self,
+        state: &EncodingJobInfo,
+        video_encoder: &str,
+        encoding_options: &EncodingOptions,
+        default_preset: EncoderPreset,
+    ) -> String {
+        self.video_quality_param_with(
+            &self.capabilities,
+            state,
+            video_encoder,
+            encoding_options,
+            default_preset,
+        )
+    }
+
+    /// [`Self::video_quality_param`] against `capabilities` instead of the
+    /// ones this helper was built with.
+    ///
+    /// `GetEncoderParam`'s VAAPI arm keys on `IsVaapiDeviceInteliHD`, and the
+    /// driver behind the configured render node is only known once the
+    /// planner has probed it for the job. The boot capabilities never carry
+    /// it, so the planner passes its per-job probe here.
+    #[must_use]
+    pub fn video_quality_param_with(
+        &self,
+        capabilities: &C,
         state: &EncodingJobInfo,
         video_encoder: &str,
         encoding_options: &EncodingOptions,
@@ -473,6 +497,7 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             encoding_options,
             video_encoder,
             is_libx265,
+            capabilities.is_vaapi_device_intel_ihd(),
         ));
         param.push_str(&self.video_bitrate_param(state, video_encoder));
 
@@ -502,6 +527,28 @@ impl<C: EncoderCapabilities> EncodingHelper<C> {
             &target_video_codec,
             encoding_options,
         ));
+
+        // Jellyfin's rate-control and film-grain settings for software AV1,
+        // which libsvtav1 takes from ffmpeg 5.1 on (`GetVideoQualityParam`,
+        // :2409-2413).
+        if video_encoder.eq_ignore_ascii_case("libsvtav1")
+            && capabilities.ffmpeg_at_least(super::hw::versions::MIN_FFMPEG_SVT_AV1_PARAMS)
+        {
+            param.push_str(
+                " -svtav1-params:0 rc=1:tune=0:film-grain=0:enable-overlays=1:enable-tf=0",
+            );
+        }
+
+        // From ffmpeg 6.0 the VAAPI H.26x encoders embed A/53 closed-caption
+        // SEI, which can overflow the driver's packed-header limit ("Access
+        // unit too large: 8192 < 20880"); `-sei -a53_cc` clears that flag
+        // (`GetVideoQualityParam`, :2415-2421).
+        if eq_any(video_encoder, &["h264_vaapi", "hevc_vaapi"])
+            && capabilities
+                .ffmpeg_at_least(super::hw::versions::MIN_FFMPEG_VAAPI_H26X_ENC_A53_CC_SEI)
+        {
+            param.push_str(" -sei -a53_cc");
+        }
 
         param
     }
@@ -705,6 +752,26 @@ fn video_bitrate_scale_factor(codec: &str) -> f64 {
     1.0
 }
 
+/// Compensates the bitrate when reducing bit depth from 10-bit to a lower target.
+///
+/// 10-bit encoded video is more efficient; reducing depth without compensation
+/// degrades quality at low bitrates. Port of `GetBitDepthCompensatedBitrate`.
+fn bit_depth_compensated_bitrate(bitrate: i32, stream: &MediaStream, target_bit_depth: i32) -> i32 {
+    if target_bit_depth >= 10 || stream.bit_depth.is_some_and(|d| d <= target_bit_depth) {
+        return bitrate;
+    }
+    let Some(source_bitrate) = stream.bit_rate else {
+        return bitrate;
+    };
+    let factor: f64 = match source_bitrate {
+        ..=4_000_000 => 1.5,
+        4_000_001..=8_000_000 => 1.2,
+        8_000_001..=12_000_000 => 1.1,
+        _ => 1.05,
+    };
+    f64_to_i32_round(f64::from(bitrate) * factor)
+}
+
 /// Scales a bitrate for a codec transition. Port of `ScaleBitrate` (public so
 /// the planner can compute the h264-equivalent bitrate the resolution
 /// normalizer keys on).
@@ -902,26 +969,22 @@ fn codec_specific_quality_args(
         }
     }
 
-    // TODO(PLAN_HWACCEL work item 7): ` -svtav1-params:0 rc=1:tune=0:
-    // film-grain=0:enable-overlays=1:enable-tf=0` is a *software* libsvtav1
-    // argument gated on ffmpeg >= 5.1. Both halves it needs already exist —
-    // `hw::versions::MIN_FFMPEG_SVT_AV1_PARAMS` and
-    // `FfmpegCapabilities::ffmpeg_at_least` — but `EncodingHelper` still holds
-    // only the one-method `EncoderCapabilities` seam and so cannot read a
-    // version. Threading the full capabilities in is what unblocks it; it has
-    // no vendor phase because it is not hardware work.
-
     param
 }
 
-/// Builds the `-preset`/`-crf` argument for software encoders. Port of the
-/// software branches of `GetEncoderParam` (libx264/libx265/libsvtav1).
+/// Builds the encoder's preset/quality argument. Port of `GetEncoderParam`:
+/// the libx264/libx265, libsvtav1, VAAPI, QSV and NVENC arms. AMF has no arm,
+/// as it is out of scope (CLAUDE.md, "Current scope").
+///
+/// `vaapi_intel_ihd` is `IMediaEncoder.IsVaapiDeviceInteliHD`, which gates
+/// the VAAPI arm.
 fn encoder_param(
     preset: EncoderPreset,
     _default_preset: EncoderPreset,
     encoding_options: &EncodingOptions,
     video_encoder: &str,
     is_libx265: bool,
+    vaapi_intel_ihd: bool,
 ) -> String {
     let mut param = String::new();
     // EncodingOptions.EncoderPreset is non-nullable and defaults to auto.
@@ -967,6 +1030,48 @@ fn encoder_param(
             _ => " -preset 10",
         };
         param.push_str(preset);
+    } else if eq_any(video_encoder, &["h264_vaapi", "hevc_vaapi", "av1_vaapi"]) {
+        // "-compression_level is not reliable on AMD." `auto` and `placebo`
+        // get nothing.
+        if vaapi_intel_ihd {
+            #[allow(clippy::match_same_arms)]
+            let level = match encoder_preset {
+                EncoderPreset::veryslow => " -compression_level 1",
+                EncoderPreset::slower => " -compression_level 2",
+                EncoderPreset::slow => " -compression_level 3",
+                EncoderPreset::medium => " -compression_level 4",
+                EncoderPreset::fast => " -compression_level 5",
+                EncoderPreset::faster => " -compression_level 6",
+                EncoderPreset::veryfast | EncoderPreset::superfast | EncoderPreset::ultrafast => {
+                    " -compression_level 7"
+                }
+                _ => "",
+            };
+            param.push_str(level);
+        }
+    } else if eq_any(video_encoder, &["h264_qsv", "hevc_qsv", "av1_qsv"]) {
+        // QSV names seven of x264's presets; anything else, `auto` included,
+        // runs at veryfast.
+        let preset = if matches!(
+            encoder_preset,
+            EncoderPreset::veryslow
+                | EncoderPreset::slower
+                | EncoderPreset::slow
+                | EncoderPreset::medium
+                | EncoderPreset::fast
+                | EncoderPreset::faster
+                | EncoderPreset::veryfast
+        ) {
+            encoder_preset
+        } else {
+            EncoderPreset::veryfast
+        };
+        let _ = write!(param, " -preset {}", preset_name(preset));
+        // MacroBlock-level rate control, for subjective quality. AV1 QSV
+        // does not take it.
+        if eq_any(video_encoder, &["h264_qsv", "hevc_qsv"]) {
+            param.push_str(" -mbbrc 1");
+        }
     } else if is_nvenc_encoder(video_encoder) {
         // NVENC's presets run p1 (fastest) to p7 (best quality), the opposite
         // direction to x264's names. The mapping is not monotonic in x264's
@@ -982,9 +1087,12 @@ fn encoder_param(
             _ => " -preset p1",
         };
         param.push_str(preset);
+        // Spatial adaptive quantisation, for subjective quality (12.2). H.264
+        // is left out because Maxwell 1 does not support it.
+        if !video_encoder.eq_ignore_ascii_case("h264_nvenc") {
+            param.push_str(" -spatial-aq 1 -aq-strength 15");
+        }
     }
-    // The remaining hardware encoder branches (vaapi/qsv/amf/videotoolbox) are
-    // the per-vendor work items of the hardware-transcoding roadmap phases 4-7.
 
     param
 }
@@ -1041,6 +1149,69 @@ pub fn normalize_transcoding_level(state: &EncodingJobInfo, level: Option<&str>)
     level.map(str::to_owned)
 }
 
+/// Port of `NormalizeSubtitleEmbed`: an `Embed` of a `DVBSUB` stream becomes
+/// `Encode` (burn-in), because a remuxed DVB subtitle is mispositioned after
+/// conversion. Every other stream and method is returned unchanged.
+///
+/// Upstream runs it in `AttachMediaSourceInfo`, once the subtitle stream and
+/// its delivery method are known and before anything reads the method.
+#[must_use]
+pub fn normalize_subtitle_embed(
+    subtitle_stream: Option<&MediaStream>,
+    method: SubtitleDeliveryMethod,
+) -> SubtitleDeliveryMethod {
+    let is_dvb = subtitle_stream
+        .and_then(|sub| sub.codec.as_deref())
+        .is_some_and(|codec| codec.eq_ignore_ascii_case(super::hw::input_args::DVBSUB_CODEC));
+    if method == SubtitleDeliveryMethod::Embed && is_dvb {
+        SubtitleDeliveryMethod::Encode
+    } else {
+        method
+    }
+}
+
+/// Port of `GetSubtitleEmbedArguments`: for an `Embed` subtitle, the codec the
+/// embedded track is written as and its default flag,
+/// ` -codec:s:0 {codec} -disposition:s:0 default`; otherwise empty.
+///
+/// The codec is the first of [`EncodingJobInfo::supported_subtitle_codecs`],
+/// or `copy` when there is none or it names the source codec (ignoring case).
+/// `GetProgressiveVideoFullCommandLine` appends it after the audio arguments.
+///
+/// The stream routes reject a `subtitleCodec` outside the container pattern
+/// before a job exists (`validate_stream_request`, upstream's
+/// `[RegularExpression(ContainerValidationRegexStr)]`). Because the value is
+/// written into the command line, a name outside that pattern is also treated
+/// as no name here, so a caller that skipped the route check cannot add
+/// arguments.
+#[must_use]
+pub fn subtitle_embed_arguments(state: &EncodingJobInfo) -> String {
+    let Some(sub) = state
+        .subtitle_stream
+        .as_ref()
+        .filter(|_| state.subtitle_delivery_method == SubtitleDeliveryMethod::Embed)
+    else {
+        return String::new();
+    };
+    let format = state
+        .supported_subtitle_codecs
+        .first()
+        .map(String::as_str)
+        .filter(|format| ferrofin_model::media_info::is_valid_stream_identifier(format))
+        .unwrap_or_default();
+    let codec = if format.is_empty()
+        || sub
+            .codec
+            .as_deref()
+            .is_some_and(|source| source.eq_ignore_ascii_case(format))
+    {
+        "copy"
+    } else {
+        format
+    };
+    format!(" -codec:s:0 {codec} -disposition:s:0 default")
+}
+
 /// The subtitle portion of [`EncodingHelper::map_args`]. Port of the
 /// subtitle-delivery-method branch of `GetMapArgs`; split out so `map_args`
 /// stays within a readable length.
@@ -1072,7 +1243,7 @@ fn subtitle_map_args(state: &EncodingJobInfo) -> String {
         return format!(" -map 0:{idx}");
     }
 
-    if sub.is_external && !is_text_subtitle_stream(sub) {
+    if sub.is_external && !sub.is_text_subtitle_stream() {
         let idx = find_index(&state.media_source.media_streams, sub);
         return format!(" -map 1:{idx} -sn");
     }
@@ -1124,9 +1295,90 @@ pub fn find_index(media_streams: &[MediaStream], stream_to_find: &MediaStream) -
     -1
 }
 
+/// The ffmpeg stream index of a subtitle track: [`find_index`], plus, for an
+/// embedded track of a Blu-ray source, the TrueHD and Atmos audio streams
+/// before it, which ffprobe does not list but ffmpeg counts. Port of
+/// `EncodingHelper.GetSubtitleStreamIndexForFfmpeg`; `-1` when the track is
+/// not among the source's streams.
+#[must_use]
+pub fn get_subtitle_stream_index_for_ffmpeg(
+    media_source: &MediaSourceInfo,
+    subtitle_stream: &MediaStream,
+) -> i32 {
+    let index = find_index(&media_source.media_streams, subtitle_stream);
+    if index == -1
+        || subtitle_stream.is_external
+        || media_source.video_type != Some(VideoType::BluRay)
+    {
+        return index;
+    }
+    let hidden_before = media_source
+        .media_streams
+        .iter()
+        .filter(|stream| {
+            stream.stream_type == MediaStreamType::Audio
+                && !stream.is_external
+                && stream.codec.as_deref().is_some_and(|codec| {
+                    codec.eq_ignore_ascii_case("truehd") || codec.eq_ignore_ascii_case("atmos")
+                })
+                && stream.index < subtitle_stream.index
+        })
+        .count();
+    index.saturating_add(i32::try_from(hidden_before).unwrap_or(i32::MAX))
+}
+
+/// The VBR arguments for `encoder` at `bitrate` over `channels`, or `None`
+/// when the encoder has no VBR mode here and is encoded at `-b:a`. Port of
+/// `EncodingHelper.GetAudioVbrModeParam`, thresholds verbatim, chosen by the
+/// bitrate per channel.
+#[must_use]
+pub fn audio_vbr_mode_param(encoder: &str, bitrate: i32, channels: i32) -> Option<String> {
+    let per_channel = bitrate / channels.max(1);
+    if encoder.eq_ignore_ascii_case("libfdk_aac") {
+        let mode = match per_channel {
+            ..32_000 => 1,
+            32_000..48_000 => 2,
+            48_000..64_000 => 3,
+            64_000..96_000 => 4,
+            _ => 5,
+        };
+        return Some(format!("-vbr:a {mode}"));
+    }
+    if encoder.eq_ignore_ascii_case("libmp3lame") {
+        // lame's VBR is only good for a certain bitrate range; below and
+        // above it, ABR.
+        if per_channel > 48_000 && per_channel < 122_500 {
+            let quality = match per_channel {
+                ..64_000 => 6,
+                64_000..88_000 => 4,
+                88_000..112_000 => 2,
+                _ => 0,
+            };
+            return Some(format!("-qscale:a {quality}"));
+        }
+        return Some(format!("-abr:a 1 -b:a {bitrate}"));
+    }
+    if encoder.eq_ignore_ascii_case("aac_at") {
+        // aac_at's CVBR mode.
+        return Some(format!("-aac_at_mode:a 2 -b:a {bitrate}"));
+    }
+    if encoder.eq_ignore_ascii_case("libvorbis") {
+        let quality = match per_channel {
+            ..40_000 => 0,
+            40_000..56_000 => 2,
+            56_000..80_000 => 4,
+            80_000..112_000 => 6,
+            _ => 8,
+        };
+        return Some(format!("-qscale:a {quality}"));
+    }
+    None
+}
+
 /// Whether the encoded output would embed a burnt-in subtitle. Port of
 /// `ShouldEncodeSubtitle`.
-fn should_encode_subtitle(state: &EncodingJobInfo) -> bool {
+#[must_use]
+pub fn should_encode_subtitle(state: &EncodingJobInfo) -> bool {
     state.subtitle_delivery_method == SubtitleDeliveryMethod::Encode
         || (state.base_request.always_burn_in_subtitle_when_transcoding
             && !EncodingJobInfo::is_copy_codec(state.output_video_codec.as_deref()))
@@ -1144,7 +1396,7 @@ pub fn burns_graphical_subtitle(state: &EncodingJobInfo) -> bool {
         && state
             .subtitle_stream
             .as_ref()
-            .is_some_and(|s| !is_text_subtitle_stream(s))
+            .is_some_and(|s| !s.is_text_subtitle_stream())
 }
 
 /// The software HDR→SDR tonemap filter chain, ending in 8-bit `yuv420p`.
@@ -1200,6 +1452,120 @@ pub fn video_sync_option(video_sync: &str, ffmpeg_version: Option<FfmpegVersion>
     }
 
     format!(" -vsync {video_sync}")
+}
+
+/// The GOP-only encoders that can force keyframes after all, once a forced
+/// I-frame is made an IDR frame, and the option that does it.
+const FORCED_IDR_ENCODERS: [(&str, &str); 6] = [
+    ("h264_nvenc", "-forced-idr:v:0"),
+    ("hevc_nvenc", "-forced-idr:v:0"),
+    ("av1_nvenc", "-forced-idr:v:0"),
+    ("h264_qsv", "-forced_idr:v:0"),
+    ("hevc_qsv", "-forced_idr:v:0"),
+    ("av1_qsv", "-forced_idr:v:0"),
+];
+
+/// Upstream's encoders that cannot force a keyframe, so only a pinned GOP
+/// cuts segments. Upstream's list but for `libsvtav1`, which forces keyframes
+/// (see [`hls_video_key_frame_arguments`]); [`FORCED_IDR_ENCODERS`] is checked
+/// first and takes its NVENC and QSV entries.
+const GOP_ONLY_KEYFRAME_ENCODERS: [&str; 10] = [
+    "h264_qsv",
+    "h264_nvenc",
+    "h264_amf",
+    "h264_rkmpp",
+    "hevc_qsv",
+    "hevc_nvenc",
+    "hevc_rkmpp",
+    "av1_qsv",
+    "av1_nvenc",
+    "av1_amf",
+];
+
+/// Encoders that honour `-force_key_frames` and need no pinned GOP.
+const FORCED_KEYFRAME_ENCODERS: [&str; 5] = [
+    "libx264",
+    "libx265",
+    "h264_vaapi",
+    "hevc_vaapi",
+    "av1_vaapi",
+];
+
+/// The arguments that put a keyframe at every HLS segment boundary, so the
+/// muxer cuts on `-hls_time` and segment N holds the time range the playlist
+/// says it does.
+///
+/// Port of `EncodingHelper.GetHlsVideoKeyFrameArguments`. Some encoders
+/// cannot force a keyframe, so they get a GOP of one segment instead; the
+/// rest get the forced-keyframe expression, and an unknown encoder gets both.
+/// `frame_rate` sizes the GOP in output frames; `None` pins no GOP, as
+/// upstream does without a frame rate. A zero, negative or non-finite rate (a
+/// probed `0/1`) counts as none here, where upstream would emit an all-intra
+/// `-g 0` or an unparseable `NaN`.
+///
+/// Divergence: upstream gives NVENC and QSV the GOP alone, because their
+/// forced I-frames are not IDR frames. Their `forced-idr` (NVENC) or
+/// `forced_idr` (QSV) option makes them so, and a keyframe forced on time
+/// then cuts every segment, where a GOP needs the rate ffmpeg encodes at,
+/// which ffprobe's rates misstate on VFR, doubled-`tbr` and millisecond-grid
+/// sources. NVENC is verified on real hardware; the QSV half rests on
+/// qsvenc's source (`forced_idr` marks a forced frame IDR) and has not yet
+/// been run on an Intel GPU.
+///
+/// Divergence: upstream gives `libsvtav1` the GOP alone too, which on a
+/// doubled-`tbr` source (`25 fps, 50 tbr`) spans two segments. libsvtav1
+/// honours `-force_key_frames` (ffmpeg n9.0.1 with SVT-AV1 4.2 cuts every
+/// segment on time), so it takes the unknown encoder's arm: the forced
+/// keyframes, and the GOP, which still cuts segments on an older ffmpeg
+/// whose libsvtav1 wrapper ignores a forced keyframe.
+///
+/// The expression is unquoted because the result is split on whitespace into
+/// argv, not handed to a shell. Returns the arguments **with a leading
+/// space**, or the empty string.
+#[must_use]
+pub fn hls_video_key_frame_arguments(
+    caps: &super::hw::capabilities::FfmpegCapabilities,
+    codec: &str,
+    segment_length: i32,
+    frame_rate: Option<f32>,
+) -> String {
+    let key_frame_arg = format!(" -force_key_frames:0 expr:gte(t,n_forced*{segment_length})");
+    // Forcing keyframes is not enough on its own: a scene cut can put a
+    // keyframe mid-segment and push the next forced one past the boundary.
+    let gop_arg = frame_rate
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .map_or_else(String::new, |rate| {
+            let gop = (f64::from(segment_length) * f64::from(rate)).ceil();
+            format!(" -g:v:0 {gop} -keyint_min:v:0 {gop}")
+        });
+    let is_one_of = |encoders: &[&str]| encoders.iter().any(|e| e.eq_ignore_ascii_case(codec));
+
+    let forced_idr = FORCED_IDR_ENCODERS
+        .iter()
+        .find(|(encoder, _)| encoder.eq_ignore_ascii_case(codec));
+
+    let mut args = if let Some((_, option)) = forced_idr {
+        format!(" {option} 1{key_frame_arg}")
+    } else if is_one_of(&GOP_ONLY_KEYFRAME_ENCODERS) {
+        gop_arg
+    } else if is_one_of(&FORCED_KEYFRAME_ENCODERS) {
+        if codec.eq_ignore_ascii_case("libx264") {
+            // Stops libx264's scene-cut detection from breaking the forced keyframes.
+            key_frame_arg + " -sc_threshold:v:0 0"
+        } else {
+            key_frame_arg
+        }
+    } else {
+        key_frame_arg + &gop_arg
+    };
+
+    // The AMD HEVC VA-API encoder's in-band parameter sets disagree with the
+    // extradata ffmpeg writes, which breaks decoding as `hvc1`; extracting the
+    // extradata from the in-band sets works around it.
+    if codec.eq_ignore_ascii_case("hevc_vaapi") && caps.is_vaapi_device_amd() {
+        args.push_str(" -flags:v -global_header -bsf:v extract_extradata=remove=0");
+    }
+    args
 }
 
 /// The `setparams` filter tagging input frames with their HDR colour metadata,
@@ -1388,24 +1754,127 @@ pub fn scale_filter(
 }
 
 /// Whether an external subtitle must be muxed as a second FFmpeg input. Port of
-/// `NeedsExternalSubtitleMuxing`.
-fn needs_external_subtitle_muxing(state: &EncodingJobInfo) -> bool {
+/// `NeedsExternalSubtitleMuxing`: an embedded external track, or a burned-in
+/// graphical one (a burned-in text file is read by the `subtitles` filter).
+#[must_use]
+pub fn needs_external_subtitle_muxing(state: &EncodingJobInfo) -> bool {
     state.subtitle_stream.as_ref().is_some_and(|sub| {
         sub.is_external
             && (state.subtitle_delivery_method == SubtitleDeliveryMethod::Embed
-                || (should_encode_subtitle(state) && !is_text_subtitle_stream(sub)))
+                || (should_encode_subtitle(state) && !sub.is_text_subtitle_stream()))
     })
 }
 
-/// Whether a subtitle stream is a text (rather than graphical) subtitle. Port of
-/// `MediaStream.IsTextSubtitleStream`: text subtitles have a codec ffmpeg can
-/// render to text (srt/ass/ssa/subrip/…) rather than an image (pgs/dvbsub/…).
-fn is_text_subtitle_stream(stream: &MediaStream) -> bool {
-    let codec = stream.codec.as_deref().unwrap_or_default();
-    matches!(
-        codec.to_ascii_lowercase().as_str(),
-        "ass" | "ssa" | "srt" | "subrip" | "microdvd" | "mov_text" | "text" | "webvtt" | "vtt"
-    )
+/// The first ffmpeg with the `-isync` input option, which offsets an input's
+/// timestamps onto another input's clock. Introduced in FFmpeg 5.1.
+const MIN_FFMPEG_INPUT_SYNC: FfmpegVersion = FfmpegVersion::new(5, 1);
+
+/// The inputs that follow the media file on the command line, as argv tokens:
+/// the external subtitle [`needs_external_subtitle_muxing`] names (input 1),
+/// then an external audio track (input 1, or 2 after a subtitle). Port of the
+/// tail of `GetInputArgument`, which [`EncodingHelper::map_args`] and the
+/// overlay pads count on.
+///
+/// `fast_seek` is the media file's own `-ss` value, if it seeks: every input
+/// is seeked alike, so the tracks stay in step with the video. A subtitle
+/// input reads with the media file's `-analyzeduration` and `-probesize`, and
+/// a burned-in graphical one with its canvas size. A VobSub `.sub` is read
+/// through its `.idx` when one lies beside it, since the `.idx` names the
+/// `.sub` and carries the palette and timing.
+///
+/// Divergence: each external input is also synced to the media file's clock
+/// (`-isync 0`, from ffmpeg 5.1, `ffmpeg_version`). Without `-copyts` ffmpeg
+/// starts every input's timeline at that input's own first packet, and a
+/// bitmap subtitle file's first packet is its first cue, so a `.sup` whose
+/// first subtitle is at 60 s would show it at once. Upstream's HLS copies
+/// timestamps, which keeps the files on one clock; Ferrofin restarts ffmpeg
+/// per segment without `-copyts`, so it syncs the inputs instead (which also
+/// times an embedded sidecar right, where upstream's progressive command,
+/// without `-copyts`, shifts it).
+///
+/// Second divergence, where the sync is available: a burned-in sidecar is not
+/// seeked but read from its start, and the overlay draws each bitmap at its
+/// own time and drops those already over. Seeked and synced, ffmpeg (9.0.1,
+/// measured) decodes the bitmaps but never draws them. A subtitle on screen
+/// at the seek point is then drawn too, which a seek would skip.
+///
+/// TODO(gl-929): an ffmpeg older than 5.1, or one whose version cannot be
+/// read (it counts as the oldest supported, as for every version gate), gets
+/// upstream's unsynced form, so a bitmap sidecar there is still early by its
+/// first cue's time. Fix path: offset it by its probed start time.
+/// TODO(gl-930): an embedded `.srt` seeked into a progressive stream that
+/// starts mid-file can keep a cue from before the start, whose negative
+/// timestamp the muxer answers by shifting every stream.
+#[must_use]
+pub fn external_stream_input_arguments(
+    state: &EncodingJobInfo,
+    fast_seek: Option<&str>,
+    ffmpeg_version: Option<FfmpegVersion>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    let can_sync = ffmpeg_version.is_some_and(|version| version >= MIN_FFMPEG_INPUT_SYNC);
+    let seek = |args: &mut Vec<String>| {
+        if let Some(time) = fast_seek {
+            args.extend(["-ss".to_owned(), time.to_owned()]);
+        }
+    };
+    let sync = |args: &mut Vec<String>| {
+        if can_sync {
+            args.extend(["-isync".to_owned(), "0".to_owned()]);
+        }
+    };
+    if let Some(sub) = state
+        .subtitle_stream
+        .as_ref()
+        .filter(|_| needs_external_subtitle_muxing(state))
+    {
+        // An external stream always has a path. Were one missing, the input
+        // still has to be there: the maps and pads number the inputs after
+        // it, and ffmpeg then names the empty path in its error.
+        let mut path = sub.path.clone().unwrap_or_default();
+        let as_path = std::path::Path::new(&path);
+        if as_path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sub"))
+        {
+            let idx = as_path.with_extension("idx");
+            if idx.is_file() {
+                path = idx.to_string_lossy().into_owned();
+            }
+        }
+        args.extend([
+            "-analyzeduration".to_owned(),
+            crate::encoder::media_encoder::analyze_duration_value(
+                state.media_source.analyze_duration_ms,
+                crate::encoder::media_encoder::DEFAULT_ANALYZE_DURATION,
+            ),
+            "-probesize".to_owned(),
+            crate::encoder::media_encoder::DEFAULT_PROBE_SIZE.to_owned(),
+        ]);
+        let burned_in = should_encode_subtitle(state) && !sub.is_text_subtitle_stream();
+        if !(burned_in && can_sync) {
+            seek(&mut args);
+        }
+        if burned_in {
+            args.extend(
+                super::hw::input_args::graphical_sub_canvas_size(Some(sub), true)
+                    .split_whitespace()
+                    .map(str::to_owned),
+            );
+        }
+        sync(&mut args);
+        args.extend(["-i".to_owned(), format!("file:{path}")]);
+    }
+    if let Some(audio) = state
+        .audio_stream
+        .as_ref()
+        .filter(|audio| audio.is_external)
+    {
+        seek(&mut args);
+        sync(&mut args);
+        args.extend(["-i".to_owned(), audio.path.clone().unwrap_or_default()]);
+    }
+    args
 }
 
 /// The score (ascending-quality index) of a profile for a codec. Port of
@@ -1713,6 +2182,7 @@ mod tests {
             transcoding_type: ferrofin_traits::media_encoding::TranscodingJobType::Progressive,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 0,
             wait_for_path: None,
             segment_container: None,
@@ -1722,6 +2192,44 @@ mod tests {
     }
 
     // ----- is_copy_codec -----------------------------------------------------
+
+    /// `GetAudioVbrModeParam`'s modes, at each threshold's edges, by the
+    /// bitrate per channel. An encoder without one (libopus, the native aac
+    /// encoder) has none, and is encoded at `-b:a`.
+    #[rstest]
+    #[case::fdk_lowest("libfdk_aac", 62_000, 2, Some("-vbr:a 1"))]
+    #[case::fdk_32k("libfdk_aac", 64_000, 2, Some("-vbr:a 2"))]
+    #[case::fdk_48k("libfdk_aac", 96_000, 2, Some("-vbr:a 3"))]
+    #[case::fdk_64k("libfdk_aac", 128_000, 2, Some("-vbr:a 4"))]
+    #[case::fdk_96k("libfdk_aac", 192_000, 2, Some("-vbr:a 5"))]
+    #[case::lame_abr_low("libmp3lame", 96_000, 2, Some("-abr:a 1 -b:a 96000"))]
+    #[case::lame_q6("libmp3lame", 98_000, 2, Some("-qscale:a 6"))]
+    #[case::lame_q4("libmp3lame", 128_000, 2, Some("-qscale:a 4"))]
+    #[case::lame_q2("libmp3lame", 176_000, 2, Some("-qscale:a 2"))]
+    #[case::lame_q0("libmp3lame", 224_000, 2, Some("-qscale:a 0"))]
+    #[case::lame_abr_high("libmp3lame", 245_000, 2, Some("-abr:a 1 -b:a 245000"))]
+    #[case::lame_mono("libmp3lame", 64_000, 1, Some("-qscale:a 4"))]
+    #[case::aac_at("aac_at", 128_000, 2, Some("-aac_at_mode:a 2 -b:a 128000"))]
+    #[case::vorbis_q0("libvorbis", 78_000, 2, Some("-qscale:a 0"))]
+    #[case::vorbis_q2("libvorbis", 80_000, 2, Some("-qscale:a 2"))]
+    #[case::vorbis_q4("libvorbis", 112_000, 2, Some("-qscale:a 4"))]
+    #[case::vorbis_q6("libvorbis", 160_000, 2, Some("-qscale:a 6"))]
+    #[case::vorbis_q8("libvorbis", 224_000, 2, Some("-qscale:a 8"))]
+    #[case::case_insensitive("LIBMP3LAME", 128_000, 2, Some("-qscale:a 4"))]
+    #[case::zero_channels("libfdk_aac", 128_000, 0, Some("-vbr:a 5"))]
+    #[case::opus("libopus", 128_000, 2, None)]
+    #[case::native_aac("aac", 128_000, 2, None)]
+    fn audio_vbr_mode_param_picks_the_encoders_mode(
+        #[case] encoder: &str,
+        #[case] bitrate: i32,
+        #[case] channels: i32,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(
+            audio_vbr_mode_param(encoder, bitrate, channels).as_deref(),
+            expected
+        );
+    }
 
     #[test]
     fn is_copy_codec_matches_copy_case_insensitively() {
@@ -1790,6 +2298,32 @@ mod tests {
     }
 
     #[test]
+    fn a_burned_external_text_file_is_neither_an_input_nor_an_overlay() {
+        // SAMI is text (`MediaStream.IsTextSubtitleStream`): the `subtitles`
+        // filter reads the file, so it is no second input, no graphical burn
+        // and no `[v]` map.
+        let sami = MediaStream {
+            codec: Some("sami".to_owned()),
+            index: 2,
+            stream_type: MediaStreamType::Subtitle,
+            is_external: true,
+            path: Some("/media/movie.smi".to_owned()),
+            ..MediaStream::default()
+        };
+        let mut state = job(&[
+            video_stream("h264", 0),
+            audio_stream("aac", 1),
+            sami.clone(),
+        ]);
+        state.subtitle_stream = Some(sami);
+        state.subtitle_delivery_method = SubtitleDeliveryMethod::Encode;
+        assert!(!burns_graphical_subtitle(&state));
+        assert!(!needs_external_subtitle_muxing(&state));
+        let args = state.map_args_for_test();
+        assert!(!args.contains("[v]") && !args.contains("-map 1:"), "{args}");
+    }
+
+    #[test]
     fn map_args_no_streams_video_input_drops_subtitles() {
         let mut state = job(&[]);
         state.is_input_video = true;
@@ -1802,6 +2336,112 @@ mod tests {
         // VideoStream present but index == -1 → "-sn".
         state.video_stream = Some(video_stream("h264", -1));
         assert_eq!(state.map_args_for_test(), "-sn");
+    }
+
+    // ----- bit_depth_compensated_bitrate ---------------------------------------
+
+    #[test]
+    fn bit_depth_compensation_at_low_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            3_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_mid_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(6_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(5_000_000, &stream, 8),
+            6_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_high_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(10_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(8_000_000, &stream, 8),
+            8_800_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_very_high_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(20_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(15_000_000, &stream, 8),
+            15_750_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_skipped_when_target_is_10() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 10),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_skipped_when_source_is_8bit() {
+        let stream = MediaStream {
+            bit_depth: Some(8),
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_skipped_when_no_source_bitrate() {
+        let stream = MediaStream {
+            bit_depth: Some(10),
+            bit_rate: None,
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn bit_depth_compensation_applies_when_bit_depth_unknown() {
+        let stream = MediaStream {
+            bit_depth: None,
+            bit_rate: Some(3_000_000),
+            ..MediaStream::default()
+        };
+        assert_eq!(
+            bit_depth_compensated_bitrate(2_000_000, &stream, 8),
+            3_000_000
+        );
     }
 
     // ----- video_bitrate_param (software) ------------------------------------
@@ -1867,10 +2507,11 @@ mod tests {
             stream_type: MediaStreamType::Video,
             ..MediaStream::default()
         };
-        // min(source 4M, requested 10M) = 4M; same codec, > 3M → factor 1; then
-        // capped to request 10M → 4_000_000.
+        // min(source 4M, requested 10M) = 4M; same codec, > 3M → factor 1;
+        // bit_depth is None → compensation factor 1.5 (source ≤ 4M);
+        // 4M × 1.5 = 6M, capped to request 10M → 6_000_000.
         let value = helper(vec![]).video_bitrate_param_value(&request, Some(&stream), "h264");
-        assert_eq!(value, 4_000_000);
+        assert_eq!(value, 6_000_000);
     }
 
     // ----- audio_bitrate_param -----------------------------------------------
@@ -1962,14 +2603,14 @@ mod tests {
     // ----- video_bitrate_param (QSV) -----------------------------------------
 
     #[rstest]
-    // `-mbbrc 1` keys on the ENCODER name; `factor` keys on the output CODEC
-    // name — two different strings decided in the same block. AV1 QSV takes no
-    // mbbrc.
+    // `factor` keys on the output CODEC name. `-mbbrc 1` is not part of the
+    // bitrate any more: v12.2 moved it into `GetEncoderParam` (see
+    // `video_quality_param_gives_qsv_its_preset_and_mbbrc`).
     #[case(
         "h264_qsv",
         "h264",
         None,
-        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
     )]
     // Below level 5.1 some weaker H.264 decoders need a strict CPB, so the
     // buffer optimisation is withheld — halving both derived sizes.
@@ -1977,27 +2618,27 @@ mod tests {
         "h264_qsv",
         "h264",
         Some("40"),
-        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 3000000 -bufsize 6000000"
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 3000000 -bufsize 6000000"
     )]
     // The boundary is strict: 51 itself does NOT get the tighter factor.
     #[case(
         "h264_qsv",
         "h264",
         Some("51"),
-        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
     )]
     // Parsed as a double, so the dotted spelling works too — and 4.0 < 51.
     #[case(
         "h264_qsv",
         "h264",
         Some("4.0"),
-        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 3000000 -bufsize 6000000"
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 3000000 -bufsize 6000000"
     )]
     #[case(
         "hevc_qsv",
         "hevc",
         None,
-        " -mbbrc 1 -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
+        " -b:v 3000000 -maxrate 3000001 -rc_init_occupancy 6000000 -bufsize 12000000"
     )]
     #[case(
         "av1_qsv",
@@ -2055,6 +2696,83 @@ mod tests {
         );
     }
 
+    /// A helper over the real capability probe, reporting `version` (`None`:
+    /// unprobed) — what the composition root builds.
+    fn probed_helper(
+        version: Option<(i32, i32)>,
+    ) -> EncodingHelper<crate::encoding_helper::hw::FfmpegCapabilities> {
+        let mut caps = crate::encoding_helper::hw::FfmpegCapabilities::builder();
+        if let Some((major, minor)) = version {
+            caps = caps.ffmpeg_version(crate::encoder::FfmpegVersion::new(major, minor));
+        }
+        EncodingHelper::with_processor_count(caps.build(), 8)
+    }
+
+    /// v12.2 `GetVideoQualityParam` (:2409-2413): software AV1 through
+    /// `libsvtav1` gets Jellyfin's rate-control and film-grain parameters on
+    /// ffmpeg 5.1 or newer (`_minFFmpegSvtAv1Params`). An unknown version
+    /// compares below it, as C#'s null `EncoderVersion` does.
+    #[rstest]
+    #[case::ffmpeg_7_1("libsvtav1", Some((7, 1)), true)]
+    #[case::ffmpeg_5_1("libsvtav1", Some((5, 1)), true)]
+    #[case::ffmpeg_5_0("libsvtav1", Some((5, 0)), false)]
+    #[case::unknown_version("libsvtav1", None, false)]
+    #[case::other_encoder("libx264", Some((7, 1)), false)]
+    fn video_quality_param_tunes_libsvtav1_on_ffmpeg_5_1(
+        #[case] encoder: &str,
+        #[case] version: Option<(i32, i32)>,
+        #[case] expected: bool,
+    ) {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("av1".to_owned());
+        let opts = default_encoding_options(0);
+
+        let param = probed_helper(version).video_quality_param(
+            &state,
+            encoder,
+            &opts,
+            EncoderPreset::veryfast,
+        );
+
+        assert_eq!(
+            param.contains(
+                " -svtav1-params:0 rc=1:tune=0:film-grain=0:enable-overlays=1:enable-tf=0"
+            ),
+            expected,
+            "{param}"
+        );
+    }
+
+    /// v12.2 `GetVideoQualityParam` (:2415-2421): from ffmpeg 6.0
+    /// (`_minFFmpegVaapiH26xEncA53CcSei`) the VAAPI H.264/HEVC encoders get
+    /// `-sei -a53_cc`, which clears the A/53 caption SEI that can overflow the
+    /// driver ("Access unit too large"). AV1 VAAPI and an unknown version get
+    /// nothing.
+    #[rstest]
+    #[case::h264_on_7_1("h264_vaapi", Some((7, 1)), true)]
+    #[case::hevc_on_6_0("hevc_vaapi", Some((6, 0)), true)]
+    #[case::h264_on_5_1("h264_vaapi", Some((5, 1)), false)]
+    #[case::unknown_version("h264_vaapi", None, false)]
+    #[case::av1("av1_vaapi", Some((7, 1)), false)]
+    fn video_quality_param_clears_vaapi_caption_sei_on_ffmpeg_6(
+        #[case] encoder: &str,
+        #[case] version: Option<(i32, i32)>,
+        #[case] expected: bool,
+    ) {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("h264".to_owned());
+        let opts = default_encoding_options(0);
+
+        let param = probed_helper(version).video_quality_param(
+            &state,
+            encoder,
+            &opts,
+            EncoderPreset::veryfast,
+        );
+
+        assert_eq!(param.contains(" -sei -a53_cc"), expected, "{param}");
+    }
+
     // ----- video_quality_param (NVENC) ---------------------------------------
 
     // Transliterated from the C# `GetEncoderParam` nvenc switch (10.11.z
@@ -2087,6 +2805,103 @@ mod tests {
             assert!(param.contains(expected), "{encoder}: {param}");
             // No `-crf`: that is a libx264/libx265 argument and NVENC rejects it.
             assert!(!param.contains("-crf"), "{encoder}: {param}");
+        }
+    }
+
+    /// v12.2 `GetEncoderParam` (PR 18261): HEVC and AV1 NVENC encodes get
+    /// spatial adaptive quantisation after the preset. H.264 is left out
+    /// because Maxwell 1 does not support it.
+    #[rstest]
+    #[case::h264("h264_nvenc", false)]
+    #[case::hevc("hevc_nvenc", true)]
+    #[case::av1("av1_nvenc", true)]
+    fn video_quality_param_gives_hevc_and_av1_nvenc_spatial_aq(
+        #[case] encoder: &str,
+        #[case] spatial_aq: bool,
+    ) {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("hevc".to_owned());
+        let opts = default_encoding_options(0);
+
+        let param =
+            helper(vec![]).video_quality_param(&state, encoder, &opts, EncoderPreset::veryfast);
+
+        assert_eq!(
+            param.contains(" -preset p1 -spatial-aq 1 -aq-strength 15"),
+            spatial_aq,
+            "{param}"
+        );
+    }
+
+    /// v12.2 `GetEncoderParam`'s QSV arm: `-preset` with the configured preset
+    /// when it is one of veryslow…veryfast and `veryfast` otherwise (`auto`
+    /// and the three fastest included), then `-mbbrc 1` for H.264/HEVC, moved
+    /// here from `GetVideoBitrateParam` by PR 18261.
+    #[rstest]
+    #[case::auto_h264("h264_qsv", EncoderPreset::auto, " -preset veryfast -mbbrc 1 -b:v")]
+    #[case::slow_hevc("hevc_qsv", EncoderPreset::slow, " -preset slow -mbbrc 1 -b:v")]
+    #[case::ultrafast_h264(
+        "h264_qsv",
+        EncoderPreset::ultrafast,
+        " -preset veryfast -mbbrc 1 -b:v"
+    )]
+    #[case::placebo_hevc("hevc_qsv", EncoderPreset::placebo, " -preset veryfast -mbbrc 1 -b:v")]
+    #[case::medium_av1("av1_qsv", EncoderPreset::medium, " -preset medium -b:v")]
+    fn video_quality_param_gives_qsv_its_preset_and_mbbrc(
+        #[case] encoder: &str,
+        #[case] preset: EncoderPreset,
+        #[case] expected: &str,
+    ) {
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("h264".to_owned());
+        state.output_video_bitrate = Some(3_000_000);
+        let mut opts = default_encoding_options(0);
+        opts.encoder_preset = preset;
+
+        let param =
+            helper(vec![]).video_quality_param(&state, encoder, &opts, EncoderPreset::veryfast);
+
+        assert!(param.contains(expected), "{param}");
+        assert_eq!(
+            param.matches("-mbbrc").count(),
+            usize::from(encoder != "av1_qsv"),
+            "{param}"
+        );
+    }
+
+    /// v12.2 `GetEncoderParam`'s VAAPI arm: an explicit preset becomes
+    /// `-compression_level 1..7` on an Intel iHD device only ("-compression_level
+    /// is not reliable on AMD"); `auto` gets nothing.
+    #[rstest]
+    #[case::ihd_slow(true, EncoderPreset::slow, Some(" -compression_level 3"))]
+    #[case::ihd_veryslow(true, EncoderPreset::veryslow, Some(" -compression_level 1"))]
+    #[case::ihd_ultrafast(true, EncoderPreset::ultrafast, Some(" -compression_level 7"))]
+    #[case::ihd_auto(true, EncoderPreset::auto, None)]
+    #[case::amd_slow(false, EncoderPreset::slow, None)]
+    fn video_quality_param_maps_the_preset_to_compression_level_on_intel_vaapi(
+        #[case] intel_ihd: bool,
+        #[case] preset: EncoderPreset,
+        #[case] expected: Option<&str>,
+    ) {
+        let caps = crate::encoding_helper::hw::FfmpegCapabilities::builder()
+            .vaapi_driver(!intel_ihd, intel_ihd, false)
+            .build();
+        let mut state = job(&[video_stream("h264", 0)]);
+        state.output_video_codec = Some("h264".to_owned());
+        let mut opts = default_encoding_options(0);
+        opts.encoder_preset = preset;
+
+        for encoder in ["h264_vaapi", "hevc_vaapi", "av1_vaapi"] {
+            let param = EncodingHelper::with_processor_count(caps.clone(), 8).video_quality_param(
+                &state,
+                encoder,
+                &opts,
+                EncoderPreset::veryfast,
+            );
+            match expected {
+                Some(level) => assert!(param.contains(level), "{encoder}: {param}"),
+                None => assert!(!param.contains("-compression_level"), "{encoder}: {param}"),
+            }
         }
     }
 
@@ -2400,7 +3215,9 @@ mod tests {
             codec: Some("av1".to_owned()),
             index: 0,
             stream_type: MediaStreamType::Video,
+            color_space: Some("bt2020nc".to_owned()),
             color_transfer: Some("smpte2084".to_owned()),
+            color_primaries: Some("bt2020".to_owned()),
             dv_profile: Some(8),
             dv_bl_signal_compatibility_id: Some(1),
             rpu_present_flag: Some(1),
@@ -2745,6 +3562,105 @@ mod tests {
         assert_eq!(video_sync_option("9", v(4, 4)), " -vsync 9");
     }
 
+    const FORCED_3S: &str = " -force_key_frames:0 expr:gte(t,n_forced*3)";
+
+    #[rstest]
+    // NVENC and QSV force their keyframes as IDR frames, whatever the rate.
+    #[case(
+        "h264_qsv",
+        Some(23.976),
+        false,
+        " -forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "HEVC_QSV",
+        None,
+        false,
+        " -forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "av1_qsv",
+        Some(25.0),
+        false,
+        " -forced_idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "h264_nvenc",
+        Some(25.0),
+        false,
+        " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "hevc_nvenc",
+        Some(25.0),
+        false,
+        " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    #[case(
+        "av1_nvenc",
+        None,
+        false,
+        " -forced-idr:v:0 1 -force_key_frames:0 expr:gte(t,n_forced*3)"
+    )]
+    // Unable to force keyframes: the GOP alone, ceil(3 × 30) = 90.
+    #[case("h264_amf", Some(30.0), false, " -g:v:0 90 -keyint_min:v:0 90")]
+    // No frame rate, no GOP: nothing at all for these encoders.
+    #[case("h264_amf", None, false, "")]
+    // Nor from a rate that is no rate: never `-g:v:0 0` or `NaN`.
+    #[case("h264_amf", Some(0.0), false, "")]
+    #[case("h264_amf", Some(f32::NAN), false, "")]
+    // libsvtav1 forces keyframes, which cut on time whatever the rate, and
+    // keeps upstream's GOP, ceil(3 × 23.976) = 72, for a build that ignores them.
+    #[case(
+        "libsvtav1",
+        Some(23.976),
+        false,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -g:v:0 72 -keyint_min:v:0 72"
+    )]
+    #[case("libsvtav1", None, false, FORCED_3S)]
+    #[case("libsvtav1", Some(0.0), false, FORCED_3S)]
+    #[case("mpeg4", Some(f32::INFINITY), false, FORCED_3S)]
+    // Forced keyframes, and libx264 also loses its scene-cut detection.
+    #[case(
+        "libx264",
+        Some(25.0),
+        false,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -sc_threshold:v:0 0"
+    )]
+    #[case("libx265", Some(25.0), false, FORCED_3S)]
+    #[case("h264_vaapi", Some(25.0), true, FORCED_3S)]
+    #[case("hevc_vaapi", Some(25.0), false, FORCED_3S)]
+    // The AMD HEVC VA-API parameter-set workaround.
+    #[case(
+        "hevc_vaapi",
+        Some(25.0),
+        true,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -flags:v -global_header -bsf:v extract_extradata=remove=0"
+    )]
+    // Any other encoder gets both.
+    #[case(
+        "mpeg4",
+        Some(25.0),
+        false,
+        " -force_key_frames:0 expr:gte(t,n_forced*3) -g:v:0 75 -keyint_min:v:0 75"
+    )]
+    #[case("mpeg4", None, false, FORCED_3S)]
+    fn hls_keyframe_arguments_follow_the_encoder(
+        #[case] codec: &str,
+        #[case] frame_rate: Option<f32>,
+        #[case] amd: bool,
+        #[case] expected: &str,
+    ) {
+        // Not AMD means an Intel iHD device, the other common VA-API driver.
+        let caps = super::super::hw::capabilities::FfmpegCapabilities::builder()
+            .vaapi_driver(amd, !amd, false)
+            .build();
+        assert_eq!(
+            hls_video_key_frame_arguments(&caps, codec, 3, frame_rate),
+            expected
+        );
+    }
+
     fn codecs(list: &str) -> Vec<String> {
         list.split(',').map(str::to_owned).collect()
     }
@@ -2808,6 +3724,95 @@ mod tests {
         assert_eq!(
             helper(vec![available]).can_encode_to_audio_codec(codec),
             expected
+        );
+    }
+
+    #[rstest]
+    #[case("ogg", "opus")]
+    #[case("webm", "opus")]
+    #[case("mp4", "aac")]
+    #[case("mkv", "aac")]
+    #[case("ts", "mp3")]
+    #[case("flac", "flac")]
+    #[case("ac3", "ac3")]
+    #[case("aac", "aac")]
+    #[case("m3u8", "aac")]
+    #[case("mpd", "aac")]
+    #[case("hls", "aac")]
+    #[case("wtv", "aac")]
+    #[case("", "aac")]
+    fn infer_audio_codec_maps_containers(#[case] container: &str, #[case] expected: &str) {
+        assert_eq!(infer_audio_codec(container), expected);
+    }
+
+    fn subtitle(codec: Option<&str>) -> MediaStream {
+        MediaStream {
+            codec: codec.map(str::to_owned),
+            index: 2,
+            stream_type: MediaStreamType::Subtitle,
+            ..MediaStream::default()
+        }
+    }
+
+    /// `NormalizeSubtitleEmbed`: only an `Embed` of a `DVBSUB` stream (any
+    /// case) turns into `Encode`.
+    #[rstest]
+    #[case(
+        Some("DVBSUB"),
+        SubtitleDeliveryMethod::Embed,
+        SubtitleDeliveryMethod::Encode
+    )]
+    #[case(
+        Some("dvbsub"),
+        SubtitleDeliveryMethod::Embed,
+        SubtitleDeliveryMethod::Encode
+    )]
+    #[case(
+        Some("DVBSUB"),
+        SubtitleDeliveryMethod::External,
+        SubtitleDeliveryMethod::External
+    )]
+    #[case(
+        Some("PGSSUB"),
+        SubtitleDeliveryMethod::Embed,
+        SubtitleDeliveryMethod::Embed
+    )]
+    #[case(None, SubtitleDeliveryMethod::Embed, SubtitleDeliveryMethod::Embed)]
+    fn normalize_subtitle_embed_burns_in_only_dvb(
+        #[case] codec: Option<&str>,
+        #[case] method: SubtitleDeliveryMethod,
+        #[case] expected: SubtitleDeliveryMethod,
+    ) {
+        let stream = subtitle(codec);
+        assert_eq!(normalize_subtitle_embed(Some(&stream), method), expected);
+        assert_eq!(normalize_subtitle_embed(None, method), method);
+    }
+
+    /// `GetSubtitleEmbedArguments` is empty unless an `Embed` subtitle is
+    /// selected; a stream without a codec takes the first requested one.
+    #[test]
+    fn subtitle_embed_arguments_need_an_embedded_stream() {
+        let mut state = job(&[]);
+        state.subtitle_delivery_method = SubtitleDeliveryMethod::Embed;
+        assert_eq!(subtitle_embed_arguments(&state), "");
+        state.subtitle_stream = Some(subtitle(None));
+        state.subtitle_delivery_method = SubtitleDeliveryMethod::Encode;
+        assert_eq!(subtitle_embed_arguments(&state), "");
+        state.subtitle_delivery_method = SubtitleDeliveryMethod::Embed;
+        assert_eq!(
+            subtitle_embed_arguments(&state),
+            " -codec:s:0 copy -disposition:s:0 default"
+        );
+        state.supported_subtitle_codecs = vec!["ass".to_owned()];
+        assert_eq!(
+            subtitle_embed_arguments(&state),
+            " -codec:s:0 ass -disposition:s:0 default"
+        );
+        // A name the routes would have refused never reaches the command line.
+        state.supported_subtitle_codecs = vec!["ass -f null /tmp/x".to_owned()];
+        assert_eq!(
+            subtitle_embed_arguments(&state),
+            " -codec:s:0 copy -disposition:s:0 default"
         );
     }
 }

@@ -58,7 +58,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-util` | leaf string/path/collection helpers |
 | `ferrofin-model` | all DTOs + enums (serde + utoipa) — the shared data universe; also the DLNA profile/StreamBuilder logic |
 | `ferrofin-naming` | filename → media parsing |
-| `ferrofin-keyframes` | keyframe extraction structures |
+| `ferrofin-keyframes` | keyframe extraction: the ffprobe output parser and the Matroska cue reader |
 | `ferrofin-chromaprint` | audio fingerprinting (chromaprint) for the intro-skipper extension |
 | `ferrofin-common` | config, app-paths, **password hashing** (real PBKDF2-HMAC-SHA512/SHA1, byte-compatible with Jellyfin) |
 | `ferrofin-networking` | bind / published-URL resolution |
@@ -70,7 +70,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
 | `ferrofin-drawing` | image resize/crop/format (via the `image` crate) |
 | `ferrofin-providers` | metadata providers (local NFO + images always on; remote TMDB/TVDB/MusicBrainz/AudioDb/fanart/Studio Images always compiled, gated per library; OMDb uses a built-in key) |
-| `ferrofin-livetv` | Live TV — M3U tuners + XMLTV guide, DB-backed DVR timers/recordings |
+| `ferrofin-livetv` | Live TV — M3U/HDHomeRun tuners + XMLTV/Schedules Direct guides, DB-backed DVR timers/recordings |
 | `ferrofin-extensions` | compiled-in extensions behind an `Extension` trait (Tier 1a — see `docs/EXTENSIONS.md`) |
 | `ferrofin-wasm` | the Tier-1b WASM plugin host: sandboxed `ferrofin:plugin` components from `{data_dir}/plugins/` (wasmtime; WIT contract in `crates/ferrofin-wasm/wit/`) |
 | `ferrofin-core` | the concrete manager implementations — the workhorse |
@@ -135,7 +135,7 @@ The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whos
 Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 12.0 database** (`0032` converges the
 10.11.8 shape the chain carried through `0029`; the gate adopts the exact
 `__EFMigrationsHistory` sets for 10.11.8–10.11.11, 12.0.0, 12.1.0 and 12.2.0, including both
-12.1 and both 12.2 upgrade routes in the [support matrix](adoption/README.md#supported-and-tested-versions)) — that is
+12.1 and both 12.2 upgrade routes in the [support matrix](gates/adoption/README.md#supported-and-tested-versions)) — that is
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
 migrates in place). Ferrofin-own tables/indexes live in a collision-proof
 `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the pin.
@@ -144,9 +144,14 @@ migrates in place). Ferrofin-own tables/indexes live in a collision-proof
 Jellyfin-owned tables (0007, 0032) and normalises stored values (GUID casing, presentation keys),
 so a database Ferrofin has migrated is not guaranteed to open under Jellyfin again. The
 adoption path copies the original to `jellyfin.db.pre-ferrofin` before touching it and logs
-the path; the table-rebuilding migrations (`0007`, `0032`) each snapshot the file to
-`jellyfin.db.pre-00NN` first, and every file-backed boot runs `PRAGMA foreign_key_check`; returning to Jellyfin means restoring that backup. Never describe the swap as
-two-way or round-trip in user-facing text. (Suite v3 exercises adoption — every server
+the path; the table-rebuilding migrations (`0007`, `0032`) and the dangling-row cleanup
+(`0044`) each snapshot the file to `jellyfin.db.pre-00NN` first, and every file-backed boot
+runs `PRAGMA foreign_key_check`; returning to Jellyfin means restoring
+`jellyfin.db.pre-ferrofin`, the only copy older than every change Ferrofin made. Any other
+migrating boot also snapshots the file, to a `.pre-NNNN` it deletes once it has passed (as
+Jellyfin does) and only warns about when it cannot write it. Every snapshot is written to
+`.partial` and renamed whole, and an existing one is kept, never replaced. Never describe the
+swap as two-way or round-trip in user-facing text. (Suite v3 exercises adoption — every server
 boots a disposable copy of a Jellyfin-scanned database and Ferrofin migrates it in place —
 but nothing checks that Jellyfin still opens the result, and nothing is expected to.)
 
@@ -168,7 +173,12 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
 - **Match the surrounding code.** New HTTP crates mirror the existing `ferrofin-api` shape
   (`create_router`, `AppState`, `error.rs` with `IntoResponse`, a `utoipa` `ApiDoc`).
 - **Port faithfully.** When implementing behavior that mirrors Jellyfin, port it faithfully
-  from the upstream C# (github.com/jellyfin/jellyfin) — including regex tables copied verbatim.
+  from the upstream C# (github.com/jellyfin/jellyfin) at `UPSTREAM_TAG` — including regex tables
+  copied verbatim. That tag is the **latest Jellyfin release when a release branch is cut**
+  (owner decisions 2026-10-16 and 2026-10-25), never a release candidate. The release branch
+  keeps it until its release, and the next release branch moves to the newest release. If
+  `git ls-remote --tags https://github.com/jellyfin/jellyfin` shows a newer release, say so: the
+  next release branch moves to it (see `UPSTREAM_TAG` in `handlers/mod.rs`).
   Where Jellyfin ships xUnit tests, transliterate the `[Theory]/[InlineData]` cases directly
   into `rstest` `#[case]` tests: the C# expected values are the oracle.
 - **Metrics** (`/metrics`, `ferrofin-metrics`): all metric work follows
@@ -192,7 +202,8 @@ cargo build --workspace
 
 # Run the server. Config via flags, FERROFIN_* env, or {data_dir}/config.toml.
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
-#   On a fresh database it seeds an admin user and logs a generated password — record it.
+#   On a fresh database it seeds a passwordless admin user (the /web wizard sets the
+#   password; FERROFIN_ADMIN_PASSWORD seeds one).
 #   ffmpeg/ffprobe are auto-discovered ($PATH or --ffmpeg); absent ffmpeg only disables transcode.
 ```
 
@@ -211,6 +222,9 @@ request via `Authorization: MediaBrowser Token="…", Client="…", Device="…"
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo nextest run --workspace          # + `cargo test --workspace --doc` for doctests
+cargo deny --locked check              # advisories, licenses, bans, sources (deny.toml)
+cargo machete apps crates              # declared but unused dependencies
+scripts/check-workspace-deps.py        # every dependency through [workspace.dependencies]
 ```
 
 **Coverage gate — ≥80% line coverage, enforced per-crate:**
@@ -236,7 +250,25 @@ integration tests are gated behind an env var and skip if ffmpeg is absent:
 ```bash
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-mediaencoding --test segment_transcode_ffmpeg
 FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-hls          --test hls_stream_manager_ffmpeg
+FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test no_repeat_extraction_ffmpeg
+FERROFIN_FFMPEG_TESTS=1 cargo test -p ferrofin-server       --test subtitle_streams_ffmpeg
 ```
+
+`no_repeat_extraction_ffmpeg` checks that chapter images, trickplay and Intro Skipper
+analysis are never redone for an unchanged file: library scans, the three scheduled tasks,
+every choice of jellyfin-web's refresh dialog but "replace trickplay images" (a deliberate
+redo) on a library, a series and an episode, and a restart, with extraction both during the
+scan and by the tasks. Intro Skipper's automatic timer is off there (its scheduled task
+drives the same engine).
+
+`subtitle_streams_ffmpeg` writes a PGS subtitle (ffmpeg has no PGS encoder) and checks it
+embedded from the movie and from a `.sup` sidecar and burned into a seeked HLS segment, at
+the right time; and it burns an ASS track in with the fonts its file ships, which must be
+extracted into the cache whatever their `filename` tags say.
+
+Both of these need an ffmpeg with libx264, and `subtitle_streams_ffmpeg` also needs ffmpeg
+5.1 or later. CI does not run them (CI never sets `FERROFIN_FFMPEG_TESTS`): run them by hand
+for changes to those paths.
 
 Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
@@ -247,38 +279,77 @@ runs it:
 FERROFIN_WASM_GUEST_TESTS=1 cargo test -p ferrofin-wasm --test wasm_hello_guest
 ```
 
-### Perf changes still need evidence — the v3 benchmark is in `bench/`
+### Performance is measured per release, not per PR — the v3 benchmark is in `gates/bench/`
 **Suite v3 exists and is the tool to use** (v2, formerly `suite/`, was scrapped by owner
 decision on 2026-09-02 for policing itself instead of answering questions; do not
 resurrect it from git history). v3 answers four questions and nothing else:
-latency (screens and endpoints), time to first screen, memory, and API parity. Read
-[`bench/README.md`](bench/README.md) first — it defines every number in one sentence.
+latency (screens and endpoints), time to first screen, memory, and response shape vs
+Jellyfin. Read [`gates/bench/README.md`](gates/bench/README.md) first — it defines every number in one
+sentence.
 
 ```bash
-# needs docker, k6, jq, taskset, curl, python3 — plus ffmpeg (libx264 + libx265),
-# ffprobe and Python Pillow to build the test data
-docker pull jellyfin/jellyfin:10.11.8 && docker pull jellyfin/jellyfin:12.0-rc7 && docker pull jellyfin/jellyfin:12.2
-bench/testdata/build.sh                          # once: ~20 min, ~17 GB (gitignored)
+# needs docker, k6, jq, taskset, curl, python3, sha256sum, timeout, setsid; ffprobe for TTFS
+# plus ffmpeg (libx264 + libx265) and Python Pillow to build the test data
+export FERROFIN_GATES_DIR=/srv/gates           # output root: absolute, local disk, outside the repo (gates/lib.sh)
+docker pull jellyfin/jellyfin:10.11.8
+docker pull "$(cat gates/bench/testdata/jellyfin-image.txt)"
+gates/bench/testdata/build.sh                          # source fixture, once: ~20 min, ~17 GB → $FERROFIN_GATES_DIR/fixtures/
+gates/bench/testdata/build.sh --export-pools             # existing fixtures only; fresh builds already include pools
+gates/bench/testdata/build.sh --prepare-jellyfin         # upgrade a copy, scan and verify, once
 docker build -t ferrofin:bench .                 # the commit under test — REBUILD IT
-bench/run.sh                                     # ~40 min → bench/runs/<tag>/report.md
-python3 bench/report.py --serve                  # compare runs at 127.0.0.1:8097
+gates/bench/run.sh                                     # ~40 min → $FERROFIN_GATES_DIR/runs/bench-<tag>/report.md
+python3 gates/bench/report.py --serve                  # compare runs at 127.0.0.1:8097
 ```
+
+`gates/run all` runs verify, adoption, parity and bench against one image as one session, after one
+preflight, and ends with one report, the session's `index.html` ([`gates/README.md`](gates/README.md));
+each gate's own script still runs alone. `make run-gates` (or `make run-<gate>`) does the same, and
+`make test-gates-offline` runs the gates' own tests (no docker), as CI does.
 
 Things that will otherwise cost you a run: the harness only ever *inspects* the
 `ferrofin:bench` image, so a stale image silently measures old code under a run name that
 claims the current commit. `run.sh` refuses to start unless the server/client cores are
-90 % idle. A rerun of the same code lands in `<tag>-run2`, never on top of the first.
-Publishable numbers come from **three** runs — `report.py` takes the median and prints the
-range each cell spanned.
+90 % idle including their SMT siblings, and rejects shared physical cores. A rerun of the same code lands in `bench-<tag>-run2`, never on top of the first.
+Publishable numbers (the Jellyfin comparison) come from **three** runs — `report.py` takes
+the median and prints the range each cell spanned.
 
-`bench/` is NOT a CI gate and is not meant to become one; it is a measuring instrument you
-run deliberately — `bench/run.sh --servers ferrofin --only loaded` on two builds is the
-cheap form for a before/after, skipping both Jellyfins. So the standing rule is unchanged: body-diff correctness is not a
-latency signal — a 100× slowdown can land "green." Any change touching `ferrofin-core`,
-`ferrofin-db`, `ferrofin-api`, or the query/repository/DTO paths (`translate_query`,
-`item_repository`, `dto_service`) must come with a measured before/after stated in the
-summary — from `bench/` where the change is on a benchmarked path, else hyperfine/curl
-against a locally run server on the same data.
+`gates/bench/` is NOT a CI gate and is not meant to become one; it is a measuring instrument you
+run deliberately. **Measurement gates releases, not PRs** (owner decision 2026-10-16), which
+keeps day-to-day work fast:
+- No PR needs a `gates/bench/` or hyperfine before/after. That includes issue fixes, features,
+  `perf:` changes and query-plan changes. A plan change still needs its `EXPLAIN QUERY PLAN`
+  pin test (below).
+- Every app release is measured before it is tagged, on the branch it is cut from:
+  - feature releases come from the current `release/vX.Y.Z`. Only one exists at a time; it
+    moves until it is frozen for the release;
+  - patch releases of the released line come from `main`.
+
+  `RELEASE.md` has the procedure: the interleaved A/B gate
+  (`gates/bench/gate.py ab <previous release image> <candidate>`), Ferrofin only, three pairs.
+  The three-server runs against Jellyfin produce the published tables and never decide a
+  release.
+- A gated cell that regresses past both of its `gates/bench/gate.toml` thresholds in at least 2 of
+  the 3 pairs blocks the release until it is fixed or the owner accepts it. So does a gated
+  cell that cannot be judged because the candidate's responses differ from the previous
+  release's.
+- When chasing a regression, `gates/bench/run.sh --servers ferrofin --only loaded` on two builds is
+  the cheap form, skipping Jellyfin.
+
+The fast stdlib reporter correctness tests (`gates/bench/test_report.py`) do run in CI and gate
+releases; they start no servers and impose no performance thresholds. The benchmark
+reference is the Jellyfin release named by `UPSTREAM_TAG` (below), pinned by digest in
+`gates/bench/testdata/jellyfin-image.txt`. A release is measured against the Jellyfin release its
+branch pins: when a newer one is out, `gates/bench/oracle.py` notes it and every run records the
+note with the oracle; no run refuses it, a release gate's included. Only a pin it cannot read is refused.
+
+Parity in the project's sense, implementation compared against the upstream C# and recorded
+in `handlers::VERIFIED`, is still done per change. Only measurement moved.
+
+The reason for the release gate is unchanged: body-diff correctness is not a latency signal,
+and a 100× slowdown can land "green." So a PR touching `ferrofin-core`, `ferrofin-db`,
+`ferrofin-api`, or the query/repository/DTO paths (`translate_query`, `item_repository`,
+`dto_service`) notes that in its description, and the release run is read against those
+notes.
 
 **Never accept an index or a plan change from an isolated statement measurement** — a
 statement that gets faster alone routinely drags a hotter query onto the wrong index. Prefer
@@ -289,16 +360,25 @@ pin a chosen plan; `crates/ferrofin-core/tests/next_up_query_plan.rs` pins the o
 a query stays *off* a `CROSS JOIN`. `ANALYZE` is deliberately unused and `sqlite_stat1`
 never exists.
 
-### Adoption has its own live check — `adoption/`
-`adoption/run.sh --fixtures DIR --image ferrofin:bench` covers real 10.11.8, 10.11.9,
+### Adoption has its own live check — `gates/adoption/`
+`gates/adoption/run.sh --image ferrofin:bench` (fixtures and work directory from `FERROFIN_GATES_DIR`, or
+`--fixtures DIR`) covers 10.11.8, 10.11.9,
 10.11.10, 10.11.11, 12.0.0, 12.1.0 and 12.2.0 databases, with separate 12.1 and 12.2
-fixtures upgraded from 10.11.8 and from 12.0.0.  Supply fixtures and build them once with
-`adoption/build-fixtures.sh`; they are never committed.  On fresh copies it checks
+fixtures upgraded from 10.11.8 and from 12.0.0.  Every fixture is **synthetic**: build them
+once with `gates/adoption/build-fixtures.sh` (invented media; the official Jellyfin images seed and upgrade
+each database themselves); they are never committed.  Never point the suite at a real
+library or a network share — the scripts refuse a DIR on a network filesystem, because every
+fixture is booted and scanned repeatedly.  A build that fails part-way is never retried
+(seeding is not idempotent): build into a new DIR (`--fixtures`), or move the half-built
+one aside.  On fresh copies it checks
 generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
-repair-free second boot.  The [test record](adoption/README.md#supported-and-tested-versions)
+repair-free second boot.  The [test record](gates/adoption/README.md#supported-and-tested-versions)
 identifies which versions passed and the image used.  Run it for any change to the migration
-chain, the adoption gate or the boot repairs.  The shell tests in CI exercise the harness
-without these live fixtures.
+chain, the adoption gate or the boot repairs, because those risk user data. This per-change
+requirement is unaffected by the release-branch rule above. The full adoption validation
+(`gates/adoption/run.sh` and the synthetic preservation matrix) also runs before every release,
+and a failure there blocks the release (see `RELEASE.md`).
+The shell tests in CI exercise the harness without these live fixtures.
 
 ### Green tests are necessary, not sufficient
 Several real bugs in this codebase passed their unit/integration tests and were caught only
@@ -315,10 +395,12 @@ the substance of what a handler actually does — don't rely on a green checkmar
 (Parity is tracked by `handlers::VERIFIED` beside `REAL_ROUTES`, validated and printed by
 `crates/ferrofin-api/tests/contract_superset.rs` against the vendored **10.11.8** contract —
 which is a different pin from the C# release named below, deliberately. The contract is the
-API real clients speak, and 12.0-rc7's own surface is smaller (364 operations to 10.11.8's 412 — it drops the
+API real clients speak, and Jellyfin 12's own surface is smaller (12.0-rc7 and 12.1.0: 364 operations to 10.11.8's 412 — it drops the
 DynamicHls family, `/MusicGenres`, `/CriticReviews` and more), so satisfying it would break
 clients. See `contracts/README.md`. The Jellyfin C# release each `VERIFIED` row was compared
-*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.0-rc7`.
+*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.2`, the release
+this branch pins; rows compared against an earlier pin are listed in
+`VERIFIED_AGAINST_EARLIER_PIN` until they are re-checked.
 Owner's standing definition: **"deep verified" means the
 Ferrofin implementation was compared against the upstream Jellyfin C# for behavioral
 equivalence** — runtime probes are supporting evidence, never a substitute, and a metric
@@ -354,6 +436,17 @@ The real remaining gaps are **by design**, not un-ported routes:
   `github.com/mangoleaf/ferrofin-plugin-template`, never from the example.
 - **DLNA server discovery (SSDP)** — Ferrofin has the profile/StreamBuilder logic but no
   SSDP broadcast/discovery.
+- **No artwork is written into a media library without the library's opt-in** — an owner
+  decision (2026-10-17). Upstream's `IsSaveLocalMetadataEnabled()` overrides (Genre,
+  MusicGenre, Playlist, Person, Studio, Year, BoxSet, …) save artwork "beside the item"
+  whatever the library says. Ferrofin ports them (Genre, MusicGenre, Playlist, Person,
+  Studio, Year, BoxSet, a by-name MusicArtist and a library's CollectionFolder; not yet
+  UserView) only while the item's own path is in its data or metadata directory or the
+  libraries' root folder (a genre's `{metadata}/Genre/<name>`, a playlist in
+  `{data}/playlists`, a library's `root/default/<name>`). An item inside a media library
+  (an `.m3u` playlist file, a playlist or box-set folder) follows the library's "Save artwork
+  into media folders" (`SaveLocalMetadata`), so with it off the media folders stay
+  untouched and need no write permission.
 - **Hardware transcoding is NVENC, VAAPI and QSV only.** AMF (AMD on Windows),
   VideoToolbox (macOS), RKMPP (Rockchip) and V4L2M2M are **not supported** — an owner
   decision (2026-08-26), not an un-ported route: their filter chains cannot be verified

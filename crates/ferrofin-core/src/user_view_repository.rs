@@ -25,10 +25,7 @@
 //! - the C# `Path.GetFileName` splits on the platform separator only; a
 //!   database adopted from a Windows Jellyfin stores `…\views\livetv`, so the
 //!   last folder is taken after **either** separator, the stance every other
-//!   view-path match in this crate takes;
-//! - `Guid.TryParse` also accepts the `(…)` and `{0x…}` forms that
-//!   [`Uuid::parse_str`] does not; such a token is kept verbatim, which is
-//!   exactly what the C# does with a token it cannot parse.
+//!   view-path match in this crate takes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -179,7 +176,7 @@ async fn typed_views(
 /// serializes the enum by name (`JsonStringEnumConverter`); the numeric form
 /// is accepted too, mapped over the public discriminants, so a blob written
 /// by a converter-less serializer still classifies.
-fn view_type_of(data: Option<&str>) -> Option<String> {
+pub(crate) fn view_type_of(data: Option<&str>) -> Option<String> {
     /// `Jellyfin.Data.Enums.CollectionType`, discriminants 0–12 in order.
     const PUBLIC_NAMES: [&str; 13] = [
         "unknown",
@@ -586,7 +583,7 @@ pub fn rewrite_view_preference(value: &str, stale: &[Uuid], canonical: Uuid) -> 
         }
         // Clients write these in both the dashed and the plain form, so
         // compare them parsed.
-        let Ok(mut parsed) = Uuid::parse_str(token) else {
+        let Some(mut parsed) = ferrofin_util::guid_extensions::parse_dotnet_guid(token) else {
             rewritten.push(token.to_owned());
             continue;
         };
@@ -1209,6 +1206,11 @@ mod tests {
         " junk , 0000000000000000000000000000000A ,, AAAAAAAA-0000-0000-0000-000000000001 ",
         Some("junk,ffffffffffffffffffffffffffffffff,AAAAAAAA-0000-0000-0000-000000000001")
     )]
+    #[case::parenthesized_is_a_guid(
+        "(00000000-0000-0000-0000-00000000000a)",
+        Some("ffffffff-ffff-ffff-ffff-ffffffffffff")
+    )]
+    #[case::urn_is_not_a_guid("urn:uuid:00000000-0000-0000-0000-00000000000a", None)]
     fn preference_values_are_rewritten_like_move_user_settings(
         #[case] value: &str,
         #[case] expected: Option<&str>,

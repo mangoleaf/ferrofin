@@ -46,16 +46,20 @@ use ferrofin_traits::library::{LibraryManager, MediaSourceManager};
 use ferrofin_traits::media_encoding::SubtitleEncoder;
 use ferrofin_traits::options::{DeleteOptions, InternalItemsQuery, InternalPeopleQuery};
 use ferrofin_traits::persistence::ItemWithCounts;
-use ferrofin_traits::subtitles::{SubtitleManager, SubtitleResponse, SubtitleSearchRequest};
+use ferrofin_traits::subtitles::{
+    ProviderLogin, SubtitleManager, SubtitleResponse, SubtitleSearchRequest,
+};
 use ferrofin_traits::system::ServerApplicationPaths;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const ITEM_ID: Uuid = Uuid::from_u128(0x00B5_0001);
+/// A non-video item: the subtitle routes upstream binds to `Video` 404 on it.
+const SERIES_ID: Uuid = Uuid::from_u128(0x00B5_0002);
 
 // ---- Fakes -----------------------------------------------------------------
 
-/// A library where only [`ITEM_ID`] exists.
+/// A library where only [`ITEM_ID`] (a Movie) and [`SERIES_ID`] exist.
 struct OneItemLibrary;
 
 #[async_trait]
@@ -76,7 +80,11 @@ impl LibraryManager for OneItemLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
-        Ok((id == ITEM_ID).then(|| minimal_base_item(id, "The Item", "Movie")))
+        Ok(match id {
+            ITEM_ID => Some(minimal_base_item(id, "The Item", "Movie")),
+            SERIES_ID => Some(minimal_base_item(id, "The Show", "Series")),
+            _ => None,
+        })
     }
     async fn query_items(
         &self,
@@ -198,7 +206,8 @@ impl ServerConfigurationManager for FontConfig {
         &self,
     ) -> Result<std::sync::Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError>
     {
-        unimplemented!("unused")
+        // Read by the response-time layer on every request.
+        Ok(std::sync::Arc::default())
     }
     async fn update_configuration(
         &self,
@@ -281,7 +290,7 @@ impl MediaSourceManager for FixedSources {
         _enable_path_substitution: bool,
         _user_id: Option<Uuid>,
     ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
-        unimplemented!("unused")
+        Ok(self.0.clone())
     }
     async fn open_live_stream(
         &self,
@@ -348,6 +357,8 @@ type Logins = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 struct CannedSubtitles {
     deleted: Arc<Mutex<Vec<(Uuid, i32)>>>,
     logins: Logins,
+    /// The decoded size of each upload that reached the manager.
+    uploads: Arc<Mutex<Vec<usize>>>,
 }
 
 #[async_trait]
@@ -368,8 +379,9 @@ impl SubtitleManager for CannedSubtitles {
     async fn upload_subtitle(
         &self,
         _item_id: Uuid,
-        _response: &SubtitleResponse,
+        response: &SubtitleResponse,
     ) -> Result<(), ServiceError> {
+        self.uploads.lock().unwrap().push(response.content.len());
         Err(ServiceError::invalid_input("no providers"))
     }
     async fn get_remote_subtitles(&self, _id: &str) -> Result<SubtitleResponse, ServiceError> {
@@ -385,16 +397,69 @@ impl SubtitleManager for CannedSubtitles {
     ) -> Result<Vec<ferrofin_model::providers::SubtitleProviderInfo>, ServiceError> {
         Ok(Vec::new())
     }
+    /// Accepts every account but `bad`, whose login OpenSubtitles refuses.
     async fn validate_provider_login(
         &self,
         provider_name: &str,
         config_json: &[u8],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<ProviderLogin, ServiceError> {
         self.logins
             .lock()
             .unwrap()
             .push((provider_name.to_owned(), config_json.to_vec()));
-        Ok(())
+        let config: serde_json::Value = serde_json::from_slice(config_json).unwrap();
+        if config["Username"] == "bad" {
+            return Err(ServiceError::Unauthorized("Unauthorized - nope".to_owned()));
+        }
+        Ok(ProviderLogin {
+            allowed_downloads: 20,
+        })
+    }
+}
+
+/// A subtitle encoder resolving every track to `path`, and recording whether
+/// a track was encoded (`get_subtitles`), which answers `[1, 2, 3]`.
+struct PathEncoder {
+    path: String,
+    encoded: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl SubtitleEncoder for PathEncoder {
+    async fn get_subtitles(
+        &self,
+        _item_id: Uuid,
+        _media_source_id: &str,
+        _subtitle_stream_index: i32,
+        _output_format: &str,
+        _start_time_ticks: i64,
+        _end_time_ticks: i64,
+        _preserve_original_timestamps: bool,
+    ) -> Result<Vec<u8>, ServiceError> {
+        self.encoded
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(vec![1, 2, 3])
+    }
+    async fn get_subtitle_file_character_set(
+        &self,
+        _subtitle_stream: &MediaStream,
+        _language: &str,
+        _media_source: &MediaSourceInfo,
+    ) -> Result<String, ServiceError> {
+        unimplemented!("unused")
+    }
+    async fn get_subtitle_file_path(
+        &self,
+        _subtitle_stream: &MediaStream,
+        _media_source: &MediaSourceInfo,
+    ) -> Result<String, ServiceError> {
+        Ok(self.path.clone())
+    }
+    async fn extract_all_extractable_subtitles(
+        &self,
+        _media_source: &MediaSourceInfo,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("unused")
     }
 }
 
@@ -585,6 +650,19 @@ async fn get_subtitle_converts_and_serves_vtt() {
 }
 
 #[tokio::test]
+async fn get_subtitle_serves_ttml_as_application_ttml_xml() {
+    // `MimeTypes.GetMimeType("file.ttml")`: the `MimeTypes` package's `.ttml` entry.
+    let app = subtitle_state(StubEncoder(Ok(b"<?xml version=\"1.0\"?><tt />".to_vec())));
+    let (status, _, ct) = call(
+        app,
+        &format!("/Videos/{ITEM_ID}/msrc/Subtitles/0/Stream.ttml"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ct.as_deref(), Some("application/ttml+xml"));
+}
+
+#[tokio::test]
 async fn get_subtitle_adds_vtt_time_map_when_requested() {
     let app = subtitle_state(StubEncoder(Ok(b"WEBVTT\n\nHi".to_vec())));
     let (status, body, _) = call(
@@ -743,6 +821,14 @@ async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // gl-25: `Ok(new { Downloads = …AllowedDownloads ?? 0 })`.
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"Downloads": 20})
+    );
     let logins = subtitles.logins.lock().unwrap().clone();
     assert_eq!(logins.len(), 1);
     assert_eq!(logins[0].0, "opensubtitles");
@@ -756,6 +842,22 @@ async fn open_subtitles_login_binds_ignoring_case_and_forwards_pascal_case() {
     let response = post(None, r#"{"Username":"u"}"#).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(subtitles.logins.lock().unwrap().len(), 1);
+
+    // gl-25: a refused login is `Unauthorized(new { Message = msg })`.
+    let response = post(
+        Some("application/json"),
+        r#"{"Username":"bad","Password":"p"}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"Message": "Unauthorized - nope"})
+    );
 }
 
 // ---- FallbackFont ----------------------------------------------------------
@@ -944,6 +1046,14 @@ async fn subtitle_management_gates_every_operation_but_deletion_requires_admin()
                 "",
                 StatusCode::NO_CONTENT,
             ),
+            // gl-25: the plugin controller is `[Authorize(Policy =
+            // Policies.SubtitleManagement)]`, as the contract records.
+            (
+                "POST",
+                "/Jellyfin.Plugin.OpenSubtitles/ValidateLoginInfo".to_owned(),
+                r#"{"Username":"u","Password":"p"}"#,
+                StatusCode::OK,
+            ),
         ] {
             let permitted = admin || api_key || (enabled && method != "DELETE");
             let response = create_router(app.clone())
@@ -970,4 +1080,237 @@ async fn subtitle_management_gates_every_operation_but_deletion_requires_admin()
         }
         assert_eq!(deleted.lock().unwrap().len(), usize::from(admin || api_key));
     }
+}
+
+// ---- Item kind --------------------------------------------------------------
+
+/// `SubtitleController` resolves `GetItemById<Video>` for search, download,
+/// upload and the subtitle playlist, so a non-video item is a `404` there and
+/// no sidecar is ever written beside a series, season or audio path.
+#[tokio::test]
+async fn video_only_subtitle_routes_refuse_a_non_video_item() {
+    let app = remote_search_state(Arc::new(CannedSubtitles::default()));
+    for (method, uri, body) in [
+        (
+            "GET",
+            format!("/Items/{SERIES_ID}/RemoteSearch/Subtitles/eng"),
+            "",
+        ),
+        (
+            "POST",
+            format!("/Items/{SERIES_ID}/RemoteSearch/Subtitles/sub1"),
+            "",
+        ),
+        (
+            "POST",
+            format!("/Videos/{SERIES_ID}/Subtitles"),
+            r#"{"Language":"eng","Format":"srt","IsForced":false,"IsHearingImpaired":false,"Data":"aGk="}"#,
+        ),
+        (
+            "GET",
+            format!("/Videos/{SERIES_ID}/msrc/Subtitles/0/subtitles.m3u8?segmentLength=10"),
+            "",
+        ),
+    ] {
+        let response = create_router(app.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("X-Emby-Token", "tok")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+}
+
+/// gl-24: `UploadSubtitle` binds its `[FromBody]` DTO under Kestrel's
+/// 30,000,000-byte default, so a subtitle with embedded fonts past axum's
+/// implicit 2 MiB reaches the manager whole, and a body past the limit is a
+/// `413`, not a `400` claiming the body is required.
+#[tokio::test]
+async fn subtitle_upload_takes_bodies_up_to_kestrels_default_limit() {
+    let subtitles = Arc::new(CannedSubtitles::default());
+    let uploads = subtitles.uploads.clone();
+    let app = remote_search_state(subtitles);
+    let upload = |data: String| {
+        let app = app.clone();
+        async move {
+            let body = format!(
+                r#"{{"Language":"eng","Format":"ass","IsForced":false,"IsHearingImpaired":false,"Data":"{data}"}}"#
+            );
+            let response = create_router(app)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/Videos/{ITEM_ID}/Subtitles"))
+                        .header("X-Emby-Token", "tok")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+
+    let (status, body) = upload("A".repeat(4_000_000)).await;
+    // The canned manager refuses every upload: reaching it is the point.
+    assert_eq!(*uploads.lock().unwrap(), [3_000_000], "{status} {body}");
+
+    let (status, body) = upload("A".repeat(30_000_000)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!body.contains("The body field is required."), "{body}");
+    assert_eq!(uploads.lock().unwrap().len(), 1);
+}
+
+// ---- Graphical subtitles served raw ----------------------------------------
+
+/// `SubtitleControllerTests.SubtitleIndex`.
+const SUBTITLE_INDEX: i32 = 2;
+
+/// A state whose item has one source (id = the item id, `N` format) with an
+/// external subtitle track at [`SUBTITLE_INDEX`] of `codec`, and an encoder
+/// resolving that track to `path`.
+fn graphical_state(codec: &str, path: &str) -> (AppState, Arc<PathEncoder>) {
+    let source = MediaSourceInfo {
+        id: Some(ITEM_ID.simple().to_string()),
+        media_streams: vec![MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            index: SUBTITLE_INDEX,
+            codec: Some(codec.to_owned()),
+            path: Some(path.to_owned()),
+            is_external: true,
+            ..MediaStream::default()
+        }],
+        ..MediaSourceInfo::default()
+    };
+    let encoder = Arc::new(PathEncoder {
+        path: path.to_owned(),
+        encoded: std::sync::atomic::AtomicBool::new(false),
+    });
+    let state = build_state(
+        Arc::new(OneItemLibrary),
+        Arc::new(FontConfig(EncodingOptions::default())),
+        Arc::new(FontFs {
+            files: Vec::new(),
+            bytes: Vec::new(),
+        }),
+        Arc::new(FixedSources(vec![source])),
+        Arc::new(FakeSubtitles),
+        Arc::clone(&encoder) as Arc<dyn SubtitleEncoder>,
+    );
+    (state, encoder)
+}
+
+/// `GET` with a `Range` header; returns the status, body and the
+/// `Content-Type` and `Accept-Ranges` headers.
+async fn call_range(
+    app: AppState,
+    uri: &str,
+    range: &str,
+) -> (StatusCode, Vec<u8>, Option<String>, Option<String>) {
+    let response = create_router(app)
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .header("x-emby-token", "tok")
+                .header("range", range)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let (content_type, accept_ranges) = (header("content-type"), header("accept-ranges"));
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    (status, body, content_type, accept_ranges)
+}
+
+/// `GetSubtitle_GraphicalStream_ReturnsRawFileWithRangeProcessing` (v12.2):
+/// a PGS `.sup` and an extracted VobSub `.mks` are handed over untouched,
+/// with Range processing, and never encoded. Both routes.
+#[rstest::rstest]
+#[case("pgssub", "sub.sup", "Stream.pgssub")]
+#[case("dvdsub", "sub.mks", "Stream.vobsub")]
+#[case("pgssub", "sub.sup", "0/Stream.pgssub")]
+#[tokio::test]
+async fn get_subtitle_graphical_stream_returns_raw_file_with_range_processing(
+    #[case] codec: &str,
+    #[case] file_name: &str,
+    #[case] route: &str,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(file_name);
+    let payload: Vec<u8> = (0..=255).collect();
+    std::fs::write(&path, &payload).unwrap();
+    let (state, encoder) = graphical_state(codec, &path.to_string_lossy());
+
+    let (status, body, content_type, accept_ranges) = call_range(
+        state,
+        &format!(
+            "/Videos/{ITEM_ID}/{}/Subtitles/{SUBTITLE_INDEX}/{route}",
+            ITEM_ID.simple()
+        ),
+        "bytes=10-19",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body, payload[10..20]);
+    // `MimeTypes.GetMimeType` knows neither extension: the default type.
+    assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
+    assert_eq!(accept_ranges.as_deref(), Some("bytes"));
+    assert!(
+        !encoder.encoded.load(std::sync::atomic::Ordering::SeqCst),
+        "a raw track is never encoded"
+    );
+}
+
+/// `GetSubtitle_RemotelyHostedGraphicalStream_FallsBackToEncoder`,
+/// `GetSubtitle_VobSubIdxPair_FallsBackToEncoder` and
+/// `GetSubtitle_TextStream_IsEncoded`: no local `.sup`/`.mks` to hand over,
+/// so the encoder answers.
+#[rstest::rstest]
+#[case("pgssub", "https://example.com/sub.sup", "pgssub")]
+#[case("dvdsub", "/media/sub.idx", "vobsub")]
+#[case("subrip", "/media/sub.srt", "vtt")]
+#[tokio::test]
+async fn get_subtitle_without_a_local_graphical_file_falls_back_to_the_encoder(
+    #[case] codec: &str,
+    #[case] path: &str,
+    #[case] format: &str,
+) {
+    let (state, encoder) = graphical_state(codec, path);
+    let (status, body, _) = call(
+        state,
+        &format!(
+            "/Videos/{ITEM_ID}/{}/Subtitles/{SUBTITLE_INDEX}/Stream.{format}",
+            ITEM_ID.simple()
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, vec![1, 2, 3]);
+    assert!(encoder.encoded.load(std::sync::atomic::Ordering::SeqCst));
 }

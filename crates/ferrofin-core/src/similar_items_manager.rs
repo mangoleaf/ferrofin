@@ -35,11 +35,10 @@
 //! seed matches every other item of its kind — as it does in C#.
 //!
 //! Accepted divergences from C#: `IsFavoriteOrLiked` is approximated as
-//! favorite-only (as elsewhere in the query layer); the person-recommendation
-//! IMDb de-dup is dropped; and results are ordered **deterministically**
-//! rather than by C#'s `Random` — the weighted path by score then
-//! (`SortName`, `Id`), the flat path by `SortName` — so a client sees a stable
-//! answer instead of a fresh shuffle per request.
+//! favorite-only (as elsewhere in the query layer); and the weighted path
+//! breaks equal scores **deterministically**, by (`SortName`, `Id`), where C# keeps whatever
+//! dictionary order the candidates arrived in, so a client sees a stable answer.
+//! The flat path orders by `Random`, as C# does.
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
@@ -190,6 +189,37 @@ struct CachedReference {
     score: Option<f32>,
 }
 
+/// The best reference per lowercased (provider, id): higher score wins, and at
+/// equal score the earlier position does — C# `ResolveRemoteReferences`'
+/// `providerLookup`.
+fn best_reference_per_id(
+    references: &[SimilarItemReference],
+) -> HashMap<(String, String), (Option<f32>, usize)> {
+    let mut best: HashMap<(String, String), (Option<f32>, usize)> = HashMap::new();
+    for (position, reference) in references.iter().enumerate() {
+        let key = (
+            reference.provider_name.to_lowercase(),
+            reference.provider_id.to_lowercase(),
+        );
+        // C#'s `match.Score > existing.Score` is a *lifted* float comparison:
+        // it is false whenever either side is null, so an unscored reference
+        // never displaces a scored one and vice versa. `Option`'s own
+        // ordering ranks `Some` above `None`, which would diverge — hence
+        // the explicit both-present check.
+        let better = match best.get(&key) {
+            None => true,
+            Some((score, at)) => match (reference.score, *score) {
+                (Some(new), Some(old)) if new > old => true,
+                _ => reference.score == *score && position < *at,
+            },
+        };
+        if better {
+            best.insert(key, (reference.score, position));
+        }
+    }
+    best
+}
+
 /// The [`BaseItemKind`] of a row, defaulting to `Folder` for an unrecognized
 /// stored `Type` (the crate-wide conservative default).
 fn kind_of(entity: &BaseItemEntity) -> BaseItemKind {
@@ -285,6 +315,20 @@ const LOCAL_SIMILARITY_PROVIDER: &str = "Local Genre/Tag";
 /// (and `MovieSimilarItemsProvider`: `var limit = query.Limit ?? 50;`).
 const DEFAULT_SIMILAR_LIMIT: i32 = 50;
 
+/// How many remote references are resolved against the library at a time;
+/// between two batches the manager checks whether it has enough (C#
+/// `SimilarItemsManager.GetSimilarItemsAsync`: `const int BatchSize = 20;`,
+/// TMDB's page size).
+const REMOTE_REFERENCE_BATCH: usize = 20;
+
+/// The most references one live fetch collects from a remote provider before
+/// it stops paging, whatever resolved (C# `MaxRemoteReferenceFetchLimit`,
+/// jellyfin/jellyfin#17590): on a small library the wanted count is never
+/// reached, and the walk otherwise ran to TMDB's last page.
+///
+/// FLAGGED as a candidate setting — plausible range 100…2000, default 500.
+const MAX_REMOTE_REFERENCES: usize = 500;
+
 /// How many scored candidates the score pass keeps per result wanted, so the
 /// access/played filter that follows can drop rows without under-filling the
 /// page (C# `MovieSimilarItemsProvider`: `.Take(limit * 3)`).
@@ -345,6 +389,20 @@ struct LocalRequest<'a> {
     wanted: i32,
 }
 
+/// One similar-items request as a remote provider sees it.
+struct RemoteRequest<'a> {
+    /// The seed row.
+    seed: &'a BaseItemEntity,
+    /// The seed's external ids, which key a remote provider's lookup.
+    seed_provider_ids: &'a HashMap<String, String>,
+    /// The query the provider is handed.
+    query: &'a SimilarItemsQuery,
+    /// The seed's kind, the only kind a reference resolves to.
+    kind: BaseItemKind,
+    /// The requesting user, when the request is user-scoped.
+    user_id: Option<Uuid>,
+}
+
 impl LocalFilter {
     /// A flat genre/tag provider that only restricts the result kinds
     /// (`SeriesSimilarItemsProvider`, `LiveTvProgramSimilarItemsProvider`).
@@ -367,10 +425,11 @@ impl LocalFilter {
 }
 
 /// Recently-played movies sampled to seed the "similar to recently played"
-/// categories (C# `GetMovieRecommendationsAsync`: `Limit = 7`).
+/// categories (C# `GetMovieRecommendationsAsync`: `Limit = 7`). The query is
+/// grouped by metadata key, so the repository reads 4 more rows.
 const RECENTLY_PLAYED_LIMIT: i32 = 7;
 /// Liked/favorited movies sampled for the "similar to liked" categories
-/// (C#: `Limit = 10`).
+/// (C#: `Limit = 10`), also read with 4 more rows.
 const LIKED_LIMIT: i32 = 10;
 /// How many of the most-recently-played movies contribute director/actor names
 /// (C#: `Take(Math.Min(count, 6))`).
@@ -460,9 +519,8 @@ impl FerrofinSimilarItemsManager {
     /// sorts local and remote providers as ONE list. Reads the library exactly
     /// once, and not at all when no compiled provider serves this kind.
     async fn similarity_plan(&self, seed: &BaseItemEntity, kind: BaseItemKind) -> SimilarityPlan {
-        // Resolving the library reads the filesystem, so narrow to the
-        // providers that could serve this kind at all first — most kinds have
-        // none, and those must not pay for a `get_virtual_folders` call.
+        // Narrow to the providers that could serve this kind at all first —
+        // most kinds have none, and those must not resolve the library.
         let (Some(library), false) = (self.library.as_ref(), self.remote.is_empty()) else {
             return SimilarityPlan::local_only();
         };
@@ -474,7 +532,9 @@ impl FerrofinSimilarItemsManager {
         let Some(type_name) = seed.type_.rsplit('.').next() else {
             return SimilarityPlan::local_only();
         };
-        let Ok(folders) = library.get_virtual_folders().await else {
+        // The snapshot, not `get_virtual_folders`: that rebuilds every
+        // library's full listing (its image and existence reads included).
+        let Ok(folders) = library.library_folders().await else {
             return SimilarityPlan::local_only();
         };
         // The seed's library: its location's (or, on a row an older scan
@@ -786,36 +846,98 @@ impl FerrofinSimilarItemsManager {
         Ok(())
     }
 
-    /// One provider's references for `seed`, read from the disk cache when it
-    /// is still fresh and written back after a live fetch.
+    /// One remote provider's results for the request, resolved against the
+    /// library and scored at `provider_order`.
     ///
-    /// Port of `TryReadSimilarItemsCacheAsync`/`SaveSimilarItemsCacheAsync`:
+    /// Port of the remote arm of `SimilarItemsManager.GetSimilarItemsAsync`.
+    /// A fresh disk cache is resolved whole. Otherwise the provider is paged
+    /// and its references are resolved in batches of
+    /// [`REMOTE_REFERENCE_BATCH`]: the walk stops once the batches have
+    /// resolved `remaining` items (jellyfin/jellyfin#15970) or
+    /// [`MAX_REMOTE_REFERENCES`] references were collected (#17590), the last
+    /// partial batch is resolved, and only the collected references are
+    /// cached, so a later request with a larger limit reads that shorter list,
+    /// as upstream's does.
+    ///
+    /// The cache is `TryReadSimilarItemsCacheAsync`/`SaveSimilarItemsCacheAsync`:
     /// the path and JSON shape match Jellyfin's, so a cache directory shared
     /// with a Jellyfin install stays valid for both.
-    async fn remote_references(
+    async fn remote_results(
         &self,
         provider: &dyn RemoteSimilarItemsProvider,
-        seed: &BaseItemEntity,
-        seed_provider_ids: &HashMap<String, String>,
-        query: &SimilarItemsQuery,
-    ) -> Vec<SimilarItemReference> {
-        let cache_path = self.cache_path(provider.name(), seed);
+        request: &RemoteRequest<'_>,
+        provider_order: usize,
+        remaining: i32,
+        claimed: &mut Seen,
+    ) -> Vec<(BaseItemEntity, f32)> {
+        let (kind, user_id) = (request.kind, request.user_id);
+        let cache_path = self.cache_path(provider.name(), request.seed);
         if let Some(path) = cache_path.as_deref()
             && let Some(cached) = read_reference_cache(path)
         {
-            return cached;
+            return self
+                .resolve_remote_references(&cached, provider_order, kind, user_id, claimed)
+                .await;
         }
-        let references = provider
-            .get_similar_items(seed, seed_provider_ids, query)
-            .await;
+        let mut results = Vec::new();
+        let mut remaining = remaining;
+        let mut collected: Vec<SimilarItemReference> = Vec::new();
+        // Where the batch not resolved yet starts in `collected`.
+        let mut pending = 0;
+        let mut page = 1;
+        'pages: loop {
+            let found = provider
+                .similar_items_page(request.seed, request.seed_provider_ids, request.query, page)
+                .await;
+            if found.references.is_empty() {
+                break;
+            }
+            for reference in found.references {
+                collected.push(reference);
+                if collected.len() - pending < REMOTE_REFERENCE_BATCH {
+                    continue;
+                }
+                let resolved = self
+                    .resolve_remote_references(
+                        &collected[pending..],
+                        provider_order,
+                        kind,
+                        user_id,
+                        claimed,
+                    )
+                    .await;
+                remaining -= i32::try_from(resolved.len()).unwrap_or(i32::MAX);
+                results.extend(resolved);
+                pending = collected.len();
+                if remaining <= 0 || collected.len() >= MAX_REMOTE_REFERENCES {
+                    break 'pages;
+                }
+            }
+            if page >= found.total_pages {
+                break;
+            }
+            page += 1;
+        }
+        if pending < collected.len() {
+            results.extend(
+                self.resolve_remote_references(
+                    &collected[pending..],
+                    provider_order,
+                    kind,
+                    user_id,
+                    claimed,
+                )
+                .await,
+            );
+        }
         if let (Some(path), Some(ttl), false) = (
             cache_path.as_deref(),
             provider.cache_duration(),
-            references.is_empty(),
+            collected.is_empty(),
         ) {
-            write_reference_cache(path, &references, ttl);
+            write_reference_cache(path, &collected, ttl);
         }
-        references
+        results
     }
 
     /// `{cache}/{provider}-similar-{type}/{itemId:N}.json`, lowercased exactly
@@ -834,43 +956,63 @@ impl FerrofinSimilarItemsManager {
         )
     }
 
+    /// The rows of `ids` that are of `kind` and that `user_id` may see, keyed
+    /// by id: C#'s `InternalItemsQuery(user) { IncludeItemTypes = [kind] }`.
+    ///
+    /// With a user, a kind that has versions is grouped by presentation key
+    /// (C# `EnableGroupByPresentationUniqueKey`), so the copies of one film
+    /// come back as their group head alone — as upstream's `GetItemList` does.
+    async fn visible_rows(
+        &self,
+        ids: Vec<Uuid>,
+        kind: BaseItemKind,
+        user_id: Option<Uuid>,
+    ) -> Result<HashMap<Uuid, BaseItemEntity>, ServiceError> {
+        // An empty `item_ids` is no filter at all: it would load every row.
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut query = InternalItemsQuery {
+            item_ids: ids,
+            include_item_types: vec![kind],
+            ..InternalItemsQuery::default()
+        };
+        if let Some(user_id) = user_id
+            && !self.configure_user_access(&mut query, user_id).await?
+        {
+            return Ok(HashMap::new());
+        }
+        Ok(self
+            .items
+            .get_item_list(&query)
+            .await?
+            .into_iter()
+            .filter_map(|row| Some((Uuid::parse_str(&row.id).ok()?, row)))
+            .collect())
+    }
+
     /// Resolves a provider's references to library items of `kind`, scoring
     /// each and skipping anything already accounted for.
     ///
     /// Port of `SimilarItemsManager.ResolveRemoteReferences`: a reference is
     /// matched by looking its provider id up in `BaseItemProviders`, and the
-    /// best (highest-scoring, else earliest) reference per id wins.
+    /// best (highest-scoring, else earliest) reference per id wins. The matched
+    /// rows are then loaded through ONE `InternalItemsQuery(user) {
+    /// IncludeItemTypes = [kind] }`, so the user's libraries, parental rating
+    /// and tag policy apply exactly as on the local path.
+    ///
+    /// C#'s closing `FilterByLibraryAccessAsync` pass over the merged results
+    /// is not repeated: both the local and this remote path already resolve
+    /// through the user-scoped query, so it could drop nothing.
     async fn resolve_remote_references(
         &self,
         references: &[SimilarItemReference],
         provider_order: usize,
         kind: BaseItemKind,
+        user_id: Option<Uuid>,
         claimed: &mut Seen,
     ) -> Vec<(BaseItemEntity, f32)> {
-        // Best reference per (provider, id): higher score wins, and at equal
-        // score the earlier position does.
-        let mut best: HashMap<(String, String), (Option<f32>, usize)> = HashMap::new();
-        for (position, reference) in references.iter().enumerate() {
-            let key = (
-                reference.provider_name.to_lowercase(),
-                reference.provider_id.to_lowercase(),
-            );
-            // C#'s `match.Score > existing.Score` is a *lifted* float comparison:
-            // it is false whenever either side is null, so an unscored reference
-            // never displaces a scored one and vice versa. `Option`'s own
-            // ordering ranks `Some` above `None`, which would diverge — hence
-            // the explicit both-present check.
-            let better = match best.get(&key) {
-                None => true,
-                Some((score, at)) => match (reference.score, *score) {
-                    (Some(new), Some(old)) if new > old => true,
-                    _ => reference.score == *score && position < *at,
-                },
-            };
-            if better {
-                best.insert(key, (reference.score, position));
-            }
-        }
+        let best = best_reference_per_id(references);
 
         // Keyed in first-seen order, not `HashMap` order: scores saturate at
         // 1.0 for the first few positions, so an arbitrary iteration order
@@ -889,12 +1031,8 @@ impl FerrofinSimilarItemsManager {
             }
         }
 
-        // C# collects into `resolvedByKey`, a presentation-key-keyed map that
-        // keeps the HIGHEST-scoring row per key, and only writes the winners
-        // into the exclude sets once the whole batch is resolved. Claiming as
-        // rows arrive instead would let an arbitrary DB row order decide which
-        // copy of a film represents it.
-        let mut resolved: Vec<(String, Uuid, BaseItemEntity, f32)> = Vec::new();
+        // Every (item, best reference) match, in provider-then-row order.
+        let mut matches: Vec<(Uuid, Option<f32>, usize)> = Vec::new();
         for (provider_key, values) in by_provider {
             let rows = match self
                 .repo
@@ -916,35 +1054,61 @@ impl FerrofinSimilarItemsManager {
                 let Some(&(score, position)) = best.get(&key) else {
                     continue;
                 };
-                if claimed.ids.contains(&item_id) {
-                    continue;
-                }
-                let Ok(Some(entity)) = self.items.retrieve_item(item_id).await else {
-                    continue;
-                };
-                if kind_of(&entity) != kind {
-                    continue;
-                }
-                // C# `GetPresentationUniqueKey()` falls back to the item id, so
-                // a keyless row is its own bucket rather than colliding with
-                // every other keyless row.
-                let key = entity
-                    .presentation_unique_key
-                    .as_deref()
-                    .map_or_else(|| item_id.to_string(), presentation_key);
-                if claimed.keys.contains(&key) {
-                    continue;
-                }
-                let score = calculate_score(score, provider_order, position);
-                match resolved.iter_mut().find(|(seen, ..)| *seen == key) {
-                    Some(entry) if entry.3 < score => *entry = (key, item_id, entity, score),
-                    Some(_) => {}
-                    None => resolved.push((key, item_id, entity, score)),
+                if !claimed.ids.contains(&item_id) {
+                    matches.push((item_id, score, position));
                 }
             }
         }
+        let ids: Vec<Uuid> = matches.iter().map(|(id, ..)| *id).collect();
+        let mut rows = match self.visible_rows(ids, kind, user_id).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    kind = ?kind,
+                    user_id = user_id.map(tracing::field::display),
+                    "loading similar-item references failed"
+                );
+                return Vec::new();
+            }
+        };
+
+        // C# collects into `resolvedByKey`, a presentation-key-keyed map that
+        // keeps the HIGHEST-scoring row per key, and only writes the winners
+        // into the exclude sets once the whole batch is resolved. Claiming as
+        // rows arrive instead would let an arbitrary DB row order decide which
+        // copy of a film represents it. Only rows the user may see take part,
+        // so a hidden copy never claims the key of a visible one. (For a
+        // user, `visible_rows` has already collapsed copies to their group
+        // head, so the choice between copies only arises without one.)
+        let mut resolved: Vec<(String, Uuid, f32)> = Vec::new();
+        for (item_id, score, position) in matches {
+            let Some(entity) = rows.get(&item_id) else {
+                continue;
+            };
+            // C# `GetPresentationUniqueKey()` falls back to the item id, so
+            // a keyless row is its own bucket rather than colliding with
+            // every other keyless row.
+            let key = entity
+                .presentation_unique_key
+                .as_deref()
+                .map_or_else(|| item_id.to_string(), presentation_key);
+            if claimed.keys.contains(&key) {
+                continue;
+            }
+            let score = calculate_score(score, provider_order, position);
+            match resolved.iter_mut().find(|(seen, ..)| *seen == key) {
+                Some(entry) if entry.2 < score => *entry = (key, item_id, score),
+                Some(_) => {}
+                None => resolved.push((key, item_id, score)),
+            }
+        }
         let mut out = Vec::with_capacity(resolved.len());
-        for (key, item_id, entity, score) in resolved {
+        for (key, item_id, score) in resolved {
+            // Each id has exactly one key, so it wins at most one bucket.
+            let Some(entity) = rows.remove(&item_id) else {
+                continue;
+            };
             claimed.ids.insert(item_id);
             claimed.keys.insert(key);
             out.push((entity, score));
@@ -1027,51 +1191,144 @@ impl FerrofinSimilarItemsManager {
         Ok(out)
     }
 
-    /// Builds one category per person `name`: their unplayed movies (C#
-    /// `GetPersonRecommendations` — `Person = name`, `IsMovie`, `IsPlayed = false`,
-    /// directors additionally filtered to the `Director` credit type). The category
-    /// id is `md5(name)`, reproducing C#'s `name.GetMD5()`.
-    async fn person_categories(
+    /// The next non-empty person category of `cursor`, querying only as many
+    /// names as it takes to find one.
+    ///
+    /// Port of C# `GetPersonRecommendations`, a `yield return` iterator the
+    /// round-robin pulls with `MoveNext`: a person's movies are queried only
+    /// when the round-robin needs another category of this type. A category is
+    /// the person's unplayed movies (`Person = name`, `IsMovie`,
+    /// `IsPlayed = false`, directors restricted to the `Director` credit type).
+    /// Each query asks for `item_limit + 2` grouped by metadata key, and the
+    /// repository adds 4 more rows (`PrepareFilterQuery`). The category then
+    /// drops later movies sharing an IMDb id and keeps `item_limit`. The
+    /// category id is `md5(name)`, as C#'s `name.GetMD5()`.
+    async fn next_person_category(
         &self,
-        names: &[String],
-        recommendation_type: RecommendationType,
-        item_limit: i32,
-        user: &UserEntity,
-        dto_options: &DtoOptions,
-    ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
+        cursor: &mut PersonCursor<'_>,
+        person_query: &PersonQuery<'_>,
+    ) -> Result<Option<SimilarItemsRecommendation>, ServiceError> {
+        let PersonQuery {
+            item_limit,
+            user,
+            movie_kinds,
+        } = *person_query;
         let person_types =
-            if recommendation_type == RecommendationType::HasDirectorFromRecentlyPlayed {
+            if cursor.recommendation_type == RecommendationType::HasDirectorFromRecentlyPlayed {
                 vec!["Director".to_owned()]
             } else {
                 Vec::new()
             };
-        let movie_kinds = self.movie_candidate_kinds().await;
-        let mut out = Vec::with_capacity(names.len());
-        for name in names {
+        while let Some(name) = cursor.names.get(cursor.next) {
+            cursor.next += 1;
             let mut query = InternalItemsQuery {
-                include_item_types: movie_kinds.clone(),
+                include_item_types: movie_kinds.to_vec(),
                 is_movie: Some(true),
                 recursive: true,
                 person: Some(name.clone()),
                 person_types: person_types.clone(),
                 is_played: Some(false),
-                limit: Some(item_limit),
+                limit: Some(item_limit.saturating_add(2)),
+                enable_group_by_metadata_key: true,
                 ..Default::default()
             };
             query.set_user(user.clone());
             let items = self.items.get_item_list(&query).await?;
-            let _ = dto_options; // DTO projection happens in the handler, as elsewhere
-            if items.is_empty() {
-                continue;
+            let ids: Vec<Uuid> = items
+                .iter()
+                .filter_map(|i| Uuid::parse_str(&i.id).ok())
+                .collect();
+            let imdb = self.repo.imdb_ids_of(&ids).await?;
+            let mut seen = std::collections::HashSet::new();
+            let items: Vec<_> = items
+                .into_iter()
+                .filter(|i| {
+                    // `?? Guid.NewGuid()`: an item with no IMDb id is never a
+                    // duplicate.
+                    Uuid::parse_str(&i.id)
+                        .ok()
+                        .and_then(|id| imdb.get(&id))
+                        .is_none_or(|key| seen.insert(key.clone()))
+                })
+                .take(usize::try_from(item_limit.max(0)).unwrap_or(0))
+                .collect();
+            if !items.is_empty() {
+                return Ok(Some(SimilarItemsRecommendation {
+                    baseline_item_name: name.clone(),
+                    category_id: ferrofin_common::extensions::get_md5(name),
+                    recommendation_type: cursor.recommendation_type,
+                    items,
+                }));
             }
-            out.push(SimilarItemsRecommendation {
-                baseline_item_name: name.clone(),
-                category_id: ferrofin_common::extensions::get_md5(name),
-                recommendation_type,
-                items,
-            });
         }
+        Ok(None)
+    }
+
+    /// Merges the four recommendation streams by round-robin — recently-played
+    /// and liked are visited twice per pass so they carry double weight (C#'s
+    /// duplicated enumerators) — up to `cat_limit`, then orders the result by
+    /// recommendation type. The director and actor streams are pulled lazily,
+    /// as C#'s `MoveNext` does.
+    async fn round_robin_categories(
+        &self,
+        similar: [Vec<SimilarItemsRecommendation>; 2],
+        people: [&mut PersonCursor<'_>; 2],
+        cat_limit: usize,
+        person_query: &PersonQuery<'_>,
+    ) -> Result<Vec<SimilarItemsRecommendation>, ServiceError> {
+        let [played, liked] = similar;
+        let mut similar = [played.into_iter(), liked.into_iter()];
+        let [directors, actors] = people;
+        let visit_order = [0usize, 0, 1, 1, 2, 3];
+        let mut out: Vec<SimilarItemsRecommendation> = Vec::with_capacity(cat_limit);
+        'fill: loop {
+            let mut advanced = false;
+            for &stream in &visit_order {
+                if out.len() >= cat_limit {
+                    break 'fill;
+                }
+                let next = match stream {
+                    0 | 1 => similar[stream].next(),
+                    2 => self.next_person_category(directors, person_query).await?,
+                    _ => self.next_person_category(actors, person_query).await?,
+                };
+                if let Some(category) = next {
+                    out.push(category);
+                    advanced = true;
+                }
+            }
+            if !advanced {
+                break;
+            }
+        }
+        out.sort_by_key(|c| c.recommendation_type as i32);
         Ok(out)
+    }
+}
+
+/// A position in the names a person category stream draws from: the names
+/// before `next` have been queried.
+struct PersonCursor<'a> {
+    names: &'a [String],
+    next: usize,
+    recommendation_type: RecommendationType,
+}
+
+/// What every person-category query of one recommendations request shares.
+#[derive(Clone, Copy)]
+struct PersonQuery<'a> {
+    item_limit: i32,
+    user: &'a UserEntity,
+    movie_kinds: &'a [BaseItemKind],
+}
+
+impl<'a> PersonCursor<'a> {
+    fn new(names: &'a [String], recommendation_type: RecommendationType) -> Self {
+        Self {
+            names,
+            next: 0,
+            recommendation_type,
+        }
     }
 }
 
@@ -1147,14 +1404,16 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                 exclude_item_ids: claimed.ids(),
                 exclude_artist_ids: exclude_artist_ids.to_vec(),
             };
-            let references = self
-                .remote_references(provider.as_ref(), &seed, &seed_provider_ids, &query)
-                .await;
-            if references.is_empty() {
-                continue;
-            }
+            let request = RemoteRequest {
+                seed: &seed,
+                seed_provider_ids: &seed_provider_ids,
+                query: &query,
+                kind,
+                user_id,
+            };
+            let remaining = wanted - i32::try_from(scored.len()).unwrap_or(0);
             scored.extend(
-                self.resolve_remote_references(&references, order, kind, &mut claimed)
+                self.remote_results(provider.as_ref(), &request, order, remaining, &mut claimed)
                     .await,
             );
         }
@@ -1200,34 +1459,18 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
             return Ok(Vec::new());
         }
 
-        // Recently-played movies (C#: IsPlayed, OrderBy DatePlayed desc, Limit 7).
-        let mut recent_played_q = InternalItemsQuery {
-            parent_id,
-            include_item_types: vec![BaseItemKind::Movie],
-            recursive: true,
-            is_played: Some(true),
-            limit: Some(RECENTLY_PLAYED_LIMIT),
-            order_by: vec![(ItemSortBy::DatePlayed, SortOrder::Descending)],
-            ..Default::default()
-        };
+        let mut recent_played_q = recently_played_query(parent_id);
         recent_played_q.set_user(user.clone());
         let recently_played = self.items.get_item_list(&recent_played_q).await?;
 
-        // Liked/favorited movies (C#: IsFavoriteOrLiked, Limit 10, minus the above).
+        // Liked/favorited movies (C#: IsFavoriteOrLiked, Limit 10,
+        // EnableGroupByMetadataKey, so 4 more, minus the above).
         let played_ids: Vec<Uuid> = recently_played
             .iter()
             .filter_map(|m| Uuid::parse_str(&m.id).ok())
             .collect();
-        let mut liked_q = InternalItemsQuery {
-            parent_id,
-            include_item_types: self.movie_candidate_kinds().await,
-            is_movie: Some(true),
-            recursive: true,
-            is_favorite_or_liked: Some(true),
-            limit: Some(LIKED_LIMIT),
-            exclude_item_ids: played_ids.clone(),
-            ..Default::default()
-        };
+        let movie_kinds = self.movie_candidate_kinds().await;
+        let mut liked_q = liked_query(parent_id, movie_kinds.clone(), played_ids.clone());
         liked_q.set_user(user.clone());
         let liked = self.items.get_item_list(&liked_q).await?;
 
@@ -1266,60 +1509,67 @@ impl SimilarItemsManager for FerrofinSimilarItemsManager {
                 dto_options,
             )
             .await?;
-        let has_director = self
-            .person_categories(
-                &directors,
-                RecommendationType::HasDirectorFromRecentlyPlayed,
-                item_limit,
-                &user,
-                dto_options,
-            )
-            .await?;
-        let has_actor = self
-            .person_categories(
-                &actors,
-                RecommendationType::HasActorFromRecentlyPlayed,
-                item_limit,
-                &user,
-                dto_options,
-            )
-            .await?;
-
-        Ok(round_robin_categories(
-            &[similar_to_played, similar_to_liked, has_director, has_actor],
+        let mut directors = PersonCursor::new(
+            &directors,
+            RecommendationType::HasDirectorFromRecentlyPlayed,
+        );
+        let mut actors = PersonCursor::new(&actors, RecommendationType::HasActorFromRecentlyPlayed);
+        self.round_robin_categories(
+            [similar_to_played, similar_to_liked],
+            [&mut directors, &mut actors],
             cat_limit,
-        ))
+            &PersonQuery {
+                item_limit,
+                user: &user,
+                movie_kinds: &movie_kinds,
+            },
+        )
+        .await
     }
 }
 
-/// Merges the four recommendation streams by round-robin — recently-played and
-/// liked are visited twice per pass so they carry double weight (C#'s duplicated
-/// enumerators) — up to `cat_limit`, then orders the result by recommendation type.
-fn round_robin_categories(
-    streams: &[Vec<SimilarItemsRecommendation>; 4],
-    cat_limit: usize,
-) -> Vec<SimilarItemsRecommendation> {
-    let visit_order = [0usize, 0, 1, 1, 2, 3];
-    let mut cursors = [0usize; 4];
-    let mut out: Vec<SimilarItemsRecommendation> = Vec::with_capacity(cat_limit);
-    'fill: loop {
-        let mut advanced = false;
-        for &stream in &visit_order {
-            if out.len() >= cat_limit {
-                break 'fill;
-            }
-            if cursors[stream] < streams[stream].len() {
-                out.push(streams[stream][cursors[stream]].clone());
-                cursors[stream] += 1;
-                advanced = true;
-            }
-        }
-        if !advanced {
-            break;
-        }
+/// The recently-played baseline of `GetMovieRecommendationsAsync`
+/// (`SimilarItemsManager.cs:316-325`): played movies, most recently played
+/// first and ties shuffled, up to [`RECENTLY_PLAYED_LIMIT`]. It is grouped by
+/// metadata key (`EnableGroupByMetadataKey`), so `PrepareFilterQuery` reads 4
+/// more.
+fn recently_played_query(parent_id: Uuid) -> InternalItemsQuery {
+    InternalItemsQuery {
+        parent_id,
+        include_item_types: vec![BaseItemKind::Movie],
+        recursive: true,
+        is_played: Some(true),
+        limit: Some(RECENTLY_PLAYED_LIMIT),
+        order_by: vec![
+            (ItemSortBy::DatePlayed, SortOrder::Descending),
+            (ItemSortBy::Random, SortOrder::Descending),
+        ],
+        enable_group_by_metadata_key: true,
+        ..Default::default()
     }
-    out.sort_by_key(|c| c.recommendation_type as i32);
-    out
+}
+
+/// The liked baseline of `GetMovieRecommendationsAsync`
+/// (`SimilarItemsManager.cs:335-347`): favourite or liked movies of `kinds`,
+/// a random [`LIKED_LIMIT`] of them, without the recently played ones.
+/// Grouped by metadata key too, so 4 more are read.
+fn liked_query(
+    parent_id: Uuid,
+    kinds: Vec<BaseItemKind>,
+    played_ids: Vec<Uuid>,
+) -> InternalItemsQuery {
+    InternalItemsQuery {
+        parent_id,
+        include_item_types: kinds,
+        is_movie: Some(true),
+        recursive: true,
+        is_favorite_or_liked: Some(true),
+        limit: Some(LIKED_LIMIT),
+        exclude_item_ids: played_ids,
+        order_by: vec![(ItemSortBy::Random, SortOrder::Descending)],
+        enable_group_by_metadata_key: true,
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -1334,6 +1584,7 @@ mod tests {
     };
     use ferrofin_db::Database;
     use ferrofin_db::entities::base_items::PeopleEntity;
+    use ferrofin_traits::library::SimilarItemsPage;
     use ferrofin_traits::persistence::{ItemPersistenceService, PeopleRepository};
     use std::time::Duration;
 
@@ -1427,7 +1678,7 @@ mod tests {
     /// user holds by default (`seed_user` writes the bare row only).
     async fn grant_all_folders(db: &Database, user: &UserEntity) {
         crate::user_entity_ext::set_permission(
-            db.writer(),
+            db,
             &user.id,
             ferrofin_db::enums::PermissionKind::EnableAllFolders,
             true,
@@ -1440,7 +1691,7 @@ mod tests {
     /// = folders`) — the dashboard's "Library access" checkboxes.
     async fn restrict_to_folders(db: &Database, user: &UserEntity, folders: &[Uuid]) {
         crate::user_entity_ext::set_permission(
-            db.writer(),
+            db,
             &user.id,
             ferrofin_db::enums::PermissionKind::EnableAllFolders,
             false,
@@ -1449,7 +1700,7 @@ mod tests {
         .expect("revoke EnableAllFolders");
         let ids: Vec<String> = folders.iter().map(ToString::to_string).collect();
         crate::user_entity_ext::set_preference(
-            db.writer(),
+            db,
             &user.id,
             ferrofin_db::enums::PreferenceKind::EnabledFolders,
             &ids,
@@ -1541,8 +1792,11 @@ mod tests {
         }
     }
 
-    /// A remote provider returning a fixed reference list, recording whether it
-    /// was asked.
+    /// How many references a [`FakeRemote`] page holds: TMDB's page size.
+    const FAKE_PAGE_SIZE: usize = 20;
+
+    /// A remote provider serving a fixed reference list in pages of
+    /// [`FAKE_PAGE_SIZE`], counting the pages it was asked for.
     struct FakeRemote {
         name: &'static str,
         kind: BaseItemKind,
@@ -1562,14 +1816,26 @@ mod tests {
         fn cache_duration(&self) -> Option<Duration> {
             self.cache
         }
-        async fn get_similar_items(
+        async fn similar_items_page(
             &self,
             _seed: &BaseItemEntity,
             _seed_provider_ids: &HashMap<String, String>,
             _query: &SimilarItemsQuery,
-        ) -> Vec<SimilarItemReference> {
+            page: i32,
+        ) -> SimilarItemsPage {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.references.clone()
+            let start = usize::try_from(page - 1).unwrap_or(0) * FAKE_PAGE_SIZE;
+            SimilarItemsPage {
+                references: self
+                    .references
+                    .iter()
+                    .skip(start)
+                    .take(FAKE_PAGE_SIZE)
+                    .cloned()
+                    .collect(),
+                total_pages: i32::try_from(self.references.len().div_ceil(FAKE_PAGE_SIZE).max(1))
+                    .unwrap_or(i32::MAX),
+            }
         }
     }
 
@@ -1606,7 +1872,7 @@ mod tests {
             _name: &str,
             _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
             _options: &ferrofin_model::configuration::LibraryOptions,
-        ) -> Result<(), ServiceError> {
+        ) -> Result<Option<uuid::Uuid>, ServiceError> {
             unimplemented!()
         }
         async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
@@ -1888,6 +2154,186 @@ mod tests {
         }
     }
 
+    /// `n` TMDB references, ids `1..=n`, in TMDB's order.
+    fn tmdb_references(n: usize) -> Vec<SimilarItemReference> {
+        (1..=n)
+            .map(|id| SimilarItemReference {
+                provider_name: "Tmdb".to_owned(),
+                provider_id: id.to_string(),
+                score: None,
+            })
+            .collect()
+    }
+
+    /// jellyfin/jellyfin#15970: the manager resolves the remote references in
+    /// batches of 20 and stops paging the provider once enough library items
+    /// have resolved, instead of walking every page TMDB reports first.
+    #[tokio::test]
+    async fn remote_paging_stops_once_enough_library_items_resolve() {
+        let db = test_db().await;
+        let library = Uuid::from_u128(0x9ab_d01);
+        let seed = Uuid::from_u128(0x9d0);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
+        // Twenty-five library films TMDB lists first, with no genre overlap:
+        // only the remote provider can surface them.
+        for n in 1..=25_u128 {
+            let id = Uuid::from_u128(0x9d0_000 + n);
+            seed_movie_in(&db, id, &format!("Film {n}"), "Drama", Some(library)).await;
+            FerrofinItemPersistenceService::new(db.clone())
+                .save_provider_id(id, "Tmdb", &n.to_string())
+                .await
+                .expect("save id");
+        }
+        let pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mgr = manager(&db).with_remote_providers(
+            vec![Arc::new(FakeRemote {
+                name: "TheMovieDb",
+                kind: BaseItemKind::Movie,
+                // A hundred pages, as a popular seed's list runs to.
+                references: tmdb_references(100 * FAKE_PAGE_SIZE),
+                cache: None,
+                calls: Arc::clone(&pages),
+            })],
+            Arc::new(FakeFolders {
+                library_id: library,
+                providers: vec!["TheMovieDb".to_owned()],
+            }),
+        );
+        let similar = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(10))
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(similar.len(), 10);
+        assert_eq!(
+            pages.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first batch resolved more than the ten wanted, so no second page"
+        );
+    }
+
+    /// A provider whose pages are not batch-sized: TMDB's twenty, but this
+    /// one's seven, counting the pages it was asked for.
+    struct SevenPerPage {
+        references: Vec<SimilarItemReference>,
+        pages: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl RemoteSimilarItemsProvider for SevenPerPage {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn name(&self) -> &str {
+            "TheMovieDb"
+        }
+        fn supports(&self, item_kind: BaseItemKind) -> bool {
+            item_kind == BaseItemKind::Movie
+        }
+        async fn similar_items_page(
+            &self,
+            _seed: &BaseItemEntity,
+            _seed_provider_ids: &HashMap<String, String>,
+            _query: &SimilarItemsQuery,
+            page: i32,
+        ) -> SimilarItemsPage {
+            self.pages.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let start = usize::try_from(page - 1).unwrap_or(0) * 7;
+            SimilarItemsPage {
+                references: self
+                    .references
+                    .iter()
+                    .skip(start)
+                    .take(7)
+                    .cloned()
+                    .collect(),
+                total_pages: i32::try_from(self.references.len().div_ceil(7)).unwrap_or(i32::MAX),
+            }
+        }
+    }
+
+    /// A batch is twenty references, whatever the pages hold: the first spans
+    /// three pages, and the last, partial one is resolved once the provider
+    /// runs out, so every resolvable reference lands.
+    #[tokio::test]
+    async fn remote_batches_span_pages_and_the_last_partial_batch_resolves() {
+        let db = test_db().await;
+        let library = Uuid::from_u128(0x9ab_d03);
+        let seed = Uuid::from_u128(0x9f0);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
+        for n in 1..=30_u128 {
+            let id = Uuid::from_u128(0x9f0_000 + n);
+            seed_movie_in(&db, id, &format!("Film {n}"), "Drama", Some(library)).await;
+            FerrofinItemPersistenceService::new(db.clone())
+                .save_provider_id(id, "Tmdb", &n.to_string())
+                .await
+                .expect("save id");
+        }
+        let pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mgr = manager(&db).with_remote_providers(
+            vec![Arc::new(SevenPerPage {
+                references: tmdb_references(30),
+                pages: Arc::clone(&pages),
+            })],
+            Arc::new(FakeFolders {
+                library_id: library,
+                providers: vec!["TheMovieDb".to_owned()],
+            }),
+        );
+        let similar = mgr
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), Some(40))
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(similar.len(), 30, "the last ten resolve too");
+        assert_eq!(pages.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    /// jellyfin/jellyfin#17590: on a library that never resolves enough, the
+    /// walk still stops after 500 collected references, and only those are
+    /// cached.
+    #[tokio::test]
+    async fn remote_paging_stops_after_500_references() {
+        let db = test_db().await;
+        let library = Uuid::from_u128(0x9ab_d02);
+        let seed = Uuid::from_u128(0x9e0);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(library)).await;
+        let cache = tempfile::tempdir().expect("cache dir");
+        let pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mgr = manager(&db)
+            .with_cache_dir(cache.path().to_path_buf())
+            .with_remote_providers(
+                vec![Arc::new(FakeRemote {
+                    name: "TheMovieDb",
+                    kind: BaseItemKind::Movie,
+                    // A thousand pages, none of whose titles the library holds.
+                    references: tmdb_references(1000 * FAKE_PAGE_SIZE),
+                    cache: Some(Duration::from_secs(3600)),
+                    calls: Arc::clone(&pages),
+                })],
+                Arc::new(FakeFolders {
+                    library_id: library,
+                    providers: vec!["TheMovieDb".to_owned()],
+                }),
+            );
+        mgr.get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(
+            pages.load(std::sync::atomic::Ordering::SeqCst),
+            500 / FAKE_PAGE_SIZE
+        );
+        let seed_row = mgr
+            .items
+            .retrieve_item(seed)
+            .await
+            .expect("seed")
+            .expect("seed row");
+        let cached =
+            read_reference_cache(&mgr.cache_path("TheMovieDb", &seed_row).expect("cache path"))
+                .expect("cached references");
+        assert_eq!(cached, tmdb_references(500));
+    }
+
     #[tokio::test]
     async fn the_cache_path_matches_jellyfins_layout() {
         // `{cache}/{provider}-similar-{type}/{itemId:N}.json`, all lowercased —
@@ -2028,6 +2474,105 @@ mod tests {
             .filter_map(|r| r.name.clone())
             .collect();
         assert_eq!(names, ["Aliens UHD"], "the higher-scoring copy must win");
+    }
+
+    #[tokio::test]
+    async fn remote_matches_in_a_library_the_user_cannot_access_are_dropped() {
+        // C# `ResolveRemoteReferences` loads the matches through
+        // `InternalItemsQuery(user)`, so a remote reference never surfaces a
+        // row the user's library access hides — and a hidden copy of a film
+        // must not claim the presentation key of the copy the user can see.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x9ac_001)).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let mine = Uuid::from_u128(0x9ac_0a1);
+        let theirs = Uuid::from_u128(0x9ac_0a2);
+        restrict_to_folders(&db, &user, &[mine]).await;
+        let seed = Uuid::from_u128(0x9ac_002);
+        let visible = Uuid::from_u128(0x9ac_003);
+        let hidden_copy = Uuid::from_u128(0x9ac_004);
+        let hidden = Uuid::from_u128(0x9ac_005);
+        seed_movie_in(&db, seed, "Alien", "SciFi", Some(mine)).await;
+        seed_movie_keyed(
+            &db,
+            visible,
+            "Aliens HD",
+            "Drama",
+            Some(mine),
+            Some("aliens"),
+        )
+        .await;
+        seed_movie_keyed(
+            &db,
+            hidden_copy,
+            "Aliens UHD",
+            "Drama",
+            Some(theirs),
+            Some("aliens"),
+        )
+        .await;
+        seed_movie_in(&db, hidden, "Solaris", "Drama", Some(theirs)).await;
+        let persistence = FerrofinItemPersistenceService::new(db.clone());
+        for (id, tmdb) in [
+            (visible, "679-hd"),
+            (hidden_copy, "679-uhd"),
+            (hidden, "348"),
+        ] {
+            persistence
+                .save_provider_id(id, "Tmdb", tmdb)
+                .await
+                .expect("save id");
+        }
+        let reference = |id: &str, score| SimilarItemReference {
+            provider_name: "Tmdb".to_owned(),
+            provider_id: id.to_owned(),
+            score: Some(score),
+        };
+        let mgr = manager(&db).with_remote_providers(
+            vec![Arc::new(FakeRemote {
+                name: "TheMovieDb",
+                kind: BaseItemKind::Movie,
+                references: vec![
+                    reference("348", 0.95),
+                    reference("679-hd", 0.2),
+                    reference("679-uhd", 0.9),
+                ],
+                cache: None,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })],
+            Arc::new(FakeFolders {
+                library_id: mine,
+                providers: vec!["TheMovieDb".to_owned()],
+            }),
+        );
+
+        let for_user = mgr
+            .get_similar_items(seed, &[], Some(user_id), &DtoOptions::default(), Some(10))
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        assert_eq!(names(&for_user), vec!["Aliens HD".to_owned()]);
+
+        let admin = seed_named_user(&db, Uuid::from_u128(0x9ac_006), "admin").await;
+        grant_all_folders(&db, &admin).await;
+        let for_admin = mgr
+            .get_similar_items(
+                seed,
+                &[],
+                Uuid::parse_str(&admin.id).ok(),
+                &DtoOptions::default(),
+                Some(10),
+            )
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        // A user-scoped query groups by presentation key (C#
+        // `EnableGroupByPresentationUniqueKey`), so the two copies of "Aliens"
+        // arrive as one row — the group head, not the better-scored copy.
+        let names = names(&for_admin);
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert_eq!(names[0], "Solaris");
+        assert!(names[1].starts_with("Aliens "), "{names:?}");
     }
 
     #[tokio::test]
@@ -2314,6 +2859,41 @@ mod tests {
         );
     }
 
+    /// `MovieSimilarItemsProvider` builds the seed's people as a `HashSet` of
+    /// person ids per item, so an actor credited in two roles on the seed
+    /// counts once (15), not once per credit row (30). The candidate sharing
+    /// two genres (20) therefore outranks the one sharing only that actor.
+    #[tokio::test]
+    async fn a_seed_actor_with_two_roles_counts_once() {
+        let db = test_db().await;
+        let seed = Uuid::from_u128(0x251);
+        let shares_actor = Uuid::from_u128(0x252);
+        let shares_genres = Uuid::from_u128(0x253);
+        seed_movie(&db, seed, "Seed", "SciFi|Horror").await;
+        seed_movie(&db, shares_actor, "SharesActor", "Romance").await;
+        seed_movie(&db, shares_genres, "SharesGenres", "SciFi|Horror").await;
+        let actor = |role: &str| PeopleEntity {
+            id: String::new(),
+            name: "Pat Actor".to_owned(),
+            person_type: Some("Actor".to_owned()),
+            role: Some(role.to_owned()),
+            ..PeopleEntity::default()
+        };
+        FerrofinPeopleRepository::new(db.clone())
+            .update_people(seed, &[actor("Twin A"), actor("Twin B")])
+            .await
+            .expect("credit two roles");
+        credit_person(&db, shares_actor, "Pat Actor", "Actor").await;
+
+        let similar = manager(&db)
+            .get_similar_items(seed, &[], None, &DtoOptions::default(), None)
+            .await
+            .expect("similar")
+            .expect("seed resolves");
+        let names: Vec<_> = similar.iter().filter_map(|r| r.name.clone()).collect();
+        assert_eq!(names, ["SharesGenres", "SharesActor"]);
+    }
+
     #[tokio::test]
     async fn a_missing_seed_is_reported_as_absent_not_empty() {
         // C# `LibraryController.GetSimilarItems`: `if (item is null) return
@@ -2326,6 +2906,25 @@ mod tests {
             .await
             .expect("similar");
         assert!(similar.is_none());
+    }
+
+    /// `GetMovieRecommendationsAsync`'s baseline orders: recently played by
+    /// `DatePlayed` descending then `Random` (`:319`), liked by `Random` alone
+    /// (`:339`), so a user with more than ten favourites gets a different
+    /// liked set on each load.
+    #[test]
+    fn the_recommendation_baselines_order_as_upstream() {
+        assert_eq!(
+            super::recently_played_query(Uuid::nil()).order_by,
+            vec![
+                (ItemSortBy::DatePlayed, SortOrder::Descending),
+                (ItemSortBy::Random, SortOrder::Descending),
+            ]
+        );
+        assert_eq!(
+            super::liked_query(Uuid::nil(), vec![BaseItemKind::Movie], Vec::new()).order_by,
+            vec![(ItemSortBy::Random, SortOrder::Descending)]
+        );
     }
 
     #[tokio::test]
@@ -2502,7 +3101,7 @@ mod tests {
             crate::test_support::seed_item(&db, folder, BaseItemKind::CollectionFolder).await;
         }
         crate::user_entity_ext::set_preference(
-            db.writer(),
+            &db,
             &user.id,
             ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
             &[blocked.to_string()],
@@ -3303,5 +3902,298 @@ mod tests {
                 category.baseline_item_name
             );
         }
+    }
+
+    /// Credits `people` on `item` in billing order (`ListOrder` 0, 1, …).
+    async fn credit_people(db: &Database, item: Uuid, people: &[(&str, &str)]) {
+        let credits: Vec<PeopleEntity> = people
+            .iter()
+            .map(|(name, person_type)| PeopleEntity {
+                id: String::new(),
+                name: (*name).to_owned(),
+                person_type: Some((*person_type).to_owned()),
+                ..PeopleEntity::default()
+            })
+            .collect();
+        FerrofinPeopleRepository::new(db.clone())
+            .update_people(item, &credits)
+            .await
+            .expect("credit people");
+    }
+
+    #[tokio::test]
+    async fn recommendation_people_come_in_billing_order() {
+        // C# `GetPeopleNamesByItems` orders credits by `ListOrder` and groups
+        // them per item; `GetPeopleNames` flattens with a stable `Distinct`. So
+        // the lead of each film comes before its supporting cast, whatever
+        // order the names or person ids sort in.
+        let db = test_db().await;
+        let first = Uuid::from_u128(0x701);
+        let second = Uuid::from_u128(0x702);
+        seed_movie(&db, first, "First", "SciFi").await;
+        seed_movie(&db, second, "Second", "SciFi").await;
+        credit_people(
+            &db,
+            first,
+            &[
+                ("Zed Lead", "Actor"),
+                ("Amy Support", "Actor"),
+                ("Dee Director", "Director"),
+            ],
+        )
+        .await;
+        credit_people(
+            &db,
+            second,
+            &[
+                ("Yan Lead", "Actor"),
+                ("Bob Guest", "GuestStar"),
+                ("Zed Lead", "Actor"),
+            ],
+        )
+        .await;
+
+        // `second` was played most recently, so its cast leads; `Zed Lead`
+        // keeps the place of his first credit.
+        let names = manager(&db)
+            .repo
+            .people_names_of(&[second, first], &["Actor", "GuestStar"])
+            .await
+            .expect("names");
+        assert_eq!(
+            names,
+            vec!["Yan Lead", "Bob Guest", "Zed Lead", "Amy Support"],
+            "billing order per film, the most recent film first, each name once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_director_category_lists_only_films_the_person_directed() {
+        // C# `GetPersonRecommendations` sets `PersonTypes = [Director]`, and
+        // TranslateQuery restricts the credit to it; it also over-fetches (by
+        // two, plus `PrepareFilterQuery`'s four) and drops a second film with
+        // the same IMDb id.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x711)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let played = Uuid::from_u128(0x712);
+        let acted = Uuid::from_u128(0x713);
+        let directed = Uuid::from_u128(0x714);
+        let same_film = Uuid::from_u128(0x715);
+        seed_movie(&db, played, "Played", "Drama").await;
+        seed_movie(&db, acted, "Acted", "Western").await;
+        seed_movie(&db, directed, "Directed", "Western").await;
+        seed_movie(&db, same_film, "Directed (Extended)", "Western").await;
+        let another = Uuid::from_u128(0x716);
+        seed_movie(&db, another, "Zulu Directed", "Western").await;
+        crate::test_support::seed_library_over(&db, &[played, acted, directed, same_film, another])
+            .await;
+        credit_person(&db, played, "Chris Maker", "Director").await;
+        credit_person(&db, acted, "Chris Maker", "Actor").await;
+        credit_person(&db, directed, "Chris Maker", "Director").await;
+        credit_person(&db, same_film, "Chris Maker", "Director").await;
+        credit_person(&db, another, "Chris Maker", "Director").await;
+        crate::test_support::seed_provider_id(&db, directed, "Imdb", "tt0000001").await;
+        crate::test_support::seed_provider_id(&db, same_film, "Imdb", "tt0000001").await;
+        seed_user_data(&db, user_id, played, true, None).await;
+
+        // `itemLimit` 2: the two editions of one film take the first two rows,
+        // so only the over-fetch leaves room for the second film.
+        // `a_person_category_reads_four_rows_more_for_its_imdb_de_duplication`
+        // pins the `+ 4` on its own.
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 6, 2, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        let directed_by = recs
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::HasDirectorFromRecentlyPlayed)
+            .expect("a directed-by category");
+        assert_eq!(directed_by.baseline_item_name, "Chris Maker");
+        let films = names(&directed_by.items);
+        assert!(
+            !films.contains(&"Acted".to_owned()),
+            "an acting credit is not directing: {films:?}"
+        );
+        assert_eq!(
+            films.len(),
+            2,
+            "one edition per IMDb id, then the next film: {films:?}"
+        );
+        assert!(films.contains(&"Zulu Directed".to_owned()), "{films:?}");
+    }
+
+    #[tokio::test]
+    async fn a_person_category_reads_four_rows_more_for_its_imdb_de_duplication() {
+        // C# `GetPersonRecommendations` asks for `itemLimit + 2` with
+        // `EnableGroupByMetadataKey`, and `PrepareFilterQuery` adds 4 more:
+        // `itemLimit + 6` rows reach `DistinctBy(Imdb).Take(itemLimit)`.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x7a1)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let played = Uuid::from_u128(0x7a2);
+        seed_movie(&db, played, "Played", "Drama").await;
+        credit_person(&db, played, "Chris Maker", "Director").await;
+        // Four editions of one film take the first four rows: `itemLimit + 2`
+        // reads only them, so the second film needs the `+ 4`.
+        let editions: Vec<Uuid> = (0..4).map(|i| Uuid::from_u128(0x7a3 + i)).collect();
+        for (i, &edition) in editions.iter().enumerate() {
+            seed_movie(&db, edition, &format!("Directed (Edition {i})"), "Western").await;
+            credit_person(&db, edition, "Chris Maker", "Director").await;
+            crate::test_support::seed_provider_id(&db, edition, "Imdb", "tt0000001").await;
+        }
+        let another = Uuid::from_u128(0x7a8);
+        seed_movie(&db, another, "Zulu Directed", "Western").await;
+        credit_person(&db, another, "Chris Maker", "Director").await;
+        let mut library = editions.clone();
+        library.extend([played, another]);
+        crate::test_support::seed_library_over(&db, &library).await;
+        seed_user_data(&db, user_id, played, true, None).await;
+
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 6, 2, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        let directed_by = recs
+            .iter()
+            .find(|r| r.recommendation_type == RecommendationType::HasDirectorFromRecentlyPlayed)
+            .expect("a directed-by category");
+        let films = names(&directed_by.items);
+        assert_eq!(films.len(), 2, "one edition, then the next film: {films:?}");
+        assert!(films.contains(&"Zulu Directed".to_owned()), "{films:?}");
+    }
+
+    /// Seeds `count` movies named `<prefix> <i>`, each in a genre of its own
+    /// that one unplayed candidate shares, so each makes one "similar to"
+    /// category. Returns the baselines and every seeded id.
+    async fn baselines_with_candidates(
+        db: &Database,
+        prefix: &str,
+        first_id: u128,
+        count: u128,
+    ) -> (Vec<Uuid>, Vec<Uuid>) {
+        let mut baselines = Vec::new();
+        let mut all = Vec::new();
+        for i in 0..count {
+            let baseline = Uuid::from_u128(first_id + 2 * i);
+            let candidate = Uuid::from_u128(first_id + 2 * i + 1);
+            let genre = format!("{prefix} Genre {i}");
+            seed_movie(db, baseline, &format!("{prefix} {i}"), &genre).await;
+            seed_movie(db, candidate, &format!("{prefix} Candidate {i}"), &genre).await;
+            baselines.push(baseline);
+            all.extend([baseline, candidate]);
+        }
+        (baselines, all)
+    }
+
+    /// How many categories of `kind` the recommendations hold.
+    fn categories_of(recs: &[SimilarItemsRecommendation], kind: RecommendationType) -> usize {
+        recs.iter()
+            .filter(|r| r.recommendation_type == kind)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn the_recently_played_baselines_read_four_rows_past_their_limit() {
+        // C# `GetMovieRecommendationsAsync`: `Limit = 7` with
+        // `EnableGroupByMetadataKey`, which `PrepareFilterQuery` makes 11.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x7b0)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let (played, all) = baselines_with_candidates(&db, "Played", 0x7c00, 9).await;
+        crate::test_support::seed_library_over(&db, &all).await;
+        for &movie in &played {
+            seed_user_data(&db, user_id, movie, true, Some(chrono::Utc::now())).await;
+        }
+
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 20, 1, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        assert_eq!(
+            categories_of(&recs, RecommendationType::SimilarToRecentlyPlayed),
+            9,
+            "all nine played movies fit in 7 + 4 rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_liked_baselines_read_four_rows_past_their_limit() {
+        // C# `GetMovieRecommendationsAsync`: `Limit = 10` with
+        // `EnableGroupByMetadataKey`, which `PrepareFilterQuery` makes 14.
+        use ferrofin_traits::library::UserDataManager as _;
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x7d0)).await;
+        grant_all_folders(&db, &user).await;
+        let user_id = Uuid::parse_str(&user.id).expect("user id");
+        let (liked, all) = baselines_with_candidates(&db, "Liked", 0x7e00, 12).await;
+        crate::test_support::seed_library_over(&db, &all).await;
+        let config: Arc<dyn ServerConfigurationManager> = Arc::new(FakeConfig {
+            external: std::sync::atomic::AtomicBool::new(false),
+        });
+        let user_data = crate::user_data_manager::FerrofinUserDataManager::new(db.clone(), config);
+        for &movie in &liked {
+            user_data
+                .save_user_data(
+                    user_id,
+                    movie,
+                    &ferrofin_model::dto::UpdateUserItemDataDto {
+                        is_favorite: Some(true),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("favourite");
+        }
+
+        let recs = manager(&db)
+            .get_movie_recommendations(Some(user_id), Uuid::nil(), 20, 1, &DtoOptions::default())
+            .await
+            .expect("recommendations");
+        assert_eq!(
+            categories_of(&recs, RecommendationType::SimilarToLikedItem),
+            12,
+            "all twelve liked movies fit in 10 + 4 rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn person_categories_are_queried_only_as_the_round_robin_needs_them() {
+        // C# `GetPersonRecommendations` is a `yield return` iterator pulled by
+        // `MoveNext`: with one category wanted, one actor is looked up, not ten.
+        let db = test_db().await;
+        let user = seed_user(&db, Uuid::from_u128(0x721)).await;
+        grant_all_folders(&db, &user).await;
+        let film = Uuid::from_u128(0x722);
+        seed_movie(&db, film, "Film", "Drama").await;
+        crate::test_support::seed_library_over(&db, &[film]).await;
+        credit_person(&db, film, "Actor 0", "Actor").await;
+        let actors: Vec<String> = (0..10).map(|i| format!("Actor {i}")).collect();
+        let mut directors =
+            PersonCursor::new(&[], RecommendationType::HasDirectorFromRecentlyPlayed);
+        let mut actor_cursor =
+            PersonCursor::new(&actors, RecommendationType::HasActorFromRecentlyPlayed);
+
+        let mgr = manager(&db);
+        let kinds = mgr.movie_candidate_kinds().await;
+        let out = mgr
+            .round_robin_categories(
+                [Vec::new(), Vec::new()],
+                [&mut directors, &mut actor_cursor],
+                1,
+                &PersonQuery {
+                    item_limit: 5,
+                    user: &user,
+                    movie_kinds: &kinds,
+                },
+            )
+            .await
+            .expect("round robin");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].baseline_item_name, "Actor 0");
+        assert_eq!(actor_cursor.next, 1, "only the first actor was queried");
     }
 }

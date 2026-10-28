@@ -18,13 +18,17 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::store::{guid_to_db, opt_datetime_to_db, opt_guid_to_db};
 use ferrofin_model::data::BaseItemKind;
+use ferrofin_model::drawing::{ImageDimensions, ImageFormat};
 use ferrofin_model::entities::ImageType;
+use ferrofin_traits::drawing::{ImageProcessor, ProcessedImage};
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
 use uuid::Uuid;
@@ -36,15 +40,52 @@ use crate::item_type_lookup::stored_type_name;
 /// backed by the real unit-1/2 repositories over the given database, for
 /// manager tests that need to resolve item kinds/rows through the library seam.
 pub fn library_manager_over(db: Database) -> Arc<dyn ferrofin_traits::library::LibraryManager> {
+    Arc::new(concrete_library_manager_over(db))
+}
+
+/// [`library_manager_over`], in the middle of a full library validation that
+/// never ends (its scan waits forever once started), for the maintenance work
+/// that stands down while a scan runs (`ILibraryManager.IsScanRunning`).
+pub async fn library_manager_mid_scan(
+    db: Database,
+) -> Arc<dyn ferrofin_traits::library::LibraryManager> {
+    use ferrofin_traits::error::ServiceError;
+    use ferrofin_traits::library::{LibraryManager as _, ScanTarget};
+
+    /// A scan that says it started, then never finishes.
+    struct EndlessScan(tokio::sync::Notify);
+
+    #[async_trait::async_trait]
+    impl crate::library_manager::ScanRunner for EndlessScan {
+        async fn run(
+            &self,
+            _scope: &ScanTarget,
+            _run: crate::library_scan::ScanRun<'_>,
+        ) -> Result<crate::library_scan::ScanOutcome, ServiceError> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    let scan = Arc::new(EndlessScan(tokio::sync::Notify::new()));
+    let manager = concrete_library_manager_over(db).with_scan_runner(scan.clone());
+    manager.queue_library_scan().await.expect("scan queued");
+    scan.0.notified().await;
+    assert!(manager.is_scan_running(), "the validation is running");
+    Arc::new(manager)
+}
+
+/// The concrete manager [`library_manager_over`] hands out.
+fn concrete_library_manager_over(db: Database) -> crate::library_manager::FerrofinLibraryManager {
     use crate::item_count_service::FerrofinItemCountService;
     use crate::people_repository::FerrofinPeopleRepository;
 
-    Arc::new(crate::library_manager::FerrofinLibraryManager::new(
+    crate::library_manager::FerrofinLibraryManager::new(
         item_repository_over(db.clone()),
         Arc::new(FerrofinItemCountService::new(db.clone())),
         Arc::new(FerrofinItemPersistenceService::new(db.clone())),
         Arc::new(FerrofinPeopleRepository::new(db)),
-    ))
+    )
 }
 
 /// Builds the real [`FerrofinItemRepository`](crate::item_repository::FerrofinItemRepository)
@@ -453,9 +494,10 @@ pub async fn seed_named_item(db: &Database, id: Uuid, kind: BaseItemKind, name: 
 /// optionally parented to `parent`.
 ///
 /// `IsFolder` is what the DTO/count paths branch on (child counts, played
-/// aggregation), and an accessed-by-name row (a genre, or an artist with no
-/// folder on disk) is stored as a folder with a `NULL` `ParentId` — pass `None`
-/// for that shape.
+/// aggregation). An accessed-by-name row (a genre, or an artist with no folder
+/// on disk) is stored with `IsFolder = 0`; seed one here, with a `None`
+/// parent, only to model a row an earlier build wrote (migration 0043 repairs
+/// that shape).
 pub async fn seed_folder_item(
     db: &Database,
     id: Uuid,
@@ -471,6 +513,31 @@ pub async fn seed_folder_item(
             name,
             is_folder: true,
             parent,
+            ..ItemRow::default()
+        },
+    )
+    .await;
+}
+
+/// [`seed_folder_item`] carrying a `Data` blob: a library's `CollectionType`,
+/// or a view's `ViewType` and `DisplayParentId`.
+pub async fn seed_folder_with_data(
+    db: &Database,
+    id: Uuid,
+    kind: BaseItemKind,
+    name: &str,
+    data: &str,
+    parent: Option<Uuid>,
+) {
+    insert_base_item(
+        db,
+        id,
+        kind,
+        &ItemRow {
+            name,
+            is_folder: true,
+            parent,
+            data: Some(data),
             ..ItemRow::default()
         },
     )
@@ -738,4 +805,236 @@ pub async fn corrupt_last_played_date(db: &Database, user: Uuid, item: Uuid) {
     .execute(db.writer())
     .await
     .expect("corrupt last played date");
+}
+
+/// An [`ImageProcessor`] fake: a deterministic cache tag per path, a fixed
+/// 2:1 dimension.
+#[derive(Default)]
+pub struct FakeImages;
+
+#[async_trait]
+impl ImageProcessor for FakeImages {
+    fn supported_input_formats(&self) -> Vec<String> {
+        vec![]
+    }
+    fn supports_image_collage_creation(&self) -> bool {
+        false
+    }
+    fn supported_image_output_formats(&self) -> Vec<ImageFormat> {
+        vec![]
+    }
+    async fn get_image_dimensions(&self, _path: &str) -> Result<ImageDimensions, ServiceError> {
+        Ok(ImageDimensions {
+            width: 400,
+            height: 200,
+        })
+    }
+    async fn get_item_image_dimensions(
+        &self,
+        _item_id: Uuid,
+        _info: &ItemImageInfo,
+    ) -> Result<ImageDimensions, ServiceError> {
+        Ok(ImageDimensions {
+            width: 400,
+            height: 200,
+        })
+    }
+    async fn get_image_blur_hash(&self, _path: &str) -> Result<String, ServiceError> {
+        Ok("blur".into())
+    }
+    async fn get_image_blur_hash_sized(
+        &self,
+        _path: &str,
+        _image_dimensions: ImageDimensions,
+    ) -> Result<String, ServiceError> {
+        Ok("blur".into())
+    }
+    async fn get_image_cache_tag(
+        &self,
+        _item_id: Uuid,
+        image: &ItemImageInfo,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(Some(format!("tag:{}", image.path)))
+    }
+    async fn get_image_cache_tag_for_path(
+        &self,
+        _base_item_path: &str,
+        _image_date_modified: DateTime<Utc>,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(None)
+    }
+    async fn process_image(
+        &self,
+        _options: &ferrofin_traits::options::ImageProcessingOptions,
+    ) -> Result<ProcessedImage, ServiceError> {
+        Err(ServiceError::NotFound("process_image".into()))
+    }
+    async fn create_image_collage(
+        &self,
+        _options: &ferrofin_traits::options::ImageCollageOptions,
+        _library_name: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// A real configuration manager under `dir` whose `PathSubstitutions` hold one
+/// `from` → `to` rule.
+pub async fn configuration_with_path_substitution(
+    dir: &std::path::Path,
+    from: &str,
+    to: &str,
+) -> std::sync::Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager> {
+    use ferrofin_traits::configuration::ServerConfigurationManager as _;
+    let paths = std::sync::Arc::new(crate::FerrofinServerApplicationPaths::new(
+        dir,
+        dir.join("log"),
+        dir.join("config"),
+        dir.join("cache"),
+        dir.join("web"),
+    ));
+    let config = crate::configuration_manager::FerrofinServerConfigurationManager::load(paths)
+        .await
+        .expect("config");
+    let mut settings = (*config.configuration().await.expect("read")).clone();
+    settings.path_substitutions = vec![ferrofin_model::configuration::PathSubstitution {
+        from: from.to_owned(),
+        to: to.to_owned(),
+    }];
+    config.update_configuration(&settings).await.expect("save");
+    std::sync::Arc::new(config)
+}
+
+/// An in-memory log sink for a scoped `fmt` subscriber
+/// (`tracing_subscriber::fmt().with_writer(logs.clone())`).
+#[derive(Clone, Default)]
+pub struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    /// Everything logged so far, as text.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// gl-571's fixture: a user root holding two libraries with one movie each
+/// (file paths, so `GetLinkedChildren(user)` checks their library), a box set
+/// linking both, and a user blocked from the second library.
+pub struct BoxSetAcrossLibraries {
+    /// The root folders, for [`rooted_library_manager`].
+    pub roots: crate::aggregate_folder::RootFolderIds,
+    /// The box set.
+    pub set: Uuid,
+    /// The user, blocked from the second library.
+    pub user: UserEntity,
+    /// The movie in the library the user can open, named "Shown".
+    pub shown: Uuid,
+    /// The movie in the library the user is blocked from, named "Blocked".
+    pub blocked: Uuid,
+}
+
+/// Seeds [`BoxSetAcrossLibraries`].
+pub async fn seed_box_set_across_libraries(db: &Database) -> BoxSetAcrossLibraries {
+    use ferrofin_traits::persistence::LinkedChildrenService as _;
+    let roots = crate::aggregate_folder::RootFolderIds {
+        user_root: Uuid::new_v4(),
+        aggregate: Uuid::new_v4(),
+    };
+    let set = Uuid::new_v4();
+    let user = seed_user_with_defaults(db, Uuid::new_v4()).await;
+    seed_named_item(db, roots.aggregate, BaseItemKind::AggregateFolder, "root").await;
+    seed_named_item(
+        db,
+        roots.user_root,
+        BaseItemKind::UserRootFolder,
+        "Media Folders",
+    )
+    .await;
+    seed_child_item(db, set, BaseItemKind::BoxSet, "Heist", roots.user_root).await;
+    let links = crate::linked_children_service::FerrofinLinkedChildrenService::new(db.clone());
+    let mut seeded = Vec::new();
+    for name in ["Shown", "Blocked"] {
+        let (library, movie) = (Uuid::new_v4(), Uuid::new_v4());
+        seed_child_item(
+            db,
+            library,
+            BaseItemKind::CollectionFolder,
+            name,
+            roots.user_root,
+        )
+        .await;
+        seed_child_item(db, movie, BaseItemKind::Movie, name, library).await;
+        let mut row = fetch_item(db, movie).await;
+        row.top_parent_id = Some(guid_to_db(library));
+        row.path = Some(format!("/media/{name}/{name}.mkv"));
+        save_item(db, &row).await;
+        links
+            .upsert_linked_child(set, movie, 0)
+            .await
+            .expect("link");
+        seeded.push((library, movie));
+    }
+    crate::user_entity_ext::set_preference(
+        db,
+        &user.id,
+        ferrofin_db::enums::PreferenceKind::BlockedMediaFolders,
+        &[guid_to_db(seeded[1].0)],
+    )
+    .await
+    .expect("block");
+    BoxSetAcrossLibraries {
+        roots,
+        set,
+        user,
+        shown: seeded[0].1,
+        blocked: seeded[1].1,
+    }
+}
+
+/// A library manager over `db` wired for browsing as the composition root
+/// wires it: the repository's root ids, `configuration` and the visibility
+/// evaluator.
+pub fn rooted_library_manager(
+    db: &Database,
+    roots: crate::aggregate_folder::RootFolderIds,
+    configuration: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+) -> crate::FerrofinLibraryManager {
+    let items = Arc::new(
+        crate::FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(crate::item_type_lookup::ItemTypeLookup::new()),
+        )
+        .with_root_ids(roots),
+    );
+    let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+        db.clone(),
+        items.clone(),
+        Arc::new(crate::LocalizationManager::new("US")),
+        "/nonexistent/ferrofin-test-data".to_owned(),
+    ));
+    crate::FerrofinLibraryManager::new(
+        items,
+        Arc::new(crate::FerrofinItemCountService::new(db.clone())),
+        Arc::new(crate::FerrofinItemPersistenceService::new(db.clone())),
+        Arc::new(crate::FerrofinPeopleRepository::new(db.clone())),
+    )
+    .with_dashboard_configuration(configuration)
+    .with_visibility(visibility)
 }

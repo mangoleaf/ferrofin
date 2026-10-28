@@ -214,12 +214,16 @@ impl Fixture {
 async fn a_season_with_no_folder_takes_jellyfins_key_and_creation_stamp() {
     let tmp = tempfile::tempdir().expect("tmp");
     let fx = Fixture::scanned(tmp.path()).await;
+    let series_db = guid_to_db(
+        derive_item_id_with(&fx.mode, BaseItemKind::Series, &fx.series.to_string_lossy())
+            .expect("series id"),
+    );
     let mut expected = Vec::new();
     for (n, file) in [(1, "Flat S01E01.mkv"), (2, "Flat S02E01.mkv")] {
         let season = fx.season(n, &format!("Season {n}"));
         let season_db = guid_to_db(season);
         let (parent, season_id, ancestors) = fx.episode_links(file).await;
-        assert_eq!(parent.as_deref(), Some(season_db.as_str()));
+        assert_eq!(parent.as_deref(), Some(series_db.as_str()));
         assert_eq!(season_id.as_deref(), Some(season_db.as_str()));
         assert!(ancestors.contains(&season_db), "{ancestors:?}");
         let (created, modified) = fx.dates(season).await;
@@ -371,8 +375,12 @@ async fn an_older_scans_season_with_no_folder_moves_to_jellyfins_id(#[case] mode
     let mut expected = vec![guid_to_db(first), second_db.clone()];
     expected.sort();
     assert_eq!(fx.seasons().await, expected, "season 1 left alone");
+    let series_db = guid_to_db(
+        derive_item_id_with(&fx.mode, BaseItemKind::Series, &fx.series.to_string_lossy())
+            .expect("series id"),
+    );
     let (parent, season_id, ancestors) = fx.episode_links("Flat S02E01.mkv").await;
-    assert_eq!(parent.as_deref(), Some(second_db.as_str()));
+    assert_eq!(parent.as_deref(), Some(series_db.as_str()));
     assert_eq!(season_id.as_deref(), Some(second_db.as_str()));
     assert!(ancestors.contains(&second_db) && !ancestors.contains(&legacy_db));
     let user_data: Vec<(String, String, bool)> =
@@ -416,7 +424,7 @@ async fn seasons_are_named_by_the_library_and_the_server_culture() {
                 "Flat S00E01.mkv",
                 "Flat S01E01.mkv",
                 "Season 3/Flat S03E01.mkv",
-                "Bonus/Making of.mkv",
+                "Making of.mkv",
             ],
             season_zero: Some("Extras"),
             culture: Some("de"),
@@ -456,6 +464,61 @@ async fn seasons_are_named_by_the_library_and_the_server_culture() {
             );
         }
     }
+}
+
+/// Only the path below the library is read for an episode's numbers: a
+/// folder above it named like `1-12` (here `media-v12-2`) is no season 12,
+/// neither when the scan plans the episode nor when a refresh re-reads it.
+/// Upstream reads the whole path (`FillMissingEpisodeNumbersFromPath`), so
+/// its `([0-9]+)-([0-9]+)` expression matches there.
+#[tokio::test]
+async fn digits_above_the_library_are_no_season() {
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fx = Fixture::scanned_with(
+        &tmp.path().join("media-v12-2"),
+        Setup {
+            files: &["Flat S01E01.mkv", "Making of.mkv"],
+            culture: Some("de"),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let read = || async {
+        let mut seasons: Vec<(Option<i64>, Option<String>)> =
+            sqlx::query_as(r#"SELECT "IndexNumber", "Name" FROM "BaseItems" WHERE "Type" = ?1"#)
+                .bind(SEASON)
+                .fetch_all(fx.db.pool())
+                .await
+                .expect("seasons");
+        seasons.sort();
+        let bonus: Option<i64> = sqlx::query_scalar(
+            r#"SELECT "ParentIndexNumber" FROM "BaseItems" WHERE "Path" LIKE '%/Making of.mkv'"#,
+        )
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("bonus episode");
+        (seasons, bonus)
+    };
+    let scanned = (
+        vec![
+            (None, Some("Staffel unbekannt".to_owned())),
+            (Some(1), Some("Staffel 1".to_owned())),
+        ],
+        None,
+    );
+    assert_eq!(read().await, scanned, "planned");
+    let replace_all = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        replace_all_metadata: true,
+        force_save: true,
+        ..MetadataRefreshOptions::default()
+    };
+    fx.scanner
+        .scan_with(None, &replace_all)
+        .await
+        .expect("replace all");
+    assert_eq!(read().await, scanned, "refreshed");
 }
 
 /// The repair leaves an older scan's season alone when the id it would move
@@ -515,10 +578,14 @@ async fn of_two_stored_seasons_of_a_number_the_scan_keeps_the_first_by_id() {
     }
     let low_db = guid_to_db(low);
 
+    let series_db = guid_to_db(
+        derive_item_id_with(&fx.mode, BaseItemKind::Series, &fx.series.to_string_lossy())
+            .expect("series id"),
+    );
     let rescan = fx.scanner.scan_all().await.expect("rescan");
     assert_eq!((rescan.created, rescan.removed), (0, 1), "{rescan:?}");
     let (parent, season, ancestors) = fx.episode_links("Flat S01E01.mkv").await;
-    assert_eq!(parent.as_deref(), Some(low_db.as_str()));
+    assert_eq!(parent.as_deref(), Some(series_db.as_str()));
     assert_eq!(season.as_deref(), Some(low_db.as_str()));
     assert!(!ancestors.contains(&guid_to_db(high)), "{ancestors:?}");
     let seasons = fx.seasons().await;

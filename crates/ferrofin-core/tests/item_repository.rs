@@ -333,6 +333,187 @@ async fn movie_page_hydration_plan_materializes_keys_before_primary_key_fetches(
     );
 }
 
+/// The grouped browse picks one row per `PresentationUniqueKey` in a subquery
+/// (`ApplyGroupingFilter`). Its plan is pinned: the filtered rows come off the
+/// type index, the representatives are computed once as a list (never per
+/// outer row), and the outer query fetches each one by its primary key.
+#[tokio::test]
+async fn grouped_browse_plan_computes_representatives_once() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB00)).await;
+    let filter = InternalItemsQuery {
+        user: Some(user),
+        recursive: true,
+        include_item_types: vec![BaseItemKind::Movie],
+        limit: Some(100),
+        order_by: vec![(ItemSortBy::DateCreated, SortOrder::Descending)],
+        ..Default::default()
+    };
+    let mut builder = build_query(&filter, QueryShape::FullRows);
+    let mut query = builder.build();
+    let args = query.take_arguments().expect("arguments").expect("binds");
+    let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+    let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+        .fetch_all(db.pool())
+        .await
+        .expect("explain")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        plan.starts_with(
+            "SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?) | LIST SUBQUERY"
+        ),
+        "the outer query probes the representatives by id: {plan}"
+    );
+    assert!(
+        !plan.contains("CORRELATED LIST SUBQUERY"),
+        "the representatives are computed once: {plan}"
+    );
+    let grouping = plan
+        .split("CO-ROUTINE")
+        .nth(1)
+        .expect("the grouping runs as a co-routine");
+    assert!(
+        grouping.contains("SEARCH bi USING INDEX IX_BaseItems_Type_TopParentId_StartDate (Type=?)"),
+        "{plan}"
+    );
+    assert!(
+        !grouping.contains("SCAN bi"),
+        "must not scan the library: {plan}"
+    );
+}
+
+/// `Person` + `PersonTypes` (movie recommendations' "directed by") stays a
+/// correlated lookup: the credit is found through the item's own map rows
+/// and the `Peoples` primary key, never by scanning `Peoples` for the type.
+#[tokio::test]
+async fn person_type_filter_plan_stays_on_the_items_credits() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    let user = seed_user_who_sees_everything(&db, Uuid::from_u128(0xB10)).await;
+    let by_name = InternalItemsQuery {
+        user: Some(user.clone()),
+        include_item_types: vec![BaseItemKind::Movie],
+        person: Some("Chris Maker".to_owned()),
+        person_types: vec!["Director".to_owned()],
+        limit: Some(7),
+        ..Default::default()
+    };
+    let by_id = InternalItemsQuery {
+        person: None,
+        person_ids: vec![Uuid::from_u128(0xB11)],
+        ..by_name.clone()
+    };
+    for filter in [by_name, by_id] {
+        let mut builder = build_query(&filter, QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(plan.contains("SEARCH pm USING"), "{plan}");
+        assert!(plan.contains("(ItemId=?"), "{plan}");
+        assert!(!plan.contains("SCAN pp"), "{plan}");
+    }
+}
+
+#[tokio::test]
+async fn person_types_restrict_the_matching_credit() {
+    // TranslateQuery: `f.People.Name == filter.Person && (personTypes.Length == 0
+    // || personTypes.Contains(f.People.PersonType))`, and the same for PersonIds.
+    use ferrofin_core::people_repository::FerrofinPeopleRepository;
+    use ferrofin_db::entities::base_items::PeopleEntity;
+    use ferrofin_traits::persistence::PeopleRepository as _;
+
+    let db = fresh_db().await;
+    let acted = Uuid::from_u128(0xB21);
+    let directed = Uuid::from_u128(0xB22);
+    for (id, name) in [(acted, "Acted"), (directed, "Directed")] {
+        // The DB GUID form, which the credit writer keys its rows by.
+        let movie = BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(id),
+            ..item(id, BaseItemKind::Movie, name)
+        };
+        FerrofinItemPersistenceService::new(db.clone())
+            .save_items(&[movie])
+            .await
+            .expect("seed");
+    }
+    for (id, person_type) in [(acted, "Actor"), (directed, "Director")] {
+        FerrofinPeopleRepository::new(db.clone())
+            .update_people(
+                id,
+                &[PeopleEntity {
+                    name: "Chris Maker".to_owned(),
+                    person_type: Some(person_type.to_owned()),
+                    ..PeopleEntity::default()
+                }],
+            )
+            .await
+            .expect("credit");
+    }
+    let names = |filter: InternalItemsQuery| {
+        let db = db.clone();
+        async move {
+            let mut names: Vec<String> = repo(&db)
+                .get_item_list(&filter)
+                .await
+                .expect("items")
+                .into_iter()
+                .filter_map(|i| i.name)
+                .collect();
+            names.sort();
+            names
+        }
+    };
+    let by_name = |person_types: Vec<String>| InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Movie],
+        person: Some("Chris Maker".to_owned()),
+        person_types,
+        ..Default::default()
+    };
+    assert_eq!(names(by_name(Vec::new())).await, ["Acted", "Directed"]);
+    assert_eq!(
+        names(by_name(vec!["Director".to_owned()])).await,
+        ["Directed"]
+    );
+
+    // The PersonIds arm, through its name bridge: the browsable Person item's
+    // id resolves to the credited name.
+    let person = Uuid::from_u128(0xB23);
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(&[BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(person),
+            ..item(person, BaseItemKind::Person, "Chris Maker")
+        }])
+        .await
+        .expect("seed person");
+    let by_id = |person_types: Vec<String>| InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Movie],
+        person_ids: vec![person],
+        person_types,
+        ..Default::default()
+    };
+    assert_eq!(names(by_id(Vec::new())).await, ["Acted", "Directed"]);
+    assert_eq!(
+        names(by_id(vec!["Director".to_owned()])).await,
+        ["Directed"]
+    );
+}
+
 #[tokio::test]
 async fn movie_page_hydration_leaves_other_query_plans_unchanged() {
     use ferrofin_core::translate_query::{QueryShape, build_query};
@@ -640,6 +821,80 @@ async fn name_and_ordering_translate() {
     assert_eq!(hit[0].name.as_deref(), Some("Memento"));
 }
 
+/// `sortBy=Name` (jellyfin-web's Songs "Track name") orders by `CleanName`,
+/// as upstream `OrderMapper` maps it — not by the `SortName`, which for a
+/// track is `{disc} - {track} - {name}` and so would give track order.
+#[tokio::test]
+async fn name_sort_orders_by_clean_name_not_sort_name() {
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    let track = |id: u128, number: &str, name: &str| {
+        let mut row = item(Uuid::from_u128(id), BaseItemKind::Audio, name);
+        row.sort_name = Some(format!("0001 - {number} - {name}"));
+        row
+    };
+    persist
+        .save_items(&[
+            track(0xC01, "0001", "Zebra"),
+            track(0xC02, "0002", "Apple"),
+            track(0xC03, "0003", "Mango"),
+        ])
+        .await
+        .expect("save");
+
+    for (order, expected) in [
+        (SortOrder::Ascending, ["Apple", "Mango", "Zebra"]),
+        (SortOrder::Descending, ["Zebra", "Mango", "Apple"]),
+    ] {
+        let rows = repository
+            .get_item_list(&InternalItemsQuery {
+                order_by: vec![(ItemSortBy::Name, order)],
+                ..Default::default()
+            })
+            .await
+            .expect("query");
+        let names: Vec<_> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+        assert_eq!(names, expected, "sortBy=Name {order:?}");
+    }
+}
+
+/// A typed `sortBy=Name` page keeps the sort it had while `Name` fell back to
+/// `SortName`: the pinned `+CleanName` stops `IX_BaseItems_Type_CleanName`
+/// from walking every row of the type, in every library, to fill one page.
+#[tokio::test]
+async fn name_sort_plan_sorts_rather_than_walking_the_clean_name_index() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    for order in [SortOrder::Ascending, SortOrder::Descending] {
+        let filter = InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::Audio],
+            top_parent_ids: vec![Uuid::from_u128(0xC10)],
+            limit: Some(100),
+            order_by: vec![(ItemSortBy::Name, order)],
+            ..Default::default()
+        };
+        let mut builder = build_query(&filter, QueryShape::FullRows);
+        let mut query = builder.build();
+        let args = query.take_arguments().expect("arguments").expect("binds");
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .expect("explain")
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "{order:?}: {plan}"
+        );
+    }
+}
+
 /// `ItemSortBy::Random` has to reach the database as a per-row draw.
 ///
 /// Two failure modes this pins, both of which pass every other test in this
@@ -753,11 +1008,8 @@ async fn counts_group_by_kind() {
     assert_eq!(by_kind.movie_count, 2);
     assert_eq!(by_kind.series_count, 1);
     assert_eq!(by_kind.episode_count, 1);
-    // Top-level ItemCount serializes as 0: Jellyfin's LibraryController never
-    // assigns it, so get_item_counts zeroes the grand total (the per-type counts
-    // above still populate). The real total is available via get_count, asserted
-    // as 4 above.
-    assert_eq!(by_kind.item_count, 0);
+    // Jellyfin 12's ItemCount is the grand total, the same 4 get_count returns.
+    assert_eq!(by_kind.item_count, 4);
 }
 
 #[tokio::test]
@@ -1144,6 +1396,59 @@ async fn premiere_date_sort_falls_back_to_production_year() {
         .expect("query");
     let names: Vec<_> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
     assert_eq!(names, ["Newer", "Older"]);
+}
+
+/// A query sorted by `AiredEpisodeOrder` orders by `SortName`, as upstream's
+/// SQL does: `OrderMapper.MapOrderByField` has no arm for the key, and
+/// `ApplyOrder` adds the final `SortName`. The aired-order comparer belongs to
+/// the in-memory sorts only, so seasons and other items are not pushed to the
+/// front and specials not to the back.
+#[tokio::test]
+async fn aired_episode_order_query_sorts_by_sort_name() {
+    tokio::time::timeout(std::time::Duration::from_mins(1), async {
+        let db = fresh_db().await;
+        let persist = FerrofinItemPersistenceService::new(db.clone());
+        let repository = repo(&db);
+        let row = |id: u128, kind: BaseItemKind, name: &str, sort_name: &str| {
+            let mut row = item(Uuid::from_u128(id), kind, name);
+            row.sort_name = Some(sort_name.to_owned());
+            row
+        };
+        let mut episode = row(0xD02, BaseItemKind::Episode, "b", "001 - 0002 - b");
+        episode.parent_index_number = Some(1);
+        episode.index_number = Some(2);
+        let mut special = row(0xD03, BaseItemKind::Episode, "s", "000 - 0001 - s");
+        special.parent_index_number = Some(0);
+        special.index_number = Some(1);
+        let mut season = row(0xD04, BaseItemKind::Season, "Season 1", "0001");
+        season.index_number = Some(1);
+        persist
+            .save_items(&[
+                row(0xD01, BaseItemKind::Movie, "alpha", "alpha"),
+                episode,
+                special,
+                season,
+            ])
+            .await
+            .expect("save");
+
+        for (order, expected) in [
+            (SortOrder::Ascending, ["s", "Season 1", "b", "alpha"]),
+            (SortOrder::Descending, ["alpha", "b", "Season 1", "s"]),
+        ] {
+            let rows = repository
+                .get_item_list(&InternalItemsQuery {
+                    order_by: vec![(ItemSortBy::AiredEpisodeOrder, order)],
+                    ..Default::default()
+                })
+                .await
+                .expect("query");
+            let names: Vec<_> = rows.iter().filter_map(|r| r.name.as_deref()).collect();
+            assert_eq!(names, expected, "sortBy=AiredEpisodeOrder {order:?}");
+        }
+    })
+    .await
+    .expect("test timed out");
 }
 
 #[tokio::test]
@@ -1621,8 +1926,11 @@ fn collection_manager_over(db: &ferrofin_db::Database) -> ferrofin_core::Ferrofi
     )
 }
 
+/// v12.2 `BuildMaxParentalRatingFilter` (45d7760a14): a container is only as
+/// visible as its Manual members, whatever rating it carries itself — the rc7
+/// rule let a rated container pass on its own rating alone.
 #[tokio::test]
-async fn maximum_rating_only_uses_linked_children_for_an_unrated_parent() {
+async fn maximum_rating_gates_every_container_on_its_members() {
     use ferrofin_model::entities_media::ParentalRatingScore;
     use ferrofin_traits::persistence::LinkedChildrenService as _;
     let db = fresh_db().await;
@@ -1653,12 +1961,9 @@ async fn maximum_rating_only_uses_linked_children_for_an_unrated_parent() {
         max_parental_rating: Some(ParentalRatingScore::new(12, None)),
         ..Default::default()
     };
-    let found = repo(&db).get_item_list(&query).await.unwrap();
-    assert_eq!(
-        found.iter().map(|i| i.name.as_deref()).collect::<Vec<_>>(),
-        vec![Some("rated")]
-    );
-    // A child below the limit admits an unrated container too.
+    // Every member over the limit hides the rated container as well.
+    assert!(repo(&db).get_item_list(&query).await.unwrap().is_empty());
+    // A member within the limit admits both.
     let mut child = item(Uuid::from_u128(0x990), BaseItemKind::Movie, "child");
     child.inherited_parental_rating_value = Some(12);
     child.inherited_parental_rating_sub_value = Some(0);
@@ -1757,5 +2062,431 @@ async fn item_value_sorts_order_by_the_first_value_of_the_type() {
         order(ItemSortBy::Artist, SortOrder::Ascending).await,
         ["Bravo", "Delta", "Charlie", "Alpha", "Echo"],
         "no artist first, then by name (ties by SortName)"
+    );
+}
+
+/// Four series in one library, each keyed `series-<name>`, with one episode
+/// each. The user finished Bravo's episode last (March) and Alpha's before it
+/// (January), is part-way through Charlie's, played most recently (May) but
+/// not finished, and never played Delta's. Another user finished Charlie's in
+/// June. `ProductionYear` runs the other way, to show it is not what orders
+/// them.
+async fn series_play_fixture(db: &Database) -> ferrofin_db::entities::users::UserEntity {
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let library = Uuid::from_u128(0x8300);
+    let mut rows = vec![{
+        let mut row = item(library, BaseItemKind::CollectionFolder, "Shows");
+        row.id = row.id.to_uppercase();
+        row
+    }];
+    let user = seed_user_who_sees_everything(db, Uuid::from_u128(0x83FF)).await;
+    let other = Uuid::from_u128(0x83FE).to_string().to_uppercase();
+    sqlx::query(
+        r#"INSERT INTO "Users"
+           ("Id", "AuthenticationProviderId", "DisplayCollectionsView",
+            "DisplayMissingEpisodes", "EnableAutoLogin", "EnableLocalPassword",
+            "EnableNextEpisodeAutoPlay", "EnableUserPreferenceAccess",
+            "HidePlayedInLatest", "InternalId", "InvalidLoginAttemptCount",
+            "MaxActiveSessions", "MustUpdatePassword",
+            "PasswordResetProviderId", "PlayDefaultAudioTrack",
+            "RememberAudioSelections", "RememberSubtitleSelections",
+            "RowVersion", "SubtitleMode", "SyncPlayAccess", "Username", "NormalizedUsername")
+           VALUES (?1, '', 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, '', 1, 1, 1, 0, 0, 0, 'ann', 'ANN')"#,
+    )
+    .bind(&other)
+    .execute(db.writer())
+    .await
+    .expect("seed the other user");
+    let mut episodes = Vec::new();
+    for (n, (name, year)) in [
+        ("Alpha", 2004),
+        ("Bravo", 2003),
+        ("Charlie", 2002),
+        ("Delta", 2001),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let key = format!("series-{}", name.to_lowercase());
+        let base = 0x8310 + 0x10 * u128::try_from(n).unwrap();
+        let mut series = item(Uuid::from_u128(base), BaseItemKind::Series, name);
+        series.id = series.id.to_uppercase();
+        series.top_parent_id = Some(library.to_string().to_uppercase());
+        series.presentation_unique_key = Some(key.clone());
+        series.production_year = Some(year);
+        let mut episode = item(Uuid::from_u128(base + 1), BaseItemKind::Episode, "Pilot");
+        episode.id = episode.id.to_uppercase();
+        episode.top_parent_id = Some(library.to_string().to_uppercase());
+        episode.series_presentation_unique_key = Some(key);
+        episodes.push(episode.id.clone());
+        rows.extend([series, episode]);
+    }
+    persist.save_items(&rows).await.expect("save");
+    for (episode, who, played, last_played) in [
+        (0, &user.id, true, "2026-01-10 00:00:00.0000000"),
+        (1, &user.id, true, "2026-03-10 00:00:00.0000000"),
+        (2, &user.id, false, "2026-05-10 00:00:00.0000000"),
+        (2, &other, true, "2026-06-10 00:00:00.0000000"),
+    ] {
+        sqlx::query(
+            r#"INSERT INTO "UserData"
+               ("ItemId","UserId","CustomDataKey","IsFavorite","LastPlayedDate",
+                "PlayCount","PlaybackPositionTicks","Played")
+               VALUES (?1,?2,?1,0,?3,1,?4,?5)"#,
+        )
+        .bind(&episodes[episode])
+        .bind(who)
+        .bind(last_played)
+        .bind(if played { 0_i64 } else { 5_000_i64 })
+        .bind(played)
+        .execute(db.writer())
+        .await
+        .expect("user data");
+    }
+    user
+}
+
+/// `SeriesDatePlayed` orders series by the newest finished episode the user
+/// played (`ApplySeriesDatePlayedOrder`, v12.2 QueryBuilding.cs:386-420): the
+/// played rows grouped by `SeriesPresentationUniqueKey` and matched on the
+/// series' `PresentationUniqueKey`. An unfinished episode does not count, a
+/// series never finished sorts as `NULL` (last descending, first ascending),
+/// and `SortName` breaks ties ascending in either direction. Without a search
+/// the key replaces the whole ordering, so a `ProductionYear` key beside it
+/// orders nothing. Without a user, every user's plays count
+/// (`OrderMapper.cs:84-87`). With a search, the date is one key among the
+/// caller's, after the relevance rank (`OrderMapper.cs:78-83`).
+#[tokio::test]
+async fn series_date_played_orders_series_by_their_newest_finished_episode() {
+    let db = fresh_db().await;
+    let user = series_play_fixture(&db).await;
+    let order = |user: Option<ferrofin_db::entities::users::UserEntity>,
+                 search_term: Option<&str>,
+                 order_by: Vec<(ItemSortBy, SortOrder)>| {
+        let db = db.clone();
+        let search_term = search_term.map(str::to_owned);
+        async move {
+            repo(&db)
+                .get_item_list(&InternalItemsQuery {
+                    user,
+                    search_term,
+                    include_item_types: vec![BaseItemKind::Series],
+                    order_by,
+                    ..Default::default()
+                })
+                .await
+                .expect("query")
+                .into_iter()
+                .filter_map(|r| r.name)
+                .collect::<Vec<_>>()
+        }
+    };
+    let me = Some(user.clone());
+    // jellyfin-web's TV Shows "Date played" sort.
+    assert_eq!(
+        order(
+            me.clone(),
+            None,
+            vec![
+                (ItemSortBy::SeriesDatePlayed, SortOrder::Descending),
+                (ItemSortBy::SortName, SortOrder::Ascending),
+            ]
+        )
+        .await,
+        ["Bravo", "Alpha", "Charlie", "Delta"]
+    );
+    assert_eq!(
+        order(
+            me.clone(),
+            None,
+            vec![(ItemSortBy::SeriesDatePlayed, SortOrder::Ascending)]
+        )
+        .await,
+        ["Charlie", "Delta", "Alpha", "Bravo"]
+    );
+    assert_eq!(
+        order(
+            me.clone(),
+            None,
+            vec![
+                (ItemSortBy::ProductionYear, SortOrder::Ascending),
+                (ItemSortBy::SeriesDatePlayed, SortOrder::Descending),
+            ]
+        )
+        .await,
+        ["Bravo", "Alpha", "Charlie", "Delta"],
+        "the other keys are dropped, as upstream"
+    );
+    // No user: the other user's June finish puts Charlie first.
+    assert_eq!(
+        order(
+            None,
+            None,
+            vec![(ItemSortBy::SeriesDatePlayed, SortOrder::Descending)]
+        )
+        .await,
+        ["Charlie", "Bravo", "Alpha", "Delta"]
+    );
+    // A search keeps the caller's keys: Alpha, Charlie and Delta all contain
+    // the term alike, so the date leads and `SortName` follows it.
+    assert_eq!(
+        order(
+            me,
+            Some("l"),
+            vec![
+                (ItemSortBy::SeriesDatePlayed, SortOrder::Descending),
+                (ItemSortBy::SortName, SortOrder::Descending),
+            ]
+        )
+        .await,
+        ["Alpha", "Delta", "Charlie"]
+    );
+}
+
+/// The series dates come from one pass over the user's played rows, grouped
+/// once and looked up per series through an index SQLite builds on the
+/// grouped result, as upstream's pre-aggregated join is: never a walk of the
+/// user's `UserData` per series row.
+#[tokio::test]
+async fn series_date_played_plan_groups_the_users_plays_once() {
+    use ferrofin_core::translate_query::{QueryShape, build_query};
+    use sqlx::{Execute as _, Row as _};
+
+    let db = fresh_db().await;
+    let user = series_play_fixture(&db).await;
+    let filter = InternalItemsQuery {
+        user: Some(user),
+        include_item_types: vec![BaseItemKind::Series],
+        order_by: vec![
+            (ItemSortBy::SeriesDatePlayed, SortOrder::Descending),
+            (ItemSortBy::SortName, SortOrder::Ascending),
+        ],
+        limit: Some(100),
+        ..Default::default()
+    };
+    let mut builder = build_query(&filter, QueryShape::FullRows);
+    let mut query = builder.build();
+    let args = query.take_arguments().expect("arguments").expect("binds");
+    let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+    let plan = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+        .fetch_all(db.pool())
+        .await
+        .expect("explain")
+        .iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(plan.contains("MATERIALIZE series_plays"), "{plan}");
+    assert!(
+        plan.contains("SEARCH series_plays USING AUTOMATIC"),
+        "looked up per series by key: {plan}"
+    );
+}
+
+/// `ImageProcessor.ProcessImage`'s `autoOrient` comes back with the image
+/// rows: a photo is oriented unless its stored orientation is `TopLeft`, and
+/// nothing else is; the rows are those `get_image_infos` reads.
+#[tokio::test]
+async fn image_infos_carry_the_photo_auto_orientation() {
+    use ferrofin_model::entities::ImageType;
+    use ferrofin_traits::options::ItemImageInfo;
+
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let rotated = Uuid::new_v4();
+    let upright = Uuid::new_v4();
+    let unknown = Uuid::new_v4();
+    let movie = Uuid::new_v4();
+    // Stored the way the image rows' foreign key reads it.
+    let with_data = |id: Uuid, kind, data: Option<&str>| BaseItemEntity {
+        id: id.to_string().to_uppercase(),
+        data: data.map(str::to_owned),
+        ..item(id, kind, "Item")
+    };
+    persist
+        .save_items(&[
+            with_data(
+                rotated,
+                BaseItemKind::Photo,
+                Some(r#"{"Orientation":"RightTop"}"#),
+            ),
+            with_data(
+                upright,
+                BaseItemKind::Photo,
+                Some(r#"{"Orientation":"TopLeft"}"#),
+            ),
+            with_data(unknown, BaseItemKind::Photo, None),
+            with_data(
+                movie,
+                BaseItemKind::Movie,
+                Some(r#"{"Orientation":"RightTop"}"#),
+            ),
+        ])
+        .await
+        .expect("save");
+    for id in [rotated, upright, unknown, movie] {
+        let image = |image_type| ItemImageInfo {
+            path: format!("/media/{id}.jpg"),
+            image_type,
+            date_modified: chrono::Utc::now(),
+            ..ItemImageInfo::default()
+        };
+        persist
+            .save_item_images(id, &[image(ImageType::Primary), image(ImageType::Thumb)])
+            .await
+            .expect("images");
+    }
+
+    let repo = repo(&db);
+    for (id, expected) in [
+        (rotated, true),
+        (upright, false),
+        (unknown, true),
+        (movie, false),
+    ] {
+        let (images, auto_orient) = repo
+            .get_image_infos_with_auto_orient(id)
+            .await
+            .expect("read");
+        assert_eq!(auto_orient, expected, "{id}");
+        assert_eq!(images, repo.get_image_infos(id).await.expect("read"));
+    }
+    let (images, auto_orient) = repo
+        .get_image_infos_with_auto_orient(Uuid::new_v4())
+        .await
+        .expect("read");
+    assert!(images.is_empty() && !auto_orient);
+
+    // The owner is read by primary key beside the image rows' own index, and
+    // that index already yields the order: no scan, no sort.
+    let shown = plan(
+        &db,
+        r#"SELECT ii.*, bi."Type" = 'x' AS "IsPhoto",
+                CASE WHEN bi."Type" = 'x' THEN bi."Data" END AS "PhotoData"
+            FROM "BaseItemImageInfos" ii
+            JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
+            WHERE ii."ItemId" = 'y'
+            ORDER BY ii."ImageType", ii.rowid"#,
+    )
+    .await;
+    assert!(
+        shown.contains("SEARCH bi USING INDEX sqlite_autoindex_BaseItems_1 (Id=?)")
+            && shown.contains("SEARCH ii USING INDEX")
+            && !shown.contains("SCAN")
+            && !shown.contains("TEMP B-TREE"),
+        "{shown}"
+    );
+}
+
+/// What `GET /Items`' `albums` and `artists` name filters resolve to and
+/// filter by. An album name is the first `MusicAlbum` of that `CleanName` by
+/// `SortName` (`GetItemIds(new InternalItemsQuery { IncludeItemTypes =
+/// [MusicAlbum], Name = name, Limit = 1 })`); `AlbumIds` keeps the album's
+/// tracks; and the nil id an unknown name takes matches nothing for
+/// `AlbumIds` and `ArtistIds`.
+#[tokio::test]
+async fn album_and_artist_filters_and_the_unresolved_name_id() {
+    use ferrofin_db::enums::ItemValueType;
+    use ferrofin_db::store::guid_to_db;
+    let db = fresh_db().await;
+    let persist = FerrofinItemPersistenceService::new(db.clone());
+    let repository = repo(&db);
+    // The album that sorts first has the larger id, so neither id nor
+    // insertion order can pass for the SortName order.
+    let (first, second, other) = (
+        Uuid::from_u128(0xD02),
+        Uuid::from_u128(0xD01),
+        Uuid::from_u128(0xD03),
+    );
+    let (in_first, in_second, in_other) = (
+        Uuid::from_u128(0xD11),
+        Uuid::from_u128(0xD12),
+        Uuid::from_u128(0xD13),
+    );
+    let album = |id, name: &str, sort: &str| BaseItemEntity {
+        id: guid_to_db(id),
+        sort_name: Some(sort.to_owned()),
+        is_folder: true,
+        ..item(id, BaseItemKind::MusicAlbum, name)
+    };
+    let track = |id, parent: Uuid| BaseItemEntity {
+        id: guid_to_db(id),
+        parent_id: Some(guid_to_db(parent)),
+        ..item(id, BaseItemKind::Audio, "Track")
+    };
+    persist
+        .save_items(&[
+            album(second, "Greatest Hits", "Greatest Hits 2"),
+            album(first, "Greatest Hits", "Greatest Hits 1"),
+            album(other, "Other", "Other"),
+        ])
+        .await
+        .unwrap();
+    persist
+        .save_items(&[
+            track(in_first, first),
+            track(in_second, second),
+            track(in_other, other),
+        ])
+        .await
+        .unwrap();
+    persist
+        .save_item_values(
+            in_first,
+            &[(i32::from(ItemValueType::Artist), "Test Artist".to_owned())],
+        )
+        .await
+        .unwrap();
+
+    let by_name = InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::MusicAlbum],
+        name: Some("Greatest Hits".to_owned()),
+        limit: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(repository.get_item_ids(&by_name).await.unwrap(), [first]);
+
+    let tracks = |album_ids: Vec<Uuid>, artist_ids: Vec<Uuid>| InternalItemsQuery {
+        include_item_types: vec![BaseItemKind::Audio],
+        album_ids,
+        artist_ids,
+        ..Default::default()
+    };
+    assert_eq!(
+        repository
+            .get_item_ids(&tracks(vec![first], Vec::new()))
+            .await
+            .unwrap(),
+        [in_first]
+    );
+    assert!(
+        repository
+            .get_item_ids(&tracks(vec![Uuid::nil()], Vec::new()))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        repository
+            .get_item_ids(&tracks(Vec::new(), vec![Uuid::nil()]))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let artist = repository
+        .get_item_ids(&InternalItemsQuery {
+            include_item_types: vec![BaseItemKind::MusicArtist],
+            name: Some("Test Artist".to_owned()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(artist.len(), 1, "saving the value materialized the artist");
+    assert_eq!(
+        repository
+            .get_item_ids(&tracks(Vec::new(), artist))
+            .await
+            .unwrap(),
+        [in_first]
     );
 }

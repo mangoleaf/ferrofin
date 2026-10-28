@@ -1,21 +1,24 @@
-//! [`FerrofinPluginManager`] — the registry-backed [`PluginManager`] for Tier-1
-//! (compile-time) plugins.
+//! [`FerrofinPluginManager`] — the registry-backed [`PluginManager`] for the
+//! compiled-in (Tier 1a) plugins and the WASM (Tier 1b) plugins the host
+//! loaded at boot.
 //!
-//! Plugins are Rust crates compiled into the server and handed to this manager as
-//! [`RegisteredPlugin`] entries at the composition root. The manager owns the
-//! immutable registry plus the mutable, on-disk state (per-plugin enabled flag,
-//! package repositories, per-plugin configuration JSON) rooted at a `plugins/`
-//! directory under the server config dir.
+//! Both are handed to this manager as [`RegisteredPlugin`] entries at the
+//! composition root. The manager owns the registry plus the mutable, on-disk
+//! state (per-plugin enabled flag, package repositories, per-plugin
+//! configuration JSON, the install ledger) rooted at a `plugins/` directory
+//! under the server config dir.
 //!
-//! Runtime installation / removal (a dynamic plugin host — WASM or `libloading`)
-//! is **Tier 2** and out of scope: [`remove_plugin`](PluginManager::remove_plugin)
-//! rejects a compiled-in extension (and, like upstream, silently ignores a
-//! plugin that reports `CanUninstall: false`), and
-//! [`list_packages`](PluginManager::list_packages)
-//! returns `[]` (no repository fetch yet). See `docs/PLUGINS_UPSTREAM.md` for
-//! the compiled-in plugin design.
+//! It is also the WASM plugin installer, Jellyfin's flow:
+//! [`list_packages`](PluginManager::list_packages) reads the configured
+//! repositories, [`install_package`](PluginManager::install_package)
+//! downloads, verifies and stages an artifact the host loads at the next
+//! start, and [`remove_plugin`](PluginManager::remove_plugin) uninstalls a
+//! WASM plugin. `remove_plugin` rejects a compiled-in extension, and, like
+//! upstream, silently ignores a plugin that reports `CanUninstall: false`.
+//! See `docs/EXTENSIONS.md` for the two tiers and `docs/PLUGINS_UPSTREAM.md`
+//! for the compiled-in plugin design.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -54,6 +57,9 @@ pub struct RegisteredPlugin {
     /// links the first page whose `PluginId` matches); the rest are typically
     /// the JS/CSS resources that page loads by name.
     pub config_pages: Vec<PluginConfigPage>,
+    /// The file a runtime-loaded (WASM) plugin was loaded from, whatever its
+    /// name; uninstalling the plugin deletes it. `None` for a compiled-in one.
+    pub artifact: Option<PathBuf>,
 }
 
 /// One dashboard page (or page resource) a plugin ships. Mirrors the C#
@@ -93,7 +99,16 @@ impl RegisteredPlugin {
             image,
             default_config: b"{}".to_vec(),
             config_pages: Vec::new(),
+            artifact: None,
         }
+    }
+
+    /// Records the file a runtime-loaded plugin came from (see
+    /// [`Self::artifact`]).
+    #[must_use]
+    pub fn with_artifact(mut self, path: PathBuf) -> Self {
+        self.artifact = Some(path);
+        self
     }
 
     /// Reports `CanUninstall: false`, undoing the `true` [`Self::new`] forces.
@@ -442,6 +457,11 @@ pub struct FerrofinPluginManager {
     /// `ConfigurationChanged`), as the in-process
     /// [`PLUGIN_CONFIGURATION_CHANGED`] event.
     events: Option<Arc<dyn ferrofin_traits::events::EventManager>>,
+    /// Runtime-loaded plugins uninstalled since the boot. `DeletePlugin`
+    /// takes a plugin out of `_plugins`; the registry is fixed after
+    /// construction, so these ids are skipped by every lookup instead, which
+    /// also stops the host running them until the restart.
+    removed: Mutex<HashSet<Uuid>>,
 }
 
 /// The in-process event a plugin configuration save publishes, with
@@ -461,14 +481,32 @@ impl std::fmt::Debug for FerrofinPluginManager {
 impl FerrofinPluginManager {
     /// Creates a manager over `plugins`, rooting persisted state at `plugins_dir`.
     ///
-    /// Loads `{plugins_dir}/state.json` if present; a missing/corrupt file starts
-    /// from empty state (every plugin at its descriptor default).
+    /// Loads `{plugins_dir}/state.json` if present; a missing, unreadable or
+    /// corrupt file starts from empty state (every plugin at its descriptor
+    /// default). One that exists but cannot be loaded is logged and kept as
+    /// `state.json.corrupt`, since the next save would overwrite the enabled
+    /// overrides and install ledger it holds.
     #[must_use]
     pub fn new(plugins: Vec<RegisteredPlugin>, plugins_dir: PathBuf) -> Self {
-        let state = std::fs::read(plugins_dir.join("state.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PersistedState>(&bytes).ok())
-            .unwrap_or_default();
+        let path = plugins_dir.join("state.json");
+        let state = match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => PersistedState::default(),
+            read => read
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+                .unwrap_or_else(|error| {
+                    let aside = plugins_dir.join("state.json.corrupt");
+                    let keep_error = std::fs::rename(&path, &aside).err().map(|e| e.to_string());
+                    tracing::error!(
+                        path = %path.display(),
+                        error,
+                        kept_as = %aside.display(),
+                        keep_error = ?keep_error,
+                        "plugin state file cannot be loaded; starting from defaults"
+                    );
+                    PersistedState::default()
+                }),
+        };
         Self {
             plugins,
             plugins_dir,
@@ -481,6 +519,7 @@ impl FerrofinPluginManager {
             application_version: DEFAULT_APPLICATION_VERSION.to_owned(),
             legacy_repositories_migrated: tokio::sync::OnceCell::new(),
             events: None,
+            removed: Mutex::default(),
         }
     }
 
@@ -541,9 +580,32 @@ impl FerrofinPluginManager {
         Self::new(Vec::new(), plugins_dir)
     }
 
-    /// Looks up a registered plugin by id.
+    /// Looks up a registered plugin by id; an uninstalled one is gone.
     fn find(&self, id: Uuid) -> Option<&RegisteredPlugin> {
+        if self.is_removed(id) {
+            return None;
+        }
         self.plugins.iter().find(|p| p.descriptor.id == id)
+    }
+
+    /// The registered plugins minus the ones uninstalled since the boot.
+    fn live_plugins(&self) -> impl Iterator<Item = &RegisteredPlugin> {
+        let removed = self
+            .removed
+            .lock()
+            .expect("plugin removal lock poisoned")
+            .clone();
+        self.plugins
+            .iter()
+            .filter(move |plugin| !removed.contains(&plugin.descriptor.id))
+    }
+
+    /// Whether the plugin was uninstalled since the boot.
+    fn is_removed(&self, id: Uuid) -> bool {
+        self.removed
+            .lock()
+            .expect("plugin removal lock poisoned")
+            .contains(&id)
     }
 
     /// A plugin's effective enabled flag: the persisted override when the
@@ -568,21 +630,17 @@ impl FerrofinPluginManager {
         self.plugins_dir.join(id.to_string()).join("config.json")
     }
 
-    /// Writes `bytes` to `path` atomically (temp file + rename), creating parents.
+    /// Writes `bytes` to `path` atomically, creating parents: a uniquely
+    /// named, synced temp file renamed over it, so two writers of one path
+    /// never share a temp file.
     fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<(), ServiceError> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| ServiceError::backend("plugin path has no parent"))?;
-        std::fs::create_dir_all(parent)
-            .map_err(|e| ServiceError::backend(format!("create {}: {e}", parent.display())))?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, bytes)
-            .map_err(|e| ServiceError::backend(format!("write {}: {e}", tmp.display())))?;
-        std::fs::rename(&tmp, path)
-            .map_err(|e| ServiceError::backend(format!("rename {}: {e}", path.display())))
+        ferrofin_util::file_helper::atomic_write(path, bytes)
+            .map_err(|e| ServiceError::backend(format!("write {}: {e}", path.display())))
     }
 
-    /// Persists the in-memory state to `state.json`.
+    /// Persists the in-memory state to `state.json`. Called with the state
+    /// lock held, so writes land in the order the state changed and an older
+    /// snapshot never replaces a newer one.
     fn persist(&self, state: &PersistedState) -> Result<(), ServiceError> {
         let bytes = serde_json::to_vec_pretty(state)
             .map_err(|e| ServiceError::backend(format!("serialize plugin state: {e}")))?;
@@ -636,9 +694,7 @@ impl FerrofinPluginManager {
     fn record_installed_egress(&self, guid: Uuid, declared: Vec<String>) {
         let mut state = self.state.lock().expect("plugin state lock poisoned");
         state.installed_egress.insert(guid.to_string(), declared);
-        let snapshot = state.clone();
-        drop(state);
-        let _ = self.persist(&snapshot);
+        let _ = self.persist(&state);
     }
 
     /// Records an installed artifact's digest (best-effort persist — the
@@ -650,9 +706,7 @@ impl FerrofinPluginManager {
             .entry(guid.to_string())
             .or_default()
             .insert(version.to_owned(), digest);
-        let snapshot = state.clone();
-        drop(state);
-        let _ = self.persist(&snapshot);
+        let _ = self.persist(&state);
     }
 
     /// Flips a plugin's enabled flag, persisting the change.
@@ -843,8 +897,7 @@ impl PluginManager for FerrofinPluginManager {
     async fn list_plugins(&self) -> Result<Vec<PluginDescriptor>, ServiceError> {
         let state = self.state.lock().expect("plugin state lock poisoned");
         Ok(self
-            .plugins
-            .iter()
+            .live_plugins()
             .map(|p| {
                 let mut d = p.descriptor.clone();
                 d.enabled = Self::effective_enabled(&state, p);
@@ -872,27 +925,42 @@ impl PluginManager for FerrofinPluginManager {
     }
 
     async fn remove_plugin(&self, id: Uuid) -> Result<(), ServiceError> {
-        // A runtime-installed WASM plugin is a file we staged — deletable.
-        // (Look for the file FIRST: a freshly-installed plugin is not in the
-        // in-memory registry until the restart that loads it.)
+        // A runtime-loaded WASM plugin is removed by the file it was loaded
+        // from, whatever its name (a hand-dropped `myplugin.wasm` too); one an
+        // install staged but no restart has loaded yet is `{id}.wasm`.
         if let Some(wasm_dir) = &self.wasm_plugins_dir {
-            let artifact = wasm_dir.join(format!("{id}.wasm"));
-            if artifact.exists() {
-                std::fs::remove_file(&artifact).map_err(|e| {
-                    ServiceError::backend(format!("removing {}: {e}", artifact.display()))
-                })?;
-                // Best-effort cleanup of the plugin's KV state, config dir
-                // + enabled override; the artifact removal above is the
-                // load-bearing part.
+            let loaded = self.find(id).and_then(|plugin| plugin.artifact.clone());
+            let staged = Some(wasm_dir.join(format!("{id}.wasm"))).filter(|path| path.exists());
+            if loaded.is_some() || staged.is_some() {
+                for artifact in loaded.iter().chain(&staged) {
+                    match std::fs::remove_file(artifact) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(ServiceError::backend(format!(
+                                "removing {}: {e}",
+                                artifact.display()
+                            )));
+                        }
+                    }
+                }
+                // Best-effort cleanup of the plugin's KV state, segment cache,
+                // config dir + enabled override; the artifact removal above is
+                // the load-bearing part.
                 let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.state.json")));
+                let _ = std::fs::remove_file(wasm_dir.join(format!("{id}.segments")));
                 let _ = std::fs::remove_dir_all(self.plugins_dir.join(id.to_string()));
+                // `DeletePlugin`'s `_plugins.Remove`: gone from every lookup,
+                // so it no longer runs, until the restart that drops it.
+                self.removed
+                    .lock()
+                    .expect("plugin removal lock poisoned")
+                    .insert(id);
                 {
                     let mut state = self.state.lock().expect("plugin state lock poisoned");
                     state.enabled.remove(&id.to_string());
                     state.installed_egress.remove(&id.to_string());
-                    let snapshot = state.clone();
-                    drop(state);
-                    let _ = self.persist(&snapshot);
+                    let _ = self.persist(&state);
                 }
                 if let Some(lifecycle) = &self.lifecycle {
                     lifecycle.mark_restart_required();
@@ -1265,7 +1333,8 @@ impl PluginManager for FerrofinPluginManager {
         let mut packages: Vec<PackageInfo> = Vec::new();
         // Manifests are small JSON documents: a total deadline plus a
         // streamed size cap, so a hostile/hung repository can neither OOM
-        // the server nor pin the task (GET /Packages is plain-auth).
+        // the server nor pin the task (GET /Packages is admin-only, but the
+        // repository is remote and untrusted).
         let client = reqwest::Client::builder()
             .timeout(REPO_FETCH_TIMEOUT)
             .build()
@@ -1373,8 +1442,7 @@ impl PluginManager for FerrofinPluginManager {
         // name + assemblyGuid, so resolve it here rather than 404ing — without
         // putting it in the installable catalogue.
         let synthesized: Vec<PackageInfo> = self
-            .plugins
-            .iter()
+            .live_plugins()
             .map(|plugin| PackageInfo {
                 name: plugin.descriptor.name.clone(),
                 description: plugin.descriptor.description.clone(),
@@ -1403,15 +1471,16 @@ impl PluginManager for FerrofinPluginManager {
         // HTML/JS served to the admin's browser (outside the WASM sandbox),
         // and Disable is the kill switch an admin reaches for — it must
         // disarm this surface too.
+        let plugins: Vec<&RegisteredPlugin> = self.live_plugins().collect();
         let enabled_flags: Vec<bool> = {
             let state = self.state.lock().expect("plugin state lock poisoned");
-            self.plugins
+            plugins
                 .iter()
                 .map(|p| Self::effective_enabled(&state, p))
                 .collect()
         };
         let mut pages = Vec::new();
-        for (plugin, enabled) in self.plugins.iter().zip(enabled_flags) {
+        for (plugin, enabled) in plugins.into_iter().zip(enabled_flags) {
             if !enabled {
                 continue;
             }
@@ -1445,8 +1514,7 @@ impl PluginManager for FerrofinPluginManager {
         // plugin's page must not remain fetchable by name.
         let state = self.state.lock().expect("plugin state lock poisoned");
         Ok(self
-            .plugins
-            .iter()
+            .live_plugins()
             .filter(|plugin| Self::effective_enabled(&state, plugin))
             .find_map(|plugin| {
                 plugin
@@ -1502,11 +1570,15 @@ fn merge_config(defaults: &[u8], stored: &[u8]) -> Vec<u8> {
 /// three were observable on the wire:
 ///   * a key the configuration type does not declare is DROPPED — Ferrofin
 ///     round-tripped `{"Bogus":"zzz"}` for ever;
-///   * a value of the wrong JSON kind THROWS — Ferrofin stored
-///     `{"Username":123}` and served an integer back to a plugin whose config
-///     type declares a string;
+///   * a value of the wrong JSON kind THROWS — an array where a number belongs,
+///     say. A number or a bool posted for a string field is the exception:
+///     upstream's `JsonStringConverter` reads it as its text, which Ferrofin does
+///     not port yet and refuses (gl-774);
 ///   * a key the body omits falls back to the C# property default rather than to
 ///     whatever was stored, which is what the merge onto `defaults` gives.
+///
+/// A number field also reads a string holding a number, as `JsonDefaults`'
+/// `AllowReadingFromString` does, and stores the number ([`bind_json`]).
 ///
 /// The schema is the plugin's `default_config`. When a plugin declares none
 /// (`RegisteredPlugin::new`'s `{}`, and any WASM guest that ships no default
@@ -1532,15 +1604,63 @@ fn project_config(
         let Some(slot) = out.get_mut(key) else {
             continue; // unknown key: the deserializer drops it
         };
-        if !same_json_kind(slot, value) {
+        let Some(bound) = bind_json(slot, value) else {
             return Err(ServiceError::invalid_input(format!(
                 "plugin configuration field {key} has the wrong type"
             )));
-        }
-        *slot = value.clone();
+        };
+        *slot = bound;
     }
     serde_json::to_vec(&serde_json::Value::Object(out))
         .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")))
+}
+
+/// What `value` binds to in the field `slot` types, or `None` where the C#
+/// deserializer throws.
+///
+/// `JsonDefaults` reads numbers with `NumberHandling = AllowReadingFromString`
+/// (`src/Jellyfin.Extensions/Json/JsonDefaults.cs:34`), so a number field also
+/// takes a string holding a JSON number, and stores the number. That is what
+/// every settings page sends: an `<input type="number">`'s `.value` is a
+/// string (TMDb's `MaxCastMembers`, MusicBrainz's `RateLimit`). The string is
+/// read with JSON's number grammar, which is stricter than .NET's (`"+1"` and
+/// `".5"` are refused). Anything else binds as [`same_json_kind`] says.
+///
+/// A number field stores a whole number as an integer ([`integral`]), so a
+/// `"15.0"` posted for an `int` field is read back by the provider's integer
+/// field rather than failing its whole configuration.
+fn bind_json(slot: &serde_json::Value, value: &serde_json::Value) -> Option<serde_json::Value> {
+    match (slot, value) {
+        (serde_json::Value::Number(_), serde_json::Value::String(text)) => {
+            // No surrounding whitespace, which .NET's number reader rejects too.
+            (text.trim() == text)
+                .then(|| serde_json::from_str::<serde_json::Number>(text).ok())
+                .flatten()
+                .map(|number| serde_json::Value::Number(integral(number)))
+        }
+        (serde_json::Value::Number(_), serde_json::Value::Number(number)) => {
+            Some(serde_json::Value::Number(integral(number.clone())))
+        }
+        _ => same_json_kind(slot, value).then(|| value.clone()),
+    }
+}
+
+/// `number` as an integer when it is a whole number a `double` holds exactly
+/// (`15.0`, `1e1`, `-0`), and unchanged otherwise (`1.5`, or an integer already).
+fn integral(number: serde_json::Number) -> serde_json::Number {
+    // 2^53: every integer up to it has an exact `double`.
+    const EXACT: f64 = 9_007_199_254_740_992.0;
+    match number.as_f64() {
+        Some(value) if number.is_f64() && value.fract() == 0.0 && value.abs() <= EXACT => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "a whole number within 2^53 converts to i64 exactly"
+            )]
+            let whole = value as i64;
+            serde_json::Number::from(whole)
+        }
+        _ => number,
+    }
 }
 
 /// Whether `value` can bind to the field `slot` types.
@@ -1629,9 +1749,38 @@ mod tests {
 
         // A `double` field takes an integer literal, as .NET does.
         assert!(project_config(defaults, &body(r#"{"RateLimit":2.5}"#)).is_ok());
-        // …but a string where a number belongs is refused.
-        let err = project_config(defaults, &body(r#"{"RateLimit":"abc"}"#)).unwrap_err();
-        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+        // `AllowReadingFromString`: a number field reads a string holding a
+        // number, what the settings page's `<input type="number">` posts, and
+        // stores the number.
+        for (posted, stored) in [("2", serde_json::json!(2)), ("1.5", serde_json::json!(1.5))] {
+            let read =
+                project_config(defaults, &body(&format!(r#"{{"RateLimit":"{posted}"}}"#))).unwrap();
+            let read: serde_json::Value = serde_json::from_slice(&read).unwrap();
+            assert_eq!(read["RateLimit"], stored, "{posted:?}");
+        }
+        // A whole number is stored as an integer, so an `int` field reads it:
+        // the page's `<input type="number">` accepts `15.0` and `1e1` too.
+        for (posted, stored) in [("15.0", 15), ("1e1", 10), ("-0", 0)] {
+            for value in [format!(r#""{posted}""#), posted.to_owned()] {
+                let read = project_config(defaults, &body(&format!(r#"{{"RateLimit":{value}}}"#)))
+                    .unwrap();
+                let read: serde_json::Value = serde_json::from_slice(&read).unwrap();
+                assert_eq!(read["RateLimit"], serde_json::json!(stored), "{value}");
+                assert!(
+                    read["RateLimit"].is_i64(),
+                    "{value} is stored as an integer"
+                );
+            }
+        }
+        // …but a string that is not a number is refused, as is a padded one.
+        for posted in ["abc", "", " 2"] {
+            let err = project_config(defaults, &body(&format!(r#"{{"RateLimit":"{posted}"}}"#)))
+                .unwrap_err();
+            assert!(
+                matches!(err, ServiceError::InvalidInput(_)),
+                "{posted:?}: {err:?}"
+            );
+        }
 
         // A schemaless plugin has no type to project onto, so its object is
         // stored as it arrives.
@@ -1822,6 +1971,51 @@ mod tests {
         );
     }
 
+    /// The TMDb settings page saves its five image sizes, upstream's `string?`
+    /// `PosterSize`/`BackdropSize`/`LogoSize`/`ProfileSize`/`StillSize`
+    /// (`Tmdb/Configuration/PluginConfiguration.cs:106-126`), along with its
+    /// cast counts, posted as strings; the save keeps them, and a size the page
+    /// leaves unset reads back `null`.
+    #[tokio::test]
+    async fn the_tmdb_image_sizes_round_trip() {
+        let tmdb = ferrofin_providers::builtin_plugins::TMDB;
+        let (mgr, _dir) = manager(vec![
+            RegisteredPlugin::new(descriptor(tmdb.id, tmdb.name, true), None)
+                .with_default_config(tmdb.default_config.as_bytes().to_vec()),
+        ]);
+        // What `tmdb.config.html` posts: every input's `.value`, so the two
+        // number inputs arrive as strings.
+        let mut page: serde_json::Value =
+            serde_json::from_str(tmdb.default_config).expect("defaults");
+        page["MaxCastMembers"] = serde_json::json!("20");
+        page["MaxCrewMembers"] = serde_json::json!("15");
+        for (key, size) in [
+            ("PosterSize", "w500"),
+            ("BackdropSize", "w1280"),
+            ("LogoSize", "w300"),
+            ("ProfileSize", "h632"),
+        ] {
+            page[key] = serde_json::json!(size);
+        }
+        mgr.set_plugin_configuration(tmdb.id, serde_json::to_vec(&page).expect("body"))
+            .await
+            .expect("save");
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&mgr.get_plugin_configuration(tmdb.id).await.expect("read"))
+                .expect("json");
+        assert_eq!(saved["MaxCastMembers"], 20, "stored as the number");
+        assert_eq!(saved["MaxCrewMembers"], 15);
+        assert_eq!(saved["PosterSize"], "w500");
+        assert_eq!(saved["BackdropSize"], "w1280");
+        assert_eq!(saved["LogoSize"], "w300");
+        assert_eq!(saved["ProfileSize"], "h632");
+        assert!(
+            saved["StillSize"].is_null(),
+            "an unset size is null: {saved}"
+        );
+    }
+
     #[tokio::test]
     async fn repositories_persist() {
         let (mgr, _dir) = manager(Vec::new());
@@ -1937,6 +2131,29 @@ mod tests {
             mgr.get_repositories().await.expect("repos"),
             config.repositories()
         );
+    }
+
+    /// A `state.json` that does not parse starts the manager from empty state
+    /// (the boot goes on), but its bytes are kept beside it rather than
+    /// overwritten by the next save: they hold the enabled overrides and the
+    /// version-immutability ledger.
+    #[tokio::test]
+    async fn a_corrupt_state_file_is_kept_aside() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("state.json"), b"{\"enabled\":{").unwrap();
+        let id = Uuid::from_u128(7);
+        let mgr = FerrofinPluginManager::new(
+            vec![RegisteredPlugin::new(descriptor(id, "Demo", true), None)],
+            dir.path().to_path_buf(),
+        );
+        mgr.disable_plugin(id).await.expect("disable");
+        assert_eq!(
+            std::fs::read(dir.path().join("state.json.corrupt")).unwrap(),
+            b"{\"enabled\":{"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!(saved["enabled"][id.to_string()], false);
     }
 
     /// A repository an admin added on the old build lived in `state.json`; the
@@ -2529,6 +2746,72 @@ mod tests {
         );
         // Unknown id after removal → NotFound (not in registry either).
         assert!(rig.mgr.remove_plugin(PKG_ID).await.is_err());
+    }
+
+    /// Uninstalling a loaded WASM plugin removes it now, as upstream's
+    /// `RemovePlugin` drops it from the list: it is no longer listed or
+    /// looked up, so the host stops running it whatever its descriptor
+    /// default (an admin had disabled it), its segment cache goes too, and a
+    /// second uninstall is a `404`, not "compiled-in".
+    #[tokio::test]
+    async fn an_uninstalled_wasm_plugin_is_gone_until_the_restart() {
+        let rig = update_rig("0.9.0", true, false).await;
+        let segments = rig.wasm_dir.join(format!("{PKG_ID}.segments"));
+        std::fs::write(&segments, b"{}").unwrap();
+        let listed = |plugins: Vec<PluginDescriptor>| plugins.iter().any(|d| d.id == PKG_ID);
+        assert!(listed(rig.mgr.list_plugins().await.unwrap()));
+
+        rig.mgr.remove_plugin(PKG_ID).await.expect("uninstall");
+        assert!(
+            rig.mgr.get_plugin(PKG_ID).await.unwrap().is_none(),
+            "not re-enabled by its descriptor default"
+        );
+        assert!(!listed(rig.mgr.list_plugins().await.unwrap()));
+        assert!(!segments.exists(), "segment cache removed");
+        assert!(rig.lifecycle.has_pending_restart());
+        // The disable is forgotten with it: a reinstall starts at its default.
+        let persisted: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(rig.mgr.plugins_dir_for_test().join("state.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            persisted["enabled"].get(PKG_ID.to_string()).is_none(),
+            "{persisted}"
+        );
+        assert!(matches!(
+            rig.mgr.remove_plugin(PKG_ID).await,
+            Err(ServiceError::NotFound(_))
+        ));
+    }
+
+    /// A plugin dropped in by hand under its own file name (the documented
+    /// air-gapped install) is uninstalled by that file, not a guessed
+    /// `{id}.wasm`.
+    #[tokio::test]
+    async fn a_hand_dropped_wasm_plugin_is_uninstalled_by_its_own_file() {
+        let mut rig = update_rig("0.9.0", false, true).await;
+        std::fs::create_dir_all(&rig.wasm_dir).unwrap();
+        let dropped = rig.wasm_dir.join("myplugin.wasm");
+        std::fs::write(&dropped, b"component").unwrap();
+        rig.mgr = FerrofinPluginManager::new(
+            vec![
+                RegisteredPlugin::new(descriptor(PKG_ID, "HelloPkg", true), None)
+                    .with_artifact(dropped.clone()),
+            ],
+            rig.mgr.plugins_dir_for_test().to_path_buf(),
+        )
+        .with_installer(
+            rig.wasm_dir.clone(),
+            Arc::new(StubValidator {
+                id: Ok(PKG_ID),
+                abi: TEST_ABI,
+            }),
+            rig.lifecycle.clone(),
+        );
+
+        rig.mgr.remove_plugin(PKG_ID).await.expect("uninstall");
+        assert!(!dropped.exists(), "its own file removed");
+        assert!(rig.mgr.get_plugin(PKG_ID).await.unwrap().is_none());
     }
 
     /// Builds an install rig whose registry already knows `PKG_ID` at

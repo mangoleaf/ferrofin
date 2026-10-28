@@ -257,6 +257,182 @@ pub fn settle_sort_name(row: &mut BaseItemEntity) {
     }
 }
 
+/// `BaseItem.UpdateRatingToItems` (`BaseItem.cs:2974-2995`, v12.2): the
+/// rating a box set or playlist takes from its members. Their distinct
+/// (ordinal-ignore-case) non-empty official ratings are ordered by `score`'s
+/// score then sub-score, an unknown rating last (as 1001), ties in member
+/// order, and the first — the least restrictive — wins. Unrated members are
+/// ignored; with no rated member the container keeps `current`.
+pub fn rating_to_items<'a>(
+    current: Option<&'a str>,
+    members: impl IntoIterator<Item = Option<&'a str>>,
+    score: impl Fn(&str) -> Option<ferrofin_model::entities_media::ParentalRatingScore>,
+) -> Option<&'a str> {
+    let mut ratings: Vec<&str> = Vec::new();
+    for rating in members.into_iter().flatten().filter(|r| !r.is_empty()) {
+        if !ratings
+            .iter()
+            .any(|seen| ferrofin_util::string_extensions::equals_ordinal_ignore_case(seen, rating))
+        {
+            ratings.push(rating);
+        }
+    }
+    ratings
+        .into_iter()
+        .min_by_key(|rating| score(rating).map_or((1001, Some(1001)), |s| (s.score, s.sub_score)))
+        .or(current)
+}
+
+/// What `UpdateMetadataFromChildren` reads of one member of a box set or
+/// playlist (`Folder.GetLinkedChildren`, one per link, in link order).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Member {
+    /// `OfficialRating`.
+    pub official_rating: Option<String>,
+    /// `Genres`, `|`-joined.
+    pub genres: Option<String>,
+    /// `Studios`, `|`-joined.
+    pub studios: Option<String>,
+    /// `PremiereDate`.
+    pub premiere_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// `ProductionYear`.
+    pub production_year: Option<i64>,
+    /// `RunTimeTicks`.
+    pub run_time_ticks: Option<i64>,
+    /// `IsFolder`.
+    pub is_folder: bool,
+}
+
+impl From<BaseItemEntity> for Member {
+    fn from(row: BaseItemEntity) -> Self {
+        Self {
+            official_rating: row.official_rating,
+            genres: row.genres,
+            studios: row.studios,
+            premiere_date: row.premiere_date,
+            production_year: row.production_year,
+            run_time_ticks: row.run_time_ticks,
+            is_folder: row.is_folder,
+        }
+    }
+}
+
+/// `MetadataService.UpdateMetadataFromChildren` (`MetadataService.cs:440-483`,
+/// v12.2) for a box set or playlist past the `isFullRefresh` gate, before
+/// its rating ([`rating_to_items`], which needs a scorer):
+/// - a playlist (`SupportsCumulativeRunTimeTicks`) takes the sum of its
+///   non-folder members' runtimes, locked or not;
+/// - an unlocked container takes the union of its members' genres and of
+///   their studios, each unless that field is locked
+///   (`EnableUpdatingGenres/StudiosFromChildren`);
+/// - an unlocked box set takes its earliest member's premiere date and year
+///   (`EnableUpdatingPremiereDateFromChildren`, `BoxSetMetadataService`).
+pub fn update_from_members(
+    row: &mut BaseItemEntity,
+    kind: BaseItemKind,
+    members: &[Member],
+    locked_fields: &[MetadataField],
+) {
+    if kind == BaseItemKind::Playlist {
+        // `UpdateCumulativeRunTimeTicks` (`:485-506`).
+        row.run_time_ticks = Some(
+            members
+                .iter()
+                .filter(|m| !m.is_folder)
+                .map(|m| m.run_time_ticks.unwrap_or(0))
+                .sum(),
+        );
+    }
+    if row.is_locked {
+        return;
+    }
+    if kind == BaseItemKind::BoxSet {
+        premiere_date_from_members(row, members);
+    }
+    if !locked_fields.contains(&MetadataField::Genres) {
+        row.genres = members_union(members.iter().map(|m| m.genres.as_deref()));
+    }
+    if !locked_fields.contains(&MetadataField::Studios) {
+        row.studios = members_union(members.iter().map(|m| m.studios.as_deref()));
+    }
+}
+
+/// `UpdatePremiereDate` (`MetadataService.cs:543-579`): the earliest member
+/// premiere date and its year; with none, or when the earliest is .NET's
+/// `DateTime.MinValue` (an unset date older rows store), the smallest member
+/// year, a member without one counting as 0, which keeps the stored year. No
+/// members leave both as stored.
+fn premiere_date_from_members(row: &mut BaseItemEntity, members: &[Member]) {
+    use chrono::Datelike as _;
+    if members.is_empty() {
+        return;
+    }
+    if let Some(date) = members
+        .iter()
+        .filter_map(|m| m.premiere_date)
+        .min()
+        .filter(|date| *date > ferrofin_model::json::datetime::dotnet_min())
+    {
+        row.premiere_date = Some(date);
+        row.production_year = Some(i64::from(date.year()));
+    } else if let Some(year) = members
+        .iter()
+        .map(|m| m.production_year.unwrap_or(0))
+        .min()
+        .filter(|year| *year > 0)
+    {
+        row.production_year = Some(year);
+    }
+}
+
+/// A box set's `Data` with its `LibraryFolderIds` set to `ids`, as `N`-form
+/// GUIDs the way Jellyfin stores them (`BoxSetMetadataService.BeforeSaveInternal`,
+/// `BoxSetMetadataService.cs:89-102`). `None` when `Data` already holds
+/// exactly those ids in that order (`SequenceEqual`), or is not a JSON
+/// object, which is then left as it is.
+#[must_use]
+pub fn data_with_library_folder_ids(data: Option<&str>, ids: &[uuid::Uuid]) -> Option<String> {
+    use serde_json::Value;
+    let mut map = match data.filter(|text| !text.trim().is_empty()) {
+        Some(text) => match serde_json::from_str(text) {
+            Ok(Value::Object(map)) => map,
+            _ => return None,
+        },
+        None => serde_json::Map::new(),
+    };
+    let stored: Option<Vec<uuid::Uuid>> = map
+        .get("LibraryFolderIds")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|id| id.as_str().and_then(|id| uuid::Uuid::parse_str(id).ok()))
+                .collect()
+        });
+    if stored.as_deref() == Some(ids) {
+        return None;
+    }
+    map.insert(
+        "LibraryFolderIds".to_owned(),
+        Value::Array(
+            ids.iter()
+                .map(|id| Value::String(id.simple().to_string()))
+                .collect(),
+        ),
+    );
+    Some(Value::Object(map).to_string())
+}
+
+/// `children.SelectMany(i => i.X).Distinct(StringComparer.OrdinalIgnoreCase)`
+/// over `|`-joined columns, in member order; `None` when there is nothing.
+fn members_union<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Option<String> {
+    let mut seen = HashSet::new();
+    let values: Vec<&str> = values
+        .flat_map(list)
+        .filter(|v| seen.insert(ferrofin_util::string_extensions::upper_invariant(v)))
+        .collect();
+    (!values.is_empty()).then(|| values.join("|"))
+}
+
 /// `EnableAlphaNumericSorting` (`BaseItem.cs`, overridden to `false` by
 /// `Person.cs` only): whether `CreateSortName` runs the alphanumeric
 /// pipeline, or keeps the name verbatim apart from `TrimStart()`.
@@ -310,14 +486,12 @@ pub fn episode_sort_name(parent_index: Option<i64>, index: Option<i64>, name: &s
     format!("{season}{episode}{name}")
 }
 
-/// Port of C# `Season.CreateSortName`: the zero-padded season number, or the
-/// name when the season has no number (so `Specials` (0000) sorts first).
+/// Port of C# `Season.CreateSortName`: the zero-padded season number (so
+/// `Specials` (0000) sorts first), or the name as it is when the season has
+/// no number, without the article-stripping, lower-casing name pipeline.
 #[must_use]
 pub fn season_sort_name(index: Option<i64>, name: &str) -> String {
-    index.map_or_else(
-        || ferrofin_util::sort_name::create_sort_name(name),
-        |n| format!("{n:04}"),
-    )
+    index.map_or_else(|| name.to_owned(), |n| format!("{n:04}"))
 }
 
 /// Port of C# `Audio.CreateSortName` (v10.11.8

@@ -143,7 +143,15 @@ impl PathManager for FerrofinPathManager {
 
     fn attachment_path(&self, media_source_id: &str, file_name: &str) -> Option<String> {
         let folder = self.attachment_folder_path(media_source_id)?;
-        let safe = safe_leaf_file_name(file_name)?;
+        let Some(safe) = ferrofin_util::path_helper::get_safe_leaf_file_name(Some(file_name))
+        else {
+            tracing::warn!(
+                file_name,
+                media_source_id,
+                "rejecting attachment filename: not a valid leaf name"
+            );
+            return None;
+        };
         Some(
             PathBuf::from(folder)
                 .join(safe)
@@ -232,21 +240,6 @@ pub(crate) fn item_internal_metadata_path(metadata_root: &str, item_id: Uuid) ->
         .join(&dashless)
 }
 
-/// A defensive leaf-file-name sanitizer, mirroring `PathHelper.GetSafeLeafFileName`.
-///
-/// Rejects names that contain a path separator, are `.`/`..`, or are empty —
-/// returning `None` so the caller drops the request (matching C# returning
-/// `null`). A safe name is returned unchanged.
-fn safe_leaf_file_name(file_name: &str) -> Option<String> {
-    if file_name.is_empty() || file_name == "." || file_name == ".." {
-        return None;
-    }
-    if file_name.contains('/') || file_name.contains('\\') || file_name.contains('\0') {
-        return None;
-    }
-    Some(file_name.to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,12 +265,26 @@ mod tests {
     }
 
     #[test]
-    fn attachment_rejects_unsafe_leaf_name() {
+    fn attachment_reduces_the_name_to_its_safe_leaf() {
+        // `PathManager.GetAttachmentPath` keeps `PathHelper.GetSafeLeafFileName`'s
+        // leaf and refuses a name with none.
         let (_tmp, m) = manager();
         let id = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
-        assert!(m.attachment_path(id, "font.ttf").is_some());
-        assert_eq!(m.attachment_path(id, "../escape").into_iter().count(), 0);
-        assert_eq!(m.attachment_path(id, "sub/dir"), None);
+        let folder = m.attachment_folder_path(id).expect("guid folder");
+        assert_eq!(
+            m.attachment_path(id, "font.ttf"),
+            Some(format!("{folder}/font.ttf"))
+        );
+        assert_eq!(
+            m.attachment_path(id, "../escape"),
+            Some(format!("{folder}/escape"))
+        );
+        assert_eq!(
+            m.attachment_path(id, "sub/font.ttf"),
+            Some(format!("{folder}/font.ttf"))
+        );
+        assert_eq!(m.attachment_path(id, ".."), None);
+        assert_eq!(m.attachment_path(id, "sub/"), None);
     }
 
     #[test]

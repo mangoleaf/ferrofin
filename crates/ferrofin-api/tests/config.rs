@@ -23,7 +23,7 @@ use ferrofin_api::test_support::{
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::activity::{ActivityLogEntry, LogLevel};
 use ferrofin_model::branding::BrandingOptions;
-use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::configuration::{EncodingOptions, ServerConfiguration};
 use ferrofin_model::entities_media::{ParentalRating, ParentalRatingScore};
 use ferrofin_model::globalization::{CountryInfo, CultureDto, LocalizationOption};
 use ferrofin_model::io::{FileSystemEntryInfo, FileSystemEntryType};
@@ -221,6 +221,56 @@ impl ServerConfigurationManager for StubConfig {
     async fn update_branding(&self, branding: &BrandingOptions) -> Result<(), ServiceError> {
         *self.branding.lock().unwrap() = branding.clone();
         Ok(())
+    }
+    async fn get_encoding_options(&self) -> Result<EncodingOptions, ServiceError> {
+        Ok(self
+            .saved_named("encoding")?
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default())
+    }
+    /// What the configuration manager serves, without the binding to each
+    /// type that its own tests pin: the saved document as stored, `{}` for a
+    /// registered key never saved, and nothing for any other key.
+    async fn get_named_configuration(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, ServiceError> {
+        let key = key.to_ascii_lowercase();
+        if key == "branding" {
+            return Ok(Some(
+                serde_json::to_value(self.branding.lock().unwrap().clone()).unwrap(),
+            ));
+        }
+        if ![
+            "encoding",
+            "network",
+            "metadata",
+            "xbmcmetadata",
+            "livetv",
+            "database",
+        ]
+        .contains(&key.as_str())
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.saved_named(&key)?
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_else(|| serde_json::json!({})),
+        ))
+    }
+}
+
+impl StubConfig {
+    /// The bytes saved under `named/{key}.json`, `None` when never saved, or
+    /// an error when the file cannot be read, as the real manager reports it.
+    fn saved_named(&self, key: &str) -> Result<Option<Vec<u8>>, ServiceError> {
+        let path = self.paths.config_dir.clone() + "/named/" + key + ".json";
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ServiceError::backend(format!("read {path}: {e}"))),
+        }
     }
 }
 
@@ -518,7 +568,8 @@ async fn post(app: AppState, uri: &str, body: &serde_json::Value) -> StatusCode 
 /// `UseFileCreationTimeForDateAdded` from `GET /System/Configuration/metadata`
 /// (the default, "Use file creation date", before anything is saved) and
 /// saves "Use date scanned into the library" as `false` through the POST —
-/// which the next GET returns and the scan reads from the same document.
+/// which the next GET returns and the scan reads from the same document. (The
+/// default before anything is saved is the configuration manager's to pin.)
 #[tokio::test]
 async fn the_date_added_behavior_round_trips_through_the_metadata_configuration() {
     let dir = tempfile::tempdir().unwrap();
@@ -526,17 +577,6 @@ async fn the_date_added_behavior_round_trips_through_the_metadata_configuration(
         log_dir: String::new(),
         config_dir: dir.path().to_string_lossy().into_owned(),
     };
-
-    let (status, body) = get(
-        admin_state_with_paths(paths.clone()),
-        "/System/Configuration/metadata",
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        json(&body)["UseFileCreationTimeForDateAdded"],
-        serde_json::json!(true)
-    );
 
     for saved in [false, true, false] {
         let status = post(
@@ -618,8 +658,10 @@ async fn named_configuration_branding_and_unknown() {
     // Branding serializes as an object.
     assert!(json(&b1).is_object());
 
+    // `GetConfiguration` throws `ResourceNotFoundException` for a key no store
+    // is registered under, which Jellyfin's exception middleware answers 404.
     let (s2, _) = get(full_state(), "/System/Configuration/unknownkey").await;
-    assert_eq!(s2, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(s2, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -722,280 +764,92 @@ fn write_named_config(dir: &std::path::Path, key: &str, body: &[u8]) {
     std::fs::write(named.join(format!("{key}.json")), body).unwrap();
 }
 
+/// A stored document that cannot be read at all is the manager's error, which
+/// answers 500 (upstream serves the defaults for some of these; see the
+/// `GET /System/Configuration/{key}` parity row). How a document that does not
+/// parse, or was never saved, reads is the configuration manager's to pin.
 #[tokio::test]
-async fn corrupt_named_configuration_falls_back_to_default_and_warns() {
+async fn an_unreadable_named_configuration_is_a_server_error() {
     let dir = tempfile::tempdir().unwrap();
-    // A truncated / partially-written save: the file exists but is not JSON.
-    write_named_config(dir.path(), "encoding", b"{\"EnableThrottling\": tru");
-    let state = state_with_paths(StubPaths {
-        log_dir: String::new(),
-        config_dir: dir.path().to_string_lossy().into_owned(),
-    });
-
-    let ((status, body), logs) =
-        with_captured_logs(get(state, "/System/Configuration/encoding")).await;
-
-    // Parity: the response shape is unchanged — the typed default object.
-    assert_eq!(status, StatusCode::OK);
-    assert!(json(&body).is_object(), "expected default EncodingOptions");
-    // …but the corrupt store is reported instead of silently swallowed.
-    let warnings = logs.warnings_matching("not valid JSON");
-    assert_eq!(
-        warnings.len(),
-        1,
-        "corrupt named configuration must warn exactly once; captured: {:?}",
-        logs.0.lock().unwrap()
-    );
-    assert!(
-        warnings[0].contains("encoding.json"),
-        "the warning must name the offending file: {}",
-        warnings[0]
-    );
-}
-
-#[tokio::test]
-async fn unreadable_named_configuration_falls_back_to_default_and_warns() {
-    let dir = tempfile::tempdir().unwrap();
-    // A directory where the config file belongs: `read` fails with EISDIR, i.e.
-    // an I/O error that is *not* "never saved".
-    std::fs::create_dir_all(dir.path().join("named").join("encoding.json")).unwrap();
-    let state = state_with_paths(StubPaths {
-        log_dir: String::new(),
-        config_dir: dir.path().to_string_lossy().into_owned(),
-    });
-
-    let ((status, body), logs) =
-        with_captured_logs(get(state, "/System/Configuration/encoding")).await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert!(json(&body).is_object());
-    let warnings = logs.warnings_matching("reading named configuration failed");
-    assert_eq!(
-        warnings.len(),
-        1,
-        "an unreadable named configuration must warn; captured: {:?}",
-        logs.0.lock().unwrap()
-    );
-}
-
-#[tokio::test]
-async fn missing_named_configuration_is_silent() {
-    // The ordinary "never saved" case (upstream's `File.Exists` guard) must not
-    // cry wolf — otherwise the warnings above mean nothing.
-    let dir = tempfile::tempdir().unwrap();
-    let state = state_with_paths(StubPaths {
-        log_dir: String::new(),
-        config_dir: dir.path().to_string_lossy().into_owned(),
-    });
-
-    let ((status, _), logs) =
-        with_captured_logs(get(state, "/System/Configuration/encoding")).await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert!(
-        logs.warnings_matching("named configuration").is_empty(),
-        "a never-saved configuration must not warn: {:?}",
-        logs.0.lock().unwrap()
-    );
-}
-
-#[tokio::test]
-async fn a_saved_network_configuration_is_served_under_the_contract_names() {
-    // A `network.json` an older Ferrofin wrote, with the four names a
-    // `PascalCase` derive produced. Served verbatim, jellyfin-web would not
-    // recognise them — the network page would show an empty remote-IP filter,
-    // and the operator's next Save would persist that emptiness.
-    let dir = tempfile::tempdir().unwrap();
-    write_named_config(
-        dir.path(),
-        "network",
-        br#"{"BaseUrl":"/jf","EnableIpv4":false,"EnableIpv6":true,
-            "RemoteIpFilter":["192.168.1.5"],"IsRemoteIpFilterBlacklist":true,
-            "KnownProxies":["10.1.2.3"]}"#,
-    );
-    let state = state_with_paths(StubPaths {
-        log_dir: String::new(),
-        config_dir: dir.path().to_string_lossy().into_owned(),
-    });
-
-    let (status, body) = get(state, "/System/Configuration/network").await;
-    assert_eq!(status, StatusCode::OK);
-    let value = json(&body);
-    let object = value.as_object().expect("an object");
-
-    assert_eq!(object["RemoteIPFilter"], serde_json::json!(["192.168.1.5"]));
-    assert_eq!(object["IsRemoteIPFilterBlacklist"], serde_json::json!(true));
-    assert_eq!(object["EnableIPv4"], serde_json::json!(false));
-    assert_eq!(object["EnableIPv6"], serde_json::json!(true));
-    for old in [
-        "RemoteIpFilter",
-        "IsRemoteIpFilterBlacklist",
-        "EnableIpv4",
-        "EnableIpv6",
-    ] {
-        assert!(!object.contains_key(old), "{old} must not reach the client");
+    // A directory where each file belongs: `read` fails with EISDIR, an I/O
+    // error that is not "never saved".
+    for key in ["encoding", "network"] {
+        std::fs::create_dir_all(dir.path().join("named").join(format!("{key}.json"))).unwrap();
     }
-    // The values around them survive the normalization, and the fields the old
-    // document never had come back as defaults.
-    assert_eq!(object["BaseUrl"], serde_json::json!("/jf"));
-    assert_eq!(object["KnownProxies"], serde_json::json!(["10.1.2.3"]));
-    assert_eq!(object["EnableUPnP"], serde_json::json!(false));
-}
-
-#[tokio::test]
-async fn a_network_configuration_that_cannot_be_read_returns_defaults_without_overwriting() {
-    // Match BaseConfigurationManager.LoadConfiguration: a malformed stored
-    // section returns a typed default and a warning. Reading must not replace
-    // the original document, which the operator may still be able to repair.
-    let dir = tempfile::tempdir().unwrap();
-    write_named_config(
-        dir.path(),
-        "network",
-        br#"{"InternalHttpPort":"not a port"}"#,
-    );
     let state = state_with_paths(StubPaths {
         log_dir: String::new(),
         config_dir: dir.path().to_string_lossy().into_owned(),
     });
 
-    let ((status, body), logs) =
-        with_captured_logs(get(state, "/System/Configuration/network")).await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json(&body)["InternalHttpPort"], serde_json::json!(8096));
-    assert_eq!(
-        logs.warnings_matching("named configuration").len(),
-        1,
-        "the unreadable configuration must be reported: {:?}",
-        logs.0.lock().unwrap()
-    );
-    assert_eq!(
-        std::fs::read(dir.path().join("named/network.json")).unwrap(),
-        br#"{"InternalHttpPort":"not a port"}"#
-    );
-}
-
-/// These partial documents predate typed named-config writes. The dashboard
-/// must see constructor defaults for omitted members, just as it does when
-/// Jellyfin loads a partial XML configuration. Unknown members are not typed
-/// settings and must not leak back into a core configuration response.
-#[tokio::test]
-async fn saved_core_configurations_return_typed_defaults() {
-    for (key, mut saved, default_field, default_value) in [
-        (
-            "metadata",
-            serde_json::json!({}),
-            "UseFileCreationTimeForDateAdded",
-            serde_json::json!(true),
-        ),
-        (
-            "xbmcmetadata",
-            serde_json::json!({"UserId":"user-1"}),
-            "SaveImagePathsInNfo",
-            serde_json::json!(true),
-        ),
-        (
-            "livetv",
-            serde_json::json!({"PrePaddingSeconds":120}),
-            "SaveRecordingNFO",
-            serde_json::json!(true),
-        ),
-        (
-            "network",
-            serde_json::json!({"EnableIpv4":false}),
-            "InternalHttpPort",
-            serde_json::json!(8096),
-        ),
-        (
-            "encoding",
-            serde_json::json!({"EncodingThreadCount":3}),
-            "DownMixAudioBoost",
-            serde_json::json!(2.0),
-        ),
+    for uri in [
+        "/System/Configuration/encoding",
+        "/System/Configuration/network",
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        saved["UnrecognizedSetting"] = serde_json::json!("old client value");
-        let bytes = serde_json::to_vec(&saved).unwrap();
-        write_named_config(dir.path(), key, &bytes);
-        let app = state_with_paths(StubPaths {
-            log_dir: String::new(),
-            config_dir: dir.path().to_string_lossy().into_owned(),
-        });
-        // The key is case-insensitive even though JSON members bind exactly.
-        let uri = format!("/System/Configuration/{}", key.to_ascii_uppercase());
-        let ((status, body), logs) = with_captured_logs(get(app, &uri)).await;
-        assert_eq!(status, StatusCode::OK, "{key}");
-        let response = json(&body);
-        assert_eq!(response[default_field], default_value, "{key}");
-        assert!(response.get("UnrecognizedSetting").is_none(), "{key}");
-        for (field, value) in saved.as_object().unwrap() {
-            match field.as_str() {
-                "UnrecognizedSetting" => {}
-                "EnableIpv4" => assert_eq!(&response["EnableIPv4"], value),
-                _ => assert_eq!(&response[field], value),
-            }
-        }
-        assert!(logs.warnings_matching("named configuration").is_empty());
-        assert_eq!(
-            std::fs::read(dir.path().join("named").join(format!("{key}.json"))).unwrap(),
-            bytes,
-            "a GET must not rewrite the stored document"
-        );
+        let (status, _) = get(state.clone(), uri).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{uri}");
     }
 }
 
+/// Only Jellyfin's registered stores are named configurations. A key none is
+/// registered under is not found on read (`ResourceNotFoundException`), even
+/// when a file of that name was left behind, and a save fails in
+/// `GetConfigurationType`'s `First()` (`InvalidOperationException`, `500`)
+/// without writing anything.
 #[tokio::test]
-async fn invalid_core_configurations_return_defaults_and_report_the_section() {
-    for (key, field, default_value) in [
-        ("metadata", "UseFileCreationTimeForDateAdded", true),
-        ("xbmcmetadata", "SaveImagePathsInNfo", true),
-        ("livetv", "SaveRecordingNFO", true),
-        ("encoding", "EnableThrottling", false),
+async fn an_unregistered_named_configuration_is_neither_served_nor_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    write_named_config(dir.path(), "plugin-owned", br#"{"CustomSetting":1}"#);
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    });
+    for uri in [
+        "/System/Configuration/plugin-owned",
+        "/System/Configuration/never-saved",
+        "/System/Configuration/not.a.key",
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let bytes = serde_json::to_vec(&serde_json::json!({field: "invalid boolean"})).unwrap();
-        write_named_config(dir.path(), key, &bytes);
-        let app = state_with_paths(StubPaths {
-            log_dir: String::new(),
-            config_dir: dir.path().to_string_lossy().into_owned(),
-        });
-        let ((status, body), logs) =
-            with_captured_logs(get(app, &format!("/System/Configuration/{key}"))).await;
-        assert_eq!(status, StatusCode::OK, "{key}");
-        assert_eq!(json(&body)[field], default_value, "{key}");
-        let warnings = logs.warnings_matching("named configuration");
-        assert_eq!(warnings.len(), 1, "{key}");
-        assert!(warnings[0].contains(key));
-        assert_eq!(
-            std::fs::read(dir.path().join("named").join(format!("{key}.json"))).unwrap(),
-            bytes
-        );
+        let (status, _) = get(app.clone(), uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
     }
+
+    let document = serde_json::json!({"CustomSetting":{"NestedValue":[1,"two",false]}});
+    assert_eq!(
+        post(app, "/System/Configuration/never-saved", &document).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(!dir.path().join("named/never-saved.json").exists());
 }
 
+/// Jellyfin's `database` store selects its database provider; Ferrofin runs on
+/// SQLite only, so a save is refused, because no other provider could be
+/// honoured. (What a read answers is the configuration manager's to pin.)
 #[tokio::test]
-async fn plugin_named_configuration_keeps_its_own_shape() {
+async fn the_database_configuration_cannot_be_changed() {
     let dir = tempfile::tempdir().unwrap();
     let app = admin_state_with_paths(StubPaths {
         log_dir: String::new(),
         config_dir: dir.path().to_string_lossy().into_owned(),
     });
-    let uri = "/System/Configuration/plugin-owned";
-    let document = serde_json::json!({"CustomSetting":{"NestedValue":[1,"two",false]}});
+    let document =
+        serde_json::json!({"DatabaseType": "Jellyfin-PgSql", "LockingBehavior": "Optimistic"});
     assert_eq!(
-        post(app.clone(), uri, &document).await,
-        StatusCode::NO_CONTENT
+        post(app, "/System/Configuration/Database", &document).await,
+        StatusCode::BAD_REQUEST
     );
-    let (status, body) = get(app, uri).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(json(&body), document);
+    assert!(!dir.path().join("named/database.json").exists());
 }
 
-/// A Live TV manager whose two configuration reads fail (backend down).
-struct FailingLiveTv;
+/// A Live TV manager whose two configuration reads answer the given rows, or
+/// fail (backend down) when it has none.
+struct ScriptedLiveTv(
+    Option<(
+        Vec<ferrofin_model::live_tv::TunerHostInfo>,
+        Vec<ferrofin_model::live_tv::ListingsProviderInfo>,
+    )>,
+);
 
 #[async_trait]
-impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
+impl ferrofin_traits::stubs::LiveTvManager for ScriptedLiveTv {
     async fn get_guide_info(&self) -> Result<ferrofin_model::live_tv::GuideInfo, ServiceError> {
         unimplemented!("this fake is never asked for the guide window")
     }
@@ -1010,12 +864,18 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     async fn get_tuner_hosts(
         &self,
     ) -> Result<Vec<ferrofin_model::live_tv::TunerHostInfo>, ServiceError> {
-        Err(ServiceError::backend("tuner store unavailable"))
+        self.0
+            .as_ref()
+            .map(|(tuners, _)| tuners.clone())
+            .ok_or_else(|| ServiceError::backend("tuner store unavailable"))
     }
     async fn get_listing_providers(
         &self,
     ) -> Result<Vec<ferrofin_model::live_tv::ListingsProviderInfo>, ServiceError> {
-        Err(ServiceError::backend("listings store unavailable"))
+        self.0
+            .as_ref()
+            .map(|(_, providers)| providers.clone())
+            .ok_or_else(|| ServiceError::backend("listings store unavailable"))
     }
     async fn get_live_tv_info(&self) -> Result<ferrofin_model::live_tv::LiveTvInfo, ServiceError> {
         unreachable!()
@@ -1042,6 +902,8 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     async fn save_listing_provider(
         &self,
         _info: ferrofin_model::live_tv::ListingsProviderInfo,
+        _validate_login: bool,
+        _validate_listings: bool,
     ) -> Result<ferrofin_model::live_tv::ListingsProviderInfo, ServiceError> {
         unreachable!()
     }
@@ -1185,9 +1047,89 @@ impl ferrofin_traits::stubs::LiveTvManager for FailingLiveTv {
     }
 }
 
+/// Tuner URLs (an IPTV playlist's usually carries the account's user name and
+/// password) and listing-provider passwords (Schedules Direct accepts the
+/// stored hash as the credential) are blanked for a caller who is not an
+/// administrator; only the dashboard's admin pages read them. Upstream serves
+/// them to every signed-in user (owner decision 2026-10-23).
+#[tokio::test]
+async fn live_tv_credentials_are_blanked_for_a_caller_who_is_not_an_administrator() {
+    use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
+    let rows = || {
+        Some((
+            vec![TunerHostInfo {
+                id: Some("tuner".to_owned()),
+                url: Some("http://iptv.example/get.php?username=u&password=p".to_owned()),
+                ..TunerHostInfo::default()
+            }],
+            vec![ListingsProviderInfo {
+                id: Some("provider".to_owned()),
+                username: Some("sd-user".to_owned()),
+                password: Some("5f4dcc3b5aa765d61d8327deb882cf99".into()),
+                ..ListingsProviderInfo::default()
+            }],
+        ))
+    };
+
+    let (status, body) = get(
+        full_state().with_live_tv(Arc::new(ScriptedLiveTv(rows()))),
+        "/System/Configuration/livetv",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(value["TunerHosts"][0]["Id"], "tuner");
+    assert_eq!(value["TunerHosts"][0]["Url"], "");
+    assert_eq!(value["ListingProviders"][0]["Username"], "sd-user");
+    assert_eq!(value["ListingProviders"][0]["Password"], "");
+
+    let (status, body) = get(
+        state_with(StubPaths::default(), Arc::new(FakeAdminUsers))
+            .with_live_tv(Arc::new(ScriptedLiveTv(rows()))),
+        "/System/Configuration/livetv",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(
+        value["TunerHosts"][0]["Url"],
+        "http://iptv.example/get.php?username=u&password=p"
+    );
+    assert_eq!(
+        value["ListingProviders"][0]["Password"],
+        "5f4dcc3b5aa765d61d8327deb882cf99"
+    );
+
+    // The lists a dashboard save left in the stored document are blanked too,
+    // when no Live TV manager supplies its own.
+    let dir = tempfile::tempdir().unwrap();
+    write_named_config(
+        dir.path(),
+        "livetv",
+        br#"{"TunerHosts":[{"Id":"tuner","Url":"http://iptv.example/u/p"},{"Id":"bare"}],
+            "ListingProviders":[{"Id":"provider","Password":"hash"}]}"#,
+    );
+    let (status, body) = get(
+        state_with_paths(StubPaths {
+            log_dir: String::new(),
+            config_dir: dir.path().to_string_lossy().into_owned(),
+        }),
+        "/System/Configuration/livetv",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(value["TunerHosts"][0]["Url"], "");
+    assert!(
+        value["TunerHosts"][1].get("Url").is_none(),
+        "absent stays absent"
+    );
+    assert_eq!(value["ListingProviders"][0]["Password"], "");
+}
+
 #[tokio::test]
 async fn live_tv_config_backend_failure_warns_instead_of_reading_as_unconfigured() {
-    let state = full_state().with_live_tv(Arc::new(FailingLiveTv));
+    let state = full_state().with_live_tv(Arc::new(ScriptedLiveTv(None)));
 
     let ((status, body), logs) =
         with_captured_logs(get(state, "/System/Configuration/livetv")).await;
@@ -1368,6 +1310,176 @@ async fn registered_store_validates_before_replacing_configuration() {
     assert_eq!(
         std::fs::read_dir(dir.path().join("named")).unwrap().count(),
         1
+    );
+}
+
+/// A host check run after each committed save; it fails the save with a
+/// missing file after recording which store was saved.
+struct MissingFileAfterSave {
+    saved: std::sync::Mutex<Vec<String>>,
+}
+
+impl ferrofin_common::configuration::CommittedConfigurationCheck for MissingFileAfterSave {
+    fn check(
+        &self,
+        key: &str,
+    ) -> Result<(), ferrofin_common::configuration::ConfigurationValidationError> {
+        self.saved.lock().unwrap().push(key.to_owned());
+        Err(
+            ferrofin_common::configuration::ConfigurationValidationError::FileNotFound(
+                "Certificate file 'missing.pfx' does not exist.".into(),
+            ),
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_committed_check_answers_every_named_save_after_it_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let check = Arc::new(MissingFileAfterSave {
+        saved: std::sync::Mutex::new(Vec::new()),
+    });
+    let app = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    })
+    .with_committed_configuration_check(check.clone());
+    let body = serde_json::json!({"CertificatePath": "missing.pfx"});
+    assert_eq!(
+        post(app.clone(), "/System/Configuration/network", &body).await,
+        StatusCode::NOT_FOUND
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("named/network.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["CertificatePath"], "missing.pfx");
+    // Upstream's handler runs after every named save, branding included.
+    assert_eq!(
+        post(
+            app.clone(),
+            "/System/Configuration/encoding",
+            &serde_json::json!({"EncodingThreadCount": 2})
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        post(
+            app.clone(),
+            "/System/Configuration/Branding",
+            &serde_json::json!({"LoginDisclaimer": "hello"})
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        *check.saved.lock().unwrap(),
+        ["network", "encoding", "branding"]
+    );
+}
+
+/// gl-29: a `KnownProxies` host name saved with the network configuration is
+/// resolved (`AddProxyAddresses`' `TryParseHost` branch) with the manager's
+/// resolver and trusted at once, where it used to be dropped.
+#[tokio::test]
+async fn a_saved_known_proxy_host_name_is_resolved_into_the_live_policy() {
+    use ferrofin_networking::{NetworkConfiguration, NetworkManager};
+    fn resolve(host: &str) -> Option<Vec<std::net::IpAddr>> {
+        (host == "proxy.example.test").then(|| vec!["10.1.0.9".parse().unwrap()])
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let network = Arc::new(std::sync::RwLock::new(
+        NetworkManager::with_defaults(NetworkConfiguration::default(), "").with_resolver(resolve),
+    ));
+    let state = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    })
+    .with_network(Arc::clone(&network));
+    let proxy = "10.1.0.9".parse().unwrap();
+    assert!(!network.read().unwrap().is_known_proxy(proxy));
+
+    assert_eq!(
+        post(
+            state,
+            "/System/Configuration/network",
+            &serde_json::json!({"KnownProxies": ["proxy.example.test"]}),
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(network.read().unwrap().is_known_proxy(proxy));
+}
+
+/// `StartupController.SetRemoteAccess` saves through `SaveConfiguration`, so
+/// the network manager re-reads its settings at once: the wizard's choice
+/// applies to the next request, not after a restart.
+#[tokio::test]
+async fn the_startup_remote_access_toggle_applies_to_the_live_policy() {
+    use ferrofin_networking::{NetworkConfiguration, NetworkManager, RemoteAccessPolicyResult};
+    let dir = tempfile::tempdir().unwrap();
+    // The rest of the saved document survives the toggle, a legacy spelling
+    // included (it is saved back under the contract's name).
+    write_named_config(
+        dir.path(),
+        "network",
+        br#"{"LocalNetworkSubnets":["10.1.0.0/16"],"KnownProxies":["10.1.0.1"],"InternalHttpPort":8097,"RemoteIpFilter":["198.51.100.0/24"]}"#,
+    );
+    let state = admin_state_with_paths(StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.path().to_string_lossy().into_owned(),
+    })
+    .with_network(Arc::new(std::sync::RwLock::new(
+        NetworkManager::with_defaults(NetworkConfiguration::default(), ""),
+    )));
+    // In the saved document's allowlist; `outside` is not.
+    let remote = "198.51.100.7".parse().unwrap();
+    let outside = "203.0.113.9".parse().unwrap();
+    assert_eq!(
+        state.remote_access_policy(remote),
+        RemoteAccessPolicyResult::Allow
+    );
+    let toggle = |enabled: bool| {
+        let state = state.clone();
+        async move {
+            post(
+                state,
+                "/Startup/RemoteAccess",
+                &serde_json::json!({"EnableRemoteAccess": enabled, "EnableAutomaticPortMapping": false}),
+            )
+            .await
+        }
+    };
+    assert_eq!(toggle(false).await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.remote_access_policy(remote),
+        RemoteAccessPolicyResult::RejectDueToRemoteAccessDisabled
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("named/network.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["EnableRemoteAccess"], false);
+    assert_eq!(
+        saved["LocalNetworkSubnets"],
+        serde_json::json!(["10.1.0.0/16"])
+    );
+    assert_eq!(saved["KnownProxies"], serde_json::json!(["10.1.0.1"]));
+    assert_eq!(saved["InternalHttpPort"], 8097);
+    assert_eq!(
+        saved["RemoteIPFilter"],
+        serde_json::json!(["198.51.100.0/24"])
+    );
+    assert!(saved.get("RemoteIpFilter").is_none());
+
+    // Back on: the whole saved document is the live policy, its allowlist too.
+    assert_eq!(toggle(true).await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.remote_access_policy(remote),
+        RemoteAccessPolicyResult::Allow
+    );
+    assert_eq!(
+        state.remote_access_policy(outside),
+        RemoteAccessPolicyResult::RejectDueToNotAllowlistedRemoteIp
     );
 }
 

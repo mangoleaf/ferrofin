@@ -8,13 +8,13 @@
 //! query-helper sibling is taken. The result feeds `TvSeriesManager`, which does
 //! the presentation-layer assembly.
 //!
-//! Access-filtering (`ApplyAccessFiltering`) and navigation-loading
-//! (`ApplyNavigations`) in C# widen/narrow the row set through the library
-//! manager's parental controls; those are not part of this repository seam, so
-//! the queries here use the item type + series key + played/virtual predicates
-//! that define the next-up algorithm and leave the parental widening to the
-//! caller. Episodes are ordered by `(ParentIndexNumber, IndexNumber)` — season,
-//! then episode — exactly as C#.
+//! Every pool is access-filtered as C# `ApplyAccessFiltering` filters it
+//! (v12.2 `QueryBuilding.cs:455-483`): the requested libraries, the user's
+//! parental restrictions, versions hidden only behind a primary in the same
+//! library, and owned non-extras dropped. Played is
+//! `DescendantQueryHelper.IsPlayedBy`: a row of the episode's own, or of a
+//! version linked under it. Episodes are ordered by `(ParentIndexNumber,
+//! IndexNumber)` — season, then episode — exactly as C#.
 //!
 //! # Round-trip budget
 //!
@@ -55,10 +55,13 @@ use ferrofin_traits::persistence::{
     NextUpEpisodeBatchResult, NextUpEpisodeUserData, NextUpService,
 };
 
+use ferrofin_db::enums::LinkedChildType;
+use sqlx::{QueryBuilder, Sqlite};
+
 use crate::db_error::db_err;
 use crate::item_repository::library_top_parents_by_view;
 use crate::item_type_lookup::stored_type_name;
-use crate::translate_query::PLACEHOLDER_ID;
+use crate::translate_query::{PLACEHOLDER_ID, TopParentTerm, push_access_filter};
 
 /// The concrete next-up service.
 #[derive(Clone)]
@@ -151,8 +154,10 @@ struct EpisodePos {
     season: Option<i64>,
     episode: Option<i64>,
     is_real: bool,
-    /// The user's most recent play date on this row (rewatching mode's
-    /// "last played by date" reads it).
+    /// The latest play date credited to this row for rewatching mode's "last
+    /// played by date" pick: C# `playedByGroupPrimary` credits every Played
+    /// row to `PrimaryVersionId ?? Id`, so the row's own Played rows (when it
+    /// is no version) and its versions' Played rows.
     last_played: Option<DateTime<Utc>>,
 }
 
@@ -166,9 +171,10 @@ impl EpisodePos {
 }
 
 /// A row of the episode projection: `(series key, id, season, episode, is
-/// virtual, primary version id, owner id, extra type, played, resume
-/// position, last played)`. The three user-data columns come off a `LEFT
-/// JOIN`, so they are `NULL` for an episode the user has no data on.
+/// virtual, primary version id, played, resume position, last played,
+/// accessible, played through a linked version, a version has a Played row,
+/// the latest date of those rows)`. The three user-data columns come off a
+/// `LEFT JOIN`, so they are `NULL` for an episode the user has no data on.
 type ProjectionRow = (
     String,
     String,
@@ -176,10 +182,12 @@ type ProjectionRow = (
     Option<i64>,
     bool,
     Option<String>,
-    Option<String>,
-    Option<i64>,
     Option<bool>,
     Option<i64>,
+    Option<DateTime<Utc>>,
+    bool,
+    bool,
+    bool,
     Option<DateTime<Utc>>,
 );
 
@@ -196,11 +204,18 @@ struct ProjectedEpisode {
     /// AND the local versions of each, which point at the version they sit
     /// beside, further down ([`version_groups`]).
     version_group: Uuid,
-    /// Whether the row may be picked at all — C# `ApplyAccessFiltering`'s
-    /// `PrimaryVersionId == null && (OwnerId == null || ExtraType != null)`:
-    /// alternate versions and owned non-extras are never last watched, next
-    /// up or a special, though their user data still counts for the group.
+    /// Whether the row may be picked at all — it passes C#
+    /// `ApplyAccessFiltering` ([`push_access`]). Rows that do not (a version
+    /// behind its primary, an owned non-extra, a row over the user's rating)
+    /// are never last watched, next up or a special, though their user data
+    /// still counts for the group.
     is_candidate: bool,
+    /// `DescendantQueryHelper.IsPlayedBy`: a Played row of its own, or of a
+    /// version linked under it (`LinkedChildren` types 2 and 3).
+    played_by: bool,
+    /// Whether any Played row is credited to this row for the rewatching pick
+    /// (see [`EpisodePos::last_played`]); a row with none is not a candidate.
+    rewatch_played: bool,
     user_data: NextUpEpisodeUserData,
 }
 
@@ -264,10 +279,23 @@ impl NextUpService for FerrofinNextUpService {
             return Ok(HashMap::new());
         }
         let episode_type = Self::episode_type()?;
+        // `PrepareFilterQuery`: the user's parental restrictions, and the
+        // libraries the pools are confined to (`ApplyAccessFiltering`).
+        let resolved = crate::query_restrictions::resolve(&self.db, filter).await?;
+        let filter = resolved.as_ref().unwrap_or(filter);
+        let top_parents = if filter.top_parent_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.top_parent_ids(&filter.top_parent_ids).await?
+        };
+        let access = Access {
+            filter,
+            top_parents: &top_parents,
+        };
 
         // ── One projection query feeds every position-based decision below ──
         let projected = self
-            .episode_projection(episode_type, &user.id, series_keys)
+            .episode_projection(episode_type, &user.id, series_keys, &access)
             .await?;
 
         // The user-data facts of every projected episode, with the resume
@@ -283,14 +311,15 @@ impl NextUpService for FerrofinNextUpService {
 
         // ── Last watched by play date (rewatching mode) ──
         let last_watched_by_date = if include_watched_for_rewatching {
-            pick_per_series(&by_key, most_recently_played)
+            last_played_per_series(&projected)
         } else {
             HashMap::new()
         };
 
         // ── Specials (season 0), non-virtual ──
         let mut specials_by_key = if include_specials {
-            self.fetch_specials(episode_type, series_keys).await?
+            self.fetch_specials(episode_type, series_keys, &access)
+                .await?
         } else {
             HashMap::new()
         };
@@ -371,30 +400,25 @@ impl NextUpService for FerrofinNextUpService {
 }
 
 impl FerrofinNextUpService {
-    /// The non-virtual special (season 0) episode rows per series key — the
-    /// primary, non-owned rows only, as `ApplyAccessFiltering` leaves them.
+    /// The non-virtual special (season 0) episode rows per series key, as
+    /// `ApplyAccessFiltering` leaves them (`NextUpService.cs:176`).
     async fn fetch_specials(
         &self,
-        episode_type: &str,
+        episode_type: &'static str,
         series_keys: &[String],
+        access: &Access<'_>,
     ) -> Result<HashMap<String, Vec<BaseItemEntity>>, ServiceError> {
-        let mut sql = String::from(
-            r#"SELECT * FROM "BaseItems"
-               WHERE "Type" = ? AND "ParentIndexNumber" = 0 AND "IsVirtualItem" = 0
-                 AND "PrimaryVersionId" IS NULL
-                 AND ("OwnerId" IS NULL OR "OwnerId" = ?
-                      OR "ExtraType" IS NOT NULL)
-                 AND "SeriesPresentationUniqueKey" IN ("#,
-        );
-        push_key_placeholders(&mut sql, series_keys.len());
-        sql.push(')');
-        let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql))
-            .bind(episode_type)
-            .bind(guid_to_db(Uuid::nil()));
-        for key in series_keys {
-            query = query.bind(key.clone());
-        }
-        let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+        let mut qb: QueryBuilder<Sqlite> =
+            QueryBuilder::new(r#"SELECT bi.* FROM "BaseItems" bi WHERE bi."Type" = "#);
+        qb.push_bind(episode_type)
+            .push(r#" AND bi."ParentIndexNumber" = 0 AND bi."IsVirtualItem" = 0"#);
+        push_series_keys(&mut qb, series_keys);
+        push_access(&mut qb, access);
+        let rows: Vec<BaseItemEntity> = qb
+            .build_query_as()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
         let mut out: HashMap<String, Vec<BaseItemEntity>> = HashMap::new();
         for row in rows {
             if let Some(key) = row.series_presentation_unique_key.clone() {
@@ -412,31 +436,26 @@ impl FerrofinNextUpService {
     /// specials' played flags) *and* the user-data facts the manager's
     /// `DetermineNextEpisode` reads per pick (resume position, play date). The
     /// join is `LEFT`, so an episode with no user data is still a candidate.
+    ///
+    /// Every row of the series is projected — a version behind its primary
+    /// still lends the group its resume position — with `accessible` saying
+    /// whether it passes `ApplyAccessFiltering`. The two version columns are
+    /// the `LinkedChildren` arm of `IsPlayedBy` and the version half of
+    /// `playedByGroupPrimary` (`NextUpService.cs:134-150`); both read rows that
+    /// may sit under another series key, so they are SQL, not a pass over the
+    /// projection.
     async fn episode_projection(
         &self,
-        episode_type: &str,
+        episode_type: &'static str,
         user_id: &str,
         series_keys: &[String],
+        access: &Access<'_>,
     ) -> Result<Vec<ProjectedEpisode>, ServiceError> {
-        let mut sql = String::from(
-            r#"SELECT bi."SeriesPresentationUniqueKey", bi."Id",
-                      bi."ParentIndexNumber", bi."IndexNumber", bi."IsVirtualItem",
-                      bi."PrimaryVersionId", bi."OwnerId", bi."ExtraType",
-                      ud."Played", ud."PlaybackPositionTicks", ud."LastPlayedDate"
-               FROM "BaseItems" bi
-               LEFT JOIN "UserData" ud ON ud."ItemId" = bi."Id" AND ud."UserId" = ?
-               WHERE bi."Type" = ? AND bi."SeriesPresentationUniqueKey" IN ("#,
-        );
-        push_key_placeholders(&mut sql, series_keys.len());
-        sql.push(')');
-
-        let mut query = sqlx::query_as::<_, ProjectionRow>(sqlx::AssertSqlSafe(sql))
-            .bind(user_id)
-            .bind(episode_type);
-        for key in series_keys {
-            query = query.bind(key.clone());
-        }
-        let rows = query.fetch_all(self.db.pool()).await.map_err(db_err)?;
+        let rows: Vec<ProjectionRow> = projection_query(episode_type, user_id, series_keys, access)
+            .build_query_as()
+            .fetch_all(self.db.pool())
+            .await
+            .map_err(db_err)?;
 
         let mut out: Vec<ProjectedEpisode> = Vec::new();
         let mut slot_of: HashMap<Uuid, usize> = HashMap::new();
@@ -447,11 +466,13 @@ impl FerrofinNextUpService {
             episode,
             is_virtual,
             primary,
-            owner,
-            extra_type,
             played,
             ticks,
             last_played,
+            accessible,
+            linked_version_played,
+            version_played,
+            version_last_played,
         ) in rows
         {
             let Ok(id) = Uuid::parse_str(&id) else {
@@ -462,21 +483,25 @@ impl FerrofinNextUpService {
                 playback_position_ticks: ticks.unwrap_or(0),
                 last_played_date: last_played,
             };
+            // `PrimaryVersionId ?? Id`: the row's own Played rows are credited
+            // to it only when it is no version.
+            let own_played = user_data.played && primary.is_none();
+            let own_date = last_played.filter(|_| own_played);
             if let Some(&slot) = slot_of.get(&id) {
                 // Another user-data key of the same episode: merge the facts.
                 let ep = &mut out[slot];
                 ep.user_data = merge_user_data(ep.user_data, user_data);
-                ep.pos.last_played = ep.user_data.last_played_date;
+                ep.played_by |= user_data.played;
+                ep.rewatch_played |= own_played;
+                ep.pos.last_played = ep.pos.last_played.max(own_date);
                 continue;
             }
             slot_of.insert(id, out.len());
-            let primary = primary
+            let version_group = primary
                 .as_deref()
                 .and_then(|p| Uuid::parse_str(p).ok())
-                .filter(|p| !p.is_nil());
-            let is_candidate =
-                primary.is_none() && (is_unowned(owner.as_deref()) || extra_type.is_some());
-            let version_group = primary.unwrap_or(id);
+                .filter(|p| !p.is_nil())
+                .unwrap_or(id);
             out.push(ProjectedEpisode {
                 key,
                 pos: EpisodePos {
@@ -484,10 +509,12 @@ impl FerrofinNextUpService {
                     season,
                     episode,
                     is_real: !is_virtual,
-                    last_played,
+                    last_played: own_date.max(version_last_played.filter(|_| version_played)),
                 },
                 version_group,
-                is_candidate,
+                is_candidate: accessible,
+                played_by: user_data.played || linked_version_played,
+                rewatch_played: own_played || version_played,
                 user_data,
             });
         }
@@ -534,13 +561,107 @@ fn chain_root(id: Uuid, primary_of: &HashMap<Uuid, Uuid>) -> Uuid {
     current
 }
 
-/// Whether an `OwnerId` means "no owner". C# treats `Guid.Empty` as unowned,
-/// and a real Jellyfin database stores the ZERO GUID on virtually every row
-/// while Ferrofin's writer leaves the column NULL — the same rule as
-/// `translate_query`'s `NO_OWNER`, without which an adopted library has no
-/// next-up candidates at all.
-fn is_unowned(owner: Option<&str>) -> bool {
-    owner.is_none_or(|o| Uuid::parse_str(o).is_ok_and(|id| id.is_nil()))
+/// The episode-projection statement of [`FerrofinNextUpService`]'s batch
+/// (see `episode_projection`).
+fn projection_query(
+    episode_type: &'static str,
+    user_id: &str,
+    series_keys: &[String],
+    access: &Access<'_>,
+) -> QueryBuilder<Sqlite> {
+    let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+        r#"SELECT bi."SeriesPresentationUniqueKey", bi."Id",
+                  bi."ParentIndexNumber", bi."IndexNumber", bi."IsVirtualItem",
+                  bi."PrimaryVersionId",
+                  ud."Played", ud."PlaybackPositionTicks", ud."LastPlayedDate",
+                  CASE WHEN 1 = 1"#,
+    );
+    push_access(&mut qb, access);
+    qb.push(
+        r#" THEN 1 ELSE 0 END,
+            EXISTS (SELECT 1 FROM "LinkedChildren" lc
+                    JOIN "UserData" cu ON cu."ItemId" = lc."ChildId"
+                    WHERE lc."ParentId" = bi."Id" AND lc."ChildType" IN ("#,
+    )
+    .push_bind(i32::from(LinkedChildType::LocalAlternateVersion))
+    .push(", ")
+    .push_bind(i32::from(LinkedChildType::LinkedAlternateVersion))
+    .push(r#") AND cu."UserId" = "#)
+    .push_bind(user_id.to_owned())
+    // `CROSS JOIN`: a plan pin. Left to itself the planner starts the two
+    // version probes from every Played row of the user's and filters by
+    // `PrimaryVersionId`, costing each episode the whole watch history; pinned,
+    // they seek the episode's versions and then each version's row.
+    .push(
+        r#" AND cu."Played" = 1),
+            EXISTS (SELECT 1 FROM "BaseItems" v CROSS JOIN "UserData" r ON r."ItemId" = v."Id"
+                    WHERE v."PrimaryVersionId" = bi."Id" AND r."UserId" = "#,
+    )
+    .push_bind(user_id.to_owned())
+    .push(
+        r#" AND r."Played" = 1),
+            (SELECT MAX(r."LastPlayedDate") FROM "BaseItems" v
+             CROSS JOIN "UserData" r ON r."ItemId" = v."Id"
+             WHERE v."PrimaryVersionId" = bi."Id" AND r."UserId" = "#,
+    )
+    .push_bind(user_id.to_owned())
+    .push(
+        r#" AND r."Played" = 1)
+           FROM "BaseItems" bi
+           LEFT JOIN "UserData" ud ON ud."ItemId" = bi."Id" AND ud."UserId" = "#,
+    )
+    .push_bind(user_id.to_owned())
+    .push(r#" WHERE bi."Type" = "#)
+    .push_bind(episode_type);
+    push_series_keys(&mut qb, series_keys);
+    qb
+}
+
+/// The episode-projection statement the next-up batch sends for
+/// `series_keys` keys, confined to `top_parents` and restricted as `filter`
+/// says — the SQL text only, for the plan pin in `tests/`.
+#[must_use]
+pub fn next_up_projection_sql(
+    filter: &InternalItemsQuery,
+    top_parents: &[Uuid],
+    series_keys: usize,
+) -> String {
+    let keys: Vec<String> = (0..series_keys).map(|n| n.to_string()).collect();
+    let access = Access {
+        filter,
+        top_parents,
+    };
+    projection_query("Episode", "user", &keys, &access)
+        .sql()
+        .as_str()
+        .to_owned()
+}
+
+/// The access scope of one batch: the resolved query and the libraries its
+/// pools are confined to.
+struct Access<'a> {
+    filter: &'a InternalItemsQuery,
+    top_parents: &'a [Uuid],
+}
+
+/// Pushes C# `ApplyAccessFiltering` on `bi` for the batch's scope
+/// ([`push_access_filter`]); its libraries may drive the pools' seeks.
+fn push_access(qb: &mut QueryBuilder<Sqlite>, access: &Access<'_>) {
+    push_access_filter(qb, access.filter, access.top_parents, TopParentTerm::Seek);
+}
+
+/// Pushes ` AND bi."SeriesPresentationUniqueKey" IN (…)` (`NULL` when empty).
+fn push_series_keys(qb: &mut QueryBuilder<Sqlite>, series_keys: &[String]) {
+    qb.push(r#" AND bi."SeriesPresentationUniqueKey" IN ("#);
+    if series_keys.is_empty() {
+        qb.push("NULL");
+    } else {
+        let mut keys = qb.separated(", ");
+        for key in series_keys {
+            keys.push_bind(key.clone());
+        }
+    }
+    qb.push(")");
 }
 
 /// Partitions the non-special projected rows into each series' played /
@@ -553,7 +674,7 @@ fn partition_pools(projected: &[ProjectedEpisode]) -> HashMap<&str, SeriesEpisod
             continue;
         }
         let bucket = by_key.entry(ep.key.as_str()).or_default();
-        if ep.user_data.played {
+        if ep.played_by {
             bucket.played.push(ep.pos);
         } else if ep.pos.is_real {
             bucket.unplayed.push(ep.pos);
@@ -571,6 +692,23 @@ fn pick_per_series<'a>(
     by_key
         .iter()
         .filter_map(|(key, episodes)| pick(&episodes.played).map(|pos| (*key, pos)))
+        .collect()
+}
+
+/// Rewatching mode's "last watched by date" per series
+/// (`NextUpService.cs:121-158`): among the accessible non-special rows —
+/// virtual ones too — with a Played row credited to them, the most recently
+/// played.
+fn last_played_per_series(projected: &[ProjectedEpisode]) -> HashMap<&str, EpisodePos> {
+    let mut by_key: HashMap<&str, Vec<EpisodePos>> = HashMap::new();
+    for ep in projected {
+        if ep.pos.season != Some(0) && ep.is_candidate && ep.rewatch_played {
+            by_key.entry(ep.key.as_str()).or_default().push(ep.pos);
+        }
+    }
+    by_key
+        .into_iter()
+        .filter_map(|(key, positions)| most_recently_played(&positions).map(|pos| (key, pos)))
         .collect()
 }
 
@@ -1817,5 +1955,193 @@ mod tests {
         // series-a is behind the cutoff; the limit keeps only the newest of the
         // remaining two, newest-first.
         assert_eq!(keys, vec!["series-c".to_owned()]);
+    }
+
+    /// Links `child` under `parent` in `LinkedChildren` (the row the scanner
+    /// writes beside `PrimaryVersionId` for a local alternate, `ChildType` 2).
+    async fn link_child(db: &Database, parent: Uuid, child: Uuid, child_type: i32) {
+        exec(
+            db,
+            r#"INSERT INTO "LinkedChildren" ("ParentId", "ChildId", "ChildType", "SortOrder")
+               VALUES (?1, ?2, ?3, 0)"#,
+            &[
+                &guid_to_db(parent),
+                &guid_to_db(child),
+                &child_type.to_string(),
+            ],
+        )
+        .await;
+    }
+
+    /// Port of v12.2 `NextUpServiceTests`
+    /// `GetNextUpEpisodesBatch_EpisodePlayedThroughItsAlternateVersion_OffersTheOneAfterIt`:
+    /// `DescendantQueryHelper.IsPlayedBy` counts an episode played when a
+    /// version linked under it (`LinkedChildren` type 2/3) is played.
+    #[tokio::test]
+    async fn an_episode_played_through_its_alternate_version_is_last_watched() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let (e1, e2, e1_alt) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, e2, "series-a", 1, 2, false, Some(top)).await;
+        seed_episode(&db, e1_alt, "series-a", 1, 1, false, Some(top)).await;
+        set_primary_version(&db, e1_alt, e1).await;
+        link_child(&db, e1, e1_alt, 2).await;
+        seed_user_data(&db, user_id, e1_alt, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+
+        let batch = FerrofinNextUpService::new(db)
+            .get_next_up_episodes_batch(
+                &query_for(user, top),
+                &["series-a".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        assert_eq!(
+            series.last_watched.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e1))
+        );
+        assert_eq!(
+            series.next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+    }
+
+    /// v12.2 `playedByGroupPrimary` (`NextUpService.cs:134-150`): a play
+    /// recorded against an alternate version dates its primary for the
+    /// rewatching pick, and only Played rows date anything.
+    #[tokio::test]
+    async fn a_rewatch_dated_on_an_alternate_version_dates_its_primary() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let (e1, e2, e3, e1_alt) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, e2, "series-a", 1, 2, false, Some(top)).await;
+        seed_episode(&db, e3, "series-a", 1, 3, false, Some(top)).await;
+        seed_episode(&db, e1_alt, "series-a", 1, 1, false, Some(top)).await;
+        set_primary_version(&db, e1_alt, e1).await;
+        link_child(&db, e1, e1_alt, 2).await;
+        // e1 was watched in 2020 and rewatched in 2023 through its 4K file;
+        // e2 was watched in 2021; e3 has an unplayed row with a newer date.
+        seed_user_data(&db, user_id, e1, true, Some(ts("2020-01-01T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, e1_alt, true, Some(ts("2023-01-01T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, e2, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+        seed_user_data(&db, user_id, e3, false, Some(ts("2024-01-01T00:00:00Z"))).await;
+
+        let batch = FerrofinNextUpService::new(db)
+            .get_next_up_episodes_batch(
+                &query_for(user, top),
+                &["series-a".to_owned()],
+                false,
+                true,
+            )
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        assert_eq!(
+            series
+                .last_watched_for_rewatching
+                .as_ref()
+                .map(|e| e.id.clone()),
+            Some(guid_to_db(e1))
+        );
+        assert_eq!(
+            series
+                .next_played_for_rewatching
+                .as_ref()
+                .map(|e| e.id.clone()),
+            Some(guid_to_db(e2))
+        );
+    }
+
+    /// v12.2 `ApplyAccessFiltering` on every pool (`NextUpService.cs:99,
+    /// 127, 176, 211, 259`): the requested libraries only, and a version is
+    /// hidden only while its primary is in the same library (911edfb64d), so
+    /// a version in another library than its primary is a candidate.
+    #[tokio::test]
+    async fn a_version_in_another_library_than_its_primary_is_a_candidate() {
+        let db = test_db().await;
+        let (library_a, library_b) = (Uuid::new_v4(), Uuid::new_v4());
+        let user = seed_user(&db, Uuid::new_v4()).await;
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let (e1, e2, e2_b) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(library_b)).await;
+        seed_episode(&db, e2, "series-a", 1, 2, false, Some(library_a)).await;
+        seed_episode(&db, e2_b, "series-a", 1, 2, false, Some(library_b)).await;
+        set_primary_version(&db, e2_b, e2).await;
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+
+        let batch = FerrofinNextUpService::new(db)
+            .get_next_up_episodes_batch(
+                &query_for(user, library_b),
+                &["series-a".to_owned()],
+                false,
+                false,
+            )
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        assert_eq!(
+            series.next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e2_b))
+        );
+    }
+
+    /// v12.2 `ApplyAccessFiltering` applies the user's parental restrictions
+    /// (`ApplyParentalRestrictions`) to the unplayed candidates and the
+    /// specials: an episode over the user's maximum rating is never offered.
+    #[tokio::test]
+    async fn an_episode_over_the_users_rating_limit_is_never_offered() {
+        let db = test_db().await;
+        let top = Uuid::new_v4();
+        let mut user = seed_user(&db, Uuid::new_v4()).await;
+        user.max_parental_rating_score = Some(10);
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        let (e1, e2, e3, special) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        seed_episode(&db, e1, "series-a", 1, 1, false, Some(top)).await;
+        seed_episode(&db, e2, "series-a", 1, 2, false, Some(top)).await;
+        seed_episode(&db, e3, "series-a", 1, 3, false, Some(top)).await;
+        seed_episode(&db, special, "series-a", 0, 1, false, Some(top)).await;
+        for id in [e2, special] {
+            exec(
+                &db,
+                r#"UPDATE "BaseItems" SET "InheritedParentalRatingValue" = 18 WHERE "Id" = ?1"#,
+                &[&guid_to_db(id)],
+            )
+            .await;
+        }
+        seed_user_data(&db, user_id, e1, true, Some(ts("2021-01-01T00:00:00Z"))).await;
+
+        let batch = FerrofinNextUpService::new(db)
+            .get_next_up_episodes_batch(
+                &query_for(user, top),
+                &["series-a".to_owned()],
+                true,
+                false,
+            )
+            .await
+            .expect("batch");
+        let series = batch.get("series-a").expect("series present");
+        assert_eq!(
+            series.next_up.as_ref().map(|e| e.id.clone()),
+            Some(guid_to_db(e3))
+        );
+        assert!(series.specials.is_empty());
     }
 }

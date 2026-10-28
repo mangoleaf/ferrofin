@@ -37,6 +37,28 @@ async fn accepts_the_fixture_component_and_reports_its_id() {
     );
 }
 
+/// The engine grants a guest only the proposals the host needs: shared
+/// memories (threads), GC types and exception handling are not part of the
+/// sandbox, so a component using one never compiles. This also pins the
+/// wasmtime crate features: one that turns a proposal back on fails here.
+#[tokio::test]
+async fn proposals_outside_the_sandbox_do_not_compile() {
+    let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
+    for (proposal, module) in [
+        ("threads", "(memory 1 1 shared)"),
+        ("gc", "(type (struct))"),
+        ("exceptions", "(tag)"),
+    ] {
+        let component = wat::parse_str(format!("(component (core module {module}))")).unwrap();
+        let err = validator.validate(&component).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not a valid WebAssembly component"),
+            "{proposal}: {err}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn rejects_garbage_and_non_component_wasm() {
     let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
@@ -93,4 +115,52 @@ async fn rejects_a_provider_name_colliding_with_a_builtin_at_install() {
         .validate(&ok)
         .await
         .expect("a non-colliding named provider validates");
+}
+
+#[tokio::test]
+async fn refuses_at_install_what_loading_would_skip() {
+    let validator = WasmArtifactValidator::new(&WasmSettings::default()).unwrap();
+    let fixture = ferrofin_wasm::TEST_FIXTURE_WAT;
+    for (wat, reason) in [
+        (
+            fixture.replace(
+                r#"(data (i32.const 128) "{\"a\":1}")"#,
+                r#"(data (i32.const 128) "notjson")"#,
+            ),
+            "default-config is not valid JSON",
+        ),
+        (
+            fixture.replace(
+                r#"(data (i32.const 64)  "Hello")"#,
+                r#"(data (i32.const 64)  "He\00lo")"#,
+            ),
+            "contains control characters",
+        ),
+        (
+            fixture.replace(
+                r#"(data (i32.const 64)  "Hello")"#,
+                r#"(data (i32.const 64)  "     ")"#,
+            ),
+            "is empty",
+        ),
+        (
+            // 300 bytes in otherwise-unused memory, pointed at by the
+            // descriptor's name slot.
+            fixture
+                .replace(
+                    r#"(data (i32.const 64)  "Hello")"#,
+                    &format!(r#"(data (i32.const 2048) "{}")"#, "n".repeat(300)),
+                )
+                .replace(
+                    "(i32.store (i32.const 520) (i32.const 64))\n      (i32.store (i32.const 524) (i32.const 5))",
+                    "(i32.store (i32.const 520) (i32.const 2048))\n      (i32.store (i32.const 524) (i32.const 300))",
+                ),
+            "exceeds 256 bytes",
+        ),
+    ] {
+        assert_ne!(wat, fixture, "the fixture patch for `{reason}` must apply");
+        let component = wat::parse_str(&wat).unwrap();
+        let err = validator.validate(&component).await.unwrap_err();
+        assert!(err.to_string().contains(reason), "{reason}: {err}");
+    }
 }

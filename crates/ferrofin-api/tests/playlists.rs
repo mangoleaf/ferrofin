@@ -293,6 +293,8 @@ impl UserManager for OkUsers {
 #[derive(Default)]
 struct OkDto {
     seen_fields: std::sync::Mutex<Vec<Vec<ferrofin_model::querying::ItemFields>>>,
+    /// Whether the linked-children projection ran.
+    linked_children: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -333,6 +335,17 @@ impl DtoService for OkDto {
             })
             .collect())
     }
+    async fn get_linked_children_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.linked_children
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.get_base_item_dtos(items, options, user, None, true)
+            .await
+    }
     async fn get_item_by_name_dto(
         &self,
         _item: &BaseItemEntity,
@@ -361,6 +374,7 @@ struct RecordingPlaylists {
     added: Mutex<Option<AddCall>>,
     removed: Mutex<Option<RemoveCall>>,
     moved: Mutex<Option<MoveCall>>,
+    updated: Mutex<Option<ferrofin_model::playlists::PlaylistUpdateRequest>>,
     access: PlaylistAccess,
     shares: Vec<ferrofin_model::entities_media::PlaylistUserPermissions>,
 }
@@ -372,6 +386,7 @@ impl Default for RecordingPlaylists {
             added: Mutex::default(),
             removed: Mutex::default(),
             moved: Mutex::default(),
+            updated: Mutex::default(),
             access: PlaylistAccess {
                 level: PlaylistAccessLevel::Owner,
                 open_access: false,
@@ -411,13 +426,14 @@ impl PlaylistManager for RecordingPlaylists {
     ) -> Result<PlaylistCreationResult, ServiceError> {
         *self.created.lock().unwrap() = Some(request.clone());
         Ok(PlaylistCreationResult {
-            id: PLAYLIST_ID.to_string(),
+            id: PLAYLIST_ID.simple().to_string(),
         })
     }
     async fn update_playlist(
         &self,
-        _request: &ferrofin_model::playlists::PlaylistUpdateRequest,
+        request: &ferrofin_model::playlists::PlaylistUpdateRequest,
     ) -> Result<(), ServiceError> {
+        *self.updated.lock().unwrap() = Some(request.clone());
         Ok(())
     }
     async fn get_playlists(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
@@ -428,7 +444,13 @@ impl PlaylistManager for RecordingPlaylists {
         _playlist_id: Uuid,
         _user_id: Uuid,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        Ok(vec![item_entity(ITEM_A), item_entity(ITEM_B)])
+        // Dashed upper case, as a Jellyfin-scanned database stores `Id`.
+        Ok([ITEM_A, ITEM_B]
+            .map(|id| BaseItemEntity {
+                id: id.to_string().to_uppercase(),
+                ..item_entity(id)
+            })
+            .into())
     }
     async fn add_user_to_shares(
         &self,
@@ -465,6 +487,10 @@ impl PlaylistManager for RecordingPlaylists {
         playlist_id: &str,
         entry_ids: &[String],
     ) -> Result<(), ServiceError> {
+        // The manager's `ArgumentException` for an id that is no playlist's.
+        if playlist_id != PLAYLIST_ID.to_string() {
+            return Err(ServiceError::invalid_input("no playlist"));
+        }
         *self.removed.lock().unwrap() = Some((playlist_id.to_owned(), entry_ids.to_vec()));
         Ok(())
     }
@@ -555,6 +581,20 @@ fn state_full(
     dto: Arc<OkDto>,
     users: Arc<dyn ferrofin_traits::library::UserManager>,
 ) -> AppState {
+    let auth = Arc::new(OkAuth);
+    state_authed(playlists, collections, dto, users, (auth.clone(), auth))
+}
+
+/// [`state_full`] with the caller's credentials chosen by the test: [`OkAuth`]
+/// is the fixed user, `FakeAuthContext` + `ApiKeyAuthService` an API key (no
+/// user).
+fn state_authed(
+    playlists: Arc<RecordingPlaylists>,
+    collections: Arc<RecordingCollections>,
+    dto: Arc<OkDto>,
+    users: Arc<dyn ferrofin_traits::library::UserManager>,
+    (context, auth): (Arc<dyn AuthorizationContext>, Arc<dyn AuthService>),
+) -> AppState {
     AppState::new(
         Arc::new(ferrofin_api::test_support::FakeLibrary),
         users,
@@ -570,8 +610,8 @@ fn state_full(
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
         dto,
-        Arc::new(OkAuth),
-        Arc::new(OkAuth),
+        context,
+        auth,
         Arc::new(ferrofin_api::test_support::FakeQuickConnect),
         playlists,
         collections,
@@ -626,12 +666,125 @@ async fn create_playlist_from_body_returns_id() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let result: PlaylistCreationResult = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(result.id, PLAYLIST_ID.to_string());
+    // The manager's id passes through unchanged.
+    assert_eq!(result.id, PLAYLIST_ID.simple().to_string());
     let created = pl.created.lock().unwrap().clone().expect("recorded");
     assert_eq!(created.name.as_deref(), Some("Roadtrip"));
     assert_eq!(created.item_id_list, vec![ITEM_A]);
     // The caller's id is used when neither query nor body names one.
     assert_eq!(created.user_id, USER_ID);
+}
+
+/// `Public = createPlaylistRequest?.IsPublic` over C#'s `bool IsPublic = true`
+/// (v12.2 PlaylistsController.cs:99, CreatePlaylistDto.cs:44): a body without
+/// `IsPublic` creates an open playlist; only the bodiless query-string form
+/// leaves it to the manager's `Public ?? false`.
+#[tokio::test]
+async fn create_playlist_is_public_defaults_per_body() {
+    let cases: [(&str, Body, Option<bool>); 4] = [
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip"}"#),
+            Some(true),
+        ),
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip","IsPublic":false}"#),
+            Some(false),
+        ),
+        (
+            "/Playlists",
+            Body::from(r#"{"Name":"Roadtrip","IsPublic":true}"#),
+            Some(true),
+        ),
+        ("/Playlists?name=Roadtrip", Body::empty(), None),
+    ];
+    for (uri, body, expected) in cases {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", uri, body).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let created = pl.created.lock().unwrap().clone().expect("recorded");
+        assert_eq!(created.public, expected, "{uri}: {expected:?}");
+    }
+}
+
+/// Bodies upstream's model binding refuses before `CreatePlaylist` runs
+/// (v12.2 `CreatePlaylistDto`, nullable annotations on): `required string Name`
+/// fails deserialization when absent, MVC's implicit `[Required]` refuses a
+/// null or blank one, and the non-nullable `bool IsPublic` refuses a null.
+/// A query-string `name` does not rescue a body without one. With no body and
+/// no `name` either, upstream throws on the null name (500); Ferrofin refuses
+/// it the same way (400) rather than create a nameless playlist.
+#[tokio::test]
+async fn create_playlist_rejects_bodies_upstream_binding_refuses() {
+    let cases = [
+        ("/Playlists", ""),
+        ("/Playlists", r#"{"Ids":[]}"#),
+        ("/Playlists?name=Roadtrip", "{}"),
+        ("/Playlists", r#"{"Name":null}"#),
+        ("/Playlists", r#"{"Name":""}"#),
+        ("/Playlists", r#"{"Name":"  "}"#),
+        ("/Playlists", r#"{"Name":"Roadtrip","IsPublic":null}"#),
+    ];
+    for (uri, body) in cases {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", uri, Body::from(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+        assert!(pl.created.lock().unwrap().is_none(), "{uri} {body}");
+    }
+}
+
+/// A `Users` entry binds through upstream's `PlaylistUserPermissions(Guid
+/// userId, bool canEdit = false)` constructor on create and update alike: a
+/// missing `CanEdit` is `false`, a missing or null `UserId` the empty GUID,
+/// and a null `CanEdit` is a 400. Measured on a live Jellyfin 12.2.
+#[tokio::test]
+async fn playlist_users_entries_bind_through_the_constructor_defaults() {
+    use ferrofin_model::entities_media::PlaylistUserPermissions as Share;
+    let users = format!(
+        r#"[{{"UserId":"{}"}},{{"CanEdit":true}},{{}},{{"UserId":null,"CanEdit":true}}]"#,
+        USER_ID.simple()
+    );
+    let expected = vec![
+        Share::new(USER_ID, false),
+        Share::new(Uuid::nil(), true),
+        Share::new(Uuid::nil(), false),
+        Share::new(Uuid::nil(), true),
+    ];
+
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let body = format!(r#"{{"Name":"Roadtrip","Users":{users}}}"#);
+    let (status, _) = send(app, "POST", "/Playlists", Body::from(body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let created = pl.created.lock().unwrap().clone().expect("recorded");
+    assert_eq!(created.users, expected);
+
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+    let uri = format!("/Playlists/{PLAYLIST_ID}");
+    let body = format!(r#"{{"Users":{users}}}"#);
+    let (status, _) = send(app, "POST", &uri, Body::from(body)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let updated = pl.updated.lock().unwrap().clone().expect("recorded");
+    assert_eq!(updated.users, Some(expected));
+
+    for (uri, body) in [
+        (
+            "/Playlists".to_owned(),
+            r#"{"Name":"Roadtrip","Users":[{"CanEdit":null}]}"#,
+        ),
+        (uri, r#"{"Users":[{"CanEdit":null}]}"#),
+    ] {
+        let pl = Arc::new(RecordingPlaylists::default());
+        let app = state(pl.clone(), Arc::new(RecordingCollections::default()));
+        let (status, _) = send(app, "POST", &uri, Body::from(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}");
+        assert!(pl.created.lock().unwrap().is_none(), "{uri} {body}");
+        assert!(pl.updated.lock().unwrap().is_none(), "{uri} {body}");
+    }
 }
 
 #[tokio::test]
@@ -701,6 +854,12 @@ async fn playlist_items_projects_the_fields_the_client_asked_for() {
         "asking for one field must not project everything — got {} fields: {fields:?}",
         fields.len()
     );
+    // `GetManageableItems()` → `ResolveLinkedChildren`: the members are
+    // projected as linked children, loaded with every field.
+    assert!(
+        dto.linked_children
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
 }
 
 #[tokio::test]
@@ -720,10 +879,32 @@ async fn get_playlist_items_pages_and_tags_entry_id() {
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(result.total_record_count, 2);
     assert_eq!(result.items.len(), 1);
+    // `ItemId?.ToString("N")` (v12.2 PlaylistsController.cs:559): 32 lower-case
+    // hex digits, whatever case the row's stored id has.
     assert_eq!(
         result.items[0].playlist_item_id.as_deref(),
         Some(ITEM_A.simple().to_string().as_str())
     );
+}
+
+/// `GET /Playlists/{id}/Items?userId=` is `RequestHelpers.GetUserId`: a
+/// non-administrator naming another user is `403`, or the member filter
+/// would run as whoever they named.
+#[tokio::test]
+async fn playlist_items_for_another_user_as_non_admin_is_forbidden() {
+    let other = Uuid::from_u128(0x0999);
+    let app = state(
+        Arc::new(RecordingPlaylists::default()),
+        Arc::new(RecordingCollections::default()),
+    );
+    let (status, _) = send(
+        app,
+        "GET",
+        &format!("/Playlists/{PLAYLIST_ID}/Items?userId={other}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -759,6 +940,36 @@ async fn remove_items_from_playlist_records_call() {
     let (pid, entries) = pl.removed.lock().unwrap().clone().expect("recorded");
     assert_eq!(pid, PLAYLIST_ID.to_string());
     assert_eq!(entries, vec![ITEM_A.to_string()]);
+}
+
+/// An API key skips the access gate, so the manager is what refuses an id
+/// that is no playlist's — and `RemoveItemFromPlaylist` answers that with a
+/// bare `NotFound()`, never the `400` its exception would otherwise be.
+#[tokio::test]
+async fn an_api_key_removing_from_a_non_playlist_is_not_found() {
+    let pl = Arc::new(RecordingPlaylists::default());
+    let app = state_authed(
+        pl.clone(),
+        Arc::new(RecordingCollections::default()),
+        Arc::new(OkDto::default()),
+        Arc::new(OkUsers),
+        (
+            Arc::new(ferrofin_api::test_support::FakeAuthContext),
+            Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+        ),
+    );
+    let (status, body) = send(
+        app,
+        "DELETE",
+        &format!("/Playlists/{ITEM_A}/Items?entryIds={ITEM_A}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // The parameterless `NotFound()`'s ProblemDetails, not the gate's message.
+    let document: serde_json::Value = serde_json::from_slice(&body).expect("problem details");
+    assert_eq!(document["title"], "Not Found");
+    assert!(pl.removed.lock().unwrap().is_none());
 }
 
 #[tokio::test]

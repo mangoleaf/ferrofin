@@ -441,6 +441,114 @@ async fn splashscreen_upload_bad_content_type_is_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// The upload is named from `MimeTypes.ToExtension`: `image/jpg` is `.jpg`
+/// (Jellyfin 12 saves `splashscreen-upload.jpg`), and image types outside the
+/// override table take the base table's extension, as upstream's
+/// `ImageControllerTests` expect for `image/apng` and `image/avif`.
+#[rstest::rstest]
+#[case("image/jpg", "splashscreen-upload.jpg")]
+#[case("image/avif", "splashscreen-upload.avif")]
+#[case("image/apng", "splashscreen-upload.apng")]
+#[tokio::test]
+async fn splashscreen_upload_names_the_file_from_the_content_type(
+    #[case] content_type: &str,
+    #[case] file_name: &str,
+) {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let config = make_config(default_branding(), &dir.to_string_lossy());
+
+    let (status, _) = send(
+        config.clone(),
+        "POST",
+        "/Branding/Splashscreen",
+        Some((content_type, "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let location = config
+        .get_branding()
+        .await
+        .expect("branding")
+        .splashscreen_location
+        .expect("location");
+    let location = std::path::Path::new(&location);
+    assert_eq!(
+        location.file_name().and_then(|name| name.to_str()),
+        Some(file_name)
+    );
+    assert!(location.is_file());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// gl-24: `UploadCustomSplashscreen` streams the base64 body under Kestrel's
+/// 30,000,000-byte default, so a 3 MB image (4 MB of base64) saves instead of
+/// tripping axum's implicit 2 MiB limit, and a body past the limit is a `413`
+/// that writes nothing.
+#[tokio::test]
+async fn splashscreen_upload_takes_bodies_up_to_kestrels_default_limit() {
+    let dir = std::env::temp_dir().join(format!("ferrofin-splash-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let config = make_config(default_branding(), &dir.to_string_lossy());
+
+    let large = "A".repeat(4_000_000);
+    let (status, _) = send(
+        config.clone(),
+        "POST",
+        "/Branding/Splashscreen",
+        Some(("image/png", &large)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let location = config
+        .get_branding()
+        .await
+        .expect("branding")
+        .splashscreen_location
+        .expect("location");
+    assert_eq!(
+        std::fs::metadata(&location).expect("splashscreen").len(),
+        3_000_000
+    );
+    std::fs::remove_file(&location).expect("remove");
+
+    let too_large = "A".repeat(30_000_004);
+    let (status, _) = send(
+        config,
+        "POST",
+        "/Branding/Splashscreen",
+        Some(("image/png", &too_large)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!std::path::Path::new(&location).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An image subtype `ToExtension` does not know is still `400`.
+#[tokio::test]
+async fn splashscreen_upload_unknown_image_subtype_is_400() {
+    let config = make_config(default_branding(), "/nonexistent-ferrofin-data-dir");
+    let (status, _) = send(
+        config.clone(),
+        "POST",
+        "/Branding/Splashscreen",
+        Some(("image/x-unknown", "aGk=")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        config
+            .get_branding()
+            .await
+            .expect("branding")
+            .splashscreen_location
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn splashscreen_delete_no_location_is_204() {
     let config = make_config(default_branding(), "/tmp");

@@ -19,6 +19,7 @@ const ADMIN_PASSWORD: &str = "visibility-admin-pw";
 /// scanned.
 struct Harness {
     wired: WiredApp,
+    db: Database,
     temp: tempfile::TempDir,
 }
 
@@ -73,7 +74,7 @@ async fn boot() -> Harness {
     ferrofin_server::seed::seed_default_admin(wired.state.users.as_ref(), &config)
         .await
         .expect("seed admin");
-    Harness { wired, temp }
+    Harness { wired, db, temp }
 }
 
 /// Sends one request as `token` (on its own device) and returns status + body.
@@ -338,6 +339,7 @@ async fn hidden_items_return_404_before_direct_reads_and_writes() {
         format!("/Items/{id}/LocalTrailers"),
         format!("/Items/{id}/Intros"),
         format!("/Items/{id}/Similar"),
+        format!("/Shows/{id}/Similar"),
         format!("/Items/{id}/ThemeSongs"),
         format!("/Items/{id}/ThemeVideos"),
         format!("/UserItems/{id}/UserData"),
@@ -1106,32 +1108,43 @@ async fn public_user_picker_filters_authenticated_devices_after_setup() {
     assert!(users.as_array().unwrap().iter().any(|u| u["Id"] == id));
 }
 
+/// Jellyfin 12.1 runs `DeviceAccessHost` after a policy save and after a
+/// rename (`UserManager.UpdatePolicyAsync` and `RenameUser` raise
+/// `OnUserUpdated`): every device of the user that the saved policy no longer
+/// allows is logged out, and signing in from it again is a security error.
 #[tokio::test]
-async fn renamed_user_loses_existing_tokens_on_disallowed_devices() {
+async fn a_policy_save_or_a_rename_signs_out_disallowed_devices() {
     let h = boot().await;
     let router = ferrofin_api::create_router(h.wired.state.clone());
     let (admin, _) = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
     let id = create_user(&router, &admin, "device-user", "pw").await;
     let (user, _) = login(&router, "device-user", "pw").await;
-    let (_, mut dto) = call(&router, "GET", &format!("/Users/{id}"), Some(&admin), None).await;
-    dto["Policy"]["EnableAllDevices"] = json!(false);
-    dto["Policy"]["EnabledDevices"] = json!([]);
-    assert_eq!(
-        call(
-            &router,
-            "POST",
-            &format!("/Users/{id}/Policy"),
-            Some(&admin),
-            Some(dto["Policy"].clone())
-        )
-        .await
-        .0,
-        StatusCode::NO_CONTENT
-    );
+    let (_, dto) = call(&router, "GET", &format!("/Users/{id}"), Some(&admin), None).await;
+    let open = dto["Policy"].clone();
+    let mut restricted = open.clone();
+    restricted["EnableAllDevices"] = json!(false);
+    restricted["EnabledDevices"] = json!([]);
+    let save = |policy: Value| {
+        let router = router.clone();
+        let admin = admin.clone();
+        let id = id.clone();
+        async move {
+            call(
+                &router,
+                "POST",
+                &format!("/Users/{id}/Policy"),
+                Some(&admin),
+                Some(policy),
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(save(restricted.clone()).await, StatusCode::NO_CONTENT);
     assert_eq!(
         call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
-        StatusCode::OK,
-        "policy saves do not emit OnUserUpdated in the pinned source"
+        StatusCode::UNAUTHORIZED,
+        "the policy save signs out the device it no longer allows"
     );
     assert_eq!(
         call(
@@ -1146,13 +1159,32 @@ async fn renamed_user_loses_existing_tokens_on_disallowed_devices() {
         StatusCode::FORBIDDEN,
         "a denied device is a security error, not bad credentials"
     );
+
+    // The rename leg: a token on a device the stored policy refuses, the
+    // policy written without the save's device check, is signed out by a
+    // rename.
+    assert_eq!(save(open).await, StatusCode::NO_CONTENT);
+    let (user, _) = login(&router, "device-user", "pw").await;
+    let policy: ferrofin_model::users::UserPolicy =
+        serde_json::from_value(restricted).expect("policy");
+    h.wired
+        .state
+        .users
+        .update_policy(uuid::Uuid::parse_str(&id).expect("id"), &policy)
+        .await
+        .expect("policy saved without the device check");
+    assert_eq!(
+        call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
+        StatusCode::OK,
+        "nothing has run the device check yet"
+    );
     assert_eq!(
         call(
             &router,
             "POST",
             &format!("/Users?userId={id}"),
             Some(&admin),
-            Some(json!({"Name":"renamed"}))
+            Some(json!({"Name":"renamed","Policy":null}))
         )
         .await
         .0,
@@ -1160,7 +1192,8 @@ async fn renamed_user_loses_existing_tokens_on_disallowed_devices() {
     );
     assert_eq!(
         call(&router, "GET", "/Users/Me", Some(&user), None).await.0,
-        StatusCode::UNAUTHORIZED
+        StatusCode::UNAUTHORIZED,
+        "the rename runs the device check"
     );
 }
 
@@ -1563,4 +1596,105 @@ async fn current_web_schedule_payload_saves_and_revokes_existing_requests() {
             StatusCode::OK
         );
     }
+}
+
+/// The viewer's `GET /Items/{allowed}` status.
+async fn viewer_reads_allowed(f: &Fixture) -> StatusCode {
+    call(
+        &f.router,
+        "GET",
+        &format!("/Items/{}", f.allowed),
+        Some(&f.viewer),
+        None,
+    )
+    .await
+    .0
+}
+
+#[tokio::test]
+async fn library_option_and_library_row_edits_reach_the_next_request() {
+    // The policy and library rows are cached across requests (ferrofin_db::row_cache, gl-973):
+    // each edit below must reach the request right after it, with the caches already warm.
+    let f = fixture().await;
+    assert!(
+        f.h.db.row_cache_enabled(),
+        "the composition root turns the caches on"
+    );
+    assert_eq!(viewer_reads_allowed(&f).await, StatusCode::OK);
+    assert!(
+        f.h.db.cached_libraries().is_some(),
+        "and the read filled them"
+    );
+    let (_, folders) = call(
+        &f.router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let allowed = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "Allowed")
+        .unwrap()
+        .clone();
+    let library = allowed["ItemId"].as_str().unwrap().to_owned();
+    // A library disabled through its options is hidden (`CollectionFolder.IsVisible`).
+    let library_path = format!("/Items/{library}");
+    let read_library = || call(&f.router, "GET", &library_path, Some(&f.viewer), None);
+    assert_eq!(read_library().await.0, StatusCode::OK);
+    for (enabled, expected) in [(false, StatusCode::NOT_FOUND), (true, StatusCode::OK)] {
+        let mut options = allowed["LibraryOptions"].clone();
+        options["Enabled"] = json!(enabled);
+        let (status, _) = call(
+            &f.router,
+            "POST",
+            "/Library/VirtualFolders/LibraryOptions",
+            Some(&f.admin),
+            Some(json!({"Id": library, "LibraryOptions": options})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(read_library().await.0, expected, "Enabled = {enabled}");
+    }
+    // A tag on the library's own row is inherited by its items, so a blocked tag hides them.
+    let (_, mut user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    user["Policy"]["BlockedTags"] = json!(["kept-out"]);
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Users/{}/Policy", f.viewer_id),
+        Some(&f.admin),
+        Some(user["Policy"].clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        viewer_reads_allowed(&f).await,
+        StatusCode::OK,
+        "no tag on the library yet"
+    );
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Items/{library}"),
+        Some(&f.admin),
+        Some(json!({"Name": "Allowed", "Tags": ["kept-out"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        viewer_reads_allowed(&f).await,
+        StatusCode::NOT_FOUND,
+        "the library's tag is blocked"
+    );
 }

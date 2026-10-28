@@ -27,6 +27,8 @@ pub(super) struct AudioTagValues {
     pub(super) credit_performers: Vec<String>,
     /// The `COMPOSER` tag's values (split on the internal separator only).
     pub(super) composers: Vec<String>,
+    /// The `REPLAYGAIN_TRACK_GAIN` tag, in dB.
+    pub(super) track_gain: Option<f64>,
 }
 
 /// Interprets unsplit embedded tags using the library's current settings.
@@ -51,6 +53,7 @@ pub(super) fn for_library(info: &MediaInfo, options: Option<&LibraryOptions>) ->
             credit_album_artists: info.album_artists.clone(),
             credit_performers: info.artists.clone(),
             composers: Vec::new(),
+            track_gain: None,
         };
     };
     let prefer_nonstandard = options.is_some_and(|o| o.prefer_nonstandard_artists_tag);
@@ -156,7 +159,38 @@ pub(super) fn for_library(info: &MediaInfo, options: Option<&LibraryOptions>) ->
         credit_album_artists,
         credit_performers,
         composers,
+        track_gain: replay_gain(raw, "replaygain_track_gain", path),
     }
+}
+
+/// The `REPLAYGAIN_ALBUM_GAIN` tag, in dB, read as the track tag is
+/// ([`replay_gain`]): what the prober gives the track's album
+/// (`audio.AlbumEntity.NormalizationGain`).
+pub(super) fn album_gain(info: &MediaInfo) -> Option<f64> {
+    let raw = info.raw_audio_tags.as_ref()?;
+    let path = info.media_source.path.as_deref().unwrap_or_default();
+    replay_gain(raw, "replaygain_album_gain", path)
+}
+
+/// A ReplayGain tag's value in dB, as `AudioFileProber.FetchDataFromTags`
+/// reads it: a trailing `dB` in any case dropped and the rest trimmed, then
+/// `float.TryParse(NumberStyles.Float, InvariantCulture)`, kept only when
+/// finite.
+fn replay_gain(raw: &HashMap<String, String>, key: &str, path: &str) -> Option<f64> {
+    let tag = read_tag(raw, &[key], path)?;
+    let number = match tag.len().checked_sub(2) {
+        Some(end)
+            if tag
+                .get(end..)
+                .is_some_and(|unit| unit.eq_ignore_ascii_case("db")) =>
+        {
+            &tag[..end]
+        }
+        _ => tag,
+    };
+    // `NumberStyles.Float` allows surrounding whitespace; Rust's parse does not.
+    let value = number.trim().parse::<f32>().ok()?;
+    value.is_finite().then(|| f64::from(value))
 }
 
 /// The people `AudioFileProber.FetchDataFromTags` credits an audio item with

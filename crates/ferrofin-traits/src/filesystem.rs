@@ -9,6 +9,8 @@
 //! Methods are synchronous (the controller calls into a blocking filesystem)
 //! and the trait is object-safe.
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use ferrofin_model::io::FileSystemEntryInfo;
 
@@ -66,6 +68,14 @@ pub trait FileSystem: Send + Sync {
         Ok(self.get_file_system_entries(path))
     }
 
+    /// [`get_file_system_entries`](Self::get_file_system_entries) as a
+    /// shared slice, for a reader that only looks through the entries: a
+    /// cached listing hands out its own copy without cloning every entry.
+    /// The default lists the directory.
+    fn shared_file_system_entries(&self, path: &str) -> Arc<[FileSystemEntryInfo]> {
+        self.get_file_system_entries(path).into()
+    }
+
     /// Lists the available drives / root mounts (C# `IFileSystem.GetDrives`).
     fn get_drives(&self) -> Vec<FileSystemEntryInfo>;
 
@@ -75,6 +85,14 @@ pub trait FileSystem: Send + Sync {
     /// answers with one stat.
     fn path_exists(&self, path: &str) -> bool {
         self.file_exists(path) || self.directory_exists(path)
+    }
+
+    /// Whether `a` and `b` name the same file or directory: two spellings of
+    /// one entry on a case-insensitive mount, say. Only a real filesystem can
+    /// tell; the default answers `false`, "not known to be the same".
+    fn same_file(&self, a: &str, b: &str) -> bool {
+        let _ = (a, b);
+        false
     }
 
     /// Whether a regular file exists at the path.

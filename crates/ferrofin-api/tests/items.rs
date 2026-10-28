@@ -37,7 +37,7 @@ use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
 use ferrofin_traits::providers::{
-    ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority,
+    ItemUpdateType, MetadataRefreshMode, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -341,11 +341,23 @@ const COLLECTION_FOLDER_ID: Uuid = Uuid::from_u128(0xC0F);
 const USER_ROOT_ID: Uuid = Uuid::from_u128(0x500);
 
 /// The `PlaylistsFolder` `CreateRootFolder` parents to the `AggregateFolder`
-/// and registers as a virtual child (LibraryManager.cs:855-885).
+/// and registers as a virtual child (v12.2 LibraryManager.cs:1101-1150).
 const PLAYLISTS_FOLDER_ID: Uuid = Uuid::from_u128(0x9F1);
 
 /// A playlist inside it — the chain that exercises the plug-in-folder exemption.
 const PLAYLIST_ID: Uuid = Uuid::from_u128(0x9F2);
+/// The user's Playlists view, displaying [`PLAYLISTS_FOLDER_ID`].
+const PLAYLISTS_VIEW_ID: Uuid = Uuid::from_u128(0x9F3);
+/// A stale Playlists view whose display parent no longer exists.
+const STALE_PLAYLISTS_VIEW_ID: Uuid = Uuid::from_u128(0x9F4);
+/// A `tvshows` library's `CollectionFolder`.
+const TV_LIBRARY_ID: Uuid = Uuid::from_u128(0xC1F);
+/// A `boxsets` library's `CollectionFolder`.
+const BOXSETS_LIBRARY_ID: Uuid = Uuid::from_u128(0xC2F);
+/// A default-builder view that delegates to [`TV_LIBRARY_ID`].
+const TV_VIEW_ID: Uuid = Uuid::from_u128(0xC3F);
+/// A box set, whose own listing is its linked children.
+const BOX_SET_ID: Uuid = Uuid::from_u128(0xB05);
 /// The physical folder's on-disk path (= one of the library's locations).
 const PHYSICAL_PATH: &str = "/media/movies-real";
 
@@ -355,6 +367,7 @@ const PHYSICAL_PATH: &str = "/media/movies-real";
 /// With `adopted_tree` set it also models a tree scanned by Jellyfin: the item
 /// parents to a physical `Folder` under the `AggregateFolder`, while the
 /// library's `CollectionFolder` parents to the `UserRootFolder`.
+#[derive(Default)]
 struct OkLibrary {
     item_id: Uuid,
     adopted_tree: bool,
@@ -366,7 +379,42 @@ struct OkLibrary {
     /// When set, `delete_item` signals it has started and waits to be
     /// released before it records the delete.
     gate: Option<Arc<DeleteGate>>,
+    /// A Person item `get_item_by_id` also resolves, shared with the
+    /// provider fake that refreshes it, and its images.
+    person: SharedRow,
+    person_images: Vec<ferrofin_traits::options::ItemImageInfo>,
+    /// When non-empty, the page `query_items` answers with, in this order and
+    /// out of [`PAGE_TOTAL`] rows, instead of the single `item_id` row.
+    rows: Vec<BaseItemEntity>,
+    /// The rows a `Name` + one-kind lookup (`get_item_list` / `get_item_ids`)
+    /// finds, matched ignoring case.
+    named: Vec<(BaseItemKind, &'static str, Uuid)>,
 }
+
+impl OkLibrary {
+    /// The ids of the [`OkLibrary::named`] rows `query` names.
+    fn named_ids(&self, query: &InternalItemsQuery) -> Vec<Uuid> {
+        let Some(name) = query.name.as_deref() else {
+            return Vec::new();
+        };
+        let ids = self
+            .named
+            .iter()
+            .filter(|(kind, row, _)| {
+                query.include_item_types.contains(kind) && row.eq_ignore_ascii_case(name.trim())
+            })
+            .map(|&(_, _, id)| id);
+        ids.take(
+            query
+                .limit
+                .map_or(usize::MAX, |n| usize::try_from(n).unwrap_or(0)),
+        )
+        .collect()
+    }
+}
+
+/// The total record count `query_items` reports alongside [`OkLibrary::rows`].
+const PAGE_TOTAL: i32 = 9;
 
 /// Holds a fake delete half way, so a test can drop the request meanwhile.
 #[derive(Default)]
@@ -377,6 +425,22 @@ struct DeleteGate {
 
 #[async_trait]
 impl LibraryManager for OkLibrary {
+    async fn get_item_images(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Vec<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
+        let is_person = self
+            .person
+            .lock()
+            .expect("person")
+            .as_ref()
+            .is_some_and(|p| Uuid::parse_str(&p.id).ok() == Some(item_id));
+        Ok(if is_person {
+            self.person_images.clone()
+        } else {
+            Vec::new()
+        })
+    }
     async fn is_item_visible_standalone(
         &self,
         _item: &ferrofin_db::entities::base_items::BaseItemEntity,
@@ -393,6 +457,15 @@ impl LibraryManager for OkLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        let person = self
+            .person
+            .lock()
+            .expect("person")
+            .clone()
+            .filter(|p| Uuid::parse_str(&p.id).ok() == Some(id));
+        if person.is_some() {
+            return Ok(person);
+        }
         if id == SEASON_VIEW_ID {
             let mut view = item_entity(SEASON_VIEW_ID, "Season view", BaseItemKind::UserView);
             view.data = Some(serde_json::json!({"DisplayParentId":SEASON_BROWSE_ID}).to_string());
@@ -411,6 +484,48 @@ impl LibraryManager for OkLibrary {
                 "Playlist",
                 BaseItemKind::Playlist,
             )));
+        }
+        if id == BOX_SET_ID {
+            return Ok(Some(item_entity(
+                BOX_SET_ID,
+                "Box set",
+                BaseItemKind::BoxSet,
+            )));
+        }
+        if id == PLAYLISTS_VIEW_ID || id == STALE_PLAYLISTS_VIEW_ID {
+            let shown = if id == PLAYLISTS_VIEW_ID {
+                PLAYLISTS_FOLDER_ID
+            } else {
+                Uuid::from_u128(0xDEAD)
+            };
+            let mut view = item_entity(id, "Playlists", BaseItemKind::UserView);
+            view.data = Some(
+                serde_json::json!({"ViewType":"playlists","DisplayParentId":shown}).to_string(),
+            );
+            return Ok(Some(view));
+        }
+        if id == PLAYLISTS_FOLDER_ID {
+            return Ok(Some(item_entity(
+                PLAYLISTS_FOLDER_ID,
+                "Playlists",
+                BaseItemKind::PlaylistsFolder,
+            )));
+        }
+        if id == TV_VIEW_ID {
+            let mut view = item_entity(TV_VIEW_ID, "Shows", BaseItemKind::UserView);
+            view.data = Some(serde_json::json!({"DisplayParentId":TV_LIBRARY_ID}).to_string());
+            return Ok(Some(view));
+        }
+        for (library, name, collection_type) in [
+            (TV_LIBRARY_ID, "Shows", "tvshows"),
+            (BOXSETS_LIBRARY_ID, "Collections", "boxsets"),
+        ] {
+            if id == library {
+                let mut folder = item_entity(library, name, BaseItemKind::CollectionFolder);
+                folder.data =
+                    Some(serde_json::json!({"CollectionType":collection_type}).to_string());
+                return Ok(Some(folder));
+            }
         }
         if self.adopted_tree && id == COLLECTION_FOLDER_ID {
             return Ok(Some(item_entity(
@@ -471,20 +586,31 @@ impl LibraryManager for OkLibrary {
         query: &InternalItemsQuery,
     ) -> Result<QueryResult<BaseItemEntity>, ServiceError> {
         *self.last_query.lock().unwrap() = Some(query.clone());
+        if !self.rows.is_empty() {
+            return Ok(QueryResult::new(
+                query.start_index,
+                Some(PAGE_TOTAL),
+                self.rows.clone(),
+            ));
+        }
         Ok(QueryResult::new(
             Some(0),
             Some(1),
             vec![base_item_entity(self.item_id)],
         ))
     }
-    async fn get_item_ids(&self, _query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
-        unimplemented!()
+    async fn get_item_ids(&self, query: &InternalItemsQuery) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(self.named_ids(query))
     }
     async fn get_item_list(
         &self,
-        _query: &InternalItemsQuery,
+        query: &InternalItemsQuery,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        unimplemented!()
+        Ok(self
+            .named_ids(query)
+            .into_iter()
+            .map(base_item_entity)
+            .collect())
     }
     async fn get_latest_item_list(
         &self,
@@ -620,6 +746,7 @@ fn entity_to_dto(item: &BaseItemEntity) -> BaseItemDto {
     BaseItemDto {
         id: Uuid::parse_str(&item.id).unwrap_or_else(|_| Uuid::nil()),
         name: item.name.clone(),
+        overview: item.overview.clone(),
         ..BaseItemDto::default()
     }
 }
@@ -701,7 +828,7 @@ impl VirtualFolderManager for OneLibrary {
         _name: &str,
         _collection_type: Option<ferrofin_model::entities::CollectionTypeOptions>,
         _options: &LibraryOptions,
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Option<uuid::Uuid>, ServiceError> {
         unimplemented!()
     }
     async fn remove_virtual_folder(&self, _name: &str) -> Result<(), ServiceError> {
@@ -736,6 +863,7 @@ fn ok_state(item_id: Uuid) -> AppState {
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     })
 }
 
@@ -765,6 +893,23 @@ fn ok_state_full(
     dto: Arc<dyn DtoService>,
     (auth_context, auth_service): Auth,
 ) -> AppState {
+    ok_state_providers(
+        library,
+        users,
+        dto,
+        (auth_context, auth_service),
+        Arc::new(FakeProviders),
+    )
+}
+
+/// [`ok_state_full`] over a caller-chosen [`ProviderManager`].
+fn ok_state_providers(
+    library: OkLibrary,
+    users: Arc<dyn UserManager>,
+    dto: Arc<dyn DtoService>,
+    (auth_context, auth_service): Auth,
+    providers: Arc<dyn ProviderManager>,
+) -> AppState {
     let item_id = library.item_id;
     AppState::new(
         Arc::new(library),
@@ -776,7 +921,7 @@ fn ok_state_full(
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
         Arc::new(FakeConfig),
-        Arc::new(FakeProviders),
+        providers,
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
         Arc::new(FakeSearch),
@@ -1091,6 +1236,414 @@ impl ProviderManager for StubProviders {
     }
 }
 
+/// A row the library fake serves and the provider fake rewrites.
+type SharedRow = Arc<std::sync::Mutex<Option<BaseItemEntity>>>;
+
+/// A [`ProviderManager`] recording the refreshes it is asked for. A refresh
+/// writes [`FETCHED_BIO`] into `row`, as a provider that found the person
+/// would.
+#[derive(Default)]
+struct RecordingProviders {
+    row: SharedRow,
+    /// When set, a refresh waits for a permit before it finishes.
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// A refresh fails instead.
+    fail: bool,
+    /// A refresh panics instead.
+    panic: bool,
+    refreshed: std::sync::Mutex<Vec<(Uuid, MetadataRefreshOptions)>>,
+    finished: std::sync::Mutex<Vec<Uuid>>,
+    queued: std::sync::Mutex<Vec<(Uuid, RefreshPriority)>>,
+}
+
+/// The overview a refresh by [`RecordingProviders`] writes, stamping the
+/// row refreshed as the real one does.
+const FETCHED_BIO: &str = "Fetched bio.";
+
+#[async_trait]
+impl ProviderManager for RecordingProviders {
+    async fn get_external_id_infos(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::providers::ExternalIdInfo>, ServiceError> {
+        Ok(Vec::new())
+    }
+    async fn queue_refresh(
+        &self,
+        item_id: Uuid,
+        _options: &MetadataRefreshOptions,
+        priority: RefreshPriority,
+    ) -> Result<(), ServiceError> {
+        self.queued
+            .lock()
+            .expect("queued")
+            .push((item_id, priority));
+        Ok(())
+    }
+    async fn refresh_full_item(
+        &self,
+        _i: Uuid,
+        _o: &MetadataRefreshOptions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn refresh_single_item(
+        &self,
+        item_id: Uuid,
+        options: &MetadataRefreshOptions,
+    ) -> Result<ItemUpdateType, ServiceError> {
+        self.refreshed
+            .lock()
+            .expect("refreshed")
+            .push((item_id, options.clone()));
+        if let Some(gate) = &self.gate {
+            let _permit = gate.acquire().await.expect("gate");
+        }
+        assert!(!self.panic, "a provider bug");
+        if self.fail {
+            return Err(ServiceError::Backend("store down".into()));
+        }
+        if let Some(row) = self.row.lock().expect("row").as_mut() {
+            row.overview = Some(FETCHED_BIO.to_owned());
+            row.date_last_refreshed = Some(chrono::Utc::now());
+        }
+        self.finished.lock().expect("finished").push(item_id);
+        Ok(ItemUpdateType::default())
+    }
+    async fn save_image_from_url(
+        &self,
+        _i: Uuid,
+        _u: &str,
+        _t: ferrofin_model::entities::ImageType,
+        _x: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn save_image(
+        &self,
+        _i: Uuid,
+        _c: &[u8],
+        _m: &str,
+        _t: ferrofin_model::entities::ImageType,
+        _x: Option<i32>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn get_available_remote_images(
+        &self,
+        _i: Uuid,
+        _q: &ferrofin_model::providers::RemoteImageQuery,
+    ) -> Result<Vec<ferrofin_model::providers::RemoteImageInfo>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_remote_image_provider_info(
+        &self,
+        _i: Uuid,
+    ) -> Result<Vec<ferrofin_model::providers::ImageProviderInfo>, ServiceError> {
+        unimplemented!()
+    }
+    async fn save_metadata(&self, _i: Uuid, _u: ItemUpdateType) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn get_all_metadata_plugins(
+        &self,
+    ) -> Result<Vec<ferrofin_model::configuration::MetadataPluginSummary>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_metadata_options(
+        &self,
+        _i: Uuid,
+    ) -> Result<ferrofin_model::configuration::MetadataOptions, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_refresh_queue(&self) -> Result<Vec<Uuid>, ServiceError> {
+        unimplemented!()
+    }
+}
+
+/// `kind`'s stored `BaseItems.Type` name.
+fn stored(kind: BaseItemKind) -> String {
+    kind.stored_type_name().expect("stored name").to_owned()
+}
+
+/// A stored row of `kind`: `overview` and the last refresh as given.
+fn person_row(
+    id: Uuid,
+    kind: BaseItemKind,
+    overview: Option<&str>,
+    refreshed_days_ago: Option<i64>,
+) -> SharedRow {
+    let mut row = item_entity(id, "Someone", kind);
+    // As the database stores it, which is what the handler reads.
+    row.type_ = stored(kind);
+    row.overview = overview.map(str::to_owned);
+    row.date_last_refreshed =
+        refreshed_days_ago.map(|days| chrono::Utc::now() - chrono::TimeDelta::days(days));
+    Arc::new(std::sync::Mutex::new(Some(row)))
+}
+
+/// A primary image, or none.
+fn primary_images(primary: bool) -> Vec<ferrofin_traits::options::ItemImageInfo> {
+    if !primary {
+        return Vec::new();
+    }
+    vec![ferrofin_traits::options::ItemImageInfo {
+        path: "/people/someone/folder.jpg".into(),
+        image_type: ImageType::Primary,
+        date_modified: chrono::Utc::now(),
+        width: 1,
+        height: 1,
+        blur_hash: None,
+    }]
+}
+
+/// A library serving `row` with `images`, and a state over `providers`.
+fn person_state(
+    row: &SharedRow,
+    images: Vec<ferrofin_traits::options::ItemImageInfo>,
+    providers: Arc<RecordingProviders>,
+) -> AppState {
+    ok_state_providers(
+        OkLibrary {
+            item_id: Uuid::from_u128(0xABCD),
+            person: Arc::clone(row),
+            person_images: images,
+            ..Default::default()
+        },
+        Arc::new(OkUsers),
+        Arc::new(OkDto),
+        (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+        providers,
+    )
+}
+
+/// The item page on `uri`: its status and its `Overview`.
+async fn get_person(state: AppState, uri: &str) -> (StatusCode, serde_json::Value) {
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let overview = if status == StatusCode::OK {
+        json_body(response).await["Overview"].clone()
+    } else {
+        serde_json::Value::Null
+    };
+    (status, overview)
+}
+
+/// C# `UserLibraryController.RefreshOnDemandIfNeeded`: a person shown without
+/// an overview or without a primary image (`!IsNullOrWhiteSpace(Overview) &&
+/// HasImage(Primary)` is false), and not refreshed for three days, is
+/// refreshed in full (metadata and images, saved) before its page is
+/// answered, on `/Items/{id}` and the legacy `/Users/{userId}/Items/{id}`.
+/// The page shows what the refresh wrote.
+#[rstest::rstest]
+#[case::no_metadata("/Items/{id}", None, false, Some(4))]
+#[case::legacy_route("/Users/{user}/Items/{id}", None, false, Some(4))]
+#[case::overview_without_image("/Items/{id}", Some("A bio."), false, Some(4))]
+#[case::image_without_overview("/Items/{id}", None, true, Some(4))]
+#[case::blank_overview_with_image("/Items/{id}", Some("  "), true, Some(4))]
+#[case::never_refreshed("/Items/{id}", None, false, None)]
+#[tokio::test]
+async fn a_person_without_metadata_is_refreshed_before_its_page(
+    #[case] route: &str,
+    #[case] overview: Option<&str>,
+    #[case] primary_image: bool,
+    #[case] refreshed_days_ago: Option<i64>,
+) {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, overview, refreshed_days_ago);
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        ..RecordingProviders::default()
+    });
+    let state = person_state(&row, primary_images(primary_image), Arc::clone(&providers));
+    let uri = route
+        .replace("{id}", &person.to_string())
+        .replace("{user}", &USER_ID.to_string());
+    let (status, shown) = get_person(state, &uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(shown, FETCHED_BIO, "the page shows the refreshed row");
+    let refreshed = providers.refreshed.lock().expect("refreshed").clone();
+    assert_eq!(refreshed.len(), 1, "{refreshed:?}");
+    let (id, options) = &refreshed[0];
+    assert_eq!(*id, person);
+    assert_eq!(
+        options.metadata_refresh_mode,
+        MetadataRefreshMode::FullRefresh
+    );
+    assert_eq!(options.image_refresh_mode, MetadataRefreshMode::FullRefresh);
+    assert!(options.force_save);
+    assert!(providers.queued.lock().expect("queued").is_empty());
+}
+
+/// A person with an overview and a primary image (whenever it was last
+/// refreshed), or refreshed in the last three days, is not refreshed;
+/// neither is anything but a person.
+#[rstest::rstest]
+#[case::has_metadata(Some("A bio."), true, None, BaseItemKind::Person)]
+#[case::refreshed_lately(None, false, Some(2), BaseItemKind::Person)]
+#[case::not_a_person(None, false, None, BaseItemKind::Movie)]
+#[tokio::test]
+async fn a_person_with_metadata_or_refreshed_lately_is_not_refreshed(
+    #[case] overview: Option<&str>,
+    #[case] primary_image: bool,
+    #[case] refreshed_days_ago: Option<i64>,
+    #[case] kind: BaseItemKind,
+) {
+    let id = Uuid::new_v4();
+    let row = person_row(id, kind, overview, refreshed_days_ago);
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        ..RecordingProviders::default()
+    });
+    let state = person_state(&row, primary_images(primary_image), Arc::clone(&providers));
+    let (status, shown) = get_person(state, &format!("/Items/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(shown, serde_json::json!(overview));
+    assert!(providers.refreshed.lock().expect("refreshed").is_empty());
+    assert!(providers.queued.lock().expect("queued").is_empty());
+}
+
+/// A refresh still running after the three seconds the page waits for is
+/// left to finish: the page is answered without it, and no second refresh
+/// is queued (upstream cancels it and queues one at high priority; a dropped
+/// refresh could stop between its writes).
+#[tokio::test(start_paused = true)]
+async fn a_slow_on_demand_refresh_finishes_after_the_page() {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, None, None);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        gate: Some(Arc::clone(&gate)),
+        ..RecordingProviders::default()
+    });
+    let state = person_state(&row, Vec::new(), Arc::clone(&providers));
+    let started = tokio::time::Instant::now();
+    let (status, shown) = get_person(state, &format!("/Items/{person}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        shown,
+        serde_json::Value::Null,
+        "answered without the refresh"
+    );
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(3));
+    assert!(providers.finished.lock().expect("finished").is_empty());
+    gate.add_permits(1);
+    wait_for_finish(&providers).await;
+    assert_eq!(*providers.finished.lock().expect("finished"), [person]);
+    assert!(providers.queued.lock().expect("queued").is_empty());
+}
+
+/// While a person's refresh runs, another view of it is answered at once and
+/// starts no second refresh.
+#[tokio::test(start_paused = true)]
+async fn a_second_view_starts_no_second_refresh() {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, None, None);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        gate: Some(Arc::clone(&gate)),
+        ..RecordingProviders::default()
+    });
+    let uri = format!("/Items/{person}");
+    let state = person_state(&row, Vec::new(), Arc::clone(&providers));
+    assert_eq!(get_person(state.clone(), &uri).await.0, StatusCode::OK);
+    let started = tokio::time::Instant::now();
+    assert_eq!(get_person(state, &uri).await.0, StatusCode::OK);
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    assert_eq!(providers.refreshed.lock().expect("refreshed").len(), 1);
+    gate.add_permits(1);
+    wait_for_finish(&providers).await;
+}
+
+/// A client that hangs up while its page waits leaves the refresh to finish,
+/// with nothing queued.
+#[tokio::test(start_paused = true)]
+async fn a_hang_up_leaves_the_refresh_to_finish() {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, None, None);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        gate: Some(Arc::clone(&gate)),
+        ..RecordingProviders::default()
+    });
+    let page = create_router(person_state(&row, Vec::new(), Arc::clone(&providers))).oneshot(
+        Request::builder()
+            .uri(format!("/Items/{person}"))
+            .header("X-Emby-Token", "valid")
+            .body(Body::empty())
+            .unwrap(),
+    );
+    let hung_up = tokio::time::timeout(std::time::Duration::from_secs(1), page).await;
+    assert!(hung_up.is_err(), "the page was still waiting");
+    gate.add_permits(1);
+    wait_for_finish(&providers).await;
+    assert_eq!(
+        row.lock()
+            .expect("row")
+            .as_ref()
+            .unwrap()
+            .overview
+            .as_deref(),
+        Some(FETCHED_BIO)
+    );
+    assert!(providers.queued.lock().expect("queued").is_empty());
+}
+
+/// A refresh that panics fails the page instead of hanging it.
+#[tokio::test]
+async fn a_panicking_on_demand_refresh_fails_the_page() {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, None, None);
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        panic: true,
+        ..RecordingProviders::default()
+    });
+    let state = person_state(&row, Vec::new(), providers);
+    let (status, _) = get_person(state, &format!("/Items/{person}")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// Waits until a gated refresh has finished.
+async fn wait_for_finish(providers: &RecordingProviders) {
+    for _ in 0..100 {
+        if !providers.finished.lock().expect("finished").is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(providers.finished.lock().expect("finished").len(), 1);
+}
+
+/// A refresh that fails within the wait fails the page, as an exception
+/// escaping C# `RefreshMetadata` does (a provider's failure is counted inside
+/// the refresh in both, so this is the store failing).
+#[tokio::test]
+async fn a_failed_on_demand_refresh_fails_the_page() {
+    let person = Uuid::new_v4();
+    let row = person_row(person, BaseItemKind::Person, None, None);
+    let providers = Arc::new(RecordingProviders {
+        row: Arc::clone(&row),
+        fail: true,
+        ..RecordingProviders::default()
+    });
+    let state = person_state(&row, Vec::new(), providers);
+    let (status, _) = get_person(state, &format!("/Items/{person}")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
 /// A [`UserViewManager`] returning one view.
 struct StubUserViews;
 
@@ -1218,6 +1771,7 @@ async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     };
     let get = |state: AppState, uri: &'static str| async move {
         let response = create_router(state)
@@ -1358,6 +1912,246 @@ async fn get_items_with_filters_returns_query_result() {
     assert_eq!(json["Items"][0]["Id"], item_id.simple().to_string());
 }
 
+/// The query `GET /Items?{params}` hands the library, and the status it
+/// answered with.
+async fn items_query(params: &str) -> (StatusCode, Option<InternalItemsQuery>) {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items?{params}"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let query = seen.lock().unwrap().take();
+    (response.status(), query)
+}
+
+/// v12.2 `ItemsController.GetItems` (`ItemsController.cs:263-274`): an API key
+/// that names no `userId` runs the query with no user, unscoped. It was a
+/// `400` ("no user for request").
+#[tokio::test]
+async fn an_api_key_lists_items_with_no_user() {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5B),
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let state = ok_state_full(
+        library,
+        Arc::new(OkUsers),
+        Arc::new(OkDto),
+        (
+            Arc::new(ferrofin_api::test_support::FakeAuthContext),
+            Arc::new(ferrofin_api::test_support::ApiKeyAuthService),
+        ),
+    );
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/Items?recursive=true&includeItemTypes=Movie")
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let query = seen.lock().unwrap().take().expect("the query ran");
+    assert!(query.user.is_none(), "an API key has no user");
+}
+
+/// The filters v12.2 `GetItems` copies straight onto the query
+/// (ItemsController.cs:396-430, 491-525): `seriesStatus` (jellyfin-web's TV
+/// Status filter), `personTypes`, `isPlaceHolder` and `hasOfficialRating`, and
+/// the two official ratings as `GetRatingScore` scores. A blank or unknown
+/// rating sets no bound.
+#[tokio::test]
+async fn get_items_forwards_the_rating_status_and_placeholder_filters() {
+    use ferrofin_model::entities::SeriesStatus;
+    use ferrofin_model::entities_media::ParentalRatingScore;
+    let (status, query) = items_query(
+        "recursive=true&seriesStatus=Continuing,ended&minOfficialRating=PG\
+         &maxOfficialRating=pg-13&personTypes=Actor,Director&isPlaceHolder=true\
+         &hasOfficialRating=false",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query = query.expect("query_items ran");
+    assert_eq!(
+        query.series_statuses,
+        [SeriesStatus::Continuing, SeriesStatus::Ended]
+    );
+    assert_eq!(
+        query.min_parental_rating,
+        Some(ParentalRatingScore::new(10, None))
+    );
+    assert_eq!(
+        query.max_parental_rating,
+        Some(ParentalRatingScore::new(13, None))
+    );
+    assert_eq!(query.person_types, ["Actor", "Director"]);
+    assert_eq!(query.is_place_holder, Some(true));
+    assert_eq!(query.has_official_rating, Some(false));
+
+    for params in [
+        "minOfficialRating=%20&maxOfficialRating=",
+        "minOfficialRating=Unrated-Nonsense&maxOfficialRating=XYZ",
+    ] {
+        let (status, query) = items_query(&format!("recursive=true&{params}")).await;
+        assert_eq!(status, StatusCode::OK, "{params}");
+        let query = query.expect("query_items ran");
+        assert_eq!(query.min_parental_rating, None, "{params}");
+        assert_eq!(query.max_parental_rating, None, "{params}");
+    }
+    let (status, _) = items_query("recursive=true&isPlaceHolder=maybe").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// The query `GET /Items?{params}` hands the library when `named` are the
+/// by-name rows and albums its lookups can find.
+async fn items_query_with_named(
+    params: &str,
+    named: Vec<(BaseItemKind, &'static str, Uuid)>,
+) -> InternalItemsQuery {
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0x5A),
+        named,
+        ..Default::default()
+    };
+    let seen = Arc::clone(&library.last_query);
+    let response = create_router(ok_state_with(library))
+        .oneshot(
+            Request::builder()
+                .uri(format!("/Items?{params}"))
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{params}");
+    seen.lock().unwrap().take().expect("query_items ran")
+}
+
+/// `artists`, `albums` and `studios` name the items whose ids replace
+/// `artistIds`, `albumIds` and `studioIds` (v12.2 ItemsController.cs:527-577).
+/// A name nothing has takes the no-match id instead of a minted row, so it
+/// matches nothing; an absent or blank list leaves the id filter as it was.
+#[tokio::test]
+async fn get_items_resolves_the_artist_album_and_studio_names() {
+    let (artist, album, studio, kept) = (
+        Uuid::from_u128(0xC1),
+        Uuid::from_u128(0xC2),
+        Uuid::from_u128(0xC3),
+        Uuid::from_u128(0xC4),
+    );
+    let named = vec![
+        (BaseItemKind::MusicArtist, "Test Artist", artist),
+        (BaseItemKind::MusicAlbum, "Middle Years", album),
+        (BaseItemKind::Studio, "Acme Pictures", studio),
+    ];
+    let query = items_query_with_named(
+        &format!(
+            "recursive=true&artistIds={kept}&artists=test%20artist|Nobody\
+             &albumIds={kept}&albums=Middle%20Years&studioIds={kept}&studios=Acme%20Pictures|Nope"
+        ),
+        named.clone(),
+    )
+    .await;
+    assert_eq!(query.artist_ids, [artist, Uuid::nil()]);
+    assert_eq!(query.album_ids, [album]);
+    assert_eq!(query.studio_ids, [studio, Uuid::nil()]);
+
+    // A repeated key joins with the declared pipe delimiter.
+    let repeated = items_query_with_named(
+        "recursive=true&studios=Acme%20Pictures&studios=Nope",
+        named.clone(),
+    )
+    .await;
+    assert_eq!(repeated.studio_ids, [studio, Uuid::nil()]);
+
+    let unknown = items_query_with_named("recursive=true&albums=Nope", named.clone()).await;
+    assert_eq!(
+        unknown.album_ids,
+        [Uuid::nil()],
+        "an unknown album matches nothing"
+    );
+
+    let blank = items_query_with_named(
+        &format!("recursive=true&studioIds={kept}&studios=&artists=%20"),
+        named,
+    )
+    .await;
+    assert_eq!(blank.studio_ids, [kept]);
+    assert!(blank.artist_ids.is_empty());
+}
+
+/// An artist's albums asked for with no `sortBy` come newest first, then by
+/// name (v12.2 ItemsController.cs:579-586), whether the artist is named by
+/// id or by name. Any requested sort, `Default` included, any other type set
+/// and a request without an artist keep their own order.
+#[tokio::test]
+async fn get_items_orders_an_artists_albums_newest_first_by_default() {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    let artist = Uuid::from_u128(0xC1);
+    let named = vec![(BaseItemKind::MusicArtist, "Test Artist", artist)];
+    let newest_first = [
+        (ItemSortBy::ProductionYear, SortOrder::Descending),
+        (ItemSortBy::SortName, SortOrder::Ascending),
+    ];
+    for params in [
+        format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum"),
+        "recursive=true&artists=Test%20Artist&includeItemTypes=MusicAlbum".to_owned(),
+        // A sort order with no sort key is no requested sort (`GetOrderBy`).
+        format!(
+            "recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum&sortOrder=Ascending"
+        ),
+    ] {
+        let query = items_query_with_named(&params, named.clone()).await;
+        assert_eq!(query.order_by, newest_first, "{params}");
+    }
+    for (params, expected) in [
+        (
+            format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum&sortBy=Default"),
+            vec![(ItemSortBy::Default, SortOrder::Ascending)],
+        ),
+        (
+            format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum,Audio"),
+            Vec::new(),
+        ),
+        (
+            "recursive=true&includeItemTypes=MusicAlbum".to_owned(),
+            Vec::new(),
+        ),
+    ] {
+        let query = items_query_with_named(&params, named.clone()).await;
+        assert_eq!(query.order_by, expected, "{params}");
+    }
+    // A search still leads with SortName, over the default.
+    let searched = items_query_with_named(
+        &format!("recursive=true&artistIds={artist}&includeItemTypes=MusicAlbum&searchTerm=light"),
+        named,
+    )
+    .await;
+    assert_eq!(
+        searched.order_by,
+        [
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            newest_first[0],
+            newest_first[1]
+        ]
+    );
+}
+
 /// jellyfin-web's artist page filters by `AlbumArtistIds` (Albums),
 /// `ContributingArtistIds` (Appears On) and `ExcludeArtistIds` (More Like
 /// This), through both the query- and the path-scoped route. Each id set
@@ -1384,6 +2178,7 @@ async fn get_items_forwards_the_artist_id_filters() {
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: None,
+            ..Default::default()
         };
         let seen = Arc::clone(&library.last_query);
         let response = create_router(ok_state_with(library))
@@ -1405,6 +2200,218 @@ async fn get_items_forwards_the_artist_id_filters() {
     }
 }
 
+/// jellyfin-web's Playlists page browses the Playlists view. Measured on
+/// Jellyfin 12.2 with a user: the view and the playlists folder each list
+/// every playlist the user may open — the ones made in the app and the
+/// playlist files the library scan found — whatever type was asked, so:
+/// - untyped, the listing becomes recursive playlists from the user root
+///   (post-filtered per user), with no linked-ancestor constraint;
+/// - `IncludeItemTypes=Playlist` re-roots to the user root the same way,
+///   since the view's collection type is the target's own;
+/// - the playlists folder lists them too, whatever was asked — except a
+///   `[BoxSet]` browse, which re-roots like any other parent.
+#[tokio::test]
+async fn playlists_view_browses_list_its_playlists() {
+    use ferrofin_model::data::BaseItemKind;
+    async fn query_for(params: &str) -> InternalItemsQuery {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+            ..Default::default()
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?{params}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{params}");
+        seen.lock().unwrap().take().expect("query_items ran")
+    }
+    for params in [
+        format!("parentId={PLAYLISTS_VIEW_ID}&recursive=true"),
+        format!("parentId={PLAYLISTS_VIEW_ID}&recursive=true&includeItemTypes=Playlist"),
+        format!("parentId={PLAYLISTS_FOLDER_ID}&includeItemTypes=Audio"),
+    ] {
+        let query = query_for(&params).await;
+        assert_eq!(query.parent_id, Uuid::nil(), "{params}");
+        assert!(query.recursive, "{params}");
+        assert_eq!(
+            query.include_item_types,
+            [BaseItemKind::Playlist],
+            "{params}"
+        );
+        assert!(query.linked_child_ancestor_ids.is_empty(), "{params}");
+        assert!(query.apply_folder_display_options, "{params}");
+    }
+    // A view whose display parent is gone gets no folder policy of its own;
+    // re-rooted, it takes the user root's, so the post-filter still runs.
+    let stale = query_for(&format!(
+        "parentId={STALE_PLAYLISTS_VIEW_ID}&recursive=true&includeItemTypes=Playlist"
+    ))
+    .await;
+    assert_eq!(stale.parent_id, Uuid::nil());
+    assert!(stale.apply_folder_display_options);
+    let boxsets = query_for(&format!(
+        "parentId={PLAYLISTS_FOLDER_ID}&recursive=true&includeItemTypes=BoxSet"
+    ))
+    .await;
+    assert_eq!(boxsets.parent_id, Uuid::nil());
+    assert_eq!(boxsets.include_item_types, [BaseItemKind::BoxSet]);
+    assert_eq!(boxsets.linked_child_ancestor_ids, [PLAYLISTS_FOLDER_ID]);
+}
+
+/// Jellyfin 12's `GetItems` dispatch (v12.2 ItemsController.cs:326-340, 592;
+/// `UserRootFolder.GetItemsInternal`):
+/// - at the user root a filtered request runs recursively, while the bare
+///   one stays the listing of the user's libraries;
+/// - an item-typed browse of a library that did not choose `recursive` is
+///   recursive, while an explicit `recursive=false` or an untyped browse
+///   lists direct children;
+/// - a `boxsets` library browsed untyped lists its box sets, recursively.
+#[tokio::test]
+async fn filtered_user_root_and_typed_library_browses_run_recursively() {
+    use ferrofin_model::data::BaseItemKind;
+    async fn query_for(params: &str) -> InternalItemsQuery {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5A),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+            ..Default::default()
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?{params}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{params}");
+        seen.lock().unwrap().take().expect("query_items ran")
+    }
+    for (params, recursive) in [
+        ("includeItemTypes=Movie&isFavorite=true".to_owned(), true),
+        ("searchTerm=blade".to_owned(), true),
+        ("genres=Drama&recursive=false".to_owned(), true),
+        (String::new(), false),
+        (
+            format!("parentId={TV_LIBRARY_ID}&includeItemTypes=Episode"),
+            true,
+        ),
+        (
+            format!("parentId={TV_LIBRARY_ID}&includeItemTypes=Episode&recursive=false"),
+            false,
+        ),
+        (format!("parentId={TV_LIBRARY_ID}"), false),
+    ] {
+        let query = query_for(&params).await;
+        assert_eq!(query.recursive, recursive, "{params}");
+        assert_eq!(query.user_root_children, !recursive, "{params}");
+    }
+    let boxsets = query_for(&format!("parentId={BOXSETS_LIBRARY_ID}")).await;
+    assert_eq!(boxsets.parent_id, BOXSETS_LIBRARY_ID);
+    assert_eq!(boxsets.include_item_types, [BaseItemKind::BoxSet]);
+    assert!(boxsets.recursive);
+    // Explicit ids keep their own path: no parent, no recursion.
+    let ids = query_for(&format!("ids={ITEM_ID}&includeItemTypes=Movie")).await;
+    assert_eq!(ids.item_ids, [ITEM_ID]);
+    assert!(!ids.recursive && !ids.user_root_children);
+    // A BoxSet browse of a TV library re-roots to the user root, where its
+    // linked-ancestor constraint is a filter.
+    let rerooted = query_for(&format!("parentId={TV_LIBRARY_ID}&includeItemTypes=BoxSet")).await;
+    assert_eq!(rerooted.parent_id, Uuid::nil());
+    assert_eq!(rerooted.linked_child_ancestor_ids, [TV_LIBRARY_ID]);
+    assert!(rerooted.recursive);
+    // A view is no library (`ICollectionFolder`), even one delegating to a
+    // library: a typed browse of it stays a direct one.
+    let view = query_for(&format!("parentId={TV_VIEW_ID}&includeItemTypes=Episode")).await;
+    assert_eq!(view.parent_id, TV_LIBRARY_ID);
+    assert!(!view.recursive);
+}
+
+/// Explicit ids without a `sortBy` answer in the order they were asked for:
+/// `ItemsController.GetItems` hands them to `Folder.GetItems`, which reorders
+/// the repository's page with `SortItemsByRequest` when `OrderBy` is empty and
+/// there is more than one id (v12.2 Folder.cs:1065-1083). The legacy
+/// `/Users/{userId}/Items` and `/Trailers` delegate to `GetItems`
+/// (ItemsController.cs:725, TrailersController.cs:216-217). Only the page is
+/// reordered: the start index and the total stay the repository's. Any
+/// `sortBy`, `Default` included, keeps the repository's order, and so does a
+/// search, which is ordered by relevance and `SortName`.
+#[tokio::test]
+async fn explicit_ids_answer_in_the_requested_order_unless_a_sort_is_asked() {
+    let [alpha, bravo, charlie] = [0x852_0001, 0x852_0002, 0x852_0003].map(Uuid::from_u128);
+    let names = |uri: String| async move {
+        let library = OkLibrary {
+            item_id: alpha,
+            // The repository's default (`SortName`) order.
+            rows: vec![
+                item_entity(alpha, "Alpha", BaseItemKind::Movie),
+                item_entity(bravo, "Bravo", BaseItemKind::Movie),
+                item_entity(charlie, "Charlie", BaseItemKind::Movie),
+            ],
+            ..Default::default()
+        };
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body = json_body(response).await;
+        assert_eq!(body["StartIndex"], 2, "{uri}: {body}");
+        assert_eq!(body["TotalRecordCount"], PAGE_TOTAL, "{uri}: {body}");
+        body["Items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["Name"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let ids = format!("ids={charlie},{alpha},{bravo}&startIndex=2");
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        for path in [
+            "/Items".to_owned(),
+            format!("/Users/{USER_ID}/Items"),
+            "/Trailers".to_owned(),
+        ] {
+            assert_eq!(
+                names(format!("{path}?{ids}")).await,
+                ["Charlie", "Alpha", "Bravo"],
+                "{path}: the requested order"
+            );
+            for kept in ["sortBy=SortName", "sortBy=Default", "searchTerm=a"] {
+                assert_eq!(
+                    names(format!("{path}?{ids}&{kept}")).await,
+                    ["Alpha", "Bravo", "Charlie"],
+                    "{path}?{kept}: the repository's order"
+                );
+            }
+        }
+    })
+    .await
+    .expect("the requests finish");
+}
+
 #[tokio::test]
 async fn repeated_item_filters_keep_collections_and_first_scalars_on_both_routes() {
     use ferrofin_model::data::BaseItemKind;
@@ -1415,6 +2422,7 @@ async fn repeated_item_filters_keep_collections_and_first_scalars_on_both_routes
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: None,
+            ..Default::default()
         };
         let seen = Arc::clone(&library.last_query);
         let response = create_router(ok_state_with(library))
@@ -1448,6 +2456,64 @@ async fn repeated_item_filters_keep_collections_and_first_scalars_on_both_routes
     }
 }
 
+/// v12.2 `ItemsController.GetItems` re-sorts a searched page by the search
+/// providers' score, then `SortName` (ItemsController.cs:596-600), a stable
+/// sort over what `folder.GetItems` returned in the caller's order. The
+/// handler reproduces it by leading the caller's keys with `SortName`, which
+/// `ApplyOrder`'s search branch puts right after the relevance rank. Without
+/// a (non-blank) search the caller's keys pass through untouched.
+#[tokio::test]
+async fn get_items_orders_a_search_by_sort_name_before_the_callers_keys() {
+    use ferrofin_model::dto::SortOrder;
+    use ferrofin_model::live_tv::ItemSortBy;
+    let order_by_for = |params: &'static str| async move {
+        let library = OkLibrary {
+            item_id: Uuid::from_u128(0x5B),
+            adopted_tree: false,
+            last_query: Arc::default(),
+            deleted: Arc::default(),
+            gate: None,
+            ..Default::default()
+        };
+        let seen = Arc::clone(&library.last_query);
+        let response = create_router(ok_state_with(library))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?recursive=true&userId={USER_ID}&{params}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{params}");
+        seen.lock()
+            .unwrap()
+            .take()
+            .expect("query_items ran")
+            .order_by
+    };
+    assert_eq!(
+        order_by_for("searchTerm=blade&sortBy=DateCreated&sortOrder=Descending").await,
+        [
+            (ItemSortBy::SortName, SortOrder::Ascending),
+            (ItemSortBy::DateCreated, SortOrder::Descending)
+        ]
+    );
+    assert_eq!(
+        order_by_for("searchTerm=blade").await,
+        [(ItemSortBy::SortName, SortOrder::Ascending)]
+    );
+    assert_eq!(
+        order_by_for("sortBy=DateCreated&sortOrder=Descending").await,
+        [(ItemSortBy::DateCreated, SortOrder::Descending)]
+    );
+    assert_eq!(
+        order_by_for("searchTerm=%20&sortBy=DateCreated").await,
+        [(ItemSortBy::DateCreated, SortOrder::Ascending)]
+    );
+}
+
 /// Wholphin's genre grid asks each genre for one random item that has a
 /// backdrop (`imageTypes=Backdrop`) and builds the card's image URL from it;
 /// an item without a backdrop yields a null URL that crashes the whole grid
@@ -1461,6 +2527,7 @@ async fn get_items_forwards_the_image_types_filter() {
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     };
     let seen = Arc::clone(&library.last_query);
     // Wholphin's request, verbatim apart from the ids.
@@ -1506,6 +2573,7 @@ async fn get_items_forwards_the_stream_language_filters_but_the_user_route_drops
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: None,
+            ..Default::default()
         };
         let seen = Arc::clone(&library.last_query);
         let response = create_router(ok_state_with(library))
@@ -1612,6 +2680,7 @@ async fn ancestors_translate_physical_root_to_the_users_view() {
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     })
     .with_virtual_folders(Arc::new(OneLibrary));
     let router = create_router(state);
@@ -1669,6 +2738,7 @@ async fn ancestors_keep_a_plugin_folder_and_the_physical_root() {
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     })
     .with_virtual_folders(Arc::new(OneLibrary));
     let router = create_router(state);
@@ -2062,6 +3132,7 @@ fn two_item_state(item_id: Uuid, dto: Arc<dyn DtoService>, auth: Auth) -> (AppSt
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     };
     let deleted = Arc::clone(&library.deleted);
     (
@@ -2197,6 +3268,7 @@ async fn a_dropped_request_still_finishes_its_delete() {
             last_query: Arc::default(),
             deleted: Arc::default(),
             gate: Some(Arc::clone(&gate)),
+            ..Default::default()
         };
         let deleted = Arc::clone(&library.deleted);
         let state = ok_state_full(library, Arc::new(OkUsers), Arc::new(OkDto), alice());
@@ -2228,6 +3300,7 @@ async fn default_season_view_preserves_actual_parent_for_live_aired_selection_an
                 last_query: Arc::default(),
                 deleted: Arc::default(),
                 gate: None,
+                ..Default::default()
             };
             let seen = library.last_query.clone();
             let router = create_router(ok_state_with(library));
@@ -2296,6 +3369,7 @@ async fn items_http_name_boundaries_bind_blank_to_null_and_preserve_nonblank() {
                 last_query: Arc::default(),
                 deleted: Arc::default(),
                 gate: None,
+                ..Default::default()
             };
             let seen = Arc::clone(&library.last_query);
             let uri = format!(
@@ -2331,6 +3405,7 @@ async fn capture_items_filter_query(uri: &str) -> (StatusCode, Option<InternalIt
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     };
     let seen = Arc::clone(&library.last_query);
     let response = create_router(ok_state_with(library))
@@ -2581,6 +3656,7 @@ async fn capture_items_date_socket_query(uri: &str) -> (StatusCode, Option<Inter
         last_query: Arc::default(),
         deleted: Arc::default(),
         gate: None,
+        ..Default::default()
     };
     let seen = Arc::clone(&library.last_query);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2661,5 +3737,108 @@ async fn items_get_result_local_dates_match_dotnet_child_process() {
                 assert!(query.is_none(), "{zone}: {uri} must fail before querying");
             }
         }
+    }
+}
+
+/// [`OkDto`], with the DTOs [`DtoService::get_linked_children_dtos`] built
+/// marked in `Overview`, so a test can see which projection a listing used.
+struct LinkedChildrenDto;
+
+#[async_trait]
+impl DtoService for LinkedChildrenDto {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_base_item_dto(
+        &self,
+        item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        Ok(entity_to_dto(item))
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        Ok(items.iter().map(entity_to_dto).collect())
+    }
+    async fn get_linked_children_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        Ok(items
+            .iter()
+            .map(|item| BaseItemDto {
+                overview: Some("linked children".to_owned()),
+                ..entity_to_dto(item)
+            })
+            .collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        Ok(entity_to_dto(item))
+    }
+}
+
+/// A playlist's or box set's own listing is its linked children
+/// (`Folder.GetItemsInternal` → `GetChildren` → `GetLinkedChildren(user)`,
+/// v12.2 Folder.cs), which upstream resolves with every field loaded, so the
+/// members take the linked-children projection; a recursive listing is the
+/// repository query and stays a plain page.
+#[tokio::test]
+async fn a_playlist_or_box_set_listing_projects_its_linked_children() {
+    for (params, linked) in [
+        (format!("parentId={PLAYLIST_ID}"), true),
+        (format!("parentId={BOX_SET_ID}"), true),
+        (format!("parentId={BOX_SET_ID}&recursive=true"), false),
+        // Named ids clear the parent: a plain lookup, not a listing.
+        (format!("parentId={BOX_SET_ID}&ids={ITEM_ID}"), false),
+        (format!("parentId={TV_LIBRARY_ID}"), false),
+    ] {
+        let state = ok_state_full(
+            OkLibrary {
+                item_id: ITEM_ID,
+                ..Default::default()
+            },
+            Arc::new(OkUsers),
+            Arc::new(LinkedChildrenDto),
+            (Arc::new(OkAuthContext), Arc::new(OkAuthService)),
+        );
+        let response = create_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/Items?userId={USER_ID}&{params}"))
+                    .header("X-Emby-Token", "valid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{params}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            page["Items"][0]["Overview"].as_str() == Some("linked children"),
+            linked,
+            "{params}: {page}"
+        );
     }
 }

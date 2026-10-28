@@ -372,20 +372,15 @@ fn bound_folder_name(valid: String) -> String {
 /// `FileSystem.GetValidFilename(name).Trim().TrimEnd('.')` — the sanitized
 /// single path segment every by-name `GetPath` builds from an item name.
 pub(crate) fn valid_filename(name: &str) -> String {
-    // `ManagedFileSystem._invalidPathCharacters`, verbatim.
-    const INVALID: &[char] = &['"', '<', '>', '|', ':', '*', '?', '\\', '/'];
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if INVALID.contains(&c) || (c as u32) <= 31 {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    sanitized.trim().trim_end_matches('.').to_owned()
+    get_valid_filename(name)
+        .trim()
+        .trim_end_matches('.')
+        .to_owned()
 }
+
+/// `ManagedFileSystem.GetValidFilename(name)`: every invalid path character
+/// replaced by a space, nothing trimmed.
+pub(crate) use ferrofin_util::path_helper::get_valid_filename;
 
 /// [`derive_item_id_with`] under [`IdDerivation::LegacyLowercase`] — kept for
 /// call sites that have not been handed a per-database mode.

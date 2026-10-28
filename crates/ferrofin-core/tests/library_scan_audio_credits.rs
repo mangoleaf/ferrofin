@@ -1,7 +1,9 @@
 //! `AudioFileProber.FetchDataFromTags`' people, over the real scanner: a track's
 //! album artists, performers and composers become its credits; a changed tag
-//! replaces them on the next probe; a `Cast` lock keeps what is stored. The
-//! ffprobe seam is a fake that answers with raw tags.
+//! replaces them on the next probe; a `Cast` lock keeps what is stored. And
+//! `AlbumMetadataService.SetPeople`'s: every album refresh credits the album's
+//! album artists, then its artists. The ffprobe seam is a fake that answers
+//! with raw tags.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -205,6 +207,30 @@ impl Harness {
         Uuid::parse_str(&id).unwrap()
     }
 
+    async fn album_id(&self) -> Uuid {
+        let id: String = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems" WHERE "Type" LIKE '%Audio.MusicAlbum'"#,
+        )
+        .fetch_one(self.db.pool())
+        .await
+        .expect("the scanned album");
+        Uuid::parse_str(&id).unwrap()
+    }
+
+    /// The album's credit rows as Jellyfin stores them: name, type,
+    /// `ListOrder`, `SortOrder` and `Role`, in `ListOrder`.
+    async fn album_credits(&self) -> Vec<(String, String, i64, Option<i64>, String)> {
+        sqlx::query_as(
+            r#"SELECT p."Name", p."PersonType", m."ListOrder", m."SortOrder", m."Role"
+               FROM "PeopleBaseItemMap" m JOIN "Peoples" p ON p."Id" = m."PeopleId"
+               WHERE m."ItemId" = ?1 ORDER BY m."ListOrder""#,
+        )
+        .bind(ferrofin_db::store::guid_to_db(self.album_id().await))
+        .fetch_all(self.db.pool())
+        .await
+        .unwrap()
+    }
+
     async fn credits(&self) -> Vec<(String, String)> {
         let id = self.track_id().await;
         let mut rows: Vec<_> = self
@@ -286,5 +312,125 @@ async fn a_cast_lock_keeps_the_stored_credits() {
     assert_eq!(
         h.credits().await,
         [("Lead".to_owned(), "Artist".to_owned())]
+    );
+}
+
+/// After `gates/adoption/unchanged_scan.py`'s audit: from here on, every write to a
+/// credit row and every new `Peoples` row is counted, a delete-and-reinsert of
+/// identical rows included.
+async fn audit_credit_writes(h: &Harness) {
+    sqlx::raw_sql(
+        r#"CREATE TABLE "Writes" ("TableName" TEXT);
+           CREATE TRIGGER "MapInsert" AFTER INSERT ON "PeopleBaseItemMap" BEGIN INSERT INTO "Writes" VALUES ('map'); END;
+           CREATE TRIGGER "MapUpdate" AFTER UPDATE ON "PeopleBaseItemMap" BEGIN INSERT INTO "Writes" VALUES ('map'); END;
+           CREATE TRIGGER "MapDelete" AFTER DELETE ON "PeopleBaseItemMap" BEGIN INSERT INTO "Writes" VALUES ('map'); END;
+           CREATE TRIGGER "PeopleInsert" AFTER INSERT ON "Peoples" BEGIN INSERT INTO "Writes" VALUES ('people'); END;"#,
+    )
+    .execute(h.db.pool())
+    .await
+    .unwrap();
+}
+
+/// The writes counted since [`audit_credit_writes`].
+async fn credit_writes(h: &Harness) -> i64 {
+    sqlx::query_scalar(r#"SELECT count(*) FROM "Writes""#)
+        .fetch_one(h.db.pool())
+        .await
+        .unwrap()
+}
+
+/// A scan of the unchanged library: nothing created or updated, nothing probed.
+async fn unchanged_rescan(h: &Harness) {
+    let probes = h.probes();
+    let outcome = h.scanner.scan_all().await.unwrap();
+    assert_eq!(outcome.created + outcome.updated, 0, "{outcome:?}");
+    assert_eq!(h.probes(), probes, "an unchanged file is not probed again");
+}
+
+/// `AlbumMetadataService.SetPeople`, which ends every album refresh: the album
+/// credits its album artists, then its artists (both from its track), in that
+/// order, as Jellyfin 12.2 stores them — `ListOrder` from 0, no `SortOrder`, an
+/// empty `Role` — one name credited as both kinds. An unchanged album without
+/// those credits, as a Jellyfin 10.11 database leaves every album (its
+/// `UpdatePeople` dropped every artist credit, `Peoples` rows included), gets
+/// them on the next scan; a scan with nothing to change writes none.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_album_refresh_credits_its_album_artists_then_its_artists() {
+    let h = harness().await;
+    let sep = '\u{1f}';
+    h.set_tags(&[
+        ("title", "Song"),
+        ("artist", &format!("The Band{sep}Guest")),
+        ("albumartist", "The Band"),
+    ]);
+    h.scanner.scan_all().await.unwrap();
+    let row = |name: &str, kind: &str, order| {
+        (name.to_owned(), kind.to_owned(), order, None, String::new())
+    };
+    let expected = [
+        row("The Band", "AlbumArtist", 0),
+        row("The Band", "Artist", 1),
+        row("Guest", "Artist", 2),
+    ];
+    assert_eq!(h.album_credits().await, expected);
+
+    // An adopted 10.11 database: no artist credit and no artist `Peoples` row.
+    sqlx::raw_sql(
+        r#"DELETE FROM "PeopleBaseItemMap" WHERE "PeopleId" IN
+             (SELECT "Id" FROM "Peoples" WHERE "PersonType" IN ('Artist', 'AlbumArtist'));
+           DELETE FROM "Peoples" WHERE "PersonType" IN ('Artist', 'AlbumArtist');"#,
+    )
+    .execute(h.db.pool())
+    .await
+    .unwrap();
+    audit_credit_writes(&h).await;
+    unchanged_rescan(&h).await;
+    assert_eq!(
+        h.album_credits().await,
+        expected,
+        "an unchanged album is credited"
+    );
+    let written = credit_writes(&h).await;
+    assert!(written > 0, "the audit counts the credits just written");
+
+    unchanged_rescan(&h).await;
+    assert_eq!(
+        credit_writes(&h).await,
+        written,
+        "nothing to change, nothing written"
+    );
+    assert_eq!(h.album_credits().await, expected);
+}
+
+/// `SetPeople` updates nothing for an album that names no artist
+/// (`AlbumArtists.Any() || Artists.Any()`): the credits it has stay.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_album_naming_no_artist_keeps_its_credits() {
+    let h = harness().await;
+    h.set_tags(&[("title", "Song")]);
+    h.scanner.scan_all().await.unwrap();
+    h.people
+        .update_people(
+            h.album_id().await,
+            &[ferrofin_db::entities::base_items::PeopleEntity {
+                name: "Some Producer".to_owned(),
+                person_type: Some("Producer".to_owned()),
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+    audit_credit_writes(&h).await;
+    unchanged_rescan(&h).await;
+    assert_eq!(credit_writes(&h).await, 0);
+    assert_eq!(
+        h.album_credits().await,
+        [(
+            "Some Producer".to_owned(),
+            "Producer".to_owned(),
+            0,
+            None,
+            String::new()
+        )]
     );
 }

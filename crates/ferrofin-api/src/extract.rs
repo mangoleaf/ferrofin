@@ -39,6 +39,14 @@
 //!   `System.Text.Json` does. Sonarr's and Radarr's camelCase
 //!   `/Library/Media/Updated` webhook bound to nothing before it.
 //!
+//! * **A body past the route's limit is 413.** Every route reads at most
+//!   axum's 2 MiB default, except the uploads, which take
+//!   [`MAX_UPLOAD_BODY_BYTES`] through [`upload_body_limit`]. Jellyfin's
+//!   `ExceptionMiddleware` answers Kestrel's "request body too large" with a
+//!   plain-text 500 (it maps no `BadHttpRequestException`); Ferrofin keeps the
+//!   `413` the condition is, never the binder's 400 claiming the body is
+//!   required.
+//!
 //! What is deliberately NOT reproduced is the `errors` dictionary's contents:
 //! its keys and messages carry .NET type names (`Jellyfin.Data.Enums.ItemSortBy`)
 //! and its `traceId` is a per-request ASP.NET activity id. The status, the
@@ -50,7 +58,8 @@ pub use crate::query::{Query, QueryParameters, QueryRejection};
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
-use axum::extract::{FromRequest, OptionalFromRequest, Request};
+use axum::extract::rejection::BytesRejection;
+use axum::extract::{DefaultBodyLimit, FromRequest, OptionalFromRequest, Request};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
@@ -62,10 +71,28 @@ use self::doc::Doc;
 pub(crate) mod contract_numbers;
 mod doc;
 
+/// The largest request body an upload route reads, in bytes: Kestrel's default
+/// `MaxRequestBodySize`, which Jellyfin never lowers on its image,
+/// splashscreen, subtitle and lyric uploads (the only `[RequestSizeLimit]` in
+/// the tree is `ClientLogController`'s). Every other route keeps axum's 2 MiB
+/// default, so an anonymous JSON route cannot be made to buffer 30 MB.
+///
+/// Candidate server setting; it ships as this constant (owner, 2026-10-24).
+pub(crate) const MAX_UPLOAD_BODY_BYTES: usize = 30_000_000;
+
+/// The body limit an upload route carries in place of axum's 2 MiB default.
+/// Layer it on the upload handler alone (`post(handler.layer(…))`); the
+/// route's auth extractors still run before the body is read.
+pub(crate) fn upload_body_limit() -> DefaultBodyLimit {
+    DefaultBodyLimit::max(MAX_UPLOAD_BODY_BYTES)
+}
+
 /// The `type` URI ASP.NET stamps on a validation failure.
 const VALIDATION_TYPE: &str = "https://tools.ietf.org/html/rfc9110#section-15.5.1";
 /// The `type` URI ASP.NET stamps on an unsupported media type.
 const UNSUPPORTED_MEDIA_TYPE_TYPE: &str = "https://tools.ietf.org/html/rfc9110#section-15.5.16";
+/// The RFC 9110 `type` URI of a body past the route's limit.
+const PAYLOAD_TOO_LARGE_TYPE: &str = "https://tools.ietf.org/html/rfc9110#section-15.5.14";
 /// The `title` of a validation failure, verbatim from ASP.NET.
 const VALIDATION_TITLE: &str = "One or more validation errors occurred.";
 
@@ -91,7 +118,7 @@ pub struct ProblemDetails {
     /// The HTTP status, repeated in the document as ASP.NET repeats it.
     pub status: u16,
     /// The per-member complaints, keyed the way `ValidationProblemDetails` keys
-    /// them. Omitted entirely on a 415, which carries none.
+    /// them. Omitted entirely on a 413 or a 415, which carry none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errors: Option<BTreeMap<String, Vec<String>>>,
 }
@@ -104,6 +131,17 @@ impl ProblemDetails {
             type_: UNSUPPORTED_MEDIA_TYPE_TYPE,
             title: "Unsupported Media Type",
             status: StatusCode::UNSUPPORTED_MEDIA_TYPE.as_u16(),
+            errors: None,
+        }
+    }
+
+    /// A 413: the body is larger than the route reads.
+    #[must_use]
+    pub fn payload_too_large() -> Self {
+        Self {
+            type_: PAYLOAD_TOO_LARGE_TYPE,
+            title: "Payload Too Large",
+            status: StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
             errors: None,
         }
     }
@@ -122,6 +160,40 @@ impl ProblemDetails {
             status: StatusCode::BAD_REQUEST.as_u16(),
             errors: Some(errors),
         }
+    }
+
+    /// A 400 naming one member of a body that bound but failed a validation
+    /// attribute (`[StringLength]`, …): ASP.NET keys it by the member name
+    /// alone, with no `body` entry, because the parameter itself bound.
+    #[must_use]
+    pub fn member_validation(member: &str, message: impl Into<String>) -> Self {
+        let mut errors = BTreeMap::new();
+        errors.insert(member.to_owned(), vec![message.into()]);
+        Self {
+            type_: VALIDATION_TYPE,
+            title: VALIDATION_TITLE,
+            status: StatusCode::BAD_REQUEST.as_u16(),
+            errors: Some(errors),
+        }
+    }
+
+    /// [`Self::member_validation`] for every `(member, message)` that failed,
+    /// as ASP.NET reports all of a body's failing members in one `400`;
+    /// `None` when there are none.
+    #[must_use]
+    pub fn members_validation(
+        failures: impl IntoIterator<Item = (String, String)>,
+    ) -> Option<Self> {
+        let errors: BTreeMap<String, Vec<String>> = failures
+            .into_iter()
+            .map(|(member, message)| (member, vec![message]))
+            .collect();
+        (!errors.is_empty()).then(|| Self {
+            type_: VALIDATION_TYPE,
+            title: VALIDATION_TITLE,
+            status: StatusCode::BAD_REQUEST.as_u16(),
+            errors: Some(errors),
+        })
     }
 
     /// The rejection for an absent, blank or `null` body.
@@ -290,7 +362,17 @@ async fn read_required<S: Send + Sync>(req: Request, state: &S) -> Result<Bytes,
     }
     Bytes::from_request(req, state)
         .await
-        .map_err(|e| ProblemDetails::validation("", e.body_text()))
+        .map_err(|e| unreadable_body(&e))
+}
+
+/// The rejection for a body that could not be buffered: one past the route's
+/// limit is a `413`, anything else the binder's `400`.
+fn unreadable_body(rejection: &BytesRejection) -> ProblemDetails {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ProblemDetails::payload_too_large()
+    } else {
+        ProblemDetails::validation("", rejection.body_text())
+    }
 }
 
 /// Reads the body of an OPTIONAL parameter, reporting whether its content type
@@ -308,7 +390,7 @@ async fn read_optional<S: Send + Sync>(
     let json_content_type = is_json_content_type(req.headers());
     let bytes = Bytes::from_request(req, state)
         .await
-        .map_err(|e| ProblemDetails::validation("", e.body_text()))?;
+        .map_err(|e| unreadable_body(&e))?;
     Ok((json_content_type, bytes))
 }
 

@@ -120,6 +120,12 @@ pub(crate) struct ByNameListQuery {
     /// Comma-delimited studio item ids the by-name row must reference.
     #[serde(default)]
     pub studio_ids: Option<String>,
+    /// Pipe-delimited studio **names** (`ArtistsController` only). Non-empty,
+    /// they replace [`Self::studio_ids`] with the named studios' ids — see
+    /// [`Self::artists_query`]. The Genres, `MusicGenres` and Studios
+    /// controllers declare no such parameter, so their handlers ignore it.
+    #[serde(default)]
+    pub studios: Option<String>,
 }
 
 /// Builds the projection options a by-name browse hands to the DTO service.
@@ -260,6 +266,46 @@ impl ByNameListQuery {
         Ok(query)
     }
 
+    /// The item `parentId` names, through [`resolve_parent`].
+    ///
+    /// # Errors
+    ///
+    /// `400` for an id naming no item.
+    pub(crate) async fn parent(
+        &self,
+        state: &AppState,
+    ) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
+        resolve_parent(state, self.parent_id).await
+    }
+
+    /// [`Self::base_query`] for `GET /Artists` and `GET /Artists/AlbumArtists`,
+    /// which also take `studios`: v12.2 `ArtistsController.cs:182-195`
+    /// (`:336-349` for album artists) sets `query.StudioIds` to the names'
+    /// studio ids, replacing any `studioIds`, when the list is non-empty.
+    /// `GetItemValues` then applies `StudioIds` to the artist row itself
+    /// (`ByName.cs:221`), which carries no studios, so any name empties the list.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::base_query`] refuses, and a failed studio lookup.
+    pub(crate) async fn artists_query(
+        &self,
+        state: &AppState,
+        user: Option<UserEntity>,
+    ) -> Result<ferrofin_traits::options::InternalItemsQuery, ApiError> {
+        let mut query = self.base_query(user)?;
+        if let Some(ids) = resolve_by_name_ids(
+            state,
+            ferrofin_model::data::BaseItemKind::Studio,
+            self.studios.as_deref(),
+        )
+        .await?
+        {
+            query.studio_ids = ids;
+        }
+        Ok(query)
+    }
+
     /// Whether the per-kind counts are folded onto each DTO — C#
     /// `filter.DtoOptions.ContainsField(ItemFields.ItemCounts)` after the
     /// controller's augmentation: "asking for a type filter has always
@@ -284,6 +330,33 @@ impl ByNameListQuery {
             fields.push(ferrofin_model::querying::ItemFields::ItemCounts);
         }
         fields
+    }
+}
+
+/// v12.2 `LibraryManager.GetParentItem` (`LibraryManager.cs:3276-3289`) for a
+/// `parentId` the request sent: the item it names, or `ArgumentException`
+/// ("Invalid parent id: …", or `GetItemById`'s "Guid can't be empty" for the
+/// zero id), which `ExceptionMiddleware` answers `400`. No `parentId` is
+/// [`None`]; the caller decides what stands for the root.
+///
+/// # Errors
+///
+/// `400` for an id naming no item, the zero id included.
+pub(crate) async fn resolve_parent(
+    state: &AppState,
+    parent_id: Option<uuid::Uuid>,
+) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
+    let Some(parent_id) = parent_id else {
+        return Ok(None);
+    };
+    if parent_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
+    match state.library.get_item_by_id(parent_id).await? {
+        Some(parent) => Ok(Some(parent)),
+        None => Err(ApiError::BadRequest(format!(
+            "Invalid parent id: {parent_id}"
+        ))),
     }
 }
 
@@ -423,6 +496,105 @@ pub(crate) async fn resolve_by_name_or_slug(
     Ok(None)
 }
 
+/// The id a name filter takes for a name that resolves to no row: the empty
+/// GUID, which no stored item carries. The referenced-item match it feeds
+/// (`WhereReferencedItem`: the `CleanName` of the referenced rows) finds no row
+/// for it, and `AlbumIds` (`ParentId IN …`) matches no item either: `ParentId`
+/// is a foreign key to `BaseItems.Id`, so no row's parent is the empty GUID.
+const UNRESOLVED_NAME_ID: uuid::Uuid = uuid::Uuid::nil();
+
+/// Resolves a pipe-delimited by-name **name** filter to the ids of its
+/// `…Ids` counterpart: the controllers'
+/// `names.Select(n => _libraryManager.Get<Kind>(n)).Where(i => i is not null).Select(i => i!.Id)`
+/// (v12.2 `ArtistsController.cs:182-195` for `studios`; `ItemsController.cs`
+/// does the same for its `studios`). Upstream wraps each `GetStudio` /
+/// `GetArtist` in a `try`/`catch` and drops a name whose lookup throws; this
+/// resolver propagates a repository error (`?`) as an error response instead,
+/// so a caller must not assume lookup errors are swallowed.
+///
+/// `None` when the parameter names nothing (`studios.Length == 0`): the
+/// caller's `…Ids` filter stands. Otherwise one id per name, and the caller
+/// REPLACES that filter with them.
+///
+/// `Get<Kind>` is `CreateItemByName<T>`: an unknown name gets a row minted,
+/// and its fresh id is one no item references, so the name matches nothing.
+/// This lookup is the non-creating
+/// [`find_named_item`](ferrofin_traits::library::LibraryManager::find_named_item),
+/// because a GET must not write, and a miss takes [`UNRESOLVED_NAME_ID`],
+/// which matches the same nothing. A miss is never dropped: with every name
+/// dropped the list would be empty, and an empty `…Ids` filter is no filter.
+///
+/// Writing an item value materializes its by-name row
+/// (`ItemPersistenceService::save_item_values`), so a name that resolves to
+/// nothing is one no item carries. The exception is an adopted database
+/// holding a value whose row Jellyfin's by-name validators had not created
+/// yet: upstream's minted row would match the items carrying it, a miss here
+/// matches none.
+///
+/// `GetArtist` (`artists` on `GET /Items`) special-cases `MusicArtist`: it
+/// takes an existing row by `Name`, a folder-backed artist before a by-name
+/// one (`IsAccessedByName`), which a plain `CleanName` match does not order.
+/// The choice cannot change an `ArtistIds` filter, which reads the `CleanName`
+/// of the row it names and so matches the same items for any row of that
+/// name; it would matter to an id-keyed use. Not for `albums`: see
+/// [`resolve_album_ids`].
+pub(crate) async fn resolve_by_name_ids(
+    state: &AppState,
+    kind: ferrofin_model::data::BaseItemKind,
+    raw: Option<&str>,
+) -> Result<Option<Vec<uuid::Uuid>>, ApiError> {
+    let names = crate::handlers::query_parse::parse_pipe_strings(raw);
+    if names.is_empty() {
+        return Ok(None);
+    }
+    // One non-creating lookup per name, accepted as the cost: upstream runs one
+    // `GetStudio` per name, and on the artist routes any non-empty list empties
+    // the answer anyway. No cap on the count, and no skipping the lookup.
+    let mut ids = Vec::with_capacity(names.len());
+    for name in &names {
+        let row = state.library.find_named_item(kind, name).await?;
+        ids.push(
+            row.and_then(|row| uuid::Uuid::parse_str(&row.id).ok())
+                .unwrap_or(UNRESOLVED_NAME_ID),
+        );
+    }
+    Ok(Some(ids))
+}
+
+/// Resolves `GET /Items`' pipe-delimited `albums` names to the ids that
+/// replace `albumIds`: `albums.SelectMany(name => GetItemIds(new
+/// InternalItemsQuery { IncludeItemTypes = [MusicAlbum], Name = name, Limit = 1 }))`
+/// (v12.2 `ItemsController.cs:554-561`) — the first album of each name by
+/// `SortName` (upstream's `ApplyOrder` default; ties fall to the engine), and
+/// no row written.
+///
+/// `None` when the parameter names nothing. A name no album has takes
+/// [`UNRESOLVED_NAME_ID`], so it matches nothing. Upstream drops it instead,
+/// and a list of unknown albums then leaves `AlbumIds` empty, which is no
+/// filter: `albums=<a typo>` answers the whole library there. That Jellyfin
+/// bug is not ported.
+pub(crate) async fn resolve_album_ids(
+    state: &AppState,
+    raw: Option<&str>,
+) -> Result<Option<Vec<uuid::Uuid>>, ApiError> {
+    let names = crate::handlers::query_parse::parse_pipe_strings(raw);
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let mut ids = Vec::with_capacity(names.len());
+    for name in names {
+        let query = ferrofin_traits::options::InternalItemsQuery {
+            include_item_types: vec![ferrofin_model::data::BaseItemKind::MusicAlbum],
+            name: Some(name),
+            limit: Some(1),
+            ..ferrofin_traits::options::InternalItemsQuery::default()
+        };
+        let found = state.library.get_item_ids(&query).await?;
+        ids.push(found.first().copied().unwrap_or(UNRESOLVED_NAME_ID));
+    }
+    Ok(Some(ids))
+}
+
 /// Projects a page of [`ItemWithCounts`] aggregates into a
 /// [`QueryResult<BaseItemDto>`], mirroring `RequestHelpers.CreateQueryResult`.
 ///
@@ -490,6 +662,7 @@ crate::query::query_parameters! {
         "tags" => '|',
         "years" => ',',
         "studioIds" => ',',
+        "studios" => '|',
     } => [("get", "/Genres"), ("get", "/MusicGenres"), ("get", "/Studios"), ("get", "/Artists"), ("get", "/Artists/AlbumArtists")];
     ByNameItemQuery {} => [("get", "/Genres/{genreName}"), ("get", "/MusicGenres/{genreName}"), ("get", "/Persons/{name}"), ("get", "/Studios/{name}"), ("get", "/Artists/{name}")];
 }
@@ -499,6 +672,57 @@ mod tests {
     use super::{ByNameListQuery, additional_dto_options};
     use ferrofin_model::entities::ImageType;
     use ferrofin_model::querying::ItemFields;
+
+    /// Every query parameter the vendored contracts give the five list routes
+    /// that bind [`ByNameListQuery`] is one of its fields, except the four
+    /// `/Artists` parameters v12.2 accepts and ignores: `GetItemValues` copies
+    /// `MinCommunityRating`, `Person`, `PersonIds` and `PersonTypes` onto
+    /// neither of its filters (`ByName.cs:180-233`). serde drops an unknown
+    /// key without a word, so a missing field is a filter the client asked for
+    /// and never got: `studios` was one, and every artist came back.
+    #[test]
+    fn by_name_list_query_binds_every_contract_parameter() {
+        const UPSTREAM_NO_OPS: [&str; 4] =
+            ["minCommunityRating", "person", "personIds", "personTypes"];
+        let mut contract = std::collections::BTreeSet::new();
+        for raw in [
+            include_str!("../../../../contracts/jellyfin-openapi-10.11.8.json"),
+            include_str!("../../../../contracts/jellyfin-openapi-12.1.0.json"),
+        ] {
+            let spec: serde_json::Value = serde_json::from_str(raw).expect("contract parses");
+            for route in [
+                "/Genres",
+                "/MusicGenres",
+                "/Studios",
+                "/Artists",
+                "/Artists/AlbumArtists",
+            ] {
+                // Jellyfin 12 drops `/MusicGenres`; 10.11.8 still lists it.
+                let Some(parameters) = spec["paths"][route]["get"]["parameters"].as_array() else {
+                    continue;
+                };
+                contract.extend(
+                    parameters
+                        .iter()
+                        .filter(|p| p["in"] == "query")
+                        .filter_map(|p| p["name"].as_str().map(str::to_owned)),
+                );
+            }
+        }
+        assert!(contract.contains("studios"), "contract read: {contract:?}");
+        let keys = crate::query::fields::<ByNameListQuery>();
+        let unbound: std::collections::BTreeSet<&str> = contract
+            .iter()
+            .map(String::as_str)
+            .filter(|name| !keys.contains(name))
+            .collect();
+        assert_eq!(
+            unbound,
+            UPSTREAM_NO_OPS.into_iter().collect(),
+            "left: the contract parameters ByNameListQuery drops; right: v12.2's no-ops. \
+             A newly dropped parameter must be bound, not listed"
+        );
+    }
 
     #[test]
     fn defaults_match_the_parameterless_csharp_call() {

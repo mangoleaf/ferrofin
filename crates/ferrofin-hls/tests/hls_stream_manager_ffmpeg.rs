@@ -247,6 +247,7 @@ impl StreamStatePlanner for FfmpegPlanner {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 2,
             wait_for_path,
             segment_container: Some(seg_ext.to_owned()),
@@ -265,6 +266,8 @@ impl StreamStatePlanner for FfmpegPlanner {
             segment_container: seg_ext.to_owned(),
             encoding_options: EncodingOptions::default(),
             min_segments: 3,
+            is_dovi_removed: false,
+            is_hdr10_plus_removed: false,
         })
     }
 }

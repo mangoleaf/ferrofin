@@ -13,24 +13,28 @@
 //! - `AsyncKeyedLock` around `ConvertSubtitles` determinism is preserved via the
 //!   same keyed-lock helper.
 
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use ferrofin_model::dto::MediaSourceInfo;
+use ferrofin_model::entities::IsoType;
 use ferrofin_model::entities_media::MediaStream;
 use ferrofin_model::media_info::{MediaProtocol, subtitle_format};
 
+use crate::encoder::{get_input_argument, quote};
+use crate::encoding_helper::helper;
 use crate::keyed_locks::KeyedLocks;
 
 use super::model::{Subtitle, TimeCode};
 use super::parser::{SubtitleEditParser, SubtitleParser};
-use super::{json_writer, srt, ssa, vtt};
+use super::{json_writer, srt, ssa, ttml, vtt};
 
 /// The output format a [`GetWriter`](write)-selected writer emits.
 ///
 /// Port of the `TryGetWriter` switch in the C# encoder, restricted to the
 /// formats the writers support (`ass`, `ssa`, `srt`/`subrip`, `vtt`/`webvtt`,
-/// `json`).
+/// `json`, `ttml`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Writer {
     /// Advanced SubStation Alpha writer.
@@ -43,7 +47,31 @@ enum Writer {
     WebVtt,
     /// Jellyfin JSON writer.
     Json,
+    /// TTML (`TimedText10`) writer.
+    Ttml,
 }
+
+/// `subtitle` without the SSA/ASS `Comment:` events its loader keeps.
+///
+/// Deliberate divergence: libse loads a script's comments as cues flagged
+/// `IsComment`, and only its SSA and ASS writers check the flag, so Jellyfin 12 shows
+/// comments as ordinary subtitle lines in WebVTT, SubRip, TTML and JSON. That is a
+/// Jellyfin bug (a script's comments are never displayed), so those writers get the
+/// cues without them; the SSA/ASS loaders number the cues as if the comments were
+/// absent. The SSA and ASS writers still write them back as `Comment:` lines.
+fn without_comment_events(subtitle: &Subtitle) -> Cow<'_, Subtitle> {
+    if subtitle.paragraphs.iter().any(|p| p.is_comment) {
+        let mut kept = subtitle.clone();
+        kept.paragraphs.retain(|p| !p.is_comment);
+        Cow::Owned(kept)
+    } else {
+        Cow::Borrowed(subtitle)
+    }
+}
+
+/// The title `SubtitleEncoder.ConvertSubtitles` passes to every writer
+/// (`formatter.ToText(subtitle, "untitled")`).
+const WRITER_TITLE: &str = "untitled";
 
 impl Writer {
     /// Resolves the writer for `format`, if supported.
@@ -64,6 +92,8 @@ impl Writer {
             || format.eq_ignore_ascii_case(subtitle_format::WEBVTT)
         {
             Some(Self::WebVtt)
+        } else if format.eq_ignore_ascii_case(subtitle_format::TTML) {
+            Some(Self::Ttml)
         } else {
             None
         }
@@ -72,11 +102,12 @@ impl Writer {
     /// Writes `subtitle` in this writer's format.
     fn write(self, subtitle: &Subtitle) -> String {
         match self {
-            Self::Ass => ssa::to_text_ass(subtitle),
-            Self::Ssa => ssa::to_text_ssa(subtitle),
-            Self::SubRip => srt::to_text(subtitle),
-            Self::WebVtt => vtt::to_text(subtitle),
-            Self::Json => json_writer::to_text(subtitle),
+            Self::Ass => ssa::to_text_ass(subtitle, WRITER_TITLE),
+            Self::Ssa => ssa::to_text_ssa(subtitle, WRITER_TITLE),
+            Self::SubRip => srt::to_text(&without_comment_events(subtitle)),
+            Self::WebVtt => vtt::to_text(&without_comment_events(subtitle)),
+            Self::Json => json_writer::to_text(&without_comment_events(subtitle)),
+            Self::Ttml => ttml::to_text(&without_comment_events(subtitle), WRITER_TITLE),
         }
     }
 }
@@ -147,7 +178,8 @@ pub trait SubtitleIo: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns an error message on ffmpeg failure.
+    /// Returns an error message on ffmpeg failure, or when `args` does not
+    /// split into argv (unbalanced quoting).
     async fn extract(&self, args: &str, output_paths: &[String]) -> Result<(), String>;
 
     /// Whether a cached subtitle file already exists at `path`. Port of the
@@ -195,6 +227,38 @@ pub trait SubtitleIo: Send + Sync {
     fn write_file(&self, path: &str, content: &[u8]) -> Result<(), String> {
         std::fs::write(path, content).map_err(|e| format!("write {path}: {e}"))
     }
+
+    /// The size in bytes and the last-write time, in .NET ticks (100 ns
+    /// intervals since 0001-01-01 UTC), of the file at `path`, or `None` when
+    /// it does not exist: the `FileInfo.Length`/`LastWriteTimeUtc.Ticks` pair a
+    /// subtitle cache's `.meta` sidecar records, so a sidecar Jellyfin 12 wrote
+    /// still matches.
+    fn file_stamp(&self, path: &str) -> Option<(u64, i64)> {
+        let metadata = std::fs::metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)?;
+        let since_epoch = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        let ticks = i64::try_from(since_epoch.as_nanos() / 100).ok()?;
+        Some((metadata.len(), UNIX_EPOCH_TICKS + ticks))
+    }
+}
+
+/// .NET ticks (100 ns intervals since 0001-01-01 UTC) at the Unix epoch.
+const UNIX_EPOCH_TICKS: i64 = 621_355_968_000_000_000;
+
+/// `SubtitleEncoder.GetCacheMetaPath`: the sidecar recording which revision
+/// of its source a subtitle cache file was built from.
+fn cache_meta_path(cache_path: &str) -> String {
+    format!("{cache_path}.meta")
+}
+
+/// `SubtitleEncoder.FormatCacheMeta`: `{size}:{ticks}`, as Jellyfin 12 writes it.
+fn format_cache_meta((size, ticks): (u64, i64)) -> String {
+    format!("{size}:{ticks}")
 }
 
 /// Resolved information about a readable subtitle file.
@@ -351,6 +415,44 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         }
     }
 
+    /// `SubtitleEncoder.IsCachedSubtitleFresh`: whether the cache file at
+    /// `cache_path` can be served for `source_path`. A missing or empty cache
+    /// is stale and a missing source keeps the cache. Otherwise the cache's
+    /// `.meta` sidecar must record the source's current size and last-write
+    /// time, so a cache from before the sidecar existed is rebuilt once.
+    async fn is_cached_subtitle_fresh(&self, cache_path: &str, source_path: &str) -> bool {
+        if !self.io.file_exists(cache_path) || self.io.file_size(cache_path) == Some(0) {
+            return false;
+        }
+        let Some(stamp) = Some(source_path)
+            .filter(|path| !path.is_empty())
+            .and_then(|path| self.io.file_stamp(path))
+        else {
+            return true;
+        };
+        self.io
+            .read_file(&cache_meta_path(cache_path))
+            .await
+            .is_ok_and(|recorded| recorded == format_cache_meta(stamp).as_bytes())
+    }
+
+    /// `SubtitleEncoder.WriteCacheMeta`: records `source_path`'s current size
+    /// and last-write time beside the cache file built from it.
+    fn write_cache_meta(&self, cache_path: &str, source_path: &str) {
+        let Some(stamp) = Some(source_path)
+            .filter(|path| !path.is_empty())
+            .and_then(|path| self.io.file_stamp(path))
+        else {
+            return;
+        };
+        if let Err(err) = self.io.write_file(
+            &cache_meta_path(cache_path),
+            format_cache_meta(stamp).as_bytes(),
+        ) {
+            tracing::warn!(cache_path, %err, "failed to record subtitle cache metadata");
+        }
+    }
+
     /// Resolves the on-disk (or extracted) path of a subtitle stream.
     ///
     /// Port of `SubtitleEncoder.GetSubtitleFilePath`: the readable-file path
@@ -504,13 +606,17 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
 
     /// Extracts every extractable subtitle from a media source via ffmpeg.
     ///
-    /// Port of `SubtitleEncoder.ExtractAllExtractableSubtitles`, reduced to the
-    /// embedded (non-`.mks`) extraction path; each output cache path is
-    /// serialized with the keyed lock. Errors are swallowed (logged in C#) so a
-    /// single un-extractable stream cannot abort the caller.
+    /// Port of `SubtitleEncoder.ExtractAllExtractableSubtitles`: the embedded
+    /// streams in one ffmpeg run over the video file, then each external
+    /// `.mks` file in its own ([`Self::extract_all_extractable_subtitles_mks`]);
+    /// each output cache path is serialized with the keyed lock. Errors are
+    /// swallowed (logged in C#) so a single un-extractable stream cannot abort
+    /// the caller.
     pub async fn extract_all_extractable_subtitles(&self, media_source: &MediaSourceInfo) {
         let source_path = media_source.path.clone().unwrap_or_default();
-        let input_path = Self::io_input_argument(&source_path, media_source);
+        // TODO(parity): upstream's `GetInputPathArgument` also picks a disc rip's
+        // playlist files, the `bluray:` prefix for an ISO and the source protocol.
+        let input_path = get_input_argument("file", &source_path, MediaProtocol::File);
         let mut args = format!("-y -i {input_path}");
         let mut output_paths: Vec<String> = Vec::new();
         // Guards for the paths this call extracts, held across the ffmpeg run so
@@ -534,16 +640,35 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             else {
                 continue;
             };
-            let Some(stream_index) = find_index(&media_source.media_streams, stream) else {
+            // `GetSubtitleStreamIndexForFfmpeg`: the track's place among the
+            // video file's own streams, not among every stream of the source
+            // (a sidecar listed first would shift it past the end of the file).
+            let stream_index = helper::get_subtitle_stream_index_for_ffmpeg(media_source, stream);
+            if stream_index == -1 {
+                tracing::error!(
+                    path = %source_path,
+                    index = stream.index,
+                    "cannot find subtitle stream index, skipping this stream"
+                );
                 continue;
-            };
-            // Lock the output path, then skip a cache hit — the C# `File.Exists`
-            // skip. Without it every subtitle request re-runs the full-file
-            // ffmpeg extraction (seconds per request) instead of serving the
-            // already-extracted cache. Taking the lock first also means a
-            // concurrent extraction of the same path completes before the check.
+            }
+            // Lock the output path, then skip a fresh cache
+            // (`IsCachedSubtitleFresh` against the stream's own file, else the
+            // media file). Without it every subtitle request re-runs the
+            // full-file ffmpeg extraction (seconds per request), and a media
+            // file replaced in place keeps serving the old extraction. Taking
+            // the lock first also means a concurrent extraction of the same
+            // path completes before the check.
             let guard = self.locks.get(&output_path).lock_owned().await;
-            if self.io.file_exists(&output_path) {
+            let cache_source = if stream_path.is_empty() {
+                source_path.as_str()
+            } else {
+                stream_path.as_str()
+            };
+            if self
+                .is_cached_subtitle_fresh(&output_path, cache_source)
+                .await
+            {
                 continue;
             }
             held.push(guard);
@@ -561,19 +686,112 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             output_paths.push(output_path.clone());
             let _ = write!(
                 args,
-                " -map 0:{stream_index} -an -vn -c:s {output_codec}{output_format_option} -flush_packets 1 \"{output_path}\""
+                " -map 0:{stream_index} -an -vn -c:s {output_codec}{output_format_option} -flush_packets 1 {}",
+                quote(&output_path)
             );
         }
 
-        if output_paths.is_empty() {
-            return;
+        if !output_paths.is_empty() {
+            let result = self.io.extract(&args, &output_paths).await;
+            let extracted = result.is_ok();
+            self.validate_extraction(&source_path, &output_paths, result)
+                .await;
+            if extracted {
+                for output_path in &output_paths {
+                    self.write_cache_meta(output_path, &source_path);
+                }
+            }
+        }
+        drop(held);
+
+        self.extract_all_extractable_subtitles_mks(media_source)
+            .await;
+    }
+
+    /// The external `.mks` half of [`Self::extract_all_extractable_subtitles`].
+    ///
+    /// Port of `SubtitleEncoder.ExtractAllExtractableSubtitlesMKS`: one ffmpeg
+    /// run per `.mks` file, each of its tracks mapped by its position inside
+    /// that file (`EncodingHelper.FindIndex`) and a VobSub track re-muxed as
+    /// Matroska, since ffmpeg has no `.idx`/`.sub` muxer. Each output is locked
+    /// and a cache hit skipped, as in the embedded pass.
+    async fn extract_all_extractable_subtitles_mks(&self, media_source: &MediaSourceInfo) {
+        let streams: Vec<&MediaStream> = media_source
+            .media_streams
+            .iter()
+            .filter(|stream| stream.is_extractable_subtitle_stream() && mks_path(stream).is_some())
+            .collect();
+        let mut files: Vec<&str> = Vec::new();
+        for file in streams.iter().filter_map(|stream| mks_path(stream)) {
+            if !files.contains(&file) {
+                files.push(file);
+            }
         }
 
-        let result = self.io.extract(&args, &output_paths).await;
-        self.validate_extraction(&source_path, &output_paths, result)
-            .await;
-
-        drop(held);
+        for file in files {
+            // `MediaEncoder.GetInputArgument(mksFile, mediaSource)`.
+            let prefix = if media_source.iso_type == Some(IsoType::BluRay) {
+                "bluray"
+            } else {
+                "file"
+            };
+            let input_path = get_input_argument(prefix, file, media_source.protocol);
+            let mut args = format!("-y -i {input_path}");
+            let mut output_paths: Vec<String> = Vec::new();
+            let mut held = Vec::new();
+            for &stream in streams.iter().filter(|stream| {
+                mks_path(stream).is_some_and(|path| path.eq_ignore_ascii_case(file))
+            }) {
+                let ext = get_extractable_subtitle_file_extension(stream);
+                let Some(output_path) = self.subtitle_cache_path(media_source, stream.index, &ext)
+                else {
+                    continue;
+                };
+                let stream_index = helper::find_index(&media_source.media_streams, stream);
+                if stream_index == -1 {
+                    tracing::error!(
+                        path = %file,
+                        index = stream.index,
+                        "cannot find subtitle stream index, skipping this stream"
+                    );
+                    continue;
+                }
+                let guard = self.locks.get(&output_path).lock_owned().await;
+                if self.is_cached_subtitle_fresh(&output_path, file).await {
+                    continue;
+                }
+                held.push(guard);
+                let codec = stream.codec.clone().unwrap_or_default();
+                let output_codec = if is_codec_copyable(&codec) {
+                    "copy"
+                } else {
+                    "srt"
+                };
+                let output_format_option = if MediaStream::is_vob_sub_format(Some(&codec)) {
+                    " -f matroska"
+                } else {
+                    ""
+                };
+                output_paths.push(output_path.clone());
+                let _ = write!(
+                    args,
+                    " -map 0:{stream_index} -an -vn -c:s {output_codec}{output_format_option} -flush_packets 1 {}",
+                    quote(&output_path)
+                );
+            }
+            if output_paths.is_empty() {
+                continue;
+            }
+            let result = self.io.extract(&args, &output_paths).await;
+            let extracted = result.is_ok();
+            self.validate_extraction(file, &output_paths, result).await;
+            if extracted {
+                for output_path in &output_paths {
+                    self.write_cache_meta(output_path, file);
+                }
+            }
+            drop(held);
+        }
     }
 
     /// Validates and cleans up the outputs of a subtitle extraction.
@@ -644,6 +862,14 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         let _held = guard.lock().await;
 
         let input_path = subtitle_stream.path.clone().unwrap_or_default();
+        // `ConvertTextSubtitleToSrt`: a conversion of this revision of the
+        // sidecar is reused instead of running ffmpeg on every request.
+        if self
+            .is_cached_subtitle_fresh(output_path, &input_path)
+            .await
+        {
+            return Ok(());
+        }
         if input_path.is_empty() {
             return Err("inputPath is empty".to_owned());
         }
@@ -665,7 +891,11 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
             format!(" -sub_charenc {charset}")
         };
 
-        let args = format!("-y{encoding_param} -i \"{input_path}\" -c:s srt \"{output_path}\"");
+        let args = format!(
+            "-y{encoding_param} -i {} -c:s srt {}",
+            quote(&input_path),
+            quote(output_path)
+        );
         self.io
             .extract(&args, std::slice::from_ref(&output_path.to_owned()))
             .await?;
@@ -674,7 +904,10 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         // per-output check in `ExtractSubtitlesForFile`, also reached via
         // `ExtractTextSubtitleInternal`).
         match self.io.file_size(output_path) {
-            Some(size) if size > 0 => Ok(()),
+            Some(size) if size > 0 => {
+                self.write_cache_meta(output_path, &input_path);
+                Ok(())
+            }
             _ => {
                 let _ = self.io.delete_file(output_path);
                 Err(format!(
@@ -717,19 +950,6 @@ impl<P: SubtitleParser, I: SubtitleIo> SubtitleEncoder<P, I> {
         let id = media_source.id.clone().unwrap_or_default();
         self.io
             .subtitle_cache_path(&id, subtitle_stream_index, &format!(".{output_extension}"))
-    }
-
-    /// Builds the ffmpeg `-i` input argument for a source path.
-    ///
-    /// The C# code calls `IMediaEncoder.GetInputArgument`; here the un-ported
-    /// hardware-aware builder is reduced to the file/URL quoting the extraction
-    /// arg-building needs (the full builder lives in the `encoder` module).
-    fn io_input_argument(path: &str, _media_source: &MediaSourceInfo) -> String {
-        if path.contains("://") {
-            format!("\"{path}\"")
-        } else {
-            format!("file:\"{}\"", path.replace('"', "\\\""))
-        }
     }
 }
 
@@ -819,8 +1039,9 @@ pub fn filter_events(
     preserve_timestamps: bool,
 ) {
     track.paragraphs.retain(|p| {
-        !((p.start_time.ticks() - start_position_ticks) < 0
-            && (p.end_time.ticks() - start_position_ticks) < 0)
+        // C#'s `long` arithmetic is unchecked; the offset comes from the request.
+        !(p.start_time.ticks().wrapping_sub(start_position_ticks) < 0
+            && p.end_time.ticks().wrapping_sub(start_position_ticks) < 0)
     });
 
     if end_time_ticks > 0 {
@@ -831,9 +1052,14 @@ pub fn filter_events(
 
     if !preserve_timestamps {
         for p in &mut track.paragraphs {
-            p.start_time =
-                TimeCode::from_ticks((p.start_time.ticks() - start_position_ticks).max(0));
-            p.end_time = TimeCode::from_ticks((p.end_time.ticks() - start_position_ticks).max(0));
+            p.start_time = TimeCode::from_ticks(
+                p.start_time
+                    .ticks()
+                    .wrapping_sub(start_position_ticks)
+                    .max(0),
+            );
+            p.end_time =
+                TimeCode::from_ticks(p.end_time.ticks().wrapping_sub(start_position_ticks).max(0));
         }
     }
 }
@@ -966,6 +1192,14 @@ fn get_extractable_subtitle_format(subtitle_stream: &MediaStream) -> String {
     }
 }
 
+/// The `.mks` file a subtitle stream lives in, if it is one.
+fn mks_path(stream: &MediaStream) -> Option<&str> {
+    stream
+        .path
+        .as_deref()
+        .filter(|path| ends_with_ignore_ascii_case(path, ".mks"))
+}
+
 /// Whether a stream codec can be copied (rather than transcoded) on extraction.
 ///
 /// Port of `SubtitleEncoder.IsCodecCopyable`.
@@ -976,17 +1210,6 @@ fn is_codec_copyable(codec: &str) -> bool {
         || codec.eq_ignore_ascii_case("subrip")
         || codec.eq_ignore_ascii_case("pgssub")
         || MediaStream::is_vob_sub_format(Some(codec))
-}
-
-/// Finds the ordinal index of `stream` within `streams` by identity/index.
-///
-/// Port of `EncodingHelper.FindIndex(mediaStreams, stream)`, matched on the
-/// stream `index` (its stable identity in a media source).
-fn find_index(streams: &[MediaStream], stream: &MediaStream) -> Option<i32> {
-    streams
-        .iter()
-        .position(|s| s.index == stream.index)
-        .and_then(|p| i32::try_from(p).ok())
 }
 
 /// Returns the lowercased file extension of `path` (without the dot), if any.

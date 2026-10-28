@@ -25,10 +25,6 @@
 //! | Preview        | `Preview`            |
 //! | Recap          | `Recap`              |
 //! | Commercial     | `Commercial`         |
-//!
-//! One route is thinner than upstream because the backing subsystem does not
-//! exist in Ferrofin, documented at its handler:
-//! `FileTransformation/RegisterTransformation` (no web-asset pipeline to hook).
 
 use std::collections::HashMap;
 
@@ -227,13 +223,16 @@ async fn plugin_version(state: &AppState) -> String {
         .map_or_else(|| "0.0.0.0".to_owned(), |d| d.version)
 }
 
-/// The episodes directly under a season (empty if the season has none).
+/// A season's episodes (empty if the season has none). By ancestry, not
+/// `ParentId`: an episode of a virtual season is stored under its series and
+/// has its season among its ancestors (`Episode.GetAncestorIds()`), so a
+/// series without season folders keeps its intros here.
 async fn season_episodes(
     state: &AppState,
     season_id: Uuid,
 ) -> Result<Vec<BaseItemEntity>, ApiError> {
     let query = InternalItemsQuery {
-        parent_id: season_id,
+        ancestor_ids: vec![season_id],
         include_item_types: vec![BaseItemKind::Episode],
         ..InternalItemsQuery::default()
     };
@@ -771,7 +770,7 @@ async fn update_skip_duration(
 /// the fields the CSS routes don't touch.
 async fn save_branding(state: &AppState, branding: BrandingOptions) -> Result<(), ApiError> {
     state.config.update_branding(&branding).await?;
-    Ok(())
+    crate::handlers::config::run_committed_checks(state, "branding")
 }
 
 // ---------------------------------------------------------------------------

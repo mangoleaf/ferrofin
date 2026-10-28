@@ -875,31 +875,61 @@ async fn add_tuner_host(
     Ok(Json(saved))
 }
 
-/// `DELETE /LiveTv/TunerHosts?id=` — remove a tuner host (and its channels).
+/// `DELETE /LiveTv/TunerHosts?id=` — remove a tuner host.
 ///
-/// Port of `LiveTvController.DeleteTunerHost`.
+/// Port of `LiveTvController.DeleteTunerHost` → `TunerHostManager.DeleteTunerHost`
+/// (v12.2 TunerHostManager.cs:104-128), which only edits the configuration and
+/// ends with `CancelIfRunningAndQueue<RefreshGuideScheduledTask>()`: the host's
+/// channels and their programmes stay listed until the queued refresh's
+/// `CleanDatabase` pass removes them. Its `{cache}/{id}_channels` file has no
+/// counterpart here.
 async fn delete_tuner_host(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
     Query(q): Query<IdQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
-    live_tv(&state)?.delete_tuner_host(&q.id).await?;
+    let m = live_tv(&state)?;
+    m.delete_tuner_host(&q.id).await?;
+    queue_guide_refresh(m);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// `POST /LiveTv/ListingProviders` — add (or update) an XMLTV listing provider.
+/// The query `POST /LiveTv/ListingProviders` binds.
 ///
-/// Port of `LiveTvController.AddListingProvider`. Saves the provider and queues
-/// the guide refresh (upstream `ListingsManager.SaveListingProvider` ends with
-/// `CancelIfRunningAndQueue`); the `pw`/`validateListings`/`validateLogin` query
-/// flags are not used by the XMLTV backend.
+/// Port of `LiveTvController.AddListingProvider`'s `[FromQuery]` parameters:
+/// `pw`, and the two validation flags, which default to `false`.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct AddListingProviderQuery {
+    /// A password to store as its lowercase SHA1 hex, replacing the body's.
+    pw: Option<String>,
+    /// Have the provider check the chosen listings (Schedules Direct adds
+    /// the lineup to the account).
+    validate_listings: bool,
+    /// Have the provider log in with the credentials.
+    validate_login: bool,
+}
+
+/// `POST /LiveTv/ListingProviders` — add (or update) a listings provider.
+///
+/// Port of `LiveTvController.AddListingProvider`. A non-empty `pw` replaces
+/// the body's `Password` with `Convert.ToHexStringLower(SHA1(UTF-8 pw))`.
+/// `ListingsManager.SaveListingProvider` then has the provider registered for
+/// the `Type` validate the info (with `validateLogin`/`validateListings`),
+/// stores it, and queues the guide refresh (`CancelIfRunningAndQueue`).
 async fn add_listing_provider(
     State(state): State<AppState>,
     RequireAdmin(_auth): RequireAdmin,
-    JsonBody(info): JsonBody<ListingsProviderInfo>,
+    Query(query): Query<AddListingProviderQuery>,
+    JsonBody(mut info): JsonBody<ListingsProviderInfo>,
 ) -> Result<Json<ListingsProviderInfo>, ApiError> {
+    if let Some(pw) = query.pw.as_deref().filter(|pw| !pw.is_empty()) {
+        info.password = Some(ferrofin_common::extensions::sha1_hex(pw.as_bytes()).into());
+    }
     let m = live_tv(&state)?;
-    let saved = m.save_listing_provider(info).await?;
+    let saved = m
+        .save_listing_provider(info, query.validate_login, query.validate_listings)
+        .await?;
     queue_guide_refresh(m);
     Ok(Json(saved))
 }
@@ -918,10 +948,6 @@ async fn delete_listing_provider(
     // `RefreshGuideScheduledTask`, whose `CleanDatabase` pass is what actually
     // drains the listings the removed provider supplied — queued, so the DELETE
     // answers 204 before the guide has drained, on both servers.
-    // (`DeleteTunerHost` deliberately queues NOTHING — upstream leaves its
-    // channels until the next refresh; here they cascade away with the host row.
-    // Recorded as an accepted divergence in `suite/parity/classifications.json`
-    // under `DELETE /LiveTv/TunerHosts`.)
     queue_guide_refresh(m);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -949,11 +975,14 @@ async fn reset_tuner(
 /// M3U/XMLTV fetch, and (behind the manager's guide lock) hold every other Live
 /// TV configuration write behind it.
 ///
-/// The one named difference: upstream CANCELS an in-flight refresh and starts
-/// over, while this queues behind it (`FerrofinLiveTvManager::guide_lock`). The
-/// end state is the same — the last pass to run rewrites the guide from the
-/// current configuration — and the fetch half runs outside that lock, so a
-/// wedged source cannot stall the queue indefinitely.
+/// Upstream CANCELS an in-flight refresh and starts over. Here the new pass
+/// supersedes the older one: the older pass stops asking Schedules Direct for
+/// stations and does not write, and the write halves are serialized by the
+/// manager's guide lock. The end state is the same — the last pass rewrites the
+/// guide from the current configuration — and the fetch half runs outside that
+/// lock, so a wedged source cannot stall the queue indefinitely. A superseded
+/// pass that is mid-fetch on a slow tuner or XMLTV source still finishes that
+/// fetch before it notices.
 fn queue_guide_refresh(manager: &std::sync::Arc<dyn ferrofin_traits::stubs::LiveTvManager>) {
     let manager = std::sync::Arc::clone(manager);
     tokio::spawn(async move {
@@ -1230,7 +1259,7 @@ async fn get_live_recording_stream(
         Some(path) => Ok(progressive_response(
             std::path::PathBuf::from(&path),
             0,
-            &path,
+            ferrofin_model::net::mime_types::get_mime_type(&path),
         )),
         None => Err(ApiError::NotFound("recording".into())),
     }
@@ -1304,7 +1333,9 @@ fn progressive_file_body(path: std::path::PathBuf, start_at: u64) -> Body {
         loop {
             match file.read(&mut buffer).await {
                 Ok(0) => {
-                    if idle_ms >= PROGRESSIVE_TIMEOUT_MS {
+                    // A client that hung up (or a `HEAD`, whose body is never
+                    // read) frees the file now, not after the idle timeout.
+                    if idle_ms >= PROGRESSIVE_TIMEOUT_MS || tx.is_closed() {
                         break;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(PROGRESSIVE_POLL_MS)).await;
@@ -1345,9 +1376,12 @@ async fn live_stream_start_offset(file: &ferrofin_traits::stubs::LiveStreamFile)
     length.saturating_sub(tail)
 }
 
-/// Builds the `200` progressive response for `path`, typed by its container.
-fn progressive_response(path: std::path::PathBuf, start_at: u64, file_name: &str) -> Response {
-    let content_type = ferrofin_model::net::mime_types::get_mime_type(file_name);
+/// Builds the `200` progressive response for `path`, of `content_type`.
+pub(crate) fn progressive_response(
+    path: std::path::PathBuf,
+    start_at: u64,
+    content_type: &str,
+) -> Response {
     Response::builder()
         .header(axum::http::header::CONTENT_TYPE, content_type)
         // The body is generated as the file grows: nothing here is cacheable
@@ -1392,17 +1426,28 @@ async fn get_live_stream_file(
     let Some(container) = route_container(&container) else {
         return Err(ApiError::NotFound("live stream file".into()));
     };
+    live_stream_buffer(&state, &stream_id, &format!("file.{container}")).await
+}
+
+/// Serves the buffer of the open shared live stream `unique_id` progressively,
+/// typed as `file_name`: `ILiveStream.GetStream()` wrapped in a
+/// `ProgressiveFileStream`. `404` when no such stream is open.
+pub(crate) async fn live_stream_buffer(
+    state: &AppState,
+    unique_id: &str,
+    file_name: &str,
+) -> Result<Response, ApiError> {
     let Some(live_tv) = state.live_tv.as_ref() else {
         return Err(ApiError::NotFound("live stream file".into()));
     };
-    let Some(file) = live_tv.get_live_stream_file(&stream_id).await? else {
+    let Some(file) = live_tv.get_live_stream_file(unique_id).await? else {
         return Err(ApiError::NotFound("live stream file".into()));
     };
     let start_at = live_stream_start_offset(&file).await;
     Ok(progressive_response(
         file.path.clone(),
         start_at,
-        &format!("file.{container}"),
+        ferrofin_model::net::mime_types::get_mime_type(file_name),
     ))
 }
 
@@ -1955,6 +2000,7 @@ crate::query::query_parameters! {
         "fields" => ',',
     } => [("get", "/LiveTv/Programs/Recommended")];
     IdQuery {} => [("delete", "/LiveTv/TunerHosts"), ("delete", "/LiveTv/ListingProviders")];
+    AddListingProviderQuery {} => [("post", "/LiveTv/ListingProviders")];
     RecordingsQuery {
         "fields" => ',',
         "enableImageTypes" => ',',
@@ -2422,6 +2468,65 @@ mod tests {
         );
     }
 
+    /// A `Static=true` stream of an opened shared live stream reads its buffer
+    /// (upstream's `DirectStreamProvider`) instead of fetching the
+    /// `LiveStreamFiles` URL back over HTTP; a stream since closed is `404`.
+    #[tokio::test]
+    async fn a_static_live_stream_is_read_from_its_buffer() {
+        use crate::handlers::streaming::{StaticSource, serve_static_source};
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("buffer.ts");
+        tokio::fs::write(&path, vec![0x47_u8; 188])
+            .await
+            .expect("write buffer");
+        let state = fake_state().with_live_tv(std::sync::Arc::new(FakeLiveTv {
+            live_stream: Some((
+                "uid-1".to_owned(),
+                ferrofin_traits::stubs::LiveStreamFile {
+                    path,
+                    opened_at: Utc::now(),
+                },
+            )),
+            ..FakeLiveTv::default()
+        }));
+        // Nothing listens on port 9: going over HTTP could not succeed.
+        let source = |unique_id: &str| StaticSource {
+            path: format!("http://127.0.0.1:9/LiveTv/LiveStreamFiles/{unique_id}/stream.ts"),
+            protocol: ferrofin_model::media_info::MediaProtocol::Http,
+            video_type: None,
+            is_live_stream: true,
+            is_infinite_stream: false,
+            user_agent: None,
+        };
+
+        let response = serve_static_source(
+            &state,
+            source("uid-1"),
+            None,
+            axum::extract::Request::new(Body::empty()),
+        )
+        .await
+        .expect("stream");
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("video/mp2t")
+        );
+        assert_eq!(first_chunk(response).await, vec![0x47_u8; 188]);
+
+        let closed = serve_static_source(
+            &state,
+            source("uid-2"),
+            None,
+            axum::extract::Request::new(Body::empty()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(closed.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn manager_backed_ops_501_without_manager() {
         let state = fake_state();
@@ -2523,6 +2628,8 @@ mod tests {
         async fn save_listing_provider(
             &self,
             info: ListingsProviderInfo,
+            _validate_login: bool,
+            _validate_listings: bool,
         ) -> Result<ListingsProviderInfo, ferrofin_traits::error::ServiceError> {
             let mut g = self.providers.lock().unwrap();
             *g = vec![info.clone()];
@@ -2640,7 +2747,7 @@ mod tests {
             &self,
             _id: &str,
         ) -> Result<(), ferrofin_traits::error::ServiceError> {
-            unimplemented!()
+            Ok(())
         }
         async fn delete_listing_provider(
             &self,
@@ -2839,6 +2946,7 @@ mod tests {
             add_listing_provider(
                 State(state),
                 admin_auth(),
+                Query(AddListingProviderQuery::default()),
                 JsonBody(ListingsProviderInfo {
                     id: Some("prov1".to_owned()),
                     ..ListingsProviderInfo::default()
@@ -2861,6 +2969,43 @@ mod tests {
             fake.refreshes.load(std::sync::atomic::Ordering::SeqCst),
             1,
             "exactly one refresh per configuration write"
+        );
+    }
+
+    /// `TunerHostManager.DeleteTunerHost` queues the guide refresh whose
+    /// `CleanDatabase` removes the host's channel and programme items, and the
+    /// DELETE answers `204` without waiting for it.
+    #[tokio::test]
+    async fn deleting_a_tuner_host_queues_the_guide_refresh() {
+        let fake = std::sync::Arc::new(FakeLiveTv {
+            hang_refresh: true,
+            ..FakeLiveTv::default()
+        });
+        let state = fake_state().with_live_tv(fake.clone());
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            delete_tuner_host(
+                State(state),
+                admin_auth(),
+                Query(IdQuery {
+                    id: "tuner1".to_owned(),
+                }),
+            ),
+        )
+        .await
+        .expect("the handler must not block on the guide refresh")
+        .expect("delete");
+        assert_eq!(status, axum::http::StatusCode::NO_CONTENT);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fake.refresh_started.notified(),
+        )
+        .await
+        .expect("the delete must queue a guide refresh");
+        assert_eq!(
+            fake.refreshes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one refresh per delete"
         );
     }
 

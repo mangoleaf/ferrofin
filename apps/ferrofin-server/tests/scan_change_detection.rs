@@ -94,14 +94,16 @@ use std::time::{Duration, Instant};
 use ferrofin_server::config::{Config, ProviderEndpoints};
 use serde_json::{Value, json};
 
+#[path = "support/boot.rs"]
+mod boot;
+
+use boot::STARTUP_DEADLINE;
+
 const CLIENT: &str =
     r#"MediaBrowser Client="scan-matrix", Device="test", DeviceId="scan-matrix", Version="1""#;
 
 /// Ceiling for one HTTP request: a hang guard, not a latency assertion.
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
-
-/// How long the server gets to bind and boot (debug build, busy machine).
-const STARTUP_DEADLINE: Duration = Duration::from_mins(2);
 
 /// How long a scan may take before the test calls it hung. The scans here
 /// cover a dozen files; this is a hang guard, not a latency assertion.
@@ -242,9 +244,16 @@ impl Providers {
 fn subtitle_answer(target: &str, addr: std::net::SocketAddr) -> Option<String> {
     let path = target.split('?').next()?;
     Some(match path {
-        "/opensubtitles/login" => json!({"token":"test-token"}).to_string(),
+        // A JWT expiring in 2100 (`{"exp":4102444800}`): downloads reuse it.
+        "/opensubtitles/login" => {
+            json!({"token":"eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjQxMDI0NDQ4MDB9.c2ln"}).to_string()
+        }
+        "/opensubtitles/infos/user" => json!({"data":{
+            "allowed_downloads":20,"remaining_downloads":20,"reset_time_utc":"2100-01-01T00:00:00Z"
+        }})
+        .to_string(),
         "/opensubtitles/download" => {
-            json!({"link":format!("http://{addr}/subtitle-file")}).to_string()
+            json!({"link":format!("http://{addr}/subtitle-file"),"remaining":19}).to_string()
         }
         "/opensubtitles/subtitles" => {
             assert!(target.contains("moviehash="));
@@ -429,12 +438,12 @@ fn answer(target: &str) -> Option<String> {
     }
     if path == "/audiodb/album-mb.php" {
         return Some(
-            r#"{"album":[{"strDescriptionEN":"Album text.","strGenre":"Jazz"}]}"#.to_owned(),
+            r#"{"album":[{"strDescription":"Album text.","strGenre":"Jazz"}]}"#.to_owned(),
         );
     }
     if path == "/audiodb/artist-mb.php" {
         return Some(
-            r#"{"artists":[{"strBiographyEN":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned(),
+            r#"{"artists":[{"strBiography":"Artist bio.","strGenre":"Jazz"}]}"#.to_owned(),
         );
     }
     None
@@ -1050,15 +1059,6 @@ const REQUEST_TABLES: [&str; 3] = ["ActivityLogs", "Devices", "Users"];
 // the server
 // ---------------------------------------------------------------------------
 
-/// A port nobody is listening on right now (a probe, not a reservation).
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral")
-        .local_addr()
-        .expect("local addr")
-        .port()
-}
-
 /// What one row observed between [`Harness::mark`] and [`Harness::settle`].
 #[derive(Debug, Default)]
 struct Seen {
@@ -1212,7 +1212,7 @@ impl Harness {
             admin_password: String::new(),
             ..Config::test_stub(temp.path())
         };
-        let (server, base, config) = Self::spawn(&client, make_config).await;
+        let (server, base, config) = boot::spawn_server(&client, make_config).await;
         let token = Self::login(&client, &base).await;
         let writes = Writes::install(&config.database_url(), &media.root).await;
         let mut harness = Self {
@@ -1230,52 +1230,6 @@ impl Harness {
         };
         harness.configure().await;
         harness
-    }
-
-    /// Starts [`ferrofin_server::run`] on a free port (another if a
-    /// concurrent test took it first) and waits until it answers.
-    async fn spawn(
-        client: &reqwest::Client,
-        make_config: impl Fn(u16) -> Config,
-    ) -> (std::thread::JoinHandle<anyhow::Result<()>>, String, Config) {
-        for _ in 0..5 {
-            let config = make_config(free_port());
-            let base = format!("http://127.0.0.1:{}", config.port);
-            let run_config = config.clone();
-            // `run`'s future is not `Send` enough for `tokio::spawn`; the
-            // binary drives it from `main`, so give it its own runtime too.
-            let server = std::thread::spawn(move || {
-                tokio::runtime::Runtime::new()
-                    .expect("server runtime")
-                    .block_on(ferrofin_server::run(run_config))
-            });
-            let deadline = Instant::now() + STARTUP_DEADLINE;
-            while Instant::now() < deadline {
-                let name = async {
-                    let info: Value = client
-                        .get(format!("{base}/System/Info/Public"))
-                        .send()
-                        .await
-                        .ok()?
-                        .json()
-                        .await
-                        .ok()?;
-                    info["ServerName"].as_str().map(str::to_owned)
-                };
-                if name.await.as_deref() == Some(config.server_name.as_str()) {
-                    return (server, base, config);
-                }
-                if server.is_finished() {
-                    break;
-                }
-                tokio::time::sleep(POLL).await;
-            }
-            assert!(
-                server.is_finished(),
-                "server never became reachable on {base}"
-            );
-        }
-        panic!("no free port survived long enough to bind");
     }
 
     async fn login(client: &reqwest::Client, base: &str) -> String {
@@ -2712,12 +2666,21 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "Default", false).await;
     let first = h.settle(mark, &[("api", 1.0)]).await;
+    let subtitles = of(&first.requests, "opensubtitles");
     assert_eq!(
-        of(&first.requests, "opensubtitles").len(),
-        3,
-        "search + login + download: {:?}",
+        subtitles.len(),
+        4,
+        "search + login + quota + download: {:?}",
         first.requests
     );
+    for path in ["/login", "/infos/user", "/download"] {
+        assert!(
+            subtitles
+                .iter()
+                .any(|r| r.contains(&format!("/opensubtitles{path}"))),
+            "{path} in {subtitles:?}"
+        );
+    }
     assert!(first.requests.iter().any(|r| r.contains("languages=en")));
     assert!(!first.requests.iter().any(|r| r.contains("languages=fr")));
     let english = movie.with_extension("eng.srt");
@@ -2754,7 +2717,25 @@ async fn subtitles_are_downloaded_during_scan(h: &Harness) {
     let mark = h.mark().await;
     h.refresh(library, "Default", false).await;
     let repaired = h.settle(mark, &[("api", 1.0)]).await;
-    assert_eq!(of(&repaired.requests, "opensubtitles").len(), 3);
+    let subtitles = of(&repaired.requests, "opensubtitles");
+    assert_eq!(
+        subtitles.len(),
+        2,
+        "search + download, on the first download's login: {:?}",
+        repaired.requests
+    );
+    assert!(
+        subtitles
+            .iter()
+            .any(|r| r.contains("/opensubtitles/download")),
+        "{subtitles:?}"
+    );
+    assert!(
+        !subtitles
+            .iter()
+            .any(|r| r.contains("/opensubtitles/login") || r.contains("/opensubtitles/infos/user")),
+        "the first download's login is reused: {subtitles:?}"
+    );
     assert_eq!(std::fs::read(&english).unwrap(), content);
 
     options["DisabledSubtitleFetchers"] = json!(["opensubtitles"]);

@@ -513,6 +513,15 @@ fn media_source(path: &str) -> MediaSourceInfo {
     }
 }
 
+/// An opened live stream, as Live TV hands it back: HTTP, with its id.
+fn live_source(path: &str) -> MediaSourceInfo {
+    MediaSourceInfo {
+        live_stream_id: Some("live-1".to_owned()),
+        protocol: ferrofin_model::media_info::MediaProtocol::Http,
+        ..media_source(path)
+    }
+}
+
 #[async_trait]
 impl MediaSourceManager for OkMediaSources {
     async fn get_media_streams(
@@ -549,10 +558,10 @@ impl MediaSourceManager for OkMediaSources {
         request: &ferrofin_model::media_info::LiveStreamRequest,
     ) -> Result<MediaSourceInfo, ServiceError> {
         *self.opened.lock().expect("lock") = Some(request.clone());
-        Ok(media_source(&self.path))
+        Ok(live_source(&self.path))
     }
     async fn get_live_stream(&self, _id: &str) -> Result<MediaSourceInfo, ServiceError> {
-        unimplemented!()
+        Ok(live_source(&self.path))
     }
     async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
         unimplemented!()
@@ -586,7 +595,7 @@ impl SessionManager for OkSessions {
         _device_id: &str,
         _device_name: &str,
         _remote_endpoint: &str,
-        _user: &UserEntity,
+        _user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         unimplemented!()
     }
@@ -800,6 +809,46 @@ fn ok_state_with_auth(
     auth_context: Arc<dyn AuthorizationContext>,
     auth_service: Arc<dyn AuthService>,
 ) -> AppState {
+    ok_state_parts(
+        item_id,
+        media_sources,
+        users,
+        auth_context,
+        auth_service,
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    )
+}
+
+/// [`ok_state_with_auth`] with any media-source and device manager.
+fn ok_state_parts(
+    item_id: Uuid,
+    media_sources: Arc<dyn MediaSourceManager>,
+    users: Arc<dyn ferrofin_traits::library::UserManager>,
+    auth_context: Arc<dyn AuthorizationContext>,
+    auth_service: Arc<dyn AuthService>,
+    devices: Arc<dyn ferrofin_traits::devices::DeviceManager>,
+) -> AppState {
+    ok_state_parts_with_config(
+        item_id,
+        media_sources,
+        users,
+        auth_context,
+        auth_service,
+        devices,
+        Arc::new(FakeConfig),
+    )
+}
+
+/// [`ok_state_parts`] with any server configuration.
+fn ok_state_parts_with_config(
+    item_id: Uuid,
+    media_sources: Arc<dyn MediaSourceManager>,
+    users: Arc<dyn ferrofin_traits::library::UserManager>,
+    auth_context: Arc<dyn AuthorizationContext>,
+    auth_service: Arc<dyn AuthService>,
+    devices: Arc<dyn ferrofin_traits::devices::DeviceManager>,
+    config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>,
+) -> AppState {
     AppState::new(
         Arc::new(OkLibrary { item_id }),
         users,
@@ -809,7 +858,7 @@ fn ok_state_with_auth(
         Arc::new(OkSessions),
         Arc::new(FakeSystem),
         Arc::new(ferrofin_api::test_support::FakeAppHost),
-        Arc::new(FakeConfig),
+        config,
         Arc::new(FakeProviders),
         Arc::new(FakeMusic),
         Arc::new(FakeSimilarItems),
@@ -825,7 +874,7 @@ fn ok_state_with_auth(
         Arc::new(ferrofin_api::test_support::FakeLyrics),
         Arc::new(ferrofin_api::test_support::FakeMediaSegments),
         Arc::new(ferrofin_api::test_support::FakeTrickplay),
-        Arc::new(ferrofin_api::test_support::FakeDevices),
+        devices,
         Arc::new(ferrofin_api::test_support::FakeClientEventLogger),
         Arc::new(ferrofin_api::test_support::FakeApiKeys),
         Arc::new(ferrofin_api::test_support::FakeLocalization),
@@ -1067,4 +1116,820 @@ async fn open_live_stream_self_as_non_admin_is_allowed() {
             .user_id,
         USER_ID
     );
+}
+
+/// Live TV's shared buffer URL, built on the loopback address for the
+/// server's own readers (its ffmpeg and the DVR)…
+const LOOPBACK_BUFFER: &str = "http://127.0.0.1:8096/LiveTv/LiveStreamFiles/abc/stream.ts";
+/// …and the same URL at the address this request reached the server by
+/// ([`ferrofin_api::test_support::FakeAppHost`]'s smart API URL).
+const PUBLISHED_BUFFER: &str = "http://localhost:8096/LiveTv/LiveStreamFiles/abc/stream.ts";
+
+/// `MediaInfoHelper.OpenMediaSource` → `RewritePublishedLiveStreamPath`
+/// (v12.2): the opened stream's response copy points its buffer URL at the
+/// request's smart API URL, not at the client's own loopback.
+#[tokio::test]
+async fn open_live_stream_publishes_the_buffer_url_at_the_request_url() {
+    let app = ok_state(Uuid::from_u128(0x0177), LOOPBACK_BUFFER);
+    let response = create_router(app)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/LiveStreams/Open?userId={USER_ID}"))
+                .header("Authorization", "Bearer t")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"OpenToken":"tok"}"#))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["MediaSource"]["Path"],
+        PUBLISHED_BUFFER
+    );
+}
+
+/// `MediaInfoHelper.GetPlaybackInfo` rewrites the cloned sources the same
+/// way: an already-open live stream named by `liveStreamId` is published at
+/// the request's URL.
+#[tokio::test]
+async fn playback_info_publishes_an_open_live_stream_buffer_url() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let response = create_router(ok_state(item_id, LOOPBACK_BUFFER))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{item_id}/PlaybackInfo?liveStreamId=live-1"))
+                .header("X-Emby-Token", "valid")
+                .header("Content-Type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert_eq!(json["MediaSources"][0]["LiveStreamId"], "live-1");
+    assert_eq!(json["MediaSources"][0]["Path"], PUBLISHED_BUFFER);
+}
+
+/// A [`MediaSourceManager`] serving a fixed set of versions and any open live
+/// stream by id, and recording what `open_live_stream` was asked to open.
+struct VersionedSources {
+    sources: Vec<MediaSourceInfo>,
+    opened: Mutex<Option<ferrofin_model::media_info::LiveStreamRequest>>,
+    /// The source an open hands back, when a test needs a real one.
+    open_as: Option<MediaSourceInfo>,
+}
+
+#[async_trait]
+impl MediaSourceManager for VersionedSources {
+    async fn get_media_streams(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::entities_media::MediaStream>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_media_attachments(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::entities_media::MediaAttachment>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_playback_media_sources(
+        &self,
+        _item_id: Uuid,
+        _user_id: Uuid,
+        _allow_media_probe: bool,
+        _enable_path_substitution: bool,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        Ok(self.sources.clone())
+    }
+    async fn get_static_media_sources(
+        &self,
+        _item_id: Uuid,
+        _enable_path_substitution: bool,
+        _user_id: Option<Uuid>,
+    ) -> Result<Vec<MediaSourceInfo>, ServiceError> {
+        Ok(self.sources.clone())
+    }
+    async fn open_live_stream(
+        &self,
+        request: &ferrofin_model::media_info::LiveStreamRequest,
+    ) -> Result<MediaSourceInfo, ServiceError> {
+        *self.opened.lock().expect("lock") = Some(request.clone());
+        if let Some(source) = &self.open_as {
+            return Ok(source.clone());
+        }
+        Ok(MediaSourceInfo {
+            id: Some("opened".to_owned()),
+            live_stream_id: Some("live-1".to_owned()),
+            protocol: ferrofin_model::media_info::MediaProtocol::Http,
+            path: Some(LOOPBACK_BUFFER.to_owned()),
+            ..MediaSourceInfo::default()
+        })
+    }
+    async fn get_live_stream(&self, id: &str) -> Result<MediaSourceInfo, ServiceError> {
+        Ok(MediaSourceInfo {
+            id: Some(format!("open-{id}")),
+            live_stream_id: Some(id.to_owned()),
+            ..MediaSourceInfo::default()
+        })
+    }
+    async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+}
+
+/// An h264 mp4 version with two `audio` tracks (1, 2) and a text subtitle (3).
+fn version(id: &str, audio: &str) -> MediaSourceInfo {
+    use ferrofin_model::entities::MediaStreamType;
+    use ferrofin_model::entities_media::MediaStream;
+    let stream = |stream_type, index, codec: &str| MediaStream {
+        stream_type,
+        index,
+        codec: Some(codec.to_owned()),
+        ..MediaStream::default()
+    };
+    MediaSourceInfo {
+        id: Some(id.to_owned()),
+        path: Some(format!("/media/{id}.mp4")),
+        container: Some("mp4".to_owned()),
+        bitrate: Some(8_000_000),
+        supports_direct_play: true,
+        supports_direct_stream: true,
+        supports_transcoding: true,
+        default_audio_stream_index: Some(1),
+        media_streams: vec![
+            stream(MediaStreamType::Video, 0, "h264"),
+            stream(MediaStreamType::Audio, 1, audio),
+            stream(MediaStreamType::Audio, 2, audio),
+            stream(MediaStreamType::Subtitle, 3, "subrip"),
+        ],
+        ..MediaSourceInfo::default()
+    }
+}
+
+/// A browser-like profile: direct-plays h264/aac mp4, transcodes to HLS ts.
+fn web_profile() -> serde_json::Value {
+    serde_json::json!({
+        "DirectPlayProfiles": [
+            {"Container": "mp4", "VideoCodec": "h264", "AudioCodec": "aac", "Type": "Video"}
+        ],
+        "TranscodingProfiles": [
+            {"Container": "ts", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac",
+             "Protocol": "hls", "Context": "Streaming"}
+        ],
+        "SubtitleProfiles": [{"Format": "vtt", "Method": "External"}]
+    })
+}
+
+fn versioned(sources: Vec<MediaSourceInfo>) -> Arc<VersionedSources> {
+    Arc::new(VersionedSources {
+        sources,
+        opened: Mutex::new(None),
+        open_as: None,
+    })
+}
+
+/// [`versioned`] whose opens hand back `open_as`.
+fn versioned_opening(
+    sources: Vec<MediaSourceInfo>,
+    open_as: MediaSourceInfo,
+) -> Arc<VersionedSources> {
+    Arc::new(VersionedSources {
+        sources,
+        opened: Mutex::new(None),
+        open_as: Some(open_as),
+    })
+}
+
+/// An opened live stream with tracks: [`version`] `opened` (h264 video,
+/// `audio` tracks) carrying a live-stream id.
+fn opened_live(audio: &str) -> MediaSourceInfo {
+    MediaSourceInfo {
+        live_stream_id: Some("live-1".to_owned()),
+        ..version("opened", audio)
+    }
+}
+
+/// POSTs `body` to `/LiveStreams/Open` as [`USER_ID`] with `state`.
+async fn open_response(state: AppState, body: &serde_json::Value) -> axum::response::Response {
+    create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/LiveStreams/Open?userId={USER_ID}"))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// [`open_response`], expecting `200 OK`, as JSON.
+async fn post_open(state: AppState, body: &serde_json::Value) -> serde_json::Value {
+    let response = open_response(state, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
+}
+
+/// POSTs `body` (or no body) to the item's PlaybackInfo with `state`.
+async fn post_playback(
+    state: AppState,
+    item_id: Uuid,
+    body: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/Items/{item_id}/PlaybackInfo"))
+        .header("X-Emby-Token", "valid");
+    let request = match body {
+        Some(body) => request
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string())),
+        None => request.body(Body::empty()),
+    };
+    let response = create_router(state)
+        .oneshot(request.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
+}
+
+/// An [`AppState`] over `sources` and `devices`.
+fn versions_state(
+    item_id: Uuid,
+    sources: Arc<VersionedSources>,
+    devices: Arc<dyn ferrofin_traits::devices::DeviceManager>,
+) -> AppState {
+    ok_state_parts(
+        item_id,
+        sources,
+        Arc::new(OkUsers),
+        Arc::new(OkAuthContext),
+        Arc::new(OkAuthService),
+        devices,
+    )
+}
+
+/// POSTs `body` to the item's PlaybackInfo against `sources`.
+async fn post_versions(
+    item_id: Uuid,
+    sources: Arc<VersionedSources>,
+    body: &serde_json::Value,
+) -> serde_json::Value {
+    let state = versions_state(
+        item_id,
+        sources,
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    post_playback(state, item_id, Some(body)).await
+}
+
+#[tokio::test]
+async fn posted_media_source_id_returns_only_that_version_with_the_picked_tracks() {
+    // jellyfin-web's version picker posts the alternate's id with the tracks
+    // chosen on the details page; upstream ResolvePlaybackMediaSources returns
+    // that version alone, so the client cannot fall back to the primary.
+    let item_id = Uuid::from_u128(0xABCD);
+    let primary = item_id.simple().to_string();
+    let json = post_versions(
+        item_id,
+        versioned(vec![version(&primary, "aac"), version("alt", "aac")]),
+        &serde_json::json!({
+            "DeviceProfile": web_profile(),
+            "MediaSourceId": "ALT",
+            "AudioStreamIndex": 2,
+            "SubtitleStreamIndex": -1,
+        }),
+    )
+    .await;
+    let sources = json["MediaSources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 1, "{json}");
+    assert_eq!(sources[0]["Id"], "alt");
+    assert_eq!(sources[0]["DefaultAudioStreamIndex"], 2);
+    // "Off" stays off rather than falling back to the default subtitle.
+    assert_eq!(sources[0]["DefaultSubtitleStreamIndex"], -1);
+}
+
+/// gl-125: a posted profile condition upstream's `ConditionProcessor` cannot
+/// evaluate throws, and `ExceptionMiddleware` answers the exception: a
+/// property the stream kind has none of is an `ArgumentException` (400), a
+/// comparison the value's type has none of an `InvalidOperationException`
+/// (500). Ferrofin used to panic on both.
+#[rstest::rstest]
+#[case::property_an_audio_track_lacks(
+    "VideoAudio",
+    "aac",
+    "Width",
+    "Equals",
+    "1",
+    StatusCode::BAD_REQUEST
+)]
+#[case::comparison_a_string_lacks(
+    "Video",
+    "h264",
+    "VideoProfile",
+    "LessThanEqual",
+    "high",
+    StatusCode::INTERNAL_SERVER_ERROR
+)]
+#[tokio::test]
+async fn an_unevaluable_profile_condition_is_answered_as_upstream_does(
+    #[case] codec_type: &str,
+    #[case] codec: &str,
+    #[case] property: &str,
+    #[case] condition: &str,
+    #[case] value: &str,
+    #[case] expected: StatusCode,
+) {
+    let item_id = Uuid::from_u128(0xABCD);
+    let mut source = version(&item_id.simple().to_string(), "aac");
+    source.media_streams[0].profile = Some("High".to_owned());
+    let mut profile = web_profile();
+    profile["CodecProfiles"] = serde_json::json!([{
+        "Type": codec_type,
+        "Codec": codec,
+        "Conditions": [{"Condition": condition, "Property": property, "Value": value, "IsRequired": false}]
+    }]);
+    let state = versions_state(
+        item_id,
+        versioned(vec![source]),
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Items/{item_id}/PlaybackInfo"))
+                .header("X-Emby-Token", "valid")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"DeviceProfile": profile}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), expected);
+}
+
+#[tokio::test]
+async fn track_picks_without_a_media_source_id_apply_to_no_version() {
+    // SetDeviceSpecificData applies the picks only to the version whose id
+    // matches; with none named every version keeps its default track.
+    let item_id = Uuid::from_u128(0xABCD);
+    let primary = item_id.simple().to_string();
+    let json = post_versions(
+        item_id,
+        versioned(vec![version("alt", "aac"), version(&primary, "aac")]),
+        &serde_json::json!({"DeviceProfile": web_profile(), "AudioStreamIndex": 2}),
+    )
+    .await;
+    let sources = json["MediaSources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 2);
+    // SortMediaSources puts the queried item's own version first.
+    assert_eq!(sources[0]["Id"], primary.as_str());
+    assert!(
+        sources.iter().all(|s| s["DefaultAudioStreamIndex"] == 1),
+        "{json}"
+    );
+}
+
+#[tokio::test]
+async fn unknown_media_source_id_reports_no_compatible_stream() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let json = post_versions(
+        item_id,
+        versioned(vec![version("alt", "aac")]),
+        &serde_json::json!({"MediaSourceId": "missing"}),
+    )
+    .await;
+    assert_eq!(json["MediaSources"], serde_json::json!([]));
+    assert_eq!(json["ErrorCode"], "NoCompatibleStream");
+    assert!(json.get("PlaySessionId").is_none(), "{json}");
+}
+
+#[tokio::test]
+async fn live_stream_id_plays_the_open_stream() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let json = post_versions(
+        item_id,
+        versioned(vec![version("alt", "aac")]),
+        &serde_json::json!({"LiveStreamId": "live-7"}),
+    )
+    .await;
+    assert_eq!(json["MediaSources"].as_array().map(Vec::len), Some(1));
+    assert_eq!(json["MediaSources"][0]["Id"], "open-live-7");
+}
+
+#[tokio::test]
+async fn auto_open_live_stream_opens_a_source_that_requires_opening() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let channel = MediaSourceInfo {
+        id: Some("channel".to_owned()),
+        requires_opening: true,
+        open_token: Some("tok".to_owned()),
+        ..MediaSourceInfo::default()
+    };
+    let sources = versioned(vec![channel]);
+    let json = post_versions(
+        item_id,
+        Arc::clone(&sources),
+        &serde_json::json!({"AutoOpenLiveStream": true, "StartTimeTicks": 5, "MaxAudioChannels": 2}),
+    )
+    .await;
+    assert_eq!(json["MediaSources"][0]["Id"], "opened");
+    // Published as `POST /LiveStreams/Open` publishes it (`OpenMediaSource`).
+    assert_eq!(json["MediaSources"][0]["Path"], PUBLISHED_BUFFER);
+    let opened = sources
+        .opened
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("opened");
+    assert_eq!(opened.open_token.as_deref(), Some("tok"));
+    assert_eq!(opened.user_id, USER_ID);
+    assert_eq!(opened.item_id, item_id);
+    assert_eq!(opened.start_time_ticks, Some(5));
+    assert_eq!(opened.max_audio_channels, Some(2));
+    assert_eq!(
+        opened.play_session_id.as_deref(),
+        json["PlaySessionId"].as_str()
+    );
+}
+
+/// A [`DeviceManager`](ferrofin_traits::devices::DeviceManager) whose stored
+/// capabilities carry the web profile, recording which device was asked for.
+struct ProfileDevices {
+    asked: Mutex<Option<String>>,
+}
+
+#[async_trait]
+impl ferrofin_traits::devices::DeviceManager for ProfileDevices {
+    async fn create_device(
+        &self,
+        _device: &ferrofin_db::entities::security::DeviceEntity,
+    ) -> Result<ferrofin_db::entities::security::DeviceEntity, ServiceError> {
+        unimplemented!()
+    }
+    async fn save_capabilities(
+        &self,
+        _device_id: &str,
+        _capabilities: &ferrofin_model::session::ClientCapabilities,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn get_capabilities(
+        &self,
+        device_id: Option<&str>,
+    ) -> Result<ferrofin_model::session::ClientCapabilities, ServiceError> {
+        *self.asked.lock().expect("lock") = device_id.map(str::to_owned);
+        Ok(ferrofin_model::session::ClientCapabilities {
+            device_profile: Some(serde_json::from_value(web_profile()).expect("profile")),
+            ..ferrofin_model::session::ClientCapabilities::default()
+        })
+    }
+    async fn get_device(
+        &self,
+        _id: &str,
+    ) -> Result<Option<ferrofin_model::dto::DeviceInfoDto>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_devices(
+        &self,
+        _query: &ferrofin_traits::devices::DeviceQuery,
+    ) -> Result<QueryResult<ferrofin_db::entities::security::DeviceEntity>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_device_infos(
+        &self,
+        _query: &ferrofin_traits::devices::DeviceQuery,
+    ) -> Result<QueryResult<ferrofin_model::devices::DeviceInfo>, ServiceError> {
+        unimplemented!()
+    }
+    async fn get_devices_for_user(
+        &self,
+        _user_id: Option<Uuid>,
+    ) -> Result<QueryResult<ferrofin_model::dto::DeviceInfoDto>, ServiceError> {
+        unimplemented!()
+    }
+    async fn delete_device(
+        &self,
+        _device: &ferrofin_db::entities::security::DeviceEntity,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn update_device(
+        &self,
+        _device: &ferrofin_db::entities::security::DeviceEntity,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn can_access_device(
+        &self,
+        _user: &UserEntity,
+        _device_id: &str,
+    ) -> Result<bool, ServiceError> {
+        unimplemented!()
+    }
+    async fn update_device_options(
+        &self,
+        _device_id: &str,
+        _device_name: Option<&str>,
+    ) -> Result<(), ServiceError> {
+        unimplemented!()
+    }
+    async fn get_device_options(
+        &self,
+        _device_id: &str,
+    ) -> Result<Option<ferrofin_db::entities::security::DeviceOptionsEntity>, ServiceError> {
+        unimplemented!()
+    }
+    async fn to_client_capabilities_dto(
+        &self,
+        _capabilities: &ferrofin_model::session::ClientCapabilities,
+    ) -> Result<ferrofin_model::dto::ClientCapabilitiesDto, ServiceError> {
+        unimplemented!()
+    }
+}
+
+#[tokio::test]
+async fn a_post_without_a_profile_negotiates_with_the_stored_capabilities() {
+    // AC3 cannot direct-play under the stored web profile, so a negotiated
+    // response clears SupportsDirectPlay; the static source would keep it.
+    let item_id = Uuid::from_u128(0xABCD);
+    let devices = Arc::new(ProfileDevices {
+        asked: Mutex::new(None),
+    });
+    let state = versions_state(
+        item_id,
+        versioned(vec![version("alt", "ac3")]),
+        Arc::clone(&devices) as Arc<dyn ferrofin_traits::devices::DeviceManager>,
+    );
+    let json = post_playback(state, item_id, None).await;
+    assert_eq!(
+        devices.asked.lock().expect("lock").as_deref(),
+        Some("dev-1")
+    );
+    assert_eq!(
+        json["MediaSources"][0]["SupportsDirectPlay"], false,
+        "{json}"
+    );
+}
+
+/// `MediaInfoHelper.OpenMediaSource` (v12.2): with a posted `DeviceProfile`,
+/// the opened source is negotiated as PlaybackInfo negotiates — here AC3
+/// audio the profile cannot play loses the source its direct play (it kept
+/// `SupportsDirectPlay: true` before; the test user's policy permits no
+/// transcode, so no transcoding URL is built, as in the PlaybackInfo tests).
+#[tokio::test]
+async fn open_live_stream_negotiates_the_opened_source_against_the_posted_profile() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let sources = versioned_opening(vec![version("v1", "aac")], opened_live("ac3"));
+    let state = versions_state(
+        item_id,
+        sources,
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    let json = post_open(
+        state,
+        &serde_json::json!({"OpenToken": "tok", "ItemId": item_id, "DeviceProfile": web_profile()}),
+    )
+    .await;
+    let source = &json["MediaSource"];
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+}
+
+/// Without a profile (none posted, none stored for the device), an opened
+/// source's existing transcoding URL is tagged with its live stream.
+#[tokio::test]
+async fn open_live_stream_without_a_profile_tags_the_transcoding_url_with_its_live_stream() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let opened = MediaSourceInfo {
+        transcoding_url: Some("/videos/x/master.m3u8?MediaSourceId=opened".to_owned()),
+        ..opened_live("aac")
+    };
+    let sources = versioned_opening(vec![version("v1", "aac")], opened);
+    let state = versions_state(
+        item_id,
+        sources,
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    let json = post_open(
+        state,
+        &serde_json::json!({"OpenToken": "tok", "ItemId": item_id}),
+    )
+    .await;
+    assert_eq!(
+        json["MediaSource"]["TranscodingUrl"],
+        "/videos/x/master.m3u8?MediaSourceId=opened&LiveStreamId=live-1"
+    );
+}
+
+/// PlaybackInfo's `AutoOpenLiveStream` opens through the same
+/// `OpenMediaSource`, so the opened source is negotiated against the
+/// posted profile too.
+#[tokio::test]
+async fn auto_open_negotiates_the_opened_source_against_the_posted_profile() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let channel = MediaSourceInfo {
+        id: Some("channel".to_owned()),
+        requires_opening: true,
+        open_token: Some("tok".to_owned()),
+        ..MediaSourceInfo::default()
+    };
+    let sources = versioned_opening(vec![channel], opened_live("ac3"));
+    let json = post_versions(
+        item_id,
+        sources,
+        &serde_json::json!({"AutoOpenLiveStream": true, "DeviceProfile": web_profile()}),
+    )
+    .await;
+    let source = &json["MediaSources"][0];
+    assert_eq!(source["Id"], "opened");
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+}
+
+/// With no profile posted, `OpenMediaSource` negotiates against the profile the
+/// device last reported, and narrows the opened source's container list to the
+/// one that profile plays (`NormalizeMediaSourceContainer`).
+#[tokio::test]
+async fn open_live_stream_negotiates_against_the_stored_profile_and_normalizes_the_container() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let devices = Arc::new(ProfileDevices {
+        asked: Mutex::new(None),
+    });
+    let opened = MediaSourceInfo {
+        container: Some("mov,mp4,m4a".to_owned()),
+        ..opened_live("ac3")
+    };
+    let state = versions_state(
+        item_id,
+        versioned_opening(vec![version("v1", "aac")], opened),
+        Arc::clone(&devices) as Arc<dyn ferrofin_traits::devices::DeviceManager>,
+    );
+    let json = post_open(
+        state,
+        &serde_json::json!({"OpenToken": "tok", "ItemId": item_id}),
+    )
+    .await;
+    assert_eq!(
+        devices.asked.lock().expect("lock").as_deref(),
+        Some("dev-1")
+    );
+    let source = &json["MediaSource"];
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+    assert_eq!(source["Container"], "mp4", "{source}");
+}
+
+/// Negotiating needs the item: an unknown `ItemId` with a profile is a 404
+/// (upstream's `ResourceNotFoundException`).
+#[tokio::test]
+async fn open_live_stream_with_a_profile_for_an_unknown_item_is_not_found() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let state = versions_state(
+        item_id,
+        versioned_opening(vec![version("v1", "aac")], opened_live("ac3")),
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    );
+    let response = open_response(
+        state,
+        &serde_json::json!({
+            "OpenToken": "tok",
+            "ItemId": Uuid::from_u128(0xDEAD),
+            "DeviceProfile": web_profile()
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// [`FakeConfig`] whose encoding options set `EnableSubtitleExtraction`.
+struct ExtractionConfig(bool);
+
+#[async_trait]
+impl ferrofin_traits::configuration::ServerConfigurationManager for ExtractionConfig {
+    fn application_paths(&self) -> Arc<dyn ferrofin_traits::system::ServerApplicationPaths> {
+        ferrofin_traits::configuration::ServerConfigurationManager::application_paths(&FakeConfig)
+    }
+    async fn configuration(
+        &self,
+    ) -> Result<Arc<ferrofin_model::configuration::ServerConfiguration>, ServiceError> {
+        FakeConfig.configuration().await
+    }
+    async fn update_configuration(
+        &self,
+        _configuration: &ferrofin_model::configuration::ServerConfiguration,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_branding(
+        &self,
+    ) -> Result<ferrofin_model::branding::BrandingOptions, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_branding(
+        &self,
+        _branding: &ferrofin_model::branding::BrandingOptions,
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_encoding_options(
+        &self,
+    ) -> Result<ferrofin_model::configuration::EncodingOptions, ServiceError> {
+        Ok(ferrofin_model::configuration::EncodingOptions {
+            enable_subtitle_extraction: self.0,
+            ..ferrofin_model::configuration::EncodingOptions::default()
+        })
+    }
+}
+
+/// The authenticated user, with a policy that allows every transcode.
+struct TranscodingAuth;
+
+impl TranscodingAuth {
+    fn info() -> AuthorizationInfo {
+        AuthorizationInfo {
+            user: Some(user_entity(USER_ID, "alice")),
+            user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                enable_audio_playback_transcoding: true,
+                enable_video_playback_transcoding: true,
+                enable_playback_remuxing: true,
+                ..ferrofin_model::users::UserPolicy::default()
+            })),
+            device_id: Some("dev-1".to_owned()),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        }
+    }
+}
+
+#[async_trait]
+impl AuthService for TranscodingAuth {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for TranscodingAuth {
+    async fn get_authorization_info(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::info())
+    }
+}
+
+/// `MediaEncoder.CanExtractSubtitles` answers `EnableSubtitleExtraction`
+/// (jellyfin/jellyfin#16380): during a transcode, an embedded text
+/// subtitle is delivered External to a profile that takes it while the
+/// setting is on, and burned in (Encode) while it is off.
+#[tokio::test]
+async fn the_subtitle_extraction_setting_decides_external_delivery_in_a_transcode() {
+    for (extraction, expected) in [(true, "External"), (false, "Encode")] {
+        let item_id = Uuid::from_u128(0x5AB);
+        let primary = item_id.simple().to_string();
+        // dts audio the profile cannot play: the source is transcoded. Its
+        // embedded subrip can be served on its own, as a probe reports it.
+        let mut source = version(&primary, "dts");
+        source.media_streams[3].supports_external_stream = true;
+        let state = ok_state_parts_with_config(
+            item_id,
+            versioned(vec![source]),
+            Arc::new(OkUsers),
+            Arc::new(TranscodingAuth),
+            Arc::new(TranscodingAuth),
+            Arc::new(ferrofin_api::test_support::FakeDevices),
+            Arc::new(ExtractionConfig(extraction)),
+        )
+        .with_encoder_support(Arc::new(ferrofin_api::test_support::CommonEncoders));
+        let body = serde_json::json!({
+            "DeviceProfile": web_profile(),
+            "MediaSourceId": primary,
+            "SubtitleStreamIndex": 3,
+        });
+        let json = post_playback(state, item_id, Some(&body)).await;
+        let source = &json["MediaSources"][0];
+        assert!(source["TranscodingUrl"].is_string(), "transcoded: {json}");
+        let subtitle = source["MediaStreams"]
+            .as_array()
+            .expect("streams")
+            .iter()
+            .find(|stream| stream["Index"] == 3)
+            .expect("the subtitle stream");
+        assert_eq!(
+            subtitle["DeliveryMethod"], expected,
+            "extraction {extraction}: {subtitle}"
+        );
+    }
 }

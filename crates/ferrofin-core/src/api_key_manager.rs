@@ -129,6 +129,10 @@ mod tests {
         assert_eq!(key.device_id.as_deref(), Some(""));
         assert_eq!(key.device_name.as_deref(), Some(""));
         assert_eq!(key.app_version.as_deref(), Some(""));
+        // The projection never assigns `DateLastActivity`: .NET's
+        // `default(DateTime)`, written `0001-01-01T00:00:00.0000000Z`.
+        let json = serde_json::to_value(key).expect("json");
+        assert_eq!(json["DateLastActivity"], "0001-01-01T00:00:00.0000000Z");
     }
 
     #[tokio::test]

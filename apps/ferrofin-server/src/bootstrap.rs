@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context as _;
 use ferrofin_db::Database;
@@ -22,13 +22,15 @@ use ferrofin_mediaencoding::{
 };
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_otlp::WithExportConfig as _;
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+use opentelemetry_otlp::{ExporterBuildError, WithExportConfig as _, WithTonicConfig as _};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
+use crate::log_lines::RecordLines;
 
 /// The OTLP tracer provider, kept alive for its background batch exporter and so
 /// [`shutdown_tracing`] can flush it on graceful shutdown. `None` (unset) unless
@@ -174,15 +176,14 @@ pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
         std::env::var("FERROFIN_LOG_FORMAT").is_ok_and(|v| v.eq_ignore_ascii_case("text"));
     let mut layers = build_fmt_layers(text_mode, file_writer);
 
-    // Compose the OTLP layer in only when export is configured; `None` is a no-op
-    // (`Option<Layer>` implements `Layer`), so tracing stays local-only otherwise.
-    if let Some(otel_layer) = build_tracer_provider().map(|provider| {
+    // Compose the OTLP layer in only when export is configured and its exporter
+    // built, so tracing stays local-only otherwise.
+    let otlp = build_tracer_provider();
+    if let Some(Ok(provider)) = otlp.as_ref().map(|export| &export.provider) {
         let tracer = provider.tracer("ferrofin");
         // Stash the provider so `shutdown_tracing` can flush the batch queue.
-        let _ = TRACER_PROVIDER.set(provider);
-        tracing_opentelemetry::layer().with_tracer(tracer)
-    }) {
-        layers.push(otel_layer.boxed());
+        let _ = TRACER_PROVIDER.set(provider.clone());
+        layers.push(tracing_opentelemetry::layer().with_tracer(tracer).boxed());
     }
 
     // `try_init` returns Err if a subscriber is already set (e.g. in tests); that
@@ -192,6 +193,9 @@ pub fn init_tracing(config: &Config) -> Option<WorkerGuard> {
         .with(layers)
         .with(filter)
         .try_init();
+    if let Some(export) = &otlp {
+        export.log();
+    }
 
     guard
 }
@@ -204,7 +208,8 @@ type BoxedLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry
 /// Default (`text_mode = false`): JSON to stdout + plain text to the file. Text
 /// mode: a single human-readable layer tee'd to stdout + file. The file sink is
 /// always plain text (dashboard parity); when no file writer exists, only stdout
-/// is written.
+/// is written. Every text sink writes through [`RecordLines`], so a line break
+/// inside a logged value cannot forge a record of its own.
 fn build_fmt_layers(
     text_mode: bool,
     file_writer: Option<tracing_appender::non_blocking::NonBlocking>,
@@ -220,7 +225,7 @@ fn build_fmt_layers(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
                 .with_ansi(false)
-                .with_writer(std::io::stdout.and(writer))
+                .with_writer(RecordLines(std::io::stdout.and(writer)))
                 .boxed(),
         ),
         // Legacy fallback when the log dir can't be prepared: stdout-only text,
@@ -228,7 +233,7 @@ fn build_fmt_layers(
         (true, None) => layers.push(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
-                .with_writer(std::io::stdout)
+                .with_writer(RecordLines(std::io::stdout))
                 .boxed(),
         ),
         // Default: JSON to stdout (structured, `trace_id`-carrying) + plain text
@@ -245,7 +250,7 @@ fn build_fmt_layers(
                 tracing_subscriber::fmt::layer()
                     .with_target(true)
                     .with_ansi(false)
-                    .with_writer(writer)
+                    .with_writer(RecordLines(writer))
                     .boxed(),
             );
         }
@@ -300,29 +305,97 @@ fn install_panic_hook() {
     });
 }
 
+/// The OTLP trace export the environment asks for, built but not yet logged.
+struct OtlpExport {
+    endpoint: String,
+    ratio: f64,
+    /// The tracer provider, or why the exporter could not be built.
+    provider: Result<SdkTracerProvider, ExporterBuildError>,
+}
+
+impl OtlpExport {
+    /// Logs whether spans are exported. `init_tracing` calls it once the
+    /// subscriber is installed: a line logged while it is still being built
+    /// reaches no sink, which left a failed exporter without a word.
+    fn log(&self) {
+        let endpoint = endpoint_for_log(&self.endpoint);
+        match &self.provider {
+            Ok(_) => tracing::info!(
+                %endpoint,
+                ratio = self.ratio,
+                "OTLP trace export enabled"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e.to_string().replace(&self.endpoint, &endpoint),
+                %endpoint,
+                "OTLP exporter init failed; traces disabled"
+            ),
+        }
+    }
+}
+
+/// `endpoint` without the `user:password@` an operator may have put in it: the
+/// exporter ignores it, and a log line must not carry it.
+fn endpoint_for_log(endpoint: &str) -> String {
+    let (scheme, rest) = match endpoint.split_once("://") {
+        Some((scheme, rest)) if !scheme.contains(['/', '?', '#']) => (Some(scheme), rest),
+        _ => (None, endpoint),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let rest = match rest[..authority_end].rfind('@') {
+        Some(at) => &rest[at + 1..],
+        None => rest,
+    };
+    match scheme {
+        Some(scheme) => format!("{scheme}://{rest}"),
+        None => rest.to_owned(),
+    }
+}
+
 /// Builds the OTLP tracer provider when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 ///
-/// Returns `None` (tracing stays local-only) when the endpoint env var is unset
-/// or empty, or on any exporter-init error — the server must start regardless,
-/// the same posture as metrics init. Traces are the ONLY signal carried on OTLP;
-/// metrics stay on the Prometheus scrape and logs on stdout/file.
-fn build_tracer_provider() -> Option<SdkTracerProvider> {
+/// Returns `None` when the endpoint env var is unset or empty. An exporter-init
+/// error is carried in the result, not raised: the server must start regardless
+/// (tracing then stays local-only), the same posture as metrics init. Traces are
+/// the ONLY signal carried on OTLP; metrics stay on the Prometheus scrape and logs
+/// on stdout/file.
+fn build_tracer_provider() -> Option<OtlpExport> {
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .ok()
         .filter(|s| !s.trim().is_empty())?;
     let ratio = sample_ratio(std::env::var("OTEL_TRACES_SAMPLER_ARG").ok().as_deref());
+    let insecure = std::env::var("OTEL_EXPORTER_OTLP_TRACES_INSECURE")
+        .or_else(|_| std::env::var("OTEL_EXPORTER_OTLP_INSECURE"))
+        .ok();
+    Some(otlp_export(endpoint, ratio, insecure.as_deref()))
+}
 
-    let exporter = match opentelemetry_otlp::SpanExporter::builder()
+/// [`build_tracer_provider`] once the environment is read: exports to
+/// `endpoint`, sampling `ratio` of new roots.
+fn otlp_export(endpoint: String, ratio: f64, insecure: Option<&str>) -> OtlpExport {
+    let provider = tracer_provider_for(&endpoint, ratio, insecure);
+    OtlpExport {
+        endpoint,
+        ratio,
+        provider,
+    }
+}
+
+/// The provider behind [`otlp_export`]: spans batch-exported over gRPC to
+/// `endpoint`.
+fn tracer_provider_for(
+    endpoint: &str,
+    ratio: f64,
+    insecure: Option<&str>,
+) -> Result<SdkTracerProvider, ExporterBuildError> {
+    let mut builder = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
-        .with_endpoint(endpoint.clone())
-        .build()
-    {
-        Ok(exporter) => exporter,
-        Err(e) => {
-            tracing::warn!(error = %e, %endpoint, "OTLP exporter init failed; traces disabled");
-            return None;
-        }
-    };
+        .with_endpoint(endpoint);
+    if let Some(tls) = otlp_tls_config(endpoint, insecure) {
+        builder = builder.with_tls_config(tls);
+    }
+
+    let exporter = builder.build()?;
 
     let resource = Resource::builder()
         .with_service_name("ferrofin")
@@ -339,8 +412,30 @@ fn build_tracer_provider() -> Option<SdkTracerProvider> {
         ))))
         .with_resource(resource)
         .build();
-    tracing::info!(%endpoint, ratio, "OTLP trace export enabled");
-    Some(provider)
+    Ok(provider)
+}
+
+/// The TLS config the OTLP exporter gets for `endpoint`: the system's roots when
+/// it speaks TLS, else none (tonic loads the roots even for a plain endpoint).
+/// The exporter's own config for an https endpoint trusts no root at all, so
+/// every handshake would fail. The system store is the one reqwest verifies
+/// against, and it carries a self-hosted collector's private CA.
+fn otlp_tls_config(endpoint: &str, insecure: Option<&str>) -> Option<ClientTlsConfig> {
+    otlp_uses_tls(endpoint, insecure).then(|| ClientTlsConfig::new().with_native_roots())
+}
+
+/// Whether the OTLP exporter speaks TLS to `endpoint`, by opentelemetry-otlp's
+/// own rule: an explicit scheme decides (in any case, as `http::Uri` reads it),
+/// and a bare `host:port` is https unless `insecure`
+/// (`OTEL_EXPORTER_OTLP_TRACES_INSECURE`, else `OTEL_EXPORTER_OTLP_INSECURE`) is
+/// `true`.
+fn otlp_uses_tls(endpoint: &str, insecure: Option<&str>) -> bool {
+    match endpoint.split_once("://") {
+        Some((scheme, _)) if !scheme.contains(['/', '?', '#']) => {
+            scheme.eq_ignore_ascii_case("https")
+        }
+        _ => !insecure.is_some_and(|v| v.eq_ignore_ascii_case("true")),
+    }
 }
 
 /// Parses `OTEL_TRACES_SAMPLER_ARG` into a sampling ratio in `0.0..=1.0`.
@@ -366,6 +461,35 @@ pub fn shutdown_tracing() {
     {
         tracing::warn!(error = %e, "tracer provider shutdown failed");
     }
+}
+
+/// The directory layout under the program-data root, ported from
+/// `ServerApplicationPaths`: {data}/log, {config}, {cache}, {web}.
+#[must_use]
+pub fn application_paths(config: &Config) -> ferrofin_core::FerrofinServerApplicationPaths {
+    ferrofin_core::FerrofinServerApplicationPaths::new(
+        &config.data_dir,
+        config.data_dir.join("log"),
+        &config.config_dir,
+        &config.cache_dir,
+        &config.web_dir,
+    )
+}
+
+/// Port of `ServerApplicationPaths.MakeSanityCheckOrThrow`, which
+/// `Program.StartApp` runs before anything else touches the paths (Ferrofin runs
+/// it once logging has started): every
+/// server directory exists and carries its `.jellyfin-<kind>` marker.
+///
+/// # Errors
+///
+/// Returns the first directory that cannot be created or marked, or the
+/// conflict when a directory carries another kind's marker (two server paths
+/// point at one directory).
+pub fn check_application_paths(config: &Config) -> anyhow::Result<()> {
+    application_paths(config)
+        .make_sanity_check()
+        .context("the server's directories failed their startup check")
 }
 
 /// Opens the SQLite database at `{data_dir}/ferrofin.db` and applies migrations.
@@ -402,7 +526,13 @@ pub async fn open_database(config: &Config) -> anyhow::Result<Database> {
     // The one-shot ports of 12.0's data routines: membership from Data JSON
     // for a database newly adopted from 10.11.8 (never from a 12.0 one, whose
     // JSON is frozen), orphaned extras, OwnerId relationships, version links.
-    ferrofin_core::adoption_repairs::run_all(&db)
+    // The membership import expands a container's `%AppDataPath%` path; the
+    // configured metadata path is not loaded yet and not needed, as 10.11
+    // keeps playlists and box sets under the data path.
+    let paths = ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(Arc::new(
+        application_paths(config),
+    ));
+    ferrofin_core::adoption_repairs::run_all(&db, &paths)
         .await
         .context("failed to run the adoption repairs")?;
     // Rows written before the persistence service derived `SortName` still
@@ -497,19 +627,19 @@ fn spawn_pool_sampler(db: &Database) {
 ///   the configuration manager is not built until `build_app_state` — and it is
 ///   mutable at runtime from the dashboard, so a value captured here could go
 ///   stale. [`crate::vaapi_probe`] therefore probes them lazily, once per
-///   device path, at the point of first VAAPI use. **That spawn has landed**;
-///   what is still outstanding is wiring its result into the planner, which
-///   arrives with the VAAPI filter chains in the hardware-transcoding roadmap phase 4b. Until
-///   then `is_vaapi_device_*` and `vaapi_vulkan_*` read `false` on the planning
-///   path — moot for now, since VAAPI is gated out of the hardware path
-///   entirely.
+///   device path, at the point of first VAAPI use, and the planner reads the
+///   result for each VAAPI job (`VaapiProber::capabilities`), so
+///   `is_vaapi_device_*` and `vaapi_vulkan_*` describe the configured device
+///   there.
 /// - The VideoToolbox AV1-decode probe is not an ffmpeg spawn at all: upstream
-///   asks macOS directly through Objective-C. It belongs to the hardware-transcoding roadmap
-///   phase 6, alongside reading the macOS release in [`read_os_version`].
+///   asks macOS directly through Objective-C. VideoToolbox is not a supported
+///   accelerator (owner decision 2026-08-26), so no job reads it.
 ///
 /// `SetFFmpegPath`'s `CheckSupportedRuntimeKey` (the transcode-throttle pause
-/// key) and `CheckSupportedProberOption` calls are outside the hardware matrix
-/// and are recorded as numbered work items in the hardware-transcoding roadmap.
+/// key) is [`probe_pause_keys`], run in the background after boot because the
+/// upstream probe is a real-time job. Its `CheckSupportedProberOption` call is
+/// outside the hardware matrix and is recorded as a numbered work item in the
+/// hardware-transcoding roadmap.
 ///
 /// # Errors
 ///
@@ -543,6 +673,7 @@ pub async fn discover_ffmpeg(
         filter_options,
         bsf_options,
         low_priority_hwaccel_flag,
+        prober_first_video_frame,
         os_version,
     ) = Box::pin(probe_round(&ffmpeg, &ffprobe)).await;
     let ffmpeg_version = ffmpeg_version
@@ -558,7 +689,6 @@ pub async fn discover_ffmpeg(
             path: ffmpeg.clone(),
         })?;
 
-    let pkey_pause_supported = probe_runtime_pause(&ffmpeg, ffmpeg_version).await;
     let mut builder = FfmpegCapabilities::builder()
         .filters(filters)
         .encoders(encoders)
@@ -569,7 +699,8 @@ pub async fn discover_ffmpeg(
         // VideoToolbox decode branches read it.
         .arm64(std::env::consts::ARCH == "aarch64")
         .low_priority_hwaccel_flag(low_priority_hwaccel_flag)
-        .pkey_pause_supported(pkey_pause_supported);
+        .prober_first_video_frame(prober_first_video_frame)
+        .validated(true);
     if let Some(version) = ffmpeg_version {
         builder = builder.ffmpeg_version(version);
     }
@@ -592,7 +723,6 @@ pub async fn discover_ffmpeg(
         platform = ?capabilities.platform(),
         tonemapx = capabilities.supports_filter("tonemapx"),
         libfdk_aac = capabilities.supports_encoder("libfdk_aac"),
-        pkey_pause_supported,
         chromaprint_muxer,
         "media encoder ready"
     );
@@ -609,38 +739,59 @@ pub async fn discover_ffmpeg(
     })
 }
 
+/// The arguments of `EncoderValidator.CheckSupportedRuntimeKey`'s dummy encode
+/// (Jellyfin 12.1, unchanged in 12.2): a 1x1 source at 1 fps, paced in real time
+/// and capped at 5 s, so it cannot finish before ffmpeg first polls stdin. The
+/// earlier form (`nullsrc=s=1x1:d=10000`, no `-re`) finished in about 0.3 s on a
+/// fast CPU, before the `?` was read, and never printed the help.
+const PAUSE_PROBE_ARGS: [&str; 9] = [
+    "-hide_banner",
+    "-re",
+    "-f",
+    "lavfi",
+    "-i",
+    "nullsrc=s=1x1:r=1:d=5",
+    "-f",
+    "null",
+    "-",
+];
+
+/// Probes the ffmpeg at `ffmpeg` for its keyboard pause controls and publishes
+/// them to `slot`, which the transcode manager reads on every throttle tick.
+///
+/// The probe is a real-time ffmpeg job (about a second or more), so it runs in
+/// the background after boot, never on the path to the listening socket.
+pub async fn probe_pause_keys(
+    ffmpeg: PathBuf,
+    version: Option<FfmpegVersion>,
+    slot: ferrofin_mediaencoding::transcoding::throttler::PauseKeySlot,
+) {
+    use ferrofin_mediaencoding::transcoding::throttler::PauseKeys;
+    let pkey_pause_supported = probe_runtime_pause(&ffmpeg).await;
+    let keys = PauseKeys::select(pkey_pause_supported, version);
+    slot.set(keys);
+    tracing::info!(pkey_pause_supported, ?keys, "ffmpeg pause key probed");
+}
+
 /// Detects Jellyfin-ffmpeg's explicit pause key from its interactive help.
 ///
-/// Matches EncoderValidator.CheckSupportedRuntimeKey's input/duration and
-/// exact, case-sensitive help description. An absent key or failed probe does
-/// not grant keyboard support; the manager separately checks the legacy gate.
-async fn probe_runtime_pause(ffmpeg: &Path, version: Option<FfmpegVersion>) -> bool {
+/// Matches EncoderValidator.CheckSupportedRuntimeKey's arguments, stdin (`?q`)
+/// and exact, case-sensitive help description. An absent key or failed probe
+/// does not grant keyboard support; [`probe_pause_keys`] applies the legacy
+/// version gate through `PauseKeys::select`.
+async fn probe_runtime_pause(ffmpeg: &Path) -> bool {
     use tokio::io::AsyncWriteExt as _;
-    let duration = if version.is_some_and(|version| version >= FfmpegVersion::new(7, 0)) {
-        "10000"
-    } else {
-        "1000"
-    };
-    let input = format!("nullsrc=s=1x1:d={duration}");
     let probe = async {
         let mut child = tokio::process::Command::new(ffmpeg)
-            .args([
-                "-hide_banner",
-                "-f",
-                "lavfi",
-                "-i",
-                &input,
-                "-f",
-                "null",
-                "-",
-            ])
+            .args(PAUSE_PROBE_ARGS)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(b"?").await?;
+            // `?` prints the key help; `q` then stops the job at once.
+            stdin.write_all(b"?q").await?;
             // Closing stdin matches disposing EncoderValidator's test writer.
             stdin.shutdown().await?;
         }
@@ -689,6 +840,7 @@ async fn probe_round(
     [bool; FilterOption::ALL.len()],
     [bool; BsfOption::ALL.len()],
     bool,
+    bool,
     Option<FfmpegVersion>,
 ) {
     tokio::join!(
@@ -702,6 +854,7 @@ async fn probe_round(
         probe_filter_options(ffmpeg),
         probe_bsf_options(ffmpeg),
         probe_hwaccel_flag(ffmpeg, "low_priority"),
+        probe_prober_option(ffprobe, "only_first_vframe"),
         read_os_version(),
     )
 }
@@ -800,6 +953,34 @@ async fn probe_help_pages(
         }
     }
     pages
+}
+
+/// Whether `ffprobe` accepts `-<option>`, decided by its exit status on a 1x1
+/// one-second null source. Port of `EncoderValidator.CheckSupportedProberOption`
+/// (`-loglevel quiet -f lavfi -i nullsrc=s=1x1:d=1 -{option}`).
+async fn probe_prober_option(ffprobe: &Path, option: &str) -> bool {
+    let status = tokio::process::Command::new(ffprobe)
+        .args([
+            "-loglevel",
+            "quiet",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=1x1:d=1",
+            &format!("-{option}"),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+    match status {
+        Ok(status) => status.success(),
+        Err(e) => {
+            tracing::debug!(error = %e, option, "error probing ffprobe option");
+            false
+        }
+    }
 }
 
 /// Whether ffmpeg accepts `-hwaccel_flags +<flag>`, decided by exit status on a
@@ -1079,6 +1260,69 @@ async fn validate_binary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_logs::CapturedLogs;
+
+    /// Startup runs `MakeSanityCheckOrThrow` (`Program.StartApp`): every
+    /// server directory exists and carries its `.jellyfin-<kind>` marker, and
+    /// the cache its `CACHEDIR.TAG`.
+    #[test]
+    fn the_startup_check_creates_and_marks_the_server_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        check_application_paths(&Config::test_stub(tmp.path())).expect("checked");
+
+        // `test_stub`'s data directory is `data/`, beside `config/` and `cache/`.
+        for (dir, marker) in [
+            ("config", "config"),
+            ("data/log", "log"),
+            ("data/plugins", "plugin"),
+            ("data", "data"),
+            ("cache", "cache"),
+            ("data/data", "data"),
+            ("data/root", "root"),
+        ] {
+            let path = tmp.path().join(dir).join(format!(".jellyfin-{marker}"));
+            assert!(path.is_file(), "missing {}", path.display());
+        }
+        assert!(tmp.path().join("cache/CACHEDIR.TAG").is_file());
+    }
+
+    /// A server directory carrying another kind's marker means two server
+    /// paths point at one directory: startup refuses it, as upstream's
+    /// `CheckOrCreateMarker` throws.
+    #[test]
+    fn the_startup_check_refuses_a_directory_marked_for_another_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("data/root")).unwrap();
+        std::fs::write(tmp.path().join("data/root/.jellyfin-config"), "").unwrap();
+
+        let error = check_application_paths(&Config::test_stub(tmp.path()))
+            .expect_err("startup refuses the directory");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Expected to find only .jellyfin-root but found marker for")
+                && message.contains(".jellyfin-config"),
+            "{message}"
+        );
+    }
+
+    /// The likeliest clash: the cache directory set to the data directory.
+    #[test]
+    fn the_startup_check_refuses_a_cache_in_the_data_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::test_stub(tmp.path());
+        config.cache_dir = config.data_dir.clone();
+
+        let error = check_application_paths(&config).expect_err("startup refuses the layout");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("Expected to find only .jellyfin-cache but found marker for")
+                && message.contains(".jellyfin-data"),
+            "{message}"
+        );
+    }
 
     #[test]
     fn derive_ffprobe_replaces_basename_in_dir() {
@@ -1262,6 +1506,122 @@ mod tests {
         assert_eq!(which_on_path("/definitely/not/here/nope"), None);
     }
 
+    /// An https collector gets an exporter. Without a TLS feature the exporter
+    /// refused the endpoint, and the server ran with no traces.
+    #[tokio::test]
+    async fn https_otlp_endpoint_builds_an_exporter() {
+        let export = otlp_export("https://127.0.0.1:4317".to_owned(), 1.0, None);
+        assert!(
+            export.provider.is_ok(),
+            "an https endpoint must not disable traces: {:?}",
+            export.provider.err()
+        );
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        export.log();
+        let infos = logs.lines_at("INFO");
+        assert_eq!(infos.len(), 1, "{}", logs.text());
+        assert!(
+            infos[0].contains("OTLP trace export enabled") && infos[0].contains("127.0.0.1:4317")
+        );
+    }
+
+    /// The exporter trusts no root on its own, so a TLS endpoint gets the
+    /// system's; a plain one gets no TLS config at all.
+    #[test]
+    fn a_tls_otlp_endpoint_gets_the_system_roots() {
+        for endpoint in [
+            "https://collector:4317",
+            "HTTPS://collector:4317",
+            "collector:4317",
+        ] {
+            let tls = otlp_tls_config(endpoint, None);
+            let tls = tls.unwrap_or_else(|| panic!("{endpoint}: no TLS config"));
+            assert!(
+                format!("{tls:?}").contains("with_native_roots: true"),
+                "{endpoint}: {tls:?}"
+            );
+        }
+        assert!(otlp_tls_config("http://collector:4317", None).is_none());
+        assert!(otlp_tls_config("collector:4317", Some("true")).is_none());
+    }
+
+    /// A failed exporter is reported, with the endpoint and the reason.
+    #[tokio::test]
+    async fn a_failed_otlp_exporter_is_logged() {
+        let export = otlp_export("http://[::1".to_owned(), 1.0, None);
+        assert!(export.provider.is_err());
+        let logs = CapturedLogs::default();
+        let _guard = logs.install();
+        export.log();
+        let warns = logs.lines_at("WARN");
+        assert_eq!(warns.len(), 1, "{}", logs.text());
+        assert!(warns[0].contains("OTLP exporter init failed") && warns[0].contains("[::1"));
+    }
+
+    #[tokio::test]
+    async fn otlp_endpoint_is_logged_without_credentials() {
+        for (endpoint, logged) in [
+            ("https://collector:4317", "https://collector:4317"),
+            (
+                "https://id:token@collector:4317/v1",
+                "https://collector:4317/v1",
+            ),
+            ("id:token@collector:4317", "collector:4317"),
+            ("http://collector:4317/a@b", "http://collector:4317/a@b"),
+            ("https://[::1]:4317", "https://[::1]:4317"),
+            ("https://id:token@[::1]:4317", "https://[::1]:4317"),
+            ("https://@collector:4317", "https://collector:4317"),
+            ("id:token@collector:4317/p://q", "collector:4317/p://q"),
+        ] {
+            assert_eq!(endpoint_for_log(endpoint), logged, "{endpoint}");
+        }
+        // Both log paths: an export that builds, and one whose error text
+        // echoes the endpoint (a bare host:port with the scheme prepended).
+        for (endpoint, level, shown) in [
+            (
+                "https://id:token@127.0.0.1:4317",
+                "INFO",
+                "https://127.0.0.1:4317",
+            ),
+            ("http://id:token@[::1", "WARN", "http://[::1"),
+            ("id:token@[::1", "WARN", "https://[::1"),
+        ] {
+            let export = otlp_export(endpoint.to_owned(), 1.0, None);
+            let logs = CapturedLogs::default();
+            let _guard = logs.install();
+            export.log();
+            let lines = logs.lines_at(level);
+            assert_eq!(lines.len(), 1, "{endpoint}: {}", logs.text());
+            assert!(lines[0].contains(shown), "{endpoint}: {}", lines[0]);
+            assert!(
+                !logs.text().contains("token"),
+                "{endpoint}: {}",
+                logs.text()
+            );
+        }
+    }
+
+    #[test]
+    fn otlp_uses_tls_follows_the_exporters_scheme_rule() {
+        for (endpoint, insecure, tls) in [
+            ("https://collector:4317", None, true),
+            ("https://collector:4317", Some("true"), true),
+            ("HTTPS://collector:4317", None, true),
+            ("http://collector:4317", None, false),
+            ("collector:4317", None, true),
+            ("collector:4317", Some("false"), true),
+            ("collector:4317", Some("TRUE"), false),
+            ("collector:4317/v1?a=b://c", Some("true"), false),
+        ] {
+            assert_eq!(
+                otlp_uses_tls(endpoint, insecure),
+                tls,
+                "{endpoint} insecure={insecure:?}"
+            );
+        }
+    }
+
     #[test]
     fn sample_ratio_parses_clamps_and_defaults() {
         assert!(
@@ -1298,25 +1658,6 @@ mod tests {
         );
     }
 
-    /// An in-memory `MakeWriter` capturing fmt-layer output for assertions.
-    #[derive(Clone, Default)]
-    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for BufWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[test]
     fn json_stdout_line_carries_trace_id_for_in_span_events() {
         // The headline correlation requirement: with the OTel layer active and the
@@ -1328,7 +1669,7 @@ mod tests {
         use tracing_opentelemetry::OpenTelemetrySpanExt as _;
         use tracing_subscriber::layer::SubscriberExt as _;
 
-        let buf = BufWriter::default();
+        let buf = CapturedLogs::default();
         let provider = SdkTracerProvider::builder()
             .with_sampler(Sampler::AlwaysOn)
             .with_simple_exporter(InMemorySpanExporter::default())
@@ -1348,7 +1689,7 @@ mod tests {
             tracing::info!("inside the request");
         });
 
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = buf.text();
         let line = out
             .lines()
             .find(|l| l.contains("inside the request"))
@@ -1470,13 +1811,45 @@ mod tests {
         );
     }
 
+    /// gl-154: the plain-text file sink `/System/Logs` serves keeps every event
+    /// on lines of its own record, in both formats: a line break inside a
+    /// logged value continues the record indented and never starts a forged
+    /// one at the left margin.
+    #[rstest::rstest]
+    #[case::json_with_text_file(false)]
+    #[case::text_tee(true)]
+    fn the_text_file_sink_cannot_be_forged_by_a_logged_line_break(#[case] text_mode: bool) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let file = CapturedLogs::default();
+        let (writer, guard) = tracing_appender::non_blocking(file.clone());
+        let layers = build_fmt_layers(text_mode, Some(writer));
+        let subscriber = tracing_subscriber::registry().with(layers);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                device = %"phone\n2026-10-24T00:00:00.000000Z ERROR ferrofin: forged",
+                "playback started"
+            );
+        });
+        drop(guard); // flushes the background queue
+
+        let text = file.text();
+        let forged = text
+            .lines()
+            .find(|line| line.contains("forged"))
+            .unwrap_or_else(|| panic!("logged: {text:?}"));
+        assert!(
+            forged.starts_with("    2026-10-24T00:00:00.000000Z ERROR"),
+            "{text:?}"
+        );
+    }
+
     #[test]
     fn panic_hook_logs_the_panic() {
         // The hook must route panics through tracing (they otherwise bypass every
         // sink). catch_unwind still fires the hook on this thread, where the scoped
         // subscriber captures it.
         use tracing_subscriber::layer::SubscriberExt as _;
-        let buf = BufWriter::default();
+        let buf = CapturedLogs::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
@@ -1486,7 +1859,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let _ = std::panic::catch_unwind(|| panic!("kaboom"));
         });
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let out = buf.text();
         assert!(
             out.contains("panicked"),
             "hook emitted the error line: {out}"
@@ -1515,7 +1888,6 @@ mod tests {
     /// discovery happy path run without a real ffmpeg install.
     #[cfg(unix)]
     fn write_fake_ffmpeg(dir: &Path, name: &str, banner_tool: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join(name);
         // First line satisfies our `<tool> version` prefix check; the `libav*`
         // lines satisfy `EncoderValidator`'s library-version cross-check for the
@@ -1525,8 +1897,7 @@ mod tests {
         // falls through to the version banner, which is what an ffmpeg without
         // that capability effectively produces for our purposes.
         let script = format!(
-            "#!/bin/sh\n\
-             if [ \"$2\" = -filters ]; then cat <<'EOF'\nFilters:\n\
+            "if [ \"$2\" = -filters ]; then cat <<'EOF'\nFilters:\n\
              \x20 T.. = Timeline support\n\
              \x20T.C scale             V->V       Scale the input video size.\n\
              \x20... tonemapx          V->V       HDR to SDR tonemapping (SIMD).\n\
@@ -1561,10 +1932,7 @@ mod tests {
              libavdevice    60.  3.100\nlibavfilter     9. 12.100\nlibswscale      7.  5.100\n\
              libswresample   4. 12.100\nEOF\n"
         );
-        std::fs::write(&path, script).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        crate::test_exec::stub_script(&path, &script);
         path
     }
 
@@ -1623,6 +1991,9 @@ mod tests {
         // a mistyped flag, or a probe that stopped running (and so fell through
         // to the version banner's exit 0) all report true and fail this.
         assert!(!caps.low_priority_hwaccel_flag());
+        // `CheckSupportedProberOption("only_first_vframe")`, by exit status too:
+        // the fake accepts it, so an unwired or inverted probe reads false.
+        assert!(caps.prober_supports_first_video_frame());
         // Populated from the host rather than left at the "nothing probed"
         // default; on Linux the OS version is read too.
         assert_eq!(caps.platform(), Platform::current());
@@ -1692,6 +2063,79 @@ mod tests {
             .await
             .expect("discovery succeeds");
         assert_eq!(paths.ffprobe, ffprobe);
+    }
+
+    /// A fake ffmpeg that records its arguments and, like Jellyfin's build, prints
+    /// the pause key's help only after reading `?` and then `q` on stdin.
+    #[cfg(unix)]
+    fn write_fake_pause_ffmpeg(dir: &Path, prints_help: bool) -> PathBuf {
+        let path = dir.join("ffmpeg");
+        let help = if prints_help {
+            "p      pause transcoding"
+        } else {
+            "Press [q] to stop"
+        };
+        crate::test_exec::stub_script(
+            &path,
+            &format!(
+                "echo \"$*\" > '{}/args'\nkeys=$(dd bs=1 count=2 2>/dev/null)\n\
+                 if [ \"$keys\" = '?q' ]; then echo '{help}' >&2; fi\n",
+                dir.display()
+            ),
+        );
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pause_probe_runs_upstreams_realtime_form_and_reads_the_help() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = write_fake_pause_ffmpeg(tmp.path(), true);
+        assert!(probe_runtime_pause(&ffmpeg).await);
+        // EncoderValidator.CheckSupportedRuntimeKey at v12.2: real-time and 5 s at most,
+        // so it cannot finish before ffmpeg first polls stdin; `q` stops it at once.
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("args"))
+                .unwrap()
+                .trim(),
+            "-hide_banner -re -f lavfi -i nullsrc=s=1x1:r=1:d=5 -f null -"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pause_probe_is_false_without_the_exact_help_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = write_fake_pause_ffmpeg(tmp.path(), false);
+        assert!(!probe_runtime_pause(&ffmpeg).await);
+        assert!(!probe_runtime_pause(&tmp.path().join("missing")).await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probed_pause_keys_follow_upstreams_version_gate() {
+        use ferrofin_mediaencoding::transcoding::throttler::{PauseKeySlot, PauseKeys};
+        let with_dir = tempfile::tempdir().unwrap();
+        let without_dir = tempfile::tempdir().unwrap();
+        let with_key = write_fake_pause_ffmpeg(with_dir.path(), true);
+        let without_key = write_fake_pause_ffmpeg(without_dir.path(), false);
+        for (ffmpeg, version, expected) in [
+            (
+                &with_key,
+                FfmpegVersion::new(8, 0),
+                Some(PauseKeys::Patched),
+            ),
+            (
+                &without_key,
+                FfmpegVersion::new(6, 1),
+                Some(PauseKeys::Legacy),
+            ),
+            (&without_key, FfmpegVersion::new(7, 0), None),
+        ] {
+            let slot = PauseKeySlot::default();
+            probe_pause_keys(ffmpeg.clone(), Some(version), slot.clone()).await;
+            assert_eq!(slot.get(), expected, "{version:?} via {ffmpeg:?}");
+        }
     }
 
     #[test]

@@ -69,7 +69,7 @@ COPY . .
 ARG SERVICE_VERSION=
 ENV FERROFIN_GIT_DESCRIBE=${SERVICE_VERSION}
 # Strip the container binary while leaving local profiling builds unchanged.
-RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --release -p ferrofin-server
+RUN CARGO_PROFILE_RELEASE_STRIP=symbols cargo build --locked --release -p ferrofin-server
 
 # ── runtime ─────────────────────────────────────────────────────────────
 FROM ${RUNTIME_IMAGE}
@@ -91,6 +91,10 @@ RUN useradd --uid 1000 --user-group --home-dir /data --no-create-home \
       --shell /usr/sbin/nologin ferrofin \
  && mkdir -p /data && chown ferrofin:ferrofin /data
 USER ferrofin
+# The commit the image was built from, for gates/run to check before it measures anything:
+# docker build --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t <image> .
+ARG SOURCE_COMMIT=
+LABEL org.opencontainers.image.revision=$SOURCE_COMMIT
 VOLUME /data
-EXPOSE 8096 7359/udp
+EXPOSE 8096 8920 7359/udp
 ENTRYPOINT ["ferrofin-server"]

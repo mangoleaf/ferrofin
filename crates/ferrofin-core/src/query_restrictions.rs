@@ -1,6 +1,9 @@
 //! Resolve the user preference portion of `InternalItemsQuery.SetUser`.
 
-use ferrofin_db::{Database, enums::PreferenceKind};
+use ferrofin_db::{
+    Database,
+    enums::{PermissionKind, PreferenceKind},
+};
 use ferrofin_model::data::UnratedItem;
 use ferrofin_traits::{error::ServiceError, options::InternalItemsQuery};
 use ferrofin_util::string_extensions::{lower_invariant, remove_diacritics};
@@ -52,6 +55,23 @@ pub(crate) async fn resolve(
                 .collect();
         }
     }
+    // `UserEntityExtensions.HasContentRestrictions`; the permission read only
+    // happens for a user no preference already restricts.
+    resolved.user_has_content_restrictions = user.max_parental_rating_score.is_some()
+        || [
+            PreferenceKind::BlockedMediaFolders,
+            PreferenceKind::BlockedTags,
+            PreferenceKind::AllowedTags,
+            PreferenceKind::BlockUnratedItems,
+        ]
+        .into_iter()
+        .any(|kind| !values(kind).is_empty())
+        || !crate::user_entity_ext::cached_permission(
+            db,
+            &user.id,
+            PermissionKind::EnableAllFolders,
+        )
+        .await?;
     resolved.user_preferences_loaded = true;
     Ok(Some(resolved))
 }

@@ -35,7 +35,7 @@ pub(crate) const PROGRAM_SELECT: &str = r#"SELECT p."Id",p."ChannelId",p."StartD
 /// Fails when the database read fails.
 pub async fn channel_rows(db: &Database) -> Result<Vec<ChannelRow>, ServiceError> {
     sqlx::query_as(
-        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated",
+        r#"SELECT "Id","TvgId","ExternalId","Name","Number","ChannelType","DateCreated","ImageUrl",
                   EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
                          WHERE p."ChannelId" = "FerrofinLiveTvChannels"."Id" AND p."IsMovie" = 1) AS "IsMovie",
                   EXISTS(SELECT 1 FROM "FerrofinLiveTvPrograms" p
@@ -383,9 +383,9 @@ pub const LISTING_PROVIDERS_TABLE: &str = "FerrofinLiveTvListingProviders";
 ///
 /// Backs the `Array.FindIndex(..., OrdinalIgnoreCase)` half of
 /// `TunerHostManager.SaveTunerHost` / `ListingsManager.SaveListingProvider`: a
-/// client id that names no existing row is discarded and a fresh one minted.
-/// The stored spelling is what comes back, because the channel rows reference
-/// their tuner host by that exact string.
+/// client id that names no existing row is discarded and a fresh one minted,
+/// and a matched row is renamed to the posted spelling as it is replaced
+/// ([`store_tuner_host`], [`store_listing_provider`]).
 ///
 /// # Errors
 ///
@@ -402,6 +402,100 @@ pub async fn existing_config_id(
         .fetch_optional(db.pool())
         .await
         .map_err(db_err)
+}
+
+/// Stores a listings provider's row (`Type`, `Path` and the JSON `Data`),
+/// first renaming the stored row to `id` when `renamed_from` is the same id
+/// spelled differently.
+///
+/// The configuration half of `ListingsManager.SaveListingProvider`, whose
+/// `config.ListingProviders[index] = info` keeps the posted spelling of a
+/// matched id. One transaction, so a failed write leaves the old row as it was.
+///
+/// # Errors
+///
+/// Fails when the database write fails.
+pub async fn store_listing_provider(
+    db: &Database,
+    renamed_from: Option<&str>,
+    id: &str,
+    provider_type: &str,
+    path: &str,
+    data: &str,
+) -> Result<(), ServiceError> {
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    if let Some(stored) = renamed_from.filter(|stored| *stored != id) {
+        sqlx::query(r#"UPDATE "FerrofinLiveTvListingProviders" SET "Id" = ?1 WHERE "Id" = ?2"#)
+            .bind(id)
+            .bind(stored)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    }
+    sqlx::query(
+        r#"INSERT INTO "FerrofinLiveTvListingProviders" ("Id","Type","Path","Data") VALUES (?1,?2,?3,?4)
+           ON CONFLICT("Id") DO UPDATE SET "Type"=excluded."Type","Path"=excluded."Path","Data"=excluded."Data""#,
+    )
+    .bind(id)
+    .bind(provider_type)
+    .bind(path)
+    .bind(data)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)
+}
+
+/// Stores a tuner host's row (`Url`, `Type` and the JSON `Data`), first
+/// renaming the stored row, and every channel row that names it, to `id` when
+/// `renamed_from` is the same id spelled differently.
+///
+/// The configuration half of `TunerHostManager.SaveTunerHost`, whose
+/// `config.TunerHosts[index] = info` keeps the posted spelling of a matched id.
+/// Channel ids do not derive from the tuner id, so a rename moves no channel or
+/// its user data. One transaction, so a failed write leaves the old rows as
+/// they were.
+///
+/// # Errors
+///
+/// Fails when the database write fails.
+pub async fn store_tuner_host(
+    db: &Database,
+    renamed_from: Option<&str>,
+    id: &str,
+    url: &str,
+    tuner_type: &str,
+    data: &str,
+) -> Result<(), ServiceError> {
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    if let Some(stored) = renamed_from.filter(|stored| *stored != id) {
+        sqlx::query(r#"UPDATE "FerrofinLiveTvTunerHosts" SET "Id" = ?1 WHERE "Id" = ?2"#)
+            .bind(id)
+            .bind(stored)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        sqlx::query(
+            r#"UPDATE "FerrofinLiveTvChannels" SET "TunerHostId" = ?1 WHERE "TunerHostId" = ?2"#,
+        )
+        .bind(id)
+        .bind(stored)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    }
+    sqlx::query(
+        r#"INSERT INTO "FerrofinLiveTvTunerHosts" ("Id","Url","Type","Data") VALUES (?1,?2,?3,?4)
+           ON CONFLICT("Id") DO UPDATE SET "Url"=excluded."Url","Type"=excluded."Type","Data"=excluded."Data""#,
+    )
+    .bind(id)
+    .bind(url)
+    .bind(tuner_type)
+    .bind(data)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    tx.commit().await.map_err(db_err)
 }
 
 /// The tuner-facing external id of one channel, or `None` when the lineup does
@@ -492,6 +586,23 @@ pub mod test_support {
     use super::{Database, db_err};
     use ferrofin_traits::error::ServiceError;
 
+    /// Overwrites a configuration row's `Data` with JSON that no longer parses;
+    /// `table` is [`super::TUNER_HOSTS_TABLE`] or
+    /// [`super::LISTING_PROVIDERS_TABLE`].
+    pub async fn corrupt_config_data(
+        db: &Database,
+        table: &'static str,
+        id: &str,
+    ) -> Result<(), ServiceError> {
+        let sql = format!(r#"UPDATE "{table}" SET "Data" = '{{' WHERE "Id" = ?1"#);
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .execute(db.writer())
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Inserts the minimal `BaseItems` row `UserData`'s FK needs for an item id.
     pub async fn seed_base_item_stub(db: &Database, id_db: &str) -> Result<(), ServiceError> {
         sqlx::query(
@@ -543,6 +654,22 @@ pub mod test_support {
         .map_err(db_err)
     }
 
+    /// Every programme item's genre links as `(Id, genre)`, ordered — the
+    /// `ItemValues` the guide refresh's mirror wrote for its airings.
+    pub async fn program_genre_links(db: &Database) -> Result<Vec<(String, String)>, ServiceError> {
+        sqlx::query_as(
+            r#"SELECT bi."Id", v."Value" FROM "ItemValuesMap" m
+               JOIN "ItemValues" v ON v."ItemValueId" = m."ItemValueId"
+               JOIN "BaseItems" bi ON bi."Id" = m."ItemId"
+               WHERE bi."Type" = ?1 AND v."Type" = 2
+               ORDER BY bi."Id", v."Value""#,
+        )
+        .bind(crate::projection::PROGRAM_TYPE_NAME)
+        .fetch_all(db.pool())
+        .await
+        .map_err(db_err)
+    }
+
     /// Marks an item favourite for a user, the way the playstate path stores it.
     pub async fn seed_favorite(
         db: &Database,
@@ -561,6 +688,25 @@ pub mod test_support {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    /// The item holding `user_id`'s favourite row keyed `key`, if any: the
+    /// channel itself, or the deletion placeholder a removed channel's rows
+    /// are parked on.
+    pub async fn favorite_holder(
+        db: &Database,
+        user_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, ServiceError> {
+        sqlx::query_scalar(
+            r#"SELECT "ItemId" FROM "UserData"
+               WHERE "UserId" = ?1 AND "CustomDataKey" = ?2 AND "IsFavorite" = 1"#,
+        )
+        .bind(user_id)
+        .bind(key)
+        .fetch_optional(db.pool())
+        .await
+        .map_err(db_err)
     }
 
     /// Pins every channel's `DateCreated` to a sentinel value.

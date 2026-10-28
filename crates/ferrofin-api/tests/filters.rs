@@ -349,6 +349,13 @@ struct StubLibrary {
     last_stream_query: Mutex<Option<InternalItemsQuery>>,
     /// Overrides the canned `(audio, subtitle)` language codes.
     stream_languages: Option<(Vec<&'static str>, Vec<&'static str>)>,
+    /// An extra item [`LibraryManager::get_item_by_id`] knows, stored as the
+    /// given kind: the `parentId` a test passes.
+    parent: Option<(Uuid, BaseItemKind)>,
+    /// The last query passed to [`LibraryManager::get_query_filters_legacy`],
+    /// which the trait's default `get_tag_names` (the Filters2 tag facet)
+    /// reads.
+    last_legacy_query: Mutex<Option<InternalItemsQuery>>,
 }
 
 #[async_trait]
@@ -369,6 +376,15 @@ impl LibraryManager for StubLibrary {
     }
 
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
+        if let Some((parent, kind)) = self.parent
+            && parent == id
+        {
+            let mut item = item_entity(parent, "Parent");
+            kind.stored_type_name()
+                .expect("a stored kind")
+                .clone_into(&mut item.type_);
+            return Ok(Some(item));
+        }
         Ok((id == SEED_ID).then(|| item_entity(SEED_ID, "Seed")))
     }
     async fn query_items(
@@ -416,8 +432,9 @@ impl LibraryManager for StubLibrary {
     }
     async fn get_query_filters_legacy(
         &self,
-        _query: &InternalItemsQuery,
+        query: &InternalItemsQuery,
     ) -> Result<QueryFiltersLegacy, ServiceError> {
+        *self.last_legacy_query.lock().expect("legacy query lock") = Some(query.clone());
         Ok(QueryFiltersLegacy {
             genres: vec!["Action".to_owned()],
             tags: vec!["Cult".to_owned()],
@@ -938,10 +955,13 @@ async fn items_filters2_language_facets_gate_and_widen_by_type(
 #[case("false")]
 #[tokio::test]
 async fn items_filters2_stream_query_shares_the_genre_query_scope(#[case] recursive: &str) {
-    // `:197-209`: one scoping branch sets the genre and the stream query alike,
+    // `:198-210`: one scoping branch sets the genre and the stream query alike,
     // and both carry the user and the live-TV `Is*` flags (`:161-178`).
-    let library = Arc::new(StubLibrary::default());
     let parent = Uuid::from_u128(0xF00D);
+    let library = Arc::new(StubLibrary {
+        parent: Some((parent, BaseItemKind::Folder)),
+        ..StubLibrary::default()
+    });
     filters2(
         Arc::clone(&library),
         &format!(
@@ -962,7 +982,12 @@ async fn items_filters2_stream_query_shares_the_genre_query_scope(#[case] recurs
         .expect("genre query lock")
         .clone()
         .expect("get_genres called");
-    assert_eq!(stream.ancestor_ids, vec![parent]);
+    if recursive == "true" {
+        assert_eq!(stream.ancestor_ids, vec![parent]);
+    } else {
+        assert_eq!(stream.parent_id, parent);
+        assert!(stream.ancestor_ids.is_empty());
+    }
     assert_eq!(stream.ancestor_ids, genre.ancestor_ids);
     assert_eq!(stream.parent_id, genre.parent_id);
     assert_eq!(stream.is_movie, Some(true));
@@ -1029,83 +1054,168 @@ async fn items_filters2_music_type_uses_music_genres() {
 }
 
 #[tokio::test]
-async fn items_filters2_leaves_tags_empty() {
-    // Pins today's behaviour, which is Jellyfin 10.11/12.0's: `GetQueryFilters`
-    // assigned only `filters.Genres`, so `Tags` stayed at the `QueryFilters`
-    // constructor's `Array.Empty<string>()`. TODO(12.1 parity): v12.1+ fills it
-    // with `GetTagNames(tagQuery)` (v12.2 `FilterController.cs:240`); porting
-    // that replaces this test.
-    let (status, body) = get("/Items/Filters2?includeItemTypes=Movie").await;
-    assert_eq!(status, StatusCode::OK);
-    let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
-    assert!(
-        filters.tags.is_empty(),
-        "Filters2 must not invent a tag facet Jellyfin never populates: {:?}",
-        filters.tags
-    );
-    // ...while the legacy route does carry tags, so the assertion above is a real
-    // constraint on Filters2 and not just an empty stub bleeding through.
-    let (_, legacy_body) = get("/Items/Filters?includeItemTypes=Movie").await;
-    let legacy: QueryFiltersLegacy = serde_json::from_slice(&legacy_body).expect("legacy filters");
-    assert_eq!(legacy.tags, vec!["Cult".to_owned()]);
+async fn items_filters2_fills_tags_from_the_tag_names() {
+    // Jellyfin 12.1+ `filters.Tags = _libraryManager.GetTagNames(tagQuery)`
+    // (v12.2 `FilterController.cs:240`). The stub answers tags only through its
+    // legacy facet set, which the trait's default `get_tag_names` reads.
+    // It runs for every type set: music, and a lone Trailer, included.
+    for types in ["Movie", "Audio", "Trailer"] {
+        let (status, body) = get(&format!("/Items/Filters2?includeItemTypes={types}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let filters: QueryFilters = serde_json::from_slice(&body).expect("filters");
+        assert_eq!(filters.tags, vec!["Cult".to_owned()], "{types}");
+    }
 }
 
 #[tokio::test]
-async fn items_filters2_non_recursive_still_scopes_to_the_parent() {
-    // `recursive=false` selects Jellyfin's `genreQuery.Parent = parentItem` branch
-    // (direct children) — and the `AncestorIds` branch anyway when the parent is a
-    // `UserView`/`ICollectionFolder`, which is what every client passes. Either way
-    // the aggregate stays scoped to the parent; dropping the parent id widened the
-    // facet out to the whole library.
-    let library = Arc::new(StubLibrary::default());
+async fn items_filters2_tag_query_is_the_genre_querys_twin() {
+    // `tagQuery` (v12.2 `FilterController.cs:181-196`) takes the genre query's
+    // user, types and live-TV flags, and the same parent scope (`:198-210`):
+    // unlike the stream-language query it neither includes owned items nor
+    // widens a show set to its episodes.
     let parent = Uuid::from_u128(0xF00D);
+    let library = Arc::new(StubLibrary {
+        parent: Some((parent, BaseItemKind::Folder)),
+        ..StubLibrary::default()
+    });
     let (status, _) = get_with(
         Arc::clone(&library),
-        &format!("/Items/Filters2?includeItemTypes=Movie&parentId={parent}&recursive=false"),
+        &format!(
+            "/Items/Filters2?userId={USER_ID}&includeItemTypes=Series&parentId={parent}\
+             &isSeries=true&recursive=false"
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let query = library
+    let tag = library
+        .last_legacy_query
+        .lock()
+        .expect("tag query lock")
+        .clone()
+        .expect("tag names read");
+    let genre = library
         .last_genre_query
         .lock()
         .expect("genre query lock")
         .clone()
         .expect("get_genres called");
-    assert_eq!(
-        query.ancestor_ids,
-        vec![parent],
-        "recursive=false must still scope the genre aggregate to parentId"
-    );
+    assert_eq!(tag, genre);
+    assert_eq!(tag.include_item_types, vec![BaseItemKind::Series]);
+    assert!(!tag.include_owned_items);
+    assert_eq!(tag.parent_id, parent);
+    assert_eq!(tag.user_id(), Some(USER_ID));
 }
 
-#[tokio::test]
-async fn items_filters2_recursive_scopes_to_the_parent() {
-    let library = Arc::new(StubLibrary::default());
+/// Runs `/Items/Filters2` over a parent of `kind` (or an unknown parent when
+/// `None`) and returns the genre and stream-language queries the handler built.
+async fn filters2_queries(
+    kind: Option<BaseItemKind>,
+    query_suffix: &str,
+) -> (Uuid, InternalItemsQuery, InternalItemsQuery) {
     let parent = Uuid::from_u128(0xF00D);
+    let library = Arc::new(StubLibrary {
+        parent: kind.map(|kind| (parent, kind)),
+        ..StubLibrary::default()
+    });
     let (status, _) = get_with(
         Arc::clone(&library),
-        &format!("/Items/Filters2?includeItemTypes=Movie&parentId={parent}&recursive=true"),
+        &format!("/Items/Filters2?includeItemTypes=Movie&parentId={parent}{query_suffix}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let query = library
+    let genre = library
         .last_genre_query
         .lock()
         .expect("genre query lock")
         .clone()
         .expect("get_genres called");
-    assert_eq!(query.ancestor_ids, vec![parent]);
+    let stream = library
+        .last_stream_query
+        .lock()
+        .expect("stream query lock")
+        .clone()
+        .expect("stream languages read");
+    (parent, genre, stream)
 }
 
+#[rstest]
+// `(recursive ?? true) || parentItem is UserView || parentItem is
+// ICollectionFolder` (v12.2 `FilterController.cs:198`) takes the ancestor
+// scope. `BasePluginFolder` (the playlists folder) is an `ICollectionFolder`.
+#[case::recursive_folder(BaseItemKind::Folder, "&recursive=true")]
+#[case::default_recursive(BaseItemKind::Folder, "")]
+#[case::library(BaseItemKind::CollectionFolder, "&recursive=false")]
+#[case::view(BaseItemKind::UserView, "&recursive=false")]
+#[case::playlists_folder(BaseItemKind::PlaylistsFolder, "&recursive=false")]
+#[case::manual_playlists_folder(BaseItemKind::ManualPlaylistsFolder, "&recursive=false")]
+#[case::plugin_folder(BaseItemKind::BasePluginFolder, "&recursive=false")]
 #[tokio::test]
-async fn items_filters2_trailer_type_skips_the_parent() {
-    // C#: a lone Trailer/Program type set forces `parentItem = null`, so the
-    // ancestor scope stays empty even when the caller passes a parentId.
-    let library = Arc::new(StubLibrary::default());
+async fn items_filters2_scopes_to_the_parents_descendants(
+    #[case] kind: BaseItemKind,
+    #[case] query_suffix: &str,
+) {
+    let (parent, genre, stream) = filters2_queries(Some(kind), query_suffix).await;
+    for query in [&genre, &stream] {
+        assert_eq!(query.ancestor_ids, vec![parent]);
+        assert_eq!(query.parent_id, Uuid::nil());
+        assert!(!query.physical_children_only);
+    }
+}
+
+#[rstest]
+#[case::folder(BaseItemKind::Folder)]
+#[case::series(BaseItemKind::Series)]
+#[case::box_set(BaseItemKind::BoxSet)]
+// Plain `Folder` subclasses upstream, not an `ICollectionFolder`.
+#[case::aggregate_folder(BaseItemKind::AggregateFolder)]
+#[case::user_root_folder(BaseItemKind::UserRootFolder)]
+#[case::channel(BaseItemKind::Channel)]
+#[tokio::test]
+async fn items_filters2_non_recursive_scopes_to_the_parents_children(#[case] kind: BaseItemKind) {
+    // The else branch: `genreQuery.Parent = parentItem` (and the stream and tag
+    // queries alike), matched as a strict `ParentId`: the direct children only.
+    let (parent, genre, stream) = filters2_queries(Some(kind), "&recursive=false").await;
+    for query in [&genre, &stream] {
+        assert_eq!(query.parent_id, parent);
+        assert!(query.ancestor_ids.is_empty(), "{:?}", query.ancestor_ids);
+        assert!(query.physical_children_only);
+    }
+}
+
+#[rstest]
+#[case::recursive("&recursive=true")]
+#[case::non_recursive("&recursive=false")]
+#[tokio::test]
+async fn items_filters2_unknown_parent_scopes_to_nothing(#[case] query_suffix: &str) {
+    // `GetItemById` finds no item, so `parentItem` is null: the ancestor branch
+    // binds `Array.Empty<Guid>()` and the else branch `Parent = null`. Both
+    // leave the facets over everything the user can see.
+    let (_, genre, stream) = filters2_queries(None, query_suffix).await;
+    for query in [&genre, &stream] {
+        assert!(query.ancestor_ids.is_empty(), "{:?}", query.ancestor_ids);
+        assert_eq!(query.parent_id, Uuid::nil());
+    }
+}
+
+#[rstest]
+#[case::trailer("Trailer", "")]
+#[case::program("Program", "")]
+#[case::non_recursive_program("Program", "&recursive=false")]
+#[tokio::test]
+async fn items_filters2_trailer_type_skips_the_parent(
+    #[case] kind: &str,
+    #[case] query_suffix: &str,
+) {
+    // C#: a lone Trailer/Program type set forces `parentItem = null`, so no
+    // scope is set even when `parentId` names a folder that exists.
     let parent = Uuid::from_u128(0xF00D);
+    let library = Arc::new(StubLibrary {
+        parent: Some((parent, BaseItemKind::Folder)),
+        ..StubLibrary::default()
+    });
     let (status, _) = get_with(
         Arc::clone(&library),
-        &format!("/Items/Filters2?includeItemTypes=Trailer&parentId={parent}"),
+        &format!("/Items/Filters2?includeItemTypes={kind}&parentId={parent}{query_suffix}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1116,4 +1226,102 @@ async fn items_filters2_trailer_type_skips_the_parent() {
         .clone()
         .expect("get_genres called");
     assert!(query.ancestor_ids.is_empty());
+    assert_eq!(query.parent_id, Uuid::nil());
+    assert!(!query.physical_children_only);
+}
+
+/// v12.2 `FilterController.GetQueryFiltersLegacy` (`FilterController.cs:66-77`)
+/// resolves the parent through `LibraryManager.GetParentItem`, which throws
+/// `ArgumentException("Invalid parent id: …")` for an id naming no item;
+/// `ExceptionMiddleware` answers it `400`. A parent that exists is the scope.
+#[tokio::test]
+async fn items_filters_refuses_an_unknown_parent() {
+    for unknown in [Uuid::from_u128(0xBAD0), Uuid::nil()] {
+        let library = Arc::new(StubLibrary::default());
+        let (status, body) = get_with(
+            Arc::clone(&library),
+            &format!("/Items/Filters?includeItemTypes=Movie&parentId={unknown}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{unknown}");
+        // `GetItemById` throws "Guid can't be empty" for the zero id.
+        let message = if unknown.is_nil() {
+            "Guid can't be empty"
+        } else {
+            "Invalid parent id"
+        };
+        assert!(
+            String::from_utf8_lossy(&body).contains(message),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(
+            library.last_legacy_query.lock().expect("lock").is_none(),
+            "{unknown}: nothing is aggregated for an unknown parent"
+        );
+    }
+
+    let parent = Uuid::from_u128(0xF00D);
+    let library = Arc::new(StubLibrary {
+        parent: Some((parent, BaseItemKind::Folder)),
+        ..StubLibrary::default()
+    });
+    let (status, _) = get_with(
+        Arc::clone(&library),
+        &format!("/Items/Filters?includeItemTypes=Movie&parentId={parent}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let query = library
+        .last_legacy_query
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("aggregated");
+    assert_eq!(query.ancestor_ids, vec![parent]);
+}
+
+/// A lone `Trailer` or `Program` type leaves `GetQueryFiltersLegacy`'s item
+/// null (`FilterController.cs:66-72`), which is no `Folder`, so upstream
+/// answers empty filters whatever `parentId` says, an unknown one included.
+#[rstest]
+#[case::trailer("Trailer")]
+#[case::program("Program")]
+#[tokio::test]
+async fn items_filters_for_a_lone_trailer_or_program_type_are_empty(#[case] kind: &str) {
+    for parent in ["", "&parentId=0000000000000000000000000000bad0"] {
+        let library = Arc::new(StubLibrary::default());
+        let (status, body) = get_with(
+            Arc::clone(&library),
+            &format!("/Items/Filters?includeItemTypes={kind}{parent}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kind}{parent}");
+        let filters: QueryFiltersLegacy = serde_json::from_slice(&body).expect("legacy filters");
+        assert_eq!(filters, QueryFiltersLegacy::default(), "{kind}{parent}");
+        assert!(
+            library.last_legacy_query.lock().expect("lock").is_none(),
+            "{kind}{parent}: nothing is aggregated"
+        );
+    }
+}
+
+/// `/Items/Filters2` reads its parent through `GetItemById<BaseItem>`, which
+/// answers null for an id naming no item (no scope) but throws for the zero
+/// id ("Guid can't be empty"), which `ExceptionMiddleware` answers `400`
+/// (v12.2 `FilterController.cs:138-141`, `LibraryManager.cs:1689-1694`).
+#[tokio::test]
+async fn items_filters2_refuses_the_zero_parent_id() {
+    let (status, _) = get(&format!(
+        "/Items/Filters2?includeItemTypes=Movie&parentId={}",
+        Uuid::nil()
+    ))
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = get(&format!(
+        "/Items/Filters2?includeItemTypes=Movie&parentId={}",
+        Uuid::from_u128(0xBAD0)
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "an unknown id is no scope");
 }

@@ -41,6 +41,9 @@
 //!   ([`ferrofin_traits::persistence::PeopleRepository`]);
 //! - [`keyframe_repository`] — [`FerrofinKeyframeRepository`]
 //!   ([`ferrofin_traits::persistence::KeyframeRepository`]);
+//! - [`keyframe_extractors`] — the ffprobe and Matroska
+//!   [`ferrofin_traits::media_encoding::KeyframeExtractor`]s and the repository
+//!   cache in front of them;
 //! - [`linked_children_service`] — [`FerrofinLinkedChildrenService`]
 //!   ([`ferrofin_traits::persistence::LinkedChildrenService`]);
 //! - [`next_up_service`] — [`FerrofinNextUpService`]
@@ -108,8 +111,8 @@
 //!   and broadcasts server → client messages as pre-serialized JSON to each
 //!   session's attached WebSocket connections. Sibling managers (user/device/
 //!   user-data/library/DTO) plus the [`EventManager`](ferrofin_traits::events::EventManager)
-//!   are injected; idle timers, instant-mix, and live-stream reference-counting
-//!   are documented deferrals.
+//!   are injected. It also runs the idle-playback and inactive-session checks
+//!   (`StartCheckTimers`) and counts live-stream consumers per session.
 //! - [`event_manager`] — [`FerrofinEventManager`]
 //!   ([`ferrofin_traits::events::EventManager`]), the in-process publish seam: a
 //!   name-keyed [`EventConsumer`] registry replacing the C# DI-scoped
@@ -177,9 +180,12 @@ pub mod configuration_manager;
 pub mod db_error;
 pub mod device_manager;
 mod device_repository;
+mod directory_cache;
 pub mod display_preferences_manager;
+mod dot_ignore;
 pub mod dto_service;
 pub mod dynamic_images;
+mod embedded_lyrics;
 pub mod event_manager;
 pub mod external_data_manager;
 mod extra_owners_repository;
@@ -194,8 +200,10 @@ pub mod item_repository;
 pub mod item_type_lookup;
 pub mod item_visibility;
 mod item_visibility_repository;
+pub mod keyframe_extractors;
 pub mod keyframe_repository;
 pub mod kinds;
+mod latest_tv_repository;
 pub mod library_changed_notifier;
 pub mod library_manager;
 pub mod library_monitor;
@@ -210,17 +218,20 @@ pub mod media_info_resolver;
 pub mod media_segment_manager;
 pub mod media_source_manager;
 pub mod media_stream_repository;
+mod media_stream_selector;
 pub mod mount_table;
 pub mod music_manager;
 pub mod next_up_service;
 pub mod notify_watcher;
 pub mod path_manager;
 pub mod people_repository;
+pub mod playback_activity;
 pub mod playback_metrics;
 pub mod plugin_manager;
 mod query_restrictions;
 pub mod quick_connect_manager;
 use ferrofin_providers::refresh_plan;
+mod library_preference_repository;
 pub mod resolvers;
 pub mod scan_metrics;
 pub mod scan_progress;
@@ -241,6 +252,7 @@ pub mod text_util;
 pub mod translate_query;
 pub mod trickplay_manager;
 pub mod tv_series_manager;
+mod user_activity_repository;
 mod user_data_key_repository;
 pub mod user_data_keys;
 pub mod user_data_manager;
@@ -280,7 +292,9 @@ pub use external_data_manager::FerrofinExternalDataManager;
 pub use file_system::FerrofinFileSystem;
 pub use item_count_service::FerrofinItemCountService;
 pub use item_persistence_service::FerrofinItemPersistenceService;
-pub use item_repository::{ActiveRecordingSlot, ActiveRecordingSource, FerrofinItemRepository};
+pub use item_repository::{
+    ActiveRecordingSlot, ActiveRecordingSource, FerrofinItemRepository, VisibilitySlot,
+};
 pub use item_type_lookup::ItemTypeLookup;
 pub use keyframe_repository::FerrofinKeyframeRepository;
 pub use library_manager::FerrofinLibraryManager;

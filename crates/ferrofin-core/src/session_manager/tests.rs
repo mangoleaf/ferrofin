@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use ferrofin_db::Database;
 use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_db::entities::users::UserEntity;
@@ -169,20 +170,7 @@ fn library_manager(db: &Database) -> Arc<FerrofinLibraryManager> {
 
 /// Builds a session manager wired over `db` with the real sibling managers.
 fn manager(db: &Database) -> Arc<FerrofinSessionManager> {
-    let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
-        config: default_server_configuration(),
-    });
-    let library = library_manager(db);
-    Arc::new(FerrofinSessionManager::new(
-        Arc::new(FerrofinUserManager::new(db.clone())),
-        Arc::new(FerrofinDeviceManager::new(db.clone())),
-        Arc::new(FerrofinUserDataManager::new(db.clone(), config)),
-        library,
-        Arc::new(UnusedDtoService),
-        Arc::new(FerrofinEventManager::new()),
-        db.clone(),
-        "server-1".to_owned(),
-    ))
+    manager_with_events(db).0
 }
 
 /// Inserts a minimal `Users` row with the given username, returning the row.
@@ -225,7 +213,7 @@ async fn log_session_activity_creates_and_reuses_a_session() {
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
 
     let first = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", Some(&user))
         .await
         .unwrap();
     assert_eq!(first.client.as_deref(), Some("Web"));
@@ -235,11 +223,108 @@ async fn log_session_activity_creates_and_reuses_a_session() {
 
     // Same app+device → same session id (reused, not duplicated).
     let again = mgr
-        .log_session_activity("Web", "1.1", "dev-1", "Chrome", "1.2.3.4", &user)
+        .log_session_activity("Web", "1.1", "dev-1", "Chrome", "1.2.3.4", Some(&user))
         .await
         .unwrap();
     assert_eq!(first.id, again.id);
     assert_eq!(again.application_version.as_deref(), Some("1.1"));
+}
+
+/// The session id is Jellyfin's byte for byte: `GetSessionKey` is
+/// `appName + deviceId + userId.ToString("N")` (v12.2 `SessionManager.cs:481`)
+/// and the id its MD5 as a `Guid` "N". The expected id is the one Jellyfin
+/// 12.2 answered in a parity replay for this user, client and device.
+#[tokio::test]
+async fn the_session_id_is_derived_from_the_client_device_and_user() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::parse_str("8f877f4cfc08426d895fc28d2d871ee4").unwrap();
+    let user = seed_named_user(&db, user_id, "parity-user").await;
+
+    let session = mgr
+        .log_session_activity("parity", "12.2", "parity", "parity", "e", Some(&user))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.id.as_deref(),
+        Some("a870e5be90a2a7581e6e659320003bfe")
+    );
+}
+
+/// Upstream commit b1e3cf1341 (in v12.0-rc7): the client name and device id
+/// come from request headers, not from the token, so a user sending another
+/// user's pair must get a session of their own. Before, the existing session
+/// was re-attributed to the caller, who could then control the victim's
+/// player without `EnableRemoteControlOfOtherUsers`.
+#[tokio::test]
+async fn another_users_client_and_device_does_not_take_over_their_session() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let alice_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    let mallory_id = Uuid::new_v4();
+    let mallory = seed_named_user(&db, mallory_id, "mallory").await;
+
+    let victim = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "e", Some(&alice))
+        .await
+        .unwrap();
+    let intruder = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "Chrome", "e", Some(&mallory))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        victim.id, intruder.id,
+        "each user gets a session of their own"
+    );
+    assert_eq!(intruder.user_id, mallory_id);
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, victim.id);
+    assert_eq!(
+        sessions[0].user_id, alice_id,
+        "the victim's session stays theirs"
+    );
+    let refused = mgr
+        .assert_can_control(
+            intruder.id.as_deref().expect("intruder id"),
+            victim.id.as_deref().expect("victim id"),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(ServiceError::Forbidden(_))),
+        "{refused:?}"
+    );
+}
+
+/// `RequestHelpers.GetSession` logs an API-key caller's activity with no user:
+/// the session's `UserId` is `Guid.Empty`, it has no `UserName`, and it is
+/// keyed like any other, with the empty user id's 32 zeros
+/// (`{appName}{deviceId}{Guid.Empty:N}`).
+#[tokio::test]
+async fn a_session_logged_without_a_user_has_none() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+
+    let session = mgr
+        .log_session_activity("my-key", "12.2", "server-id", "Jellyfin Server", "e", None)
+        .await
+        .unwrap();
+    assert_eq!(session.user_id, Uuid::nil());
+    assert_eq!(session.user_name, None);
+    assert_eq!(session.client.as_deref(), Some("my-key"));
+    let again = mgr
+        .log_session_activity("my-key", "12.2", "server-id", "Jellyfin Server", "e", None)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.id, again.id,
+        "the same key and device reuse the session"
+    );
 }
 
 #[tokio::test]
@@ -249,7 +334,7 @@ async fn empty_device_name_falls_back_to_network_device() {
     let user = seed_named_user(&db, Uuid::new_v4(), "bob").await;
 
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-x", "", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-x", "", "e", Some(&user))
         .await
         .unwrap();
     assert_eq!(dto.device_name.as_deref(), Some("Network Device"));
@@ -273,16 +358,11 @@ async fn a_non_admin_sees_the_transcode_but_not_the_silicon() {
     );
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "viewer").await;
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.clone().unwrap();
@@ -350,7 +430,7 @@ async fn additional_users_add_and_remove() {
     let _guest = seed_named_user(&db, guest_id, "guest").await;
 
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &primary)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&primary))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -389,7 +469,7 @@ async fn adding_the_primary_user_as_additional_is_rejected() {
     let primary_id = Uuid::new_v4();
     let primary = seed_named_user(&db, primary_id, "primary").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &primary)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&primary))
         .await
         .unwrap();
     let err = mgr
@@ -405,7 +485,7 @@ async fn report_capabilities_updates_session_and_persists() {
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -440,16 +520,11 @@ async fn bus_connected_session_is_controllable_and_receives_play() {
     );
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
     let dto = mgr
-        .log_session_activity("TV App", "1.0", "dev-tv", "Living Room", "e", &user)
+        .log_session_activity("TV App", "1.0", "dev-tv", "Living Room", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -506,7 +581,7 @@ async fn report_now_viewing_rejects_bad_id() {
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let err = mgr
@@ -522,14 +597,9 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
     let mgr = manager(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
 
     let request = AuthenticationRequest {
         user_id: Some(user_id),
@@ -584,14 +654,9 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
     let mgr = manager(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "bob").await;
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
 
     let request = AuthenticationRequest {
         username: Some("bob".to_owned()),
@@ -607,14 +672,9 @@ async fn authenticate_new_session_enforces_password_and_returns_the_token() {
         mgr.authenticate_new_session(&request).await,
         Err(ServiceError::Forbidden(_))
     ));
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableRemoteAccess,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableRemoteAccess, true)
+        .await
+        .unwrap();
     let result = mgr.authenticate_new_session(&request).await.unwrap();
     assert_eq!(result.session.user_id, user_id);
     assert!(
@@ -671,14 +731,9 @@ async fn logout_by_token_ends_the_session() {
     let mgr = manager(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
     let request = AuthenticationRequest {
         user_id: Some(user_id),
         app: Some("Web".to_owned()),
@@ -708,6 +763,101 @@ async fn logout_by_token_ends_the_session() {
     assert!(matches!(err, ServiceError::Unauthorized(_)));
 }
 
+/// Signs `user` in on `device_id` (`AuthenticateDirect`), returning the token.
+async fn sign_in(mgr: &FerrofinSessionManager, user_id: Uuid, device_id: &str) -> String {
+    let request = AuthenticationRequest {
+        user_id: Some(user_id),
+        app: Some("Web".to_owned()),
+        app_version: Some("1.0".to_owned()),
+        device_id: Some(device_id.to_owned()),
+        device_name: Some(device_id.to_owned()),
+        ..AuthenticationRequest::default()
+    };
+    mgr.authenticate_direct(&request)
+        .await
+        .unwrap()
+        .access_token
+        .expose()
+        .to_owned()
+}
+
+/// Every stored device id, sorted, as the device manager lists them.
+async fn device_ids(db: &Database) -> Vec<String> {
+    use ferrofin_traits::devices::{DeviceManager, DeviceQuery};
+    let mut ids: Vec<String> = FerrofinDeviceManager::new(db.clone())
+        .get_devices(&DeviceQuery::default())
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|d| d.device_id)
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// `SessionManager.RevokeUserTokens(userId, currentAccessToken)`: every device
+/// of the user except the one holding `currentAccessToken` (compared ignoring
+/// case) is logged out (`Logout(Device)`: the device row goes and its sessions
+/// end), and nobody else's device is touched. Password change, user deletion
+/// and disabling a user all rely on it.
+#[tokio::test]
+async fn revoking_a_users_tokens_keeps_only_the_current_device() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let alice_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    let bob_id = Uuid::new_v4();
+    let bob = seed_named_user(&db, bob_id, "bob").await;
+    for user in [&alice, &bob] {
+        set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+            .await
+            .unwrap();
+    }
+    let current = sign_in(&mgr, alice_id, "alice-phone").await;
+    let other = sign_in(&mgr, alice_id, "alice-tv").await;
+    let bobs = sign_in(&mgr, bob_id, "bob-laptop").await;
+    mgr.log_session_activity("Web", "1.0", "alice-tv", "TV", "e", Some(&alice))
+        .await
+        .unwrap();
+    let on_tv = |sessions: &[SessionInfoDto]| {
+        sessions
+            .iter()
+            .any(|s| s.device_id.as_deref() == Some("alice-tv"))
+    };
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert!(on_tv(&sessions), "the TV has a live session to end");
+
+    mgr.revoke_user_tokens(alice_id, &current.to_uppercase())
+        .await
+        .unwrap();
+
+    assert_eq!(device_ids(&db).await, ["alice-phone", "bob-laptop"]);
+    for (token, device) in [(&current, "alice-phone"), (&bobs, "bob-laptop")] {
+        mgr.get_session_by_authentication_token(token, device, "e")
+            .await
+            .unwrap_or_else(|e| panic!("{device} keeps its token: {e}"));
+    }
+    let err = mgr
+        .get_session_by_authentication_token(&other, "alice-tv", "e")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ServiceError::Unauthorized(_)), "{err:?}");
+    let sessions = mgr
+        .get_sessions(alice_id, None, None, None, false)
+        .await
+        .unwrap();
+    assert!(!on_tv(&sessions), "the revoked device's session ended");
+
+    // With no current token, every device of the user goes (user deletion,
+    // and a disable through the policy).
+    mgr.revoke_user_tokens(alice_id, "").await.unwrap();
+    assert_eq!(device_ids(&db).await, ["bob-laptop"]);
+}
+
 #[tokio::test]
 async fn get_sessions_non_admin_sees_only_own() {
     let db = test_db().await;
@@ -716,10 +866,10 @@ async fn get_sessions_non_admin_sees_only_own() {
     let bob_id = Uuid::new_v4();
     let alice = seed_named_user(&db, alice_id, "alice").await;
     let bob = seed_named_user(&db, bob_id, "bob").await;
-    mgr.log_session_activity("Web", "1.0", "a", "A", "e", &alice)
+    mgr.log_session_activity("Web", "1.0", "a", "A", "e", Some(&alice))
         .await
         .unwrap();
-    mgr.log_session_activity("Web", "1.0", "b", "B", "e", &bob)
+    mgr.log_session_activity("Web", "1.0", "b", "B", "e", Some(&bob))
         .await
         .unwrap();
 
@@ -738,19 +888,14 @@ async fn get_sessions_admin_sees_all() {
     let mgr = manager(&db);
     let admin_id = Uuid::new_v4();
     let admin = seed_named_user(&db, admin_id, "admin").await;
-    set_permission(
-        db.writer(),
-        &admin.id,
-        PermissionKind::IsAdministrator,
-        true,
-    )
-    .await
-    .unwrap();
-    let other = seed_named_user(&db, Uuid::new_v4(), "other").await;
-    mgr.log_session_activity("Web", "1.0", "a", "A", "e", &admin)
+    set_permission(&db, &admin.id, PermissionKind::IsAdministrator, true)
         .await
         .unwrap();
-    mgr.log_session_activity("Web", "1.0", "b", "B", "e", &other)
+    let other = seed_named_user(&db, Uuid::new_v4(), "other").await;
+    mgr.log_session_activity("Web", "1.0", "a", "A", "e", Some(&admin))
+        .await
+        .unwrap();
+    mgr.log_session_activity("Web", "1.0", "b", "B", "e", Some(&other))
         .await
         .unwrap();
 
@@ -768,7 +913,7 @@ async fn broadcast_pushes_to_attached_connections() {
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -786,16 +931,42 @@ async fn broadcast_pushes_to_attached_connections() {
     assert_eq!(frame["MessageType"], "RestartRequired");
 }
 
-// Progress reported from one device must be pushed (`UserDataChanged`) to the
-// same user's OTHER sessions — that's what keeps resume positions in sync when
-// jumping between devices — and must not leak to other users' sessions.
+/// [`manager`] whose user-data manager announces its saves to the manager's
+/// sessions, as the composition root wires them.
+fn manager_announcing_user_data(db: &Database) -> Arc<FerrofinSessionManager> {
+    let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+        config: default_server_configuration(),
+    });
+    let user_data = Arc::new(FerrofinUserDataManager::new(db.clone(), config));
+    let mgr = Arc::new(FerrofinSessionManager::new(
+        Arc::new(FerrofinUserManager::new(db.clone())),
+        Arc::new(FerrofinDeviceManager::new(db.clone())),
+        user_data.clone(),
+        library_manager(db),
+        Arc::new(UnusedDtoService),
+        Arc::new(FerrofinEventManager::new()),
+        db.clone(),
+        "server-1".to_owned(),
+    ));
+    let sessions: Arc<dyn SessionManager> = mgr.clone();
+    user_data.set_user_data_changed_sink(Arc::new(crate::user_data_manager::SessionUserDataSink(
+        Arc::downgrade(&sessions),
+    )));
+    mgr
+}
+
+// A stop reported from one device reaches the same user's OTHER sessions as
+// `UserDataChanged`, which keeps resume positions in sync between devices, and
+// never another user's. A progress report is not announced, as upstream's
+// `UserDataChangeNotifier` skips `PlaybackProgress` saves.
 #[tokio::test]
-async fn playback_progress_pushes_user_data_changed_to_the_users_other_sessions() {
+async fn playback_stop_pushes_user_data_changed_to_the_users_other_sessions_and_progress_does_not()
+{
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::session::PlaybackProgressInfo;
 
     let db = test_db().await;
-    let mgr = manager(&db);
+    let mgr = manager_announcing_user_data(&db);
     let user_id = Uuid::new_v4();
     let user = seed_named_user(&db, user_id, "shared").await;
     let other_id = Uuid::new_v4();
@@ -805,15 +976,15 @@ async fn playback_progress_pushes_user_data_changed_to_the_users_other_sessions(
 
     // The same user on two devices, plus an unrelated user's session.
     let tv = mgr
-        .log_session_activity("wolphin", "1.0", "dev-tv", "Shield", "e", &user)
+        .log_session_activity("wolphin", "1.0", "dev-tv", "Shield", "e", Some(&user))
         .await
         .unwrap();
     let web = mgr
-        .log_session_activity("Jellyfin Web", "1.0", "dev-web", "Mac", "e", &user)
+        .log_session_activity("Jellyfin Web", "1.0", "dev-web", "Mac", "e", Some(&user))
         .await
         .unwrap();
     let other_session = mgr
-        .log_session_activity("Web", "1.0", "dev-o", "PC", "e", &other)
+        .log_session_activity("Web", "1.0", "dev-o", "PC", "e", Some(&other))
         .await
         .unwrap();
 
@@ -839,18 +1010,38 @@ async fn playback_progress_pushes_user_data_changed_to_the_users_other_sessions(
         ..PlaybackProgressInfo::default()
     };
     mgr.on_playback_progress(&info, false).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    // A progress report is never announced (`UserDataChangeNotifier`) …
+    assert_eq!(web_conn.sent_count(), 0);
 
-    // The same user's other device received the play-state push …
-    assert_eq!(web_conn.sent_count(), 1);
-    let frame: serde_json::Value =
-        serde_json::from_slice(&web_conn.sent.lock().unwrap()[0]).unwrap();
-    assert_eq!(frame["MessageType"], "UserDataChanged");
-    assert_eq!(frame["Data"]["UserId"], user_id.simple().to_string());
+    let stop = ferrofin_model::session::PlaybackStopInfo {
+        session_id: tv.id.clone(),
+        item_id,
+        position_ticks: Some(2000),
+        ..ferrofin_model::session::PlaybackStopInfo::default()
+    };
+    mgr.on_playback_stopped(&stop).await.unwrap();
+    // … the stop is, to the same user's other device, once its batch window
+    // closes (polled up to a deadline, so a loaded host does not fail it) …
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while web_conn.sent_count() == 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let frames: Vec<serde_json::Value> = web_conn
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|raw| serde_json::from_slice(raw).unwrap())
+        .filter(|frame: &serde_json::Value| frame["MessageType"] == "UserDataChanged")
+        .collect();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["Data"]["UserId"], user_id.simple().to_string());
     assert_eq!(
-        frame["Data"]["UserDataList"][0]["ItemId"],
+        frames[0]["Data"]["UserDataList"][0]["ItemId"],
         item_id.simple().to_string()
     );
-    // … and the unrelated user's session did not.
+    // … and the unrelated user's session hears nothing.
     assert_eq!(other_conn.sent_count(), 0);
 }
 
@@ -860,7 +1051,7 @@ async fn send_message_command_accepts_any_existing_session() {
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -891,7 +1082,7 @@ async fn report_session_ended_removes_the_session() {
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.unwrap();
@@ -969,6 +1160,19 @@ impl ferrofin_traits::library::UserDataManager for CountingUserData {
             .update_play_state(user_id, item_id, reported_position_ticks)
             .await
     }
+    async fn update_play_progress(
+        &self,
+        user_id: Uuid,
+        item_id: Uuid,
+        reported_position_ticks: Option<i64>,
+        streams: ferrofin_traits::library::ReportedStreams,
+    ) -> Result<bool, ServiceError> {
+        self.play_state_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner
+            .update_play_progress(user_id, item_id, reported_position_ticks, streams)
+            .await
+    }
     async fn mark_played(
         &self,
         user_id: Uuid,
@@ -1020,12 +1224,11 @@ fn manager_counting(
     ))
 }
 
-// A progress report still persists play state when the user has no session that
-// could receive the `UserDataChanged` push — but it must not pay the extra
-// `UserData` read to build a message nobody can receive. Playstate progress is
-// the hottest write in the server, so that read is per-report waste.
+// A progress report persists play state and pays no `UserData` read for a
+// push, with or without a session listening: progress is the hottest write in
+// the server, and upstream announces no progress save.
 #[tokio::test]
-async fn progress_without_a_listening_session_skips_the_push_read() {
+async fn progress_reports_pay_no_read_for_a_push() {
     use ferrofin_model::data::BaseItemKind;
     use ferrofin_model::session::PlaybackProgressInfo;
 
@@ -1042,7 +1245,7 @@ async fn progress_without_a_listening_session_skips_the_push_read() {
     let item_id = Uuid::new_v4();
     crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
     let session = mgr
-        .log_session_activity("Web", "1.0", "dev-solo", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-solo", "TV", "e", Some(&user))
         .await
         .unwrap();
     let info = PlaybackProgressInfo {
@@ -1052,13 +1255,11 @@ async fn progress_without_a_listening_session_skips_the_push_read() {
         ..PlaybackProgressInfo::default()
     };
 
-    // No WebSocket, no bus sink: the push would reach nobody.
     mgr.on_playback_progress(&info, false).await.unwrap();
     assert_eq!(counting.play_state_writes(), 1, "the write still happens");
-    assert_eq!(counting.dto_reads(), 0, "no push means no read for it");
+    assert_eq!(counting.dto_reads(), 0);
 
-    // Attach a socket to that same session: the push is deliverable again and
-    // the read is paid for exactly one message.
+    // A socket on that same session changes nothing.
     let conn = FakeConnection::new(AuthorizationInfo::default());
     mgr.add_web_socket(
         session.id.as_deref().unwrap(),
@@ -1068,8 +1269,110 @@ async fn progress_without_a_listening_session_skips_the_push_read() {
     .unwrap();
     mgr.on_playback_progress(&info, false).await.unwrap();
     assert_eq!(counting.play_state_writes(), 2);
-    assert_eq!(counting.dto_reads(), 1);
-    assert_eq!(conn.sent_count(), 1);
+    assert_eq!(counting.dto_reads(), 0);
+    assert_eq!(conn.sent_count(), 0);
+}
+
+/// "Remember audio/subtitle selections": a progress report saves the tracks
+/// the user picked, so the next play of the item starts on them
+/// (`OnPlaybackProgress` → `UpdatePlaybackSettings`, v12.2
+/// SessionManager.cs:971-1055, with jellyfin#16501, #16769 and #17044):
+/// - a reported index is saved while its setting is on;
+/// - a report carrying no index keeps the saved one;
+/// - a report with no position but a new index still saves it;
+/// - with a setting off, a stored index is cleared, and a reported index of
+///   that kind resets both of the user's remembered tracks for the item.
+#[tokio::test]
+async fn progress_remembers_the_reported_audio_and_subtitle_tracks() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackProgressInfo;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "linguist").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-tracks", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let report =
+        |position: Option<i64>, audio: Option<i32>, subtitle: Option<i32>| PlaybackProgressInfo {
+            session_id: session.id.clone(),
+            item_id,
+            position_ticks: position,
+            audio_stream_index: audio,
+            subtitle_stream_index: subtitle,
+            ..PlaybackProgressInfo::default()
+        };
+    // The remembered tracks as playback reads them back
+    // (`GetUserData(user, item)`'s `AudioStreamIndex`/`SubtitleStreamIndex`).
+    let remembered = || {
+        let db = db.clone();
+        async move {
+            use ferrofin_traits::library::UserDataManager as _;
+            let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+                config: default_server_configuration(),
+            });
+            FerrofinUserDataManager::new(db, config)
+                .get_stream_default_data(item_id, user_id)
+                .await
+                .expect("remembered tracks")
+        }
+    };
+    let set_remember = |audio: bool, subtitles: bool| {
+        let db = db.clone();
+        async move {
+            let users = FerrofinUserManager::new(db);
+            let mut row = users.get_user_by_id(user_id).await.unwrap().unwrap();
+            row.remember_audio_selections = audio;
+            row.remember_subtitle_selections = subtitles;
+            users.update_user(&row).await.unwrap();
+        }
+    };
+
+    mgr.on_playback_progress(&report(Some(1000), Some(2), Some(3)), false)
+        .await
+        .unwrap();
+    assert_eq!(remembered().await, (Some(2), Some(3)), "both saved");
+
+    mgr.on_playback_progress(&report(Some(2000), None, None), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        remembered().await,
+        (Some(2), Some(3)),
+        "no index keeps them"
+    );
+
+    mgr.on_playback_progress(&report(None, Some(4), None), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        remembered().await,
+        (Some(4), Some(3)),
+        "saved without a position"
+    );
+
+    set_remember(false, true).await;
+    mgr.on_playback_progress(&report(Some(3000), None, None), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        remembered().await,
+        (None, Some(3)),
+        "audio off clears audio"
+    );
+
+    mgr.on_playback_progress(&report(Some(4000), Some(1), Some(5)), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        remembered().await,
+        (None, None),
+        "an audio index with audio off resets both, as upstream"
+    );
 }
 
 /// A media-source manager that records every `close_live_stream` id. Only the
@@ -1151,7 +1454,7 @@ async fn stopping_playback_closes_the_reported_live_stream() {
     );
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let session = mgr
-        .log_session_activity("Web", "1.0", "dev-live", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-live", "TV", "e", Some(&user))
         .await
         .unwrap();
 
@@ -1168,9 +1471,10 @@ async fn stopping_playback_closes_the_reported_live_stream() {
         "a report without a live stream id closes nothing"
     );
 
-    // A stream this session never reported playing is not its to release
-    // (upstream's `_activeLiveStreamSessions` has no mapping, so
-    // `liveStreamNeedsToBeClosed` stays false).
+    // A stream no session registered (its start and progress reports did not
+    // name it) is closed by the stop that does: upstream's
+    // `_activeLiveStreamSessions` has no entry for it, and the `else` branch
+    // sets `liveStreamNeedsToBeClosed`.
     mgr.on_playback_stopped(&PlaybackStopInfo {
         session_id: session.id.clone(),
         item_id: Uuid::nil(),
@@ -1179,21 +1483,29 @@ async fn stopping_playback_closes_the_reported_live_stream() {
     })
     .await
     .unwrap();
-    assert!(
-        sources.closed.lock().expect("closed mutex").is_empty(),
-        "an unregistered live stream closes nothing"
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["never-started".to_owned()],
+        "an unregistered live stream is closed once"
     );
 
-    // Playback start registers the holder; the stop then releases it.
-    mgr.on_playback_start(&ferrofin_model::session::PlaybackStartInfo {
-        session_id: session.id.clone(),
-        item_id: Uuid::nil(),
-        live_stream_id: Some("live-42".to_owned()),
-        play_session_id: Some("play-42".to_owned()),
-        ..ferrofin_model::session::PlaybackStartInfo::default()
-    })
-    .await
-    .unwrap();
+    // Playback start registers the holder; the stop then releases it. A second
+    // viewer holds the same stream, so its entry outlives this viewer's.
+    let other = mgr
+        .log_session_activity("Web", "1.0", "dev-live-2", "TV 2", "e", Some(&user))
+        .await
+        .unwrap();
+    for (holder, play) in [(&session, "play-42"), (&other, "play-other")] {
+        mgr.on_playback_start(&ferrofin_model::session::PlaybackStartInfo {
+            session_id: holder.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("live-42".to_owned()),
+            play_session_id: Some(play.to_owned()),
+            ..ferrofin_model::session::PlaybackStartInfo::default()
+        })
+        .await
+        .unwrap();
+    }
     mgr.on_playback_stopped(&PlaybackStopInfo {
         session_id: session.id.clone(),
         item_id: Uuid::nil(),
@@ -1204,21 +1516,113 @@ async fn stopping_playback_closes_the_reported_live_stream() {
     .unwrap();
     assert_eq!(
         *sources.closed.lock().expect("closed mutex"),
-        vec!["live-42".to_owned()],
+        vec!["never-started".to_owned(), "live-42".to_owned()],
         "the reported live stream is closed exactly once"
     );
 
     // The same viewer under its OTHER id (the play session) must not release a
-    // second consumer — that is what would tear the tuner out from under
-    // another viewer of the same channel.
+    // second consumer while the stream still has a holder — that is what would
+    // tear the tuner out from under the other viewer of the same channel.
     mgr.close_live_stream_if_needed("live-42", "play-42")
         .await
         .unwrap();
     assert_eq!(
         sources.closed.lock().expect("closed mutex").len(),
-        1,
+        2,
         "one viewer releases once, however many of its ids report"
     );
+}
+
+/// A release for a live stream no session registered closes it (C#
+/// `CloseLiveStreamIfNeededAsync`'s `else { liveStreamNeedsToBeClosed = true; }`,
+/// from jellyfin#17178 in 12.0-rc2). This is the transcode teardown of a
+/// vanished client whose play-state reports never named the stream: the
+/// releaser passes the job's play-session id, or nothing when the job has none.
+/// Without the close the tuner stays open until a restart.
+#[tokio::test]
+async fn a_live_stream_no_session_registered_is_closed() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let db = test_db().await;
+        let sources = Arc::new(RecordingMediaSources {
+            closed: Mutex::new(Vec::new()),
+        });
+        let mgr = manager_recording_releases(&db, &sources);
+
+        mgr.close_live_stream_if_needed("live-job", "play-job")
+            .await
+            .unwrap();
+        assert_eq!(
+            *sources.closed.lock().expect("closed mutex"),
+            vec!["live-job".to_owned()],
+            "a teardown release of an unregistered stream closes it once"
+        );
+
+        mgr.close_live_stream_if_needed("live-job2", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            *sources.closed.lock().expect("closed mutex"),
+            vec!["live-job".to_owned(), "live-job2".to_owned()],
+            "a job without a play session closes its unregistered stream once"
+        );
+    })
+    .await
+    .expect("the test finished in time");
+}
+
+/// The case the holder map guards: a stream registered by one viewer is not
+/// closed by a release under an id that is not among its holders (C#
+/// `activeSessionMappings.TryRemove` fails, so `liveStreamNeedsToBeClosed`
+/// stays false). The holder's own release still closes it.
+#[tokio::test]
+async fn a_release_by_a_stranger_does_not_close_a_registered_stream() {
+    use ferrofin_model::session::{PlaybackStartInfo, PlaybackStopInfo};
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let db = test_db().await;
+        let sources = Arc::new(RecordingMediaSources {
+            closed: Mutex::new(Vec::new()),
+        });
+        let mgr = manager_recording_releases(&db, &sources);
+        let user = seed_named_user(&db, Uuid::new_v4(), "bob").await;
+        let bob = mgr
+            .log_session_activity("Web", "1.0", "dev-bob", "TV", "e", Some(&user))
+            .await
+            .unwrap();
+        mgr.on_playback_start(&PlaybackStartInfo {
+            session_id: bob.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("shared".to_owned()),
+            play_session_id: Some("play-bob".to_owned()),
+            ..PlaybackStartInfo::default()
+        })
+        .await
+        .unwrap();
+
+        mgr.close_live_stream_if_needed("shared", "stranger")
+            .await
+            .unwrap();
+        assert!(
+            sources.closed.lock().expect("closed mutex").is_empty(),
+            "a release by an id that holds nothing closes nothing"
+        );
+
+        mgr.on_playback_stopped(&PlaybackStopInfo {
+            session_id: bob.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("shared".to_owned()),
+            ..PlaybackStopInfo::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *sources.closed.lock().expect("closed mutex"),
+            vec!["shared".to_owned()],
+            "the holder's own stop closes it"
+        );
+    })
+    .await
+    .expect("the test finished in time");
 }
 
 /// Two viewers of one channel: the first to stop must not close the stream the
@@ -1241,11 +1645,11 @@ async fn one_viewer_stopping_does_not_release_another_viewers_stream() {
     );
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let alice = mgr
-        .log_session_activity("Web", "1.0", "dev-a", "TV A", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-a", "TV A", "e", Some(&user))
         .await
         .unwrap();
     let bob = mgr
-        .log_session_activity("Web", "1.0", "dev-b", "TV B", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-b", "TV B", "e", Some(&user))
         .await
         .unwrap();
 
@@ -1297,6 +1701,469 @@ async fn one_viewer_stopping_does_not_release_another_viewers_stream() {
     assert_eq!(sources.closed.lock().expect("closed mutex").len(), 2);
 }
 
+/// A manager whose live-stream releases `sources` records.
+fn manager_recording_releases(
+    db: &Database,
+    sources: &Arc<RecordingMediaSources>,
+) -> Arc<FerrofinSessionManager> {
+    Arc::new(
+        Arc::try_unwrap(manager(db))
+            .expect("sole owner")
+            .with_media_sources(
+                Arc::clone(sources) as Arc<dyn ferrofin_traits::library::MediaSourceManager>
+            ),
+    )
+}
+
+/// C# `OnPlaybackStopped` resolves the reported item with `GetNowPlayingItem`,
+/// which is null for an id the library no longer has (a channel a guide
+/// refresh dropped mid-play, an item deleted while it played). Nothing is
+/// saved for it, but the live stream is still released and the stop succeeds.
+#[tokio::test]
+async fn a_stop_for_an_item_the_library_no_longer_has_still_releases_the_live_stream() {
+    use ferrofin_model::session::{PlaybackStartInfo, PlaybackStopInfo};
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = manager_recording_releases(&db, &sources);
+    let user = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-gone", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let gone = Uuid::new_v4();
+    crate::test_support::seed_item(&db, gone, ferrofin_model::data::BaseItemKind::Movie).await;
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id: gone,
+        live_stream_id: Some("live-gone".to_owned()),
+        play_session_id: Some("play-gone".to_owned()),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    // The row goes while it plays.
+    crate::FerrofinItemPersistenceService::new(db.clone())
+        .delete_items(&[gone])
+        .await
+        .unwrap();
+
+    let stopped = mgr
+        .on_playback_stopped(&PlaybackStopInfo {
+            session_id: session.id.clone(),
+            item_id: gone,
+            live_stream_id: Some("live-gone".to_owned()),
+            position_ticks: Some(1000),
+            ..PlaybackStopInfo::default()
+        })
+        .await;
+    assert!(stopped.is_ok(), "{stopped:?}");
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["live-gone".to_owned()]
+    );
+}
+
+/// A stop whose save fails (here the session's user was deleted mid-play, where
+/// C# `GetUsers` throws) still releases the live stream and publishes, then
+/// returns the error. Upstream skips the release then, which leaks the tuner.
+#[tokio::test]
+async fn a_stop_whose_save_fails_still_releases_the_live_stream_and_returns_the_error() {
+    use ferrofin_model::session::{PlaybackStartInfo, PlaybackStopInfo};
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = manager_recording_releases(&db, &sources);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "leaving").await;
+    // The last user cannot be deleted.
+    seed_named_user(&db, Uuid::new_v4(), "staying").await;
+    let item = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item, ferrofin_model::data::BaseItemKind::Movie).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-err", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id: item,
+        live_stream_id: Some("live-err".to_owned()),
+        play_session_id: Some("play-err".to_owned()),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    FerrofinUserManager::new(db.clone())
+        .delete_user(user_id)
+        .await
+        .unwrap();
+
+    let stopped = mgr
+        .on_playback_stopped(&PlaybackStopInfo {
+            session_id: session.id.clone(),
+            item_id: item,
+            live_stream_id: Some("live-err".to_owned()),
+            position_ticks: Some(1000),
+            ..PlaybackStopInfo::default()
+        })
+        .await;
+    assert!(
+        matches!(stopped, Err(ServiceError::NotFound(_))),
+        "{stopped:?}"
+    );
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["live-err".to_owned()],
+        "the live stream is released before the error is returned"
+    );
+}
+
+/// C# `OnPlaybackStart` and `OnPlaybackProgress` guard their per-user save the
+/// same way (`if (libraryItem is not null)`): a report for an item the library
+/// does not have succeeds and saves nothing.
+#[tokio::test]
+async fn start_and_progress_for_an_item_the_library_does_not_have_save_nothing() {
+    use ferrofin_model::session::{PlaybackProgressInfo, PlaybackStartInfo};
+    use ferrofin_traits::library::UserDataManager as _;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "viewer").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-none", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let unknown = Uuid::new_v4();
+
+    let started = mgr
+        .on_playback_start(&PlaybackStartInfo {
+            session_id: session.id.clone(),
+            item_id: unknown,
+            ..PlaybackStartInfo::default()
+        })
+        .await;
+    assert!(started.is_ok(), "{started:?}");
+    let progressed = mgr
+        .on_playback_progress(
+            &PlaybackProgressInfo {
+                session_id: session.id.clone(),
+                item_id: unknown,
+                position_ticks: Some(1000),
+                ..PlaybackProgressInfo::default()
+            },
+            false,
+        )
+        .await;
+    assert!(progressed.is_ok(), "{progressed:?}");
+    let user_data = FerrofinUserDataManager::new(
+        db.clone(),
+        Arc::new(FixedConfig {
+            config: default_server_configuration(),
+        }),
+    );
+    // An item without a stored row reads as the empty row.
+    let data = user_data
+        .get_user_data_dto(unknown, user_id)
+        .await
+        .unwrap()
+        .expect("the empty row");
+    assert_eq!(
+        (
+            data.play_count,
+            data.playback_position_ticks,
+            data.last_played_date
+        ),
+        (0, 0, None),
+        "nothing was saved"
+    );
+}
+
+/// C# `OnPlaybackStopped` refuses a negative position (stalled clients report
+/// one): it releases the live stream first, so no tuner leaks, then throws
+/// before anything is saved. The resume point the last progress report left
+/// stays.
+#[tokio::test]
+async fn a_stop_at_a_negative_position_releases_the_live_stream_and_keeps_the_resume_point() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
+    use ferrofin_traits::library::UserDataManager as _;
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = manager_recording_releases(&db, &sources);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "viewer").await;
+    let item = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item, BaseItemKind::Movie).await;
+    let mut row = crate::test_support::fetch_item(&db, item).await;
+    row.run_time_ticks = Some(72_000_000_000);
+    crate::test_support::save_item(&db, &row).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-neg", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id: item,
+        live_stream_id: Some("live-neg".to_owned()),
+        play_session_id: Some("play-neg".to_owned()),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    let halfway = 36_000_000_000;
+    mgr.on_playback_progress(
+        &PlaybackProgressInfo {
+            session_id: session.id.clone(),
+            item_id: item,
+            position_ticks: Some(halfway),
+            ..PlaybackProgressInfo::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+
+    let stopped = mgr
+        .on_playback_stopped(&PlaybackStopInfo {
+            session_id: session.id.clone(),
+            item_id: item,
+            live_stream_id: Some("live-neg".to_owned()),
+            position_ticks: Some(-1),
+            ..PlaybackStopInfo::default()
+        })
+        .await;
+    assert!(
+        matches!(stopped, Err(ServiceError::InvalidInput(_))),
+        "{stopped:?}"
+    );
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["live-neg".to_owned()],
+        "the live stream is released before the stop is refused"
+    );
+    // Refused before `RemoveNowPlayingItem`: only automatic progress stopped.
+    let snapshot = mgr
+        .get_session_snapshot(session.id.as_deref().expect("session id"))
+        .await
+        .unwrap();
+    assert_eq!(
+        (snapshot.now_playing_item_id, snapshot.is_playing),
+        (Some(item), false)
+    );
+    let user_data = FerrofinUserDataManager::new(
+        db.clone(),
+        Arc::new(FixedConfig {
+            config: default_server_configuration(),
+        }),
+    );
+    let resume = user_data
+        .get_user_data_dto(item, user_id)
+        .await
+        .unwrap()
+        .map_or(0, |data| data.playback_position_ticks);
+    assert_eq!(resume, halfway, "nothing is saved for a refused stop");
+}
+
+/// C# `CloseIfNeededAsync`: when a session's last socket closes, the live
+/// stream it was playing (`PlayState.LiveStreamId`) is released before the
+/// session ends, so a client that vanishes without a stop does not hold its
+/// tuner until a restart.
+#[tokio::test]
+async fn the_last_socket_closing_releases_the_sessions_live_stream() {
+    use ferrofin_model::session::PlaybackStartInfo;
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = manager_recording_releases(&db, &sources);
+    let user = seed_named_user(&db, Uuid::new_v4(), "vanishing").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-vanish", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let session_id = session.id.clone().expect("session id");
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("live-vanish".to_owned()),
+        play_session_id: Some("play-vanish".to_owned()),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+
+    mgr.close_if_needed(&session_id).await.unwrap();
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["live-vanish".to_owned()]
+    );
+    assert!(
+        mgr.get_session_snapshot(&session_id).await.is_err(),
+        "the session ended"
+    );
+}
+
+/// What the last socket closing does not release: a stream a stop already
+/// released (the session's play state no longer names it), and nothing at
+/// all for a logout (C# `ReportSessionEnded`, which only ends the session).
+#[tokio::test]
+async fn a_logout_or_an_already_stopped_stream_is_not_released_on_session_end() {
+    use ferrofin_model::session::{PlaybackStartInfo, PlaybackStopInfo};
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = manager_recording_releases(&db, &sources);
+    let user = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let start = |session: &SessionInfoDto, stream: &str| PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some(stream.to_owned()),
+        play_session_id: Some(format!("play-{stream}")),
+        ..PlaybackStartInfo::default()
+    };
+
+    let logged_out = mgr
+        .log_session_activity("Web", "1.0", "dev-out", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    mgr.on_playback_start(&start(&logged_out, "live-out"))
+        .await
+        .unwrap();
+    mgr.report_session_ended(logged_out.id.as_deref().expect("id"))
+        .await
+        .unwrap();
+    assert!(
+        sources.closed.lock().expect("closed mutex").is_empty(),
+        "a logout releases nothing"
+    );
+
+    let stopped = mgr
+        .log_session_activity("Web", "1.0", "dev-stop", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    mgr.on_playback_start(&start(&stopped, "live-stop"))
+        .await
+        .unwrap();
+    mgr.on_playback_stopped(&PlaybackStopInfo {
+        session_id: stopped.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("live-stop".to_owned()),
+        ..PlaybackStopInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        mgr.get_session_snapshot(stopped.id.as_deref().expect("id"))
+            .await
+            .unwrap()
+            .now_playing_live_stream_id,
+        None,
+        "a stop clears the session's live stream (C# `RemoveNowPlayingItem`)"
+    );
+    mgr.close_if_needed(stopped.id.as_deref().expect("id"))
+        .await
+        .unwrap();
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["live-stop".to_owned()],
+        "released once, by the stop"
+    );
+}
+
+/// The session's live stream is what the latest report names (C#
+/// `PlayState.LiveStreamId = info.LiveStreamId`), so a progress report
+/// without one clears it. A stop refused for its negative position releases
+/// the stream and keeps the play state, so the socket closing afterwards
+/// releases it again: the refused stop emptied the stream's holders, and C#
+/// `CloseLiveStreamIfNeededAsync` closes a stream with no holder entry. The
+/// second close finds no consumer left unless an unregistered viewer shares it.
+#[tokio::test]
+async fn the_sessions_live_stream_follows_the_reports() {
+    use ferrofin_model::session::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
+
+    let db = test_db().await;
+    let sources = Arc::new(RecordingMediaSources {
+        closed: Mutex::new(Vec::new()),
+    });
+    let mgr = manager_recording_releases(&db, &sources);
+    let user = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-follow", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let session_id = session.id.clone().expect("session id");
+    let stream = |mgr: &Arc<FerrofinSessionManager>| {
+        let mgr = Arc::clone(mgr);
+        let session_id = session_id.clone();
+        async move {
+            mgr.get_session_snapshot(&session_id)
+                .await
+                .unwrap()
+                .now_playing_live_stream_id
+        }
+    };
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id: Uuid::nil(),
+        live_stream_id: Some("live-follow".to_owned()),
+        play_session_id: Some("play-follow".to_owned()),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(stream(&mgr).await.as_deref(), Some("live-follow"));
+    mgr.on_playback_progress(
+        &PlaybackProgressInfo {
+            session_id: session.id.clone(),
+            item_id: Uuid::nil(),
+            ..PlaybackProgressInfo::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stream(&mgr).await, None, "a report without one clears it");
+
+    mgr.on_playback_progress(
+        &PlaybackProgressInfo {
+            session_id: session.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("live-follow".to_owned()),
+            ..PlaybackProgressInfo::default()
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    let refused = mgr
+        .on_playback_stopped(&PlaybackStopInfo {
+            session_id: session.id.clone(),
+            item_id: Uuid::nil(),
+            live_stream_id: Some("live-follow".to_owned()),
+            position_ticks: Some(-1),
+            ..PlaybackStopInfo::default()
+        })
+        .await;
+    assert!(matches!(refused, Err(ServiceError::InvalidInput(_))));
+    mgr.close_if_needed(&session_id).await.unwrap();
+    assert_eq!(
+        *sources.closed.lock().expect("closed mutex"),
+        vec!["live-follow".to_owned(), "live-follow".to_owned()],
+        "released by the refused stop, then by the socket closing, as upstream"
+    );
+}
+
 /// A session recreated after its previous one ended (the socket closed, or an
 /// explicit logout) inherits the device's last reported capabilities — C#
 /// `OnSessionStarted` → `ReportCapabilities(info, _deviceManager.GetCapabilities
@@ -1310,7 +2177,7 @@ async fn a_recreated_session_inherits_the_devices_capabilities() {
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
     let dto = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     let session_id = dto.id.clone().unwrap();
@@ -1341,7 +2208,7 @@ async fn a_recreated_session_inherits_the_devices_capabilities() {
 
     // The client's next request recreates it — same id, capabilities intact.
     let again = mgr
-        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
     assert_eq!(again.id.as_deref(), Some(session_id.as_str()));
@@ -1420,7 +2287,7 @@ async fn cast_target(
     device_id: &str,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
     let session_id = mgr
-        .log_session_activity("Web", "1.0", device_id, "TV", "e", user)
+        .log_session_activity("Web", "1.0", device_id, "TV", "e", Some(user))
         .await
         .unwrap()
         .id
@@ -1463,32 +2330,29 @@ async fn seed_ancestor(db: &Database, child: Uuid, parent: Uuid) {
         .expect("set ancestors");
 }
 
-/// Sets an item's `SortName` through the production writer — the fixture insert
-/// leaves it NULL, which makes a `SortName` ordering assertion meaningless.
+/// Sets an item's `SortName` through the production repository save, which
+/// keeps a key the caller supplies (the scanner's path) — the fixture insert
+/// leaves it NULL, which makes a `SortName` ordering assertion meaningless. Not
+/// through `LibraryManager::update_items`: an edit's save re-derives the key
+/// from the name, as upstream's does.
 async fn set_sort_name(db: &Database, id: Uuid, sort_name: &str) {
-    let library = library_manager(db);
-    let mut row = library
+    let mut row = library_manager(db)
         .get_item_by_id(id)
         .await
         .expect("load item")
         .expect("item present");
     row.sort_name = Some(sort_name.to_owned());
-    library
-        .update_items(std::slice::from_ref(&row), None)
+    FerrofinItemPersistenceService::new(db.clone())
+        .save_items(std::slice::from_ref(&row))
         .await
         .expect("set sort name");
 }
 
 /// Grants the playback permission `GetPlayAccess` gates every cast on.
 async fn allow_playback(db: &Database, user: &UserEntity) {
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableMediaPlayback,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(db, &user.id, PermissionKind::EnableMediaPlayback, true)
+        .await
+        .unwrap();
 }
 
 /// A `PlayNow` cast of exactly these ids.
@@ -2022,7 +2886,7 @@ async fn casting_stamps_the_controlling_user_on_play_and_playstate() {
     let controller_id = Uuid::new_v4();
     let controller = seed_named_user(&db, controller_id, "controller").await;
     set_permission(
-        db.writer(),
+        &db,
         &controller.id,
         PermissionKind::EnableRemoteControlOfOtherUsers,
         true,
@@ -2033,7 +2897,14 @@ async fn casting_stamps_the_controlling_user_on_play_and_playstate() {
     allow_playback(&db, &target_user).await;
 
     let controlling_session = mgr
-        .log_session_activity("Web", "1.0", "dev-controller", "Phone", "e", &controller)
+        .log_session_activity(
+            "Web",
+            "1.0",
+            "dev-controller",
+            "Phone",
+            "e",
+            Some(&controller),
+        )
         .await
         .unwrap()
         .id
@@ -2196,14 +3067,9 @@ async fn concurrent_logins_cannot_exceed_max_active_sessions() {
         )
         .await
         .unwrap();
-    set_permission(
-        db.writer(),
-        &user.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
 
     let logins = 16;
     let gate = Arc::new(tokio::sync::Barrier::new(logins));
@@ -2318,7 +3184,7 @@ async fn remote_control_permission_gates_delivery_and_saved_changes() {
     let alice_id = Uuid::parse_str(&alice.id).unwrap();
     let bob = seed_named_user(&db, Uuid::new_v4(), "target").await;
     let controller = mgr
-        .log_session_activity("Web", "1", "control", "Control", "e", &alice)
+        .log_session_activity("Web", "1", "control", "Control", "e", Some(&alice))
         .await
         .unwrap()
         .id
@@ -2330,7 +3196,7 @@ async fn remote_control_permission_gates_delivery_and_saved_changes() {
     };
     for enabled in [false, true, false] {
         set_permission(
-            db.writer(),
+            &db,
             &alice.id,
             PermissionKind::EnableRemoteControlOfOtherUsers,
             enabled,
@@ -2344,14 +3210,9 @@ async fn remote_control_permission_gates_delivery_and_saved_changes() {
         assert_eq!(result.is_ok(), enabled);
         assert_eq!(received.lock().unwrap().len(), usize::from(enabled));
     }
-    set_permission(
-        db.writer(),
-        &alice.id,
-        PermissionKind::IsAdministrator,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &alice.id, PermissionKind::IsAdministrator, true)
+        .await
+        .unwrap();
     assert!(
         matches!(
             mgr.assert_can_control(&controller, &target).await,
@@ -2386,14 +3247,9 @@ async fn shared_device_filter_uses_the_requested_user_and_device_access() {
     let (mgr, bus) = cast_manager(&db);
     let alice = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
     let id = Uuid::parse_str(&alice.id).unwrap();
-    set_permission(
-        db.writer(),
-        &alice.id,
-        PermissionKind::EnableAllDevices,
-        true,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &alice.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
     let (own, _) = cast_target(&mgr, bus.as_ref(), &alice, "own").await;
     mgr.report_capabilities(
         &own,
@@ -2422,7 +3278,7 @@ async fn shared_device_filter_uses_the_requested_user_and_device_access() {
     bus.register(public.clone(), Box::new(|_| {}));
     for enabled in [false, true, false] {
         set_permission(
-            db.writer(),
+            &db,
             &alice.id,
             PermissionKind::EnableSharedDeviceControl,
             enabled,
@@ -2454,14 +3310,9 @@ async fn shared_device_filter_uses_the_requested_user_and_device_access() {
             .unwrap()
             .is_empty()
     );
-    set_permission(
-        db.writer(),
-        &alice.id,
-        PermissionKind::EnableAllDevices,
-        false,
-    )
-    .await
-    .unwrap();
+    set_permission(&db, &alice.id, PermissionKind::EnableAllDevices, false)
+        .await
+        .unwrap();
     assert!(
         mgr.get_sessions(id, None, None, Some(id), false)
             .await
@@ -2502,7 +3353,7 @@ async fn progress_is_kept_against_the_version_the_media_source_names() {
         crate::test_support::save_item(&db, &row).await;
     }
     let session = mgr
-        .log_session_activity("Web", "1.0", "dev-v", "TV", "e", &user)
+        .log_session_activity("Web", "1.0", "dev-v", "TV", "e", Some(&user))
         .await
         .unwrap();
     let report = |source: Uuid, ticks: i64| PlaybackProgressInfo {
@@ -2545,4 +3396,523 @@ async fn progress_is_kept_against_the_version_the_media_source_names() {
         "no version of it: the item"
     );
     assert_eq!(position(stranger).await, 0);
+}
+
+/// A session recreated mid-playback (a restart, a WebSocket-close session end,
+/// a relogin) only ever receives progress reports: the client never resends
+/// PlaybackStart. C# `OnPlaybackProgress` → `UpdateNowPlayingItem` restores the
+/// now-playing item from the first one, and keeps the first pause's date.
+#[tokio::test]
+async fn progress_alone_restores_the_now_playing_item() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackProgressInfo;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "viewer").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-recreated", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    assert!(!mgr.has_active_playback().await.unwrap());
+
+    let paused = PlaybackProgressInfo {
+        session_id: session.id.clone(),
+        item_id,
+        position_ticks: Some(1000),
+        is_paused: true,
+        ..PlaybackProgressInfo::default()
+    };
+    mgr.on_playback_progress(&paused, false).await.unwrap();
+    assert!(
+        mgr.has_active_playback().await.unwrap(),
+        "progress names the now-playing item"
+    );
+    let id = session.id.as_deref().unwrap();
+    let first = mgr.get_session_snapshot(id).await.unwrap();
+    assert_eq!(first.now_playing_item_id, Some(item_id));
+    assert!(
+        super::session_info_to_dto(&first)
+            .play_state
+            .unwrap()
+            .can_seek
+    );
+    let paused_since = first
+        .last_paused_date
+        .expect("a paused report dates the pause");
+
+    // A later paused report keeps the date the pause began.
+    mgr.on_playback_progress(&paused, false).await.unwrap();
+    let again = mgr.get_session_snapshot(id).await.unwrap();
+    assert_eq!(again.last_paused_date, Some(paused_since));
+}
+
+/// The rest of C# `UpdateNowPlayingItem`: an item the library cannot resolve
+/// and a report without an item leave nothing playing, and an automated report
+/// does not count as a check-in.
+#[tokio::test]
+async fn progress_names_only_items_the_library_knows() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackProgressInfo;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "viewer").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-unknown", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let id = session.id.as_deref().unwrap();
+    let report = |item_id| PlaybackProgressInfo {
+        session_id: session.id.clone(),
+        item_id,
+        ..PlaybackProgressInfo::default()
+    };
+
+    // The user-data write then rejects the unknown item; only the session
+    // state matters here.
+    let _ = mgr
+        .on_playback_progress(&report(Uuid::new_v4()), false)
+        .await;
+    assert!(!mgr.has_active_playback().await.unwrap(), "unknown item");
+
+    mgr.on_playback_progress(&report(item_id), false)
+        .await
+        .unwrap();
+    assert!(mgr.has_active_playback().await.unwrap());
+    let checked_in = mgr
+        .get_session_snapshot(id)
+        .await
+        .unwrap()
+        .last_playback_check_in;
+
+    mgr.on_playback_progress(&report(item_id), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        mgr.get_session_snapshot(id)
+            .await
+            .unwrap()
+            .last_playback_check_in,
+        checked_in,
+        "an automated report is no check-in"
+    );
+
+    mgr.on_playback_progress(&report(Uuid::nil()), false)
+        .await
+        .unwrap();
+    assert!(
+        !mgr.has_active_playback().await.unwrap(),
+        "no item reported"
+    );
+}
+
+/// `LogSessionActivity` (`SessionManager.cs:244-292`) stamps the signed-in
+/// user's `LastActivityDate` when the user's own date is more than a minute
+/// old (never set counts as old), and not again within the minute, even
+/// though the caller still holds the entity it read before the stamp, as a
+/// request served from the auth cache does. A user active within the minute
+/// is left as is.
+#[tokio::test]
+async fn session_activity_stamps_the_users_last_activity_at_most_once_a_minute() {
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let users = crate::user_manager::FerrofinUserManager::new(db.clone());
+    let stored = |id: Uuid| {
+        let users = &users;
+        async move {
+            users
+                .get_user_by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_activity_date
+        }
+    };
+
+    let alice_id = Uuid::new_v4();
+    let alice = seed_named_user(&db, alice_id, "alice").await;
+    assert_eq!(alice.last_activity_date, None);
+    let before = chrono::Utc::now();
+    mgr.log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", Some(&alice))
+        .await
+        .unwrap();
+    let stamped = stored(alice_id).await.expect("stamped");
+    assert!(
+        stamped >= before - chrono::Duration::seconds(1),
+        "{stamped}"
+    );
+
+    let row_version = || async {
+        users
+            .get_user_by_id(alice_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .row_version
+    };
+    let written = row_version().await;
+    mgr.log_session_activity("Web", "1.0", "dev-1", "Chrome", "1.2.3.4", Some(&alice))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored(alice_id).await,
+        Some(stamped),
+        "not again within the minute"
+    );
+    assert_eq!(row_version().await, written, "no write at all");
+
+    let bob_id = Uuid::new_v4();
+    let mut bob = seed_named_user(&db, bob_id, "bob").await;
+    bob.last_activity_date = Some(chrono::Utc::now() - chrono::Duration::seconds(10));
+    mgr.log_session_activity("Web", "1.0", "dev-2", "Chrome", "1.2.3.4", Some(&bob))
+        .await
+        .unwrap();
+    assert_eq!(stored(bob_id).await, None, "active within the minute");
+}
+
+// ---- idle and inactive playback (C# `CheckForIdlePlayback` / `CheckForInactiveSteams`).
+
+/// A session manager over `db` with its event manager exposed, for recording
+/// what it publishes.
+fn manager_with_events(db: &Database) -> (Arc<FerrofinSessionManager>, Arc<FerrofinEventManager>) {
+    let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+        config: default_server_configuration(),
+    });
+    let events = Arc::new(FerrofinEventManager::new());
+    let mgr = Arc::new(FerrofinSessionManager::new(
+        Arc::new(FerrofinUserManager::new(db.clone())),
+        Arc::new(FerrofinDeviceManager::new(db.clone())),
+        Arc::new(FerrofinUserDataManager::new(db.clone(), config)),
+        library_manager(db),
+        Arc::new(UnusedDtoService),
+        Arc::clone(&events) as Arc<dyn ferrofin_traits::events::EventManager>,
+        db.clone(),
+        "server-1".to_owned(),
+    ));
+    (mgr, events)
+}
+
+/// Records the payloads published as `event`.
+fn record_event(events: &FerrofinEventManager, event: &str) -> Arc<Mutex<Vec<serde_json::Value>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    events.subscribe(
+        event,
+        Arc::new(move |payload: &str| {
+            sink.lock()
+                .unwrap()
+                .push(serde_json::from_str(payload).expect("event payload"));
+            crate::event_manager::consumer_done()
+        }),
+    );
+    seen
+}
+
+/// A user's session playing a seeded movie from `position_ticks`, `paused` or
+/// not. Returns the session id and the item id.
+async fn playing_session(
+    db: &Database,
+    mgr: &FerrofinSessionManager,
+    device: &str,
+    position_ticks: Option<i64>,
+    paused: bool,
+) -> (String, Uuid, Uuid) {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackStartInfo;
+
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(db, user_id, &format!("user-{device}")).await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(db, item_id, BaseItemKind::Movie).await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", device, "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    let session_id = session.id.unwrap();
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: Some(session_id.clone()),
+        item_id,
+        media_source_id: Some(item_id.simple().to_string()),
+        position_ticks,
+        is_paused: paused,
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    (session_id, item_id, user_id)
+}
+
+/// Moves a session's last playback check-in back to `at`.
+async fn checked_in_at(mgr: &FerrofinSessionManager, session_id: &str, at: DateTime<Utc>) {
+    let mut sessions = mgr.sessions.lock().await;
+    let session = sessions
+        .values_mut()
+        .find(|s| s.id == session_id)
+        .expect("session");
+    session.last_playback_check_in = at;
+}
+
+/// When the session last did something (`LastActivityDate`).
+async fn activity_of(mgr: &FerrofinSessionManager, session_id: &str) -> DateTime<Utc> {
+    mgr.sessions
+        .lock()
+        .await
+        .values()
+        .find(|s| s.id == session_id)
+        .expect("session")
+        .last_activity_date
+}
+
+/// Moves the start of a session's pause back to `at`.
+async fn paused_since(mgr: &FerrofinSessionManager, session_id: &str, at: DateTime<Utc>) {
+    let mut sessions = mgr.sessions.lock().await;
+    let session = sessions
+        .values_mut()
+        .find(|s| s.id == session_id)
+        .expect("session");
+    session.last_paused_date = Some(at);
+}
+
+/// `IdlePlaybackTests.CheckForIdlePlayback_StopsAtLastClientReportedPosition`:
+/// a session that has not checked in for more than five minutes is stopped at
+/// the position the client last reported, `null` when it reported none.
+#[rstest::rstest]
+#[case(None, None)]
+#[case(Some(123_456_789), Some(123_456_789))]
+#[tokio::test]
+async fn idle_playback_stops_at_the_last_client_reported_position(
+    #[case] client_position_ticks: Option<i64>,
+    #[case] expected_position_ticks: Option<i64>,
+) {
+    let db = test_db().await;
+    let (mgr, events) = manager_with_events(&db);
+    let stopped = record_event(&events, "PlaybackStopped");
+    let (session_id, item_id, _) =
+        playing_session(&db, &mgr, "dev-idle", client_position_ticks, false).await;
+    let now = Utc::now();
+    checked_in_at(&mgr, &session_id, now - chrono::Duration::seconds(301)).await;
+    let active_before = activity_of(&mgr, &session_id).await;
+
+    mgr.check_for_idle_playback(now).await;
+
+    // Only the client's own requests mark the session active, as upstream:
+    // the server stopping it does not.
+    assert_eq!(activity_of(&mgr, &session_id).await, active_before);
+
+    let stopped = stopped.lock().unwrap().clone();
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(stopped[0]["SessionId"], session_id.as_str());
+    assert_eq!(stopped[0]["ItemId"], serde_json::json!(item_id));
+    assert_eq!(
+        stopped[0]["PositionTicks"],
+        serde_json::json!(expected_position_ticks)
+    );
+    assert!(!mgr.has_active_playback().await.unwrap());
+}
+
+/// `TotalMinutes > 5`: a session that checked in five minutes ago, or that is
+/// not playing, is left alone.
+#[tokio::test]
+async fn a_recent_check_in_or_no_playback_is_not_idle() {
+    let db = test_db().await;
+    let (mgr, events) = manager_with_events(&db);
+    let stopped = record_event(&events, "PlaybackStopped");
+    let (session_id, _, _) = playing_session(&db, &mgr, "dev-recent", Some(10), false).await;
+    let user = seed_named_user(&db, Uuid::new_v4(), "browsing").await;
+    let browsing = mgr
+        .log_session_activity("Web", "1.0", "dev-browse", "TV", "e", Some(&user))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let now = Utc::now();
+    checked_in_at(&mgr, &session_id, now - chrono::Duration::minutes(5)).await;
+    checked_in_at(&mgr, &browsing, now - chrono::Duration::hours(1)).await;
+
+    mgr.check_for_idle_playback(now).await;
+
+    assert!(stopped.lock().unwrap().is_empty());
+    assert!(mgr.has_active_playback().await.unwrap());
+}
+
+/// The idle stop reports the media source the client last named, so the
+/// position is kept against the version that was playing, as a client's own
+/// stop would (`GetProgressItem`), and the session forgets the source.
+#[tokio::test]
+async fn an_idle_stop_keeps_the_position_against_the_version_played() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::PlaybackStartInfo;
+    use ferrofin_traits::library::UserDataManager as _;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "viewer").await;
+    let (primary, version) = (Uuid::new_v4(), Uuid::new_v4());
+    for id in [primary, version] {
+        crate::test_support::seed_item(&db, id, BaseItemKind::Movie).await;
+        let mut row = crate::test_support::fetch_item(&db, id).await;
+        row.run_time_ticks = Some(72_000_000_000);
+        if id == version {
+            row.owner_id = Some(guid_to_db(primary));
+            row.primary_version_id = Some(guid_to_db(primary));
+        }
+        crate::test_support::save_item(&db, &row).await;
+    }
+    let session_id = mgr
+        .log_session_activity("Web", "1.0", "dev-version", "TV", "e", Some(&user))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let halfway = 36_000_000_000;
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: Some(session_id.clone()),
+        item_id: primary,
+        media_source_id: Some(version.simple().to_string()),
+        position_ticks: Some(halfway),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    let now = Utc::now();
+    checked_in_at(&mgr, &session_id, now - chrono::Duration::minutes(6)).await;
+
+    mgr.check_for_idle_playback(now).await;
+
+    let user_data = FerrofinUserDataManager::new(
+        db.clone(),
+        Arc::new(FixedConfig {
+            config: default_server_configuration(),
+        }),
+    );
+    let position = |id: Uuid| {
+        let user_data = &user_data;
+        async move {
+            user_data
+                .get_user_data_dto(id, user_id)
+                .await
+                .unwrap()
+                .map_or(0, |d| d.playback_position_ticks)
+        }
+    };
+    assert_eq!(position(version).await, halfway, "the version played");
+    assert_eq!(position(primary).await, 0, "not the item shown");
+    let sessions = mgr.sessions.lock().await;
+    let session = sessions
+        .values()
+        .find(|s| s.id == session_id)
+        .expect("session");
+    assert!(session.now_playing_item_id.is_none());
+    assert!(session.now_playing_media_source_id.is_none());
+}
+
+/// One tick of the loop: the inactive check only with a threshold above 0,
+/// the idle check only on every fifth minute.
+#[tokio::test]
+async fn each_minute_runs_the_checks_that_are_due() {
+    let db = test_db().await;
+    let (mgr, events) = manager_with_events(&db);
+    let stopped = record_event(&events, "PlaybackStopped");
+    let (idle_id, _, _) = playing_session(&db, &mgr, "dev-tick-idle", Some(1), false).await;
+    let (paused_id, _, _) = playing_session(&db, &mgr, "dev-tick-paused", Some(2), true).await;
+    let connection = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(
+        &paused_id,
+        connection.clone() as Arc<dyn WebSocketConnection>,
+    )
+    .await
+    .unwrap();
+    let now = Utc::now();
+    checked_in_at(&mgr, &idle_id, now - chrono::Duration::minutes(6)).await;
+    checked_in_at(&mgr, &paused_id, now).await;
+    paused_since(&mgr, &paused_id, now - chrono::Duration::hours(1)).await;
+    let stops_sent = |connection: &FakeConnection| {
+        connection
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| {
+                serde_json::from_slice::<serde_json::Value>(frame).unwrap()["MessageType"]
+                    == "Playstate"
+            })
+            .count()
+    };
+
+    // Minute 4, no threshold: neither check runs.
+    mgr.run_playback_checks_at(4, 0, now).await;
+    assert!(stopped.lock().unwrap().is_empty());
+    assert_eq!(stops_sent(&connection), 0);
+
+    // Minute 4 with a threshold: only the inactive check.
+    mgr.run_playback_checks_at(4, 30, now).await;
+    assert!(stopped.lock().unwrap().is_empty());
+    assert_eq!(stops_sent(&connection), 1);
+
+    // Minute 5: the idle check too.
+    mgr.run_playback_checks_at(5, 0, now).await;
+    assert_eq!(stopped.lock().unwrap().len(), 1);
+    assert_eq!(stops_sent(&connection), 1);
+}
+
+/// `CheckForInactiveSteams`: a session paused longer than
+/// `InactiveSessionThreshold` minutes is sent a `Stop` at its position, as
+/// from itself.
+#[tokio::test]
+async fn a_session_paused_past_the_threshold_is_told_to_stop() {
+    let db = test_db().await;
+    let (mgr, _) = manager_with_events(&db);
+    let (session_id, _, user_id) = playing_session(&db, &mgr, "dev-paused", Some(42), true).await;
+    let connection = FakeConnection::new(AuthorizationInfo::default());
+    mgr.add_web_socket(
+        &session_id,
+        connection.clone() as Arc<dyn WebSocketConnection>,
+    )
+    .await
+    .unwrap();
+    let now = Utc::now();
+    let playstates = |connection: &FakeConnection| -> Vec<serde_json::Value> {
+        connection
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|frame| serde_json::from_slice::<serde_json::Value>(frame).unwrap())
+            .filter(|frame| frame["MessageType"] == "Playstate")
+            .collect()
+    };
+
+    // Paused nine minutes against a ten-minute threshold: nothing.
+    paused_since(&mgr, &session_id, now - chrono::Duration::minutes(9)).await;
+    mgr.check_for_inactive_streams(10, now).await;
+    assert!(playstates(&connection).is_empty());
+
+    // Past it: one `Stop`, at the paused position, from the session's user.
+    paused_since(&mgr, &session_id, now - chrono::Duration::minutes(11)).await;
+    mgr.check_for_inactive_streams(10, now).await;
+    let sent = playstates(&connection);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["Data"]["Command"], "Stop");
+    assert_eq!(sent[0]["Data"]["SeekPositionTicks"], 42);
+    assert_eq!(
+        sent[0]["Data"]["ControllingUserId"],
+        user_id.simple().to_string()
+    );
+}
+
+/// Upstream's idle timer fires every five minutes; the one-minute loop runs
+/// the idle check on every fifth tick.
+#[test]
+fn the_idle_check_runs_every_fifth_minute() {
+    let due: Vec<u64> = (1..=12)
+        .filter(|&minute| super::idle_check_due(minute))
+        .collect();
+    assert_eq!(due, [5, 10]);
 }

@@ -125,6 +125,12 @@ pub struct MetadataRefreshOptions {
     /// opening an item for playback with a probe allowed does
     /// (`MediaSourceManager.GetPlaybackMediaSources`).
     pub enable_remote_content_probe: bool,
+    /// `ImageRefreshOptions.IsAutomated`: `true` (the default) for a scan,
+    /// `false` only for `POST /Items/{itemId}/Refresh`
+    /// (`ItemRefreshController.cs:86`). A refresh that is not automated also
+    /// refreshes each album's artists known only by name
+    /// (`MusicAlbum.RefreshAllMetadata`, `MusicAlbum.cs:212-215`).
+    pub is_automated: bool,
 }
 
 impl Default for MetadataRefreshOptions {
@@ -140,6 +146,8 @@ impl Default for MetadataRefreshOptions {
             force_save: false,
             regenerate_trickplay: false,
             enable_remote_content_probe: false,
+            // `ImageRefreshOptions()` sets `IsAutomated = true`.
+            is_automated: true,
         }
     }
 }
@@ -147,8 +155,9 @@ impl Default for MetadataRefreshOptions {
 impl MetadataRefreshOptions {
     /// The options `POST /Items/{itemId}/Refresh` refreshes with — port of
     /// `ItemRefreshController.RefreshItem` (`ItemRefreshController.cs:76-89`):
-    /// `ForceSave` for a full refresh of either kind or any replace, and
-    /// `RemoveOldMetadata` exactly when replacing all metadata.
+    /// `ForceSave` for a full refresh of either kind or any replace,
+    /// `RemoveOldMetadata` exactly when replacing all metadata, and
+    /// `IsAutomated = false`.
     #[must_use]
     pub fn for_item_refresh(
         metadata_refresh_mode: MetadataRefreshMode,
@@ -170,6 +179,7 @@ impl MetadataRefreshOptions {
                 || replace_all_metadata,
             regenerate_trickplay,
             enable_remote_content_probe: false,
+            is_automated: false,
         }
     }
 }
@@ -270,6 +280,31 @@ pub trait ProviderManager: Send + Sync {
         image_type: ImageType,
         image_index: Option<i32>,
     ) -> Result<(), ServiceError>;
+
+    /// The local copy of a remote image row's `path`, downloaded into the
+    /// server's remote-image cache on first use.
+    ///
+    /// Port of the download half of `LibraryManager.ConvertImageToLocal`,
+    /// which `ImageController` calls for an image that is not a local file and
+    /// `GuideManager.PreCacheImages` calls ahead of time: `path` may hold
+    /// several `|`-separated URLs, tried in order. Upstream then rewrites the
+    /// row to the downloaded file. Ferrofin leaves the row at its URL and
+    /// keeps the file in a cache keyed by the URL, because the Live TV
+    /// refresh compares a row's path with the listing's URL to tell whether
+    /// its artwork changed: a rewritten row never matches again, so every
+    /// refresh would re-download every logo and guide image.
+    ///
+    /// The default has no cache.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when no URL could be downloaded as an image,
+    /// or no cache is wired. The error never names the URL: tuner and guide
+    /// image URLs can carry credentials, and the image routes repeat it.
+    async fn cached_remote_image(&self, path: &str) -> Result<String, ServiceError> {
+        let _ = path;
+        Err(ServiceError::backend("no remote image cache is wired"))
+    }
 
     /// Stores caller-supplied image bytes for an item.
     async fn save_image(
@@ -547,6 +582,43 @@ pub trait DynamicMetadataProvider: Send + Sync {
 }
 
 fn _assert_object_safe_dynamic_metadata_provider(_: &dyn DynamicMetadataProvider) {}
+
+/// The providers that draw an item's Primary from other items' artwork: a
+/// genre's, music genre's or playlist's collage, a photo album's or folder's
+/// copied image.
+///
+/// Port of upstream's `BaseDynamicImageProvider<T>` family as an item refresh
+/// runs it: an `ICustomMetadataProvider` that is also an `IForcedProvider` and
+/// an `IHasItemChangeMonitor` (`MetadataService.GetProviders`). The library
+/// scan calls the implementation directly; this is the seam the provider
+/// manager, below it in the crate graph, reaches it through.
+#[async_trait]
+pub trait GeneratedImageProvider: Send + Sync {
+    /// `FetchAsync` for one item: draws its Primary and reports
+    /// [`ItemUpdateType::ImageUpdate`], or reports [`ItemUpdateType::None`] for
+    /// a kind no provider supports, a Primary outside the item's metadata
+    /// folder (remote, or a local file elsewhere, such as an upload saved
+    /// beside a genre's or playlist's path), or an item with nothing to draw
+    /// from.
+    ///
+    /// `force` is the refresh's `runAllProviders`; without it the provider
+    /// draws only when its `HasChanged` gate opens (no Primary yet, or the
+    /// generated file changed on disk). The caller skips a locked item, as
+    /// `MetadataService.RefreshWithProviders` does: the provider itself does
+    /// not look at the lock.
+    ///
+    /// # Errors
+    ///
+    /// A repository read/write failure, an unwritable art folder, or a
+    /// collage the image processor could not composite.
+    async fn refresh_generated_image(
+        &self,
+        item: &ferrofin_db::entities::base_items::BaseItemEntity,
+        force: bool,
+    ) -> Result<ItemUpdateType, ServiceError>;
+}
+
+fn _assert_object_safe_generated_image_provider(_: &dyn GeneratedImageProvider) {}
 
 #[cfg(test)]
 mod tests {

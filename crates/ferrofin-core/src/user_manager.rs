@@ -47,7 +47,7 @@ use sqlx::{Sqlite, SqliteExecutor};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::UserManager;
+use ferrofin_traits::library::{PolicyGuardState, PolicySaved, UserManager, policy_update_refusal};
 use ferrofin_traits::security::AuthenticationManager;
 
 use crate::auth_providers::{
@@ -57,7 +57,7 @@ use crate::auth_providers::{
 use crate::db_error::db_err;
 use crate::user_entity_ext::{
     has_permission, is_parental_schedule_allowed, seed_defaults, set_permission, set_permission_tx,
-    set_preference, set_preference_tx,
+    set_preference_tx,
 };
 
 /// The C# type name of the default password-reset provider, stored on
@@ -106,9 +106,9 @@ pub struct FerrofinUserManager {
     /// (update/delete, password, policy, configuration) so cached auth can
     /// never outlive a change to what it authorizes.
     auth_cache: Arc<crate::auth_cache::AuthCache>,
-    /// The directory user profile images are written under
-    /// (`{dir}/{userId}/profile{ext}`). Set by the composition root; `None`
-    /// rejects uploads until a directory is configured.
+    /// The directory user profile images are written under — upstream's
+    /// `UserConfigurationDirectoryPath` (`{dir}/{Username}/profile{ext}`). Set by
+    /// the composition root; `None` rejects uploads until a directory is configured.
     profile_image_dir: Option<DirectoryPath>,
     image_processor: Option<Arc<dyn ferrofin_traits::drawing::ImageProcessor>>,
 }
@@ -122,6 +122,20 @@ impl std::fmt::Debug for FerrofinUserManager {
 }
 
 impl FerrofinUserManager {
+    /// After a committed write to user rows: drops every cached token
+    /// resolution and every user's cached policy rows
+    /// ([`Database::invalidate_all_user_policies`]).
+    fn users_changed(&self) {
+        self.auth_cache.clear();
+        self.db.invalidate_all_user_policies();
+    }
+
+    /// After a committed write to `user_id`'s rows alone.
+    fn user_changed(&self, user_id: &str) {
+        self.auth_cache.invalidate_user(user_id);
+        self.db.invalidate_user_policy(user_id);
+    }
+
     /// Creates a user manager over the given database with only the built-in
     /// [`DefaultAuthenticationProvider`] registered.
     #[must_use]
@@ -214,7 +228,7 @@ impl FerrofinUserManager {
                     .await
                     .map_err(db_err)?;
                 id.clone_into(&mut user.authentication_provider_id);
-                self.auth_cache.clear();
+                self.users_changed();
             }
             return Ok((resolved, true));
         }
@@ -232,9 +246,9 @@ impl FerrofinUserManager {
             .login_attempts_before_lockout
             .is_some_and(|max| attempts >= max)
         {
-            set_permission(self.db.writer(), &user.id, PermissionKind::IsDisabled, true).await?;
+            set_permission(&self.db, &user.id, PermissionKind::IsDisabled, true).await?;
             // A locked-out account's cached auth must not outlive the lock.
-            self.auth_cache.clear();
+            self.users_changed();
             tracing::warn!(
                 username = %user.username,
                 user_id = %user.id,
@@ -260,7 +274,10 @@ impl FerrofinUserManager {
             .execute(self.db.writer())
             .await
             .map_err(db_err)?;
-        self.auth_cache.clear();
+        // Only this user's row changed (a lockout cleared everything above);
+        // a wholesale clear here would let a stream of wrong passwords for one
+        // account keep every other user's cached auth cold.
+        self.user_changed(&user.id);
         tracing::warn!(
             username = %user.username,
             user_id = %user.id,
@@ -364,6 +381,24 @@ impl FerrofinUserManager {
             .or_else(|| apps.first().map(|app| app.id.clone()))
     }
 
+    /// The `CastReceiverId` a configuration save stores, `None` to keep the
+    /// stored one. Port of `UpdateConfigurationAsync`: only a non-empty id
+    /// naming a configured receiver application (ordinal) is taken. Without a
+    /// configuration seam there is no list to check, and the id is taken as
+    /// [`Self::resolve_cast_receiver_id`] echoes it.
+    async fn accepted_cast_receiver_id<'a>(&self, sent: Option<&'a str>) -> Option<&'a str> {
+        let sent = sent.filter(|id| !id.is_empty())?;
+        let Some(config) = &self.config else {
+            return Some(sent);
+        };
+        let configured = config.configuration().await.ok()?;
+        configured
+            .cast_receiver_applications
+            .iter()
+            .any(|app| app.id == sent)
+            .then_some(sent)
+    }
+
     /// Attaches the activity-log seam so an account lockout is recorded as a
     /// dashboard Alert.
     #[must_use]
@@ -383,7 +418,8 @@ impl FerrofinUserManager {
         self
     }
 
-    /// Sets the directory user profile images are stored under, enabling
+    /// Sets the directory user profile images are stored under (the user
+    /// configuration directory, `{config}/users`), enabling
     /// [`save_profile_image`](ferrofin_traits::library::UserManager::save_profile_image).
     #[must_use]
     pub fn with_profile_image_dir(mut self, dir: impl Into<DirectoryPath>) -> Self {
@@ -412,6 +448,51 @@ impl FerrofinUserManager {
             .fetch_optional(executor)
             .await
             .map_err(db_err)
+    }
+
+    /// Moves a user's profile image from `{dir}/{old_name}/` to `{dir}/{new_name}/`
+    /// and rebases its `ImageInfos` row on `conn` (the rename's transaction). An
+    /// image stored anywhere else (an adopted path, the earlier
+    /// `{metadata}/users/{id}/` layout) stays put. Returns `(from, to)` when a file
+    /// moved, so the caller can move it back if the transaction fails.
+    async fn move_profile_image_on(
+        &self,
+        conn: &mut sqlx::SqliteConnection,
+        user_id: Uuid,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, ServiceError> {
+        let Some(base) = &self.profile_image_dir else {
+            return Ok(None);
+        };
+        let base = base.resolve();
+        let user_id = guid_to_db(user_id);
+        let image = user_repository::profile_image(&mut *conn, &user_id)
+            .await
+            .map_err(db_err)?;
+        let Some(from) = image.map(|i| std::path::PathBuf::from(i.path)) else {
+            return Ok(None);
+        };
+        let Some(file_name) = from
+            .file_name()
+            .filter(|_| from.parent() == Some(base.join(old_name).as_path()))
+        else {
+            return Ok(None);
+        };
+        let to_dir = base.join(new_name);
+        let to = to_dir.join(file_name);
+        user_repository::set_profile_image_path(&mut *conn, &user_id, &to.to_string_lossy())
+            .await
+            .map_err(db_err)?;
+        tokio::fs::create_dir_all(&to_dir)
+            .await
+            .map_err(|e| ServiceError::backend(format!("create profile-image dir: {e}")))?;
+        match tokio::fs::rename(&from, &to).await {
+            Ok(()) => Ok(Some((from, to))),
+            // The row named a missing file; it now names the new home instead.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ServiceError::backend(format!("move profile image: {e}"))),
+        }
     }
 
     /// Fetches a user row by id, or `None`.
@@ -493,6 +574,123 @@ impl FerrofinUserManager {
         .map_err(db_err)
     }
 
+    /// Port of `UserManager.UpdatePolicyAsync`: the `Users` columns, every
+    /// permission flag, the access schedules (replaced wholesale) and the
+    /// list-valued preferences the policy carries, in one transaction.
+    ///
+    /// With `guarded`, `UserController.UpdateUserPolicy`'s guards
+    /// ([`policy_update_refusal`]) are read inside that transaction first, as
+    /// `delete_user`'s are: they are invariants over every user, and read from
+    /// the pool they were a check-then-act, so two administrators demoting or
+    /// disabling each other at once could both pass and leave the server with
+    /// no administrator or no enabled user. The single writer connection makes
+    /// the in-transaction read unovertakeable. Upstream has the same race.
+    async fn save_policy(
+        &self,
+        user_id: Uuid,
+        policy: &UserPolicy,
+        guarded: bool,
+    ) -> Result<PolicySaved, ServiceError> {
+        let id = guid_to_db(user_id);
+        let login_lock = self.login_lock(&id);
+        let _login_guard = login_lock.lock().await;
+        self.require_user(user_id).await?;
+
+        // "The default number of login attempts is 3, but for some god forsaken
+        // reason it's sent to the server as 0": -1 → unlimited (NULL), 0 → 3.
+        let max_login_attempts: Option<i64> = match policy.login_attempts_before_lockout {
+            -1 => None,
+            0 => Some(3),
+            n => Some(i64::from(n)),
+        };
+
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let was_disabled = has_permission(&mut *tx, &id, PermissionKind::IsDisabled).await?;
+        if guarded {
+            let state = PolicyGuardState {
+                was_administrator: has_permission(&mut *tx, &id, PermissionKind::IsAdministrator)
+                    .await?,
+                was_disabled,
+                administrators: Self::admin_count_on(&mut *tx).await?,
+                enabled_users: user_repository::enabled_count(&mut *tx)
+                    .await
+                    .map_err(db_err)?,
+            };
+            if let Some(refusal) = policy_update_refusal(state, policy) {
+                return Err(ServiceError::Forbidden(refusal.to_owned()));
+            }
+        }
+        sqlx::query(
+            r#"UPDATE "Users" SET
+                "MaxActiveSessions" = ?2, "MaxParentalRatingScore" = ?3,
+                "MaxParentalRatingSubScore" = ?4, "LoginAttemptsBeforeLockout" = ?5,
+                "EnableUserPreferenceAccess" = ?6, "InvalidLoginAttemptCount" = ?7,
+                "RemoteClientBitrateLimit" = ?8, "AuthenticationProviderId" = ?9,
+                "PasswordResetProviderId" = ?10, "SyncPlayAccess" = ?11,
+                "RowVersion" = "RowVersion" + 1
+               WHERE "Id" = ?1"#,
+        )
+        .bind(&id)
+        .bind(i64::from(policy.max_active_sessions))
+        .bind(policy.max_parental_rating.map(i64::from))
+        .bind(policy.max_parental_sub_rating.map(i64::from))
+        .bind(max_login_attempts)
+        .bind(policy.enable_user_preference_access)
+        .bind(i64::from(policy.invalid_login_attempt_count))
+        .bind(i64::from(policy.remote_client_bitrate_limit))
+        .bind(&policy.authentication_provider_id)
+        .bind(&policy.password_reset_provider_id)
+        .bind(policy.sync_play_access.json_value())
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+
+        for (kind, value) in policy_permissions(policy) {
+            set_permission_tx(&mut tx, &id, kind, value).await?;
+        }
+
+        crate::access_schedule_repository::replace_tx(&mut tx, &id, &policy.access_schedules)
+            .await?;
+
+        // `policy.BlockUnratedItems ?? Array.Empty<UnratedItem>()` and the six
+        // list preferences; each stored as the delimited value list C# writes.
+        let unrated: Vec<String> = policy
+            .block_unrated_items
+            .iter()
+            .map(|u| u.json_name().into_owned())
+            .collect();
+        let guids = |ids: &[Uuid]| ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+        for (kind, values) in [
+            (PreferenceKind::BlockUnratedItems, unrated),
+            (PreferenceKind::BlockedTags, policy.blocked_tags.clone()),
+            (PreferenceKind::AllowedTags, policy.allowed_tags.clone()),
+            (
+                PreferenceKind::EnabledChannels,
+                guids(&policy.enabled_channels),
+            ),
+            (
+                PreferenceKind::EnabledDevices,
+                policy.enabled_devices.clone(),
+            ),
+            (
+                PreferenceKind::EnabledFolders,
+                guids(&policy.enabled_folders),
+            ),
+            (
+                PreferenceKind::EnableContentDeletionFromFolders,
+                policy.enable_content_deletion_from_folders.clone(),
+            ),
+        ] {
+            set_preference_tx(&mut tx, &id, kind, &values).await?;
+        }
+        // One `SaveChangesAsync`: all or nothing.
+        tx.commit().await.map_err(db_err)?;
+        self.users_changed();
+        Ok(PolicySaved {
+            newly_disabled: policy.is_disabled && !was_disabled,
+        })
+    }
+
     /// The next legacy `InternalId` (C# `max(InternalId) + 1`), from any
     /// executor. Read inside the insert's transaction so two concurrent
     /// creations cannot mint the same id.
@@ -565,6 +763,8 @@ impl FerrofinUserManager {
         seed_defaults(&mut tx, &id_str).await?;
         configure(&mut tx, &id_str).await?;
         tx.commit().await.map_err(db_err)?;
+        // A read for this id before it existed may have cached empty policy rows.
+        self.db.invalidate_user_policy(&id_str);
 
         self.require_user(id).await
     }
@@ -582,20 +782,26 @@ fn provider_id(name: &str) -> &str {
     }
 }
 
-/// Validates a username against the C# `ValidUsernameRegex`
-/// (`^(?!\s)[\w \-'._@+]+(?<!\s)$`) plus the `.`/`..` exclusions, without a
-/// regex engine: allowed characters are word characters (Unicode alphanumerics
-/// or `_`), space, and any of `- ' . _ @ +`; it must be non-empty, must not
-/// start or end with whitespace, and must not be `.` or `..`.
+/// The C# `ValidUsernameRegex` (`^(?!\s)[\w\ \-'._@+]+(?<!\s)$`,
+/// `UserManager.cs:119`) without its lookarounds, which [`valid_username`]
+/// checks itself. .NET's `\w` is `[\p{L}\p{Mn}\p{Nd}\p{Pc}]`, narrower than
+/// Rust's: it has no other numerics (`²`, `½`, `Ⅻ`) and no spacing marks.
+static VALID_USERNAME: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[\p{L}\p{Mn}\p{Nd}\p{Pc} \-'._@+]+$")
+        .expect("ValidUsernameRegex pattern is valid")
+});
+
+/// Validates a username against the C# `ValidUsernameRegex` plus the
+/// `.`/`..` exclusions (`ThrowIfInvalidUsername`, `UserManager.cs:965`): word
+/// characters, space and any of `- ' . _ @ +`, not starting or ending with a
+/// space. One divergence: .NET's `$` also matches before a final newline, so
+/// upstream admits `"alice\n"`; Ferrofin does not.
 fn valid_username(name: &str) -> bool {
-    if name.is_empty() || name == "." || name == ".." {
-        return false;
-    }
-    if name.starts_with(char::is_whitespace) || name.ends_with(char::is_whitespace) {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '_' | ' ' | '-' | '\'' | '.' | '@' | '+'))
+    VALID_USERNAME.is_match(name)
+        && !name.starts_with(' ')
+        && !name.ends_with(' ')
+        && name != "."
+        && name != ".."
 }
 
 /// Validates a username or returns [`ServiceError::InvalidInput`] (C#
@@ -727,15 +933,31 @@ impl UserManager for FerrofinUserManager {
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        // Divergence from upstream, which leaves the file: the profile image
+        // directory is keyed by username, so it follows the rename. Otherwise a
+        // new user taking the old name would overwrite this user's avatar.
+        let moved = self
+            .move_profile_image_on(&mut tx, user_id, old_name, new_name)
+            .await?;
+        if let Err(e) = tx.commit().await {
+            if let Some((from, to)) = moved
+                && let Err(undo) = tokio::fs::rename(&to, &from).await
+            {
+                tracing::warn!(user_id = %user_id, error = %undo, "restoring profile image after failed rename");
+            }
+            return Err(db_err(e));
+        }
+        self.users_changed();
         Ok(())
     }
 
     async fn update_user(&self, user: &UserEntity) -> Result<(), ServiceError> {
         // Ensure the row exists (C# ResourceNotFound). The sibling
         // permission/preference/schedule collections are managed through their
-        // own helpers; this persists the flat `Users` columns.
+        // own helpers; this persists the flat `Users` columns. Session activity
+        // stamps `LastActivityDate` on its own (`record_user_activity`), so a
+        // save from an entity read before that stamp never moves it back, nor
+        // clears it.
         let id = Uuid::parse_str(&user.id)
             .map_err(|_| ServiceError::invalid_input("user id is not a valid guid"))?;
         self.require_user(id).await?;
@@ -758,7 +980,10 @@ impl UserManager for FerrofinUserManager {
                 "EnableLocalPassword" = ?8, "EnableNextEpisodeAutoPlay" = ?9,
                 "EnableUserPreferenceAccess" = ?10, "HidePlayedInLatest" = ?11,
                 "InternalId" = ?12, "InvalidLoginAttemptCount" = ?13,
-                "LastActivityDate" = ?14, "LastLoginDate" = ?15,
+                "LastActivityDate" = CASE
+                    WHEN ?14 IS NULL OR "LastActivityDate" > ?14 THEN "LastActivityDate"
+                    ELSE ?14 END,
+                "LastLoginDate" = ?15,
                 "LoginAttemptsBeforeLockout" = ?16, "MaxActiveSessions" = ?17,
                 "MaxParentalRatingScore" = ?18, "MaxParentalRatingSubScore" = ?19,
                 "MustUpdatePassword" = ?20,
@@ -805,8 +1030,16 @@ impl UserManager for FerrofinUserManager {
         .await
         .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
+    }
+
+    async fn record_user_activity(
+        &self,
+        user: &UserEntity,
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), ServiceError> {
+        crate::user_activity_repository::stamp_last_activity(&self.db, &user.id, at).await
     }
 
     async fn create_user(&self, name: &str) -> Result<UserEntity, ServiceError> {
@@ -872,7 +1105,7 @@ impl UserManager for FerrofinUserManager {
             .await
             .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
     }
 
@@ -898,22 +1131,19 @@ impl UserManager for FerrofinUserManager {
         let provider = candidates[0]; // The invalid-provider fallback guarantees a candidate.
         provider.change_password(&user, new_password).await?;
         if provider_id(provider.name()) != DEFAULT_AUTH_PROVIDER_ID {
-            self.auth_cache.clear();
+            self.users_changed();
             return Ok(());
         }
         // The built-in provider supplies the hash while this manager owns its
         // database write. External providers own their credential store.
-        let hash = self.default_provider.format_password_hash(new_password)?;
-        sqlx::query(
-            r#"UPDATE "Users" SET "Password" = ?2, "RowVersion" = "RowVersion" + 1
-               WHERE "Id" = ?1"#,
-        )
-        .bind(guid_to_db(user_id))
-        .bind(hash)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
-        self.auth_cache.clear();
+        let hash = self
+            .default_provider
+            .format_password_hash(new_password)
+            .await?;
+        user_repository::set_password(self.db.writer(), &guid_to_db(user_id), hash.as_deref())
+            .await
+            .map_err(db_err)?;
+        self.users_changed();
         Ok(())
     }
 
@@ -977,6 +1207,25 @@ impl UserManager for FerrofinUserManager {
             return Ok(None);
         }
 
+        // Upstream's default provider migrates a legacy hash once the password
+        // verified ("Migrate old hashes to the new default"); the entity it
+        // changed is saved with the successful login.
+        if user
+            .authentication_provider_id
+            .eq_ignore_ascii_case(DEFAULT_AUTH_PROVIDER_ID)
+            && let Some(stored) = user.password.as_deref()
+            && let Some(hash) = self
+                .default_provider
+                .upgraded_hash(stored, password)
+                .await?
+        {
+            user_repository::set_password(self.db.writer(), &user.id, Some(&hash))
+                .await
+                .map_err(db_err)?;
+            tracing::info!(user_id = %user.id, "migrated password hash to the current default");
+            user.password = Some(hash);
+        }
+
         // Success: reset the failure counter and, for a real user session, stamp
         // the login/activity dates.
         let now = chrono::Utc::now();
@@ -1003,7 +1252,8 @@ impl UserManager for FerrofinUserManager {
         }
 
         tracing::info!(user_id = %user.id, username = %user.username, "login succeeded");
-        self.auth_cache.clear();
+        // The writes above touch this user's row only.
+        self.user_changed(&user.id);
         Ok(Some(user))
     }
 
@@ -1124,8 +1374,10 @@ impl UserManager for FerrofinUserManager {
             enable_auto_login: Some(user.enable_auto_login),
             last_login_date: user.last_login_date,
             last_activity_date: user.last_activity_date,
-            has_password: Some(user.password.is_some()),
-            has_configured_password: Some(user.password.is_some()),
+            // `HasPassword`/`HasConfiguredPassword` keep their defaults: Jellyfin
+            // 12 stopped reporting whether a user has a password (PR 14950), as
+            // it told anyone, the anonymous `/Users/Public` caller included,
+            // which accounts have none.
             configuration: Some(configuration),
             policy: Some(policy),
             ..UserDto::default()
@@ -1144,7 +1396,14 @@ impl UserManager for FerrofinUserManager {
     ) -> Result<(), ServiceError> {
         self.require_user(user_id).await?;
         let id = guid_to_db(user_id);
+        let cast_receiver_id = self
+            .accepted_cast_receiver_id(config.cast_receiver_id.as_deref())
+            .await;
 
+        // One writer transaction, as upstream's single `SaveChangesAsync`. It
+        // starts with the UPDATE, so it holds the write lock from its first
+        // statement and never reads a snapshot a scan write could invalidate.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
         sqlx::query(
             r#"UPDATE "Users" SET
                 "AudioLanguagePreference" = ?2, "PlayDefaultAudioTrack" = ?3,
@@ -1152,7 +1411,8 @@ impl UserManager for FerrofinUserManager {
                 "SubtitleMode" = ?6, "DisplayCollectionsView" = ?7,
                 "EnableLocalPassword" = ?8, "HidePlayedInLatest" = ?9,
                 "RememberAudioSelections" = ?10, "RememberSubtitleSelections" = ?11,
-                "EnableNextEpisodeAutoPlay" = ?12, "CastReceiverId" = ?13,
+                "EnableNextEpisodeAutoPlay" = ?12,
+                "CastReceiverId" = coalesce(?13, "CastReceiverId"),
                 "RowVersion" = "RowVersion" + 1
                WHERE "Id" = ?1"#,
         )
@@ -1168,129 +1428,40 @@ impl UserManager for FerrofinUserManager {
         .bind(config.remember_audio_selections)
         .bind(config.remember_subtitle_selections)
         .bind(config.enable_next_episode_auto_play)
-        .bind(&config.cast_receiver_id)
-        .execute(self.db.writer())
-        .await
-        .map_err(db_err)?;
-
-        // The list-valued configuration fields are stored as user preferences.
-        set_uuid_preference(
-            self.db.pool(),
-            &id,
-            PreferenceKind::GroupedFolders,
-            &config.grouped_folders,
-        )
-        .await?;
-        set_uuid_preference(
-            self.db.pool(),
-            &id,
-            PreferenceKind::OrderedViews,
-            &config.ordered_views,
-        )
-        .await?;
-        set_uuid_preference(
-            self.db.pool(),
-            &id,
-            PreferenceKind::LatestItemExcludes,
-            &config.latest_items_excludes,
-        )
-        .await?;
-        set_uuid_preference(
-            self.db.pool(),
-            &id,
-            PreferenceKind::MyMediaExcludes,
-            &config.my_media_excludes,
-        )
-        .await?;
-        self.auth_cache.clear();
-        Ok(())
-    }
-
-    async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError> {
-        // Port of `UserManager.UpdatePolicyAsync`: the `Users` columns, every
-        // permission flag, the access schedules (replaced wholesale) and the
-        // list-valued preferences the policy carries.
-        let id = guid_to_db(user_id);
-        let login_lock = self.login_lock(&id);
-        let _login_guard = login_lock.lock().await;
-        self.require_user(user_id).await?;
-
-        // "The default number of login attempts is 3, but for some god forsaken
-        // reason it's sent to the server as 0": -1 → unlimited (NULL), 0 → 3.
-        let max_login_attempts: Option<i64> = match policy.login_attempts_before_lockout {
-            -1 => None,
-            0 => Some(3),
-            n => Some(i64::from(n)),
-        };
-
-        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        sqlx::query(
-            r#"UPDATE "Users" SET
-                "MaxActiveSessions" = ?2, "MaxParentalRatingScore" = ?3,
-                "MaxParentalRatingSubScore" = ?4, "LoginAttemptsBeforeLockout" = ?5,
-                "EnableUserPreferenceAccess" = ?6, "InvalidLoginAttemptCount" = ?7,
-                "RemoteClientBitrateLimit" = ?8, "AuthenticationProviderId" = ?9,
-                "PasswordResetProviderId" = ?10, "SyncPlayAccess" = ?11,
-                "RowVersion" = "RowVersion" + 1
-               WHERE "Id" = ?1"#,
-        )
-        .bind(&id)
-        .bind(i64::from(policy.max_active_sessions))
-        .bind(policy.max_parental_rating.map(i64::from))
-        .bind(policy.max_parental_sub_rating.map(i64::from))
-        .bind(max_login_attempts)
-        .bind(policy.enable_user_preference_access)
-        .bind(i64::from(policy.invalid_login_attempt_count))
-        .bind(i64::from(policy.remote_client_bitrate_limit))
-        .bind(&policy.authentication_provider_id)
-        .bind(&policy.password_reset_provider_id)
-        .bind(policy.sync_play_access.json_value())
+        .bind(cast_receiver_id)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
 
-        for (kind, value) in policy_permissions(policy) {
-            set_permission_tx(&mut tx, &id, kind, value).await?;
-        }
-
-        crate::access_schedule_repository::replace_tx(&mut tx, &id, &policy.access_schedules)
-            .await?;
-
-        // `policy.BlockUnratedItems ?? Array.Empty<UnratedItem>()` and the six
-        // list preferences; each stored as the delimited value list C# writes.
-        let unrated: Vec<String> = policy
-            .block_unrated_items
-            .iter()
-            .map(|u| u.json_name().into_owned())
-            .collect();
-        let guids = |ids: &[Uuid]| ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+        // The list-valued configuration fields are stored as user preferences,
+        // as the hyphenated strings C# persists.
         for (kind, values) in [
-            (PreferenceKind::BlockUnratedItems, unrated),
-            (PreferenceKind::BlockedTags, policy.blocked_tags.clone()),
-            (PreferenceKind::AllowedTags, policy.allowed_tags.clone()),
+            (PreferenceKind::OrderedViews, &config.ordered_views),
+            (PreferenceKind::GroupedFolders, &config.grouped_folders),
+            (PreferenceKind::MyMediaExcludes, &config.my_media_excludes),
             (
-                PreferenceKind::EnabledChannels,
-                guids(&policy.enabled_channels),
-            ),
-            (
-                PreferenceKind::EnabledDevices,
-                policy.enabled_devices.clone(),
-            ),
-            (
-                PreferenceKind::EnabledFolders,
-                guids(&policy.enabled_folders),
-            ),
-            (
-                PreferenceKind::EnableContentDeletionFromFolders,
-                policy.enable_content_deletion_from_folders.clone(),
+                PreferenceKind::LatestItemExcludes,
+                &config.latest_items_excludes,
             ),
         ] {
-            set_preference_tx(&mut tx, &id, kind, &values).await?;
+            let strings: Vec<String> = values.iter().map(Uuid::to_string).collect();
+            set_preference_tx(&mut tx, &id, kind, &strings).await?;
         }
-        // One `SaveChangesAsync`: all or nothing.
         tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
+    }
+
+    async fn update_policy(&self, user_id: Uuid, policy: &UserPolicy) -> Result<(), ServiceError> {
+        self.save_policy(user_id, policy, false).await.map(|_| ())
+    }
+
+    async fn update_policy_guarded(
+        &self,
+        user_id: Uuid,
+        policy: &UserPolicy,
+    ) -> Result<PolicySaved, ServiceError> {
+        self.save_policy(user_id, policy, true).await
     }
 
     async fn save_profile_image(
@@ -1305,8 +1476,16 @@ impl UserManager for FerrofinUserManager {
                 "save_profile_image requires a profile-image directory",
             ));
         };
-        // Write `{base}/{userId}/profile{ext}` (extension carries its dot).
-        let dir = base.join(&user.id);
+        // Write `{base}/{Username}/profile{ext}` (extension carries its dot),
+        // refusing a username that escapes `base` (C# `PathHelper.IsContainedIn`).
+        let base = base.resolve();
+        let dir = base.join(&user.username);
+        if !ferrofin_util::path_helper::is_contained_in(
+            &base.to_string_lossy(),
+            &dir.to_string_lossy(),
+        ) {
+            return Err(ServiceError::invalid_input("Invalid user."));
+        }
         let ext = extension.trim_start_matches('.');
         let dest = dir.join(format!("profile.{ext}"));
         std::fs::create_dir_all(&dir)
@@ -1315,32 +1494,43 @@ impl UserManager for FerrofinUserManager {
             .map_err(|e| ServiceError::backend(format!("write profile image: {e}")))?;
         // One image per user: replace any existing row (unique index on UserId).
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
-        sqlx::query(r#"DELETE FROM "ImageInfos" WHERE "UserId" = ?1"#)
-            .bind(&user.id)
-            .execute(&mut *tx)
+        user_repository::replace_profile_image(&mut tx, &user.id, &dest.to_string_lossy())
             .await
             .map_err(db_err)?;
-        sqlx::query(
-            r#"INSERT INTO "ImageInfos" ("LastModified", "Path", "UserId") VALUES (?1, ?2, ?3)"#,
-        )
-        .bind(datetime_to_db(chrono::Utc::now()))
-        .bind(dest.to_string_lossy().as_ref())
-        .bind(&user.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
         tx.commit().await.map_err(db_err)?;
-        self.auth_cache.clear();
+        self.users_changed();
         Ok(())
     }
 
     async fn clear_profile_image(&self, user: &UserEntity) -> Result<(), ServiceError> {
-        sqlx::query(r#"DELETE FROM "ImageInfos" WHERE "UserId" = ?1"#)
-            .bind(&user.id)
-            .execute(self.db.writer())
+        // `DeleteUserImage`: delete the file, then the row. The row delete is held
+        // open so a failure C# lets escape keeps it, as upstream does.
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let path = user_repository::delete_profile_image(&mut *tx, &user.id)
             .await
             .map_err(db_err)?;
-        self.auth_cache.clear();
+        if let Some(path) = path {
+            match tokio::fs::remove_file(&path).await {
+                // C# `File.Delete` ignores a missing file.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // `UnauthorizedAccessException` escapes the controller's
+                // `catch (IOException)`: the request fails and the row stays.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::IsADirectory
+                    ) =>
+                {
+                    return Err(ServiceError::backend(format!("delete profile image: {e}")));
+                }
+                Err(e) => {
+                    tracing::warn!(user_id = %user.id, path, error = %e, "deleting user profile image failed");
+                }
+                Ok(()) => {}
+            }
+        }
+        tx.commit().await.map_err(db_err)?;
+        self.users_changed();
         Ok(())
     }
 
@@ -1348,13 +1538,9 @@ impl UserManager for FerrofinUserManager {
         &self,
         user_id: Uuid,
     ) -> Result<Option<ferrofin_traits::options::ItemImageInfo>, ServiceError> {
-        let row = sqlx::query_as::<_, ferrofin_db::entities::users::ImageInfoEntity>(
-            r#"SELECT * FROM "ImageInfos" WHERE "UserId" = ?1 LIMIT 1"#,
-        )
-        .bind(guid_to_db(user_id))
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db_err)?;
+        let row = user_repository::profile_image(self.db.pool(), &guid_to_db(user_id))
+            .await
+            .map_err(db_err)?;
         Ok(row.map(|r| ferrofin_traits::options::ItemImageInfo {
             path: r.path,
             image_type: ferrofin_model::entities::ImageType::Profile,
@@ -1430,7 +1616,7 @@ fn pref(map: &HashMap<i32, String>, kind: PreferenceKind) -> Vec<String> {
 fn guid_pref(map: &HashMap<i32, String>, kind: PreferenceKind) -> Vec<Uuid> {
     pref(map, kind)
         .iter()
-        .filter_map(|v| Uuid::parse_str(v).ok())
+        .filter_map(|v| ferrofin_util::guid_extensions::parse_dotnet_guid(v))
         .collect()
 }
 
@@ -1511,19 +1697,6 @@ async fn build_user_policy(
         blocked_media_folders: Some(blocked_media_folders),
         block_unrated_items,
     })
-}
-
-/// Writes a list of [`Uuid`]s to a list-valued preference, stored as their
-/// hyphenated strings (the form C# persists for the folder/view preference
-/// lists).
-async fn set_uuid_preference(
-    pool: &sqlx::sqlite::SqlitePool,
-    user_id: &str,
-    kind: PreferenceKind,
-    values: &[Uuid],
-) -> Result<(), ServiceError> {
-    let strings: Vec<String> = values.iter().map(Uuid::to_string).collect();
-    set_preference(pool, user_id, kind, &strings).await
 }
 
 /// Narrows a stored `i64` column to the DTO's `i32`, clamping on overflow.
@@ -1633,6 +1806,60 @@ fn parse_unrated_item(value: &str) -> Option<UnratedItem> {
 mod tests {
     use super::*;
     use crate::test_support::test_db;
+    use ferrofin_common::cryptography::PasswordHash;
+
+    /// `GetPreferenceValues<Guid>` trims each value and parses it as .NET
+    /// parses a GUID: the padded and `(…)` forms count, `urn:uuid:` and junk
+    /// do not.
+    #[test]
+    fn guid_preferences_parse_as_dotnet_does() {
+        let id = Uuid::from_u128(0x785);
+        let map = HashMap::from([(
+            i32::from(PreferenceKind::OrderedViews),
+            format!(" {id} ,({id}),urn:uuid:{id},junk"),
+        )]);
+        assert_eq!(guid_pref(&map, PreferenceKind::OrderedViews), vec![id, id]);
+    }
+
+    /// Session activity's stamp never moves `LastActivityDate` back (an
+    /// earlier stamp writes nothing, `RowVersion` included), and a full save
+    /// from an entity read before the stamp, older or never set, keeps it.
+    #[tokio::test]
+    async fn the_activity_stamp_never_moves_back_or_is_undone_by_a_save() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let read = mgr.create_user("synthetic-activity").await.unwrap();
+        let id = Uuid::parse_str(&read.id).unwrap();
+        let stored = || async { mgr.get_user_by_id(id).await.unwrap().unwrap() };
+        let now = chrono::Utc::now();
+        mgr.record_user_activity(&read, now).await.unwrap();
+        let stamped = stored().await;
+        assert_eq!(
+            stamped.last_activity_date.map(|d| d.timestamp_micros()),
+            Some(now.timestamp_micros())
+        );
+
+        mgr.record_user_activity(&read, now - chrono::Duration::minutes(5))
+            .await
+            .unwrap();
+        let after = stored().await;
+        assert_eq!(after.last_activity_date, stamped.last_activity_date);
+        assert_eq!(after.row_version, stamped.row_version, "nothing written");
+
+        for before in [Some(now - chrono::Duration::days(30)), None] {
+            mgr.update_user(&UserEntity {
+                last_activity_date: before,
+                ..stored().await
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                stored().await.last_activity_date,
+                stamped.last_activity_date,
+                "a save from {before:?} keeps the stamp"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn profile_image_tags_follow_upload_replacement_and_removal() {
@@ -1690,12 +1917,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(std::path::Path::new(&info.path).starts_with(&replacement));
+        // Upstream layout: `{UserConfigurationDirectoryPath}/{Username}/profile{ext}`.
+        assert_eq!(
+            std::path::Path::new(&info.path),
+            replacement.join("synthetic-avatar").join("profile.jpg")
+        );
         assert!(std::path::Path::new(&info.path).is_file());
         assert!(
             dir.path()
                 .join("users")
-                .join(&user.id)
+                .join("synthetic-avatar")
                 .join("profile.png")
                 .is_file()
         );
@@ -1707,19 +1938,125 @@ mod tests {
                 .primary_image_tag
                 .is_none()
         );
+        // `DeleteUserImage` deletes the file too; clearing again (no row) is a no-op.
+        assert!(!std::path::Path::new(&info.path).exists());
+        mgr.clear_profile_image(&user).await.unwrap();
     }
 
-    #[test]
-    fn valid_username_accepts_and_rejects() {
-        assert!(valid_username("alice"));
-        assert!(valid_username("a-b_c.d@e+f 1"));
-        assert!(!valid_username(""));
-        assert!(!valid_username("."));
-        assert!(!valid_username(".."));
-        assert!(!valid_username(" leading"));
-        assert!(!valid_username("trailing "));
-        assert!(!valid_username("has\ttab"));
-        assert!(!valid_username("bad/slash"));
+    /// C# `File.Delete` throws `UnauthorizedAccessException` for a directory (or
+    /// a permission error), which escapes `DeleteUserImage`'s `catch (IOException)`:
+    /// the request fails and the row is kept.
+    #[tokio::test]
+    async fn clear_profile_image_keeps_the_row_when_the_file_cannot_be_deleted() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinUserManager::new(db).with_profile_image_dir(dir.path().to_path_buf());
+        let user = mgr.create_user("synthetic-undeletable").await.unwrap();
+        mgr.save_profile_image(&user, b"x", "image/png", ".png")
+            .await
+            .unwrap();
+        let path = dir.path().join("synthetic-undeletable/profile.png");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = mgr.clear_profile_image(&user).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Backend(_)), "{err:?}");
+        let user_id = Uuid::parse_str(&user.id).unwrap();
+        assert!(mgr.get_profile_image(user_id).await.unwrap().is_some());
+    }
+
+    /// Divergence from upstream: the avatar follows a rename, so a new user who
+    /// takes the old name can neither overwrite nor delete the renamed user's image.
+    #[tokio::test]
+    async fn profile_image_follows_a_rename() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinUserManager::new(db).with_profile_image_dir(dir.path().to_path_buf());
+        let alice = mgr.create_user("synthetic-alice").await.unwrap();
+        mgr.save_profile_image(&alice, b"alice", "image/png", ".png")
+            .await
+            .unwrap();
+        let alice_id = Uuid::parse_str(&alice.id).unwrap();
+        mgr.rename_user(alice_id, "synthetic-alice", "synthetic-alice.old")
+            .await
+            .unwrap();
+        let moved = dir.path().join("synthetic-alice.old/profile.png");
+        let info = mgr.get_profile_image(alice_id).await.unwrap().unwrap();
+        assert_eq!(info.path, moved.to_string_lossy());
+        assert!(!dir.path().join("synthetic-alice/profile.png").exists());
+
+        let newcomer = mgr.create_user("synthetic-alice").await.unwrap();
+        mgr.save_profile_image(&newcomer, b"newcomer", "image/png", ".png")
+            .await
+            .unwrap();
+        mgr.clear_profile_image(&newcomer).await.unwrap();
+        assert_eq!(std::fs::read(&moved).unwrap(), b"alice");
+    }
+
+    #[tokio::test]
+    async fn profile_image_rejects_username_escaping_user_config_dir() {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = FerrofinUserManager::new(db).with_profile_image_dir(dir.path().join("users"));
+        let mut user = mgr.create_user("synthetic-escape").await.unwrap();
+        // Usernames are validated on create/rename, but an adopted database is
+        // not; C# `PostUserImage` re-checks containment before writing.
+        user.username = "..".to_owned();
+        let err = mgr
+            .save_profile_image(&user, b"x", "image/png", ".png")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ServiceError::InvalidInput(ref m) if m == "Invalid user."));
+        assert!(!dir.path().join("profile.png").exists());
+        assert!(
+            mgr.get_profile_image(Uuid::parse_str(&user.id).unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// `UserManagerTests.ThrowIfInvalidUsername_*` (`[InlineData]` verbatim),
+    /// then the word class .NET `\w` is: letters, nonspacing marks (a
+    /// Devanagari virama, a decomposed acute), decimal digits and connector
+    /// punctuation — not spacing marks, nor other numerics such as `²`, `½`
+    /// or `Ⅻ`.
+    #[rstest::rstest]
+    #[case::upstream_valid_1("this_is_valid", true)]
+    #[case::upstream_valid_2("this is also valid", true)]
+    #[case::upstream_valid_3("0@_-' .", true)]
+    #[case::upstream_valid_4("Aa0@_-' .+", true)]
+    #[case::upstream_valid_5("thisisa+testemail@test.foo", true)]
+    #[case::upstream_valid_6(
+        "------@@@--+++----@@--abcdefghijklmn---------@----_-_-___-_ .9foo+",
+        true
+    )]
+    #[case::upstream_invalid_1(" ", false)]
+    #[case::upstream_invalid_2("", false)]
+    #[case::upstream_invalid_3("special characters like & $ ? are not allowed", false)]
+    #[case::upstream_invalid_4("thishasaspaceontheend ", false)]
+    #[case::upstream_invalid_5(" thishasaspaceatthestart", false)]
+    #[case::upstream_invalid_6(" thishasaspaceatbothends ", false)]
+    #[case::upstream_invalid_7(" this has a space at both ends and inbetween ", false)]
+    #[case::upstream_invalid_8(".", false)]
+    #[case::upstream_invalid_9("..", false)]
+    #[case::devanagari_virama("कृष्ण", true)]
+    // ज़ुबैर: a nukta and two vowel signs, all nonspacing (`Mn`).
+    #[case::devanagari_nukta("\u{91c}\u{93c}\u{941}\u{92c}\u{948}\u{930}", true)]
+    // जो: the vowel sign O is a spacing mark (`Mc`), outside .NET's `\w`.
+    #[case::devanagari_spacing_mark("\u{91c}\u{94b}", false)]
+    #[case::decomposed_latin("Jose\u{301}", true)]
+    #[case::connector_punctuation("a\u{203f}b", true)]
+    #[case::superscript_digit("user²", false)]
+    #[case::vulgar_fraction("half½", false)]
+    #[case::roman_numeral("Louis Ⅻ", false)]
+    #[case::tab("has\ttab", false)]
+    #[case::trailing_no_break_space("a\u{a0}", false)]
+    #[case::slash("bad/slash", false)]
+    // .NET's `$` also matches before a final newline, so upstream admits
+    // "alice\n"; Ferrofin does not port that.
+    #[case::trailing_newline("alice\n", false)]
+    fn valid_username_matches_the_upstream_regex(#[case] name: &str, #[case] valid: bool) {
+        assert_eq!(valid_username(name), valid, "{name:?}");
     }
 
     // jellyfin-web refuses to initialize the Cast SDK when CastReceiverId is
@@ -1769,6 +2106,47 @@ mod tests {
         // Without a configuration seam the stored value is echoed unchanged.
         let bare = FerrofinUserManager::new(db);
         assert_eq!(bare.resolve_cast_receiver_id(None).await, None);
+    }
+
+    // v12.2 `UpdateConfigurationAsync`: "Only set cast receiver id if it is
+    // passed in and it exists in the server config", else the stored one stays.
+    #[rstest::rstest]
+    #[case::configured(Some("F007D354"), Some("F007D354"))]
+    #[case::null(None, Some("6F511C87"))]
+    #[case::empty(Some(""), Some("6F511C87"))]
+    #[case::not_configured(Some("GONE"), Some("6F511C87"))]
+    #[case::case_differs(Some("6f511c87"), Some("6F511C87"))]
+    #[tokio::test]
+    async fn a_configuration_save_stores_only_a_configured_cast_receiver(
+        #[case] sent: Option<&str>,
+        #[case] stored: Option<&str>,
+    ) {
+        let db = test_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let config: Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager> = Arc::new(
+            crate::configuration_manager::FerrofinServerConfigurationManager::load(
+                crate::app_paths::test_paths(dir.path()),
+            )
+            .await
+            .expect("config"),
+        );
+        let mgr = FerrofinUserManager::new(db).with_configuration(config);
+        let user = mgr.create_user("alice").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("id");
+        let save = |cast_receiver_id: Option<&str>| UserConfiguration {
+            cast_receiver_id: cast_receiver_id.map(str::to_owned),
+            ..UserConfiguration::default()
+        };
+        mgr.update_configuration(id, &save(Some("6F511C87")))
+            .await
+            .expect("pick a receiver");
+
+        mgr.update_configuration(id, &save(sent))
+            .await
+            .expect("save");
+
+        let user = mgr.get_user_by_id(id).await.expect("get").expect("present");
+        assert_eq!(user.cast_receiver_id.as_deref(), stored);
     }
 
     #[tokio::test]
@@ -1941,11 +2319,11 @@ mod tests {
 
         // Seed a list-valued preference directly (the read path parses Guids).
         let folder = Uuid::from_u128(0xF00D);
-        set_uuid_preference(
-            db.pool(),
+        crate::user_entity_ext::set_preference(
+            &db,
             &user.id,
             PreferenceKind::EnabledFolders,
-            &[folder],
+            &[folder.to_string()],
         )
         .await
         .expect("seed pref");
@@ -1976,6 +2354,225 @@ mod tests {
         assert!(!dto_config.hide_played_in_latest);
         assert_eq!(dto_config.latest_items_excludes, vec![excluded]);
         assert_eq!(dto_config.subtitle_mode, SubtitlePlaybackMode::Always);
+    }
+
+    /// Creates `name` with `policy` saved, returning its id.
+    async fn user_with_policy(mgr: &FerrofinUserManager, name: &str, policy: &UserPolicy) -> Uuid {
+        let user = mgr.create_user(name).await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        mgr.update_policy(id, policy).await.expect("policy");
+        id
+    }
+
+    /// How many users the stored policies make administrators.
+    async fn administrators(mgr: &FerrofinUserManager) -> usize {
+        let mut count = 0;
+        for user in mgr.get_users().await.expect("users") {
+            let dto = mgr.get_user_dto(&user, None).await.expect("dto");
+            count += usize::from(dto.policy.is_some_and(|p| p.is_administrator));
+        }
+        count
+    }
+
+    /// gl-186: the two administrators demote each other at once. The guard
+    /// is read inside the writing transaction, so the second save sees the
+    /// first one's demotion and is refused: one administrator remains. Read
+    /// before the transaction, both saves passed and none was left.
+    #[tokio::test]
+    async fn concurrent_demotions_cannot_remove_the_last_administrator() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let admin = UserPolicy {
+            is_administrator: true,
+            ..UserPolicy::default()
+        };
+        let a = user_with_policy(&mgr, "admin-a", &admin).await;
+        let b = user_with_policy(&mgr, "admin-b", &admin).await;
+        assert_eq!(administrators(&mgr).await, 2);
+
+        let demoted = UserPolicy::default();
+        let (first, second) = tokio::join!(
+            mgr.update_policy_guarded(a, &demoted),
+            mgr.update_policy_guarded(b, &demoted)
+        );
+        let refused: Vec<_> = [&first, &second]
+            .into_iter()
+            .filter_map(|r| r.as_ref().err())
+            .collect();
+        assert_eq!(
+            refused.len(),
+            1,
+            "exactly one demotion goes through: {first:?} {second:?}"
+        );
+        assert!(
+            matches!(refused[0], ServiceError::Forbidden(m)
+                if m == "there must be at least one user in the system with administrative access"),
+            "{refused:?}"
+        );
+        assert_eq!(administrators(&mgr).await, 1);
+    }
+
+    /// The guarded save refuses what `UserController.UpdateUserPolicy`
+    /// refuses, saves nothing then, and reports a disable so the caller can
+    /// revoke the user's tokens.
+    #[tokio::test]
+    async fn the_guarded_policy_save_refuses_like_upstream_and_reports_a_disable() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let admin = user_with_policy(
+            &mgr,
+            "only-admin",
+            &UserPolicy {
+                is_administrator: true,
+                ..UserPolicy::default()
+            },
+        )
+        .await;
+        let viewer = user_with_policy(&mgr, "viewer", &UserPolicy::default()).await;
+
+        let refused = mgr
+            .update_policy_guarded(
+                admin,
+                &UserPolicy {
+                    is_administrator: true,
+                    is_disabled: true,
+                    ..UserPolicy::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(ServiceError::Forbidden(m)) if m == "administrators cannot be disabled"),
+            "{refused:?}"
+        );
+        let refused = mgr
+            .update_policy_guarded(admin, &UserPolicy::default())
+            .await;
+        assert!(
+            matches!(refused, Err(ServiceError::Forbidden(_))),
+            "{refused:?}"
+        );
+        assert_eq!(
+            administrators(&mgr).await,
+            1,
+            "a refused save writes nothing"
+        );
+
+        let disable = UserPolicy {
+            is_disabled: true,
+            ..UserPolicy::default()
+        };
+        let saved = mgr
+            .update_policy_guarded(viewer, &disable)
+            .await
+            .expect("disable");
+        assert!(saved.newly_disabled);
+        let again = mgr
+            .update_policy_guarded(viewer, &disable)
+            .await
+            .expect("save again");
+        assert!(
+            !again.newly_disabled,
+            "an already disabled user is not disabled again"
+        );
+
+        let missing = mgr.update_policy_guarded(Uuid::new_v4(), &disable).await;
+        assert!(
+            matches!(missing, Err(ServiceError::NotFound(_))),
+            "{missing:?}"
+        );
+    }
+
+    /// The last-enabled-user guard counts, inside the save, the users with no
+    /// `IsDisabled` permission set. Upstream never lets an administrator be
+    /// disabled, so reaching one enabled user takes the unguarded save: here
+    /// the only administrator is disabled, which leaves the viewer.
+    #[tokio::test]
+    async fn the_last_enabled_user_cannot_be_disabled_inside_the_save() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        user_with_policy(
+            &mgr,
+            "disabled-admin",
+            &UserPolicy {
+                is_administrator: true,
+                is_disabled: true,
+                ..UserPolicy::default()
+            },
+        )
+        .await;
+        let viewer = user_with_policy(&mgr, "viewer", &UserPolicy::default()).await;
+
+        let refused = mgr
+            .update_policy_guarded(
+                viewer,
+                &UserPolicy {
+                    is_disabled: true,
+                    ..UserPolicy::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(&refused, Err(ServiceError::Forbidden(m))
+                if m == "there must be at least one enabled user in the system"),
+            "{refused:?}"
+        );
+        let viewer = mgr
+            .get_user_by_id(viewer)
+            .await
+            .expect("load")
+            .expect("some");
+        let dto = mgr.get_user_dto(&viewer, None).await.expect("dto");
+        assert!(
+            dto.policy.is_some_and(|p| !p.is_disabled),
+            "nothing was saved"
+        );
+
+        // A second enabled user lifts the guard.
+        user_with_policy(&mgr, "second", &UserPolicy::default()).await;
+        let saved = mgr
+            .update_policy_guarded(
+                Uuid::parse_str(&viewer.id).expect("uuid"),
+                &UserPolicy {
+                    is_disabled: true,
+                    ..UserPolicy::default()
+                },
+            )
+            .await
+            .expect("disable with another enabled user left");
+        assert!(saved.newly_disabled);
+    }
+
+    /// Jellyfin 12 no longer reports a user's password state (PR 14950):
+    /// `UserManager.GetUserDto` assigns neither `HasPassword` nor
+    /// `HasConfiguredPassword`, so every user reads their `[Obsolete]` defaults
+    /// (`true`, `true`, and `false` for the easy password). A passwordless user
+    /// is no longer told apart, not even on the anonymous `/Users/Public` list.
+    #[tokio::test]
+    async fn get_user_dto_does_not_reveal_whether_a_user_has_a_password() {
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let passwordless = mgr.create_user("nopass").await.expect("create");
+        assert!(
+            passwordless.password.is_none(),
+            "a new user has no password"
+        );
+        let with_password = mgr.create_user("haspass").await.expect("create");
+        let id = Uuid::parse_str(&with_password.id).expect("uuid");
+        mgr.change_password(id, "secret").await.expect("password");
+        let with_password = mgr.get_user_by_id(id).await.expect("reload").expect("some");
+        assert!(with_password.password.is_some());
+
+        for user in [&passwordless, &with_password] {
+            let dto = mgr.get_user_dto(user, None).await.expect("dto");
+            assert_eq!(dto.has_password, Some(true), "{}", user.username);
+            assert_eq!(dto.has_configured_password, Some(true), "{}", user.username);
+            assert_eq!(
+                dto.has_configured_easy_password,
+                Some(false),
+                "{}",
+                user.username
+            );
+        }
     }
 
     #[tokio::test]
@@ -2255,6 +2852,55 @@ mod tests {
         ));
     }
 
+    /// A successful login re-hashes a legacy hash with the current default, as
+    /// upstream `DefaultAuthenticationProvider.Authenticate` does ("Migrate old
+    /// hashes to the new default"); a failed one leaves it alone.
+    #[tokio::test]
+    async fn login_upgrades_a_legacy_password_hash() {
+        // PBKDF2-HMAC-SHA1, 1000 iterations, 32-byte key, of "legacy-pw".
+        const LEGACY: &str = "$PBKDF2$iterations=1000$69F420AABBCCDDEEFF00112233445566$\
+            28A5D139D2C7C66286E60F053FD55AFE9DAA7A94D4A45B84B8E08479F4D3122E";
+        let db = test_db().await;
+        let mgr = FerrofinUserManager::new(db.clone());
+        let user = mgr.create_user("erin").await.expect("create");
+        let id = Uuid::parse_str(&user.id).expect("uuid");
+        user_repository::set_password(db.writer(), &user.id, Some(LEGACY))
+            .await
+            .expect("seed legacy hash");
+        let stored = || async {
+            mgr.get_user_by_id(id)
+                .await
+                .expect("read")
+                .and_then(|user| user.password)
+                .expect("password")
+        };
+
+        let bad = mgr
+            .authenticate_user("erin", "wrong", "127.0.0.1", true)
+            .await
+            .expect("auth call");
+        assert!(bad.is_none());
+        assert_eq!(stored().await, LEGACY, "a failed login keeps the hash");
+
+        let ok = mgr
+            .authenticate_user("erin", "legacy-pw", "127.0.0.1", true)
+            .await
+            .expect("auth ok");
+        assert!(ok.is_some());
+        let upgraded = PasswordHash::parse(&stored().await).expect("parse");
+        assert!(
+            DefaultAuthenticationProvider::new().hash_is_current(&upgraded),
+            "upgraded to the current default: {upgraded}"
+        );
+        assert!(
+            mgr.authenticate_user("erin", "legacy-pw", "127.0.0.1", true)
+                .await
+                .expect("auth again")
+                .is_some(),
+            "the upgraded hash still verifies"
+        );
+    }
+
     #[tokio::test]
     async fn admin_password_may_not_be_emptied() {
         let db = test_db().await;
@@ -2266,6 +2912,96 @@ mod tests {
             mgr.change_password(id, "   ").await,
             Err(ServiceError::InvalidInput(_))
         ));
+    }
+
+    /// A login attempt that does not lock the account changes only that user's
+    /// own row, so it drops only that user's cached auth: a failed or a
+    /// successful login for one user leaves every other user's cached token
+    /// and DTO in place, and a failed password stream cannot keep the whole
+    /// cache cold.
+    #[tokio::test]
+    async fn a_login_attempt_invalidates_only_that_users_cached_auth() {
+        let db = test_db().await;
+        let cache = Arc::new(crate::auth_cache::AuthCache::default());
+        let mgr = FerrofinUserManager::new(db).with_auth_cache(Arc::clone(&cache));
+        let tried = mgr.create_user("tried").await.unwrap();
+        let other = mgr.create_user("other").await.unwrap();
+        mgr.change_password(Uuid::parse_str(&tried.id).unwrap(), "secret")
+            .await
+            .unwrap();
+        let tried = mgr
+            .get_user_by_id(Uuid::parse_str(&tried.id).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        let cache_both = || {
+            let generation = cache.generation();
+            for (token, user) in [("tried-token", &tried), ("other-token", &other)] {
+                let device = ferrofin_db::entities::security::DeviceEntity {
+                    id: 1,
+                    access_token: token.to_owned(),
+                    app_name: "app".into(),
+                    app_version: "1.0".into(),
+                    date_created: chrono::Utc::now(),
+                    date_last_activity: chrono::Utc::now(),
+                    date_modified: chrono::Utc::now(),
+                    device_id: token.to_owned(),
+                    device_name: "Device".into(),
+                    is_active: true,
+                    user_id: user.id.clone(),
+                };
+                cache.put(generation, token, device, Some(user.clone()), None);
+                cache.put_user_dto(generation, user, UserDto::default());
+            }
+        };
+
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "wrong", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(cache.get("other-token").is_some(), "another user's token");
+        assert!(cache.get_user_dto(&other).is_some(), "another user's DTO");
+        assert!(cache.get("tried-token").is_none(), "the tried user's token");
+        assert!(cache.get_user_dto(&tried).is_none(), "the tried user's DTO");
+
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "secret", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(cache.get("other-token").is_some(), "another user's token");
+        assert!(cache.get_user_dto(&other).is_some(), "another user's DTO");
+        assert!(cache.get("tried-token").is_none(), "the tried user's token");
+        assert!(cache.get_user_dto(&tried).is_none(), "the tried user's DTO");
+
+        // A failure that locks the account out still clears everyone: the
+        // lock must not wait for any cached resolution to expire.
+        let tried_id = Uuid::parse_str(&tried.id).unwrap();
+        mgr.update_policy(
+            tried_id,
+            &UserPolicy {
+                login_attempts_before_lockout: 1,
+                ..UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+        cache_both();
+        assert!(
+            mgr.authenticate_user("tried", "wrong", "127.0.0.1", true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cache.get("other-token").is_none(),
+            "a lockout clears everyone"
+        );
     }
 
     #[rstest::rstest]

@@ -96,6 +96,16 @@ Conventions:
 ### File Transformation
 - Ferrofin files: `crates/ferrofin-extensions/src/file_transformation.rs`,
   vendored assets `crates/ferrofin-extensions/assets/filetransformation/`.
+- Accepted divergences:
+  - **A failing callback leaves the file as it was.** The plugin writes a callback's body over
+    the file whatever its status (`TransformationHelper.ApplyTransformation`), so an error
+    page is served as the bundle, and a timeout or transport failure is an exception that
+    fails the request. Ferrofin serves the file unchanged and logs the failure once at warn,
+    then at debug until the callback works again.
+  - **The pipeline's output is capped at 16 MiB** (`MAX_TRANSFORMED_BYTES`). The plugin reads
+    a callback's whole answer and applies every search/replace. Ferrofin reads no more than
+    16 MiB of an answer, and skips a step that would grow the file past 16 MiB, because the
+    pipeline runs on every anonymous `/web` request. jellyfin-web's bundles are a few MiB.
 
 ### Merge Versions
 - Ferrofin files: `crates/ferrofin-extensions/src/merge_versions.rs` (the whole
@@ -126,13 +136,15 @@ Conventions:
   files it groups (`ItemPersistenceService::sync_local_versions`). An
   adopted database's plugin merges (owned, type 2) therefore read as local
   versions here. The linked-child reroute is not ported.
-- Accepted divergences (do NOT "fix" during sync): No
-  `VideoType`/`Video3DFormat` columns in Ferrofin's schema, so primary selection
-  cannot demote 3D/non-file videos (width ordering only). No `IndexNumberEnd`
-  column, so that episode-key component is always empty. Upstream's
+- Accepted divergences (do NOT "fix" during sync): Upstream's
   `Parallel.ForEach` fire-and-forget async merges (error-dropping) run
-  sequentially in Ferrofin. The episode merge key is scoped to the series
-  *row* (`SeriesPresentationUniqueKey`), not the series name as upstream
+  sequentially in Ferrofin. The four bulk operations (the routes and both
+  daily tasks) also run one at a time: upstream has no lock, so a merge and a
+  split started together interleave their link writes; here a second call
+  waits for the first. The routes keep upstream's plain `[Authorize]` (any
+  signed-in user), unlike core `POST /Videos/MergeVersions`, which requires
+  elevation: owner decision 2026-10-24. The episode merge key is scoped to
+  the series *row* (`SeriesPresentationUniqueKey`), not the series name as upstream
   does: a show present in two libraries (hot/cold tiers) has two series rows
   with one name, and the name-scoped key merged episodes across them —
   hiding each alternate from its own series' list and skewing season counts.

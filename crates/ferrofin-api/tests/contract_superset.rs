@@ -16,10 +16,13 @@
 //!    vendored paths never yields `404` (it yields `501`/`401`, i.e. the route
 //!    exists).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use ferrofin_api::handlers::{Verified, VerifiedSubsystem};
 use ferrofin_api::routes::{axum_routes, normalize_contract_path};
 use ferrofin_api::test_support::fake_state;
 use ferrofin_api::{VENDORED_ROUTES, create_router};
@@ -279,29 +282,68 @@ fn extension_routes_have_no_duplicates() {
     );
 }
 
-/// The per-row well-formedness rules of a `VERIFIED` entry (everything except
-/// its membership in the route table). Empty = well-formed.
-fn row_problems(v: &ferrofin_api::handlers::Verified) -> Vec<String> {
+/// Earlier-pin entries (`earlier`, as `(row key, tag)`, from the list named
+/// `list`) must each name a distinct row of `dates` (row key → its `date`),
+/// carry a release tag other than `UPSTREAM_TAG`, and belong to a row dated
+/// before `UPSTREAM_PIN_DATE` (a later row was compared against the current
+/// pin).
+fn earlier_pin_problems<K: Ord + Copy + std::fmt::Debug>(
+    dates: &BTreeMap<K, &str>,
+    earlier: impl IntoIterator<Item = (K, &'static str)>,
+    list: &str,
+) -> Vec<String> {
+    use ferrofin_api::handlers::{UPSTREAM_PIN_DATE, UPSTREAM_TAG};
+
     let mut out = Vec::new();
-    let is_cs = std::path::Path::new(v.upstream_file)
+    let mut seen = BTreeSet::new();
+    for (key, tag) in earlier {
+        if !seen.insert(key) {
+            out.push(format!("{key:?}: listed twice in {list}"));
+        }
+        match dates.get(&key) {
+            None => out.push(format!("{key:?}: in {list} but not a row of its table")),
+            Some(date) if *date >= UPSTREAM_PIN_DATE => out.push(format!(
+                "{key:?}: dated {date}, on or after the move to {UPSTREAM_TAG} \
+                 ({UPSTREAM_PIN_DATE}), but still in {list}"
+            )),
+            Some(_) => {}
+        }
+        if !tag.starts_with('v') || tag == UPSTREAM_TAG {
+            out.push(format!(
+                "{key:?}: {tag:?} is not an earlier jellyfin release tag"
+            ));
+        }
+    }
+    out
+}
+
+/// The well-formedness rules every parity row obeys, operation or subsystem
+/// (everything except its key). Empty = well-formed.
+fn record_problems(
+    upstream_file: &str,
+    upstream_method: &str,
+    ferrofin: &str,
+    date: &str,
+    divergences: &[&str],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let is_cs = std::path::Path::new(upstream_file)
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("cs"));
-    if !is_cs || v.upstream_file.contains(char::is_whitespace) {
+    if !is_cs || upstream_file.contains(char::is_whitespace) {
         out.push(format!(
-            "upstream_file must be a repo-relative `.cs` path, got {:?}",
-            v.upstream_file
+            "upstream_file must be a repo-relative `.cs` path, got {upstream_file:?}"
         ));
     }
-    if v.upstream_method.is_empty() || v.upstream_method.contains(char::is_whitespace) {
+    if upstream_method.is_empty() || upstream_method.contains(char::is_whitespace) {
         out.push(format!(
-            "upstream_method must be one method name, got {:?}",
-            v.upstream_method
+            "upstream_method must be one method name, got {upstream_method:?}"
         ));
     }
-    if v.divergences.iter().any(|d| d.trim().is_empty()) {
+    if divergences.iter().any(|d| d.trim().is_empty()) {
         out.push("empty divergence string".to_string());
     }
-    let d = v.date.as_bytes();
+    let d = date.as_bytes();
     let digits =
         |r: std::ops::Range<usize>| d.get(r).is_some_and(|b| b.iter().all(u8::is_ascii_digit));
     if d.len() != 10
@@ -311,28 +353,152 @@ fn row_problems(v: &ferrofin_api::handlers::Verified) -> Vec<String> {
         || !digits(5..7)
         || !digits(8..10)
     {
-        out.push(format!("date must be YYYY-MM-DD, got {:?}", v.date));
+        out.push(format!("date must be YYYY-MM-DD, got {date:?}"));
     }
-    if v.ferrofin.is_empty() {
+    if ferrofin.is_empty() {
         out.push("ferrofin code path is empty".to_string());
     }
     out
 }
 
+/// Subsystem rows must each use a distinct `SUBSYSTEM_KEYS` key, and every
+/// operation row's `refs` must name one of those rows.
+fn ref_problems(ops: &[Verified], subsystems: &[VerifiedSubsystem]) -> Vec<String> {
+    use ferrofin_api::handlers::SUBSYSTEM_KEYS;
+
+    let mut out = Vec::new();
+    let mut keys = BTreeSet::new();
+    for s in subsystems {
+        if !SUBSYSTEM_KEYS.contains(&s.key) {
+            out.push(format!(
+                "subsystem {:?}: not one of SUBSYSTEM_KEYS {SUBSYSTEM_KEYS:?}",
+                s.key
+            ));
+        }
+        if !keys.insert(s.key) {
+            out.push(format!("subsystem {:?}: duplicate row", s.key));
+        }
+    }
+    for v in ops {
+        for r in v.refs.iter().filter(|r| !keys.contains(*r)) {
+            out.push(format!(
+                "{:?}: refs {r:?}, which is not a VERIFIED_SUBSYSTEMS row",
+                (v.method, v.path)
+            ));
+        }
+    }
+    out
+}
+
+/// Whether `name` occurs in `src` as a whole identifier (so `GetItem` does not
+/// match `GetItems`).
+fn names_identifier(src: &str, name: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+    src.match_indices(name).any(|(i, _)| {
+        !src[..i].chars().next_back().is_some_and(is_ident)
+            && !src[i + name.len()..].chars().next().is_some_and(is_ident)
+    })
+}
+
+/// Each `(row label, upstream_file, upstream_method)` must name a file under
+/// the upstream checkout `dir` that contains `upstream_method`.
+fn upstream_problems<'a>(
+    dir: &Path,
+    rows: impl IntoIterator<Item = (String, &'a str, &'a str)>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (label, file, method) in rows {
+        match std::fs::read_to_string(dir.join(file)) {
+            Err(e) => out.push(format!(
+                "{label}: upstream_file {file:?} is not readable under {}: {e}",
+                dir.display()
+            )),
+            Ok(src) if !names_identifier(&src, method) => out.push(format!(
+                "{label}: upstream_method {method:?} does not appear in {file}"
+            )),
+            Ok(_) => {}
+        }
+    }
+    out
+}
+
+/// Every rule the parity record obeys across `VERIFIED`, `VERIFIED_SUBSYSTEMS`
+/// and their earlier-pin lists, except the upstream-checkout ones.
+/// Empty = well-formed.
+fn parity_record_problems() -> Vec<String> {
+    use ferrofin_api::handlers::{
+        REAL_ROUTES, VERIFIED, VERIFIED_AGAINST_EARLIER_PIN, VERIFIED_SUBSYSTEMS,
+        VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN,
+    };
+
+    let real: BTreeSet<(&str, &str)> = REAL_ROUTES.iter().copied().collect();
+    let mut dates = BTreeMap::new();
+    let mut problems = Vec::new();
+    for v in VERIFIED {
+        let key = (v.method, v.path);
+        if dates.insert(key, v.date).is_some() {
+            problems.push(format!("{key:?}: duplicate row"));
+        }
+        if !real.contains(&key) {
+            problems.push(format!("{key:?}: not a REAL_ROUTES operation"));
+        }
+        let rp = record_problems(
+            v.upstream_file,
+            v.upstream_method,
+            v.ferrofin,
+            v.date,
+            v.divergences,
+        );
+        problems.extend(rp.into_iter().map(|p| format!("{key:?}: {p}")));
+    }
+    let subsystem_dates: BTreeMap<&str, &str> = VERIFIED_SUBSYSTEMS
+        .iter()
+        .map(|s| (s.key, s.date))
+        .collect();
+    for s in VERIFIED_SUBSYSTEMS {
+        let rp = record_problems(
+            s.upstream_file,
+            s.upstream_method,
+            s.ferrofin,
+            s.date,
+            s.divergences,
+        );
+        problems.extend(
+            rp.into_iter()
+                .map(|p| format!("subsystem {:?}: {p}", s.key)),
+        );
+    }
+    problems.extend(ref_problems(VERIFIED, VERIFIED_SUBSYSTEMS));
+    problems.extend(earlier_pin_problems(
+        &dates,
+        VERIFIED_AGAINST_EARLIER_PIN
+            .iter()
+            .map(|&(m, p, tag)| ((m, p), tag)),
+        "VERIFIED_AGAINST_EARLIER_PIN",
+    ));
+    problems.extend(earlier_pin_problems(
+        &subsystem_dates,
+        VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN.iter().copied(),
+        "VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN",
+    ));
+    problems
+}
+
 /// **The API-parity record** (`handlers::VERIFIED`) is well-formed, and this
 /// test prints the parity section the README publishes:
-/// `N / <ops> operations deep-verified (K with recorded divergences)` plus the
-/// per-controller table (`--nocapture`). Every row must be a `REAL_ROUTES`
-/// operation (so a verified op is a served op), name the C# file and method it
-/// was compared against (the tag and commit are pinned once, as consts), and
-/// carry a `YYYY-MM-DD` date.
-/// The count moves only when a row is written; a suite rewrite cannot touch it.
+/// `N / <ops> operations deep-verified against <UPSTREAM_TAG>, plus M compared
+/// against an earlier release` plus the per-controller table (`--nocapture`).
+/// Every row must be a `REAL_ROUTES` operation (so a verified op is a served
+/// op), name the C# file and method it was compared against (the tag and commit
+/// are pinned once, as consts, with `VERIFIED_AGAINST_EARLIER_PIN` naming the
+/// rows compared against an earlier tag), and carry a `YYYY-MM-DD` date.
+/// The counts move only when a row is written or re-checked, or the pin moves;
+/// a suite rewrite cannot touch them.
 #[test]
 fn verified_rows_are_real_operations_and_print_the_parity_line() {
-    use std::collections::BTreeMap;
-
     use ferrofin_api::handlers::{
-        EXTENSION_ROUTES, REAL_ROUTES, UPSTREAM_COMMIT, UPSTREAM_TAG, VERIFIED,
+        EXTENSION_ROUTES, UPSTREAM_COMMIT, UPSTREAM_TAG, VERIFIED, VERIFIED_AGAINST_EARLIER_PIN,
+        VERIFIED_SUBSYSTEMS,
     };
 
     assert!(
@@ -344,19 +510,7 @@ fn verified_rows_are_real_operations_and_print_the_parity_line() {
         "UPSTREAM_COMMIT must be a hex commit id"
     );
 
-    let real: BTreeSet<(&str, &str)> = REAL_ROUTES.iter().copied().collect();
-    let mut seen = BTreeSet::new();
-    let mut problems = Vec::new();
-    for v in VERIFIED {
-        let key = (v.method, v.path);
-        if !seen.insert(key) {
-            problems.push(format!("{key:?}: duplicate row"));
-        }
-        if !real.contains(&key) {
-            problems.push(format!("{key:?}: not a REAL_ROUTES operation"));
-        }
-        problems.extend(row_problems(v).into_iter().map(|p| format!("{key:?}: {p}")));
-    }
+    let problems = parity_record_problems();
     assert!(
         problems.is_empty(),
         "VERIFIED rows are malformed:\n{}",
@@ -401,10 +555,13 @@ fn verified_rows_are_real_operations_and_print_the_parity_line() {
         .filter(|v| extension.contains(&(v.method, v.path)))
         .count();
     println!(
-        "\n{} / {total} operations deep-verified against Jellyfin {UPSTREAM_TAG} ({UPSTREAM_COMMIT}) — {with_div} with recorded divergences; {ext_verified} owned by compiled-in extensions\n",
-        VERIFIED.len()
+        "\n{} / {total} operations deep-verified against Jellyfin {UPSTREAM_TAG} ({UPSTREAM_COMMIT}), plus {} compared against an earlier release and owed a re-check — of all {} rows, {with_div} with recorded divergences; {ext_verified} owned by compiled-in extensions; {} subsystem rows (not counted above)\n",
+        VERIFIED.len() - VERIFIED_AGAINST_EARLIER_PIN.len(),
+        VERIFIED_AGAINST_EARLIER_PIN.len(),
+        VERIFIED.len(),
+        VERIFIED_SUBSYSTEMS.len()
     );
-    println!("| controller | verified / operations |\n|---|---|");
+    println!("| controller | rows, any pin / operations |\n|---|---|");
     for (tag, (v, n)) in &per {
         println!("| {tag} | {v} / {n} |");
     }
@@ -421,4 +578,132 @@ fn verified_rows_are_real_operations_and_print_the_parity_line() {
         VENDORED_ROUTES.len(),
         "spec_routes and VENDORED_ROUTES disagree"
     );
+}
+
+/// With `FERROFIN_UPSTREAM_DIR` naming a Jellyfin checkout at
+/// `UPSTREAM_COMMIT`, every `VERIFIED` and `VERIFIED_SUBSYSTEMS` row names an
+/// upstream file that exists there and a method that appears in it. Skips with
+/// a message when the variable is unset or the checkout is at another commit,
+/// so CI runs without the checkout.
+#[test]
+fn verified_rows_name_existing_upstream_code() {
+    use ferrofin_api::handlers::{UPSTREAM_COMMIT, UPSTREAM_TAG, VERIFIED, VERIFIED_SUBSYSTEMS};
+
+    let Ok(dir) = std::env::var("FERROFIN_UPSTREAM_DIR") else {
+        eprintln!(
+            "SKIP: set FERROFIN_UPSTREAM_DIR to a jellyfin checkout at {UPSTREAM_COMMIT} \
+             ({UPSTREAM_TAG}) to check VERIFIED rows against the upstream code"
+        );
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let head = Command::new("git")
+        .arg("-C")
+        .arg(&dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    if !head.starts_with(UPSTREAM_COMMIT) {
+        eprintln!(
+            "SKIP: FERROFIN_UPSTREAM_DIR {} is at {head:?}, not UPSTREAM_COMMIT \
+             {UPSTREAM_COMMIT} ({UPSTREAM_TAG})",
+            dir.display()
+        );
+        return;
+    }
+    let rows = VERIFIED
+        .iter()
+        .map(|v| {
+            (
+                format!("{} {}", v.method, v.path),
+                v.upstream_file,
+                v.upstream_method,
+            )
+        })
+        .chain(VERIFIED_SUBSYSTEMS.iter().map(|s| {
+            (
+                format!("subsystem {}", s.key),
+                s.upstream_file,
+                s.upstream_method,
+            )
+        }));
+    let problems = upstream_problems(&dir, rows);
+    assert!(
+        problems.is_empty(),
+        "VERIFIED rows name upstream code missing at {UPSTREAM_COMMIT}:\n{}",
+        problems.join("\n")
+    );
+}
+
+#[test]
+fn upstream_problems_name_the_row_with_a_missing_file_or_method() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = "Jellyfin.Api/Controllers/ItemsController.cs";
+    std::fs::create_dir_all(dir.path().join("Jellyfin.Api/Controllers")).expect("mkdir");
+    std::fs::write(
+        dir.path().join(file),
+        "public ActionResult<QueryResult<BaseItemDto>> GetItems(Guid? userId)",
+    )
+    .expect("write");
+
+    assert!(upstream_problems(dir.path(), [("ok".to_string(), file, "GetItems")]).is_empty());
+    let problems = upstream_problems(
+        dir.path(),
+        [
+            ("get /Items".to_string(), file, "GetItem"),
+            ("get /Gone".to_string(), "Jellyfin.Api/Gone.cs", "GetItems"),
+        ],
+    );
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(problems[0].starts_with("get /Items: upstream_method \"GetItem\""));
+    assert!(problems[1].starts_with("get /Gone: upstream_file"));
+}
+
+#[test]
+fn earlier_pin_rejects_a_row_dated_on_or_after_the_pin_move() {
+    use ferrofin_api::handlers::UPSTREAM_PIN_DATE;
+
+    let dates = BTreeMap::from([("before", "2026-01-01"), ("after", UPSTREAM_PIN_DATE)]);
+    let problems = earlier_pin_problems(
+        &dates,
+        [("before", "v12.0-rc7"), ("after", "v12.0-rc7")],
+        "EARLIER",
+    );
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].starts_with("\"after\": dated"), "{problems:?}");
+}
+
+#[test]
+fn refs_must_name_a_subsystem_row_with_a_known_key() {
+    let subsystem = |key| VerifiedSubsystem {
+        key,
+        upstream_file: "Jellyfin.Server.Implementations/Item/BaseItemRepository.cs",
+        upstream_method: "TranslateQuery",
+        ferrofin: "translate_query.rs",
+        date: "2026-10-19",
+        divergences: &[],
+    };
+    let op = Verified {
+        method: "get",
+        path: "/Items",
+        upstream_file: "Jellyfin.Api/Controllers/ItemsController.cs",
+        upstream_method: "GetItems",
+        ferrofin: "handlers/items.rs",
+        date: "2026-10-19",
+        divergences: &[],
+        refs: &["query-translation", "user-data"],
+    };
+
+    let subsystems = [subsystem("query-translation"), subsystem("user-data")];
+    assert!(ref_problems(std::slice::from_ref(&op), &subsystems).is_empty());
+    let problems = ref_problems(
+        std::slice::from_ref(&op),
+        &[subsystem("query-translation"), subsystem("bogus")],
+    );
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    assert!(problems[0].starts_with("subsystem \"bogus\": not one of SUBSYSTEM_KEYS"));
+    assert!(problems[1].contains("refs \"user-data\""), "{problems:?}");
 }

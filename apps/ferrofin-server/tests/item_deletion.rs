@@ -495,21 +495,23 @@ async fn deleting_items_over_http_checks_can_delete_and_removes_their_files() {
     // the delete (`500`) with nothing deleted and the row in place.
     let folder = h.path("movies/Epsilon (2003)");
     std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).expect("chmod");
-    // Root ignores the mode bits; then there is nothing to simulate.
+    // Root ignores the mode bits; then there is nothing to simulate, and a
+    // delete would succeed and remove the folder, so none is sent.
     let probe = folder.join(".probe");
     let bypassed = std::fs::write(&probe, b"").is_ok();
-    let (status, _) = call(
-        &router,
-        "DELETE",
-        &format!("/Items/{epsilon}"),
-        Some(&admin),
-        None,
-    )
-    .await;
-    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     if bypassed {
         std::fs::remove_file(&probe).expect("probe");
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     } else {
+        let (status, _) = call(
+            &router,
+            "DELETE",
+            &format!("/Items/{epsilon}"),
+            Some(&admin),
+            None,
+        )
+        .await;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(exists(&router, &admin, &epsilon).await, "the row stays");
         assert!(h.path("movies/Epsilon (2003)/Epsilon (2003).mkv").is_file());

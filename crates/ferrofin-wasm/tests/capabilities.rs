@@ -21,11 +21,8 @@ use ferrofin_wasm::capabilities::{
 mod common;
 use common::{EnabledStub, OneMovieLibrary, RecordingSegments, one_shot_http};
 
-fn client() -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap()
+fn client() -> ferrofin_wasm::capabilities::GuestHttp {
+    ferrofin_wasm::capabilities::GuestHttp::new(std::time::Duration::from_secs(5)).unwrap()
 }
 
 #[test]
@@ -330,6 +327,16 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
         "ff02::1",           // v6 multicast
         "::ffff:10.0.0.1",   // v4-mapped RFC1918
         "::ffff:100.64.0.1", // v4-mapped CGNAT
+        // IPv6 forms that carry a private IPv4 reach it through a NAT64
+        // gateway, a 6to4 relay or IPv4-compatible routing.
+        "64:ff9b::a9fe:a9fe", // NAT64 → cloud metadata
+        "64:ff9b::7f00:1",    // NAT64 → loopback
+        "64:ff9b:1::1",       // local-use NAT64 prefix (not globally reachable)
+        "2002:7f00:1::",      // 6to4 → loopback
+        "2002:c0a8:101::1",   // 6to4 → 192.168.1.1
+        "2002:a00:1::",       // 6to4 → 10.0.0.1
+        "::127.0.0.1",        // IPv4-compatible loopback
+        "::10.0.0.1",         // IPv4-compatible RFC1918
     ] {
         assert!(
             is_private_address(private.parse().unwrap()),
@@ -343,6 +350,11 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
         "100.63.255.255", // just below CGNAT
         "100.128.0.0",    // just above CGNAT
         "2606:4700:4700::1111",
+        "64:ff9b::808:808", // NAT64 → 8.8.8.8
+        "2002:808:808::1",  // 6to4 → 8.8.8.8
+        "::8.8.8.8",        // IPv4-compatible public
+        "64:ff9b:2::1",     // just past the local-use NAT64 prefix
+        "64:ff9b:0:0:1::1", // not the NAT64 /96: a non-zero middle
     ] {
         assert!(
             !is_private_address(public.parse().unwrap()),
@@ -370,6 +382,63 @@ fn http_fetch_denies_private_destinations_unless_allowlisted() {
     .unwrap_err();
     assert!(
         err.contains("private/loopback") && err.contains("FERROFIN_WASM_PRIVATE_HTTP_ALLOW"),
+        "got: {err}"
+    );
+}
+
+/// A HOSTNAME that resolves to a private address is refused by the vetted
+/// client's resolver, before any connection: the address vetted is the
+/// address that would be connected (the DNS-rebinding guard). The guest
+/// sees the same message as for a private IP literal, and an unresolvable
+/// name still says so.
+#[test]
+fn a_hostname_resolving_to_a_private_address_is_refused_before_connecting() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let err = http_fetch(
+        &client(),
+        "untrusted-plugin",
+        1024,
+        false,
+        &ferrofin_wasm::capabilities::EgressPolicy::parse(&["localhost".to_owned()]),
+        std::time::Duration::from_secs(5),
+        &HttpRequest {
+            method: "GET".to_owned(),
+            url: format!("http://localhost:{port}/x"),
+            headers: Vec::new(),
+            body: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("destination `localhost` resolves to the private/loopback address")
+            && err.contains("`untrusted-plugin`")
+            && err.contains("FERROFIN_WASM_PRIVATE_HTTP_ALLOW"),
+        "got: {err}"
+    );
+    assert!(
+        matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "no connection was opened"
+    );
+
+    let err = http_fetch(
+        &client(),
+        "untrusted-plugin",
+        1024,
+        false,
+        &ferrofin_wasm::capabilities::EgressPolicy::parse(&["*".to_owned()]),
+        std::time::Duration::from_secs(5),
+        &HttpRequest {
+            method: "GET".to_owned(),
+            url: "http://nothing-here.invalid/x".to_owned(),
+            headers: Vec::new(),
+            body: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.starts_with("could not resolve `nothing-here.invalid`"),
         "got: {err}"
     );
 }
@@ -439,25 +508,59 @@ fn download_image_enforces_egress_status_and_returns_bytes() {
 
     // Undeclared destination: refused before any connection.
     let policy = EgressPolicy::parse(&["cdn.example.com".to_owned()]);
-    let err =
-        download_image("p", false, &policy, CAP, TIMEOUT, "http://127.0.0.1:9/x").unwrap_err();
+    let err = download_image(
+        &client(),
+        "p",
+        false,
+        &policy,
+        CAP,
+        TIMEOUT,
+        "http://127.0.0.1:9/x",
+    )
+    .unwrap_err();
     assert!(err.contains("declared egress"), "got: {err}");
 
     // Declared but loopback/private: still refused without the grant.
     let policy = EgressPolicy::parse(&["127.0.0.1".to_owned()]);
-    let err =
-        download_image("p", false, &policy, CAP, TIMEOUT, "http://127.0.0.1:9/x").unwrap_err();
+    let err = download_image(
+        &client(),
+        "p",
+        false,
+        &policy,
+        CAP,
+        TIMEOUT,
+        "http://127.0.0.1:9/x",
+    )
+    .unwrap_err();
     assert!(err.contains("private"), "got: {err}");
 
     // With the private grant: a non-200 answer loses the slot…
     let (url, server) = one_shot_http("404 Not Found", b"nope");
-    let err = download_image("p", true, &EgressPolicy::default(), CAP, TIMEOUT, &url).unwrap_err();
+    let err = download_image(
+        &client(),
+        "p",
+        true,
+        &EgressPolicy::default(),
+        CAP,
+        TIMEOUT,
+        &url,
+    )
+    .unwrap_err();
     assert!(err.contains("404"), "got: {err}");
     server.join().unwrap();
 
     // …and a 200 yields the raw bytes via a GET.
     let (url, server) = one_shot_http("200 OK", b"IMAGEBYTES");
-    let bytes = download_image("p", true, &EgressPolicy::default(), CAP, TIMEOUT, &url).unwrap();
+    let bytes = download_image(
+        &client(),
+        "p",
+        true,
+        &EgressPolicy::default(),
+        CAP,
+        TIMEOUT,
+        &url,
+    )
+    .unwrap();
     assert_eq!(bytes, b"IMAGEBYTES");
     let request = server.join().unwrap();
     assert!(request.starts_with(b"GET "), "artwork fetch must be a GET");

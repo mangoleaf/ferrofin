@@ -12,6 +12,9 @@ use axum::{
 use ferrofin_server::config::{Config, ProviderEndpoints};
 use serde_json::{Value, json};
 
+#[path = "support/boot.rs"]
+mod boot;
+
 const POSTER: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 2, 0,
     0, 0, 253, 212, 154, 115, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 68, 12,
@@ -72,7 +75,7 @@ async fn provider(
         }
         return ([("content-type", "image/png")], bytes).into_response();
     }
-    if uri.path() == "/movie/603/similar" {
+    if uri.path() == "/movie/603/recommendations" {
         return Json(json!({"results":[{"id":604}],"total_pages":1})).into_response();
     }
     if uri.path() == "/movie/603/images" {
@@ -303,15 +306,16 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     let mock = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let config = Config {
+    let ffmpeg = probe_stub(tmp.path(), "ffmpeg");
+    let ffprobe = probe_stub(tmp.path(), "ffprobe");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let (server, base, config) = boot::spawn_server(&client, |port| Config {
         port,
-        ffmpeg_path: Some(probe_stub(tmp.path(), "ffmpeg")),
-        ffprobe_path: Some(probe_stub(tmp.path(), "ffprobe")),
+        ffmpeg_path: Some(ffmpeg.clone()),
+        ffprobe_path: Some(ffprobe.clone()),
         provider_endpoints: ProviderEndpoints {
             tmdb: Some(endpoint.clone()),
             tmdb_images: Some(endpoint.clone()),
@@ -323,39 +327,16 @@ async fn saved_locales_change_provider_requests_without_restarting() {
             lrclib: Some(endpoint.clone()),
         },
         studios_repo_url: endpoint.clone(),
-        musicbrainz_base_url: endpoint,
+        musicbrainz_base_url: endpoint.clone(),
         ..Config::test_stub(tmp.path())
-    };
-    let database_url = config.database_url();
-    let server = std::thread::spawn(move || {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(ferrofin_server::run(config))
-            .unwrap();
-    });
+    })
+    .await;
     let mut api = Api {
-        client: reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap(),
-        base: format!("http://127.0.0.1:{port}"),
+        client,
+        base,
         auth: CLIENT.to_owned(),
-        database_url,
+        database_url: config.database_url(),
     };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if api
-            .client
-            .get(format!("{}/System/Info/Public", api.base))
-            .send()
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        assert!(Instant::now() < deadline, "server readiness");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     let login: Value = api
         .client
         .post(format!("{}/Users/AuthenticateByName", api.base))
@@ -614,7 +595,7 @@ async fn saved_locales_change_provider_requests_without_restarting() {
     verify_date_added_policy(&api, tmp.path()).await;
     verify_root_library_location(&api).await;
     api.post("/System/Shutdown", &Value::Null).await;
-    tokio::task::spawn_blocking(move || server.join().unwrap())
+    tokio::task::spawn_blocking(move || server.join().unwrap().unwrap())
         .await
         .unwrap();
     mock.abort();
@@ -997,7 +978,7 @@ async fn verify_nfo_savers(
         &nfo,
         saved.replace(
             "</movie>",
-            "<custom><nested>keep me</nested></custom><genre>stale</genre></movie>",
+            "<custom><nested>keep me</nested></custom><genre>cleared-genre-sentinel</genre></movie>",
         ),
     )
     .unwrap();
@@ -1012,7 +993,9 @@ async fn verify_nfo_savers(
     assert!(saved.contains("<nested>keep me</nested>"));
     assert!(saved.contains("<customid>changed</customid>"));
     assert!(saved.contains("<lockdata>true</lockdata>"));
-    assert!(!saved.contains("stale"));
+    // The NFO also carries absolute image paths, so the check needs a word no
+    // checkout or temp path contains.
+    assert!(!saved.contains("cleared-genre-sentinel"));
     // Selecting no saver suppresses writes even when the legacy flag is on.
     options["MetadataSavers"] = json!([]);
     options["SaveLocalMetadata"] = json!(true);
@@ -1472,6 +1455,7 @@ async fn verify_artwork_destinations(
     // ImageSaver retains existing local art even during replacement refresh.
     // Remove it to exercise a genuinely new automatic acquisition.
     std::fs::remove_file(media.join("folder.png")).unwrap();
+    let _ = std::fs::remove_file(media.join("backdrop.png"));
     options["TypeOptions"][0]["ImageFetchers"] = json!(["TheMovieDb"]);
     api.post(
         "/Library/VirtualFolders/LibraryOptions",
@@ -1479,9 +1463,26 @@ async fn verify_artwork_destinations(
     )
     .await;
     api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=None&imageRefreshMode=FullRefresh&replaceAllImages=true"),&Value::Null).await;
+    // The refresh saves the poster, then the backdrop the image options from
+    // `verify_movie_image_options` still select (one, at least 3000 wide).
+    // Waiting for the poster alone let the backdrop land after the backdrop
+    // steps below had reset the slots, as `backdrop.png` ahead of `fanart.png`.
+    // The backdrop steps count the item's image rows, so the row must be
+    // saved too, not only the file.
+    let saved = |name: &str, tail: &[u8]| {
+        std::fs::read(media.join(name)).is_ok_and(|bytes| bytes.ends_with(tail))
+    };
+    let backdrop = media.join("backdrop.png").to_string_lossy().into_owned();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if std::fs::read(media.join("folder.png")).is_ok_and(|bytes| bytes.ends_with(b"/large.png"))
+        let rows = api.get(&format!("/Items/{id}/Images")).await;
+        let backdrop_row =
+            rows.as_array().unwrap().iter().any(|image| {
+                image["ImageType"] == "Backdrop" && image["Path"] == backdrop.as_str()
+            });
+        if saved("folder.png", b"/large.png")
+            && saved("backdrop.png", b"/backdrop-three.png")
+            && backdrop_row
         {
             break;
         }
@@ -1773,7 +1774,7 @@ async fn verify_similarity_selection(
             .lock()
             .unwrap()
             .iter()
-            .filter(|uri| uri.starts_with("/movie/603/similar"))
+            .filter(|uri| uri.starts_with("/movie/603/recommendations"))
             .count()
     };
     let before = similar_calls();
@@ -3329,7 +3330,9 @@ async fn verify_by_name_metadata_languages(
                     .unwrap()
                     .iter()
                     .any(|uri| uri.starts_with(&format!("/original/locale-{expected_image}.png"))),
-                "automatic acquisition must select the newly requested language"
+                "automatic acquisition must select the newly requested language \
+                 ({language}, {label}): {:?}",
+                requests.lock().unwrap()
             );
             let provider_path = if label == "Person biography" {
                 "/person/"
@@ -3529,6 +3532,17 @@ async fn verify_special_episode_display(api: &Api, root: &std::path::Path) {
         .find(|task| task["Key"] == "RefreshLibrary")
         .expect("registered refresh task");
     let task_id = task["Id"].as_str().unwrap();
+    // The test's first `/Library/Refresh` may still be in its closing passes:
+    // starting the task again before it is idle is refused.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let task = loop {
+        let task = api.get(&format!("/ScheduledTasks/{task_id}")).await;
+        if task["State"] == "Idle" {
+            break task;
+        }
+        assert!(Instant::now() < deadline, "refresh task never idle: {task}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     let previous = task["LastExecutionResult"]["EndTimeUtc"].clone();
     api.post(&format!("/ScheduledTasks/Running/{task_id}"), &Value::Null)
         .await;

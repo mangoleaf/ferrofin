@@ -69,55 +69,84 @@ pub struct XmlError;
 /// instructions are skipped (matching `IgnoreComments`/
 /// `IgnoreProcessingInstructions`). Returns [`XmlError`] on a malformed document.
 fn tokenize(xml: &str) -> Result<Vec<XmlToken>, XmlError> {
+    match tokenize_until_error(xml) {
+        (tokens, true) => Ok(tokens),
+        (_, false) => Err(XmlError),
+    }
+}
+
+/// Tokenizes `xml` up to its first malformed spot, returning the tokens and
+/// whether the whole document was read. After an error the tokens end at the
+/// last complete child of the root element: `XmlReader` throws inside the
+/// element holding the error, so a parser catching the `XmlException` has
+/// applied every element before that one and nothing of it. (A handler that
+/// walks a child with `ReadSubtree` and sets fields as it goes, `<ratings>`
+/// for one, keeps the values before the error upstream; dropping the whole
+/// child is the approximation here.)
+fn tokenize_until_error(xml: &str) -> (Vec<XmlToken>, bool) {
     let mut reader = Reader::from_str(xml);
     let config = reader.config_mut();
     config.check_end_names = false;
     config.trim_text(false);
 
     let mut tokens: Vec<XmlToken> = Vec::new();
+    // Nesting depth, and how many tokens end at a complete root child.
+    let mut depth = 0usize;
+    let mut complete = 0usize;
 
     loop {
-        match reader.read_event() {
-            Ok(Event::Start(e)) => {
-                let attributes = read_attrs(&e)?;
+        let read = match reader.read_event() {
+            Ok(Event::Start(e)) => read_attrs(&e).map(|attributes| {
                 tokens.push(XmlToken::Start {
                     name: local_name(&e),
                     attributes,
                 });
-            }
-            Ok(Event::Empty(e)) => {
-                let attributes = read_attrs(&e)?;
+                depth += 1;
+                if depth == 1 {
+                    complete = tokens.len();
+                }
+            }),
+            Ok(Event::Empty(e)) => read_attrs(&e).map(|attributes| {
                 tokens.push(XmlToken::Empty {
                     name: local_name(&e),
                     attributes,
                 });
-            }
+                if depth <= 1 {
+                    complete = tokens.len();
+                }
+            }),
             Ok(Event::End(e)) => {
                 tokens.push(XmlToken::End {
                     name: e.local_name().as_ref().to_owned(),
                 });
+                // A stray end tag (no `check_end_names`) can skew the depth;
+                // .NET rejects such a document outright.
+                depth = depth.saturating_sub(1);
+                if depth <= 1 {
+                    complete = tokens.len();
+                }
+                Ok(())
             }
             Ok(Event::Text(e)) => {
-                let text = e.as_ref().to_owned();
-                push_text(&mut tokens, text);
+                push_text(&mut tokens, e.as_ref().to_owned());
+                Ok(())
             }
-            Ok(Event::GeneralRef(e)) => {
-                let text = quick_xml::escape::unescape(&format!("&{};", e.as_ref()))
-                    .map_err(|_| XmlError)?
-                    .into_owned();
-                push_text(&mut tokens, text);
-            }
+            Ok(Event::GeneralRef(e)) => quick_xml::escape::unescape(&format!("&{};", e.as_ref()))
+                .map(|text| push_text(&mut tokens, text.into_owned()))
+                .map_err(|_| XmlError),
             Ok(Event::CData(e)) => {
-                let text = e.as_ref().to_owned();
-                push_text(&mut tokens, text);
+                push_text(&mut tokens, e.as_ref().to_owned());
+                Ok(())
             }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(_) => return Err(XmlError),
+            Ok(Event::Eof) => return (tokens, true),
+            Ok(_) => Ok(()),
+            Err(_) => Err(XmlError),
+        };
+        if read.is_err() {
+            tokens.truncate(complete);
+            return (tokens, false);
         }
     }
-
-    Ok(tokens)
 }
 
 /// Reads a start/empty element's attributes as `(local-name, unescaped-value)`.
@@ -170,6 +199,15 @@ impl XmlCursor {
             tokens: tokenize(xml)?,
             pos: 0,
         })
+    }
+
+    /// A cursor over the elements read before the first malformed spot, and
+    /// whether the whole document was well-formed: the reader a C# parser
+    /// that catches `XmlException` has walked when the exception lands.
+    #[must_use]
+    pub fn up_to_error(xml: &str) -> (Self, bool) {
+        let (tokens, clean) = tokenize_until_error(xml);
+        (Self { tokens, pos: 0 }, clean)
     }
 
     /// Whether the cursor has consumed every node (`XmlReader.EOF`).
@@ -415,7 +453,43 @@ fn escape_attr(text: &str) -> String {
 
 #[cfg(test)]
 mod entity_tests {
-    use super::{XmlToken, tokenize};
+    use super::{XmlToken, tokenize, tokenize_until_error};
+
+    fn names(tokens: &[XmlToken]) -> Vec<String> {
+        tokens
+            .iter()
+            .map(|token| match token {
+                XmlToken::Start { name, .. } => format!("<{name}>"),
+                XmlToken::Empty { name, .. } => format!("<{name}/>"),
+                XmlToken::End { name } => format!("</{name}>"),
+                XmlToken::Text { value } => value.clone(),
+            })
+            .collect()
+    }
+
+    /// After a malformed spot the prefix ends at the last complete child of
+    /// the root, and the flag says the document was not clean.
+    #[rstest::rstest]
+    #[case::clean("<m><a>1</a></m>", &["<m>", "<a>", "1", "</a>", "</m>"], true)]
+    #[case::empty_root("<m/>", &["<m/>"], true)]
+    #[case::error_in_a_child("<m><a>1</a><b>x & y</b></m>", &["<m>", "<a>", "1", "</a>"], false)]
+    #[case::error_between_children("<m><a>1</a> & <b>2</b></m>", &["<m>", "<a>", "1", "</a>"], false)]
+    #[case::empty_child_before_the_error("<m><a/><b>x & y</b></m>", &["<m>", "<a/>"], false)]
+    #[case::error_in_the_root_start_tag(r#"<m a="1 & 2"><a>1</a></m>"#, &[], false)]
+    #[case::junk_after_the_root(
+        "<m><a>1</a></m> & junk",
+        &["<m>", "<a>", "1", "</a>", "</m>"],
+        false
+    )]
+    fn tokenize_until_error_keeps_complete_root_children(
+        #[case] xml: &str,
+        #[case] expected: &[&str],
+        #[case] clean: bool,
+    ) {
+        let (tokens, whole) = tokenize_until_error(xml);
+        assert_eq!(names(&tokens), expected, "{xml}");
+        assert_eq!(whole, clean, "{xml}");
+    }
 
     #[test]
     fn text_entities_and_cdata_coalesce_without_losing_spaces() {

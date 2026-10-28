@@ -178,11 +178,14 @@ fn is_file_protocol(path: Option<&str>) -> bool {
 ///   supports deleting (there is no channel-plugin mechanism), so `false`;
 /// - `Video.CanDelete` is `false` while a recording writes its file;
 /// - otherwise `IsFileProtocol`: an item with no path, or a streamed one,
-///   cannot be deleted. The exceptions are the collections and playlists
-///   Ferrofin creates: their rows have no path, where upstream's sit in the
-///   data directory (`collections/<name> [boxset]`,
-///   `playlists/<name>`, `PlaylistManager.cs:83-141`), so upstream's
-///   `CanDelete()` is `true` for them and so is this.
+///   cannot be deleted. The exceptions are a collection an older Ferrofin
+///   created (gl-738 tracks giving it a folder), and a playlist an older
+///   Ferrofin created that the boot repair could not give a folder
+///   ([`crate::adoption_repairs::rekey_pathless_playlists`]): their rows have
+///   no path, where upstream's sit in the data directory
+///   (`collections/<name> [boxset]`, `playlists/<name>`,
+///   `PlaylistManager.cs:83-141`), so upstream's `CanDelete()` is `true` for
+///   them and so is this.
 ///
 /// A virtual item (a missing episode or season) is never deletable: it has
 /// nothing on disk, and upstream's has no path.
@@ -544,7 +547,8 @@ mod tests {
     #[case::no_path(BaseItemKind::Movie, None, false)]
     #[case::empty_path(BaseItemKind::Episode, Some(""), false)]
     #[case::streamed(BaseItemKind::Movie, Some("http://host/film.mkv"), false)]
-    #[case::ferrofin_collection(BaseItemKind::BoxSet, None, true)]
+    #[case::older_ferrofin_collection(BaseItemKind::BoxSet, None, true)]
+    #[case::collection(BaseItemKind::BoxSet, Some("/data/collections/Saga [boxset]"), true)]
     #[case::ferrofin_playlist(BaseItemKind::Playlist, None, true)]
     #[case::adopted_playlist(BaseItemKind::Playlist, Some("%AppDataPath%/playlists/Mix"), true)]
     #[case::pathless_season(BaseItemKind::Season, None, false)]

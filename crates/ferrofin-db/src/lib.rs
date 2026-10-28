@@ -16,13 +16,14 @@ pub mod enums;
 pub mod error;
 pub mod normalized_usernames;
 pub mod presentation_key;
+pub mod row_cache;
 mod sqlite_casing;
 pub mod sqlite_random;
 pub mod store;
 
 pub use database::{
     AdoptionState, Database, ImageParentRow, JELLYFIN_GENERATIONS, JellyfinGeneration,
-    MigrationHistory, inspect_migration_history,
+    MigrationHistory, init_sqlite, inspect_migration_history, schema_head,
 };
 
 /// How many ids one `IN (…)` query binds at a time: stays far below SQLite's

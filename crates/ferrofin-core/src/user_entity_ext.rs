@@ -16,7 +16,6 @@
 
 use ferrofin_db::Database;
 use ferrofin_db::enums::{PermissionKind, PreferenceKind};
-use sqlx::sqlite::SqlitePool;
 use sqlx::{Sqlite, SqliteExecutor};
 
 use crate::db_error::db_err;
@@ -88,7 +87,54 @@ pub async fn guid_preference(
     Ok(get_preference(pool, user_id, kind)
         .await?
         .iter()
-        .filter_map(|v| uuid::Uuid::parse_str(v).ok())
+        .filter_map(|v| ferrofin_util::guid_extensions::parse_dotnet_guid(v))
+        .collect())
+}
+
+/// [`has_permission`] from the cross-request policy cache ([`Database::user_policy`]), for a read on
+/// a request path. Every committed policy write invalidates the user's entry, so it is as current as
+/// the database for anything outside a transaction.
+///
+/// # Errors
+/// Returns [`ServiceError::Db`] if the policy read fails.
+pub async fn cached_permission(
+    db: &Database,
+    user_id: &str,
+    kind: PermissionKind,
+) -> Result<bool, ServiceError> {
+    let policy = db.user_policy(user_id).await.map_err(ServiceError::from)?;
+    Ok(policy.permission(i32::from(kind)))
+}
+
+/// [`get_preference`] from the cross-request policy cache, as [`cached_permission`] reads.
+///
+/// # Errors
+/// Returns [`ServiceError::Db`] if the policy read fails.
+pub async fn cached_preference(
+    db: &Database,
+    user_id: &str,
+    kind: PreferenceKind,
+) -> Result<Vec<String>, ServiceError> {
+    let policy = db.user_policy(user_id).await.map_err(ServiceError::from)?;
+    Ok(match policy.preference(i32::from(kind)) {
+        Some(v) if !v.is_empty() => v.split(PREFERENCE_DELIMITER).map(str::to_owned).collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// [`guid_preference`] from the cross-request policy cache, as [`cached_permission`] reads.
+///
+/// # Errors
+/// Returns [`ServiceError::Db`] if the policy read fails.
+pub async fn cached_guid_preference(
+    db: &Database,
+    user_id: &str,
+    kind: PreferenceKind,
+) -> Result<Vec<uuid::Uuid>, ServiceError> {
+    Ok(cached_preference(db, user_id, kind)
+        .await?
+        .iter()
+        .filter_map(|v| ferrofin_util::guid_extensions::parse_dotnet_guid(v))
         .collect())
 }
 
@@ -104,7 +150,7 @@ pub async fn guid_preference(
 /// # Errors
 /// Returns [`ServiceError::Db`] if either query fails.
 pub async fn live_tv_enabled_for(db: &Database, user_id: &str) -> Result<bool, ServiceError> {
-    if !has_permission(db.pool(), user_id, PermissionKind::EnableLiveTvAccess).await? {
+    if !cached_permission(db, user_id, PermissionKind::EnableLiveTvAccess).await? {
         return Ok(false);
     }
     Ok(db.live_tv_tuner_count().await.map_err(ServiceError::from)? > 0)
@@ -137,7 +183,8 @@ where
 }
 
 /// Sets a permission to `value`, inserting the row when absent (C#
-/// `SetPermission`).
+/// `SetPermission`), then drops the user's cached policy rows
+/// ([`Database::invalidate_user_policy`]).
 ///
 /// `Permissions` has no unique index on `(UserId, Kind)`, so this mirrors the
 /// C# "find then update-or-insert" as an `UPDATE` followed by a conditional
@@ -147,11 +194,12 @@ where
 /// # Errors
 /// Returns [`ServiceError::Db`] if either statement fails.
 pub async fn set_permission(
-    pool: &SqlitePool,
+    db: &Database,
     user_id: &str,
     kind: PermissionKind,
     value: bool,
 ) -> Result<(), ServiceError> {
+    let pool = db.writer();
     sqlx::query(r#"UPDATE "Permissions" SET "Value" = ?3 WHERE "UserId" = ?1 AND "Kind" = ?2"#)
         .bind(user_id)
         .bind(i32::from(kind))
@@ -160,7 +208,7 @@ pub async fn set_permission(
         .await
         .map_err(db_err)?;
 
-    sqlx::query(
+    let inserted = sqlx::query(
         r#"INSERT INTO "Permissions" ("Kind", "RowVersion", "UserId", "Value")
            SELECT ?2, 1, ?1, ?3
            WHERE NOT EXISTS (
@@ -172,8 +220,10 @@ pub async fn set_permission(
     .bind(value)
     .execute(pool)
     .await
-    .map_err(db_err)?;
-    Ok(())
+    .map_err(db_err);
+    // Whatever the second statement did: the first may already have changed the row.
+    db.invalidate_user_policy(user_id);
+    inserted.map(drop)
 }
 
 /// Reads a list-valued preference, split on the delimiter (C# `GetPreference`).
@@ -204,19 +254,22 @@ where
 }
 
 /// Writes a list-valued preference, joining `values` with the delimiter (C#
-/// `SetPreference`). Inserts the row when absent, updates it otherwise.
+/// `SetPreference`). Inserts the row when absent, updates it otherwise, then
+/// drops the user's cached policy rows ([`Database::invalidate_user_policy`]).
 ///
 /// # Errors
 /// Returns [`ServiceError::Db`] if either statement fails.
 pub async fn set_preference(
-    pool: &SqlitePool,
+    db: &Database,
     user_id: &str,
     kind: PreferenceKind,
     values: &[String],
 ) -> Result<(), ServiceError> {
-    let mut tx = pool.begin().await.map_err(db_err)?;
+    let mut tx = db.writer().begin().await.map_err(db_err)?;
     set_preference_tx(&mut tx, user_id, kind, values).await?;
-    tx.commit().await.map_err(db_err)
+    tx.commit().await.map_err(db_err)?;
+    db.invalidate_user_policy(user_id);
+    Ok(())
 }
 
 /// Whether a list-valued preference contains `needle`, case-insensitively (the
@@ -457,28 +510,18 @@ mod tests {
         let id = Uuid::from_u128(2);
         seed_user(&db, id).await;
 
-        set_permission(
-            db.pool(),
-            &guid_to_db(id),
-            PermissionKind::IsAdministrator,
-            true,
-        )
-        .await
-        .expect("insert");
+        set_permission(&db, &guid_to_db(id), PermissionKind::IsAdministrator, true)
+            .await
+            .expect("insert");
         assert!(
             has_permission(db.pool(), &guid_to_db(id), PermissionKind::IsAdministrator)
                 .await
                 .expect("read")
         );
 
-        set_permission(
-            db.pool(),
-            &guid_to_db(id),
-            PermissionKind::IsAdministrator,
-            false,
-        )
-        .await
-        .expect("update");
+        set_permission(&db, &guid_to_db(id), PermissionKind::IsAdministrator, false)
+            .await
+            .expect("update");
         assert!(
             !has_permission(db.pool(), &guid_to_db(id), PermissionKind::IsAdministrator)
                 .await
@@ -578,7 +621,7 @@ mod tests {
         assert!(live_tv_enabled_for(&db, &user).await.expect("gate"));
 
         // …and a tuner does not override a revoked permission.
-        set_permission(db.pool(), &user, PermissionKind::EnableLiveTvAccess, false)
+        set_permission(&db, &user, PermissionKind::EnableLiveTvAccess, false)
             .await
             .expect("revoke");
         assert!(!live_tv_enabled_for(&db, &user).await.expect("gate"));

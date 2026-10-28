@@ -41,10 +41,11 @@ use ferrofin_model::playlists::{
 };
 use ferrofin_model::querying::QueryResult;
 use ferrofin_traits::collections::{PlaylistAccess, PlaylistAccessLevel};
+use ferrofin_traits::error::ServiceError;
 use uuid::Uuid;
 
 use crate::auth::RequireAuth;
-use crate::error::ApiError;
+use crate::error::{ApiError, ProblemStatus};
 use crate::extract::{JsonBody, Query};
 use crate::handlers::items::effective_user_id;
 use crate::handlers::query_parse::parse_csv_uuids;
@@ -78,13 +79,19 @@ struct CreatePlaylistQuery {
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
     user_id: Option<Uuid>,
+    /// The media type (obsolete query form).
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_parse::nullable_enum"
+    )]
+    media_type: Option<ferrofin_model::data::MediaType>,
 }
 
 /// `POST /Playlists` — creates a new playlist.
 ///
 /// Port of `PlaylistsController.CreatePlaylist`. Query parameters (obsolete) take
 /// precedence over the body, matching the C# merge: `ids` fall back to the body,
-/// and `name`/`userId` prefer the query when present.
+/// and `name`/`userId`/`mediaType` prefer the query when present.
 #[utoipa::path(
     post,
     path = "/Playlists",
@@ -113,11 +120,18 @@ async fn create_playlist(
     // user (which would make *them* the playlist owner) requires the
     // administrator role.
     let user_id = effective_user_id(&state, &auth, query.user_id.or(body.user_id)).await?;
+    // C# `Name = name ?? createPlaylistRequest?.Name`: with neither, upstream's
+    // GetValidFilename(null) throws (500). A nameless playlist is refused here.
+    let Some(name) = query.name.or(body.name) else {
+        return Err(ApiError::BadRequest(
+            "The Name field is required.".to_owned(),
+        ));
+    };
 
     let request = PlaylistCreationRequest {
-        name: query.name.or(body.name),
+        name: Some(name),
         item_id_list,
-        media_type: body.media_type,
+        media_type: query.media_type.or(body.media_type),
         user_id,
         users: body.users,
         public: body.is_public,
@@ -252,6 +266,7 @@ struct GetPlaylistItemsQuery {
     params(("playlistId" = String, Path, description = "The playlist id")),
     responses(
         (status = 200, description = "Original playlist returned (QueryResult<BaseItemDto>)"),
+        (status = 403, description = "Another user's id without administrator rights"),
         (status = 404, description = "Playlist not found")
     ),
     tag = "ferrofin"
@@ -262,7 +277,9 @@ async fn get_playlist_items(
     Path(playlist_id): Path<Uuid>,
     Query(query): Query<GetPlaylistItemsQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    let calling_user_id = query.user_id.unwrap_or_else(|| auth.user_id());
+    // `RequestHelpers.GetUserId(User, userId)`: another user's id only for an
+    // administrator, or every member filter below would be the caller's pick.
+    let calling_user_id = effective_user_id(&state, &auth, query.user_id).await?;
     let user = if calling_user_id.is_nil() {
         None
     } else {
@@ -273,6 +290,12 @@ async fn get_playlist_items(
         .playlists
         .get_playlist_items(playlist_id, calling_user_id)
         .await?;
+    // `GetManageableItems().Where(i => i.Item2.IsVisible(user))`: a member
+    // the caller may not see (its rating or tags) is out of the page and the
+    // count.
+    if let Some(user) = &user {
+        items = state.library.filter_visible_items(items, user).await?;
+    }
     let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
 
     if let Some(start) = query.start_index
@@ -309,14 +332,18 @@ async fn get_playlist_items(
         query.enable_image_types.as_deref(),
         query.enable_user_data,
     );
+    // `GetManageableItems()` resolves the members through
+    // `ResolveLinkedChildren`, with every field loaded whatever the client
+    // asked for.
     let mut dtos = state
         .dto
-        .get_base_item_dtos(&items, &options, user.as_ref(), None, true)
+        .get_linked_children_dtos(&items, &options, user.as_ref())
         .await?;
-    // Tag each DTO with its playlist-entry id (the member item id in the minimal
-    // port; C# uses the linked-child entry guid).
-    for (dto, item) in dtos.iter_mut().zip(items.iter()) {
-        dto.playlist_item_id = Some(item.id.replace('-', ""));
+    // Tag each DTO with its playlist-entry id: C#'s
+    // `Item1.ItemId?.ToString("N")`, the linked child's item id — the member's
+    // own id, written as 32 lower-case hex digits whatever case the row stores.
+    for dto in &mut dtos {
+        dto.playlist_item_id = Some(dto.id.simple().to_string());
     }
 
     Ok(Json(QueryResult::new(query.start_index, Some(total), dtos)))
@@ -431,11 +458,18 @@ async fn remove_item_from_playlist(
                 .collect()
         })
         .unwrap_or_default();
-    state
+    // C# `catch (ArgumentException) { return NotFound(); }`: the manager's
+    // "no such playlist" is a bare `404` here, which is how an API key, past
+    // no gate above, hears that the id names no playlist.
+    match state
         .playlists
         .remove_item_from_playlist(&playlist_id.to_string(), &entry_ids)
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
+        .await
+    {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(ServiceError::InvalidInput(_)) => Err(ApiError::Problem(ProblemStatus::NotFound)),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// `POST /Playlists/{playlistId}/Items/{itemId}/Move/{newIndex}` — reorders.

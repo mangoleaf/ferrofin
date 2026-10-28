@@ -131,7 +131,7 @@ impl ChapterImageExtractor {
         }
         let item_id = Uuid::parse_str(&video.id)
             .map_err(|error| ServiceError::invalid_input(error.to_string()))?;
-        let folders = self.folders.get_virtual_folders().await?;
+        let folders = self.folders.library_folders().await?;
         let enabled = owning_library(
             &folders,
             video.top_parent_id.as_deref(),
@@ -212,14 +212,17 @@ impl ChapterImageExtractor {
         Ok(outcome)
     }
 
-    async fn is_active_recording(&self, video: &BaseItemEntity) -> bool {
+    /// `Video.IsActiveRecording()`: whether Live TV is still writing the
+    /// video's file. A failed lookup counts as recording, so nothing is
+    /// extracted from a file that may be incomplete.
+    pub(crate) async fn is_active_recording(&self, video: &BaseItemEntity) -> bool {
         let Some(live_tv) = self.live_tv.as_ref().and_then(Weak::upgrade) else {
             return false;
         };
         match live_tv.active_recording_paths().await {
             Ok(paths) => paths.iter().any(|path| video.path.as_ref() == Some(path)),
             Err(error) => {
-                tracing::warn!(item = %video.id, %error, "chapter image recording lookup failed");
+                tracing::warn!(item_id = %video.id, %error, "active recording lookup failed");
                 true
             }
         }
@@ -386,6 +389,8 @@ fn average_chapter_duration(chapters: &[ChapterInfo]) -> i64 {
     sum / i64::try_from(chapters.len()).unwrap_or(i64::MAX)
 }
 
+/// An item's `DateModified` as .NET `DateTime.Ticks` (100 ns since
+/// `0001-01-01`); unset is `DateTime.MinValue`, 0 ticks.
 pub(crate) fn date_modified_ticks(date: Option<DateTime<Utc>>) -> i64 {
     date.map_or(0, |date| {
         621_355_968_000_000_000

@@ -10,11 +10,11 @@
 //! ## Port rules applied
 //! - **Sibling managers are injected** (`Arc<dyn _>`): [`UserManager`],
 //!   [`DeviceManager`], [`UserDataManager`], [`LibraryManager`], [`DtoService`]
-//!   and the [`EventManager`] publish seam. The `IMusicManager` /
-//!   `IImageProcessor` / `IMediaSourceManager` used only for instant-mix
-//!   translation and image-cache tags are **not** injected into this unit; the
-//!   features that need them (instant-mix `SendPlayCommand`, user-image tags,
-//!   live-stream media-source resolution) are documented deferrals.
+//!   and the [`EventManager`] publish seam. The `IMusicManager` (instant-mix
+//!   `SendPlayCommand`) and `IMediaSourceManager` (closing live streams) are
+//!   attached with `with_music_manager` and `with_media_sources`. The
+//!   `IImageProcessor` behind user-image tags is not injected. TODO(gl-119):
+//!   fill `UserPrimaryImageTag` with the rest of the session's `PlayState`.
 //! - **The domain `SessionInfo` is modelled here**, not in `ferrofin-traits`
 //!   (whose reads surface the [`SessionInfoDto`] wire type). It is a private
 //!   in-memory struct; [`session_info_to_dto`] maps it to the DTO on read.
@@ -28,9 +28,14 @@
 //!   methods return an [`AuthenticationResultData`] (the [`SessionInfoDto`] plus
 //!   the minted access token) from which the API layer assembles the wire
 //!   envelope. The access token is minted via [`DeviceManager`].
-//! - **Idle/inactive timers and `IAsyncDisposable`** are dropped — no real
-//!   scheduler in this crate (that is Wave 8 / scheduled tasks). Automatic
-//!   progress is tracked as a flag on the in-memory session.
+//! - **The idle and inactive checks** (`StartCheckTimers`) run from
+//!   [`FerrofinSessionManager::run_playback_checks`], which the composition root
+//!   starts with the host and aborts with it: a session playing without a
+//!   check-in for five minutes is stopped, and with `InactiveSessionThreshold`
+//!   set, a session paused past it is told to stop. Automatic progress
+//!   (`SessionInfo.StartAutomaticProgress`) is tracked as a flag on the
+//!   in-memory session. TODO(gl-803): port its one-second position estimate,
+//!   keeping the client-reported position the idle stop saves.
 //! - **The session pool is evicted exactly where upstream evicts it**, never on
 //!   a timer: [`SessionManager::report_session_ended`] (`/Sessions/Logout`, and
 //!   the C# `WebSocketController.OnConnectionClosed` -> `CloseIfNeededAsync`
@@ -38,7 +43,7 @@
 //!   closes) and [`SessionManager::logout`]. A client that only ever speaks
 //!   HTTP therefore keeps its entry until the server restarts — same as
 //!   upstream, where `/Sessions` filters the stale ones by `activeWithinSeconds`
-//!   rather than reaping them.
+//!   rather than reaping them; its playback is stopped by the idle check.
 //! - **Exceptions → `Result<_, ServiceError>`**: `SecurityException` /
 //!   `AuthenticationException` → [`ServiceError::Unauthorized`]; a missing
 //!   session / user → [`ServiceError::NotFound`]; bad arguments →
@@ -65,11 +70,12 @@ use ferrofin_model::live_tv::ItemSortBy;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::{
     ClientCapabilities, GeneralCommand, GeneralCommandType, MessageCommand, PlayCommand,
-    PlayRequest, PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest,
-    SessionMessageType, SessionUserInfo, TranscodingInfo, UserDataChangeInfo,
+    PlayRequest, PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, PlaystateCommand,
+    PlaystateRequest, SessionMessageType, SessionUserInfo, TranscodingInfo,
 };
 use ferrofin_util::shuffle_extensions::shuffle;
 
+use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::devices::{DeviceManager, DeviceQuery};
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
@@ -84,6 +90,11 @@ use ferrofin_traits::session_bus::SessionMessageBus;
 
 use crate::db_error::db_err;
 use crate::user_entity_ext::has_permission;
+
+/// How long a user's `LastActivityDate` stands before session activity
+/// stamps it again (`SessionManager.cs:265`, `TotalSeconds > 60`). Upstream
+/// hardcodes it, with no setting.
+const USER_ACTIVITY_STAMP_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
 
 /// The default device name applied when a client reports an empty one (C#
 /// `CreateSessionInfo` → `"Network Device"`).
@@ -116,13 +127,21 @@ struct SessionInfo {
     /// surfaced as the session's `PlayState` (C# `Session.PlayState`). Cleared on stop.
     now_playing_position_ticks: Option<i64>,
     now_playing_is_paused: bool,
+    /// The `MediaSourceId` the last start or progress report named (C#
+    /// `PlayState.MediaSourceId`), which the idle stop reports. Cleared on stop.
+    now_playing_media_source_id: Option<String>,
+    /// The live stream the now-playing item is read from (C#
+    /// `PlayState.LiveStreamId`): released when the session's last socket
+    /// closes. Cleared on stop.
+    now_playing_live_stream_id: Option<String>,
     now_viewing_item_id: Option<Uuid>,
     additional_users: Vec<SessionUserInfo>,
     capabilities: ClientCapabilities,
     transcoding_info: Option<TranscodingInfo>,
     /// Whether automatic progress reporting was started for the current item
-    /// (C# `StartAutomaticProgress`). No timer runs in this crate; the flag
-    /// preserves the observable state.
+    /// (C# `StartAutomaticProgress`). No automatic-progress timer runs; the
+    /// flag preserves the observable state. TODO(gl-803): port the
+    /// one-second position estimate.
     is_playing: bool,
     /// The live WebSocket connections attached to this session (the C#
     /// `SessionControllers`). Broadcasts push serialized bytes to each.
@@ -130,6 +149,45 @@ struct SessionInfo {
 }
 
 impl SessionInfo {
+    /// Records what a start or progress report says is playing (C#
+    /// `SessionManager.UpdateNowPlayingItem`, which both `OnPlaybackStart` and
+    /// `OnPlaybackProgress` call). A session recreated mid-playback gets its
+    /// now-playing item back from the first progress report, since clients
+    /// never resend the start. `now_playing` is the reported item when the
+    /// library knows it, else `None` (C# leaves `NowPlayingItem` null for an
+    /// item it cannot resolve). `media_source_id` and `live_stream_id` are
+    /// stored as reported (C# `PlayState.MediaSourceId = info.MediaSourceId`
+    /// and `PlayState.LiveStreamId = info.LiveStreamId`), so a report without
+    /// a live stream clears it. A report without a media source leaves `None`
+    /// where C# first fills in the item id; the idle stop's save
+    /// (`progress_item`) reads both as the item itself.
+    fn update_now_playing(
+        &mut self,
+        now_playing: Option<Uuid>,
+        position_ticks: Option<i64>,
+        is_paused: bool,
+        media_source_id: Option<&str>,
+        live_stream_id: Option<&str>,
+        update_check_in: bool,
+    ) {
+        let now = Utc::now();
+        self.now_playing_item_id = now_playing;
+        self.last_activity_date = now;
+        if update_check_in {
+            self.last_playback_check_in = now;
+        }
+        // The date the pause began: kept across paused reports.
+        if !is_paused {
+            self.last_paused_date = None;
+        } else if self.last_paused_date.is_none() {
+            self.last_paused_date = Some(now);
+        }
+        self.now_playing_is_paused = is_paused;
+        self.now_playing_position_ticks = position_ticks;
+        self.now_playing_media_source_id = media_source_id.map(str::to_owned);
+        self.now_playing_live_stream_id = live_stream_id.map(ToOwned::to_owned);
+    }
+
     /// Whether the session references `user_id` as its primary or an additional
     /// user (C# `SessionInfo.ContainsUser`).
     fn contains_user(&self, user_id: Uuid) -> bool {
@@ -151,6 +209,21 @@ impl SessionInfo {
     fn supports_remote_control(&self) -> bool {
         self.capabilities.supports_media_control && self.is_active()
     }
+}
+
+/// How long a playing session may go without a client check-in before it is
+/// stopped, and how often that is checked (`CheckForIdlePlayback`'s timer and
+/// `TotalMinutes > 5`).
+const IDLE_PLAYBACK_MINUTES: u64 = 5;
+
+/// How often the playback checks run: upstream's inactive-session timer
+/// period, one minute.
+const PLAYBACK_CHECK_PERIOD: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Whether the idle check runs on the `minute`-th tick of the one-minute
+/// loop: every [`IDLE_PLAYBACK_MINUTES`]th.
+fn idle_check_due(minute: u64) -> bool {
+    minute.is_multiple_of(IDLE_PLAYBACK_MINUTES)
 }
 
 /// The server → client message envelope pushed over a WebSocket.
@@ -214,6 +287,14 @@ pub struct FerrofinSessionManager {
     /// session and the play session), and a release under either drops BOTH, so
     /// it counts once. A plain set of released ids would count that viewer
     /// twice and close a stream another viewer is still watching.
+    ///
+    /// Entries come only from start and progress reports that name a
+    /// `LiveStreamId`, and the guard lasts only while a stream has one. A
+    /// stream with no entry (no report named it, or its last holder released)
+    /// is closed by any release, as upstream has done since 12.0-rc2: that is
+    /// what frees the tuner of a client whose reports omit the `LiveStreamId`.
+    /// So a release after the last holder's closes again, which costs nothing
+    /// unless an unregistered viewer shares the stream.
     active_live_stream_sessions: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
     /// Serializes the `MaxActiveSessions` admission decision with the session
     /// creation that satisfies it.
@@ -227,6 +308,10 @@ pub struct FerrofinSessionManager {
     /// default (`0` = unlimited, what every user has unless an admin says
     /// otherwise) still logs in with no added serialization.
     session_limit_gate: Arc<Mutex<()>>,
+    /// When session activity last stamped each user's `LastActivityDate`
+    /// ([`Self::stamp_user_activity`]). The user a request carries can be the
+    /// auth cache's copy, read before that stamp.
+    user_activity: Arc<std::sync::Mutex<HashMap<Uuid, DateTime<Utc>>>>,
     /// The session message bus the HTTP WebSocket handler registers client
     /// sinks on. A bus-registered socket counts as a live controller (it drives
     /// `SupportsRemoteControl`) and is the delivery path for remote-control
@@ -281,6 +366,7 @@ impl FerrofinSessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             active_live_stream_sessions: Arc::new(Mutex::new(HashMap::new())),
             session_limit_gate: Arc::new(Mutex::new(())),
+            user_activity: Arc::new(std::sync::Mutex::new(HashMap::new())),
             media_sources: None,
             music_manager: None,
             bus: None,
@@ -370,9 +456,131 @@ impl FerrofinSessionManager {
         Ok(())
     }
 
-    /// Computes the session key the pool is indexed by (C# `GetSessionKey`).
-    fn session_key(app_name: &str, device_id: &str) -> String {
-        format!("{app_name}{device_id}")
+    /// Port of `SessionManager.CheckForIdlePlayback`: every session playing
+    /// something that has not checked in for more than
+    /// [`IDLE_PLAYBACK_MINUTES`] at `now` is stopped, at the position its
+    /// client last reported (upstream PR #17631) and with its media source.
+    /// As upstream, the stop names no live stream, so it releases none. Its
+    /// stop event gets the dashboard's "has finished playing" entry from the
+    /// `PlaybackStopLogger` port (`crate::playback_activity`), as a client's
+    /// own stop does.
+    pub async fn check_for_idle_playback(&self, now: DateTime<Utc>) {
+        let window = chrono::Duration::minutes(IDLE_PLAYBACK_MINUTES.cast_signed());
+        let idle: Vec<(String, PlaybackStopInfo)> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .values()
+                .filter(|s| {
+                    s.now_playing_item_id.is_some() && now - s.last_playback_check_in > window
+                })
+                .map(|s| {
+                    let stop = PlaybackStopInfo {
+                        item_id: s.now_playing_item_id.unwrap_or_default(),
+                        session_id: Some(s.id.clone()),
+                        media_source_id: s.now_playing_media_source_id.clone(),
+                        position_ticks: s.now_playing_position_ticks,
+                        ..PlaybackStopInfo::default()
+                    };
+                    (s.id.clone(), stop)
+                })
+                .collect()
+        };
+        for (session_id, stop) in idle {
+            debug!(session_id, "session has gone idle while playing");
+            if let Err(err) = self.on_playback_stopped(&stop).await {
+                debug!(session_id, %err, "error stopping idle playback");
+            }
+        }
+    }
+
+    /// Port of `SessionManager.CheckForInactiveSteams`: every session paused
+    /// on something for more than `threshold_minutes` at `now` is sent a
+    /// `Stop` at its position, as from itself.
+    pub async fn check_for_inactive_streams(&self, threshold_minutes: i32, now: DateTime<Utc>) {
+        let inactive: Vec<(String, Uuid, Option<i64>)> = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .values()
+                .filter(|s| {
+                    s.now_playing_item_id.is_some()
+                        && s.now_playing_is_paused
+                        && s.last_paused_date.is_some_and(|paused| {
+                            now - paused > chrono::Duration::minutes(i64::from(threshold_minutes))
+                        })
+                })
+                .map(|s| (s.id.clone(), s.user_id, s.now_playing_position_ticks))
+                .collect()
+        };
+        for (session_id, user_id, position_ticks) in inactive {
+            debug!(
+                session_id,
+                threshold_minutes, "session has been inactive; stopping it"
+            );
+            let stop = PlaystateRequest {
+                command: PlaystateCommand::Stop,
+                seek_position_ticks: position_ticks,
+                controlling_user_id: Some(user_id.to_string()),
+            };
+            if let Err(err) = self
+                .send_playstate_command(&session_id, &session_id, &stop)
+                .await
+            {
+                debug!(session_id, %err, "error stopping inactive session");
+            }
+        }
+    }
+
+    /// Runs [`Self::check_for_idle_playback`] and
+    /// [`Self::check_for_inactive_streams`] for as long as the host lives: the
+    /// port of `SessionManager.StartCheckTimers`' two timers. Every minute the
+    /// inactive check runs while `InactiveSessionThreshold` (read live) is
+    /// above 0, and every [`IDLE_PLAYBACK_MINUTES`] minutes the idle check
+    /// runs. Upstream starts both with a playback and stops them while nothing
+    /// plays; here they then find nothing to do. The composition root spawns
+    /// this and aborts it when the host is torn down.
+    pub async fn run_playback_checks(self: Arc<Self>, config: Arc<dyn ServerConfigurationManager>) {
+        let mut minutes = tokio::time::interval_at(
+            tokio::time::Instant::now() + PLAYBACK_CHECK_PERIOD,
+            PLAYBACK_CHECK_PERIOD,
+        );
+        minutes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut minute: u64 = 0;
+        loop {
+            minutes.tick().await;
+            minute += 1;
+            let threshold = match config.configuration().await {
+                Ok(configuration) => configuration.inactive_session_threshold,
+                Err(err) => {
+                    debug!(%err, "configuration unavailable; skipping the inactive-session check");
+                    0
+                }
+            };
+            self.run_playback_checks_at(minute, threshold, Utc::now())
+                .await;
+        }
+    }
+
+    /// One tick of [`Self::run_playback_checks`]: the `minute`-th, with the
+    /// `InactiveSessionThreshold` in force, at `now`.
+    async fn run_playback_checks_at(&self, minute: u64, threshold: i32, now: DateTime<Utc>) {
+        if threshold > 0 {
+            self.check_for_inactive_streams(threshold, now).await;
+        }
+        if idle_check_due(minute) {
+            self.check_for_idle_playback(now).await;
+        }
+    }
+
+    /// Computes the session key the pool is indexed by (C# `GetSessionKey`:
+    /// `appName + deviceId + userId.ToString("N")`, `Guid.Empty` for a session
+    /// with no user).
+    ///
+    /// The user is part of the key because the client name and the device id
+    /// come from the request headers, not from the access token: without it,
+    /// any signed-in user sending another user's pair took over that user's
+    /// session (upstream commit b1e3cf1341, in v12.0-rc7).
+    fn session_key(app_name: &str, device_id: &str, user_id: Uuid) -> String {
+        format!("{app_name}{device_id}{}", user_id.simple())
     }
 
     /// The stable session id derived from the session key (C#
@@ -407,13 +615,13 @@ impl FerrofinSessionManager {
             return Err(ServiceError::invalid_input("deviceId is required"));
         }
 
-        let key = Self::session_key(app_name, device_id);
         let now = Utc::now();
         let user_id = match user {
             // C# `SessionInfo.UserId` is `Guid.Empty` when no user is signed in.
             None => Uuid::nil(),
             Some(u) => parse_user_id(&u.id)?,
         };
+        let key = Self::session_key(app_name, device_id, user_id);
         let user_name = user.map(|u| u.username.clone());
 
         // The custom device name, if the device has one persisted.
@@ -466,6 +674,8 @@ impl FerrofinSessionManager {
                 now_playing_item_id: None,
                 now_playing_position_ticks: None,
                 now_playing_is_paused: false,
+                now_playing_media_source_id: None,
+                now_playing_live_stream_id: None,
                 now_viewing_item_id: None,
                 additional_users: Vec::new(),
                 capabilities: device_capabilities,
@@ -504,8 +714,47 @@ impl FerrofinSessionManager {
             // registered on the injected event manager.
             let _ = self.event_manager.publish("SessionStarted", &payload).await;
         }
+        // Upstream saves the user after `GetSessionInfo` has registered (and
+        // announced) the session, and a failed save fails the request; only a
+        // concurrency conflict, which this write cannot raise, is swallowed.
+        if let Some(user) = user {
+            self.stamp_user_activity(user, user_id, now).await?;
+        }
 
         Ok(dto)
+    }
+
+    /// `LogSessionActivity`'s user stamp (`SessionManager.cs:262-275`): when
+    /// the user was last active more than [`USER_ACTIVITY_STAMP_INTERVAL`]
+    /// before `now` (never counts), their `LastActivityDate` becomes `now`.
+    /// Upstream reads that date from its in-memory user, which its own save
+    /// keeps current; `user` here can be the auth cache's copy, read before
+    /// the last stamp, so the later of its date and the last stamp this
+    /// manager made decides.
+    async fn stamp_user_activity(
+        &self,
+        user: &UserEntity,
+        user_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<(), ServiceError> {
+        let stamped = self
+            .user_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&user_id)
+            .copied();
+        if stamped
+            .max(user.last_activity_date)
+            .is_some_and(|last| now - last <= USER_ACTIVITY_STAMP_INTERVAL)
+        {
+            return Ok(());
+        }
+        self.user_manager.record_user_activity(user, now).await?;
+        self.user_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(user_id, now);
+        Ok(())
     }
 
     /// Looks up a live session by its **session id** (not key), cloning a
@@ -622,30 +871,6 @@ impl FerrofinSessionManager {
         Ok(())
     }
 
-    /// Whether any of `user_id`'s sessions could actually receive a pushed
-    /// message: an open WebSocket connection on the session, or a sink
-    /// registered on the session bus for its id (the `/socket` handler's path).
-    /// Exactly the two delivery routes [`Self::broadcast`] uses, so a `false`
-    /// here means the broadcast would reach nobody.
-    async fn has_listener_for_user(&self, user_id: Uuid) -> bool {
-        let bus_candidates: Vec<String> = {
-            let sessions = self.sessions.lock().await;
-            let mut ids = Vec::new();
-            for session in sessions.values().filter(|s| s.contains_user(user_id)) {
-                if session.connections.iter().any(|c| c.is_open()) {
-                    return true;
-                }
-                ids.push(session.id.clone());
-            }
-            ids
-        };
-        self.bus.as_ref().is_some_and(|bus| {
-            bus_candidates
-                .iter()
-                .any(|id| bus.is_connected(id.as_str()))
-        })
-    }
-
     /// The item a playback report's user data is kept against — port of
     /// `SessionManager.GetProgressItem` (`SessionManager.cs:742-756`): a
     /// client playing another version of the item it shows reports the shown
@@ -681,41 +906,29 @@ impl FerrofinSessionManager {
             .unwrap_or(item_id))
     }
 
-    /// Pushes the user's refreshed play-state for `item_id` to every session
-    /// belonging to that user (`UserDataChanged`), so their other signed-in
-    /// devices update resume position / played flags live instead of showing
-    /// stale progress until re-login. Port of Jellyfin's
-    /// `UserDataChangedNotifier` (which fires on every user-data save).
-    /// Best-effort: a delivery failure must not fail the playback report.
-    async fn push_user_data_changed(&self, user_id: Uuid, item_id: Uuid) {
-        // Building the payload costs a `UserData` read, and every play-state
-        // report triggers one. When the user has no session that could receive
-        // the push — no open WebSocket and no registered bus sink — `broadcast`
-        // would drop it, so skip the read instead of paying for a message
-        // nobody is listening for. (A session with either delivery path still
-        // gets the push, unchanged.)
-        if !self.has_listener_for_user(user_id).await {
-            return;
+    /// The final play-state save of a stop, per session user (C#
+    /// `OnPlaybackStopped(user, item, positionTicks, playbackFailed)`); the
+    /// user-data manager announces each save to the user's devices.
+    async fn save_stopped_play_state(
+        &self,
+        session: &SessionInfo,
+        info: &PlaybackStopInfo,
+    ) -> Result<(), ServiceError> {
+        let progress_item = self
+            .progress_item(info.item_id, info.media_source_id.as_deref())
+            .await?;
+        for user in self.users_for(session).await? {
+            let user_id = parse_user_id(&user.id)?;
+            self.user_data_manager
+                .update_play_state_with_reason(
+                    user_id,
+                    progress_item,
+                    info.position_ticks,
+                    ferrofin_model::entities::UserDataSaveReason::PlaybackFinished,
+                )
+                .await?;
         }
-        let Ok(Some(dto)) = self
-            .user_data_manager
-            .get_user_data_dto(item_id, user_id)
-            .await
-        else {
-            return;
-        };
-        let info = UserDataChangeInfo {
-            user_id,
-            user_data_list: vec![dto],
-        };
-        let Ok(data) = serde_json::to_string(&info) else {
-            return;
-        };
-        let _ = self
-            .broadcast(SessionMessageType::UserDataChanged, &data, |s| {
-                s.contains_user(user_id)
-            })
-            .await;
+        Ok(())
     }
 
     /// Expands one cast item id into the ids a client can actually play — port
@@ -1104,7 +1317,7 @@ impl SessionManager for FerrofinSessionManager {
         device_id: &str,
         device_name: &str,
         remote_endpoint: &str,
-        user: &UserEntity,
+        user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError> {
         self.upsert_session(
             app_name,
@@ -1112,7 +1325,7 @@ impl SessionManager for FerrofinSessionManager {
             device_id,
             device_name,
             remote_endpoint,
-            Some(user),
+            user,
         )
         .await
     }
@@ -1150,36 +1363,51 @@ impl SessionManager for FerrofinSessionManager {
             .await;
         }
 
-        // Record the now-playing item + mark automatic progress started.
-        {
-            let mut sessions = self.sessions.lock().await;
-            if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
-                s.now_playing_item_id = (!info.item_id.is_nil()).then_some(info.item_id);
-                s.now_playing_position_ticks = info.position_ticks;
-                s.now_playing_is_paused = info.is_paused;
-                s.is_playing = true;
-                s.last_playback_check_in = Utc::now();
-            }
-        }
-
-        // Resolve the library item (best-effort) for the event payload.
+        // Resolve the library item (best-effort): it names the now-playing
+        // item and the event payload.
         let item = if info.item_id.is_nil() {
             None
         } else {
             self.library_manager.get_item_by_id(info.item_id).await?
         };
-        if item.is_some() {
+
+        // Record the now-playing item + mark automatic progress started.
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
+                s.update_now_playing(
+                    item.as_ref().map(|_| info.item_id),
+                    info.position_ticks,
+                    info.is_paused,
+                    info.media_source_id.as_deref(),
+                    info.live_stream_id.as_deref(),
+                    true,
+                );
+                s.is_playing = true;
+            }
+        }
+
+        // C# `OnPlaybackStart`: "User {0} started playback of '{1}' ({2} {3})",
+        // logged here so every route that reports a start logs it once.
+        if let Some(item) = &item {
             info!(
-                user = ?session.user_name,
-                client = ?session.client,
+                user = session.user_name.as_deref(),
+                user_id = %session.user_id,
+                item_id = %info.item_id,
+                item = item.name.as_deref(),
+                device = session.device_name.as_deref(),
+                device_id = %session.device_id,
+                client = session.client.as_deref(),
+                application_version = session.application_version.as_deref(),
                 "user started playback",
             );
         }
 
         // Record the start on every session user's data (C# OnPlaybackStart:
-        // PlayCount++ and the LastPlayedDate stamp Next Up filters on), then
-        // push the change to the user's other devices.
-        if !info.item_id.is_nil() {
+        // PlayCount++ and the LastPlayedDate stamp Next Up filters on); the
+        // user-data manager announces the save to the user's devices. Only for
+        // a library item: C# `if (libraryItem is not null)`.
+        if item.is_some() {
             let progress_item = self
                 .progress_item(info.item_id, info.media_source_id.as_deref())
                 .await?;
@@ -1188,7 +1416,6 @@ impl SessionManager for FerrofinSessionManager {
                 self.user_data_manager
                     .record_playback_start(user_id, progress_item)
                     .await?;
-                self.push_user_data_changed(user_id, progress_item).await;
             }
         }
 
@@ -1200,7 +1427,7 @@ impl SessionManager for FerrofinSessionManager {
     async fn on_playback_progress(
         &self,
         info: &PlaybackProgressInfo,
-        _is_automated: bool,
+        is_automated: bool,
     ) -> Result<(), ServiceError> {
         let session_id = info
             .session_id
@@ -1219,34 +1446,53 @@ impl SessionManager for FerrofinSessionManager {
             .await;
         }
 
+        // C# `GetNowPlayingItem`: the item the session already plays is not
+        // looked up again, so a steady stream of reports costs no query.
+        let now_playing = if info.item_id.is_nil() {
+            None
+        } else if session.now_playing_item_id == Some(info.item_id) {
+            Some(info.item_id)
+        } else {
+            self.library_manager
+                .get_item_by_id(info.item_id)
+                .await?
+                .map(|_| info.item_id)
+        };
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
-                s.last_activity_date = Utc::now();
-                s.last_playback_check_in = Utc::now();
-                s.now_playing_position_ticks = info.position_ticks;
-                s.now_playing_is_paused = info.is_paused;
-                if info.is_paused {
-                    s.last_paused_date = Some(Utc::now());
-                } else {
-                    s.last_paused_date = None;
-                }
+                s.update_now_playing(
+                    now_playing,
+                    info.position_ticks,
+                    info.is_paused,
+                    info.media_source_id.as_deref(),
+                    info.live_stream_id.as_deref(),
+                    !is_automated,
+                );
             }
         }
 
         // Persist play-state for every user on the session (C#
-        // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState`), then
-        // push the change to the user's other devices.
-        if !info.item_id.is_nil() {
+        // `OnPlaybackProgress(user, item, info)` → `UpdatePlayState` and
+        // `UpdatePlaybackSettings`, which keeps the reported tracks as the
+        // user's "Remember audio/subtitle selections" say). A progress save is
+        // not announced (`UserDataChangeNotifier`). Only for a library item:
+        // C# `if (libraryItem is not null …)`.
+        if now_playing.is_some() {
             let progress_item = self
                 .progress_item(info.item_id, info.media_source_id.as_deref())
                 .await?;
             for user in self.users_for(&session).await? {
                 let user_id = parse_user_id(&user.id)?;
+                let streams = ferrofin_traits::library::ReportedStreams {
+                    audio_stream_index: info.audio_stream_index,
+                    subtitle_stream_index: info.subtitle_stream_index,
+                    remember_audio: user.remember_audio_selections,
+                    remember_subtitles: user.remember_subtitle_selections,
+                };
                 self.user_data_manager
-                    .update_play_state(user_id, progress_item, info.position_ticks)
+                    .update_play_progress(user_id, progress_item, info.position_ticks, streams)
                     .await?;
-                self.push_user_data_changed(user_id, progress_item).await;
             }
         }
 
@@ -1265,52 +1511,134 @@ impl SessionManager for FerrofinSessionManager {
             .ok_or_else(|| ServiceError::invalid_input("sessionId is required"))?;
         let session = self.get_session_snapshot(session_id).await?;
 
+        // C# `OnPlaybackStopped` refuses a negative position (stalled clients
+        // report one), and releases the live stream first so that no tuner
+        // leaks. Only the session's automatic progress has stopped by then
+        // (`StopAutomaticProgress`): its now-playing item stays.
+        if info.position_ticks.is_some_and(|ticks| ticks < 0) {
+            {
+                let mut sessions = self.sessions.lock().await;
+                if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
+                    s.is_playing = false;
+                }
+            }
+            if let Some(live_stream_id) = info.live_stream_id.as_deref() {
+                self.close_live_stream_if_needed(live_stream_id, session_id)
+                    .await?;
+            }
+            return Err(ServiceError::invalid_input(
+                "The PlaybackStopInfo's PositionTicks was negative.",
+            ));
+        }
+
+        // C# `GetNowPlayingItem`: an id the library no longer has (a channel a
+        // guide refresh dropped mid-play, an item deleted while it played) is
+        // no library item, and nothing is saved for it. Always looked up, not
+        // taken from the session's now-playing item as C# can: a row deleted
+        // mid-play is then no item, where C#'s cached one makes the save throw.
+        let library_item = if info.item_id.is_nil() {
+            Ok(None)
+        } else {
+            self.library_manager.get_item_by_id(info.item_id).await
+        };
+
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
                 s.now_playing_item_id = None;
                 s.now_playing_position_ticks = None;
                 s.now_playing_is_paused = false;
+                s.now_playing_media_source_id = None;
+                s.now_playing_live_stream_id = None;
                 s.is_playing = false;
-                s.last_activity_date = Utc::now();
             }
         }
 
-        // Final play-state update per user unless playback failed (C#
-        // `OnPlaybackStopped(user, item, positionTicks, playbackFailed)`),
-        // then push the change to the user's other devices.
-        if !info.item_id.is_nil() && !info.failed {
-            let progress_item = self
-                .progress_item(info.item_id, info.media_source_id.as_deref())
-                .await?;
-            for user in self.users_for(&session).await? {
-                let user_id = parse_user_id(&user.id)?;
-                self.user_data_manager
-                    .update_play_state_with_reason(
-                        user_id,
-                        progress_item,
-                        info.position_ticks,
-                        ferrofin_model::entities::UserDataSaveReason::PlaybackFinished,
-                    )
-                    .await?;
-                self.push_user_data_changed(user_id, progress_item).await;
+        // The save's outcome is kept, not returned at once: the live stream is
+        // released and the stop published whatever it was. Upstream skips the
+        // release when the save throws; releasing anyway closes that leak.
+        let saved = match library_item {
+            Ok(Some(_)) if !info.failed => self.save_stopped_play_state(&session, info).await,
+            // No library item, or the playback failed: nothing to save.
+            Ok(_) => Ok(()),
+            Err(error) => Err(error),
+        };
+
+        // C# `OnPlaybackStopped`: "User {0} stopped playback of '{1}' at {2}ms
+        // ({3} {4})", for a stop whose item resolves. `position_ms` is left out
+        // when the client sent no position (upstream writes "unknown"; a numeric
+        // field cannot). The lookup only names the item in this line, so its
+        // failure must not fail the stop report.
+        let stopped_item = if info.item_id.is_nil() {
+            None
+        } else {
+            match self.library_manager.get_item_by_id(info.item_id).await {
+                Ok(item) => item,
+                Err(error) => {
+                    tracing::debug!(
+                        item_id = %info.item_id,
+                        %error,
+                        "playback stop: item lookup failed"
+                    );
+                    None
+                }
             }
+        };
+        if let Some(item) = stopped_item {
+            info!(
+                user = session.user_name.as_deref(),
+                user_id = %session.user_id,
+                item_id = %info.item_id,
+                item = item.name.as_deref(),
+                position_ms = info.position_ticks.map(|ticks| ticks / TICKS_PER_MILLISECOND),
+                device = session.device_name.as_deref(),
+                device_id = %session.device_id,
+                client = session.client.as_deref(),
+                application_version = session.application_version.as_deref(),
+                "user stopped playback",
+            );
         }
 
         // C# `OnPlaybackStopped`: the live stream the client was playing is
         // closed here, not only by an explicit `/LiveStreams/Close`. A client that
         // stops playback and never calls Close otherwise leaks its open stream.
-        if let Some(live_stream_id) = info.live_stream_id.as_deref() {
-            self.close_live_stream_if_needed(live_stream_id, session_id)
-                .await?;
-        }
+        let released = match info.live_stream_id.as_deref() {
+            Some(live_stream_id) => {
+                self.close_live_stream_if_needed(live_stream_id, session_id)
+                    .await
+            }
+            None => Ok(()),
+        };
 
         let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
         let _ = self
             .event_manager
             .publish("PlaybackStopped", &payload)
             .await;
-        Ok(())
+        saved.and(released)
+    }
+
+    async fn close_if_needed(&self, session_id: &str) -> Result<(), ServiceError> {
+        // C# `CloseIfNeededAsync`: the live stream the session plays
+        // (`PlayState.LiveStreamId`) is released, then the session ends.
+        let live_stream_id = {
+            let sessions = self.sessions.lock().await;
+            sessions
+                .values()
+                .find(|s| s.id == session_id)
+                .and_then(|s| s.now_playing_live_stream_id.clone())
+        };
+        let released = match live_stream_id.as_deref() {
+            Some(live_stream_id) => {
+                self.close_live_stream_if_needed(live_stream_id, session_id)
+                    .await
+            }
+            None => Ok(()),
+        };
+        // Ended whatever the release returned: a session whose socket is gone
+        // is not kept for it.
+        let ended = self.report_session_ended(session_id).await;
+        released.and(ended)
     }
 
     async fn report_session_ended(&self, session_id: &str) -> Result<(), ServiceError> {
@@ -1451,6 +1779,29 @@ impl SessionManager for FerrofinSessionManager {
             user_ids.iter().any(|id| s.contains_user(*id))
         })
         .await
+    }
+
+    /// An open WebSocket connection on one of the user's sessions, or a sink
+    /// registered on the session bus for its id (the `/socket` handler's
+    /// path): exactly the two delivery routes `broadcast` uses, so a `false`
+    /// here means a broadcast would reach nobody.
+    async fn has_listener_for_user(&self, user_id: Uuid) -> bool {
+        let bus_candidates: Vec<String> = {
+            let sessions = self.sessions.lock().await;
+            let mut ids = Vec::new();
+            for session in sessions.values().filter(|s| s.contains_user(user_id)) {
+                if session.connections.iter().any(|c| c.is_open()) {
+                    return true;
+                }
+                ids.push(session.id.clone());
+            }
+            ids
+        };
+        self.bus.as_ref().is_some_and(|bus| {
+            bus_candidates
+                .iter()
+                .any(|id| bus.is_connected(id.as_str()))
+        })
     }
 
     async fn send_message_to_all_sessions(
@@ -1866,44 +2217,55 @@ impl SessionManager for FerrofinSessionManager {
     ) -> Result<(), ServiceError> {
         // Port of `CloseLiveStreamIfNeededAsync`. A Live TV stream IS shared
         // between viewers (they all get the same `LiveStreamId`) and every
-        // `OpenLiveStream` raised its consumer count, so a release must happen
-        // exactly once per viewer: `MediaSourceManager::close_live_stream` drops
-        // the tuner when that count reaches zero, and one release too many takes
-        // the channel away from someone still watching. The holder map is what
-        // makes "once per viewer" true — see its field docs. A report for a
-        // stream this server never registered releases nothing, as upstream's
-        // missing-mapping branch does.
+        // `OpenLiveStream` raised its consumer count;
+        // `MediaSourceManager::close_live_stream` lowers it and drops the tuner
+        // at zero. The holder map (see its field docs) decides whether this
+        // release closes, in upstream's three cases:
+        // - the caller's id holds the stream: that id and its partner are
+        //   removed and the stream is closed, so the same viewer reporting under
+        //   both its session id and its play-session id, or twice, closes once;
+        // - the stream has holders but not this id (this viewer already
+        //   released, or never held it): nothing is closed, so one release too
+        //   many cannot take the channel from someone still watching;
+        // - the stream has no holder entry at all (no start or progress report
+        //   named it, or its last holder already released): it is closed
+        //   (upstream's `else { liveStreamNeedsToBeClosed = true; }`). That frees
+        //   the tuner of a client whose play-state reports omit the
+        //   `LiveStreamId`; closing a stream that is already closed is a no-op.
         if live_stream_id.is_empty() {
             return Ok(());
         }
-        // One close per VIEWER (C# `CloseLiveStreamIfNeededAsync`): removing the
-        // id the caller used also removes its partner, so the same viewer
-        // reporting under both its session id and its play-session id — or
-        // reporting twice — releases the consumer once.
-        {
+        let needs_close = {
             let mut holders = self.active_live_stream_sessions.lock().await;
-            let Some(mappings) = holders.get_mut(live_stream_id) else {
+            if let Some(mappings) = holders.get_mut(live_stream_id) {
+                let released = if let Some(partner) = mappings.remove(session_or_play_session_id) {
+                    if !partner.is_empty() {
+                        mappings.remove(&partner);
+                    }
+                    true
+                } else {
+                    debug!(
+                        %live_stream_id,
+                        session = %session_or_play_session_id,
+                        "live stream not held by this session; releasing nothing"
+                    );
+                    false
+                };
+                if mappings.is_empty() {
+                    holders.remove(live_stream_id);
+                }
+                released
+            } else {
                 debug!(
                     %live_stream_id,
                     session = %session_or_play_session_id,
-                    "live stream has no registered holder"
+                    "live stream has no registered holder; closing it"
                 );
-                return Ok(());
-            };
-            let Some(partner) = mappings.remove(session_or_play_session_id) else {
-                debug!(
-                    %live_stream_id,
-                    session = %session_or_play_session_id,
-                    "live stream already released by this session"
-                );
-                return Ok(());
-            };
-            if !partner.is_empty() {
-                mappings.remove(&partner);
+                true
             }
-            if mappings.is_empty() {
-                holders.remove(live_stream_id);
-            }
+        };
+        if !needs_close {
+            return Ok(());
         }
         let Some(media_sources) = self.media_sources.as_ref() else {
             return Ok(());
@@ -2221,7 +2583,14 @@ fn session_started_payload(session: &SessionInfo) -> String {
     serde_json::to_string(&session_info_to_dto(session)).unwrap_or_else(|_| "{}".to_owned())
 }
 
-/// The JSON payload for a playback-progress event.
+/// .NET ticks (100 ns each) in a millisecond.
+const TICKS_PER_MILLISECOND: i64 = 10_000;
+
+/// The JSON payload for a playback event. The user name, device name and
+/// client stand for `PlaybackProgressEventArgs`' `Users`, `DeviceName` and
+/// `ClientName`: the playback activity loggers read the first two
+/// ([`crate::playback_activity`]), and plugins receive all three, as
+/// upstream's event consumers do.
 fn playback_event_payload(
     session: &SessionInfo,
     item_id: Uuid,
@@ -2230,6 +2599,9 @@ fn playback_event_payload(
     serde_json::json!({
         "SessionId": session.id,
         "UserId": session.user_id,
+        "UserName": session.user_name,
+        "DeviceName": session.device_name,
+        "ClientName": session.client,
         "ItemId": item_id,
         "PositionTicks": position_ticks,
     })
@@ -2435,19 +2807,19 @@ mod bus_fallback_tests {
 
         // Three sessions of the same user, one per regime.
         let direct = mgr
-            .log_session_activity("Direct", "1.0", "dev-direct", "Mac", "e", &user)
+            .log_session_activity("Direct", "1.0", "dev-direct", "Mac", "e", Some(&user))
             .await
             .expect("direct session")
             .id
             .expect("direct session id");
         let busonly = mgr
-            .log_session_activity("BusOnly", "1.0", "dev-bus", "TV", "e", &user)
+            .log_session_activity("BusOnly", "1.0", "dev-bus", "TV", "e", Some(&user))
             .await
             .expect("bus session")
             .id
             .expect("bus session id");
         let stale = mgr
-            .log_session_activity("Stale", "1.0", "dev-stale", "Phone", "e", &user)
+            .log_session_activity("Stale", "1.0", "dev-stale", "Phone", "e", Some(&user))
             .await
             .expect("stale session")
             .id
@@ -2589,7 +2961,7 @@ mod bus_fallback_tests {
         let user_id = Uuid::new_v4();
         let user = crate::test_support::seed_user(&db, user_id).await;
         for device in ["dev-a", "dev-b", "dev-c"] {
-            mgr.log_session_activity("Web", "1.0", device, "Box", "e", &user)
+            mgr.log_session_activity("Web", "1.0", device, "Box", "e", Some(&user))
                 .await
                 .expect("session");
         }
@@ -2795,7 +3167,14 @@ mod broadcast_lock_tests {
         let user = crate::test_support::seed_user(&db, user_id).await;
 
         let stalled = mgr
-            .log_session_activity("Stalled Client", "1.0", "dev-stalled", "TV", "e", &user)
+            .log_session_activity(
+                "Stalled Client",
+                "1.0",
+                "dev-stalled",
+                "TV",
+                "e",
+                Some(&user),
+            )
             .await
             .expect("session created");
         let stalled_id = stalled.id.clone().expect("session id");
@@ -2840,7 +3219,7 @@ mod broadcast_lock_tests {
         timeout(PROGRESS_TIMEOUT, async {
             assert!(!mgr.has_active_playback().await.expect("playback probe"));
             let other = mgr
-                .log_session_activity("Web", "1.0", "dev-web", "Mac", "e", &user)
+                .log_session_activity("Web", "1.0", "dev-web", "Mac", "e", Some(&user))
                 .await
                 .expect("second session created");
             assert_ne!(other.id, stalled.id);
@@ -2881,7 +3260,7 @@ mod broadcast_lock_tests {
         let user_id = Uuid::new_v4();
         let user = crate::test_support::seed_user(&db, user_id).await;
         let session = mgr
-            .log_session_activity("Web", "1.0", "dev-1", "Mac", "e", &user)
+            .log_session_activity("Web", "1.0", "dev-1", "Mac", "e", Some(&user))
             .await
             .expect("session created");
         let session_id = session.id.clone().expect("session id");

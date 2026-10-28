@@ -30,9 +30,10 @@ use axum::routing::{get, post};
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
 use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_model::entities_media::VirtualFolderInfo;
+use ferrofin_traits::error::ServiceError;
 use uuid::Uuid;
 
-use crate::auth::FirstTimeSetupOrAuth;
+use crate::auth::FirstTimeSetupOrElevated;
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
@@ -65,8 +66,29 @@ async fn after_structure_change(state: &AppState, refresh_library: bool, scope: 
     }
 }
 
-/// Resolves a just-mutated virtual folder's `CollectionFolder` id by name, for
-/// scoping the follow-up scan.
+/// Upstream's `finally` after a structure change: unless the change was
+/// refused up front (the argument, existence and conflict checks upstream
+/// makes before its `try`: 400, 404, 409), run [`after_structure_change`]
+/// whether the change succeeded or failed part-way, then hand back the
+/// change's own result.
+async fn finish_structure_change<T>(
+    state: &AppState,
+    refresh_library: bool,
+    scope: Option<Uuid>,
+    result: Result<T, ServiceError>,
+) -> Result<T, ApiError> {
+    if !matches!(
+        result,
+        Err(ServiceError::InvalidInput(_) | ServiceError::NotFound(_) | ServiceError::Conflict(_))
+    ) {
+        after_structure_change(state, refresh_library, scope).await;
+    }
+    result.map_err(ApiError::from)
+}
+
+/// Resolves a just-renamed virtual folder's `CollectionFolder` id by name, for
+/// scoping the follow-up scan. Safe only because rename stores `new_name`
+/// verbatim; an add can store another name, so it uses the id its call returns.
 ///
 /// Best-effort. `get_virtual_folders` mints the row (and its path-derived id)
 /// for every directory it enumerates, so a just-renamed library resolves; the
@@ -100,7 +122,7 @@ async fn library_id_by_name(state: &AppState, name: &str) -> Option<Uuid> {
 )]
 async fn get_virtual_folders(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
 ) -> Result<Json<Vec<VirtualFolderInfo>>, ApiError> {
     Ok(Json(state.virtual_folders.get_virtual_folders().await?))
 }
@@ -160,7 +182,7 @@ struct AddVirtualFolderQuery {
 )]
 async fn add_virtual_folder(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     Query(query): Query<AddVirtualFolderQuery>,
     body: Option<JsonBody<AddVirtualFolderBody>>,
 ) -> Result<StatusCode, ApiError> {
@@ -190,12 +212,16 @@ async fn add_virtual_folder(
         }
     }
 
-    state
+    // Scope by the id the add returns, never by `name`: the stored name can
+    // differ (`Kids: Movies` → `Kids Movies`, a taken `Movies` → `Movies2`), and
+    // a lookup by the requested one would rescan the name-sake library.
+    // A failed add has no id to scope by, so its requested scan is full.
+    let added = state
         .virtual_folders
         .add_virtual_folder(&name, query.collection_type, &options)
-        .await?;
-    let scope = library_id_by_name(&state, &name).await;
-    after_structure_change(&state, query.refresh_library, scope).await;
+        .await;
+    let scope = added.as_ref().ok().copied().flatten();
+    finish_structure_change(&state, query.refresh_library, scope, added).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -213,8 +239,10 @@ struct RemoveVirtualFolderQuery {
 
 /// `DELETE /Library/VirtualFolders` — remove a virtual folder.
 ///
-/// Port of `LibraryStructureController.RemoveVirtualFolder`: a missing folder is
-/// a `404` (mirroring the C# `FileNotFoundException`).
+/// Port of `LibraryStructureController.RemoveVirtualFolder`: a blank `name` is a
+/// `400` (C# `ArgumentNullException`), and a name that is not an existing
+/// folder directly under the libraries root (`GetChildPath`) is a `404`
+/// (mirroring the C# `FileNotFoundException`).
 #[utoipa::path(
     delete,
     path = "/Library/VirtualFolders",
@@ -224,18 +252,19 @@ struct RemoveVirtualFolderQuery {
     ),
     responses(
         (status = 204, description = "Folder removed"),
+        (status = 400, description = "Missing name"),
         (status = 404, description = "Folder not found")
     ),
     tag = "ferrofin"
 )]
 async fn remove_virtual_folder(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     Query(query): Query<RemoveVirtualFolderQuery>,
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
-    state.virtual_folders.remove_virtual_folder(&name).await?;
-    after_structure_change(&state, query.refresh_library, None).await;
+    let removed = state.virtual_folders.remove_virtual_folder(&name).await;
+    finish_structure_change(&state, query.refresh_library, None, removed).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -257,8 +286,10 @@ struct RenameVirtualFolderQuery {
 /// `POST /Library/VirtualFolders/Name` — rename a virtual folder.
 ///
 /// Port of `LibraryStructureController.RenameVirtualFolder`: a missing `name`/
-/// `newName` is a `400` (C# `ArgumentNullException`), a missing source folder is
-/// a `404`, and a target name that already exists is a `409`.
+/// `newName` is a `400` (C# `ArgumentNullException`), as is a `newName` that is
+/// not a single folder under the libraries root (`GetChildPath`); a `name` that
+/// is not an existing such folder is a `404`, and a target name that already
+/// exists is a `409`.
 #[utoipa::path(
     post,
     path = "/Library/VirtualFolders/Name",
@@ -269,6 +300,7 @@ struct RenameVirtualFolderQuery {
     ),
     responses(
         (status = 204, description = "Folder renamed"),
+        (status = 400, description = "Missing or invalid name"),
         (status = 404, description = "Library does not exist"),
         (status = 409, description = "Library already exists")
     ),
@@ -276,7 +308,7 @@ struct RenameVirtualFolderQuery {
 )]
 async fn rename_virtual_folder(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     Query(query): Query<RenameVirtualFolderQuery>,
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
@@ -287,21 +319,27 @@ async fn rename_virtual_folder(
     if new_name.trim().is_empty() {
         return Err(ApiError::BadRequest("newName must not be empty".to_owned()));
     }
-    state
+    let renamed = state
         .virtual_folders
         .rename_virtual_folder(&name, &new_name)
-        .await?;
+        .await;
     // Materialize the renamed collection folder even without a refresh, so its
     // physical locations can be browsed immediately. Media rows survive the
     // collection-folder identity change; only the requested refresh scans them.
-    let scope = library_id_by_name(&state, &new_name).await;
-    if query.refresh_library && scope.is_none() {
-        tracing::warn!(
-            new_name,
-            "renamed library has no resolvable item id; falling back to a FULL library scan"
-        );
-    }
-    after_structure_change(&state, query.refresh_library, scope).await;
+    // A failed rename has no settled id, so its requested scan is full.
+    let scope = if renamed.is_ok() {
+        let scope = library_id_by_name(&state, &new_name).await;
+        if query.refresh_library && scope.is_none() {
+            tracing::warn!(
+                new_name,
+                "renamed library has no resolvable item id; falling back to a FULL library scan"
+            );
+        }
+        scope
+    } else {
+        None
+    };
+    finish_structure_change(&state, query.refresh_library, scope, renamed).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -353,7 +391,7 @@ struct MediaPathQuery {
 )]
 async fn add_media_path(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     Query(query): Query<MediaPathQuery>,
     JsonBody(body): JsonBody<MediaPathBody>,
 ) -> Result<StatusCode, ApiError> {
@@ -372,11 +410,11 @@ async fn add_media_path(
             ));
         }
     };
-    state
+    let added = state
         .virtual_folders
         .add_media_path(&name, &path_info)
-        .await?;
-    after_structure_change(&state, query.refresh_library, None).await;
+        .await;
+    finish_structure_change(&state, query.refresh_library, None, added).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -408,7 +446,7 @@ struct UpdateMediaPathBody {
 )]
 async fn update_media_path(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     JsonBody(body): JsonBody<UpdateMediaPathBody>,
 ) -> Result<StatusCode, ApiError> {
     let name = body.name.unwrap_or_default();
@@ -446,7 +484,7 @@ async fn update_media_path(
 )]
 async fn remove_media_path(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     Query(query): Query<MediaPathQuery>,
 ) -> Result<StatusCode, ApiError> {
     let name = query.name.unwrap_or_default();
@@ -457,11 +495,8 @@ async fn remove_media_path(
     if path.trim().is_empty() {
         return Err(ApiError::BadRequest("path must not be empty".to_owned()));
     }
-    state
-        .virtual_folders
-        .remove_media_path(&name, &path)
-        .await?;
-    after_structure_change(&state, query.refresh_library, None).await;
+    let removed = state.virtual_folders.remove_media_path(&name, &path).await;
+    finish_structure_change(&state, query.refresh_library, None, removed).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -513,7 +548,7 @@ struct UpdateLibraryOptionsBody {
 )]
 async fn update_library_options(
     State(state): State<AppState>,
-    FirstTimeSetupOrAuth(_auth): FirstTimeSetupOrAuth,
+    FirstTimeSetupOrElevated(_auth): FirstTimeSetupOrElevated,
     JsonBody(body): JsonBody<UpdateLibraryOptionsBody>,
 ) -> Result<StatusCode, ApiError> {
     let options = body.library_options.unwrap_or_default();

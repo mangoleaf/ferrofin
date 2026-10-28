@@ -22,6 +22,7 @@
 use std::path::Path;
 
 use axum::extract::{Request, State};
+use axum::handler::Handler;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -31,8 +32,8 @@ use ferrofin_traits::options::ItemImageInfo;
 
 use crate::auth::{AuthenticatedIdentity, RequireAdmin, is_administrator_identity};
 use crate::error::ApiError;
-use crate::extract::Query;
-use crate::handlers::image_upload::{decode_base64, image_extension_from_content_type};
+use crate::extract::{Query, upload_body_limit};
+use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
 use crate::handlers::images::{ImageQuery, serve_image_file};
 use crate::state::AppState;
 
@@ -172,6 +173,7 @@ async fn get_splashscreen(
         uuid::Uuid::nil(),
         &image,
         0,
+        false,
         &ImageQuery::tagged(query.tag, query.format),
         request,
     )
@@ -181,7 +183,8 @@ async fn get_splashscreen(
 /// `POST /Branding/Splashscreen` — upload a custom splashscreen.
 ///
 /// Port of `ImageController.UploadCustomSplashscreen`: validates the
-/// `Content-Type` is an image type (`400` otherwise), base64-decodes the body,
+/// `Content-Type` with `TryGetImageExtensionFromContentType` (an image type
+/// `ToExtension` knows, else `400 Incorrect ContentType.`), base64-decodes the body,
 /// writes it to `<data>/splashscreen-upload{ext}`, and records that path on the
 /// branding options. Returns `204`.
 #[utoipa::path(
@@ -202,8 +205,9 @@ async fn upload_splashscreen(
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
-    let extension = image_extension_from_content_type(content_type)
-        .ok_or_else(|| ApiError::BadRequest("Incorrect ContentType.".to_owned()))?;
+    let extension = try_get_image_extension_from_content_type(content_type)
+        .ok_or_else(|| ApiError::BadRequest("Incorrect ContentType.".to_owned()))?
+        .extension;
     let bytes = decode_base64(body.trim())
         .ok_or_else(|| ApiError::BadRequest("splashscreen data is not valid base64".to_owned()))?;
 
@@ -225,6 +229,7 @@ async fn upload_splashscreen(
     let mut branding = state.config.get_branding().await?;
     branding.splashscreen_location = Some(file_path.to_string_lossy().into_owned());
     state.config.update_branding(&branding).await?;
+    crate::handlers::config::run_committed_checks(&state, "branding")?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -255,6 +260,7 @@ async fn delete_splashscreen(
         })?;
         branding.splashscreen_location = None;
         state.config.update_branding(&branding).await?;
+        crate::handlers::config::run_committed_checks(&state, "branding")?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -268,7 +274,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
         .route(
             "/Branding/Splashscreen",
             get(get_splashscreen)
-                .post(upload_splashscreen)
+                .post(upload_splashscreen.layer(upload_body_limit()))
                 .delete(delete_splashscreen),
         )
 }

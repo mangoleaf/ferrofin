@@ -1,0 +1,18 @@
+[Script Info]
+; This is a Sub Station Alpha v4 script.
+Title: untitled
+ScriptType: v4.00
+Collisions: Normal
+PlayDepth: 0
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding
+Style: Default,Arial,20,-1,-65536,-16777216,-16777216,0,0,1,1,1,2,10,10,10,0,1
+
+
+[Events]
+Format: Marked, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Comment: Marked=0,0:00:00.50,0:00:01.00,*Default,NTP,0000,0000,0000,,translator note
+Dialogue: Marked=0,0:00:01.00,0:00:02.00,*Default,NTP,0000,0000,0000,,first line
+Comment: Marked=0,0:00:02.00,0:00:02.50,*Default,TL,0000,0000,0000,karaoke,{\i1}timing note
+Dialogue: Marked=0,0:00:02.50,0:00:03.50,*Default,NTP,0000,0000,0000,,second line

@@ -9,7 +9,8 @@
 //! - `GET  /Users` — list users (optionally filtered by hidden/disabled).
 //! - `GET  /Users/Public` — the login-screen-visible subset.
 //! - `GET  /Users/{userId}` — a single user by id.
-//! - `DELETE /Users/{userId}` — delete a user (revoking its tokens first).
+//! - `DELETE /Users/{userId}` — delete a user (revoking its tokens first),
+//!   then hand over or delete the playlists it owned.
 //! - `POST /Users/New` — create a user (optionally with a password).
 //! - `POST /Users` — update a user's name/configuration.
 //! - `POST /Users/{userId}/Policy` — update a user's policy.
@@ -24,19 +25,22 @@
 //!   [`AuthenticationResultData`] (session DTO + minted access token), which the
 //!   handler assembles into the wire [`AuthenticationResult`] — the client gets a
 //!   real `AccessToken` to present on subsequent requests.
-//! - The `[Authorize(Policy = …)]` gates (`RequiresElevation` /
-//!   `IgnoreParentalControl`) are not enforced by a policy middleware here; the
-//!   in-body admin guards the C# controller itself applies (last-admin,
-//!   disable-admin, "may this caller update this user") are ported faithfully via
-//!   [`is_administrator`].
-//! - `ServerId` (a client-cosmetic display field) is left unset: sourcing it
-//!   needs `IApplicationHost.SystemId`, which is not exposed at this layer.
-//! - The `PlaylistManager.RemovePlaylistsAsync` cleanup on delete is deferred
-//!   (no playlist manager at this layer); token revocation + user deletion run.
+//! - The `[Authorize]` attributes are extractors: `Policy = RequiresElevation` is
+//!   [`RequireAdmin`], `Policy = IgnoreParentalControl` is
+//!   [`RequireAuthIgnoringSchedule`], and a plain `[Authorize]` is
+//!   [`RequireAuth`]. The guards the C# controller applies itself ("may this
+//!   caller update this user", the last administrator, an administrator
+//!   disabled, the last enabled user) are ported too; the policy ones run
+//!   inside the save
+//!   ([`UserManager::update_policy_guarded`](ferrofin_traits::library::UserManager::update_policy_guarded)).
+//! - `ServerId` is the server's system id: the user manager sets it on every
+//!   `UserDto` it builds, and the authentication result takes it from the
+//!   session.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_db::entities::users::UserEntity;
@@ -55,7 +59,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthenticatedIdentity, RequireAdmin, RequireAuth, RequireAuthIgnoringSchedule};
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{JsonBody, ProblemDetails, Query};
 use crate::handlers::items::user_uuid;
 use crate::state::AppState;
 
@@ -78,9 +82,11 @@ struct AuthenticateByNameRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct QuickConnectDto {
-    /// The Quick Connect secret returned by the initiate endpoint.
+    /// The Quick Connect secret returned by the initiate endpoint. Upstream
+    /// marks it `[Required]`, so the handler refuses a missing, `null` or
+    /// blank one.
     #[serde(default)]
-    secret: Secret,
+    secret: Option<Secret>,
 }
 
 /// The `POST /Users/New` request body.
@@ -306,7 +312,7 @@ pub(crate) async fn user_policy(
 
 /// Ports C# `RequestHelpers.AssertCanUpdateUser`: the caller may update `target`
 /// when the caller is an administrator, or when the caller *is* the target.
-async fn assert_can_update_user(
+pub(crate) async fn assert_can_update_user(
     state: &AppState,
     auth: &AuthorizationInfo,
     target: &UserEntity,
@@ -451,7 +457,9 @@ async fn authenticate(
 /// `POST /Users/AuthenticateWithQuickConnect` — finish a Quick Connect login.
 ///
 /// Port of `UserController.AuthenticateWithQuickConnect`: exchanges an authorized
-/// Quick Connect secret for a session.
+/// Quick Connect secret for the session and token opened when its code was
+/// authorized. It never authenticates again: a second login would count the
+/// authorize-time session against `MaxActiveSessions` and orphan its token.
 #[utoipa::path(
     post,
     path = "/Users/AuthenticateWithQuickConnect",
@@ -460,39 +468,28 @@ async fn authenticate(
 )]
 async fn authenticate_with_quick_connect(
     State(state): State<AppState>,
-    parts: Parts,
     JsonBody(body): JsonBody<QuickConnectDto>,
-) -> Result<Json<AuthenticationResult>, ApiError> {
-    // Validate the secret (it has already been authorized on another device),
-    // then open a session for that user *directly* — no password — so the client
-    // receives a real `AccessToken` instead of thinking it logged in with none.
-    let session = state
-        .quick_connect
-        .get_authorized_request(body.secret.expose())
-        .await?;
-    let auth = auth_info(&parts);
-    let request = AuthenticationRequest {
-        username: None,
-        user_id: Some(session.user_id),
-        password: None,
-        app: auth.client,
-        app_version: auth.version,
-        device_id: auth.device_id,
-        device_name: auth.device,
-        // As on the password path: C# fills this from
-        // `HttpContext.GetNormalizedRemoteIP()`.
-        remote_endpoint: Some(state.client_address(&parts).to_string()),
+) -> Result<Response, ApiError> {
+    // `[Required]` model validation runs before the action and refuses a
+    // blank string (`IsNullOrWhiteSpace`) as well as a missing one.
+    let Some(secret) = body.secret.filter(|s| !s.expose().trim().is_empty()) else {
+        return Ok(
+            ProblemDetails::member_validation("Secret", "The Secret field is required.")
+                .into_response(),
+        );
     };
-    let result = state.sessions.authenticate_direct(&request).await?;
-    Ok(Json(authentication_result(&state, result).await))
+    let result = state
+        .quick_connect
+        .get_authorized_request(secret.expose())
+        .await?;
+    Ok(Json(authentication_result(&state, result).await).into_response())
 }
 
 /// Assembles the [`AuthenticationResult`] wire body from an authenticated
 /// session and its minted access token.
 ///
 /// The token is echoed back to the client as `AccessToken` so subsequent
-/// requests can authenticate; a genuinely empty token (e.g. the Quick Connect
-/// seam that does not carry one) collapses to `None`.
+/// requests can authenticate.
 async fn authentication_result(
     state: &AppState,
     result: AuthenticationResultData,
@@ -520,7 +517,7 @@ async fn authentication_result(
     AuthenticationResult {
         user: Some(user),
         session_info: Some(session),
-        access_token: (!access_token.expose().is_empty()).then_some(access_token),
+        access_token: Some(access_token),
         server_id,
     }
 }
@@ -646,8 +643,17 @@ async fn get_user_by_id(
 
 /// `DELETE /Users/{userId}` — delete a user.
 ///
-/// Port of `UserController.DeleteUser`: revokes the user's tokens, then deletes
-/// the user. (The playlist cleanup is deferred — see the module note.)
+/// Port of `UserController.DeleteUser`: revokes the user's tokens, deletes the
+/// user, then hands over or deletes the playlists they owned
+/// ([`PlaylistManager::remove_playlists`](ferrofin_traits::collections::PlaylistManager::remove_playlists)).
+///
+/// Upstream does the playlists between the two, before `DeleteUserAsync`,
+/// whose last-user / last-admin refusal then leaves the user in place with
+/// their playlists already given away or deleted. Here a refused delete
+/// touches no playlist (a Jellyfin bug not ported). The deletion's activity
+/// entry and `UserDeleted` message go out before the playlists, as upstream
+/// raises them inside `DeleteUserAsync`, so a failed hand-over (an error
+/// response, the user already deleted) cannot skip them.
 #[utoipa::path(
     delete,
     path = "/Users/{userId}",
@@ -694,13 +700,15 @@ async fn delete_user(
             )
             .await;
     }
+    state.playlists.remove_playlists(user_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Pushes a `UserUpdated` message carrying the refreshed [`UserDto`] to the
-/// user's sessions, so open clients pick up name/configuration/policy changes
-/// without re-login (port of Jellyfin's `ServerEventNotifier.OnUserUpdated`).
-/// Best-effort: a delivery failure must not fail the mutating request.
+/// user's sessions (port of `UserUpdatedNotifier`, the consumer of the
+/// `UserUpdatedEventArgs` that only `UserManager.RenameUser` and
+/// `UpdatePolicyAsync` publish: a rename and a policy save). Best-effort: a
+/// delivery failure must not fail the mutating request.
 async fn notify_user_updated(state: &AppState, user_id: Uuid) {
     let Ok(user) = load_user(state, user_id).await else {
         return;
@@ -766,6 +774,7 @@ async fn create_user_by_name(
     params(("userId" = Option<String>, Query, description = "The user id (defaults to caller)")),
     responses(
         (status = 204, description = "User updated"),
+        (status = 400, description = "Invalid name, or an incomplete policy"),
         (status = 403, description = "Update not allowed"),
         (status = 404, description = "User not found")
     ),
@@ -776,29 +785,67 @@ async fn update_user(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<UserIdQuery>,
     JsonBody(body): JsonBody<UserDto>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
+    // Model validation walks into the nested `Policy` before the action runs.
+    // A body without one gets `UserDto`'s constructor policy, whose provider
+    // ids are null, so only a complete policy or `"Policy": null` passes.
+    if let Some(problem) = body
+        .policy
+        .as_ref()
+        .and_then(|policy| policy_validation(policy, "Policy."))
+    {
+        return Ok(problem.into_response());
+    }
     let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
     let user = load_user(&state, user_id).await?;
     assert_can_update_user(&state, &auth, &user).await?;
 
-    if let Some(new_name) = &body.name
-        && new_name != &user.username
-    {
+    // C# renames whenever `updateUser.Name` differs from the stored name, so a
+    // missing or null name reaches `RenameUser` too, and its
+    // `ThrowIfInvalidUsername` refuses it (400) as it refuses a blank one.
+    let new_name = body.name.as_deref().unwrap_or_default();
+    if new_name != user.username {
         state
             .users
             .rename_user(user_id, &user.username, new_name)
             .await?;
-        update_device_access(&state, &user).await?;
+        // `RenameUser` publishes `UserUpdated` before it raises
+        // `OnUserUpdated` for the device check, ahead of the configuration
+        // save.
+        notify_user_updated(&state, user_id).await;
+        refresh_device_access(&state, user_id).await;
     }
+    // A body without `Configuration` binds `UserDto`'s constructor default, so
+    // the save resets the user's settings as upstream's does; `null` (a 500
+    // upstream, `UpdateConfigurationAsync` dereferences it) saves nothing.
     if let Some(config) = &body.configuration {
         state.users.update_configuration(user_id, config).await?;
     }
-    notify_user_updated(&state, user_id).await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// The pinned `DeviceAccessHost` observes `OnUserUpdated`, emitted by rename.
-/// Policy/configuration saves do not emit that event in the pinned source.
+/// Port of `DeviceAccessHost.OnUserUpdated`, registered since Jellyfin 12.1:
+/// `UserManager.RenameUser` and `UpdatePolicyAsync` raise `OnUserUpdated`, and
+/// the host then logs out every device of the user that the saved policy no
+/// longer allows ([`update_device_access`]). A configuration save raises no
+/// such event.
+///
+/// The change it follows is already saved, so a failure is logged and not
+/// answered, as upstream's handler catches and logs it.
+async fn refresh_device_access(state: &AppState, user_id: Uuid) {
+    let refreshed = async {
+        let user = load_user(state, user_id).await?;
+        update_device_access(state, &user).await
+    }
+    .await;
+    if let Err(error) = refreshed {
+        tracing::error!(user_id = %user_id, %error, "error updating device access for user");
+    }
+}
+
+/// `DeviceAccessHost.UpdateDeviceAccess`: unless the user may use every device
+/// (`EnableAllDevices`), logs out (`Logout(Device)`) each of their devices
+/// `CanAccessDevice` refuses.
 async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(), ApiError> {
     if user_policy(state, user)
         .await?
@@ -832,14 +879,20 @@ async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(),
 ///
 /// Port of `UserController.UpdateUserPolicy`, including the guards: the last
 /// administrator may not be demoted, an administrator may not be disabled, and
-/// the last enabled user may not be disabled. On a successful disable, the
-/// user's tokens are revoked.
+/// the last enabled user may not be disabled. The guards are read inside the
+/// save's transaction ([`UserManager::update_policy_guarded`]), so concurrent
+/// saves cannot both pass one. On a successful disable, the user's tokens are
+/// revoked, and after every save the devices the saved policy no longer allows
+/// are logged out (Jellyfin 12.1's `DeviceAccessHost`).
+///
+/// [`UserManager::update_policy_guarded`]: ferrofin_traits::library::UserManager::update_policy_guarded
 #[utoipa::path(
     post,
     path = "/Users/{userId}/Policy",
     params(("userId" = String, Path, description = "The user id")),
     responses(
         (status = 204, description = "Policy updated"),
+        (status = 400, description = "A required provider id is missing or blank"),
         (status = 403, description = "Policy update forbidden"),
         (status = 404, description = "User not found")
     ),
@@ -850,47 +903,57 @@ async fn update_user_policy(
     RequireAdmin(_auth): RequireAdmin,
     Path(user_id): Path<Uuid>,
     JsonBody(new_policy): JsonBody<UserPolicy>,
-) -> Result<StatusCode, ApiError> {
-    let user = load_user(&state, user_id).await?;
-    let was_admin = is_administrator(&state, &user).await?;
-
-    // If removing admin access, there must remain at least one administrator.
-    if !new_policy.is_administrator && was_admin && admin_count(&state).await? == 1 {
-        return Err(ApiError::Forbidden(
-            "there must be at least one user in the system with administrative access".to_owned(),
-        ));
+) -> Result<Response, ApiError> {
+    // Model validation runs after the authorization policy and before the
+    // action, so it answers ahead of the unknown user's 404.
+    if let Some(problem) = policy_validation(&new_policy, "") {
+        return Ok(problem.into_response());
     }
-
-    // Administrators cannot be disabled.
-    if new_policy.is_disabled && was_admin {
-        return Err(ApiError::Forbidden(
-            "administrators cannot be disabled".to_owned(),
-        ));
-    }
-
-    // Disabling a currently-enabled user: at least one enabled user must remain.
-    let currently_disabled = state
+    load_user(&state, user_id).await?;
+    // The guards run inside the save's transaction (`update_policy_guarded`),
+    // so the tokens of a user it disabled go once it committed. Upstream
+    // revokes first, which is the same once its guards have passed; here a
+    // refused or failed save logs nobody out.
+    let saved = state
         .users
-        .get_user_dto(&user, None)
-        .await?
-        .policy
-        .is_some_and(|p| p.is_disabled);
-    let mut revoke_on_disable = false;
-    if new_policy.is_disabled && !currently_disabled {
-        if enabled_count(&state).await? == 1 {
-            return Err(ApiError::Forbidden(
-                "there must be at least one enabled user in the system".to_owned(),
-            ));
-        }
-        revoke_on_disable = true;
-    }
-
-    if revoke_on_disable {
+        .update_policy_guarded(user_id, &new_policy)
+        .await?;
+    if saved.newly_disabled {
         state.sessions.revoke_user_tokens(user_id, "").await?;
     }
-    state.users.update_policy(user_id, &new_policy).await?;
+    // `UpdatePolicyAsync` publishes `UserUpdated` before it raises
+    // `OnUserUpdated` for the device check.
     notify_user_updated(&state, user_id).await;
-    Ok(StatusCode::NO_CONTENT)
+    refresh_device_access(&state, user_id).await;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `UserPolicy`'s two `[Required(AllowEmptyStrings = false)]` members, checked
+/// as ASP.NET's model validation checks them before the action runs: a member
+/// the body leaves out or sends `null` (both bound as `""`) or blank
+/// (`IsNullOrWhiteSpace`) is a `400` keyed `{prefix}{member}`. `prefix` is
+/// `"Policy."` for the policy nested in a `UserDto` body.
+fn policy_validation(policy: &UserPolicy, prefix: &str) -> Option<ProblemDetails> {
+    ProblemDetails::members_validation(
+        [
+            (
+                "AuthenticationProviderId",
+                &policy.authentication_provider_id,
+            ),
+            (
+                "PasswordResetProviderId",
+                &policy.password_reset_provider_id,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, value)| value.trim().is_empty())
+        .map(|(member, _)| {
+            (
+                format!("{prefix}{member}"),
+                format!("The {member} field is required."),
+            )
+        }),
+    )
 }
 
 /// `POST /Users/Configuration` — update a user's configuration.
@@ -917,8 +980,8 @@ async fn update_user_configuration(
     let user_id = query.user_id.unwrap_or_else(|| auth.user_id());
     let user = load_user(&state, user_id).await?;
     assert_can_update_user(&state, &auth, &user).await?;
+    // `UpdateConfigurationAsync` raises no event, so nothing is pushed.
     state.users.update_configuration(user_id, &config).await?;
-    notify_user_updated(&state, user_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1119,36 +1182,6 @@ async fn load_user(state: &AppState, user_id: Uuid) -> Result<UserEntity, ApiErr
         .ok_or_else(|| ApiError::NotFound("user not found".to_owned()))
 }
 
-/// Counts the administrators in the system (for the policy guards).
-async fn admin_count(state: &AppState) -> Result<usize, ApiError> {
-    let users = state.users.get_users().await?;
-    let mut count = 0;
-    for user in &users {
-        if is_administrator(state, user).await? {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
-/// Counts the enabled (non-disabled) users in the system (for the policy guards).
-async fn enabled_count(state: &AppState) -> Result<usize, ApiError> {
-    let users = state.users.get_users().await?;
-    let mut count = 0;
-    for user in &users {
-        let disabled = state
-            .users
-            .get_user_dto(user, None)
-            .await?
-            .policy
-            .is_some_and(|p| p.is_disabled);
-        if !disabled {
-            count += 1;
-        }
-    }
-    Ok(count)
-}
-
 /// `POST /Users/{userId}` — path-scoped form of `POST /Users` (update user).
 ///
 /// Upstream keeps these `/Users/{userId}/…` forms `[Obsolete]` and hidden from
@@ -1160,7 +1193,7 @@ async fn update_user_for_user(
     auth: RequireAuth,
     Path(user_id): Path<Uuid>,
     body: JsonBody<UserDto>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     let query = UserIdQuery {
         user_id: Some(user_id),
     };

@@ -283,14 +283,15 @@ struct RunningJob {
     /// Known source runtime and the current job's seek offset.
     run_time_ticks: Option<i64>,
     start_time_ticks: Option<i64>,
-    /// Exact segment duration for download tracking and cleanup.
-    segment_length_secs: i32,
     /// The rolling deletion timer, canceled when this job is removed.
     segment_cleaner: Option<super::segment_cleaner::SegmentCleanerTask>,
     /// Dashboard details updated by stderr statistics.
     info: TranscodingInfo,
     /// Dynamic segment paths waiting for response completion.
     segment_endings: std::collections::HashMap<PathBuf, i64>,
+    /// Per-segment end-position tracking for the segment cleaner (replaces the
+    /// old division-by-segment-length estimate that deleted ahead on MKV remux).
+    served_segments: std::sync::Arc<Mutex<std::collections::HashMap<i64, i64>>>,
     /// The segment cache directory to purge on kill (`DeleteHlsPartialStreamFiles`).
     output_dir: PathBuf,
     /// The `.m3u8`/output path whose stem selects the files to delete.
@@ -321,6 +322,7 @@ impl RunningJob {
             ),
             controller: std::sync::Arc::new(tokio::sync::Mutex::new(ThrottleController {
                 keys: None,
+                timed: false,
                 next_tick: Instant::now() + super::throttler::THROTTLE_INTERVAL,
                 paused: false,
                 stopped: false,
@@ -328,10 +330,10 @@ impl RunningJob {
             })),
             run_time_ticks: state.run_time_ticks,
             start_time_ticks: state.base_request.start_time_ticks,
-            segment_length_secs: state.segment_length_secs,
             segment_cleaner: None,
             info: transcoding_info(state, hardware_acceleration_type),
             segment_endings: std::collections::HashMap::new(),
+            served_segments: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
             output_dir,
             playlist_path,
             segment_extension,
@@ -343,10 +345,28 @@ impl RunningJob {
 /// Per-job control state, serialized with teardown.
 struct ThrottleController {
     keys: Option<super::throttler::PauseKeys>,
+    /// Whether this job was eligible and live when its timer was armed. Only
+    /// such a job may adopt keys the startup probe publishes later.
+    timed: bool,
     next_tick: Instant,
     paused: bool,
     stopped: bool,
     last_progress: Option<super::progress::FfmpegProgress>,
+}
+
+impl ThrottleController {
+    /// The job's pause keys, adopting ones the startup probe published after
+    /// its timer was armed. A job that never got a timer (ineligible) never
+    /// adopts keys.
+    fn keys_now(
+        &mut self,
+        slot: &super::throttler::PauseKeySlot,
+    ) -> Option<super::throttler::PauseKeys> {
+        if self.keys.is_none() && self.timed {
+            self.keys = slot.get();
+        }
+        self.keys
+    }
 }
 
 /// The response-body lifetime keeps the producing job alive and records reads.
@@ -356,6 +376,8 @@ struct DownloadObserver<S: SessionReporter, C: FileCleaner> {
     child: std::sync::Arc<dyn TranscodeChild>,
     progress: std::sync::Arc<Mutex<super::throttler::ThrottleProgress>>,
     ending_ticks: Option<i64>,
+    segment_index: Option<i64>,
+    served_segments: std::sync::Arc<Mutex<std::collections::HashMap<i64, i64>>>,
     completed: std::sync::atomic::AtomicBool,
 }
 
@@ -384,6 +406,14 @@ impl<S: SessionReporter, C: FileCleaner> ferrofin_traits::media_encoding::Transc
                     .unwrap_or(ending_ticks)
                     .max(ending_ticks),
             );
+            if let Some(idx) = self.segment_index
+                && idx >= 0
+            {
+                self.served_segments
+                    .lock()
+                    .expect("served_segments lock poisoned")
+                    .insert(idx, ending_ticks);
+            }
         }
     }
 
@@ -455,7 +485,10 @@ pub struct TranscodeManagerImpl<S: SessionReporter, C: FileCleaner = FsFileClean
     file_cleaner: C,
     encoding_config:
         Option<std::sync::Arc<dyn ferrofin_traits::configuration::ServerConfigurationManager>>,
-    pause_keys: Option<super::throttler::PauseKeys>,
+    /// The throttle's reads of `encoding_config`, which report a document
+    /// that cannot be read once rather than on every due timer.
+    throttle_options: crate::configuration::EncodingOptionsReader,
+    pause_keys: super::throttler::PauseKeySlot,
 }
 
 /// An active-consumer mark on a transcode job, released on drop.
@@ -492,7 +525,10 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             reporter,
             file_cleaner,
             encoding_config: None,
-            pause_keys: None,
+            throttle_options: crate::configuration::EncodingOptionsReader::new(
+                "transcode throttle",
+            ),
+            pause_keys: super::throttler::PauseKeySlot::default(),
         }
     }
 
@@ -506,11 +542,18 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self
     }
 
-    /// Sets the startup-probed ffmpeg keyboard controls.
+    /// Fixes the ffmpeg keyboard controls now (`None`: this ffmpeg has none).
     #[must_use]
-    pub fn with_pause_keys(mut self, keys: Option<super::throttler::PauseKeys>) -> Self {
-        self.pause_keys = keys;
+    pub fn with_pause_keys(self, keys: Option<super::throttler::PauseKeys>) -> Self {
+        self.pause_keys.set(keys);
         self
+    }
+
+    /// The slot the startup probe publishes the keyboard controls through, when
+    /// they are not known at construction. Jobs read it on every throttle tick.
+    #[must_use]
+    pub fn pause_key_slot(&self) -> super::throttler::PauseKeySlot {
+        self.pause_keys.clone()
     }
 
     /// Associates a dynamic segment with its exact ending position.
@@ -568,6 +611,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             child: std::sync::Arc::clone(&running.child),
             progress: std::sync::Arc::clone(&running.progress),
             ending_ticks: running.segment_endings.get(file).copied(),
+            segment_index: None,
+            served_segments: std::sync::Arc::clone(&running.served_segments),
             completed: std::sync::atomic::AtomicBool::new(false),
         };
         job.active_request_count += 1;
@@ -578,6 +623,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// Binds a dynamic segment response to its current producing job atomically.
     /// The result owns the old job's progress even after a seek replaces it.
     ///
+    /// `segment_index` is the zero-based index of the segment being served
+    /// (or negative for init segments, which are not tracked).
+    ///
     /// # Panics
     /// Panics if the registry lock is poisoned.
     #[must_use]
@@ -585,6 +633,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         self: &std::sync::Arc<Self>,
         playlist: &str,
         ending_ticks: i64,
+        segment_index: i64,
     ) -> Option<std::sync::Arc<dyn ferrofin_traits::media_encoding::TranscodeStreamProgress>>
     where
         S: 'static,
@@ -602,6 +651,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             child: std::sync::Arc::clone(&running.child),
             progress: std::sync::Arc::clone(&running.progress),
             ending_ticks: Some(ending_ticks),
+            segment_index: Some(segment_index),
+            served_segments: std::sync::Arc::clone(&running.served_segments),
             completed: std::sync::atomic::AtomicBool::new(false),
         };
         job.active_request_count += 1;
@@ -671,7 +722,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     }
                 }
             }
-            let Some(keys) = controller.keys else {
+            let Some(keys) = controller.keys_now(&self.pause_keys) else {
                 continue;
             };
             if Instant::now() < controller.next_tick {
@@ -683,13 +734,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             let options = if let Some(options) = override_options {
                 options.clone()
             } else if let Some(config) = &self.encoding_config {
-                match config.get_encoding_options().await {
-                    Ok(options) => options,
-                    Err(error) => {
-                        tracing::error!(%error, "reading transcode throttle configuration failed");
-                        ferrofin_model::configuration::EncodingOptions::default()
-                    }
-                }
+                self.throttle_options.read(config.as_ref()).await
             } else {
                 ferrofin_model::configuration::EncodingOptions::default()
             };
@@ -754,8 +799,8 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             display: String::new(),
             is_user_paused: false,
             // Consumers are counted by begin/end request pairing (the guard);
-            // registration itself stamps last_activity, which keeps the idle
-            // reaper away until the initiating request attaches its guard.
+            // `start_ffmpeg` holds one over its startup wait. A job enrolled
+            // here directly has no consumer, and its idle countdown starts now.
             active_request_count: 0,
             last_activity: std::time::Instant::now(),
             handle: handle.clone(),
@@ -807,8 +852,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
     /// # Errors
     ///
     /// Returns an error if the output directory cannot be created, the process
-    /// cannot be spawned, ffmpeg exits non-zero, or the first segment does not
-    /// appear within [`WAIT_FOR_FILE_TIMEOUT_MS`].
+    /// cannot be spawned, ffmpeg exits non-zero, the job is killed before its
+    /// first segment appears, or that segment does not appear within
+    /// [`WAIT_FOR_FILE_TIMEOUT_MS`].
     ///
     /// # Panics
     ///
@@ -873,6 +919,13 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         // plays so a later kill/reap log doesn't reduce to ids.
         self.register_job(handle.clone());
         self.set_job_display(&handle, &display);
+        // The startup wait below is the job's first consumer, as upstream's
+        // `OnTranscodeBeginning` starts it at `ActiveRequestCount = 1`: it can
+        // outlast the ping timeout (a cold 4K software encode), and the idle
+        // reaper must not kill the job this request is waiting on. A guard,
+        // not a count set in `register_job`: a start cancelled by a client
+        // disconnect drops it, so its job is still reaped.
+        let _startup = self.begin_request_guard(&handle.path, handle.job_type);
 
         // Tell the session layer what this job is, so the dashboard's transcode
         // panel is not blank. Only meaningful with a device to attach it to.
@@ -910,22 +963,7 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             .wait_for_path
             .clone()
             .unwrap_or_else(|| output_path.to_path_buf());
-        let waiter = FsWaiter::new(&target);
-        let deadline = Instant::now() + Duration::from_millis(WAIT_FOR_FILE_TIMEOUT_MS);
-        loop {
-            let exited = self.with_running(&handle, |r| r.child.has_exited());
-            if target.exists() || exited == Some(true) {
-                break;
-            }
-            if Instant::now() >= deadline {
-                self.kill_and_remove(&handle, true, false).await;
-                return Err(format!(
-                    "timed out waiting for {} after {WAIT_FOR_FILE_TIMEOUT_MS}ms",
-                    target.display()
-                ));
-            }
-            waiter.wait().await;
-        }
+        self.wait_for_first_output(&handle, &target).await?;
 
         self.wait_for_progressive_buffer(&handle, state).await;
 
@@ -942,13 +980,49 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             });
             if let Some(controller) = controller {
                 let mut controller = controller.lock().await;
-                controller.keys = self.pause_keys;
+                controller.keys = self.pause_keys.get();
+                controller.timed = true;
                 controller.next_tick = Instant::now() + super::throttler::THROTTLE_INTERVAL;
             }
         }
         self.start_segment_cleaner(state, &handle);
         // 10. Return the handle.
         Ok(handle)
+    }
+
+    /// `start_ffmpeg`'s wait for `target` (its first segment, or the
+    /// progressive output): returns once it exists or the process has exited,
+    /// and fails when the job is killed meanwhile or the wait outlasts
+    /// [`WAIT_FOR_FILE_TIMEOUT_MS`], which kills it.
+    async fn wait_for_first_output(
+        &self,
+        handle: &TranscodingJobHandle,
+        target: &Path,
+    ) -> Result<(), String> {
+        let waiter = FsWaiter::new(target);
+        let deadline = Instant::now() + Duration::from_millis(WAIT_FOR_FILE_TIMEOUT_MS);
+        loop {
+            let exited = self.with_running(handle, |r| r.child.has_exited());
+            if target.exists() || exited == Some(true) {
+                return Ok(());
+            }
+            // The job was killed while it started (a stop report, a device's
+            // jobs killed): nothing will ever write the target.
+            let Some(false) = exited else {
+                return Err(format!(
+                    "transcode job was stopped before {} appeared",
+                    target.display()
+                ));
+            };
+            if Instant::now() >= deadline {
+                self.kill_and_remove(handle, true, false).await;
+                return Err(format!(
+                    "timed out waiting for {} after {WAIT_FOR_FILE_TIMEOUT_MS}ms",
+                    target.display()
+                ));
+            }
+            waiter.wait().await;
+        }
     }
 
     fn start_segment_cleaner(&self, state: &EncodingJobInfo, handle: &TranscodingJobHandle) {
@@ -972,13 +1046,13 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                     std::sync::Arc::clone(&running.child),
                     std::sync::Arc::clone(config),
                     running.playlist_path.clone(),
-                    running.segment_length_secs,
                     std::sync::Arc::new(move || {
                         progress
                             .lock()
                             .expect("progress lock poisoned")
                             .download_position_ticks
                     }),
+                    std::sync::Arc::clone(&running.served_segments),
                 ));
             }
         }
@@ -1979,6 +2053,7 @@ mod start_ffmpeg_tests {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 6,
             wait_for_path: wait_for.map(Path::to_path_buf),
             segment_container: Some("ts".to_owned()),
@@ -2390,6 +2465,103 @@ mod start_ffmpeg_tests {
         let killed = m.reap_idle_jobs().await;
         assert_eq!(killed.len(), 1);
         assert_eq!(m.active_job_count(), 0, "idle reaper removed the job");
+    }
+
+    /// Drives `start` until its job is registered with a running child, i.e.
+    /// it has reached the wait for its first output.
+    async fn reach_startup_wait<F: std::future::Future + Unpin>(
+        m: &TranscodeManagerImpl<NoopSessionReporter>,
+        start: &mut F,
+    ) where
+        F::Output: std::fmt::Debug,
+    {
+        for _ in 0..200 {
+            tokio::select! {
+                result = &mut *start => panic!("start_ffmpeg ended early: {result:?}"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+            }
+            if m.jobs.lock().unwrap().iter().any(|j| j.running.is_some()) {
+                return;
+            }
+        }
+        panic!("start_ffmpeg never reached its startup wait");
+    }
+
+    /// Ages every registered job past its idle window (`ping_timeout_ms = -1`
+    /// is exceeded by any elapsed time).
+    fn expire_idle_windows(m: &TranscodeManagerImpl<NoopSessionReporter>) {
+        for job in m.jobs.lock().unwrap().iter_mut() {
+            job.ping_timeout_ms = -1;
+        }
+    }
+
+    /// A first segment slower than the ping timeout (a cold 4K software encode,
+    /// a slow tuner) must not get its own job reaped while `start_ffmpeg`
+    /// waits for it: upstream's `OnTranscodeBeginning` starts the job with
+    /// `ActiveRequestCount = 1`. Once the job is handed back with no consumer,
+    /// the idle countdown runs again.
+    #[tokio::test]
+    async fn a_startup_slower_than_the_ping_timeout_is_not_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        // Writes nothing and keeps running: the first output is slow to appear.
+        let fake = FakeSegmentTranscoder::new(FakeScript::default());
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let mut start = Box::pin(m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![])));
+        reach_startup_wait(&m, &mut start).await;
+
+        expire_idle_windows(&m);
+        assert!(
+            m.reap_idle_jobs().await.is_empty(),
+            "the reaper killed a job during its own startup wait"
+        );
+
+        std::fs::write(&playlist, b"#EXTM3U\n").unwrap();
+        start.await.expect("the first output appeared");
+        expire_idle_windows(&m);
+        assert_eq!(m.reap_idle_jobs().await.len(), 1);
+    }
+
+    /// A client that disconnects during the startup wait drops `start_ffmpeg`;
+    /// its job must still be reaped, or ffmpeg would run with no consumer
+    /// forever (the cast-disconnect leak the reaper exists for).
+    #[tokio::test]
+    async fn a_cancelled_startup_is_still_reaped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript::default());
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let mut start = Box::pin(m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![])));
+        reach_startup_wait(&m, &mut start).await;
+
+        drop(start);
+        expire_idle_windows(&m);
+        assert_eq!(m.reap_idle_jobs().await.len(), 1);
+        assert_eq!(m.active_job_count(), 0);
+    }
+
+    /// A job killed while `start_ffmpeg` waits for its first output (a stop
+    /// report, a device's jobs killed) ends the wait at once, instead of
+    /// polling a job that no longer exists until the 180 s deadline.
+    #[tokio::test]
+    async fn a_job_killed_during_startup_ends_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let playlist = tmp.path().join("s").join("out.m3u8");
+        let fake = FakeSegmentTranscoder::new(FakeScript::default());
+        let m = manager();
+        let st = state(&playlist, Some(&playlist));
+        let mut start = Box::pin(m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, vec![])));
+        reach_startup_wait(&m, &mut start).await;
+
+        let handle = m.jobs.lock().unwrap()[0].handle.clone();
+        m.kill_and_remove(&handle, true, false).await;
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), start)
+            .await
+            .expect("the startup wait ended with its job")
+            .expect_err("a killed job is not a started transcode");
+        assert!(error.contains("stopped"), "{error}");
     }
 
     #[tokio::test]
@@ -2837,6 +3009,7 @@ pub(super) mod throttle_tests {
             transcoding_type: TranscodingJobType::Hls,
             supported_video_codecs: Vec::new(),
             supported_audio_codecs: Vec::new(),
+            supported_subtitle_codecs: Vec::new(),
             segment_length_secs: 6,
             wait_for_path: Some(path.to_path_buf()),
             segment_container: Some("ts".to_owned()),
@@ -2852,12 +3025,35 @@ pub(super) mod throttle_tests {
         Arc<ChildState>,
         TranscodingJobHandle,
     ) {
+        fixture_of(TranscodeManagerImpl::new(NoopSessionReporter).with_pause_keys(keys)).await
+    }
+    /// A started job on `manager`, whatever its pause-key state.
+    async fn fixture_of(
+        manager: TranscodeManagerImpl<NoopSessionReporter>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<TranscodeManagerImpl<NoopSessionReporter>>,
+        Arc<ChildState>,
+        TranscodingJobHandle,
+    ) {
+        fixture_job(manager, true).await
+    }
+    /// As [`fixture_of`], for a video (throttle-eligible) or audio-only job.
+    async fn fixture_job(
+        manager: TranscodeManagerImpl<NoopSessionReporter>,
+        is_input_video: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<TranscodeManagerImpl<NoopSessionReporter>>,
+        Arc<ChildState>,
+        TranscodingJobHandle,
+    ) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("out.m3u8");
-        let manager =
-            Arc::new(TranscodeManagerImpl::new(NoopSessionReporter).with_pause_keys(keys));
+        let manager = Arc::new(manager);
         let child = Arc::new(ChildState::default());
-        let state = state(&path);
+        let mut state = state(&path);
+        state.is_input_video = is_input_video;
         let handle = manager
             .start_ffmpeg(
                 &ControlledTranscoder(Arc::clone(&child)),
@@ -2907,6 +3103,89 @@ pub(super) mod throttle_tests {
             throttle_delay_seconds: delay,
             ..EncodingOptions::default()
         }
+    }
+
+    /// Drives one due tick of a job that is eligible, fully downloaded and over
+    /// its throttle delay, so whether a pause key is written depends only on the
+    /// keys the manager knows by then.
+    async fn tick_over_the_delay(
+        manager: &TranscodeManagerImpl<NoopSessionReporter>,
+        child: &ChildState,
+        handle: &TranscodingJobHandle,
+    ) {
+        encoded(child, 200);
+        progress(manager, handle)
+            .lock()
+            .unwrap()
+            .download_position_ticks = Some(6 * TICKS_PER_SECOND);
+        due(manager, handle).await;
+        manager
+            .update_transcoding_jobs_with_options(Some(&options(60)))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn keys_probed_after_the_job_started_apply_on_a_later_tick() {
+        // The startup probe runs in the background, so a job can start first.
+        let manager = TranscodeManagerImpl::new(NoopSessionReporter);
+        let slot = manager.pause_key_slot();
+        let (_directory, manager, child, handle) = fixture_of(manager).await;
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(
+            child.events.lock().unwrap().is_empty(),
+            "no key is known yet, so nothing is written"
+        );
+        slot.set(Some(PauseKeys::Patched));
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert_eq!(*child.events.lock().unwrap(), vec![b"p".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_found_no_pause_key_leaves_the_job_unthrottled() {
+        let manager = TranscodeManagerImpl::new(NoopSessionReporter);
+        let slot = manager.pause_key_slot();
+        let (_directory, manager, child, handle) = fixture_of(manager).await;
+        slot.set(None);
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(child.events.lock().unwrap().is_empty());
+        slot.set(Some(PauseKeys::Patched));
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(
+            child.events.lock().unwrap().is_empty(),
+            "a published \"no keys\" does not turn into keys later"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_job_that_was_never_eligible_does_not_adopt_probed_keys() {
+        // An audio-only job gets no throttle timer, so published keys never reach it.
+        let manager = TranscodeManagerImpl::new(NoopSessionReporter);
+        let slot = manager.pause_key_slot();
+        let (_directory, manager, child, handle) = fixture_job(manager, false).await;
+        slot.set(Some(PauseKeys::Patched));
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(child.events.lock().unwrap().is_empty());
+        // The same keys fixed up front behave the same way.
+        let (_directory, manager, child, handle) = fixture_job(
+            TranscodeManagerImpl::new(NoopSessionReporter)
+                .with_pause_keys(Some(PauseKeys::Patched)),
+            false,
+        )
+        .await;
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(child.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_first_probe_result_stands() {
+        let manager = TranscodeManagerImpl::new(NoopSessionReporter).with_pause_keys(None);
+        manager.pause_key_slot().set(Some(PauseKeys::Patched));
+        let (_directory, manager, child, handle) = fixture_of(manager).await;
+        tick_over_the_delay(&manager, &child, &handle).await;
+        assert!(
+            child.events.lock().unwrap().is_empty(),
+            "keys fixed by the composition root are not overwritten by a later probe"
+        );
     }
 
     #[tokio::test]
@@ -3095,6 +3374,66 @@ pub(super) mod throttle_tests {
             *child.events.lock().unwrap(),
             vec![b"p".to_vec(), b"u".to_vec(), b"p".to_vec(), b"u".to_vec()]
         );
+    }
+
+    /// A settings file the throttle cannot read is reported once at `warn`,
+    /// then at `debug` while it stays broken. The throttle reads it on every
+    /// due timer of every running job and carries on with the defaults, so an
+    /// `error` per tick would flood the log (LOGGING.md §1).
+    #[tokio::test]
+    async fn an_unreadable_settings_file_is_warned_about_once_not_every_tick() {
+        use crate::configuration::reader::tests::CapturedLogs;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("out.m3u8");
+        let config = Arc::new(LiveOptions::new(options(60)));
+        config.failed.store(true, Ordering::SeqCst);
+        let manager = Arc::new(
+            TranscodeManagerImpl::new(NoopSessionReporter)
+                .with_pause_keys(Some(PauseKeys::Patched))
+                .with_encoding_configuration(config.clone()),
+        );
+        let child = Arc::new(ChildState::default());
+        let state = state(&path);
+        let handle = manager
+            .start_ffmpeg(
+                &ControlledTranscoder(Arc::clone(&child)),
+                StartFfMpegRequest {
+                    program: "controlled",
+                    state: &state,
+                    output_path: &path,
+                    arguments: Vec::new(),
+                    log_dir: directory.path().join("logs"),
+                    working_dir: None,
+                    env: Vec::new(),
+                    hardware_acceleration_type: HardwareAccelerationType::none,
+                },
+            )
+            .await
+            .unwrap();
+
+        let logs = CapturedLogs::default();
+        let guard = logs.install();
+        for _ in 0..3 {
+            due(&manager, &handle).await;
+            manager.update_transcoding_jobs().await;
+        }
+        drop(guard);
+
+        assert_eq!(config.reads.load(Ordering::SeqCst), 3);
+        assert!(
+            logs.lines_at("ERROR").is_empty(),
+            "{:#?}",
+            logs.lines_at("ERROR")
+        );
+        let warnings = logs.lines_at("WARN");
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("transcode throttle"), "{warnings:#?}");
+        let repeats = logs
+            .lines_at("DEBUG")
+            .into_iter()
+            .filter(|line| line.contains("cannot read the encoding configuration"))
+            .count();
+        assert_eq!(repeats, 2);
     }
 
     #[tokio::test]

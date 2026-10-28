@@ -46,6 +46,15 @@ struct Fixture {
 impl Fixture {
     /// A library of `kind` (none: untyped) holding `files`.
     async fn new(files: &[&str], kind: Option<CollectionTypeOptions>) -> Self {
+        Self::with_options(files, kind, LibraryOptions::default()).await
+    }
+
+    /// [`Fixture::new`] with the library's `options` (its path is added).
+    async fn with_options(
+        files: &[&str],
+        kind: Option<CollectionTypeOptions>,
+        options: LibraryOptions,
+    ) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let media = tmp.path().join("media");
         std::fs::create_dir_all(&media).unwrap();
@@ -66,7 +75,7 @@ impl Fixture {
                 path_infos: vec![MediaPathInfo {
                     path: media.to_string_lossy().into_owned(),
                 }],
-                ..LibraryOptions::default()
+                ..options
             },
         )
         .await
@@ -169,6 +178,45 @@ impl Fixture {
         self.store.save_items(&[row.clone()]).await.unwrap();
         row.id
     }
+
+    /// Gives the version at `relative` the shape Ferrofin v1.0.0 left: the
+    /// scanned row standalone (no owner, no pointer, its own key) and a
+    /// 10.11 `Video` row at the same path that `owner` owns. Returns
+    /// (standalone id, stale video id).
+    async fn split_off(&self, relative: &str, owner: &str) -> (String, String) {
+        let standalone = self
+            .restore_as(relative, |row| {
+                row.owner_id = None;
+                row.primary_version_id = None;
+                row.presentation_unique_key =
+                    Some(Uuid::parse_str(&row.id).unwrap().as_simple().to_string());
+            })
+            .await;
+        let mut stale = self.row(relative).await;
+        stale.id = guid_to_db(self.id(BaseItemKind::Video, relative));
+        stored_type_name(BaseItemKind::Video)
+            .unwrap()
+            .clone_into(&mut stale.type_);
+        stale.owner_id = Some(owner.to_owned());
+        stale.parent_id = None;
+        stale.top_parent_id = None;
+        stale.presentation_unique_key =
+            Some(Uuid::parse_str(&stale.id).unwrap().as_simple().to_string());
+        self.store.save_items(&[stale.clone()]).await.unwrap();
+        (standalone, stale.id)
+    }
+}
+
+/// Empties `primary`'s `LocalAlternateVersions`, as Ferrofin v1.0.0 left it.
+async fn unlist_versions(db: &Database, primary: &str) {
+    sqlx::query(
+        r#"UPDATE "BaseItems" SET "Data" = json_remove("Data", '$.LocalAlternateVersions')
+           WHERE "Id" = ?1"#,
+    )
+    .bind(primary)
+    .execute(db.writer())
+    .await
+    .unwrap();
 }
 
 fn touch(root: &std::path::Path, relative: &str) {
@@ -762,6 +810,140 @@ async fn an_adopted_group_repaired_at_boot_scans_quietly() {
     );
 }
 
+/// The shape Ferrofin v1.0.0 leaves of an adopted Jellyfin 10.11 group: its
+/// scan stored the alternate again as a standalone `Movie` under the `Movie`
+/// id (no owner, no pointer, hanging under the library) beside the 10.11
+/// `Video` row the primary still owns, and emptied the primary's
+/// `LocalAlternateVersions`. Each row holds one user's history. The boot
+/// repairs (`run_all`, then `rehome_local_versions`, as the server runs them)
+/// reunite them before any scan: the `Movie` row is the primary's local
+/// version again, owned, pointing at it and linked, with both histories;
+/// the `Video` row is gone; the primary lists the version; the first scan
+/// writes nothing.
+#[tokio::test]
+async fn a_version_ferrofin_1_0_split_off_is_reunited_at_boot() {
+    const PRIMARY: &str = "Twin Horizon/Twin Horizon - 1080p.mkv";
+    const ALTERNATE: &str = "Twin Horizon/Twin Horizon - 720p.mkv";
+    let f = Fixture::movies(&[PRIMARY, ALTERNATE]).await;
+    f.scanner.scan_all().await.unwrap();
+    let primary = f.row(PRIMARY).await;
+    let planned = f.row(ALTERNATE).await;
+    sqlx::query(r#"DELETE FROM "LinkedChildren""#)
+        .execute(f.db.writer())
+        .await
+        .unwrap();
+    let (split, stale) = f.split_off(ALTERNATE, &primary.id).await;
+    unlist_versions(&f.db, &primary.id).await;
+    assert_eq!(f.rows_at(ALTERNATE).await, 2);
+    let (watched_split, watched_stale) = (seed_user(&f.db).await, seed_user(&f.db).await);
+    play(&f.db, &split, watched_split).await;
+    play(&f.db, &stale, watched_stale).await;
+
+    ferrofin_core::adoption_repairs::run_all(
+        &f.db,
+        &ferrofin_core::virtual_paths::VirtualPathExpander::identity(),
+    )
+    .await
+    .unwrap();
+    ferrofin_core::adoption_repairs::rehome_local_versions(
+        &f.db,
+        &IdDerivation::LegacyLowercase,
+        None,
+        None,
+        f.store.as_ref(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(f.rows_at(ALTERNATE).await, 1);
+    let alternate = f.row(ALTERNATE).await;
+    assert_eq!(alternate.id, planned.id);
+    assert_eq!(kind_of(&alternate), "Movie");
+    assert_eq!(alternate.owner_id.as_ref(), Some(&primary.id));
+    assert_eq!(alternate.primary_version_id.as_ref(), Some(&primary.id));
+    assert_eq!(f.links(&primary.id).await, vec![(alternate.id.clone(), 2)]);
+    assert_eq!(
+        data_list(&f.row(PRIMARY).await, "LocalAlternateVersions"),
+        Some(vec![f.path(ALTERNATE)])
+    );
+    assert!(f.played(&alternate.id, watched_split).await);
+    assert!(f.played(&alternate.id, watched_stale).await);
+
+    count_item_writes(&f.db).await;
+    let first = f.scanner.scan_all().await.unwrap();
+    assert_eq!((first.created, first.updated), (0, 0), "{first:?}");
+    assert_eq!(item_writes(&f.db).await, 0);
+}
+
+/// Two versions of one primary split off by Ferrofin v1.0.0, a third it
+/// still lists: both are reunited, the listed one stays listed first, and
+/// running the repair again changes nothing.
+#[tokio::test]
+async fn every_split_version_of_a_primary_is_reunited() {
+    const PRIMARY: &str = "Night Arc/Night Arc - 2160p.mkv";
+    const LISTED: &str = "Night Arc/Night Arc - 1080p.mkv";
+    const SPLIT: [&str; 2] = [
+        "Night Arc/Night Arc - 480p.mkv",
+        "Night Arc/Night Arc - 720p.mkv",
+    ];
+    let f = Fixture::movies(&[PRIMARY, LISTED, SPLIT[0], SPLIT[1]]).await;
+    f.scanner.scan_all().await.unwrap();
+    let primary = f.row(PRIMARY).await;
+    let mut kept = Vec::new();
+    for relative in SPLIT {
+        kept.push(f.split_off(relative, &primary.id).await.0);
+    }
+    sqlx::query(
+        r#"UPDATE "BaseItems"
+           SET "Data" = json_set("Data", '$.LocalAlternateVersions', json_array(?2))
+           WHERE "Id" = ?1"#,
+    )
+    .bind(&primary.id)
+    .bind(f.path(LISTED))
+    .execute(f.db.writer())
+    .await
+    .unwrap();
+
+    let reunited = ferrofin_core::adoption_repairs::reunite_split_versions(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(reunited, 2);
+    for (relative, id) in SPLIT.iter().zip(&kept) {
+        assert_eq!(f.rows_at(relative).await, 1);
+        assert_eq!(&f.row(relative).await.id, id);
+    }
+    assert_eq!(
+        data_list(&f.row(PRIMARY).await, "LocalAlternateVersions"),
+        Some(vec![f.path(LISTED), f.path(SPLIT[0]), f.path(SPLIT[1])])
+    );
+    let again = ferrofin_core::adoption_repairs::reunite_split_versions(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(again, 0);
+}
+
+/// A stale `Video` owned by a movie in another folder is not a version that
+/// movie lost: the repair leaves both rows to the path de-duplication.
+#[tokio::test]
+async fn a_video_owned_from_another_folder_is_not_reunited() {
+    const OWNER: &str = "Long Coast/Long Coast.mkv";
+    const OTHER: &str = "Short Coast/Short Coast.mkv";
+    let f = Fixture::movies(&[OWNER, OTHER]).await;
+    f.scanner.scan_all().await.unwrap();
+    let owner = f.row(OWNER).await;
+    f.split_off(OTHER, &owner.id).await;
+
+    let reunited = ferrofin_core::adoption_repairs::reunite_split_versions(&f.db)
+        .await
+        .unwrap();
+    assert_eq!(reunited, 0);
+    assert_eq!(f.rows_at(OTHER).await, 2);
+    assert_eq!(
+        data_list(&f.row(OWNER).await, "LocalAlternateVersions"),
+        data_list(&owner, "LocalAlternateVersions")
+    );
+}
+
 /// The synthetic adoption fixture's Jellyfin 10.11.8 group: two version
 /// files, the alternate a `Video` under its own id — its own name, the
 /// rating the primary had when 10.11 last copied it (`G`), no pointer, no
@@ -1162,12 +1344,22 @@ async fn a_scoped_scan_of_a_new_root_part_regroups_its_stack() {
 /// A refresh of one local version replacing all its metadata leaves the
 /// version's primary as it was: a version's refresh never reaches the item
 /// it belongs to, which the scan only saves with what the walk resolved.
+/// The library saves no metadata, so "Replace all metadata" still reads the
+/// NFO (`isSavingMetadata`, `MetadataService.cs:803`).
 #[tokio::test]
 async fn replacing_one_versions_metadata_leaves_its_primarys() {
     use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
     const PRIMARY: &str = "Ronin (1998)/Ronin (1998) - 2160p.mkv";
     const VERSION: &str = "Ronin (1998)/Ronin (1998) - 1080p.mkv";
-    let f = Fixture::movies(&[PRIMARY, VERSION]).await;
+    let f = Fixture::with_options(
+        &[PRIMARY, VERSION],
+        Some(CollectionTypeOptions::movies),
+        LibraryOptions {
+            metadata_savers: Some(Vec::new()),
+            ..LibraryOptions::default()
+        },
+    )
+    .await;
     std::fs::write(
         f.path("Ronin (1998)/movie.nfo"),
         "<movie><title>Ronin</title><plot>From the NFO.</plot></movie>",
@@ -1968,6 +2160,32 @@ async fn merge_onto(f: &Fixture, relative: &str, onto: &str) {
     .execute(f.db.writer())
     .await
     .unwrap();
+}
+
+/// A version merged by hand (unowned, `PrimaryVersionId` at a primary of the
+/// same library) is weighed like any child, as Jellyfin 12.1's
+/// `Folder.GetChildrenForValidation` (`IncludeAlternateVersions = true`)
+/// does: kept while its file exists, and once it is gone pruned with its
+/// merge row, the primary untouched.
+#[tokio::test]
+async fn a_hand_merged_version_whose_file_is_gone_is_pruned() {
+    const ORIGINAL: &str = "A (2001)/A (2001).mkv";
+    const SECOND: &str = "A Second (2001)/A Second (2001).mkv";
+    let f = Fixture::movies(&[ORIGINAL, SECOND]).await;
+    f.scanner.scan_all().await.unwrap();
+    merge_onto(&f, SECOND, ORIGINAL).await;
+    let (primary, version) = (f.row(ORIGINAL).await.id, f.row(SECOND).await.id);
+
+    f.scanner.scan_all().await.unwrap();
+    assert_eq!(f.rows_at(SECOND).await, 1, "kept while its file exists");
+    assert_eq!(f.links(&primary).await, vec![(version.clone(), 3)]);
+
+    std::fs::remove_dir_all(f.media.join("A Second (2001)")).unwrap();
+    let report = f.scanner.scan_all().await.unwrap();
+    assert_eq!(report.removed, 1, "{report:?}");
+    assert_eq!(f.rows_at(SECOND).await, 0, "the version is pruned");
+    assert!(f.links(&primary).await.is_empty(), "its merge row goes too");
+    assert_eq!(f.rows_at(ORIGINAL).await, 1, "the primary stays");
 }
 
 /// Stores the row at `relative` as no version at all: unowned, pointing at

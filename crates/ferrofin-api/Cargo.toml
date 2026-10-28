@@ -36,7 +36,6 @@ ferrofin-util.workspace = true
 ferrofin-db.workspace = true
 axum = { workspace = true, features = ["ws", "macros"] }
 serde_path_to_error.workspace = true
-axum-extra.workspace = true
 chrono.workspace = true
 # ItemsController converts offsetless premiere dates with local standard-time
 # rules for skipped/repeated wall times; reuse the workspace-locked libc.
@@ -58,21 +57,22 @@ serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 utoipa.workspace = true
 uuid.workspace = true
+url.workspace = true
 tracing.workspace = true
 # Read the OTel trace_id off the request span for log↔trace correlation. No
 # exporter here — that lives in ferrofin-server; these are API-only helpers.
 opentelemetry.workspace = true
 tracing-opentelemetry.workspace = true
-zip = { version = "2", default-features = false, features = ["deflate", "time"] }
+zip = { workspace = true, features = ["time"] }   # backup archives; `time` stamps entries with now
 
 [dev-dependencies]
 # Self dev-dependency so unit + integration tests build with the `test-util`
 # fakes (the composition-root deps are unavailable at this layer by design).
-ferrofin-api = { path = ".", features = ["test-util"] }
+ferrofin-api = { workspace = true, features = ["test-util"] }
 async-trait.workspace = true
 serde_json.workspace = true
 serde.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # The /socket tests drive a real WebSocket against a real listener — the
 # push path cannot be exercised through `tower::oneshot`.
 tokio-tungstenite.workspace = true

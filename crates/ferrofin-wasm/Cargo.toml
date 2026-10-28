@@ -19,6 +19,7 @@ ferrofin-model.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true }
 serde_json.workspace = true
+regex.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 wasmtime.workspace = true

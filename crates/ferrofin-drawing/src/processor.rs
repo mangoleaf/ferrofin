@@ -14,11 +14,11 @@
 //!   [`ImageProcessor::with_encoding_limit`], matching the C# constructor.
 //! - The overloaded `GetImageDimensions` / `GetImageCacheTag` methods collapse
 //!   onto the id-plus-[`ItemImageInfo`] forms the trait declares.
-//! - The `Photo` auto-orientation branch is **deferred**: the `Photo` entity is
-//!   not wired into [`ImageProcessingOptions`] here (it carries an
-//!   [`item_id`](ImageProcessingOptions::item_id), not a domain item), so
-//!   `auto_orient` is always `false`. The gate is preserved structurally so it
-//!   can be re-enabled once the entity lands.
+//! - The `Photo` auto-orientation branch is decided by the caller, which read
+//!   the item: [`ImageProcessingOptions`] carries an
+//!   [`item_id`](ImageProcessingOptions::item_id), not a domain item, so the
+//!   `autoOrient` the C# derives from `item is Photo` arrives as
+//!   [`auto_orient`](ImageProcessingOptions::auto_orient).
 //! - `MimeTypes.GetMimeType` is reused from [`ferrofin_model::net::mime_types`];
 //!   `GetMD5().ToString("N")` is reused from [`ferrofin_common::extensions::get_md5`]
 //!   plus [`Uuid::simple`] (32-char lowercase hex, identical to .NET `"N"`).
@@ -315,6 +315,13 @@ impl<F: FileMeta> ImageProcessor<F> {
             filename.push_str(foreground_layer);
         }
 
+        // Ferrofin-local, not in upstream's key: earlier Ferrofin builds cached
+        // photos un-oriented under the same key, so an oriented encode needs
+        // its own. Only auto-oriented photos are re-encoded.
+        if options.auto_orient {
+            filename.push_str(",autoorient");
+        }
+
         filename.push_str(",v=");
         filename.push(self.cache_version);
 
@@ -395,6 +402,22 @@ fn extension_of(path: &str) -> String {
         Some(idx) => last_segment[idx..].to_ascii_lowercase(),
         None => String::new(),
     }
+}
+
+/// Whether an encode failure is logged at `debug` rather than `warn`.
+///
+/// `InvalidInput` is the requested size or the file's content as the encoder
+/// sees it: a size that rounds an axis to 0, a source the decoder rejects
+/// (corrupt, truncated, a read error mid-decode, over the `image` crate's
+/// allocation limit), a JPEG output past 65535 px, or a WebP output past
+/// 16383 px. A failed encode writes no
+/// cache file, so it recurs on every request for that image and its volume
+/// grows with items × requests; LOGGING.md §1 keeps that at `debug`.
+/// Everything else (cache-dir I/O, an unreadable or removed source, codec or
+/// encoder faults) is a degradation an operator can act on: `warn`, as a
+/// fallback was taken.
+fn encode_failure_logs_at_debug(err: &ServiceError) -> bool {
+    matches!(err, ServiceError::InvalidInput(_))
 }
 
 #[async_trait]
@@ -508,7 +531,7 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
 
     /// Port of `ProcessImage`: the full on-the-fly pipeline — `.tbn` passthrough,
     /// `SupportsImageEncoding` gate, missing-file / GIF passthrough, transparency
-    /// detection, the (deferred) `Photo` auto-orient branch, the
+    /// detection, the `Photo` auto-orient branch (decided by the caller), the
     /// `HasDefaultOptions` short-circuit, output-format selection, cache-key
     /// derivation, cache-hit skip, encode, `resultPath == original` short-circuit,
     /// and error-to-original fallback.
@@ -556,9 +579,8 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
         let requires_transparency =
             TRANSPARENT_IMAGE_TYPES.contains(&extension_of(&original_image_path).as_str());
 
-        // The Photo auto-orientation branch is deferred: no Photo entity is wired
-        // into the options, so auto_orient stays false. The gate is preserved.
-        let auto_orient = false;
+        // `autoOrient` for a Photo; the caller, which read the item, sets it.
+        let auto_orient = options.auto_orient;
 
         if options.has_default_options(&original_image_path, original_image_size)
             && (!auto_orient || !options.requires_auto_orientation)
@@ -598,12 +620,31 @@ impl<F: FileMeta + 'static> ImageProcessorTrait for ImageProcessor<F> {
             Ok(Some(processed)) => Ok(processed),
             // `resultPath == originalPath` short-circuit (`Ok(None)`) and the C#
             // catch-all that returns the original on any encode error (`Err`)
-            // both fall through to the same original-file passthrough.
-            Ok(None) | Err(_) => Ok(ProcessedImage {
-                path: original_image_path.clone(),
-                mime_type: Some(get_mime_type(&original_image_path).to_owned()),
-                date_modified,
-            }),
+            // both fall through to the same original-file passthrough. Upstream
+            // logs the catch at Error; see `encode_failure_logs_at_debug` for
+            // why the level depends on the failure here.
+            result => {
+                if let Err(e) = result {
+                    if encode_failure_logs_at_debug(&e) {
+                        tracing::debug!(
+                            error = %e,
+                            path = %original_image_path,
+                            "image encode rejected; serving the original"
+                        );
+                    } else {
+                        tracing::warn!(
+                            error = %e,
+                            path = %original_image_path,
+                            "error encoding image; serving the original"
+                        );
+                    }
+                }
+                Ok(ProcessedImage {
+                    path: original_image_path.clone(),
+                    mime_type: Some(get_mime_type(&original_image_path).to_owned()),
+                    date_modified,
+                })
+            }
         }
     }
 
@@ -686,6 +727,7 @@ mod tests {
     //! option and carries `v=3`; default options pass the original through; a
     //! resize produces then hits the cache.
     use super::*;
+    use crate::error::DrawingError;
     use crate::image_encoder::ImageCrateEncoder;
     use chrono::TimeZone;
     use image::{DynamicImage, Rgba, RgbaImage};
@@ -1014,6 +1056,95 @@ mod tests {
         assert_eq!(processed.path, input);
         // No encode happened.
         assert_eq!(encoder.calls.load(Ordering::SeqCst), 0);
+
+        // `autoOrient` (a photo) defeats the passthrough, as upstream, and the
+        // oriented encode is cached under its own key.
+        let oriented = ImageProcessingOptions {
+            auto_orient: true,
+            ..options.clone()
+        };
+        let processed = proc.process_image(&oriented).await.expect("process");
+        assert_ne!(processed.path, input);
+        assert_eq!(encoder.calls.load(Ordering::SeqCst), 1);
+        let dt = Utc::now();
+        assert_ne!(
+            proc.cache_file_path(&input, &options, 95, dt, ImageFormat::Jpg)
+                .expect("key"),
+            proc.cache_file_path(&input, &oriented, 95, dt, ImageFormat::Jpg)
+                .expect("key")
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::bad_size_or_source(ServiceError::invalid_input("cannot resize to 0x1"), true)]
+    #[case::cache_write(DrawingError::io("mkdir", std::io::Error::other("full")).into(), false)]
+    #[case::encoder_backend(ServiceError::backend("encoder panicked"), false)]
+    #[case::vanished_source(ServiceError::not_found("image file not found: /x.png"), false)]
+    fn encode_failure_level_policy(#[case] err: ServiceError, #[case] at_debug: bool) {
+        assert_eq!(encode_failure_logs_at_debug(&err), at_debug);
+    }
+
+    #[tokio::test]
+    async fn cache_write_failure_serves_original() {
+        // The warn arm: a file where the resized-images directory belongs makes
+        // the encoder's mkdir fail (ENOTDIR, even as root), and the C#
+        // catch-all serves the original.
+        let dir = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        std::fs::write(cache.path().join("resized-images"), b"").expect("blocker");
+        let input = fixture(&dir, "orig.png", 60, 40);
+        let proc = processor_with(
+            Arc::new(ImageCrateEncoder::new()),
+            &cache,
+            FakeFs::with(&[&input]),
+        );
+        let options = ImageProcessingOptions {
+            image: ItemImageInfo {
+                path: input.clone(),
+                width: 60,
+                height: 40,
+                ..Default::default()
+            },
+            max_width: Some(30),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let processed = proc.process_image(&options).await.expect("process");
+        assert_eq!(processed.path, input);
+
+        // The blocker was the only cause: without it the same request encodes.
+        std::fs::remove_file(cache.path().join("resized-images")).expect("unblock");
+        let processed = proc.process_image(&options).await.expect("process");
+        assert!(processed.path.contains("resized-images"));
+    }
+
+    #[tokio::test]
+    async fn zero_axis_resize_serves_original() {
+        // The encoder fails on a size that rounds one axis to 0 (Skia's empty
+        // surface), and the C# catch-all serves the original.
+        let dir = TempDir::new().expect("tempdir");
+        let cache = TempDir::new().expect("cache");
+        let input = fixture(&dir, "orig.png", 60, 40);
+        let proc = processor_with(
+            Arc::new(ImageCrateEncoder::new()),
+            &cache,
+            FakeFs::with(&[&input]),
+        );
+        let options = ImageProcessingOptions {
+            image: ItemImageInfo {
+                path: input.clone(),
+                width: 60,
+                height: 40,
+                ..Default::default()
+            },
+            width: Some(1),
+            height: Some(i32::MAX),
+            max_height: Some(1_000_000_000),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let processed = proc.process_image(&options).await.expect("process");
+        assert_eq!(processed.path, input);
     }
 
     #[tokio::test]

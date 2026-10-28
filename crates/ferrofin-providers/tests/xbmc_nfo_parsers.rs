@@ -13,11 +13,13 @@ use ferrofin_model::dto::DayOfWeek;
 use ferrofin_model::entities::{ImageType, SeriesStatus, Video3DFormat};
 
 use ferrofin_providers::container_types::{FileSystemMetadata, MetadataResult};
+use ferrofin_providers::xbmc::base_parser::FetchError;
 use ferrofin_providers::xbmc::base_parser::{DirectoryService, NoDirectoryService};
 use ferrofin_providers::xbmc::config::NfoConfiguration;
 use ferrofin_providers::xbmc::item::{NfoBaseItem, NfoItemKind};
 use ferrofin_providers::xbmc::{
-    StaticExternalIds, fetch_episode, fetch_movie, fetch_season, fetch_series, new_result,
+    StaticExternalIds, fetch_episode, fetch_movie, fetch_music, fetch_season, fetch_series,
+    new_result,
 };
 
 const TICKS_PER_SECOND: i64 = 10_000_000;
@@ -540,6 +542,41 @@ fn episode_fetch_multi_episode_success() {
     assert_eq!(item.production_year, Some(2004));
 }
 
+/// Port of v12.2 `Fetch_Valid_MultiEpisode_Unordered_Success` (PR 17805):
+/// the `<episodedetails>` blocks are stored in descending order (as Sonarr
+/// writes them), and the merged episode must still be in ascending order.
+#[test]
+fn episode_fetch_multi_episode_unordered_success() {
+    let external_ids = StaticExternalIds::new(["Imdb"]);
+    let mut result = new_result(NfoItemKind::Episode);
+    fetch_episode(
+        &mut result,
+        "Test Data/Rising-Reversed.nfo",
+        &read_fixture("Test Data/Rising-Reversed.nfo"),
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    let item = &result.item;
+
+    assert_eq!(item.name.as_deref(), Some("Rising (1) / Rising (2)"));
+    assert_eq!(item.index_number, Some(1));
+    assert_eq!(item.index_number_end, Some(2));
+    assert_eq!(item.parent_index_number, Some(1));
+    assert_eq!(
+        item.overview.as_deref(),
+        Some(
+            "A new Stargate team embarks on a dangerous mission to a distant galaxy, where they discover a mythical lost city -- and a deadly new enemy. / Sheppard tries to convince Weir to mount a rescue mission to free Colonel Sumner, Teyla, and the others captured by the Wraith."
+        )
+    );
+    assert_eq!(
+        item.premiere_date.map(|d| d.format("%Y-%m-%d").to_string()),
+        Some("2004-07-16".to_owned())
+    );
+    assert_eq!(item.production_year, Some(2004));
+}
+
 #[test]
 fn episode_fetch_multi_episode_with_missing_tags() {
     let external_ids = StaticExternalIds::new(["Imdb"]);
@@ -767,4 +804,174 @@ fn season_fetch_valid_success() {
         nini.image_url.as_deref(),
         Some("/config/metadata/People/O/Olivia Rodrigo/poster.jpg")
     );
+}
+
+// ---------------------------------------------------------------------------
+// GetPersonFromXmlNode `<type>` (not in the C# suites)
+// ---------------------------------------------------------------------------
+
+/// `XmlReaderExtensions.GetPersonFromXmlNode` reads `<type>` with
+/// `Enum.TryParse(text, true, out type)`: any member name in any case binds,
+/// and a value that does not parse leaves `default(PersonKind)`, `Unknown`,
+/// not the `Actor` a missing `<type>` keeps.
+#[test]
+fn person_type_parses_like_enum_try_parse() {
+    let nfo = r#"<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<movie>
+  <title>T</title>
+  <actor><name>Missing</name></actor>
+  <actor><name>Lower</name><type>lyricist</type></actor>
+  <actor><name>Comic</name><type>CoverArtist</type></actor>
+  <actor><name>Bogus</name><type>Chief Vibes Officer</type></actor>
+  <actor><name>Empty</name><type></type></actor>
+</movie>"#;
+    let mut result = new_result(NfoItemKind::Movie);
+    fetch_movie(
+        &mut result,
+        "inline.nfo",
+        nfo,
+        &NfoConfiguration::default(),
+        &StaticExternalIds::new(["Tmdb"]),
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    let kinds: Vec<(&str, PersonKind)> = result
+        .people
+        .as_ref()
+        .expect("people")
+        .iter()
+        .map(|person| (person.name.as_str(), person.type_))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("Missing", PersonKind::Actor),
+            ("Lower", PersonKind::Lyricist),
+            ("Comic", PersonKind::CoverArtist),
+            ("Bogus", PersonKind::Unknown),
+            ("Empty", PersonKind::Unknown),
+        ]
+    );
+}
+
+/// `MovieNfoParser`'s `Fetch` (the `SupportsUrlAfterClosingXmlTag` path)
+/// swallows `XmlException`, so one malformed spot keeps every element read
+/// before it: here a bare `&` in `<plot>` keeps the title and the pinned
+/// TMDb id, and neither the plot nor anything after it.
+#[test]
+fn a_malformed_movie_nfo_keeps_the_elements_before_the_error() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Movie);
+    fetch_movie(
+        &mut result,
+        "movie.nfo",
+        "<movie><title>Ronin</title><tmdbid>8195</tmdbid>\
+         <plot>Tom & Jerry</plot><year>1998</year></movie>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(result.item.name.as_deref(), Some("Ronin"));
+    assert_eq!(get_provider_id(&result.item, "Tmdb"), Some("8195"));
+    assert_eq!(result.item.overview, None, "the element with the error");
+    assert_eq!(result.item.production_year, None, "nothing after it");
+}
+
+/// `EpisodeNfoParser.Fetch` swallows `XmlException` too: an `&nbsp;` (not an
+/// XML entity) in a late `<actor>` keeps the fields before it, and the actor
+/// it sits in is not added.
+#[test]
+fn a_malformed_episode_nfo_keeps_the_elements_before_the_error() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Episode);
+    fetch_episode(
+        &mut result,
+        "episode.nfo",
+        "<episodedetails><title>Pilot</title><season>1</season><episode>2</episode>\
+         <actor><name>Ann&nbsp;Lee</name></actor></episodedetails>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(result.item.name.as_deref(), Some("Pilot"));
+    assert_eq!(result.item.index_number, Some(2));
+    assert!(result.people.unwrap_or_default().is_empty());
+}
+
+/// The plain `Fetch` (`SeasonNfoParser`, and the album/artist parsers) does not
+/// catch `XmlException`: it reaches the provider, whose result is not used,
+/// so a malformed season NFO is a failed fetch rather than an empty success.
+#[test]
+fn a_malformed_season_nfo_is_a_failed_fetch() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Season);
+    let fetched = fetch_season(
+        &mut result,
+        "season.nfo",
+        "<season><title>Season 1</title><plot>a & b</plot></season>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    );
+    assert!(fetched.is_err(), "{fetched:?}");
+}
+
+/// `SeriesNfoParser` shares the movie's swallowing path: the elements before a
+/// malformed spot stand.
+#[test]
+fn a_malformed_series_nfo_keeps_the_elements_before_the_error() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Series);
+    fetch_series(
+        &mut result,
+        "tvshow.nfo",
+        "<tvshow><title>Show</title><plot>a &nbsp; b</plot><year>2001</year></tvshow>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(result.item.name.as_deref(), Some("Show"));
+    assert_eq!(result.item.overview, None);
+    assert_eq!(result.item.production_year, None);
+}
+
+/// An `album.nfo`/`artist.nfo` reads through the plain `Fetch`, which does not
+/// recover from a malformed document.
+#[test]
+fn a_malformed_music_nfo_is_a_failed_fetch() {
+    let external_ids = StaticExternalIds::new(["MusicBrainzAlbum"]);
+    let mut result = new_result(NfoItemKind::MusicAlbum);
+    let fetched = fetch_music(
+        &mut result,
+        "album.nfo",
+        "<album><title>Kind of Blue</title><review>A & B</review></album>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    );
+    assert_eq!(fetched, Err(FetchError::MalformedXml));
+}
+
+/// With several `<episodedetails>` blocks, C# parses them all before merging,
+/// inside one `catch (XmlException)`: a malformed block ends the read before
+/// anything reaches the item.
+#[test]
+fn a_malformed_block_of_a_multi_episode_nfo_merges_nothing() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Episode);
+    fetch_episode(
+        &mut result,
+        "episode.nfo",
+        "<episodedetails><title>One</title><episode>1</episode></episodedetails>\
+         <episodedetails><title>Two & a half</title><episode>2</episode></episodedetails>",
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(result.item.name, None);
+    assert_eq!(result.item.index_number, None);
 }
