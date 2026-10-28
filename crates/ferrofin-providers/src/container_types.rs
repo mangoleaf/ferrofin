@@ -478,8 +478,12 @@ mod tests {
         assert!(result.people.is_none());
         assert!(!result.has_metadata);
         assert!(!result.queried_by_id);
-        assert!(result.remote_images.is_empty());
-        assert!(result.images.is_empty());
+        assert!(
+            result.remote_images.is_empty(),
+            "{:?}",
+            result.remote_images
+        );
+        assert!(result.images.is_empty(), "{:?}", result.images);
     }
 
     #[test]
@@ -691,7 +695,7 @@ mod tests {
     fn add_person_drops_empty_name() {
         let mut people = Vec::new();
         add_person(&mut people, PersonInfo::new("   "));
-        assert!(people.is_empty());
+        assert!(people.is_empty(), "{people:?}");
     }
 
     #[test]

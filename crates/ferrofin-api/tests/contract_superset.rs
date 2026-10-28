@@ -649,7 +649,8 @@ fn upstream_problems_name_the_row_with_a_missing_file_or_method() {
     )
     .expect("write");
 
-    assert!(upstream_problems(dir.path(), [("ok".to_string(), file, "GetItems")]).is_empty());
+    let found = upstream_problems(dir.path(), [("ok".to_string(), file, "GetItems")]);
+    assert!(found.is_empty(), "{found:?}");
     let problems = upstream_problems(
         dir.path(),
         [
@@ -698,7 +699,8 @@ fn refs_must_name_a_subsystem_row_with_a_known_key() {
     };
 
     let subsystems = [subsystem("query-translation"), subsystem("user-data")];
-    assert!(ref_problems(std::slice::from_ref(&op), &subsystems).is_empty());
+    let found = ref_problems(std::slice::from_ref(&op), &subsystems);
+    assert!(found.is_empty(), "{found:?}");
     let problems = ref_problems(
         std::slice::from_ref(&op),
         &[subsystem("query-translation"), subsystem("bogus")],

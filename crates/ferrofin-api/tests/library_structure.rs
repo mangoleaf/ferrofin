@@ -171,12 +171,10 @@ async fn add_virtual_folder_rejects_names_outside_the_upstream_regex() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
     }
-    assert!(
-        ferrofin_traits::library::VirtualFolderManager::get_virtual_folders(&*vf)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let virtual_folders = ferrofin_traits::library::VirtualFolderManager::get_virtual_folders(&*vf)
+        .await
+        .unwrap();
+    assert!(virtual_folders.is_empty(), "{virtual_folders:?}");
 }
 
 #[tokio::test]

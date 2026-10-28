@@ -420,7 +420,7 @@ async fn get_tasks_is_enabled_false_returns_none() {
     let (status, body) = send(tasks, true, "GET", "/ScheduledTasks?isEnabled=false").await;
     assert_eq!(status, StatusCode::OK);
     let result: Vec<TaskInfo> = serde_json::from_slice(&body).expect("task list");
-    assert!(result.is_empty());
+    assert!(result.is_empty(), "{result:?}");
 }
 
 #[tokio::test]

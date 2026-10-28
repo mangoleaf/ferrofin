@@ -897,7 +897,8 @@ fn a_malformed_episode_nfo_keeps_the_elements_before_the_error() {
     .expect("fetch succeeds");
     assert_eq!(result.item.name.as_deref(), Some("Pilot"));
     assert_eq!(result.item.index_number, Some(2));
-    assert!(result.people.unwrap_or_default().is_empty());
+    let people = result.people.unwrap_or_default();
+    assert!(people.is_empty(), "{people:?}");
 }
 
 /// The plain `Fetch` (`SeasonNfoParser`, and the album/artist parsers) does not

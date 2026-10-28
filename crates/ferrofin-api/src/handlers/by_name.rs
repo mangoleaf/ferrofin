@@ -729,7 +729,7 @@ mod tests {
         // `new DtoOptions { Fields = [] }.AddAdditionalDtoOptions(null, null, null, [])`
         // leaves images on, the type set complete and the limit unbounded.
         let o = additional_dto_options(None, None, None, None, None);
-        assert!(o.fields.is_empty());
+        assert!(o.fields.is_empty(), "{:?}", o.fields);
         assert!(o.enable_images);
         assert!(o.enable_user_data);
         assert_eq!(o.image_type_limit, i32::MAX);

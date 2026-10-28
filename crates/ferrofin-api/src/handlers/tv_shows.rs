@@ -995,7 +995,8 @@ mod episode_season_tests {
             names(season_episode_rows(&rows, &negative, true, false)),
             ["Beta", "Alpha"]
         );
-        assert!(season_episode_rows(&rows, &negative, false, true).is_empty());
+        let found = season_episode_rows(&rows, &negative, false, true);
+        assert!(found.is_empty(), "{found:?}");
     }
     #[test]
     fn virtual_location_uses_path_and_actual_channel_source_instead_of_the_saved_bit() {
@@ -1033,7 +1034,8 @@ mod episode_season_tests {
             names(season_episode_rows(&rows, &one, true, false)),
             ["Moved"]
         );
-        assert!(season_episode_rows(&rows, &one, false, true).is_empty());
+        let found = season_episode_rows(&rows, &one, false, true);
+        assert!(found.is_empty(), "{found:?}");
         let item = BaseItemEntity {
             parent_index_number: Some(3),
             data: Some("broken".to_owned()),

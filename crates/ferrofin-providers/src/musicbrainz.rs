@@ -1156,7 +1156,11 @@ mod tests {
         assert!(c.lookup_artist("{not-an-mbid}").await.is_none());
         assert!(c.artist_details("rel-1").await.is_none());
         assert!(c.first_release_of("").await.is_none());
-        assert!(c.release_group_releases("rg").await.is_empty());
+        let release_group_releases = c.release_group_releases("rg").await;
+        assert!(
+            release_group_releases.is_empty(),
+            "{release_group_releases:?}"
+        );
     }
 
     /// `MusicBrainzAlbumProvider.Populate` (`:268-320`) over a release and

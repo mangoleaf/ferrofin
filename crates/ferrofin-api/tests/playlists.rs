@@ -803,7 +803,7 @@ async fn get_playlist_returns_item_ids() {
     assert_eq!(status, StatusCode::OK);
     let dto: PlaylistDto = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(dto.item_ids, vec![ITEM_A, ITEM_B]);
-    assert!(dto.shares.is_empty());
+    assert!(dto.shares.is_empty(), "{:?}", dto.shares);
 }
 
 #[tokio::test]
@@ -1006,7 +1006,7 @@ async fn get_playlist_users_returns_empty_shares() {
     assert_eq!(status, StatusCode::OK);
     let shares: Vec<ferrofin_model::entities_media::PlaylistUserPermissions> =
         serde_json::from_slice(&bytes).unwrap();
-    assert!(shares.is_empty());
+    assert!(shares.is_empty(), "{shares:?}");
 }
 
 #[tokio::test]

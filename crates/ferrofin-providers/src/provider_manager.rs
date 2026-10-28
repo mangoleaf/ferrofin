@@ -5404,7 +5404,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name.as_deref(), Some("Exact"));
         assert_eq!(results[0].production_year, Some(2001));
-        assert!(results[0].artists.is_empty());
+        assert!(results[0].artists.is_empty(), "{:?}", results[0].artists);
         assert!(results[0].album_artist.is_none());
         assert_eq!(
             results[0].provider_ids.as_ref().expect("ids")["MusicBrainzAlbum"],
@@ -5528,7 +5528,7 @@ mod tests {
             .get_search_results(&named_request(BaseItemKind::MusicArtist, "Nobody"))
             .await
             .expect("results");
-        assert!(results.is_empty());
+        assert!(results.is_empty(), "{results:?}");
     }
 
     #[tokio::test]
@@ -5570,20 +5570,16 @@ mod tests {
         assert!(album.supports(BaseItemKind::MusicAlbum));
         assert!(!album.supports(BaseItemKind::MusicArtist));
         assert!(artist.supports(BaseItemKind::MusicArtist));
-        assert!(
-            album
-                .get_search_results(&named_request(BaseItemKind::MusicAlbum, "Kind of Blue"))
-                .await
-                .expect("ok")
-                .is_empty()
-        );
-        assert!(
-            artist
-                .get_search_results(&named_request(BaseItemKind::MusicArtist, "Miles Davis"))
-                .await
-                .expect("ok")
-                .is_empty()
-        );
+        let search_results = album
+            .get_search_results(&named_request(BaseItemKind::MusicAlbum, "Kind of Blue"))
+            .await
+            .expect("ok");
+        assert!(search_results.is_empty(), "{search_results:?}");
+        let search_results = artist
+            .get_search_results(&named_request(BaseItemKind::MusicArtist, "Miles Davis"))
+            .await
+            .expect("ok");
+        assert!(search_results.is_empty(), "{search_results:?}");
     }
 
     #[tokio::test]
@@ -5642,13 +5638,11 @@ mod tests {
         assert_eq!(ids["Imdb"], "nm0000093");
 
         // No name and no id → nothing to search.
-        assert!(
-            provider
-                .get_search_results(&request(BaseItemKind::Person))
-                .await
-                .expect("ok")
-                .is_empty()
-        );
+        let search_results = provider
+            .get_search_results(&request(BaseItemKind::Person))
+            .await
+            .expect("ok");
+        assert!(search_results.is_empty(), "{search_results:?}");
     }
 
     #[tokio::test]
@@ -6489,7 +6483,8 @@ mod tests {
         let mut locked_rows = HashMap::new();
         locked_rows.insert(artist_id, entity);
         let locked = manager(vec!["MusicBrainz".to_owned()], locked_rows);
-        assert!(locked.remote_search(&scoped).await.unwrap().is_empty());
+        let results = locked.remote_search(&scoped).await.unwrap();
+        assert!(results.is_empty(), "{results:?}");
     }
 
     #[tokio::test]
@@ -6541,7 +6536,7 @@ mod tests {
             .remote_search(&request(BaseItemKind::Movie))
             .await
             .unwrap();
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[tokio::test]
@@ -6560,7 +6555,8 @@ mod tests {
         assert_eq!(mgr.remote_search(&req).await.unwrap().len(), 1);
 
         req.search_provider_name = Some("NoSuchProvider".to_owned());
-        assert!(mgr.remote_search(&req).await.unwrap().is_empty());
+        let results = mgr.remote_search(&req).await.unwrap();
+        assert!(results.is_empty(), "{results:?}");
     }
 
     #[tokio::test]
@@ -6630,7 +6626,8 @@ mod tests {
         assert_eq!(results[0].name.as_deref(), Some("Matched"));
         assert_eq!(results[0].provider_ids.as_ref().unwrap()["Tvdb"], "42");
         req.search_info.provider_ids = Some(HashMap::from([("Tmdb".into(), "404".into())]));
-        assert!(provider.get_search_results(&req).await.unwrap().is_empty());
+        let search_results = provider.get_search_results(&req).await.unwrap();
+        assert!(search_results.is_empty(), "{search_results:?}");
     }
 
     #[tokio::test]
@@ -6645,7 +6642,7 @@ mod tests {
             .get_search_results(&request(BaseItemKind::Series))
             .await
             .expect("empty");
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[tokio::test]
@@ -6701,7 +6698,7 @@ mod tests {
             .get_external_id_infos(Uuid::nil())
             .await
             .expect("descriptor query succeeds");
-        assert!(infos.is_empty());
+        assert!(infos.is_empty(), "{infos:?}");
     }
 
     /// An [`ItemTypeLookup`] over the two names the descriptor tests need.
@@ -6872,22 +6869,22 @@ mod tests {
         let id = Uuid::new_v4();
         let query = RemoteImageQuery::new("Tmdb".into());
 
+        let available_remote_images = mgr.get_available_remote_images(id, &query).await.unwrap();
         assert!(
-            mgr.get_available_remote_images(id, &query)
-                .await
-                .unwrap()
-                .is_empty()
+            available_remote_images.is_empty(),
+            "{available_remote_images:?}"
         );
+        let remote_image_provider_info = mgr.get_remote_image_provider_info(id).await.unwrap();
         assert!(
-            mgr.get_remote_image_provider_info(id)
-                .await
-                .unwrap()
-                .is_empty()
+            remote_image_provider_info.is_empty(),
+            "{remote_image_provider_info:?}"
         );
         // The metadata-plugin registry projects the compiled-in providers, so it
         // is non-empty (covered in detail by `library_options` tests).
-        assert!(!mgr.get_all_metadata_plugins().await.unwrap().is_empty());
-        assert!(mgr.get_refresh_queue().await.unwrap().is_empty());
+        let all_metadata_plugins = mgr.get_all_metadata_plugins().await.unwrap();
+        assert!(!all_metadata_plugins.is_empty(), "{all_metadata_plugins:?}");
+        let refresh_queue = mgr.get_refresh_queue().await.unwrap();
+        assert!(refresh_queue.is_empty(), "{refresh_queue:?}");
 
         // With no config reader and no item store, `GetMetadataOptions` has
         // nothing to look up and takes the `?? new MetadataOptions()` arm.
@@ -7224,7 +7221,7 @@ mod tests {
             .get_available_remote_images(item_id, &RemoteImageQuery::default())
             .await
             .expect("images");
-        assert!(images.is_empty());
+        assert!(images.is_empty(), "{images:?}");
     }
 
     /// A stored `(provider key, value)` id list.
@@ -8402,11 +8399,13 @@ mod tests {
         assert_eq!(banners.len(), 1);
         assert_eq!(banners[0].url.as_deref(), Some("https://f/banner.jpg"));
         // An unknown provider name yields nothing.
+        let available_remote_images = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::new("Nope".to_owned()))
+            .await
+            .unwrap();
         assert!(
-            mgr.get_available_remote_images(item_id, &RemoteImageQuery::new("Nope".to_owned()))
-                .await
-                .unwrap()
-                .is_empty()
+            available_remote_images.is_empty(),
+            "{available_remote_images:?}"
         );
     }
 
@@ -8473,11 +8472,13 @@ mod tests {
                 .len(),
             2
         );
+        let available_remote_images = bare
+            .get_available_remote_images(bare_id, &RemoteImageQuery::default())
+            .await
+            .unwrap();
         assert!(
-            bare.get_available_remote_images(bare_id, &RemoteImageQuery::default())
-                .await
-                .unwrap()
-                .is_empty()
+            available_remote_images.is_empty(),
+            "{available_remote_images:?}"
         );
     }
 
@@ -8767,7 +8768,8 @@ mod tests {
             }
         }
         assert_eq!(order, [high, normal, low_a, low_b]);
-        assert!(mgr.get_refresh_queue().await.unwrap().is_empty());
+        let refresh_queue = mgr.get_refresh_queue().await.unwrap();
+        assert!(refresh_queue.is_empty(), "{refresh_queue:?}");
     }
 
     #[tokio::test]
@@ -9327,7 +9329,8 @@ mod tests {
         // answer with the MusicBrainz hit.
         let mut req = request(BaseItemKind::MusicAlbum);
         req.item_id = item_id;
-        assert!(mgr.remote_search(&req).await.expect("search").is_empty());
+        let results = mgr.remote_search(&req).await.expect("search");
+        assert!(results.is_empty(), "{results:?}");
 
         // `IncludeDisabledProviders` short-circuits the whole gate
         // (`CanRefreshMetadata`'s `if (includeDisabled) return true`) — this is
@@ -9360,7 +9363,8 @@ mod tests {
         );
         let mut req = request(BaseItemKind::MusicAlbum);
         req.item_id = item_id;
-        assert!(mgr.remote_search(&req).await.expect("search").is_empty());
+        let results = mgr.remote_search(&req).await.expect("search");
+        assert!(results.is_empty(), "{results:?}");
 
         // …unless the caller explicitly asked for disabled providers.
         req.include_disabled_providers = true;

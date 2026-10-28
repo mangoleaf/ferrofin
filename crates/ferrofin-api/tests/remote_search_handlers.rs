@@ -489,7 +489,7 @@ async fn apply_refreshes_existing_item() {
     let recorder = RefreshRecorder::default();
     let (status, bytes) = send_to(state_recording(recorder.clone()), "POST", &uri, body).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    assert!(bytes.is_empty());
+    assert!(bytes.is_empty(), "{bytes:?}");
 
     let (item_id, options) = recorder.lock().unwrap().clone().expect("refresh ran");
     assert_eq!(item_id, ITEM_ID);

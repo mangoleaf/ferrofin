@@ -875,7 +875,8 @@ async fn activity_log_binds_sorts_and_severity_like_the_model_binder() {
 async fn dashboard_pages_empty_and_page_not_found() {
     let (pages, pb) = get(elevated_full_state(), "/web/ConfigurationPages").await;
     assert_eq!(pages, StatusCode::OK);
-    assert!(json(&pb).as_array().unwrap().is_empty());
+    let page_list = json(&pb);
+    assert!(page_list.as_array().unwrap().is_empty(), "{page_list}");
 
     let (page, _) = get(full_state(), "/web/ConfigurationPage?name=whatever").await;
     assert_eq!(page, StatusCode::NOT_FOUND);

@@ -793,7 +793,8 @@ async fn subtitle_remote_search_is_empty_list() {
         call(app, &format!("/Items/{ITEM_ID}/RemoteSearch/Subtitles/eng")).await;
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(v.as_array().unwrap().is_empty());
+    let items = v.as_array().unwrap();
+    assert!(items.is_empty(), "{items:?}");
 }
 
 // ---- OpenSubtitles login validation ----------------------------------------
@@ -946,7 +947,7 @@ async fn fallback_font_unconfigured_path_is_ok_empty() {
     );
     let (status, body, _) = call(app, "/FallbackFont/Fonts/roboto.ttf").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "{body:?}");
 }
 
 #[tokio::test]
@@ -960,7 +961,7 @@ async fn fallback_font_missing_named_file_is_ok_empty() {
     );
     let (status, body, _) = call(app, "/FallbackFont/Fonts/absent.ttf").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "{body:?}");
 }
 
 /// Mirrors a production token-cache snapshot; FakeUsers must never be queried.

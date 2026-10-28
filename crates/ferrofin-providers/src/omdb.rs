@@ -819,7 +819,8 @@ mod tests {
         )
         .expect("parse");
         assert_eq!(item.plot, None);
-        assert!(item.genres().is_empty());
+        let genres = item.genres();
+        assert!(genres.is_empty(), "{genres:?}");
         assert_eq!(item.community_rating(), None);
         assert_eq!(item.website, None);
         assert_eq!(item.poster, None);

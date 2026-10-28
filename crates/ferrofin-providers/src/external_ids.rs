@@ -674,7 +674,8 @@ mod tests {
             series_display_order: Some("Absolute"),
             ..ExternalIdItem::new(BaseItemKind::Season, &own)
         };
-        assert!(urls(&item).is_empty());
+        let found = urls(&item);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -758,13 +759,15 @@ mod tests {
     fn ids_from_the_wrong_kind_are_ignored() {
         // A movie carrying music ids must not sprout MusicBrainz links.
         let map = ids(&[("MusicBrainzAlbum", "release-1"), ("AudioDbArtist", "1")]);
-        assert!(urls(&ExternalIdItem::new(BaseItemKind::Movie, &map)).is_empty());
+        let found = urls(&ExternalIdItem::new(BaseItemKind::Movie, &map));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
     fn blank_and_whitespace_ids_produce_no_link() {
         let map = ids(&[("Imdb", "   "), ("Tmdb", "")]);
-        assert!(urls(&ExternalIdItem::new(BaseItemKind::Movie, &map)).is_empty());
+        let found = urls(&ExternalIdItem::new(BaseItemKind::Movie, &map));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -871,6 +874,7 @@ mod tests {
 
     #[test]
     fn a_kind_with_no_external_ids_returns_an_empty_list() {
-        assert!(external_id_infos(BaseItemKind::Folder).is_empty());
+        let found = external_id_infos(BaseItemKind::Folder);
+        assert!(found.is_empty(), "{found:?}");
     }
 }

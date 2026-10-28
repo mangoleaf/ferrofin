@@ -803,7 +803,7 @@ async fn similar_rows_always_carry_provider_ids() {
 async fn unknown_season_number_has_no_episodes_and_existing_number_resolves_its_season() {
     let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?season=99")).await;
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
-    assert!(result.items.is_empty());
+    assert!(result.items.is_empty(), "{:?}", result.items);
     let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?season=1")).await;
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
     assert_eq!(result.items.len(), 3);
@@ -822,7 +822,7 @@ async fn episode_adjacency_is_applied_after_start_filter_before_paging() {
     let absent = Uuid::new_v4();
     let (_, body) = get(&format!("/Shows/{SERIES_ID}/Episodes?adjacentTo={absent}")).await;
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).unwrap();
-    assert!(result.items.is_empty());
+    assert!(result.items.is_empty(), "{:?}", result.items);
 }
 
 #[tokio::test]
