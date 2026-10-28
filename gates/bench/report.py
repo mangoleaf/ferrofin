@@ -2043,14 +2043,15 @@ def parity_overview(run, name):
         if doc is None:
             raise ValueError("result.json is gone")
         d, e = doc["detail"], html.escape
+        shown = publish.shown_outcomes(doc["counts"])
         rows = "".join(f"<tr><th>{e(a['area'])}</th><td class='num'>{a['requests']}</td>"
-                       + "".join(f"<td class='num'>{a.get(k, 0)}</td>" for k in publish.PARITY_OUTCOMES) + "</tr>"
+                       + "".join(f"<td class='num'>{a.get(k, 0)}</td>" for k in shown) + "</tr>"
                        for a in d.get("areas", []))
-        counts = " · ".join(f"{doc['counts'].get(k, 0)} {e(label)}" for k, label in publish.PARITY_OUTCOMES.items())
+        counts = " · ".join(f"{doc['counts'].get(k, 0)} {e(publish.PARITY_OUTCOMES[k])}" for k in shown)
         body = (f"<h1>Parity {e(name)}</h1><p class='lede'>{e(doc['verdict'])}: {e(d.get('reason', ''))} — {d.get('sent', 0)} of "
                 f"{d.get('planned', 0)} requests against Jellyfin {e(str(d.get('oracle_version') or 'of an unrecorded version'))}: {counts}. Rendered from "
                 "result.json; the full report is written with results.json.</p><div class='scroll'><table><thead><tr><th>Area</th>"
-                "<th>Requests</th><th>Identical</th><th>Accepted</th><th>Filed</th><th>New</th><th>Not compared</th></tr></thead>"
+                "<th>Requests</th>" + "".join(f"<th>{e(publish.PARITY_COLUMNS[k])}</th>" for k in shown) + "</tr></thead>"
                 f"<tbody>{rows}</tbody></table></div>")
         return 200, page_html(f"Parity {name}", body)
     except Exception as ex:

@@ -382,6 +382,72 @@ class Comparison(Scratch):
                          [("Items[0].Year", "Items[].Year", "value", "1", "9"),
                           ("Items[1].Id", "Items[].Id", "value", '"b"', '"c"')])
 
+    def test_the_same_items_in_another_order_are_one_order_difference_and_each_item_is_compared_with_its_own(self):
+        oracle = {"Items": [{"Id": "a", "N": 1}, {"Id": "b", "N": 2}, {"Id": "c", "N": 3}]}
+        ferrofin = {"Items": [{"Id": "C", "N": 3}, {"Id": "a", "N": 1}, {"Id": "b", "N": 9}]}
+        differences, _ = pair(oracle, ferrofin)
+        self.assertEqual(sorted((d.at, d.path, d.kind, d.oracle, d.ferrofin) for d in differences),
+                         [("Items", "Items", "order", '"[0] a of 3"', '"[0] c of 3"'),
+                          ("Items[1].N", "Items[].N", "value", "2", "9"),
+                          ("Items[2].Id", "Items[].Id", "value", '"c"', '"C"')])
+
+    def test_a_root_array_reordered_is_an_order_difference_at_the_root(self):
+        differences, _ = pair([{"Id": "a"}, {"Id": "b"}], [{"Id": "b"}, {"Id": "a"}])
+        self.assertEqual(kinds(differences), [("$", "order")])
+
+    def test_items_are_matched_by_the_first_key_every_item_has(self):
+        oracle = [{"ItemId": "x", "Key": "1"}, {"ItemId": "y", "Key": "2"}]
+        ferrofin = [{"ItemId": "y", "Key": "2"}, {"ItemId": "x", "Key": "1"}]
+        self.assertEqual(kinds(pair(oracle, ferrofin)[0]), [("$", "order")])
+
+    def test_a_late_reorder_names_where_the_orders_part(self):
+        ids = [{"Id": str(n)} for n in range(10)]
+        (found,) = pair({"Items": ids}, {"Items": ids[:8] + ids[:7:-1]})[0]
+        self.assertEqual((found.kind, found.oracle, found.ferrofin), ("order", '"[8] 8 of 10"', '"[8] 9 of 10"'))
+
+    def test_an_opaque_id_falls_through_to_the_next_key(self):
+        rules = self.rules('[[rule]]\npaths = ["Items[].Id"]\nkind = "opaque"\nreason = "per server"\n')
+        differences, _ = pair({"Items": [{"Id": "x", "Key": "a"}, {"Id": "y", "Key": "b"}]},
+                              {"Items": [{"Id": "z", "Key": "b"}, {"Id": "w", "Key": "a"}]}, rules)
+        self.assertEqual(kinds(differences), [("Items", "order")])
+
+    def test_ids_that_collide_once_dashes_and_case_are_set_aside_compare_by_position(self):
+        differences, _ = pair({"Items": [{"Id": "a-b", "N": 1}, {"Id": "AB", "N": 2}]},
+                              {"Items": [{"Id": "AB", "N": 2}, {"Id": "a-b", "N": 1}]})
+        self.assertEqual(sorted(kinds(differences)),
+                         [("Items[0].Id", "value"), ("Items[0].N", "value"), ("Items[1].Id", "value"), ("Items[1].N", "value")])
+
+    def test_arrays_of_arrays_and_mixed_arrays_compare_by_position(self):
+        self.assertEqual(kinds(pair({"L": [[1], [2]]}, {"L": [[2], [1]]})[0]), [("L[0][0]", "value"), ("L[1][0]", "value")])
+        self.assertEqual(kinds(pair({"L": [{"Id": "a"}, "b"]}, {"L": ["b", {"Id": "a"}]})[0]), [("L[0]", "type"), ("L[1]", "type")])
+
+    def test_an_unordered_rule_pairs_its_array_itself(self):
+        rules = self.rules('[[rule]]\npaths = ["Items"]\nkind = "unordered"\nby = "Name"\nreason = "no order"\n')
+        differences, used = pair({"Items": [{"Id": "a", "Name": "x"}, {"Id": "b", "Name": "y"}]},
+                                 {"Items": [{"Id": "b", "Name": "y"}, {"Id": "a", "Name": "x"}]}, rules)
+        self.assertEqual((differences, len(used)), ([], 1))
+
+    def test_scalars_in_another_order_are_an_order_difference(self):
+        self.assertEqual(kinds(pair({"Tags": ["a", "b", "a"]}, {"Tags": ["a", "a", "b"]})[0]), [("Tags", "order")])
+
+    def test_a_page_holding_other_items_is_not_a_reorder(self):
+        differences, _ = pair({"Items": [{"Id": "a"}, {"Id": "b"}]}, {"Items": [{"Id": "b"}, {"Id": "c"}]})
+        self.assertEqual(kinds(differences), [("Items[0].Id", "value"), ("Items[1].Id", "value")])
+
+    def test_a_repeated_or_missing_key_compares_by_position(self):
+        repeated = pair({"Items": [{"Id": "a", "N": 1}, {"Id": "a", "N": 2}]}, {"Items": [{"Id": "a", "N": 2}, {"Id": "a", "N": 1}]})[0]
+        self.assertEqual(kinds(repeated), [("Items[0].N", "value"), ("Items[1].N", "value")])
+        keyless = pair({"Items": [{"N": 1}, {"N": 2}]}, {"Items": [{"N": 2}, {"N": 1}]})[0]
+        self.assertEqual(kinds(keyless), [("Items[0].N", "value"), ("Items[1].N", "value")])
+
+    def test_an_opaque_only_key_or_a_rule_on_the_element_keeps_position(self):
+        oracle = {"Items": [{"Id": "a", "N": 1}, {"Id": "b", "N": 2}]}
+        ferrofin = {"Items": [{"Id": "b", "N": 2}, {"Id": "a", "N": 1}]}
+        opaque_id = self.rules('[[rule]]\npaths = ["Items[].Id"]\nkind = "opaque"\nreason = "per server"\n')
+        self.assertEqual(kinds(pair(oracle, ferrofin, opaque_id)[0]), [("Items[0].N", "value"), ("Items[1].N", "value")])
+        element = self.rules('[[rule]]\npaths = ["Items[]"]\nkind = "opaque"\nreason = "per server"\n')
+        self.assertEqual(pair(oracle, ferrofin, element)[0], [])
+
     def test_an_id_that_differs_only_in_its_format_is_the_same_item_and_its_fields_are_compared(self):
         differences, _ = pair({"Items": [{"Id": "0123abcd", "N": 1}]}, {"Items": [{"Id": "0123-ABCD", "N": 2}]})
         self.assertEqual(sorted(kinds(differences)), [("Items[0].Id", "value"), ("Items[0].N", "value")])
@@ -550,6 +616,20 @@ class Ledger(Scratch):
         entries = self.ledger('[[entry]]\nrequest = "a"\npath = "X"\nverified = "GET /Shows/NextUp"\nkind = "value"\nreason = "r"\n'
                               '[[entry]]\nrequest = "b"\npath = "Y"\nissue = 12\nkind = "null"\nreason = "r"\n')
         self.assertEqual([e.link() for e in entries], ["VERIFIED GET /Shows/NextUp", "issue gl-12"])
+
+    def test_an_order_entry_accepts_a_reorder_at_the_array_and_at_the_root(self):
+        entries = self.ledger('[[entry]]\nrequest = "GetYears"\npath = "Items"\nissue = 862\nkind = "order"\nreason = "r"\n'
+                              '[[entry]]\nrequest = "GetTasks"\npath = "$"\nissue = 428\nkind = "order"\nreason = "r"\n')
+        (items,), _ = pair({"Items": [{"Id": "a"}, {"Id": "b"}]}, {"Items": [{"Id": "b"}, {"Id": "a"}]})
+        (whole,), _ = pair([{"Id": "a"}, {"Id": "b"}], [{"Id": "b"}, {"Id": "a"}])
+        self.assertEqual(diff.matching_entry(entries, "GetYears", items), entries[0])
+        self.assertEqual(diff.matching_entry(entries, "GetTasks", whole), entries[1])
+        self.assertIsNone(diff.matching_entry(entries, "GetYears", whole))   # an order entry names its array
+
+    def test_an_order_difference_the_ledger_does_not_accept_is_new(self):
+        order = {"path": "Items", "kind": "order", "ledger": None, "filed": None}
+        self.assertEqual(diff.outcome({"state": "differences", "differences": [order]}), "new")
+        self.assertEqual(diff.outcome({"state": "differences", "differences": [{**order, "filed": 861}]}), "filed")
 
     def test_the_method_of_a_verified_link_is_not_case_sensitive(self):
         self.ledger('[[entry]]\nrequest = "a"\npath = "X"\nverified = "post /Items/{itemId}/PlaybackInfo"\nkind = "value"\nreason = "r"\n')
@@ -1053,6 +1133,9 @@ class Overview(Scratch):
             {"target": "/Items/1?Fields=Overview", "state": "match", "differences": []},
             {"target": "/Items/2", "state": "match", "differences": []},
             {"target": "/Items/3", "state": "ledgered", "differences": [new("Tags", ledger="ledger.toml#12")]},
+            {"target": "/Years", "state": "ledgered", "differences": [new("Items", "order", ledger="ledger.toml#40")]},
+            {"target": "/Years?limit=2", "state": "ledgered",
+             "differences": [new("Items", "order", ledger="ledger.toml#40"), new("Items[].Name", ledger="ledger.toml#41")]},
             {"target": "Users/u1/Items", "state": "differences", "differences": [new("A"), new("B", ledger="ledger.toml#3")]},
             {"target": "/Videos/1/stream", "state": "differences", "differences": [new("C", filed=832), new("D", ledger="x")]},
             {"target": "/Videos/2/stream", "state": "differences", "differences": [new("E", filed=860), new("F")]},
@@ -1064,20 +1147,22 @@ class Overview(Scratch):
 
     def test_each_request_has_one_outcome_and_an_oracle_failure_is_never_identical(self):
         outcomes = [diff.outcome(r) for r in self.summary()["requests"]]
-        self.assertEqual(outcomes, ["identical", "identical", "accepted", "new", "filed", "new", "oracle_failed"])
+        self.assertEqual(outcomes, ["identical", "identical", "accepted", "order", "accepted", "new", "filed", "new",
+                                    "oracle_failed"])
 
     def test_the_overview_counts_outcomes_overall_and_by_area_with_its_source(self):
         doc = diff.result_doc(self.summary())
         self.assertEqual(diff.gate_result().problems(doc), [])
         self.assertEqual((doc["gate"], doc["verdict"]), ("parity", "new differences"))
-        self.assertEqual(doc["counts"], {"identical": 2, "accepted": 1, "filed": 1, "new": 2, "oracle_failed": 1})
+        self.assertEqual(doc["counts"], {"identical": 2, "order": 1, "accepted": 2, "filed": 1, "new": 2, "oracle_failed": 1})
         detail = doc["detail"]
         self.assertEqual(detail["areas"], [
-            {"area": "/Items", "requests": 3, "identical": 2, "accepted": 1, "filed": 0, "new": 0, "oracle_failed": 0},
-            {"area": "/Videos", "requests": 2, "identical": 0, "accepted": 0, "filed": 1, "new": 1, "oracle_failed": 0},
-            {"area": "/Intros", "requests": 1, "identical": 0, "accepted": 0, "filed": 0, "new": 0, "oracle_failed": 1},
-            {"area": "/Users", "requests": 1, "identical": 0, "accepted": 0, "filed": 0, "new": 1, "oracle_failed": 0}])
-        self.assertEqual((detail["sent"], detail["planned"], detail["oracle_version"]), (7, 9, "12.2.0"))
+            {"area": "/Items", "requests": 3, "identical": 2, "order": 0, "accepted": 1, "filed": 0, "new": 0, "oracle_failed": 0},
+            {"area": "/Videos", "requests": 2, "identical": 0, "order": 0, "accepted": 0, "filed": 1, "new": 1, "oracle_failed": 0},
+            {"area": "/Years", "requests": 2, "identical": 0, "order": 1, "accepted": 1, "filed": 0, "new": 0, "oracle_failed": 0},
+            {"area": "/Intros", "requests": 1, "identical": 0, "order": 0, "accepted": 0, "filed": 0, "new": 0, "oracle_failed": 1},
+            {"area": "/Users", "requests": 1, "identical": 0, "order": 0, "accepted": 0, "filed": 0, "new": 1, "oracle_failed": 0}])
+        self.assertEqual((detail["sent"], detail["planned"], detail["oracle_version"]), (9, 9, "12.2.0"))
         self.assertEqual((detail["new_differences"], detail["unfiled_groups"], detail["filed_issues"]), (4, 2, [832, 860]))
         self.assertEqual({k: doc["source"][k] for k in ("commit", "image", "image_digest", "oracle", "fixture")},
                          {"commit": "5112240e", "image": "ferrofin:x", "image_digest": "sha256:f", "oracle": "jellyfin@pin",

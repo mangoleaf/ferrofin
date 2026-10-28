@@ -55,11 +55,11 @@ STYLE = {
     "light": {"ink": "#1A1E24", "muted": "#5B636E", "grid": "#E1E5EA", "ferrofin": "#2E6E8E",
               "jellyfin": "#A3ACB7", "slower": "#B7791F", "on_bar": "#FFFFFF",
               "PASS": "#2E7D4F", "FAIL": "#A83A2E", "SKIP": "#8A939E", "INCOMPLETE": "#B7791F",
-              "identical": "#2E7D4F", "accepted": "#2E6E8E", "filed": "#B7791F", "new": "#A83A2E", "oracle_failed": "#C3C9D1"},
+              "identical": "#2E7D4F", "order": "#7DB892", "accepted": "#2E6E8E", "filed": "#B7791F", "new": "#A83A2E", "oracle_failed": "#C3C9D1"},
     "dark": {"ink": "#E7EAEE", "muted": "#9AA3AE", "grid": "#2B323C", "ferrofin": "#6FB3D2",
              "jellyfin": "#5B636E", "slower": "#E0B25A", "on_bar": "#13161B",
              "PASS": "#6CC08B", "FAIL": "#E07A6E", "SKIP": "#6B7480", "INCOMPLETE": "#E0B25A",
-             "identical": "#6CC08B", "accepted": "#6FB3D2", "filed": "#E0B25A", "new": "#E07A6E", "oracle_failed": "#4A515B"},
+             "identical": "#6CC08B", "order": "#3E7A55", "accepted": "#6FB3D2", "filed": "#E0B25A", "new": "#E07A6E", "oracle_failed": "#4A515B"},
 }
 FONT = "system-ui,-apple-system,'Segoe UI',Helvetica,Arial,sans-serif"
 WIDTH = 760
@@ -225,13 +225,28 @@ def adoption_summary(session, bench_commit=None, publishing=True):
 
 
 #: A parity request's outcome, as gates/parity/diff.py counts it, and how the README names it.
-PARITY_OUTCOMES = {"identical": "identical", "accepted": "known differences", "filed": "filed as issues",
+PARITY_OUTCOMES = {"identical": "identical", "order": "the same answer in another order",
+                   "accepted": "known differences", "filed": "filed as issues",
                    "new": "new differences", "oracle_failed": "not compared (Jellyfin failed them)"}
-#: What the parity graph's legend calls each outcome: a known difference is one the ledger links to its issue
+#: What the parity graph's legend calls each outcome: order only is the same answer in another order, which
+#: the ledger accepts for that request; a known difference is one the ledger links to its issue
 #: or its accepted reason; filed and new are both differences the ledger does not cover yet; a request Jellyfin
 #: failed (an error, or an area stock Jellyfin does not have), or a write step after one, is not compared.
-PARITY_LEGEND = {"identical": "identical", "accepted": "known (in ledger)", "filed": "filed, not in ledger",
+PARITY_LEGEND = {"identical": "identical", "order": "order only", "accepted": "known (in ledger)", "filed": "filed, not in ledger",
                  "new": "new", "oracle_failed": "Jellyfin failed"}
+#: Outcomes a run from before them did not record: shown only for a run that counted them (its requests were
+#: counted under another outcome, so a zero would be false).
+LATER_OUTCOMES = ("order",)
+
+
+def shown_outcomes(counts):
+    """The outcomes a parity run's counts are shown with: every one it recorded."""
+    return tuple(k for k in PARITY_OUTCOMES if k in counts or k not in LATER_OUTCOMES)
+
+
+#: The parity table's column for each outcome.
+PARITY_COLUMNS = {"identical": "Identical", "order": "Order only", "accepted": "Known", "filed": "Filed", "new": "New",
+                  "oracle_failed": "Not compared"}
 #: How many API areas the parity graph draws, busiest first; the rest are one "other areas" bar.
 PARITY_AREAS = 12
 
@@ -268,10 +283,10 @@ def parity_summary(session, commit, publishing=True):
     return {"source": {"session": os.path.basename(os.path.normpath(session)), "commit": commit,
                        "oracle": f"Jellyfin {detail.get('oracle_version')}" if detail.get("oracle_version") else None,
                        "date": (record.get("started") or "")[:10] or None},
-            "verdict": doc["verdict"], "counts": {k: doc["counts"].get(k, 0) for k in PARITY_OUTCOMES},
+            "verdict": doc["verdict"], "counts": {k: doc["counts"][k] for k in PARITY_OUTCOMES if k in doc["counts"]},
             "sent": detail["sent"], "planned": detail.get("planned", 0), "new_differences": detail.get("new_differences", 0),
             "filed_issues": detail.get("filed_issues", []),
-            "areas": [{"area": a["area"], "requests": a["requests"], **{k: a.get(k, 0) for k in PARITY_OUTCOMES}}
+            "areas": [{"area": a["area"], "requests": a["requests"], **{k: a[k] for k in PARITY_OUTCOMES if k in a}}
                       for a in detail.get("areas", [])]}
 
 
@@ -606,13 +621,13 @@ def parity_rows(areas):
     top, rest = areas[:PARITY_AREAS], areas[PARITY_AREAS:]
     if rest:
         top = top + [{"area": f"{len(rest)} other areas", "requests": sum(a["requests"] for a in rest),
-                      **{k: sum(a[k] for a in rest) for k in PARITY_OUTCOMES}}]
+                      **{k: sum(a.get(k, 0) for a in rest) for k in PARITY_OUTCOMES}}]
     return top
 
 
-def parity_graph(title, parity, caption, theme_name, alt=""):
+def parity_graph(title, parity, caption, theme_name, alt="", outcomes=tuple(PARITY_OUTCOMES)):
     """One stacked bar per API area, its length the requests sent there, split by outcome: identical,
-    known differences, filed, new and not compared, with how many of its requests were answered identically
+    order only, known differences, filed, new and not compared, with how many of its requests were answered identically
     at the right (`parity_label`)."""
     t = STYLE[theme_name]
     rows = parity_rows(parity["areas"])
@@ -637,13 +652,13 @@ def parity_graph(title, parity, caption, theme_name, alt=""):
         body.append(text(left - 10, y + bar_h - 3, r["area"], 12, anchor="end", theme=t))
         at = left
         for key in PARITY_OUTCOMES:
-            width = plot * r[key] / scale_top
+            width = plot * r.get(key, 0) / scale_top
             if width > 0:
                 body.append(f"<rect x='{at:.1f}' y='{y:.1f}' width='{width:.1f}' height='{bar_h}' fill='{t[key]}'/>")
                 at += width
         body.append(text(at + 5, y + bar_h - 3, label, 11, "muted", theme=t))
     body.append(caption_lines(caption, end + 54, t))
-    return frame(title, end + 76, "".join(body), theme_name, tuple(PARITY_LEGEND.items()), alt)
+    return frame(title, end + 76, "".join(body), theme_name, tuple((k, PARITY_LEGEND[k]) for k in outcomes), alt)
 
 
 def parity_label(row):
@@ -666,20 +681,26 @@ def parity_verdict(parity):
 
 
 def parity_section(parity, version, rel, results_dir):
-    """`(files, README lines)` of the parity overview."""
+    """`(files, README lines)` of the parity overview. A summary written before an outcome existed (`order`,
+    whose requests that run counted as known differences) is shown without it."""
+    shown = shown_outcomes(parity["counts"])
+    parity = {**parity, "counts": {k: parity["counts"].get(k, 0) for k in PARITY_OUTCOMES},
+              "areas": [{**a, **{k: a.get(k, 0) for k in PARITY_OUTCOMES}} for a in parity["areas"]]}
     src, c = parity["source"], parity["counts"]
     title = f"Answering jellyfin-web like {src['oracle']}"
     compared = parity["sent"] - c["oracle_failed"]
-    alt = (f"{title}: of {parity['sent']} requests, " + ", ".join(f"{c[k]} {PARITY_OUTCOMES[k]}" for k in PARITY_OUTCOMES) + ".")
+    alt = (f"{title}: of {parity['sent']} requests, " + ", ".join(f"{c[k]} {PARITY_OUTCOMES[k]}" for k in shown) + ".")
     cap = (f"{ferrofin(version)} (commit {src['commit'][:8]}) against {src['oracle']}, gates session {src['session']}, "
            f"{src['date']}. How differences are judged: gates/parity/README.md")
     files = {os.path.join(results_dir, version, f"parity{'' if theme == 'light' else '-dark'}.svg"):
-             parity_graph(title, parity, cap, theme, alt) for theme in STYLE}
+             parity_graph(title, parity, cap, theme, alt, shown) for theme in STYLE}
     issues = ", ".join(f"gl-{i}" if str(i).isdigit() else str(i) for i in parity["filed_issues"])
     lines = ["### Answering like Jellyfin\n",
              f"The parity gate replays the **{parity['sent']:,}** requests jellyfin-web makes against {src['oracle']} and "
              f"Ferrofin **{version}** (commit `{src['commit'][:12]}`, a local gates session on {src['date']}) and compares the "
-             f"answers. Of the {compared:,} it could compare, **{c['identical']:,} are identical** and **{c['accepted']:,} differ "
+             f"answers. Of the {compared:,} it could compare, **{c['identical']:,} are identical**"
+             + (f", **{c['order']:,} hold the same answer in another order** (the ledger accepts each order)," if c["order"] else "")
+             + f" and **{c['accepted']:,} differ "
              "in known ways** (the parity ledger links each to its issue, or to the reason it is accepted); "
              f"**{c['filed']} {'is filed as an issue' if c['filed'] == 1 else 'are filed as issues'}** and "
              f"**{c['new']} {'is' if c['new'] == 1 else 'are'} new**. {c['oracle_failed']} "
@@ -688,8 +709,8 @@ def parity_section(parity, version, rel, results_dir):
              f'<picture>\n  <source media="(prefers-color-scheme: dark)" srcset="{rel}/parity-dark.svg">\n'
              f'  <img alt="{html.escape(alt)}" src="{rel}/parity.svg">\n</picture>\n',
              "<details><summary>Parity: every API area</summary>\n",
-             "| Area | Requests | Identical | Known | Filed | New | Not compared |", "|---|---|---|---|---|---|---|"]
-    lines += [f"| {md(a['area'])} | {a['requests']} | " + " | ".join(str(a[k]) for k in PARITY_OUTCOMES) + " |"
+             "| Area | Requests | " + " | ".join(PARITY_COLUMNS[k] for k in shown) + " |", "|---|---|" + "---|" * len(shown)]
+    lines += [f"| {md(a['area'])} | {a['requests']} | " + " | ".join(str(a[k]) for k in shown) + " |"
               for a in parity["areas"]]
     lines += ["", f"Filed as issues: {md(issues)}." if issues else "", "\n</details>\n"]
     return files, lines

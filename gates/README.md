@@ -150,8 +150,8 @@ of every cell and the reason a cell was not comparable.
 
 Below them, a grid gives the adoption status of every supported Jellyfin version and upgrade route:
 passed, failed, skipped (a fixture that was not built) or unfinished, with a table of the reasons. Then the
-parity overview: of the requests jellyfin-web makes, how many Ferrofin answers identically, with an accepted
-difference, with a difference filed as an issue, or with a new one, and how many could not be compared because
+parity overview: of the requests jellyfin-web makes, how many Ferrofin answers identically, with the same answer
+in another order (counted from releases whose run recorded it), with an accepted difference, with a difference filed as an issue, or with a new one, and how many could not be compared because
 Jellyfin itself failed them, as one stacked bar per API area (the busiest twelve, then the rest as one) and a
 table of every area. Last, one graph follows the headline numbers (cold start, the median p50 of the comparable
 screens at 5 screens/s, peak and idle memory) over every release published, each against the Jellyfin release it
