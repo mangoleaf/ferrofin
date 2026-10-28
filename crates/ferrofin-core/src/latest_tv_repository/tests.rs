@@ -183,6 +183,163 @@ async fn latest_tv_statements_seek_the_library() {
     assert!(!episodes.contains("SCAN bi"), "{episodes}");
 }
 
+/// The filter jellyfin-web's "Latest in TV" row builds for `user`, with
+/// `IsPlayed` = `played` (`false` hides played episodes, as
+/// `HidePlayedInLatest` does).
+fn latest_filter(
+    user: ferrofin_db::entities::users::UserEntity,
+    top: Uuid,
+    played: bool,
+) -> ferrofin_traits::options::InternalItemsQuery {
+    ferrofin_traits::options::InternalItemsQuery {
+        user: Some(user),
+        is_played: Some(played),
+        is_folder: Some(false),
+        is_virtual_item: Some(false),
+        media_types: vec![ferrofin_model::data::MediaType::Video],
+        top_parent_ids: vec![top],
+        limit: Some(16),
+        ..Default::default()
+    }
+}
+
+/// gl-978: step 2 tests its rows' played state one row at a time. Its rows
+/// are the newest series' episodes since the cutoff, usually a handful, and
+/// the list form rebuilt the user's whole watch history to test them. Pinned:
+/// the own-row seek, a version-group seek and no scan; the folder arm, which
+/// no leaf reaches, keeps its lists.
+#[tokio::test]
+async fn step_two_tests_played_per_row() {
+    let db = crate::test_support::test_db().await;
+    let user = crate::test_support::seed_user(&db, id(0x500)).await;
+    let filter = latest_filter(user, id(0x900), false);
+    let build = || {
+        crate::translate_query::build_latest_tv_episodes_query(
+            &filter,
+            &["A".to_owned()],
+            Some(at(0)),
+        )
+    };
+    let sql = build().sql().as_str().to_owned();
+    assert!(
+        !sql.contains(r#"bi."Id" IN (SELECT ud."ItemId""#),
+        "no played list built for the rows themselves: {sql}"
+    );
+    let plan = super::explain(&db, build()).await;
+    assert!(
+        plan.contains(
+            "SEARCH ud USING COVERING INDEX IX_UserData_UserId_Played_ItemId (UserId=? AND Played=? AND ItemId=?)"
+        ),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("SEARCH v USING INDEX IX_BaseItems_PrimaryVersionId (PrimaryVersionId=?)"),
+        "{plan}"
+    );
+    assert!(!plan.contains("SCAN "), "{plan}");
+}
+
+/// gl-978: testing played per row selects exactly the episodes the list form
+/// selects, hiding the played ones (`IsPlayed=false`) or keeping only them
+/// (`IsPlayed=true`), under each arm of the rule: an episode played itself,
+/// the primary of a group whose version was played, and a version (in
+/// another library than its primary, so it is listed) of a group whose
+/// primary was played. Another user's plays count for nothing.
+#[tokio::test]
+async fn step_two_selects_what_the_played_lists_select() {
+    use crate::test_support::{
+        fetch_item, link_alternate_version, save_item, seed_episode, seed_named_user, seed_user,
+        seed_user_data,
+    };
+    let db = crate::test_support::test_db().await;
+    // Off the low ids: `id(1)` is the placeholder row's.
+    let ep = |n: u128| id(0x100 + n);
+    let (me, them) = (id(0x500), id(0x501));
+    let user = seed_user(&db, me).await;
+    seed_named_user(&db, them, "other").await;
+    let (top, elsewhere) = (id(0x900), id(0x901));
+    let seed = |n: u128, library: Uuid| {
+        let db = db.clone();
+        async move {
+            seed_episode(
+                &db,
+                ep(n),
+                "key-a",
+                1,
+                i64::try_from(n).unwrap(),
+                false,
+                Some(library),
+            )
+            .await;
+            let mut row = fetch_item(&db, ep(n)).await;
+            row.series_name = Some("A".to_owned());
+            row.date_created = Some(at(1));
+            row.media_type = Some("Video".to_owned());
+            save_item(&db, &row).await;
+        }
+    };
+    for n in 1..=8 {
+        seed(n, top).await;
+    }
+    for n in [50, 60] {
+        seed(n, elsewhere).await;
+    }
+    seed_user_data(&db, me, ep(1), true, None).await; // 1: played itself
+    link_alternate_version(&db, ep(3), ep(2)).await; // 2: its version 3 played
+    seed_user_data(&db, me, ep(3), true, None).await;
+    link_alternate_version(&db, ep(5), ep(4)).await; // 4: its version 5 played by another
+    seed_user_data(&db, them, ep(5), true, None).await;
+    link_alternate_version(&db, ep(6), ep(50)).await; // 6: version of played 50
+    seed_user_data(&db, me, ep(50), true, None).await;
+    link_alternate_version(&db, ep(7), ep(60)).await; // 7: version of unplayed 60
+    seed_user_data(&db, them, ep(8), true, None).await; // 8: played by another
+
+    // 3 and 5 are alternates hidden behind a primary in their library; 6 and
+    // 7 are listed, their primaries being in another; 50 and 60 are outside
+    // the filter's library.
+    let names = ["A".to_owned()];
+    for (played, expected) in [(false, [4, 7, 8]), (true, [1, 2, 6])] {
+        let filter = latest_filter(user.clone(), top, played);
+        let mut per_row: Vec<String> =
+            crate::translate_query::build_latest_tv_episodes_query(&filter, &names, Some(at(0)))
+                .build_query_as::<(
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                )>()
+                .fetch_all(db.pool())
+                .await
+                .expect("step 2")
+                .into_iter()
+                .map(|row| row.0)
+                .collect();
+        let mut oracle = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            r#"SELECT bi."Id" FROM "BaseItems" AS bi WHERE 1 = 1"#,
+        );
+        crate::translate_query::append_predicates(&mut oracle, &filter);
+        oracle
+            .push(r#" AND bi."SeriesName" IN ("#)
+            .push_bind("A")
+            .push(r#") AND bi."DateCreated" >= "#)
+            .push_bind(ferrofin_db::store::datetime_to_db(at(0)));
+        let mut lists: Vec<String> = oracle
+            .build_query_scalar()
+            .fetch_all(db.pool())
+            .await
+            .expect("list form");
+        per_row.sort();
+        lists.sort();
+        assert_eq!(per_row, lists, "IsPlayed={played}");
+        let expected: Vec<String> = expected
+            .into_iter()
+            .map(|n| ferrofin_db::store::guid_to_db(ep(n)))
+            .collect();
+        assert_eq!(per_row, expected, "IsPlayed={played}");
+    }
+}
+
 /// The window is inclusive: an episode exactly 24 hours older than the
 /// series' newest still counts as added with it.
 #[test]
