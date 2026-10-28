@@ -4,7 +4,7 @@
 owed a re-check against an earlier release, 0 subsystem rows (as of 2026-10-19; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
-Ferrofin answers the way Jellyfin does (identical, an accepted difference, filed, new), by API
+Ferrofin answers the way Jellyfin does (identical, in another order, an accepted difference, filed, new), by API
 area, is in the root README's [Results](../README.md#answering-like-jellyfin).
 
 Ferrofin implements the Jellyfin server API surface, not a subset of it. Every one of the

@@ -429,7 +429,8 @@ class PublishTests(unittest.TestCase):
         parity = doc["parity"]
         self.assertEqual(publish.summary_problems(doc), [])
         self.assertEqual((parity["sent"], parity["counts"], parity["filed_issues"], parity["source"]["oracle"]),
-                         (12, {"identical": 6, "accepted": 3, "filed": 1, "new": 1, "oracle_failed": 1}, [832], "Jellyfin 12.2.0"))
+                         (12, {"identical": 6, "order": 0, "accepted": 3, "filed": 1, "new": 1, "oracle_failed": 1}, [832],
+                          "Jellyfin 12.2.0"))
         self.assertEqual([a["area"] for a in parity["areas"]], ["/Items", "/Intros", "/Sessions", "/Videos"])
         files, readme = publish.render(str(self.published([doc])), README, str(self.root))
         graph = files[next(p for p in files if p.endswith("/parity.svg"))]
@@ -440,12 +441,38 @@ class PublishTests(unittest.TestCase):
             self.assertIn(text, graph)
         for text in ("### Answering like Jellyfin", "replays the **12** requests", "**6 are identical**",
                      "**3 differ in known ways**", "**1 is filed as an issue** and **1 is new**",
-                     "1 was not compared because Jellyfin itself failed it", "| /Items | 9 | 6 | 3 | 0 | 0 | 0 |",
+                     "1 was not compared because Jellyfin itself failed it", "| /Items | 9 | 6 | 0 | 3 | 0 | 0 | 0 |",
+                     "| Area | Requests | Identical | Order only | Known |",
                      "Filed as issues: gl-832.", 'srcset="docs/results/v1.4.0/parity-dark.svg"'):
             self.assertIn(text, readme)
         self.assertLess(readme.index("### Adopting an existing"), readme.index("### Answering like Jellyfin"))
         self.assertIn("**The parity gate did not pass** (new differences): 2 requests differ in ways the ledger does "
                       "not cover yet.", readme)
+
+    def test_reorders_are_their_own_bucket_and_a_summary_from_before_it_is_shown_without_it(self):
+        s = adoption_session(self.root, ADOPTION)
+        doc = publish.summarise("v1.4.0", self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)]), str(s))
+        parity = doc["parity"]
+        parity["counts"].update(identical=4, order=2)
+        parity["areas"][0].update(identical=4, order=2)
+        self.assertEqual(publish.summary_problems(doc), [])
+        files, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        self.assertIn("**4 are identical**, **2 hold the same answer in another order**", readme)
+        self.assertIn("| /Items | 9 | 4 | 2 | 3 | 0 | 0 | 0 |", readme)
+        self.assertIn(">order only<", files[next(p for p in files if p.endswith("/parity.svg"))])
+        # v1.4.0's summary predates the bucket: its reorders were counted as known differences
+        del parity["counts"]["order"]
+        for area in parity["areas"]:
+            area.pop("order")
+        parity["counts"]["identical"] = parity["areas"][0]["identical"] = 6
+        self.assertEqual(publish.summary_problems(doc), [])
+        files, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        self.assertIn("**6 are identical** and **3 differ in known ways**", readme)
+        self.assertIn("| Area | Requests | Identical | Known | Filed | New | Not compared |", readme)
+        self.assertIn("| /Items | 9 | 6 | 3 | 0 | 0 | 0 |", readme)
+        graph = files[next(p for p in files if p.endswith("/parity.svg"))]
+        self.assertNotIn("order only", graph)
+        self.assertNotIn("another order", readme)
 
     def test_a_passing_parity_run_says_so(self):
         doc = publish.summarise("v1.4.0", self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)]),

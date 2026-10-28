@@ -10,7 +10,7 @@
 #   path      the field path as the report prints it (`MediaSources[].Size`); `$status` for the
 #             status code, `$` for the whole body; `<tag>` stands for every image-tag key of a map
 #             (`Items[].ImageBlurHashes.Primary.<tag>`)
-#   kind      required: one kind or a list of status, value, type, null, missing, extra, length. An
+#   kind      required: one kind or a list of status, value, type, null, missing, extra, length, order. An
 #             entry accepts only the kinds it names, so a harmless value difference cannot also hide
 #             a null, a type change or a Ferrofin timeout at the same path
 #
@@ -207,12 +207,22 @@ kind = "value"
 issue = 861
 reason = "Equal sort keys (many seasons share a name) come back in a different order: Jellyfin's row order after SortName."
 
+# The glob holds only requests with Resume's own date-played sort: a request naming a SortBy needs its own
+# entries, since a reorder against the key it names is a real difference.
+[[entry]]
+request = "GetResumeItems*"
+path = "Items"
+kind = "order"
+issue = 861
+reason = "Equal sort keys (many seasons share a name) come back in a different order: Jellyfin's row order after SortName."
+
+# Paged, the different tie order puts other items on the page.
 [[entry]]
 request = "GetResumeItems*"
 path = "Items[].Id"
 kind = "value"
 issue = 861
-reason = "Equal sort keys (many seasons share a name) come back in a different order: Jellyfin's row order after SortName."
+reason = "Equal sort keys (many seasons share a name) come back in a different order, so a page holds other items."
 
 # The page follows the difference gl-827 tracks.
 [[entry]]
@@ -969,10 +979,17 @@ reason = "Ferrofin does not read the task history an adopted Jellyfin data direc
 # A task's raw key stands in for its name, so it sorts elsewhere and the task rows shift.
 [[entry]]
 request = "GetTasks"
-path = "[].Id"
-kind = "value"
+path = "$"
+kind = "order"
 issue = 428
 reason = "A task's raw key stands in for its name, so it sorts elsewhere and the task rows shift."
+
+[[entry]]
+request = "GetTasks"
+path = "[].Name"
+kind = "value"
+issue = 428
+reason = "A task's raw key stands in for its name: its Name differs from Jellyfin's display name."
 
 # The obsolete SystemInfo members are not upstream's constants, and PackageName is set.
 [[entry]]
@@ -1094,8 +1111,8 @@ reason = "Ferrofin names its log files differently, so the oracle's log name is 
 # A Jellyfin bug not ported: its /Years total counts the items scanned and lists years in first-appearance order.
 [[entry]]
 request = "GetYears"
-path = "Items[].Id"
-kind = "value"
+path = "Items"
+kind = "order"
 issue = 862
 reason = "A Jellyfin bug not ported: its /Years total counts the items scanned and lists years in first-appearance order."
 
