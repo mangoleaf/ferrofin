@@ -262,6 +262,33 @@ fn get_media_info_ts_success() {
     assert_eq!(res.media_source.media_streams[0].is_avc, Some(false));
 }
 
+// GetMediaInfo_TSWithoutDimensions_Success
+#[rstest]
+#[case("video_ts_no_dimensions.json", None)]
+#[case("video_ts_no_dimensions_zero_dar.json", Some("0:1"))]
+fn get_media_info_ts_without_dimensions_success(
+    #[case] name: &str,
+    #[case] expected_aspect_ratio: Option<&str>,
+) {
+    let res = normalizer().get_media_info(
+        load(name),
+        Some(VideoType::VideoFile),
+        false,
+        "http://192.168.1.19:5004/auto/v4",
+        MediaProtocol::Http,
+    );
+
+    assert_eq!(res.media_source.media_streams.len(), 2);
+
+    let video = &res.media_source.media_streams[0];
+    assert_eq!(video.stream_type, MediaStreamType::Video);
+    assert_eq!(video.codec.as_deref(), Some("mpeg2video"));
+    assert_eq!(video.width, None);
+    assert_eq!(video.height, None);
+    assert_eq!(video.aspect_ratio.as_deref(), expected_aspect_ratio);
+    assert_eq!(video.is_anamorphic, Some(false));
+}
+
 #[test]
 fn get_media_info_webm_success() {
     let res = get_media_info(
