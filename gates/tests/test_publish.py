@@ -50,12 +50,13 @@ def bench_result(scale=1.0, digest="sha256:img", search_withheld=None, started=N
                                             row("search", 30 * scale, 64, withheld=search_withheld)],
                      "endpoints": [row("home:image", 0.74 * scale, 5.4), row("playback:intros", 6.0 * scale, 5.4)]}
     detail = {"runs": ["r"], "servers": {"jellyfin": "Jellyfin 12.2.0", "ferrofin": "Ferrofin"},
-              "oracle_label": "Jellyfin 12.2.0", "conditions": {}, "levels": {"loaded": level(), "stress": level()},
+              "oracle_label": "Jellyfin 12.2.0", "levels": {"loaded": level(), "stress": level()},
               "ttfs": [row("cold start (restart → authenticated views; host caches retained)", 379 * scale, 3420),
                        row("HLS first segment (forced transcode)", 203 * scale, 434)],
               "memory": [row("peak under load", 147 * scale, 470, "MiB"), row("steady idle", 106 * scale, 295, "MiB")],
               "cpu_per_screen": [row("loaded", 33 * scale, 132, withheld="Ferrofin: search differs")],
-              "missing": [], "load_problems": []}
+              "missing": [], "load_problems": [],
+              "conditions": {"fixture_counts": {"movies": 3001, "series": 250, "episodes": 7490, "hdr": 50}}}
     source = {"commit": "5112240e", "image": "ferrofin:x", "image_digest": digest, "oracle": "jellyfin/jellyfin@sha256:pin",
               "host_class": {"cores": 32, "memory_gib": 125}, "fixture": "4b217db66afc0000"}
     started = started or f"2026-10-26T01:{int(scale * 100) % 60:02d}:00Z"   # each run its own start
@@ -70,6 +71,11 @@ def parity_requests():
             + [{"target": "/Sessions", "state": "differences", "differences": [new("B")]},
                {"target": "/Videos/1", "state": "differences", "differences": [new("C", filed=832)]},
                {"target": "/Intros", "state": "oracle failed", "differences": []}])
+
+
+def page_of(files):
+    """The release's own page among the files `render` writes: every graph and table."""
+    return files[next(p for p in files if p.endswith("/README.md"))]
 
 
 def adoption_session(root, rows, commit="5112240e1923cdc9", dirty=False, parity=True):
@@ -251,15 +257,32 @@ class PublishTests(unittest.TestCase):
         self.assertTrue(readme.endswith("<!-- END GENERATED RESULTS -->\n\n## After\n"))
         for text in ("**9.0× faster cold start**", "**3.2× lighter peak memory under load**",
                      '<source media="(prefers-color-scheme: dark)" srcset="docs/results/v1.4.0/screens-loaded-dark.svg">',
-                     'src="docs/results/v1.4.0/screens-loaded.svg"', "| home | 17 ms | 55 ms | 3.2× faster |",
-                     "- CPU per screen · loaded level: Ferrofin: search differs",
-                     "median of 3 runs"):
+                     'src="docs/results/v1.4.0/screens-loaded.svg"', 'src="docs/results/v1.4.0/startup.svg"',
+                     'src="docs/results/v1.4.0/memory.svg"', "median of 3 runs",
+                     "over the same library (3,001 movies, 250 series, 7,490 episodes, 50 HDR videos)",
+                     "One host and one library: other hardware and libraries give other numbers.",
+                     "Not compared in this release, because the two servers did different work there or the evidence is "
+                     "incomplete: CPU per screen.",
+                     "Measured from commit `5112240e`. Every graph and table, the withheld cells and the sources: "
+                     "[docs/results/v1.4.0/README.md](docs/results/v1.4.0/README.md)"):
             self.assertIn(text, readme)
+        for text in ("screens-stress", "endpoints-loaded", "| home | 17 ms |", "Source:", "<details>"):
+            self.assertNotIn(text, readme)   # the release's page has them
         self.assertNotIn("\nold\n", readme)   # the block it replaced
+        page = page_of(files)
+        self.assertEqual(Path(next(p for p in files if p.endswith("/README.md"))).parent.name, "v1.4.0")
+        for text in ("# Ferrofin v1.4.0 against Jellyfin 12.2.0", "[README](../../../README.md#results)",
+                     'src="./screens-stress.svg"', 'src="./endpoints-loaded.svg"', "| home | 17 ms | 55 ms | 3.2× faster |",
+                     "| CPU per screen | loaded level | Ferrofin: search differs |",
+                     "Commit `5112240e`, image `sha256:img`, fixture `4b217db66afc`, 3 runs.",
+                     "[`docs/BENCHMARKS.md`](../../../docs/BENCHMARKS.md)"):
+            self.assertIn(text, page)
 
     def test_every_graph_is_well_formed_svg_with_no_external_reference(self):
         files, _ = publish.render(str(self.published([self.summary()])), README, str(self.root))
         for path, svg in files.items():
+            if not path.endswith(".svg"):
+                continue
             with self.subTest(Path(path).name):
                 root = ET.fromstring(svg)
                 self.assertEqual(root.get("width"), str(publish.WIDTH))
@@ -296,11 +319,14 @@ class PublishTests(unittest.TestCase):
         doc["bench"]["levels"]["loaded"]["screens"][0]["name"] = "a|b <i>"
         doc["bench"]["levels"]["loaded"]["screens"][2].update(ratio=None, withheld="x | <script>")
         files, readme = publish.render(str(self.published([doc])), README, str(self.root))
-        self.assertIn("| a\\|b &lt;i&gt; | 17 ms |", readme)
-        self.assertIn("search: x \\| &lt;script&gt;", readme)
-        self.assertNotIn("<script>", readme)
-        for svg in files.values():
-            ET.fromstring(svg)
+        page = page_of(files)
+        self.assertIn("| a\\|b &lt;i&gt; | 17 ms |", page)
+        self.assertIn("| search | x \\| &lt;script&gt; |", page)
+        self.assertIn("incomplete: the search screen, CPU per screen.", readme)
+        self.assertNotIn("<script>", readme + page)
+        for path, svg in files.items():
+            if path.endswith(".svg"):
+                ET.fromstring(svg)
 
     def test_a_summary_filed_under_another_version_is_refused(self):
         doc = self.summary()
@@ -326,16 +352,17 @@ class PublishTests(unittest.TestCase):
         for doc in out:
             publish.write_json(str(results / doc["version"] / "summary.json"), doc)
         files, readme = publish.render(str(results), README, str(self.root))
-        return files[str(results / "history.svg")], readme
+        return files.get(str(results / "history.svg")), readme
 
-    def test_one_release_is_drawn_as_points_and_named_with_its_jellyfin(self):
-        svg, readme = self.history(["v1.4.0"])
+    def test_one_release_has_no_history_in_the_readme_and_would_be_drawn_as_points(self):
+        drawn, readme = self.history(["v1.4.0"])
+        self.assertIsNone(drawn)
+        self.assertNotIn("Release over release", readme)
+        svg = publish.history_graph(publish.history_series([self.summary()]), "light")
         ET.fromstring(svg)
         self.assertNotIn("stroke-width='2'", svg)   # one point per server per panel: no line to draw
         for text in (">v1.4.0<", ">vs Jellyfin 12.2.0<", ">379 ms<", ">3420 ms<", ">17 ms<", "Cold start", "Idle memory"):
             self.assertIn(text, svg)
-        self.assertIn('### Release over release', readme)
-        self.assertIn('srcset="history/0/history-dark.svg"', readme)
 
     def test_two_releases_on_one_host_are_joined_and_another_host_starts_a_new_line(self):
         joined, _ = self.history(["v1.4.0", "v1.5.0"])
@@ -389,13 +416,20 @@ class PublishTests(unittest.TestCase):
         readme.write_text(README)
         with contextlib.redirect_stdout(io.StringIO()):
             publish.main(args)
-        leftover = results / "v1.4.0" / "gone.svg"   # a graph the summary no longer gives
-        leftover.write_text("<svg/>")
-        with self.assertRaisesRegex(SystemExit, "gone.svg"):
+        page = results / "v1.4.0" / "README.md"
+        page.write_text(page.read_text().replace("3.2× faster", "4× faster"))   # a hand edit of the release's page
+        with self.assertRaisesRegex(SystemExit, "v1.4.0/README.md"):
             publish.main([*args, "--check"])
         with contextlib.redirect_stdout(io.StringIO()):
             publish.main(args)
-        self.assertFalse(leftover.exists())
+        for leftover in (results / "v1.4.0" / "gone.svg",   # a graph the summary no longer gives
+                         results / "history.svg"):   # one release has no history graph
+            leftover.write_text("<svg/>")
+            with self.assertRaisesRegex(SystemExit, leftover.name):
+                publish.main([*args, "--check"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                publish.main(args)
+            self.assertFalse(leftover.exists())
         with self.assertRaisesRegex(SystemExit, "publish: no .*missing: run summarise first"):
             publish.main(["readme", "--results", str(self.root / "missing"), "--readme", str(readme)])
 
@@ -415,13 +449,53 @@ class PublishTests(unittest.TestCase):
         grid = files[next(p for p in files if p.endswith("/adoption.svg"))]
         ET.fromstring(grid)
         for text in ("10.11.11-messy", ">failed<", ">skipped<", ">passed<", f"fill='{publish.STYLE['light']['SKIP']}'",
-                     "gates session " + s.name):
+                     "a local gates session"):
             self.assertIn(text, grid)
         for text in ("### Adopting an existing Jellyfin database", "**2 of 4 passed** (1 skipped: their fixtures were not built)",
-                     "(commit `5112240e1923`)",
-                     'srcset="docs/results/v1.4.0/adoption-dark.svg"', "| jellyfin-12.1-from-12 | path | 12.1.0 | skipped | fixture not built |"):
+                     "(commit `5112240e1923`", "[Migrating from Jellyfin](#migrating-from-jellyfin)"):
             self.assertIn(text, readme)
+        self.assertNotIn("adoption-dark.svg", readme)
         self.assertLess(readme.index("### Speed and memory against Jellyfin"), readme.index("### Adopting an existing"))
+        page = page_of(files)
+        for text in ("## Adopting an existing Jellyfin database", 'srcset="./adoption-dark.svg"',
+                     "[Migrating from Jellyfin](../../../README.md#migrating-from-jellyfin)",
+                     "| jellyfin-12.1-from-12 | path | 12.1.0 | skipped | fixture not built |"):
+            self.assertIn(text, page)
+
+    def test_a_summary_from_before_the_library_size_names_none_and_a_bad_one_is_refused(self):
+        doc = self.summary()
+        del doc["bench"]["source"]["library"]   # v1.4.0's summary
+        self.assertEqual(publish.summary_problems(doc), [])
+        _, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        self.assertIn("over the same library, 2026-10-26.", readme)
+        doc["bench"]["source"]["library"] = {"movies": "many"}
+        self.assertIn("bench.source.library is not an object of item counts", publish.summary_problems(doc))
+
+    def test_withheld_cells_are_named_by_screen_and_endpoint_and_search_only_when_its_screen_is(self):
+        doc = self.summary()
+        loaded = doc["bench"]["levels"]["loaded"]
+        loaded["endpoints"][0].update(name="search:artists", ratio=None, withheld="ids differ")
+        _, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        self.assertIn("incomplete: the search endpoints, CPU per screen.\n", readme)
+        self.assertNotIn("The search screen", readme)   # the screen itself is compared
+        loaded["screens"][2].update(ratio=None, withheld="ids differ")
+        _, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        self.assertIn("incomplete: the search screen, the search endpoints, CPU per screen.\n", readme)
+        self.assertNotIn("The search screen", readme)   # still compared at the stress level
+        doc["bench"]["levels"]["stress"]["screens"][2].update(ratio=None, withheld="ids differ")
+        _, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        self.assertIn("incomplete: the search screen, the search endpoints, CPU per screen. The search screen therefore "
+                      "has no comparison yet.", readme)
+
+    def test_nothing_published_names_a_private_issue_or_a_gates_session(self):
+        s = adoption_session(self.root / "detached-5112240e1923-20261026-0101", ADOPTION)
+        ab = ab_session(self.root / "detached-8f052092ca2f-20261027-1135", AB_VERDICTS)
+        doc = publish.summarise("v1.4.0", self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)]), str(s), str(ab))
+        self.assertEqual(doc["parity"]["filed_issues"], [832])   # the summary keeps them; the text never shows them
+        files, readme = publish.render(str(self.published([doc])), README, str(self.root))
+        published = readme + "".join(files.values())
+        for text in ("gl-", "detached-"):
+            self.assertNotIn(text, published)
 
     def test_the_parity_overview_comes_from_the_named_session(self):
         s = adoption_session(self.root, ADOPTION)
@@ -437,14 +511,20 @@ class PublishTests(unittest.TestCase):
         ET.fromstring(graph)
         for text in ("/Items", ">6 of 9 identical<", ">0 of 1 identical  ·  1 Jellyfin failed<", ">0 of 1 identical  ·  1 not in ledger<",
                      ">known (in ledger)<", f"fill='{publish.STYLE['light']['new']}'",
-                     "against Jellyfin 12.2.0, gates session"):
+                     "against Jellyfin 12.2.0, a local gates session"):
             self.assertIn(text, graph)
         for text in ("### Answering like Jellyfin", "replays the **12** requests", "**6 are identical**",
-                     "**3 differ in known ways**", "**1 is filed as an issue** and **1 is new**",
-                     "1 was not compared because Jellyfin itself failed it", "| /Items | 9 | 6 | 0 | 3 | 0 | 0 | 0 |",
-                     "| Area | Requests | Identical | Order only | Known |",
-                     "Filed as issues: gl-832.", 'srcset="docs/results/v1.4.0/parity-dark.svg"'):
+                     "**3 are known differences**, each recorded in the parity ledger with the issue that tracks it, or "
+                     "the parity row that accepts it", "**1 is filed as an issue** and **1 is new**",
+                     "1 was not compared because Jellyfin itself failed it"):
             self.assertIn(text, readme)
+        for text in ("accepted", "gl-832", "parity-dark.svg", "| /Items |"):
+            self.assertNotIn(text, readme)
+        page = page_of(files)
+        for text in ("## Answering like Jellyfin", "| /Items | 9 | 6 | 0 | 3 | 0 | 0 | 0 |",
+                     "| Area | Requests | Identical | Order only | Known |", 'srcset="./parity-dark.svg"'):
+            self.assertIn(text, page)
+        self.assertNotIn("gl-832", page)
         self.assertLess(readme.index("### Adopting an existing"), readme.index("### Answering like Jellyfin"))
         self.assertIn("**The parity gate did not pass** (new differences): 2 requests differ in ways the ledger does "
                       "not cover yet.", readme)
@@ -458,7 +538,7 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(publish.summary_problems(doc), [])
         files, readme = publish.render(str(self.published([doc])), README, str(self.root))
         self.assertIn("**4 are identical**, **2 hold the same answer in another order**", readme)
-        self.assertIn("| /Items | 9 | 4 | 2 | 3 | 0 | 0 | 0 |", readme)
+        self.assertIn("| /Items | 9 | 4 | 2 | 3 | 0 | 0 | 0 |", page_of(files))
         self.assertIn(">order only<", files[next(p for p in files if p.endswith("/parity.svg"))])
         # v1.4.0's summary predates the bucket: its reorders were counted as known differences
         del parity["counts"]["order"]
@@ -467,9 +547,9 @@ class PublishTests(unittest.TestCase):
         parity["counts"]["identical"] = parity["areas"][0]["identical"] = 6
         self.assertEqual(publish.summary_problems(doc), [])
         files, readme = publish.render(str(self.published([doc])), README, str(self.root))
-        self.assertIn("**6 are identical** and **3 differ in known ways**", readme)
-        self.assertIn("| Area | Requests | Identical | Known | Filed | New | Not compared |", readme)
-        self.assertIn("| /Items | 9 | 6 | 3 | 0 | 0 | 0 |", readme)
+        self.assertIn("**6 are identical** and **3 are known differences**", readme)
+        self.assertIn("| Area | Requests | Identical | Known | Filed | New | Not compared |", page_of(files))
+        self.assertIn("| /Items | 9 | 6 | 3 | 0 | 0 | 0 |", page_of(files))
         graph = files[next(p for p in files if p.endswith("/parity.svg"))]
         self.assertNotIn("order only", graph)
         self.assertNotIn("another order", readme)
@@ -641,16 +721,18 @@ class PublishTests(unittest.TestCase):
         self.assertIn(">Ferrofin v1.4.0 against Ferrofin v1.3.2<", graph)
         widest = max(float(x) + len(t) * 11 * 0.58 for x, t in re.findall(r"<text x='([\d.]+)'[^>]*font-size='11'[^>]*>([^<]*)</text>", graph))
         self.assertLessEqual(widest, publish.WIDTH)   # every bar's note fits the graph (by the same width estimate)
-        for text in ("### Against the previous release", "**Ferrofin v1.3.2** (`ghcr.io/mangoleaf/ferrofin:v1.3.2`)", "3 interleaved pairs",
+        self.assertNotIn("previous release", readme)
+        readme = page_of(files)   # what follows reads the release's page
+        for text in ("## Against the previous release", "**Ferrofin v1.3.2** (`ghcr.io/mangoleaf/ferrofin:v1.3.2`)", "3 interleaved pairs",
                      "of 5 gated cells, **2 improved**, 1 is within noise and **1 regressed**, and 1 could not be compared "
                      "(it blocks like a regression); **1 gated cell blocked the release**. The graph draws the cells "
                      "that improved or regressed; every cell is in the table under it.",
                      "| loaded/screens/movies | 10.0 ms | 10.2 ms | +2.0% | within noise |",
                      "| memory/peak under load | 100 MiB | 125 MiB | +25.0% | regressed |",
                      "| loaded/screens/search | — | — | — | not comparable: other work |",
-                     'srcset="docs/results/v1.4.0/previous-release-dark.svg"'):
+                     'srcset="./previous-release-dark.svg"'):
             self.assertIn(text, readme)
-        self.assertLess(readme.index("### Speed and memory against Jellyfin"), readme.index("### Against the previous release"))
+        self.assertLess(readme.index("## Speed and memory against Jellyfin"), readme.index("## Against the previous release"))
 
     def test_an_older_session_counts_its_pairs_from_its_cells_and_fewer_than_three_are_refused(self):
         s = ab_session(self.root / "old", AB_VERDICTS)
@@ -673,7 +755,8 @@ class PublishTests(unittest.TestCase):
                                 ab=str(ab_session(self.root / "zero", verdicts)))
         files, readme = publish.render(str(self.published([doc])), README, str(self.root))
         self.assertNotIn("memory/steady idle", files[next(p for p in files if p.endswith("/previous-release.svg"))])
-        self.assertIn("| memory/steady idle | 0.00 MiB | 90.0 MiB | — | regressed (not drawn: a median is missing) |", readme)
+        self.assertIn("| memory/steady idle | 0.00 MiB | 90.0 MiB | — | regressed (not drawn: a median is missing) |",
+                      page_of(files))
 
     def test_summarise_refuses_a_session_that_is_not_an_ab_gate_or_judged_nothing(self):
         runs = self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)])
