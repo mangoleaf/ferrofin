@@ -74,7 +74,7 @@ const DEFAULT_WS_MIN_STREAM_PERIOD_MS: u32 = 100;
 /// Only the knobs a operator commonly overrides on the command line are
 /// exposed as flags; everything else is env / file / default. Each flag, when
 /// present, overrides the corresponding env var and `config.toml` value.
-#[derive(Debug, Default, Parser)]
+#[derive(Debug, Default, Clone, Parser)]
 #[command(name = "ferrofin-server", about = "Ferrofin media server", version)]
 pub struct Cli {
     /// Program-data root directory (overrides `FERROFIN_DATA_DIR`).
@@ -292,8 +292,8 @@ pub struct Config {
 
     /// What loading noticed and set aside without failing, e.g. a key the
     /// file may not set. Loading runs before logging starts, so the server
-    /// logs these once it has, each with [`config_file`](Self::config_file)
-    /// as its `path`.
+    /// logs these once it has (at boot, and after each in-process restart),
+    /// each with [`config_file`](Self::config_file) as its `path`.
     pub load_warnings: Vec<String>,
 
     /// Configuration directory holding `system.json` + `branding.json`.
@@ -667,6 +667,24 @@ impl Config {
         Self::load_from(cli, &EnvProvider)
     }
 
+    /// [`Config::load`] with `vars` in place of the process environment, so a
+    /// test that loads a `config.toml` as the binary does sees none of the
+    /// environment it runs in.
+    ///
+    /// # Errors
+    ///
+    /// As [`Config::load`].
+    #[doc(hidden)]
+    pub fn load_with_vars(cli: Cli, vars: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        struct Vars<'a>(&'a dyn Fn(&str) -> Option<String>);
+        impl Env for Vars<'_> {
+            fn var(&self, key: &str) -> Option<String> {
+                (self.0)(key)
+            }
+        }
+        Self::load_from(cli, &Vars(vars))
+    }
+
     /// [`Config::load`] against an injectable environment provider (for tests).
     // One linear layering of CLI > env > file > default per knob; it grows by a
     // line per config field, so the length is inherent (cf. `build_app_state`).
@@ -1030,6 +1048,49 @@ impl Config {
         default
     }
 
+    /// `next`, loaded again for an in-process restart, with what this process
+    /// holds for its whole life put back to its running value; and the
+    /// `config.toml` keys of the settings whose new value that leaves
+    /// unapplied until the process restarts.
+    ///
+    /// Held for the process's life: the data, configuration and cache
+    /// directories (the database, configuration and caches never move under a
+    /// running process), the log filter (`init_tracing` installs it once), and
+    /// the scan-duration histogram buckets (the metrics pipeline installs them
+    /// once; kept even before metrics were first enabled, so the setting
+    /// always applies on a process restart). The test seams that are no
+    /// setting (`discovery_bind_addr`, `provider_endpoints`) carry over
+    /// without a mention. `web_dir` is served anew each lifetime, so it
+    /// follows the reload, even when it derives from a `data_dir` kept here.
+    #[must_use]
+    pub fn for_restart(&self, mut next: Config) -> (Config, Vec<&'static str>) {
+        let mut kept = Vec::new();
+        keep_running(&mut next.data_dir, &self.data_dir, "data_dir", &mut kept);
+        keep_running(
+            &mut next.config_dir,
+            &self.config_dir,
+            "config_dir",
+            &mut kept,
+        );
+        keep_running(&mut next.cache_dir, &self.cache_dir, "cache_dir", &mut kept);
+        keep_running(&mut next.log_level, &self.log_level, "log_level", &mut kept);
+        // Compared bit for bit: an unparsable entry is NaN, which never equals
+        // itself, and an unchanged list must not read as a change.
+        let bits = |buckets: &Option<Vec<f64>>| {
+            buckets
+                .as_ref()
+                .map(|list| list.iter().map(|b| b.to_bits()).collect::<Vec<_>>())
+        };
+        if bits(&next.metrics_scan_duration_buckets) != bits(&self.metrics_scan_duration_buckets) {
+            next.metrics_scan_duration_buckets
+                .clone_from(&self.metrics_scan_duration_buckets);
+            kept.push("metrics_scan_duration_buckets");
+        }
+        next.discovery_bind_addr = self.discovery_bind_addr;
+        next.provider_endpoints.clone_from(&self.provider_endpoints);
+        (next, kept)
+    }
+
     /// The `sqlite:` connection URL for [`Config::database_path`], suitable for
     /// `ferrofin_db::Database::connect`.
     #[must_use]
@@ -1119,6 +1180,20 @@ impl Config {
             playback_metrics_queue: None,
             quick_connect_pending_per_ip: None,
         }
+    }
+}
+
+/// [`Config::for_restart`]'s step for one setting: sets `next` back to
+/// `running` and records `key` when the reload changed it.
+fn keep_running<T: Clone + PartialEq>(
+    next: &mut T,
+    running: &T,
+    key: &'static str,
+    kept: &mut Vec<&'static str>,
+) {
+    if next != running {
+        next.clone_from(running);
+        kept.push(key);
     }
 }
 
@@ -1272,11 +1347,45 @@ fn load_file_config(path: &Path) -> anyhow::Result<(FileConfig, bool)> {
     let settings = config::Config::builder()
         .add_source(config::File::from(path))
         .build()
-        .map_err(|e| anyhow::anyhow!("failed to read config file `{}`: {e}", path.display()))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to read config file `{}`: {}",
+                path.display(),
+                without_source_lines(&e.to_string())
+            )
+        })?;
     let file = settings
         .try_deserialize()
         .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))?;
     Ok((file, true))
+}
+
+/// A TOML parse error without the lines of the file it quotes: the line at
+/// fault may hold a password or an API key, and the error reaches the log (an
+/// in-process restart logs it) and the terminal. What is left names the line
+/// and column and the problem, e.g. `TOML parse error at line 3, column 18:
+/// invalid basic string`.
+fn without_source_lines(message: &str) -> String {
+    let quotes_the_file = |line: &str| {
+        line.trim_start()
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .trim_start()
+            .starts_with('|')
+    };
+    let mut kept = String::new();
+    for line in message
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !quotes_the_file(line))
+    {
+        // The `config` crate appends ` in <file>` on a line of its own.
+        let separator = if line.starts_with("in ") { " " } else { ": " };
+        if !kept.is_empty() {
+            kept.push_str(separator);
+        }
+        kept.push_str(line);
+    }
+    kept
 }
 
 /// The default program-data root: `$XDG_DATA_HOME/ferrofin`, else
@@ -1727,6 +1836,105 @@ mod tests {
         let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
         assert!(cfg.config_file_found);
         assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+    }
+
+    /// An in-process restart applies what the reload changed, except what
+    /// the process holds for its life, which keeps its running value and is
+    /// named; the test seams carry over unnamed.
+    #[test]
+    fn a_restart_applies_the_reload_but_keeps_what_the_process_holds() {
+        let running = Config {
+            metrics_scan_duration_buckets: Some(vec![f64::NAN, 1.0]),
+            ..Config::test_stub(Path::new("/run"))
+        };
+        let reloaded = Config {
+            server_name: "renamed".to_owned(),
+            scan_probe_concurrency: Some(3),
+            // A bad bucket entry (NaN) on both sides is no change.
+            metrics_scan_duration_buckets: Some(vec![f64::NAN, 1.0]),
+            discovery_bind_addr: Some(std::net::SocketAddr::from(([0, 0, 0, 0], 7359))),
+            provider_endpoints: ProviderEndpoints::default(),
+            ..Config::test_stub(Path::new("/run"))
+        };
+        let (next, kept) = running.for_restart(reloaded);
+        assert!(kept.is_empty(), "{kept:?}");
+        assert_eq!(next.server_name, "renamed");
+        assert_eq!(next.scan_probe_concurrency, Some(3));
+        assert_eq!(next.discovery_bind_addr, None);
+        assert_eq!(next.provider_endpoints, ProviderEndpoints::offline());
+
+        let moved = Config {
+            log_level: "debug".to_owned(),
+            metrics_scan_duration_buckets: Some(vec![0.5, 5.0]),
+            ..Config::test_stub(Path::new("/elsewhere"))
+        };
+        let (next, kept) = running.for_restart(moved);
+        assert_eq!(
+            kept,
+            [
+                "data_dir",
+                "config_dir",
+                "cache_dir",
+                "log_level",
+                "metrics_scan_duration_buckets"
+            ]
+        );
+        assert_eq!(next.data_dir, running.data_dir);
+        assert_eq!(next.config_dir, running.config_dir);
+        assert_eq!(next.cache_dir, running.cache_dir);
+        assert_eq!(
+            next.web_dir,
+            PathBuf::from("/elsewhere/web"),
+            "served anew each lifetime"
+        );
+        assert_eq!(next.log_level, running.log_level);
+        assert_eq!(
+            bits(next.metrics_scan_duration_buckets.as_deref()),
+            bits(running.metrics_scan_duration_buckets.as_deref())
+        );
+    }
+
+    fn bits(buckets: Option<&[f64]>) -> Option<Vec<u64>> {
+        buckets.map(|list| list.iter().map(|b| b.to_bits()).collect())
+    }
+
+    /// A file that does not parse is refused naming its line and column, but
+    /// never quoting the line: it may be a password's.
+    #[test]
+    fn a_parse_error_never_quotes_the_line_at_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "port = 5000\nadmin_password = \"hunter2\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let message = format!("{:#}", Config::load_from(cli, &FakeEnv::new()).unwrap_err());
+        assert!(!message.contains("hunter2"), "{message}");
+        assert!(message.contains("line 2"), "{message}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(!message.contains(": in "), "{message}");
+    }
+
+    /// A secret written without quotes is read as text, so its type never
+    /// makes an error that would quote it.
+    #[test]
+    fn an_unquoted_secret_is_read_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "admin_password = 123456\ntvdb_subscriber_pin = 4321\nomdb_api_key = true\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.admin_password, "123456");
+        assert_eq!(cfg.tvdb_subscriber_pin, "4321");
+        assert_eq!(cfg.omdb_api_key, "true");
     }
 
     /// The config file is TOML: a file named for another format is refused,

@@ -273,10 +273,11 @@ async fn announce_shutdown(
 ///
 /// `POST /System/Restart` (and a scheduled backup restore) re-create the host
 /// IN-PROCESS: the server drains, the state is dropped, and [`serve_once`] runs
-/// again on the same configuration — Jellyfin's `Program.Main`
-/// `do { … } while (_restartOnShutdown)`. A container therefore survives a
-/// restart without a supervisor, exactly as a Jellyfin container does. Shutdown
-/// and signals return from here and the process exits.
+/// again — Jellyfin's `Program.Main` `do { … } while (_restartOnShutdown)`. A
+/// container therefore survives a restart without a supervisor, exactly as a
+/// Jellyfin container does. Shutdown and signals return from here and the
+/// process exits. Every lifetime here runs on `config`; the binary runs
+/// [`run_reloading`] instead, which loads `config.toml` again for each one.
 ///
 /// # Errors
 ///
@@ -285,6 +286,38 @@ async fn announce_shutdown(
 /// fails, seeding fails, the listener cannot bind the configured address, or the
 /// server loop errors.
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    run_lifetimes(config, None).await
+}
+
+/// [`run`], with `reload` called for the configuration of each in-process
+/// restart, as Jellyfin's restart loop builds a new host that reads its XML
+/// configuration again. The binary passes a [`Config::load`] of its command
+/// line, so a changed `config.toml` applies on `POST /System/Restart`.
+///
+/// What the process holds for its whole life (the directories, the log
+/// filter, the scan-duration histogram buckets) keeps its running value, with
+/// a warning naming each such setting that changed
+/// ([`Config::for_restart`]). A reload that fails (a `config.toml` that no
+/// longer parses or validates) is logged as an error naming the file, and the
+/// next lifetime runs on the configuration this one ran on: a server with no
+/// supervisor must not stop over an edit. A cold boot still fails fast, in
+/// `main`, before this is called.
+///
+/// # Errors
+///
+/// As [`run`].
+pub async fn run_reloading(
+    config: Config,
+    mut reload: impl FnMut() -> anyhow::Result<Config> + Send,
+) -> anyhow::Result<()> {
+    run_lifetimes(config, Some(&mut reload)).await
+}
+
+/// The restart loop behind [`run`] and [`run_reloading`].
+async fn run_lifetimes(
+    mut config: Config,
+    mut reload: Option<&mut (dyn FnMut() -> anyhow::Result<Config> + Send)>,
+) -> anyhow::Result<()> {
     // Hold the log-writer guard until after the server drains so the last
     // buffered file-log lines flush rather than being discarded on exit.
     let _log_guard = init_tracing(&config);
@@ -300,7 +333,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     loop {
         let started = std::time::Instant::now();
         match serve_once(&config, started, &mut metrics, &signals).await {
-            Ok(true) => tracing::info!("restart requested — re-creating the host in-process"),
+            Ok(true) => {
+                tracing::info!("restart requested — re-creating the host in-process");
+                if let Some(reload) = reload.as_deref_mut() {
+                    // A small file read on the loop's own task, once per restart.
+                    config = next_lifetime_config(&config, reload());
+                }
+            }
             Ok(false) => break,
             // The one place a failed boot or serve is logged, so it reaches the
             // log file as well as the exit status `main` reports.
@@ -318,6 +357,39 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // loses the last spans is a bug. No-op when trace export is disabled.
     shutdown_tracing();
     Ok(())
+}
+
+/// The configuration the next in-process lifetime runs on: `reloaded`, with
+/// what the process holds for its life kept at its running value
+/// ([`Config::for_restart`]); or `running` again when the reload failed.
+fn next_lifetime_config(running: &Config, reloaded: anyhow::Result<Config>) -> Config {
+    match reloaded {
+        Ok(reloaded) => {
+            let (next, kept) = running.for_restart(reloaded);
+            tracing::info!(
+                path = %next.config_file.display(),
+                config_file_found = next.config_file_found,
+                "configuration loaded again for the restart"
+            );
+            log_load_warnings(&next);
+            if !kept.is_empty() {
+                tracing::warn!(
+                    settings = ?kept,
+                    "these settings changed but apply only when the server process restarts; \
+                     the in-process restart keeps their running values"
+                );
+            }
+            next
+        }
+        Err(error) => {
+            tracing::error!(
+                path = %running.config_file.display(),
+                error = format!("{error:#}"),
+                "the configuration could not be loaded again; restarting on the one already running"
+            );
+            running.clone()
+        }
+    }
 }
 
 /// Logs what loading `config` set aside ([`Config::load_warnings`]): loading

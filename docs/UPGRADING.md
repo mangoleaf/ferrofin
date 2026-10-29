@@ -8,7 +8,7 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
-## Unreleased — `{data_dir}/config.toml` is read for every data directory
+## Unreleased — `{data_dir}/config.toml` is read for every data directory, and a dashboard restart reloads it
 
 - **A `config.toml` in the data directory now applies however the data directory is named.**
   It used to be read only when `FERROFIN_DATA_DIR` named the data directory: a server started
@@ -25,6 +25,12 @@ major-version upgrade.
 - **A `data_dir` key in a `config.toml` found in the data directory is ignored**, with a
   warning in the log: the file cannot move the directory it was found in. It still applies
   in a file named by `--config` or `FERROFIN_CONFIG_FILE`.
+- **Dashboard → Restart applies `config.toml`.** The in-process restart used to come back
+  on the configuration the process started with; it now loads `config.toml` again, so an
+  edit made and forgotten applies at the next dashboard restart. The data, configuration and
+  cache directories, `log_level` and `metrics_scan_duration_buckets` still need a restart of
+  the process (the log names any that changed). A `config.toml` that no longer loads is logged as an error
+  and the server comes back on its previous configuration.
 
 ## Unreleased — Live TV sources and guides follow Jellyfin more closely
 

@@ -19,6 +19,24 @@ The startup log's `paths` line names the file (`config_file`) and whether it was
 Everything below has a working default except where noted; a bare `cargo run -p ferrofin-server`
 boots.
 
+### When a change applies
+
+A change to `config.toml` applies at the next restart, whether that is a restart of the server
+process or the in-process restart that **Dashboard → Restart** (`POST /System/Restart`) and a
+backup restore run: the in-process restart loads the configuration again. These settings are
+held for the life of the process, so they need the process itself to restart:
+
+- the directories: `data_dir`, `config_dir`, `cache_dir` (`web_dir` is not among them: the
+  in-process restart serves the web client from its new value);
+- `log_level` (logging is set up once per process);
+- `metrics_scan_duration_buckets` (the metrics pipeline is set up once per process).
+
+When one of them has changed, the in-process restart keeps its current value and logs a warning
+naming it. When `config.toml` no longer loads (a syntax error, an invalid value), the in-process
+restart logs an error naming the file and comes back on the configuration it was running; at a
+process start the same file stops the server. Environment variables and flags are read from the
+process, so a change to one applies only when the process restarts.
+
 ## Paths
 
 | Variable | Default | Purpose |

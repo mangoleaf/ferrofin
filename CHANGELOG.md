@@ -953,6 +953,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   The startup log names the file (`config_file`, `config_file_found`), and a `data_dir` key in
   a file found in the data directory is ignored with a warning (see
   [docs/UPGRADING.md](docs/UPGRADING.md))
+- Dashboard → Restart loads `config.toml` again, so its changes apply without restarting the
+  process; the data, configuration and cache directories, `log_level` and
+  `metrics_scan_duration_buckets` keep their values until the process restarts (with a warning
+  naming them), and a file that no longer loads is logged and leaves the previous
+  configuration running. A `config.toml` parse error names the line and column but no longer
+  quotes the line, which may hold a password
 
 ## [1.0.0] - 2026-09-05
 
