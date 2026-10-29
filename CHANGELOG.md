@@ -42,6 +42,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   folders; play state moves to the placeholder item
 
 ### Tooling
+- A release's A/B gate compares against the latest release of the minor line before it (v1.4.1
+  against v1.3.2): for a release (its `release/vX.Y.Z` branch, or `--release vX.Y.Z` for a patch cut
+  from `main`), `gates/run --previous` and every `gates/bench/gate.py` mode that takes a previous
+  image refuse any other one and name the right one
 - `gates/adoption/run.sh` stops at once when terminated, under bash 5.2 too (a TERM was
   sometimes lost and the run waited out its deadlines); GitHub's shell-tests job gets a
   15-minute timeout

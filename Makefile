@@ -1,14 +1,16 @@
 # The gates (gates/README.md), from the repository root. Their output root comes from the environment
 # (FERROFIN_GATES_DIR). IMAGE, the Ferrofin image under test, defaults to the one gates/run names for the
-# checked-out commit; PREVIOUS, the previous release's image, makes bench the release A/B gate. Both are
-# taken from the command line only, never from the environment, where another tool may have set them:
+# checked-out commit; PREVIOUS, the previous release's image, makes bench the release A/B gate (the latest
+# release of the minor line before the release), and RELEASE names that release when the checkout is not
+# its release/vX.Y.Z branch (a patch cut from main). All are taken from the command line only, never from the environment, where
+# another tool may have set them:
 #   make run-gates IMAGE=ferrofin:v1.4.0-rc PREVIOUS=ghcr.io/mangoleaf/ferrofin:v1.3.2
 # There is deliberately no test, check or all target (they would read as the cargo workflow), and a bare
 # `make` only lists the targets: a gates session is never started by habit.
 
 .DEFAULT_GOAL := help
 cli = $(if $(filter command line,$(origin $(1))),$($(1)))
-GATES_RUN = $(strip gates/run $(if $(call cli,IMAGE),--image '$(IMAGE)') $(if $(call cli,PREVIOUS),--previous '$(PREVIOUS)'))
+GATES_RUN = $(strip gates/run $(if $(call cli,IMAGE),--image '$(IMAGE)') $(if $(call cli,PREVIOUS),--previous '$(PREVIOUS)') $(if $(call cli,RELEASE),--release '$(RELEASE)'))
 
 .PHONY: help run-gates run-verify run-adoption run-parity run-bench test-gates-offline publish-results
 
@@ -16,6 +18,7 @@ help:
 	@echo "make run-gates                 every gate against one image, as one session (gates/run all)"
 	@echo "make run-verify|run-adoption|run-parity|run-bench   one gate, as a session"
 	@echo "    IMAGE=<image>  the image under test; PREVIOUS=<image>  bench as the release A/B gate"
+	@echo "    RELEASE=vX.Y.Z  the release that gate is for, when not on its release/vX.Y.Z branch (a patch cut from main)"
 	@echo "make test-gates-offline        the gates' own tests: no docker, server or fixtures"
 	@echo "make publish-results VERSION=vX.Y.Z SESSION=DIR BENCH=\"RUN RUN RUN\"   the release's summary, README Results and graphs"
 

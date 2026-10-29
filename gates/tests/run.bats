@@ -56,7 +56,9 @@ EOS
   chmod +x bin/*
   PATH="$TMP/bin:$PATH"
   ORACLE=$(cat repo/gates/bench/testdata/jellyfin-image.txt)
-  export FAKE_CALLS="$TMP/calls" FAKE_IMAGES="ferrofin:test ferrofin:old $ORACLE" FAKE_REVISION=$COMMIT
+  local released=ghcr.io/mangoleaf/ferrofin   # the releases the A/B baseline tests name
+  export FAKE_CALLS="$TMP/calls" FAKE_REVISION=$COMMIT \
+    FAKE_IMAGES="ferrofin:test ferrofin:old $ORACLE $released:v1.3.2 $released:v1.3.2@sha256:abc $released:v1.4.0 ferrofin:v1.4.2"
   export FAKE_LATEST_TAG=v12.2   # the pin is the latest Jellyfin release unless a test says otherwise
   export FERROFIN_GATES_DIR="$TMP/root"
   ROOT=$FERROFIN_GATES_DIR
@@ -245,6 +247,41 @@ session() { # the one session directory made under the root
   run repo/gates/run bench --image ferrofin:test --previous ferrofin:old --dry-run
   [ "$status" -eq 0 ]
   [[ "$output" == *"oracle: measured against Jellyfin v12.2, the release this branch pins; the latest Jellyfin release could not be looked up"* ]]
+}
+
+@test "gates/run: a release branch's A/B gate compares against the latest release of the minor line before it" {
+  local v132=ghcr.io/mangoleaf/ferrofin:v1.3.2 v140=ghcr.io/mangoleaf/ferrofin:v1.4.0
+  git -C repo checkout -q -b release/v1.4.1
+  run repo/gates/run bench --image ferrofin:test --previous "$v132" --dry-run   # no tags: say how to get them
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"no v1.3 release tag in this checkout to compare release v1.4.1 against: git fetch --tags"* ]]
+  for tag in v1.2.0 v1.3.0 v1.3.2 v1.3.10-rc1 v1.4.0; do git -C repo tag "$tag"; done
+  run repo/gates/run bench --image ferrofin:test --previous "$v132" --dry-run
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"preflight: passed"* ]]
+  run repo/gates/run bench --image ferrofin:test --previous "$v140" --dry-run   # its own minor's x.0
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"the release A/B gate of v1.4.1 compares against v1.3.2, the latest v1.3 release: use $v132 as the previous image, not $v140"* ]]
+  git -C repo checkout -q -b release/v2.0.0
+  git -C repo tag v1.4.2
+  run repo/gates/run bench --image ferrofin:test --previous ferrofin:v1.4.2 --dry-run   # a major: the latest of the one before
+  [ "$status" -eq 0 ]
+}
+
+@test "gates/run: a patch cut from main names its release with --release; work in progress may A/B any image" {
+  local v132=ghcr.io/mangoleaf/ferrofin:v1.3.2
+  for tag in v1.3.2 v1.4.0; do git -C repo tag "$tag"; done
+  run repo/gates/run bench --image ferrofin:test --previous ferrofin:old --dry-run   # main, no --release: any image
+  [ "$status" -eq 0 ]
+  run repo/gates/run bench --image ferrofin:test --previous ferrofin:old --release v1.4.2 --dry-run
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"compares against v1.3.2, the latest v1.3 release: use $v132 as the previous image"* ]]
+  run repo/gates/run bench --image ferrofin:test --previous "$v132@sha256:abc" --release v1.4.2 --dry-run   # a pinned digest
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"gates/bench/gate.py ab $v132@sha256:abc ferrofin:test --out "*" --release v1.4.2"* ]]
+  run repo/gates/run bench --image ferrofin:test --release v1.4.2 --dry-run
+  [ "$status" -eq 2 ]
+  [[ "$output" == *"--release names the release an A/B gate is for: give --previous too"* ]]
 }
 
 @test "gates/run: the release A/B gate's refusals stop the preflight: an unreadable pin, a missing previous image, --previous without bench" {
