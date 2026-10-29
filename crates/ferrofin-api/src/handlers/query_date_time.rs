@@ -1,8 +1,11 @@
-//! ItemsController's DateTime query binding followed by ToUniversalTime.
+//! ASP.NET's `[FromQuery] DateTime?` binding, as every controller's value
+//! reaches the database.
 //!
 //! ASP.NET uses AdjustToUniversal | AllowWhiteSpaces, without AssumeUniversal:
-//! an offsetless value remains Unspecified until the controller converts it
-//! using the server's local time zone. LiveTV has a separate existing binder.
+//! an offsetless value remains Unspecified until ItemsController's
+//! ToUniversalTime, or EF's DateTimeKindValueConverter (ToUniversalTime on
+//! every parameter) for LiveTv, ActivityLog, NextUp and datePlayed, converts it
+//! using the server's local time zone.
 
 use chrono::{
     DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Timelike,
@@ -10,7 +13,8 @@ use chrono::{
 };
 use serde::{Deserialize, Deserializer};
 
-pub(super) fn deserialize_optional_premiere_date<'de, D>(
+/// Binds an optional `DateTime` query parameter (a malformed value is a 400).
+pub(super) fn deserialize_optional_date_time<'de, D>(
     deserializer: D,
 ) -> Result<Option<DateTime<Utc>>, D::Error>
 where
@@ -20,9 +24,40 @@ where
     let Some(raw) = raw.as_deref().map(str::trim).filter(|raw| !raw.is_empty()) else {
         return Ok(None);
     };
-    parse_premiere_date(raw)
+    parse_date_time(raw)
         .map(Some)
-        .ok_or_else(|| serde::de::Error::custom("invalid premiere date"))
+        .ok_or_else(|| serde::de::Error::custom("invalid date-time"))
+}
+
+/// `LegacyDateTimeModelBinder` (PlaystateController's `datePlayed`): exactly
+/// `yyyyMMddHHmmss` read as UTC, else [`deserialize_optional_date_time`].
+pub(super) fn deserialize_optional_legacy_date_time<'de, D>(
+    deserializer: D,
+) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = raw.as_deref().filter(|raw| !raw.trim().is_empty()) else {
+        return Ok(None);
+    };
+    parse_legacy_date_time(raw)
+        .or_else(|| parse_date_time(raw.trim()))
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("invalid date-time"))
+}
+
+/// TryParseExact with "yyyyMMddHHmmss" and no AllowWhiteSpaces: fourteen
+/// digits, nothing else.
+fn parse_legacy_date_time(raw: &str) -> Option<DateTime<Utc>> {
+    if raw.len() != 14 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    // chrono reads second 60 as a leap second; .NET's `ss` stops at 59.
+    NaiveDateTime::parse_from_str(raw, "%Y%m%d%H%M%S")
+        .ok()
+        .filter(|value| value.year() >= 1 && value.nanosecond() < 1_000_000_000)
+        .map(|value| value.and_utc())
 }
 
 fn date_limits() -> Option<(NaiveDateTime, NaiveDateTime)> {
@@ -31,7 +66,7 @@ fn date_limits() -> Option<(NaiveDateTime, NaiveDateTime)> {
     Some((min, max))
 }
 
-fn parse_premiere_date(raw: &str) -> Option<DateTime<Utc>> {
+fn parse_date_time(raw: &str) -> Option<DateTime<Utc>> {
     let (whole, ticks) = split_fraction(raw)?;
     let (min, max) = date_limits()?;
     if let Ok(aware) = DateTime::parse_from_rfc3339(&whole) {
@@ -184,7 +219,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn premiere_dates_explicit_offsets_keep_source_fraction_and_boundaries() {
+    fn date_times_explicit_offsets_keep_source_fraction_and_boundaries() {
         for (raw, expected) in [
             (
                 "2026-01-02T03:04:05.0000001+02:00",
@@ -202,7 +237,7 @@ mod tests {
             ("0001-01-01T00:00:00+02:00", "0001-01-01T22:00:00Z"),
         ] {
             assert_eq!(
-                parse_premiere_date(raw),
+                parse_date_time(raw),
                 Some(expected.parse().unwrap()),
                 "{raw}"
             );
@@ -216,7 +251,25 @@ mod tests {
             "2016-12-31T23:59:60Z",
             "2026-01-02T03:04:05.Z",
         ] {
-            assert!(parse_premiere_date(raw).is_none(), "{raw}");
+            assert!(parse_date_time(raw).is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn legacy_date_times_are_exactly_fourteen_digits_read_as_utc() {
+        assert_eq!(
+            parse_legacy_date_time("20261028123456"),
+            Some("2026-10-28T12:34:56Z".parse().unwrap())
+        );
+        for raw in [
+            "00001028123456",
+            "20261328123456",
+            "20261028123460",
+            " 20261028123456",
+            "2026102812345",
+            "202610281234567",
+        ] {
+            assert!(parse_legacy_date_time(raw).is_none(), "{raw}");
         }
     }
 }

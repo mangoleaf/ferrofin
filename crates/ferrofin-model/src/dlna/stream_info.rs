@@ -777,6 +777,8 @@ impl StreamInfo {
     ) -> Option<SubtitleStreamInfo> {
         let media_source = self.media_source.as_ref()?;
 
+        // Upstream passes the stream's `SubProtocol`: an HLS transcode never
+        // considers an embedded delivery, whatever its segment container.
         let subtitle_profile = StreamBuilder::get_subtitle_profile(
             media_source,
             stream,
@@ -784,7 +786,7 @@ impl StreamInfo {
             self.play_method,
             transcoder_support,
             self.container.as_deref(),
-            None,
+            Some(self.sub_protocol),
         );
 
         let mut info = SubtitleStreamInfo {

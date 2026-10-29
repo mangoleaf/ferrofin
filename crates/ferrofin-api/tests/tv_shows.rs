@@ -576,7 +576,8 @@ impl LibraryManager for StubLibrary {
     }
 }
 
-/// A [`TvSeriesManager`] returning a fixed one-episode next-up queue.
+/// A [`TvSeriesManager`] returning a fixed one-episode next-up queue. The
+/// episode's `PremiereDate` echoes the bound `nextUpDateCutoff`.
 struct StubTvSeries;
 
 #[async_trait]
@@ -592,6 +593,7 @@ impl TvSeriesManager for StubTvSeries {
             vec![BaseItemDto {
                 id: Uuid::from_u128(0x9E27),
                 name: Some("Next Episode".to_owned()),
+                premiere_date: query.next_up_date_cutoff,
                 ..BaseItemDto::default()
             }],
         ))
@@ -707,6 +709,35 @@ async fn next_up_returns_queue() {
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("next up");
     assert_eq!(result.total_record_count, 1);
     assert_eq!(result.items[0].name.as_deref(), Some("Next Episode"));
+}
+
+/// `[FromQuery] DateTime? nextUpDateCutoff` binds through ASP.NET's default
+/// binder, and EF's `ToUniversalTime` reads an offset-less value as server
+/// time. jellyfin-web 12.x sends a bare date (`toIsoDateOnlyString`).
+#[tokio::test]
+async fn next_up_binds_a_date_only_cutoff_as_server_local_time() {
+    if ferrofin_api::test_support::rerun_in_time_zone(
+        "next_up_binds_a_date_only_cutoff_as_server_local_time",
+    ) {
+        return;
+    }
+    let bound = |uri: &'static str| async move {
+        let (status, body) = get(uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("next up");
+        result.items[0].premiere_date
+    };
+    // Midnight in Asia/Kolkata (+05:30).
+    assert_eq!(
+        bound("/Shows/NextUp?nextUpDateCutoff=2025-10-28").await,
+        Some("2025-10-27T18:30:00Z".parse().expect("date"))
+    );
+    assert_eq!(
+        bound("/Shows/NextUp?nextUpDateCutoff=2025-10-28T00:00:00.000Z").await,
+        Some("2025-10-28T00:00:00Z".parse().expect("date"))
+    );
+    let (status, _) = get("/Shows/NextUp?nextUpDateCutoff=yesterday").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
