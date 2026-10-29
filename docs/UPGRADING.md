@@ -8,6 +8,24 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — `{data_dir}/config.toml` is read for every data directory
+
+- **A `config.toml` in the data directory now applies however the data directory is named.**
+  It used to be read only when `FERROFIN_DATA_DIR` named the data directory: a server started
+  with `--data-dir`, or on the default data directory (`$XDG_DATA_HOME/ferrofin`,
+  `~/.local/share/ferrofin`, `/var/lib/ferrofin`), ignored it. If such a file was left there
+  and forgotten, its settings (the port, the bind address, `base_url` and the rest) take
+  effect at the next start: check `{data_dir}/config.toml` before upgrading. The startup log
+  now names the file it read (`config_file`, `config_file_found`). With both `--data-dir`
+  and `FERROFIN_DATA_DIR`, the file is read from the flag's directory, as the data is.
+  The Docker image (it sets `FERROFIN_DATA_DIR`) and the Debian package (its unit passes
+  `--config`) are unaffected.
+- **A blank `FERROFIN_CONFIG_FILE` counts as unset.** It used to name an empty path, so no
+  file was read at all; now `{data_dir}/config.toml` is read, as when the variable is unset.
+- **A `data_dir` key in a `config.toml` found in the data directory is ignored**, with a
+  warning in the log: the file cannot move the directory it was found in. It still applies
+  in a file named by `--config` or `FERROFIN_CONFIG_FILE`.
+
 ## Unreleased — Live TV sources and guides follow Jellyfin more closely
 
 - **A local M3U playlist is opened exactly as configured.** An M3U tuner configured as a

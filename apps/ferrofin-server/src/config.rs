@@ -53,6 +53,10 @@ const SYSTEM_DATA_DIR: &str = "/var/lib/ferrofin";
 /// The file stem of the SQLite database inside the data directory.
 const DATABASE_FILE_NAME: &str = "ferrofin.db";
 
+/// The bootstrap file's name inside the data directory, where it is read
+/// from unless `--config` or `FERROFIN_CONFIG_FILE` names another.
+const CONFIG_FILE_NAME: &str = "config.toml";
+
 /// ASP.NET's `HostOptions.ShutdownTimeout` default, which Jellyfin runs with.
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u32 = 30;
 
@@ -94,9 +98,11 @@ pub struct Cli {
     #[arg(long = "ffmpeg", value_name = "PATH")]
     pub ffmpeg_path: Option<PathBuf>,
 
-    /// Path to an optional `config.toml` bootstrap file.
+    /// Path to an optional `config.toml` bootstrap file
+    /// (overrides `FERROFIN_CONFIG_FILE`).
     ///
-    /// When omitted, `{data_dir}/config.toml` is consulted if present.
+    /// When omitted, `config.toml` in the data directory (`--data-dir`, else
+    /// `FERROFIN_DATA_DIR`, else the default location) is read if present.
     #[arg(long = "config", value_name = "FILE")]
     pub config_file: Option<PathBuf>,
 }
@@ -263,14 +269,32 @@ impl ProviderEndpoints {
 /// ffmpeg discovery, and fresh-install seeding.
 // Field names deliberately mirror the `FERROFIN_*` env-var stems / `config.toml`
 // keys (`config_dir`, `cache_dir`, ...), so the `_dir` suffix repeating the
-// struct name is intentional and keeps the three config layers 1:1.
-#[allow(clippy::struct_field_names)]
+// struct name is intentional and keeps the three config layers 1:1. Its bools
+// are independent settings and facts, not the states of one machine.
+#[allow(clippy::struct_field_names, clippy::struct_excessive_bools)]
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Program-data root; derives the `data`/`config`/`cache`/`log`/`web`
     /// sub-directories. From `--data-dir` / `FERROFIN_DATA_DIR`, else
     /// `$XDG_DATA_HOME/ferrofin`, else [`SYSTEM_DATA_DIR`].
     pub data_dir: PathBuf,
+
+    /// The bootstrap `config.toml` this configuration was read from, or would
+    /// have been: `--config`, else `FERROFIN_CONFIG_FILE`, else
+    /// `{data_dir}/config.toml` for the data directory `--data-dir`,
+    /// `FERROFIN_DATA_DIR` or the default location names (never a `data_dir`
+    /// set inside the file itself). Whether it existed is
+    /// [`config_file_found`](Self::config_file_found).
+    pub config_file: PathBuf,
+
+    /// Whether [`config_file`](Self::config_file) existed and was read.
+    pub config_file_found: bool,
+
+    /// What loading noticed and set aside without failing, e.g. a key the
+    /// file may not set. Loading runs before logging starts, so the server
+    /// logs these once it has, each with [`config_file`](Self::config_file)
+    /// as its `path`.
+    pub load_warnings: Vec<String>,
 
     /// Configuration directory holding `system.json` + `branding.json`.
     /// From `FERROFIN_CONFIG_DIR`, else `{data_dir}/config`.
@@ -648,14 +672,40 @@ impl Config {
     // line per config field, so the length is inherent (cf. `build_app_state`).
     #[allow(clippy::too_many_lines)]
     fn load_from(cli: Cli, env: &dyn Env) -> anyhow::Result<Self> {
-        let file = load_file_config(cli.config_file.as_deref(), env)?;
-
-        // data_dir: CLI > env > file > $XDG_DATA_HOME/ferrofin > /var/lib/ferrofin.
-        let data_dir = cli
+        let mut load_warnings = Vec::new();
+        let chosen_data_dir = cli
             .data_dir
-            .or_else(|| env.var("FERROFIN_DATA_DIR").map(PathBuf::from))
-            .or(file.data_dir)
-            .unwrap_or_else(|| default_data_dir(env));
+            .or_else(|| env.var("FERROFIN_DATA_DIR").map(PathBuf::from));
+        let named_file = cli.config_file.or_else(|| {
+            env.var("FERROFIN_CONFIG_FILE")
+                .filter(|s| !s.trim().is_empty())
+                .map(PathBuf::from)
+        });
+
+        // data_dir: CLI > env > file > $XDG_DATA_HOME/ferrofin > /var/lib/ferrofin,
+        // where the file may set it only when `--config`/`FERROFIN_CONFIG_FILE`
+        // named the file: one found in the data directory cannot move it.
+        let (data_dir, config_file, file, config_file_found) = if let Some(config_file) = named_file
+        {
+            let (file, found) = load_file_config(&config_file)?;
+            let data_dir = chosen_data_dir
+                .or_else(|| file.data_dir.clone())
+                .unwrap_or_else(|| default_data_dir(env));
+            (data_dir, config_file, file, found)
+        } else {
+            let data_dir = chosen_data_dir.unwrap_or_else(|| default_data_dir(env));
+            let config_file = data_dir.join(CONFIG_FILE_NAME);
+            let (file, found) = load_file_config(&config_file)?;
+            if let Some(ignored) = file.data_dir.as_ref().filter(|dir| **dir != data_dir) {
+                load_warnings.push(format!(
+                    "data_dir `{}` in config.toml is ignored: a config.toml found in the data \
+                     directory cannot move it; set --data-dir or FERROFIN_DATA_DIR, or name \
+                     the file with --config or FERROFIN_CONFIG_FILE",
+                    ignored.display()
+                ));
+            }
+            (data_dir, config_file, file, found)
+        };
 
         let config_dir = env
             .var("FERROFIN_CONFIG_DIR")
@@ -787,6 +837,9 @@ impl Config {
 
         Ok(Self {
             data_dir,
+            config_file,
+            config_file_found,
+            load_warnings,
             config_dir,
             cache_dir,
             web_dir,
@@ -1008,6 +1061,9 @@ impl Config {
     pub fn test_stub(root: &Path) -> Self {
         Config {
             data_dir: root.join("data"),
+            config_file: root.join("data").join(CONFIG_FILE_NAME),
+            config_file_found: false,
+            load_warnings: Vec::new(),
             config_dir: root.join("config"),
             cache_dir: root.join("cache"),
             web_dir: root.join("web"),
@@ -1205,34 +1261,22 @@ fn resolve_trickplay_concurrency(
     }
 }
 
-/// Reads and parses the optional `config.toml`.
-///
-/// The file is looked up at, in order: the `--config` flag, `FERROFIN_CONFIG_FILE`
-/// env var, else `{data_dir}/config.toml` when `FERROFIN_DATA_DIR` is set. A
-/// missing file yields an empty (all-`None`) config — never an error.
-fn load_file_config(explicit: Option<&Path>, env: &dyn Env) -> anyhow::Result<FileConfig> {
-    let path = explicit
-        .map(Path::to_path_buf)
-        .or_else(|| env.var("FERROFIN_CONFIG_FILE").map(PathBuf::from))
-        .or_else(|| {
-            env.var("FERROFIN_DATA_DIR")
-                .map(|d| PathBuf::from(d).join("config.toml"))
-        });
-
-    let Some(path) = path else {
-        return Ok(FileConfig::default());
-    };
+/// Reads and parses the optional `config.toml` at `path` (chosen by
+/// [`Config::load_from`]), and says whether it existed. A missing file yields
+/// an empty (all-`None`) config — never an error.
+fn load_file_config(path: &Path) -> anyhow::Result<(FileConfig, bool)> {
     if !path.exists() {
-        return Ok(FileConfig::default());
+        return Ok((FileConfig::default(), false));
     }
 
     let settings = config::Config::builder()
-        .add_source(config::File::from(path.as_path()))
+        .add_source(config::File::from(path))
         .build()
         .map_err(|e| anyhow::anyhow!("failed to read config file `{}`: {e}", path.display()))?;
-    settings
+    let file = settings
         .try_deserialize()
-        .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))
+        .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))?;
+    Ok((file, true))
 }
 
 /// The default program-data root: `$XDG_DATA_HOME/ferrofin`, else
@@ -1311,8 +1355,19 @@ mod tests {
     /// A fake environment backed by a map — no real `std::env` mutation.
     struct FakeEnv(HashMap<String, String>);
 
+    /// `XDG_DATA_HOME` in [`FakeEnv::new`]: a directory no host has, so a test
+    /// that names no data directory reads no `config.toml` of the host's.
+    const NOWHERE: &str = "/nonexistent/ferrofin-config-test";
+
     impl FakeEnv {
+        /// An environment that sets only `XDG_DATA_HOME`, to [`NOWHERE`].
         fn new() -> Self {
+            Self::empty().with("XDG_DATA_HOME", NOWHERE)
+        }
+
+        /// An environment that sets nothing at all, for the tests of the
+        /// default data directory's fallbacks.
+        fn empty() -> Self {
             Self(HashMap::new())
         }
 
@@ -1332,6 +1387,7 @@ mod tests {
     fn defaults_apply_with_empty_env_and_cli() {
         let env = FakeEnv::new();
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.data_dir, PathBuf::from(NOWHERE).join("ferrofin"));
         assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
         assert_eq!(cfg.https_port, DEFAULT_HTTPS_PORT);
         assert_eq!(cfg.bind_addr.to_string(), DEFAULT_BIND_ADDR);
@@ -1342,8 +1398,6 @@ mod tests {
         assert_eq!(cfg.base_url, "");
         assert!(cfg.library_roots.is_empty(), "{:?}", cfg.library_roots);
         assert!(cfg.ffmpeg_path.is_none());
-        // With no XDG/HOME the system location is used.
-        assert_eq!(cfg.data_dir, PathBuf::from(SYSTEM_DATA_DIR));
         assert_eq!(
             cfg.websocket_min_stream_period_ms,
             DEFAULT_WS_MIN_STREAM_PERIOD_MS
@@ -1400,9 +1454,22 @@ mod tests {
 
     #[test]
     fn home_fallback_when_no_xdg() {
-        let env = FakeEnv::new().with("HOME", "/home/u");
+        let env = FakeEnv::empty().with("HOME", "/home/u");
         let cfg = Config::load_from(Cli::default(), &env).unwrap();
         assert_eq!(cfg.data_dir, PathBuf::from("/home/u/.local/share/ferrofin"));
+    }
+
+    /// With no `XDG_DATA_HOME` and no `HOME`, the system location. It reads
+    /// the host's `/var/lib/ferrofin/config.toml` if there is one, which
+    /// cannot move the data directory it was found in.
+    #[test]
+    fn system_data_dir_when_no_xdg_and_no_home() {
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::empty()).unwrap();
+        assert_eq!(cfg.data_dir, PathBuf::from(SYSTEM_DATA_DIR));
+        assert_eq!(
+            cfg.config_file,
+            PathBuf::from(SYSTEM_DATA_DIR).join("config.toml")
+        );
     }
 
     #[test]
@@ -1488,6 +1555,178 @@ mod tests {
             "10.0.0.1",
             "file bind_addr applies"
         );
+    }
+
+    /// `{data_dir}/config.toml` is read whatever names the data directory:
+    /// the `--data-dir` flag, `FERROFIN_DATA_DIR`, or the default location.
+    #[test]
+    fn config_toml_in_the_data_dir_is_read_however_the_data_dir_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let flag_dir = dir.path().join("flag");
+        let env_dir = dir.path().join("env");
+        let xdg = dir.path().join("xdg");
+        let default_dir = xdg.join("ferrofin");
+        for (data_dir, port) in [(&flag_dir, 5001), (&env_dir, 5002), (&default_dir, 5003)] {
+            std::fs::create_dir_all(data_dir).unwrap();
+            std::fs::write(data_dir.join("config.toml"), format!("port = {port}\n")).unwrap();
+        }
+
+        let by_flag = Cli {
+            data_dir: Some(flag_dir.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(by_flag, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.port, 5001, "--data-dir names the file");
+        assert_eq!(cfg.config_file, flag_dir.join("config.toml"));
+        assert!(cfg.config_file_found);
+
+        let env = FakeEnv::new().with("FERROFIN_DATA_DIR", env_dir.to_str().unwrap());
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.port, 5002, "FERROFIN_DATA_DIR names the file");
+        assert_eq!(cfg.config_file, env_dir.join("config.toml"));
+
+        let env = FakeEnv::new().with("XDG_DATA_HOME", xdg.to_str().unwrap());
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.port, 5003, "the default data dir names the file");
+        assert_eq!(cfg.data_dir, default_dir);
+        assert_eq!(cfg.config_file, default_dir.join("config.toml"));
+    }
+
+    /// The flag beats the variable for the file as it does for the data
+    /// directory, so `FERROFIN_DATA_DIR=/a --data-dir /b` reads
+    /// `/b/config.toml`, never `/a/config.toml`.
+    #[test]
+    fn the_data_dir_flag_names_the_config_file_over_the_env_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        for (data_dir, port) in [(&a, 5001), (&b, 5002)] {
+            std::fs::create_dir_all(data_dir).unwrap();
+            std::fs::write(data_dir.join("config.toml"), format!("port = {port}\n")).unwrap();
+        }
+        let env = FakeEnv::new().with("FERROFIN_DATA_DIR", a.to_str().unwrap());
+        let cli = Cli {
+            data_dir: Some(b.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(cfg.data_dir, b);
+        assert_eq!(cfg.port, 5002);
+        assert_eq!(cfg.config_file, b.join("config.toml"));
+    }
+
+    /// No file in the data directory: the path it would be read from is
+    /// still resolved (and logged), and nothing is read.
+    #[test]
+    fn a_missing_config_toml_still_names_where_it_was_looked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = Cli {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.config_file, dir.path().join("config.toml"));
+        assert!(!cfg.config_file_found);
+        assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+    }
+
+    /// `data_dir` inside the file applies only to a file named by `--config`
+    /// or `FERROFIN_CONFIG_FILE`. Found in the data directory, the file cannot
+    /// move that directory: the key is ignored with a warning naming it.
+    #[test]
+    fn data_dir_in_the_file_applies_only_to_a_file_named_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&data).unwrap();
+        let body = format!(
+            "data_dir = {:?}\nport = 5004\n",
+            elsewhere.to_str().unwrap()
+        );
+        std::fs::write(data.join("config.toml"), &body).unwrap();
+
+        let cli = Cli {
+            data_dir: Some(data.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(
+            cfg.data_dir, data,
+            "the file found in the data dir cannot move it"
+        );
+        assert_eq!(cfg.port, 5004, "the file's other keys still apply");
+        assert_eq!(cfg.load_warnings.len(), 1, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("data_dir"),
+            "{:?}",
+            cfg.load_warnings
+        );
+
+        let env = FakeEnv::new().with(
+            "FERROFIN_CONFIG_FILE",
+            data.join("config.toml").to_str().unwrap(),
+        );
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.data_dir, elsewhere, "a file named explicitly sets it");
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+    }
+
+    /// `--config` beats `FERROFIN_CONFIG_FILE`; a blank variable is unset, so
+    /// the data directory's file is read; a named file that does not exist
+    /// is no error and reads nothing, even with a data-dir file present.
+    #[test]
+    fn a_named_config_file_wins_and_a_blank_variable_is_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (flag_file, env_file) = (dir.path().join("flag.toml"), dir.path().join("env.toml"));
+        std::fs::write(&flag_file, "port = 5001\n").unwrap();
+        std::fs::write(&env_file, "port = 5002\n").unwrap();
+        std::fs::write(dir.path().join("config.toml"), "port = 5003\n").unwrap();
+        let data_dir = dir.path().to_str().unwrap();
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_DATA_DIR", data_dir)
+            .with("FERROFIN_CONFIG_FILE", env_file.to_str().unwrap());
+        let cli = Cli {
+            config_file: Some(flag_file.clone()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!((cfg.port, cfg.config_file), (5001, flag_file));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_DATA_DIR", data_dir)
+            .with("FERROFIN_CONFIG_FILE", "  ");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.port, 5003, "a blank FERROFIN_CONFIG_FILE is unset");
+        assert_eq!(cfg.config_file, dir.path().join("config.toml"));
+
+        let missing = dir.path().join("missing.toml");
+        let env = FakeEnv::new()
+            .with("FERROFIN_DATA_DIR", data_dir)
+            .with("FERROFIN_CONFIG_FILE", missing.to_str().unwrap());
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(
+            cfg.port, DEFAULT_HTTP_PORT,
+            "the named file, not the data dir's"
+        );
+        assert_eq!(cfg.config_file, missing);
+        assert!(!cfg.config_file_found);
+    }
+
+    /// A `data_dir` key naming the directory the file was found in changes
+    /// nothing, so it draws no warning.
+    #[test]
+    fn data_dir_in_the_file_naming_its_own_directory_is_no_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = format!("data_dir = {:?}\n", dir.path().to_str().unwrap());
+        std::fs::write(dir.path().join("config.toml"), body).unwrap();
+        let cli = Cli {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert!(cfg.config_file_found);
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
     }
 
     /// The config file is TOML: a file named for another format is refused,

@@ -948,6 +948,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   checks the collector against the system trust store. It refused an https endpoint before, and
   that went unlogged, like every other exporter outcome: the server logged them before its
   log output was set up. The startup log now says whether traces are exported, or why not
+- `{data_dir}/config.toml` is read for a data directory named by `--data-dir` or the default
+  location, not only by `FERROFIN_DATA_DIR`; with both, the flag's directory names the file.
+  The startup log names the file (`config_file`, `config_file_found`), and a `data_dir` key in
+  a file found in the data directory is ignored with a warning (see
+  [docs/UPGRADING.md](docs/UPGRADING.md))
 
 ## [1.0.0] - 2026-09-05
 

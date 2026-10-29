@@ -86,6 +86,8 @@ fn log_startup_banner(config: &Config) {
     );
     tracing::info!(
         data_dir = %config.data_dir.display(),
+        config_file = %config.config_file.display(),
+        config_file_found = config.config_file_found,
         config_dir = %config.config_dir.display(),
         cache_dir = %config.cache_dir.display(),
         web_dir = %config.web_dir.display(),
@@ -287,6 +289,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // buffered file-log lines flush rather than being discarded on exit.
     let _log_guard = init_tracing(&config);
     log_startup_banner(&config);
+    log_load_warnings(&config);
     // The Prometheus pipeline is process-global (OTel meter provider + the
     // set-once HTTP instruments), so it lives across in-process restarts.
     let mut metrics = None;
@@ -315,6 +318,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // loses the last spans is a bug. No-op when trace export is disabled.
     shutdown_tracing();
     Ok(())
+}
+
+/// Logs what loading `config` set aside ([`Config::load_warnings`]): loading
+/// runs before tracing is installed, so its findings are logged here instead.
+fn log_load_warnings(config: &Config) {
+    for warning in &config.load_warnings {
+        tracing::warn!(path = %config.config_file.display(), "{warning}");
+    }
 }
 
 /// Marks setup complete when the wizard flag says it is not but a configured

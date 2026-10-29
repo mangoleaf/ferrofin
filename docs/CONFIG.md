@@ -9,6 +9,13 @@ Ferrofin is configured three ways, **highest precedence first**:
    (`FERROFIN_BIND_ADDR` → `bind_addr`). The whole file is optional; a missing one is not an
    error. It is TOML and must be named `*.toml`: any other name (`config.json`, `config.yaml`, …) is refused.
 
+The file is `--config`, else `FERROFIN_CONFIG_FILE` (blank counts as unset), else `config.toml` in the data directory
+that `--data-dir`, `FERROFIN_DATA_DIR` or the default location names, in that order. A
+`data_dir` key in the file applies only to a file named by `--config` or `FERROFIN_CONFIG_FILE`:
+a file found in the data directory cannot move it, so the key is ignored there, with a warning.
+The startup log's `paths` line names the file (`config_file`) and whether it was found
+(`config_file_found`).
+
 Everything below has a working default except where noted; a bare `cargo run -p ferrofin-server`
 boots.
 
