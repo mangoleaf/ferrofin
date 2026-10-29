@@ -391,14 +391,14 @@ struct ItemsQuery {
     /// and converted to UTC.
     #[serde(
         default,
-        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+        deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time"
     )]
     min_date_last_saved: Option<DateTime<Utc>>,
     /// The minimum last-saved date of the caller's user data, bound and
     /// converted like `minDateLastSaved`.
     #[serde(
         default,
-        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+        deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time"
     )]
     min_date_last_saved_for_user: Option<DateTime<Utc>>,
     /// Restrict to metadata-locked (or unlocked) items (`IsLocked`).
@@ -478,13 +478,13 @@ struct ItemsQuery {
     /// Inclusive lower premiere-date bound, normalized to UTC.
     #[serde(
         default,
-        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+        deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time"
     )]
     min_premiere_date: Option<DateTime<Utc>>,
     /// Inclusive upper premiere-date bound, normalized to UTC.
     #[serde(
         default,
-        deserialize_with = "crate::handlers::item_dates::deserialize_optional_premiere_date"
+        deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time"
     )]
     max_premiere_date: Option<DateTime<Utc>>,
     /// Return this item and its immediate neighbours after sorting, before paging.

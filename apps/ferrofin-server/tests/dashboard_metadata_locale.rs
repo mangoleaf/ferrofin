@@ -2290,6 +2290,46 @@ async fn await_nfo_contents(path: &std::path::Path, predicate: impl Fn(&str) -> 
     }
 }
 
+/// Re-sends `post` until the NFO at `path` satisfies `predicate`.
+///
+/// Every queued library scan shares one worker, which keeps the culture of the
+/// request that started it (upstream's `Task.Run` worker). A request that
+/// arrives while an earlier request's worker still drains joins that worker and
+/// runs under its culture, so a culture-specific result only shows once a
+/// request finds the queue idle and starts a worker of its own.
+async fn post_until_nfo<F, Fut>(
+    path: &std::path::Path,
+    mut post: F,
+    predicate: impl Fn(&str) -> bool,
+) -> String
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // Together the 30 s `await_nfo_contents` allows.
+    const ATTEMPTS: u32 = 6;
+    const WAIT: Duration = Duration::from_secs(5);
+    let mut xml = String::new();
+    for _ in 0..ATTEMPTS {
+        post().await;
+        let deadline = Instant::now() + WAIT;
+        loop {
+            xml = std::fs::read_to_string(path).unwrap();
+            if predicate(&xml) {
+                return xml;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    panic!(
+        "{ATTEMPTS} requests, {WAIT:?} each: none started a worker that wrote the expected NFO {}: {xml}",
+        path.display()
+    );
+}
+
 // No item metadata edit occurs between these mutations and their sidecar
 // assertions. Generic UserData updates/start/progress intentionally do not
 // trigger the pinned hosted saver; rating/played/finished events do.
@@ -3127,9 +3167,19 @@ async fn verify_nfo_image_order_culture(
     }
     // This verifies Ferrofin's implemented queued caller path. The native full
     // library proof starts persistent workers with aligned Swedish culture;
-    // it does not establish that every worker inherits the latest request.
-    api.post(&format!("/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None&replaceAllMetadata=true&culture=sv-SE"), &Value::Null).await;
-    await_nfo_contents(&nfo, |xml| mapped_nfo_fanarts(xml) == sv).await;
+    // it does not establish that every worker inherits the latest request:
+    // the en-US refresh's worker may still be draining, so the request is
+    // re-sent until one starts a Swedish worker.
+    let sv_refresh = format!(
+        "/Items/{id}/Refresh?metadataRefreshMode=FullRefresh&imageRefreshMode=None&replaceAllMetadata=true&culture=sv-SE"
+    );
+    let no_body = Value::Null;
+    post_until_nfo(
+        &nfo,
+        || api.post(&sv_refresh, &no_body),
+        |xml| mapped_nfo_fanarts(xml) == sv,
+    )
+    .await;
     let response = api.client.post(format!("{}/Items/{id}/Images/Logo?culture=en-US", api.base))
         .header("Authorization", &api.auth).header("Content-Type", "image/png")
         .header("Accept-Language", "sv").header("Cookie", ".AspNetCore.Culture=c=sv|uic=sv")
@@ -3174,9 +3224,14 @@ async fn verify_nfo_image_order_culture(
         .find(|task| task["Key"] == "RefreshLibrary")
         .unwrap()["LastExecutionResult"]["EndTimeUtc"]
         .clone();
-    api.post("/Library/Refresh?culture=sv-SE", &Value::Null)
-        .await;
-    await_nfo_contents(&nfo, |xml| mapped_nfo_fanarts(xml) == sv).await;
+    // The scan joins a worker still draining an earlier request the same way
+    // the item refresh above can; each re-send cancels the run it replaces.
+    post_until_nfo(
+        &nfo,
+        || api.post("/Library/Refresh?culture=sv-SE", &no_body),
+        |xml| mapped_nfo_fanarts(xml) == sv,
+    )
+    .await;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let tasks = api.get("/ScheduledTasks").await;
@@ -3186,8 +3241,12 @@ async fn verify_nfo_image_order_culture(
             .iter()
             .find(|task| task["Key"] == "RefreshLibrary")
             .unwrap();
-        if task["State"] == "Idle" && task["LastExecutionResult"]["EndTimeUtc"] != previous_end {
-            assert_eq!(task["LastExecutionResult"]["Status"], "Completed");
+        // A run a re-send replaced ends Cancelled; wait for the last one.
+        if task["State"] == "Idle"
+            && task["LastExecutionResult"]["EndTimeUtc"] != previous_end
+            && task["LastExecutionResult"]["Status"] != "Cancelled"
+        {
+            assert_eq!(task["LastExecutionResult"]["Status"], "Completed", "{task}");
             break;
         }
         assert!(
@@ -3913,6 +3972,17 @@ async fn date_policy_scan(api: &Api) {
         .find(|task| task["Key"] == "RefreshLibrary")
         .unwrap();
     let id = task["Id"].as_str().unwrap();
+    // A run an earlier step started may still be going; its end must not be
+    // taken for this run's (starting a running task is refused anyway).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let task = loop {
+        let task = api.get(&format!("/ScheduledTasks/{id}")).await;
+        if task["State"] == "Idle" {
+            break task;
+        }
+        assert!(Instant::now() < deadline, "refresh task never idle: {task}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     let previous = task["LastExecutionResult"]["EndTimeUtc"].clone();
     api.post(&format!("/ScheduledTasks/Running/{id}"), &Value::Null)
         .await;
@@ -4000,17 +4070,29 @@ async fn verify_date_added_policy(api: &Api, root: &std::path::Path) {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let started = std::time::SystemTime::now();
         date_policy_scan(api).await;
+        // CI has seen the task Idle with a new end before this phase's movie
+        // was listed (cause not established); wait for the import itself, and
+        // bound the date by when it was seen.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let item = loop {
+            let result = api
+                .get("/Items?recursive=true&includeItemTypes=Movie&fields=DateCreated,Etag")
+                .await;
+            if let Some(item) = result["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["Name"] == phase)
+            {
+                break item.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "import phase did not persist: {result}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
         let finished = std::time::SystemTime::now();
-        let result = api
-            .get("/Items?recursive=true&includeItemTypes=Movie&fields=DateCreated,Etag")
-            .await;
-        let item = result["Items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["Name"] == phase)
-            .unwrap_or_else(|| panic!("import phase did not persist: {result}"))
-            .clone();
         let date = date_policy_ticks(&item);
         if creation {
             assert_eq!(date, born, "new creation-enabled import: {item}");

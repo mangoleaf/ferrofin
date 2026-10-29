@@ -830,68 +830,6 @@ fn remote_bitrate_limit(
     }
 }
 
-/// The HLS segment container to transcode into, constrained to Jellyfin's
-/// `supportedHlsContainers` ({`ts`, `mp4`}).
-///
-/// A `negotiated` value of `ts`/`mp4` is honoured; anything else (e.g. the source
-/// `mkv` from a DirectStream-remux path) falls back to a codec-appropriate
-/// choice: fMP4 (`mp4`) for HEVC/AV1 — which browsers can only decode as an
-/// `hvc1`/`av01`-tagged fragment — and MPEG-TS (`ts`) otherwise.
-fn hls_segment_container(negotiated: Option<&str>, source: &MediaSourceInfo) -> String {
-    // HEVC/AV1 must be fMP4 regardless of what the builder negotiated: browsers
-    // decode them via MSE only as an `hvc1`/`av01`-tagged mp4 fragment, never in
-    // MPEG-TS (HDR HEVC in TS is exactly what failed to start). This is also what
-    // jellyfin-web's `mp4` HLS transcoding profile selects for these codecs.
-    let needs_fmp4 = source
-        .video_stream()
-        .and_then(|v| v.codec.as_deref())
-        .is_some_and(|codec| {
-            codec.eq_ignore_ascii_case("hevc")
-                || codec.eq_ignore_ascii_case("h265")
-                || codec.eq_ignore_ascii_case("av1")
-        });
-    if needs_fmp4 {
-        return "mp4".to_owned();
-    }
-    // Otherwise honour a valid HLS container ({ts, mp4}); a remux path may hand
-    // back the source container (e.g. `mkv`), which is not one — fall back to `ts`.
-    match negotiated {
-        Some(c) if c.eq_ignore_ascii_case("mp4") => "mp4".to_owned(),
-        _ => "ts".to_owned(),
-    }
-}
-
-/// The HLS video transcoding profile's `MaxAudioChannels` for `container`, if
-/// the client's profile declares one.
-///
-/// Prefers the HLS video transcoding profile whose container matches the chosen
-/// segment container, falling back to any HLS video profile. Returns `None` when
-/// the profile sets no channel cap (then the source's channel count streams
-/// through unchanged, matching the pre-existing behaviour).
-fn hls_transcoding_max_audio_channels(profile: &DeviceProfile, container: &str) -> Option<i32> {
-    let mut fallback = None;
-    for p in &profile.transcoding_profiles {
-        if p.profile_type != DlnaProfileType::Video || p.protocol != MediaStreamProtocol::hls {
-            continue;
-        }
-        let Some(max) = p
-            .max_audio_channels
-            .as_deref()
-            .and_then(|c| c.trim().parse::<i32>().ok())
-        else {
-            continue;
-        };
-        if p.container
-            .split(',')
-            .any(|c| c.eq_ignore_ascii_case(container))
-        {
-            return Some(max);
-        }
-        fallback.get_or_insert(max);
-    }
-    fallback
-}
-
 /// The client's stream picks and limits, threaded from the PlaybackInfo
 /// query/body into the [`StreamBuilder`]'s [`MediaOptions`] and the
 /// resulting [`StreamInfo`](ferrofin_model::dlna::StreamInfo).
@@ -968,8 +906,9 @@ fn optimal_stream(
 
 /// Runs the DLNA [`StreamBuilder`] for one media source against the client's
 /// profile and stamps the resulting play decision onto it: direct-play stays as-is,
-/// otherwise `SupportsDirectPlay` is cleared and a `TranscodingUrl` (the HLS master
-/// / remux stream, with the negotiated codecs) is set so the client transcodes.
+/// otherwise `SupportsDirectPlay` is cleared and a `TranscodingUrl` (a video's HLS
+/// master playlist, an audio item's stream, with the negotiated codecs) is set so
+/// the client transcodes.
 /// Returns the decision summary for the metrics recorder ([`None`] when the
 /// builder produced no stream), or the error for a profile the builder cannot
 /// evaluate ([`optimal_stream`]).
@@ -1006,10 +945,23 @@ fn apply_stream_decision(
     options.media_source_id.clone_from(&source.id);
     options.device_id = device_id.map(str::to_owned);
     options.max_bitrate = max_streaming_bitrate;
-    // The client's capability veto (EnableDirectPlay/EnableDirectStream): the
-    // builder never picks a vetoed method.
+    // The client's direct-play veto (EnableDirectPlay): the builder never picks
+    // a vetoed method.
     options.enable_direct_play = flags.enable_direct_play;
-    options.enable_direct_stream = flags.enable_direct_stream;
+    // `SetDeviceSpecificData` switches the builder's direct stream off unless it
+    // is forced ("direct-stream http streaming is currently broken"), and
+    // PlaybackInfo never forces it. So a video that cannot be direct played is
+    // always negotiated against the client's transcoding profiles, and the
+    // container is the chosen profile's, never the source's. The audio builder
+    // does not read this option.
+    if !options.force_direct_stream {
+        options.enable_direct_stream = false;
+    }
+    // The client's stream-copy vetoes: the builder ranks a transcoding profile
+    // that can copy the video or audio ahead of one that must re-encode it only
+    // while copying is allowed (`MediaOptions` defaults both to off).
+    options.allow_video_stream_copy = flags.allow_video_stream_copy;
+    options.allow_audio_stream_copy = flags.allow_audio_stream_copy;
     // The client's explicit stream picks. A `-1` subtitle index ("off") passes
     // through as upstream: it matches no stream, whereas leaving it unset
     // would fall back to the default subtitle.
@@ -1074,47 +1026,31 @@ fn apply_stream_decision(
             support,
         )));
     }
-    // Not direct-play: deliver an HLS transcode. The negotiated codecs (typically
-    // copy the compatible video, re-encode only the incompatible audio) are carried
-    // on the StreamInfo; we pin the delivery to HLS because the builder can mislabel
-    // an audio-only re-encode as a raw-copy DirectStream, which would hand the client
-    // the untouched incompatible audio (the "video plays, no audio" case).
+    // Not direct-play: a transcode the builder negotiated against the client's
+    // transcoding profile (typically copying the compatible video and
+    // re-encoding only the incompatible audio). Ferrofin delivers every video
+    // transcode over HLS, so a profile whose protocol is `http` is pinned to
+    // HLS too, where upstream would stream it progressively.
+    // TODO(gl-1023): deliver an `http` profile's transcode progressively, as
+    // `StreamInfo.ToUrl` does, and drop this pin.
     stream.play_method = PlayMethod::Transcode;
     stream.sub_protocol = MediaStreamProtocol::hls;
-    // Choose a valid HLS segment container. Jellyfin's `supportedHlsContainers`
-    // is {ts, mp4}: honour the profile's choice when it is one of those, but the
-    // builder can hand back the *source* container (e.g. `mkv`) from a
-    // DirectStream-remux path — not a valid HLS segment container — so otherwise
-    // pick by the copied video codec. HEVC/AV1 must be fMP4 (browsers only decode
-    // them in an `hvc1`/`av01`-tagged mp4 fragment, never MPEG-TS); everything
-    // else stays on the broadly-compatible `ts`. Forcing `ts` unconditionally
-    // (the old behaviour) is what made HDR HEVC fail to start.
-    let container = hls_segment_container(stream.container.as_deref(), source);
-    stream.container = Some(container.clone());
+    // The segment container is the one the builder negotiated, the chosen
+    // profile's: `StreamInfo.ToUrl` writes it as `SegmentContainer` whatever
+    // the source's video codec. A browser that decodes HEVC/AV1 only in an
+    // `hvc1`/`av01` fMP4 fragment asks for it with an `mp4` HLS profile, as
+    // jellyfin-web does.
+    let container = stream.container.clone();
 
-    // The pin above invalidates a subtitle delivery method decided under the
-    // builder's DirectStream context (e.g. `Embed` — impossible in an HLS ts
-    // segment). Recompute it for the pinned Transcode+HLS state, exactly as the
-    // builder's own transcode branch would, so the `SubtitleMethod` baked into
-    // the transcoding URL agrees with the per-stream `DeliveryMethod` DTOs from
+    // A subtitle delivery the builder decided for an `http` profile (e.g.
+    // `Embed`) cannot be delivered in HLS. Recompute it for the pinned
+    // Transcode+HLS state, exactly as the builder's own transcode branch does
+    // for an HLS profile, so the `SubtitleMethod` baked into the transcoding
+    // URL agrees with the per-stream `DeliveryMethod` DTOs from
     // `apply_subtitle_delivery`. When they disagreed the transcode burned the
     // track in while the client also rendered the external VTT it was promised
     // — the same subtitle twice on screen.
-    set_hls_subtitle_delivery(&mut stream, source, profile, &container, support);
-
-    // Adopt the HLS transcoding profile's audio-channel cap. The builder can
-    // label this a raw-copy DirectStream (video copied, incompatible audio left
-    // to a container remux); Jellyfin would deliver that progressively over HTTP,
-    // where the browser's native pipeline decodes 7.1 AAC. We instead force an
-    // HLS *transcode* of the audio (above), which the browser decodes via MSE —
-    // and MSE can't handle >2ch AAC under a web profile. So downmix to the HLS
-    // profile's `MaxAudioChannels`, carried on the URL as
-    // `TranscodingMaxAudioChannels` → the transcoder's `-ac`. Without it the
-    // HDR HEVC video plays but the audio track is silent/undecodable.
-    if stream.transcoding_max_audio_channels.is_none() {
-        stream.transcoding_max_audio_channels =
-            hls_transcoding_max_audio_channels(profile, &container);
-    }
+    set_hls_subtitle_delivery(&mut stream, source, profile, container.as_deref(), support);
 
     source.supports_direct_play = false;
     source.supports_direct_stream = false;
@@ -1141,7 +1077,12 @@ fn apply_stream_decision(
     push_burn_in(&mut transcoding_url, &stream);
     source.transcoding_url = Some(transcoding_url);
     source.transcoding_sub_protocol = MediaStreamProtocol::hls;
-    source.transcoding_container = Some(container.clone());
+    // The builder stamps the chosen profile's container on the source it
+    // negotiates (`SetStreamInfoOptionsFromTranscodingProfile`); it works on a
+    // copy here. A source no profile was chosen for keeps its own.
+    if container.is_some() {
+        source.transcoding_container = container;
+    }
     apply_subtitle_delivery(source, &stream, support, token);
     Ok(Some(StreamDecision::transcode(&stream)))
 }
@@ -1221,7 +1162,7 @@ fn set_hls_subtitle_delivery(
     stream: &mut ferrofin_model::dlna::StreamInfo,
     source: &MediaSourceInfo,
     profile: &DeviceProfile,
-    container: &str,
+    container: Option<&str>,
     support: &FerrofinTranscoderSupport<'_>,
 ) {
     if let Some(index) = stream.subtitle_stream_index
@@ -1240,7 +1181,7 @@ fn set_hls_subtitle_delivery(
             &profile.subtitle_profiles,
             PlayMethod::Transcode,
             support,
-            Some(container),
+            container,
             Some(MediaStreamProtocol::hls),
         );
         stream.subtitle_delivery_method = subtitle_profile.method;
@@ -1809,9 +1750,7 @@ mod published_live_stream_path_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FerrofinTranscoderSupport, hls_segment_container, hls_transcoding_max_audio_channels,
-    };
+    use super::FerrofinTranscoderSupport;
     use ferrofin_model::data::MediaStreamProtocol;
     use ferrofin_model::dlna::{
         DeviceProfile, DlnaProfileType, TranscoderSupport, TranscodingProfile,
@@ -1959,48 +1898,6 @@ mod tests {
         assert_eq!(body.max_streaming_bitrate, Some(140_000_000));
     }
 
-    fn hls_video_profile(container: &str, max_channels: Option<&str>) -> TranscodingProfile {
-        TranscodingProfile {
-            container: container.to_owned(),
-            profile_type: DlnaProfileType::Video,
-            protocol: MediaStreamProtocol::hls,
-            max_audio_channels: max_channels.map(str::to_owned),
-            ..TranscodingProfile::default()
-        }
-    }
-
-    #[test]
-    fn hls_channel_cap_prefers_matching_container_then_falls_back() {
-        let profile = DeviceProfile {
-            transcoding_profiles: vec![
-                // A non-HLS profile is ignored even though it matches the container.
-                TranscodingProfile {
-                    container: "mp4".to_owned(),
-                    profile_type: DlnaProfileType::Video,
-                    protocol: MediaStreamProtocol::http,
-                    max_audio_channels: Some("6".to_owned()),
-                    ..TranscodingProfile::default()
-                },
-                hls_video_profile("ts", Some("2")),
-                hls_video_profile("mp4", Some("2")),
-            ],
-            ..DeviceProfile::default()
-        };
-        assert_eq!(hls_transcoding_max_audio_channels(&profile, "mp4"), Some(2));
-        assert_eq!(hls_transcoding_max_audio_channels(&profile, "ts"), Some(2));
-        // No container match → falls back to the first HLS video profile's cap.
-        assert_eq!(hls_transcoding_max_audio_channels(&profile, "mkv"), Some(2));
-    }
-
-    #[test]
-    fn hls_channel_cap_absent_when_profile_sets_none() {
-        let profile = DeviceProfile {
-            transcoding_profiles: vec![hls_video_profile("mp4", None)],
-            ..DeviceProfile::default()
-        };
-        assert_eq!(hls_transcoding_max_audio_channels(&profile, "mp4"), None);
-    }
-
     fn source_with_video(codec: &str) -> MediaSourceInfo {
         MediaSourceInfo {
             media_streams: vec![MediaStream {
@@ -2010,25 +1907,6 @@ mod tests {
             }],
             ..MediaSourceInfo::default()
         }
-    }
-
-    #[test]
-    fn hls_container_constrains_to_ts_or_mp4() {
-        let hevc = source_with_video("hevc");
-        let h264 = source_with_video("h264");
-        // HEVC/AV1 are ALWAYS fMP4 — even if the builder negotiated `ts` or the
-        // source `mkv` — because browsers can't decode them in MPEG-TS.
-        assert_eq!(hls_segment_container(Some("ts"), &hevc), "mp4");
-        assert_eq!(hls_segment_container(Some("mkv"), &hevc), "mp4");
-        assert_eq!(
-            hls_segment_container(None, &source_with_video("av1")),
-            "mp4"
-        );
-        // h264 honours a valid HLS container, else falls back to ts (never mkv).
-        assert_eq!(hls_segment_container(Some("MP4"), &h264), "mp4");
-        assert_eq!(hls_segment_container(Some("ts"), &h264), "ts");
-        assert_eq!(hls_segment_container(Some("mkv"), &h264), "ts");
-        assert_eq!(hls_segment_container(None, &h264), "ts");
     }
 
     #[test]
@@ -2354,14 +2232,15 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // one long fixture, one scenario
     fn pinned_transcode_subtitle_method_agrees_between_url_and_dto() {
-        // The double-subtitle regression: the builder decides DirectStream and,
-        // in that context, an Embed subtitle delivery. `apply_stream_decision`
-        // pins the result to Transcode+HLS — where embedding in a ts segment is
-        // impossible — so it must recompute the delivery. With the stale Embed
-        // the transcoding URL carried `SubtitleStreamIndex&SubtitleMethod=Embed`
-        // (→ the planner burned the track in) while the per-stream DTO promised
-        // External with a DeliveryUrl (→ the client overlaid the VTT): the same
-        // subtitle rendered twice on screen.
+        // The double-subtitle regression: the builder negotiates a transcode
+        // against an `http` mkv profile and, in that context, an Embed subtitle
+        // delivery. `apply_stream_decision` pins the result to HLS — where a
+        // subtitle cannot be embedded — so it must recompute the delivery. With
+        // the stale Embed the transcoding URL carried
+        // `SubtitleStreamIndex&SubtitleMethod=Embed` (→ the planner burned the
+        // track in) while the per-stream DTO promised External with a
+        // DeliveryUrl (→ the client overlaid the VTT): the same subtitle
+        // rendered twice on screen.
         use ferrofin_model::dlna::{DirectPlayProfile, SubtitleDeliveryMethod, SubtitleProfile};
         use uuid::Uuid;
 
@@ -2403,22 +2282,22 @@ mod tests {
                 profile_type: DlnaProfileType::Video,
             }],
             transcoding_profiles: vec![TranscodingProfile {
-                container: "ts".to_owned(),
+                container: "mkv".to_owned(),
                 profile_type: DlnaProfileType::Video,
-                protocol: MediaStreamProtocol::hls,
+                protocol: MediaStreamProtocol::http,
                 video_codec: "h264".to_owned(),
                 audio_codec: "aac".to_owned(),
                 ..TranscodingProfile::default()
             }],
             subtitle_profiles: vec![
-                // Matches under the DirectStream context (embedded subrip in mkv)…
+                // Matches for the `http` mkv transcode (embedded subrip in mkv)…
                 SubtitleProfile {
                     format: Some("subrip".to_owned()),
                     method: SubtitleDeliveryMethod::Embed,
                     container: Some("mkv".to_owned()),
                     ..SubtitleProfile::default()
                 },
-                // …but a ts HLS transcode can only deliver it externally.
+                // …but an HLS transcode can only deliver it externally.
                 SubtitleProfile {
                     format: Some("vtt".to_owned()),
                     method: SubtitleDeliveryMethod::External,
@@ -2427,8 +2306,8 @@ mod tests {
             ],
             ..DeviceProfile::default()
         };
-        // DirectPlay vetoed so the builder lands on DirectStream, which the
-        // handler pins to Transcode.
+        // DirectPlay vetoed so the builder negotiates the `http` transcode,
+        // which the handler pins to HLS.
         let flags = super::PlaybackFlags {
             enable_direct_play: false,
             ..super::PlaybackFlags::default()
@@ -2468,7 +2347,7 @@ mod tests {
         assert_eq!(
             sub.delivery_method,
             Some(SubtitleDeliveryMethod::External),
-            "ts HLS transcode delivers text subs externally"
+            "an HLS transcode delivers text subs externally"
         );
         assert!(
             sub.delivery_url.is_some(),
