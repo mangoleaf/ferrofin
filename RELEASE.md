@@ -193,6 +193,11 @@ from.
    two more `make run-bench IMAGE=<candidate>` sessions for the second and third comparison. They
    are publication inputs only: their numbers never decide a release, and parity is not a gate
    here. Keep the three session folders for step 6.
+   On a branch whose `UPSTREAM_TAG` moved since the corpus was last prepared, prepare it for
+   the new oracle first: `docker pull "$(cat gates/bench/testdata/jellyfin-image.txt)"`, move
+   `$FERROFIN_GATES_DIR/fixtures/bench-testdata/jellyfin/` aside, and run
+   `gates/bench/testdata/build.sh "$FERROFIN_GATES_DIR/fixtures/bench-testdata" --prepare-jellyfin`;
+   until then every run with Jellyfin refuses to start ("Jellyfin preparation does not match").
 
    **Validate adoption.** The evidence is a green run of the `Adoption` workflow
    (`.github/workflows/adoption.yml`) on the frozen release commit. It builds the image from

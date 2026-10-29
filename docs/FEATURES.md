@@ -1,7 +1,7 @@
 # Feature status
 
-**Parity: 7 / 412 operations deep-verified against Jellyfin v12.2** (`ca0f16eb7c`), none
-owed a re-check against an earlier release, 0 subsystem rows (as of 2026-10-19; the
+**Parity: 12 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+23 compared against v12.2 and owed a re-check, 0 subsystem rows (as of 2026-10-28; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
 Ferrofin answers the way Jellyfin does (identical, an accepted difference, filed, new), by API
@@ -33,8 +33,8 @@ with `FERROFIN_UPSTREAM_DIR` naming a Jellyfin checkout at `UPSTREAM_COMMIT`, pr
 upstream test project the Ferrofin rstest cases that cite an upstream test next to that
 project's `[InlineData]` count (1,833 cases against 2,677 at v12.2, as of 2026-10-19).
 
-Separately, [`gates/bench/`](../gates/bench/README.md) compares response *shapes* against Jellyfin
-12.0-rc7 each run, on a generated library scanned by a real Jellyfin. That is supporting
+Separately, [`gates/bench/`](../gates/bench/README.md) compares response *shapes* against the Jellyfin
+release `UPSTREAM_TAG` names each run, on a generated library scanned by a real Jellyfin. That is supporting
 evidence, not the parity number — it covers 28 requests and only the fields those requests
 happen to exercise.
 
