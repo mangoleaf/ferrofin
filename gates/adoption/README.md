@@ -1,7 +1,7 @@
 # Adoption smoke test
 
 Ferrofin supports in-place adoption of Jellyfin **10.11.8, 10.11.9, 10.11.10, 10.11.11,
-12.0.0, 12.1.0 and 12.2.0** databases. Adoption is one-way; returning to Jellyfin requires
+12.0.0, 12.1.0, 12.2.0, 12.3.0 and 12.4.0** databases. Adoption is one-way; returning to Jellyfin requires
 restoring a backup. Follow the
 [migration procedure](../../docs/INSTALL.md#migrate-an-existing-jellyfin-installation) for a
 real installation.
@@ -16,7 +16,9 @@ The 10.11 and 12.0–12.1 fixture paths below **passed** the live suite on **202
 (US/Mountain)**, against fixtures derived from a real library. The suite no longer uses real
 libraries: since 2026-10-14 every fixture is [synthetic](#the-fixtures-are-synthetic). All ten
 paths, 12.2 included, **passed** both `run.sh` and `synthetic.py run` on synthetic fixtures on
-**2026-10-17**; the synthetic results follow the table.
+**2026-10-17**; the synthetic results follow the table. All seventeen paths passed `run.sh` on
+**2026-10-29**, and the fourteen seeded paths also passed `synthetic.py run`; the three fresh
+installs are `run.sh`'s alone ([record](#2026-10-29-jellyfin-123-and-124-routes-gl-874)).
 
 Each test booted Ferrofin on a fresh copy of a Jellyfin database. The 10.11.8 fixture was the
 original snapshot; the others were produced by booting the corresponding Jellyfin releases on
@@ -34,7 +36,13 @@ copies, as shown below.
 | 12.2.0 | 10.11.8 → 12.2.0 | 107 | `12.2.0` | PASS (synthetic) |
 | 12.2.0 | 10.11.8 → 12.0.0 → 12.2.0 | 108 | `12.2.0` | PASS (synthetic) |
 | 12.2.0 | 10.11.8 → 12.0.0 → 12.1.0 → 12.2.0 | 109 | `12.2.0` | PASS (synthetic) |
-| 12.2.0 | Fresh 12.2 install (not upgraded) | 105 | `12.2.0` | pending — Adoption workflow |
+| 12.2.0 | Fresh 12.2 install (not upgraded) | 105 | `12.2.0` | PASS (synthetic, `run.sh`) |
+| 12.3.0 | 10.11.8 → 12.3.0 | 107 | `12.2.0` | PASS (synthetic) |
+| 12.3.0 | 10.11.8 → 12.0.0 → 12.1.0 → 12.2.0 → 12.3.0 | 109 | `12.2.0` | PASS (synthetic) |
+| 12.3.0 | Fresh 12.3 install (not upgraded) | 105 | `12.2.0` | PASS (synthetic, `run.sh`) |
+| 12.4.0 | 10.11.8 → 12.4.0 | 107 | `12.2.0` | PASS (synthetic) |
+| 12.4.0 | 10.11.8 → 12.0.0 → 12.1.0 → 12.2.0 → 12.3.0 → 12.4.0 | 109 | `12.2.0` | PASS (synthetic) |
+| 12.4.0 | Fresh 12.4 install (not upgraded) | 105 | `12.2.0` | PASS (synthetic, `run.sh`) |
 
 The gate in `crates/ferrofin-db/src/database.rs` matches migration **ID sets**, not just
 their counts or a version string. Releases sharing a set share the logged generation.
@@ -42,7 +50,11 @@ Both 12.1 paths are accepted because the older rating-level migration ID is opti
 both 12.2 paths because the 12.0-era and 12.1-era optional ids are carried forward. A fresh
 12.2 install carries the smallest set (105 ids, without the retired 10.11-era routines) and
 the fresh-install schema (no `IX_CustomItemDisplayPreferences_UserId`), yet still adopts as
-`12.2.0`; `0041` gives it that index. Unknown or incomplete histories are refused; the listed
+`12.2.0`; `0041` gives it that index. Jellyfin 12.3 and 12.4 add no EF migration and no code
+routine, so each of their routes records exactly the set of its 12.2 counterpart (107 ids from
+10.11.8, 109 on top of the 12.1 → 12.2 route, 105 on a first run; `build-fixtures.sh` checks the
+sets, not only the counts) and adopts as `12.2.0`, as 10.11.9 adopts as `10.11.8`.
+Unknown or incomplete histories are refused; the listed
 versions do not imply support for other 10.11.x or 12.x releases. Other upgrade routes were not
 separately exercised by the live run.
 
@@ -131,7 +143,9 @@ set (105) and schema and adopts as `12.2.0`. The offline gates all pass — `bat
 `run.sh`/`build-fixtures.sh` could not run on the author's host (its system `containerd` was
 down). The live result above is therefore recorded as **pending**: the `Adoption` workflow
 exercises this row on the next push to `release/v1.4.0`, and `release-gate` blocks the tag until
-it is green. Update the table row and this note once that run lands.
+it is green. Update the table row and this note once that run lands. **Update (2026-10-29):**
+the row has passed `run.sh`, first on 2026-10-21 (below) and again in the
+[2026-10-29 record](#2026-10-29-jellyfin-123-and-124-routes-gl-874).
 
 ### 2026-10-20 messy rows, first slice (gl-629)
 
@@ -227,12 +241,45 @@ built into a new directory and `synthetic.py run --only jellyfin-12.2-from-10` *
 stages, its page listing 35 checks under the same stage names as `run.sh`'s. The other paths of the
 matrix, and the messy shapes added to the messy fixtures later, were not run again for this change.
 
+### 2026-10-29 Jellyfin 12.3 and 12.4 routes (gl-874)
+
+The whole fixture set was built fresh by `build-fixtures.sh` at this change's recipe, with the
+official `jellyfin/jellyfin:12.3` and `jellyfin/jellyfin:12.4` images added. Each new route recorded
+exactly its 12.2 counterpart's EF id **set**, which the build checks: `jellyfin-12.3-from-122` and
+`jellyfin-12.4-from-123` 109 ids (as `jellyfin-12.2-from-121`), `jellyfin-12.3-from-10` and
+`jellyfin-12.4-from-10` 107 (as `jellyfin-12.2-from-10`), `jellyfin-12.3-fresh` and
+`jellyfin-12.4-fresh` 105 (as `jellyfin-12.2-fresh`). Every upgrade route ended with exactly 12.2's
+schema, and the fresh installs with 12.2's fresh-install schema. Jellyfin 12.4 (oracle image ID
+`sha256:fea863d0cd9ec445985d9c75fc6ed64e38a1d2766cf0c250a33d553f4fc1b771`) gives smoke answers that
+differ from 12.2's only in the version lines and the activity-log count, and a messy-shape record
+equal to 12.2's on both lineages, shape by shape and with all shapes combined.
+
+Image `ferrofin:v1.4.0-18-8a83f190`, built from `8a83f190` (`release/v1.5.0` plus this change's
+adoption commit), local image ID
+`sha256:3386eb71b163957ee206f4708a6cf3ee935db0f758c78211d93f3eb6ad423a27`. `run.sh` ran in a local
+gates session (`make run-adoption`) and compared answers with its adoption oracle, Jellyfin 12.4
+(the session's own oracle pin, which parity and the benchmark use, was still the 12.2 image);
+`synthetic.py run` and the boot below ran after it, on the same image and fixture directory:
+
+- `run.sh`: **PASS** on all 20 rows (17 paths, the two messy copies and the scale row), 0 failed, 0
+  incomplete, 0 skipped. The six new routes log generation `12.2.0`. The scale row: migration 2.6 s,
+  peak memory 1.4 GiB (cgroup, page cache included; anonymous 275.2 MiB), disk high-water 1.4 GiB
+  (WAL 145.9 MiB), `foreign_key_check` 0.2 s.
+- `synthetic.py run`: **PASS** on all 14 seeded paths at all four stages, 0 failed, 0 incomplete, 0
+  skipped (the three fresh installs are `run.sh`'s alone).
+- A boot on a fresh copy of `jellyfin-12.4-from-123` logs "adopted an existing Jellyfin database in
+  place" with generation `12.2.0` and the `jellyfin.db.pre-ferrofin` backup, and `GET
+  /System/Info/Public` answers `"Version": "12.4.0"`.
+
 ## What the live suite checks
 
 1. The boot log names the expected generation, reports completed database migrations and
    logs no `ERROR`.
 2. The read-only probes in `smoke.sh` produce the same normalised summaries as **Jellyfin
-   12.2** on the same library. IDs and image byte counts are normalised; server-info,
+   12.4**, the latest release, on the same library (`--oracle 12.1` or `12.2` compares with
+   an earlier one). A fresh-install row answers that release's fresh-install oracle (12.4's with
+   `--oracle 12.1`, which has no fresh-install fixture). IDs and
+   image byte counts are normalised; server-info,
    task, plugin, device, virtual-folder, activity-log and session lines are excluded.
    A 10.11 source has no music-artist credits until its first 12.x or Ferrofin scan
    (10.11 never creates them; 12.x creates them on a metadata refresh, `AudioFileProber`
@@ -254,8 +301,8 @@ matrix, and the messy shapes added to the messy fixtures later, were not run aga
    database and movie/episode API responses, including watched flags and progress.
 7. Every row of the Jellyfin-owned tables no other check covers survives each stage, bar
    the rewrites listed under the table digests below.
-8. After the eleven paths, two **messy** fixtures are adopted (see [Messy rows](#messy-rows)):
-   each shape of rows real databases carry ends as Jellyfin 12.2 left it, or as a divergence
+8. After the seventeen paths, two **messy** fixtures are adopted (see [Messy rows](#messy-rows)):
+   each shape of rows real databases carry ends as Jellyfin 12.4 left it, or as a divergence
    written down.
 9. Last, a **scale** fixture of 40,000 items is adopted (see [Scale fixture](#scale-fixture)):
    every cloned item and the rows that hang off it survive, and the run records the migration
@@ -359,7 +406,7 @@ asset, and shows:
   matrix, user accounts, seeded states and artwork);
 - the **table-digest differences** of a stage that lost or changed a row;
 - for a messy fixture, **each shape's end state next to the one it must reach** and where that
-  expectation comes from (Jellyfin 12.2's record, or the divergence written for it);
+  expectation comes from (the oracle release's record, Jellyfin 12.4's, or the divergence written for it);
 - for the scale fixture, the **measurements** (migration time, peak and anonymous memory, disk
   high-water, WAL peak, the `foreign_key_check` time) and which of them could not be taken.
 
@@ -419,12 +466,12 @@ one manifest entry (`messy.json`) per shape:
 | `gone_file_userdata` | a movie whose file is not there and the play state two users recorded for it |
 | `non_ascii_names` | three users whose names case mappings disagree on (Turkish dotted capital I, a sharp s, an e with a combining diaeresis, each, on 12.x, with a stored normalised name that is no normalisation of it), a person with a decomposed name, and a movie whose path has an accent, a decomposed accent and a symbol |
 
-They go into `jellyfin-10.11.11-messy` and `jellyfin-12.2-messy`, copies of the latest 10.11.x and
-the latest 12.x fixture (`jellyfin-12.2-from-121`), one per lineage: the 10.11 lineage runs 0032
+They go into `jellyfin-10.11.11-messy` and `jellyfin-12.4-messy`, copies of the latest 10.11.x and
+the latest 12.x fixture (`jellyfin-12.4-from-123`), one per lineage: the 10.11 lineage runs 0032
 and `FixIncorrectOwnerIdRelationships` on adoption, a 12.x database already has. The copies leave
-the eleven clean paths and their smoke oracle as the control; `build-fixtures.sh` builds them last.
+the clean paths and their smoke oracle as the control; `build-fixtures.sh` builds them last.
 
-**An item needs its file.** Jellyfin 12.2 removes, when it upgrades a 10.11 database, every
+**An item needs its file.** Jellyfin 12.2 and later remove, when they upgrade a 10.11 database, every
 non-folder item whose file is missing under a library location (`MigrateLinkedChildren`, see
 [the stale-file sweep](#the-stale-file-sweep)). A seeded row with no file would be gone before its
 shape showed anything, so every non-folder, non-virtual item a shape creates with a library path has a file: a hard link to its template's, in
@@ -434,8 +481,8 @@ alone has no file, on purpose: that is its shape. The seeded rows are independen
 never share a path with another shape's rows, name an original another shape rewrites, or copy another shape's rows, because the
 combined fixture is adopted and must end as each shape alone does (the build checks it).
 
-The expectation per shape is what **Jellyfin 12.2 itself did**, not an assumption:
-`messy.py build` pulls `jellyfin/jellyfin:12.2` (a stale local tag would record another release;
+The expectation per shape is what **the latest Jellyfin release (12.4) itself did**, not an assumption:
+`messy.py build` pulls `jellyfin/jellyfin:12.4` (a stale local tag would record another release;
 the image id goes into the record), boots it on a clean copy of the source carrying only that
 shape, waits for its tasks to settle, and records the outcome and the end state read from the
 database (`messy-oracle.json`). It then boots it once on a copy carrying every shape, because
@@ -456,9 +503,11 @@ database) ends the wait at once. Where Ferrofin is meant to end differently, `DI
 `messy.py` names the state it must reach and why; a difference that is not written there fails, a
 shape Jellyfin refuses needs a written expectation, and a fixture built with a different list of
 shapes is refused rather than partly checked. People and artists are counted by name, not by id,
-because Ferrofin deliberately re-keys a person (`unify_person_identities`). What Jellyfin 12.2 did:
+because Ferrofin deliberately re-keys a person (`unify_person_identities`). What Jellyfin 12.4 does
+(its record equals Jellyfin 12.2's on both lineages, shape by shape and with all shapes combined:
+the [2026-10-29 record](#2026-10-29-jellyfin-123-and-124-routes-gl-874)):
 
-| Shape | 10.11 lineage (upgraded by 12.2) | 12.x lineage (booted as is) |
+| Shape | 10.11 lineage (upgraded by 12.4) | 12.x lineage (booted as is) |
 |---|---|---|
 | `deleted_user` | deletes Permissions and Preferences; keeps UserData, Devices, DisplayPreferences | keeps every row |
 | `dangling_owner_extra` | deletes the extra | keeps it, dangling |
@@ -484,7 +533,7 @@ Jellyfin's upgrade routine `MigrateLinkedChildren` deletes the non-folder, non-v
 no longer exists under a library location that is readable (with guards for an empty or missing
 location), and the items whose `TopParentId` names no item, and keeps their play state. Ferrofin's 10.11
 adoption ports both sweeps as a one-shot boot repair (`adoption_repairs::sweep_missing_items`, the
-owner's decision on gl-521), so `gone_file_userdata` ends on the 10.11 lineage as Jellyfin 12.2 left it:
+owner's decision on gl-521), so `gone_file_userdata` ends on the 10.11 lineage as Jellyfin 12.4 left it:
 the item gone, its play state on the placeholder item by its key.
 
 ## Scale fixture
@@ -540,7 +589,7 @@ Every fixture is built from **synthetic data only**: no real library, personal m
 server or network share is read, mounted or scanned. `build-fixtures.sh` runs the
 [synthetic builder](#synthetic-preservation-fixture), which generates invented media
 under `$FIXTURES/media` and has each official Jellyfin image build its own fixture through
-its API. It then records the Jellyfin 12.1 and 12.2 oracles. `run.sh` and `synthetic.py`
+its API. It then records the Jellyfin 12.1, 12.2 and 12.4 oracles. `run.sh` and `synthetic.py`
 use the same directory.
 
 The fixture directory and the work directory must be on a **local disk**. Every fixture
@@ -565,10 +614,17 @@ $FIXTURES/
   jellyfin-12.2-from-12/       built: jellyfin/jellyfin:12.2 on 12.0
   jellyfin-12.2-from-121/      built: jellyfin/jellyfin:12.2 on 12.1-from-12
   jellyfin-12.2-fresh/         built: jellyfin/jellyfin:12.2 seeded from scratch (a first run)
-  oracle/smoke-jellyfin-12.{1,2}.txt  built: each release's own smoke answers
-  oracle/smoke-jellyfin-12.2-fresh.txt  built: Jellyfin 12.2's answers on the fresh-install library
+  jellyfin-12.3-from-122/      built: jellyfin/jellyfin:12.3 on 12.2-from-121
+  jellyfin-12.3-from-10/       built: jellyfin/jellyfin:12.3 on 10.11.8
+  jellyfin-12.3-fresh/         built: jellyfin/jellyfin:12.3 seeded from scratch (a first run)
+  jellyfin-12.4-from-123/      built: jellyfin/jellyfin:12.4 on 12.3-from-122
+  jellyfin-12.4-from-10/       built: jellyfin/jellyfin:12.4 on 10.11.8
+  jellyfin-12.4-fresh/         built: jellyfin/jellyfin:12.4 seeded from scratch (a first run)
+  oracle/smoke-jellyfin-12.{1,2,4}.txt  built: each release's own smoke answers (12.4's on 12.4-from-123, the default)
+  oracle/smoke-jellyfin-12.{2,4}-fresh.txt  built: Jellyfin 12.2's and 12.4's answers on their fresh-install library
   oracle/user.txt              built: the account those answers were probed as
-  jellyfin-12.2-schema.sql     built: the 12.2 schema the other 12.2 routes are diffed against
+  jellyfin-12.2-schema.sql     built: the 12.2 schema every other 12.2, 12.3 and 12.4 upgrade route is diffed against
+  jellyfin-12.{3,4}-schema.sql built: the same dump of 12.3-from-122 and 12.4-from-123
   work/                        scratch: synthetic.py's copies (and run.sh's in work/run/ when no output root is set); failures stay here
 ```
 
@@ -581,7 +637,7 @@ Debian/Ubuntu), PyICU (`python3-icu`, for the `CleanValue` derivation), `sqlite3
 
 ```bash
 export FERROFIN_GATES_DIR=/srv/gates                # the output root: absolute, a local disk, outside the checkout
-gates/adoption/build-fixtures.sh                    # once; pulls 10.11.8–12.2 → $FERROFIN_GATES_DIR/fixtures/adoption-<key>
+gates/adoption/build-fixtures.sh                    # once; pulls 10.11.8–12.4 → $FERROFIN_GATES_DIR/fixtures/adoption-<key>
 docker build -t ferrofin:bench .                    # the commit under test
 gates/adoption/run.sh --image ferrofin:bench        # copies and report → $FERROFIN_GATES_DIR/work/adoption
 python3 gates/adoption/synthetic.py run --image ferrofin:bench
@@ -648,7 +704,7 @@ failure reporting. Its fixtures contain only invented IDs and playback data.
 `tests/test_table_digests.py` checks a lost row in each listed table, a changed column, a
 lost and an added column, and a case per normaliser rule (each with the unrewritten change
 next to it that must still fail). `tests/test_messy.py` checks each shape's seeder and end-state
-reader on a scratch SQLite database, the comparison with Jellyfin 12.2's record, and that every
+reader on a scratch SQLite database, the comparison with the oracle release's record, and that every
 written divergence names a seeded shape, a derived lineage and a whole state.
 `tests/test_scale.py` checks the cloning on a small library with the same table shapes
 (round-robin templates, ids and paths of their own, every hanging row copied, the play-state
@@ -682,6 +738,20 @@ fixture directory (the recipe changes), refresh the oracle if that release chang
 teach the gate (`JELLYFIN_GENERATIONS` in `crates/ferrofin-db/src/database.rs`). The oracle is always the
 newest supported Jellyfin: parity is measured against the current release, not the one the
 database came from.
+
+A release that adds **no** ids (12.3 and 12.4 add none to 12.2's) is a new set of routes, not a
+generation: add its rows the same way with its counterpart's count, a pair to the id-set check in
+`build-fixtures.sh` (the same count is not the same set), and its version to `GENERATIONS` and
+`RUNS_12_2_ROUTINES` in `preservation.py`. If it is the newest release, the oracles move to it:
+- the smoke oracle: the `build_oracle` lines and the oracle labels they accept in `build-fixtures.sh`;
+  in `run.sh` the `ORACLE_VERSION` default, the `--oracle` allow-list and the `FRESH_VERSION`
+  fallback; and the preflight's `ADOPTION_ORACLE` default in `gates/run`;
+- the seeds' oracle: `ORACLE_RELEASE`, `ORACLE` and `UPGRADED_FROM_10` in `preservation.py`;
+- the messy-shape oracle: `ORACLE_RELEASE` and the 12.x copy in `DERIVED` in `messy.py`, and the
+  release its `DIVERGENCES` reasons name, once the new oracle's record confirms each.
+
+`tests/adoption.bats` checks that they all name the same release. `JELLYFIN_GENERATIONS` stays as
+it is; a fixture whose set is not its counterpart's fails the build instead.
 
 ## Why the checks are what they are
 
@@ -857,7 +927,8 @@ docker build -t ferrofin:bench .
 python3 gates/adoption/synthetic.py run --image ferrofin:bench
 ```
 
-The ten version/upgrade paths are the ones `run.sh` covers (`VERSIONS` in `synthetic.py`).
+The version/upgrade paths are the ones `run.sh` covers (`VERSIONS` in `synthetic.py`); the
+fresh installs carry no seeds and are left to `run.sh`.
 Each upgraded Jellyfin completes a scan before supplying its baseline. `--only`
 selects one named fixture; building an upgraded fixture requires its parent to
 have been built. `--port` changes the localhost-only test port (default 18120).
@@ -925,10 +996,10 @@ Both sides are Ferrofin, so every comparison is exact, with these exceptions:
   parent chain and the stale LinkedChildren entries first. Releases before v1.4.0 have
   no orphan clean-up and fail on both, on a foreign key. `synthetic.py run` covers the
   candidate on those seeds.
-- **Changes the candidate's boot repairs make by design, following Jellyfin 12.2.**
+- **Changes the candidate's boot repairs make by design, following Jellyfin 12.2 and later.**
   These are the seeded ratings' visibility, the harmonized conflicting user data, and the
   re-keyed id of the local alternate version, for which only the version count is
-  compared. `synthetic.py run` holds each of these against Jellyfin 12.2.
+  compared. `synthetic.py run` holds each of these against Jellyfin 12.4.
 - **Avatars.** They are fetched with the admin's token, because v1.0.0 serves them to no
   anonymous client.
 - **A start release with a known API bug.** v1.0.0 lets a restricted user download an

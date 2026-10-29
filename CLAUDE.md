@@ -64,7 +64,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-networking` | bind / published-URL resolution |
 | `ferrofin-health` | liveness/readiness router |
 | `ferrofin-metrics` | Prometheus `/metrics` with Jellyfin-parity names (see `docs/conventions/METRICS.md`) |
-| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 12.0; adopts 10.11.8–10.11.11, 12.0, 12.1 and 12.2 databases in place) |
+| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 12.0; adopts 10.11.8–10.11.11, 12.0, 12.1, 12.2, 12.3 and 12.4 databases in place) |
 | `ferrofin-traits` | the manager/service **traits** — the dependency-injection seam (see below) |
 | `ferrofin-mediaencoding` | ffmpeg/ffprobe: probing, transcode arg-building, the live transcode runtime |
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
@@ -135,7 +135,8 @@ The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whos
 Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 12.0 database** (`0032` converges the
 10.11.8 shape the chain carried through `0029`; the gate adopts the exact
 `__EFMigrationsHistory` sets for 10.11.8–10.11.11, 12.0.0, 12.1.0 and 12.2.0, including both
-12.1 and both 12.2 upgrade routes in the [support matrix](gates/adoption/README.md#supported-and-tested-versions)) — that is
+12.1 and both 12.2 upgrade routes in the [support matrix](gates/adoption/README.md#supported-and-tested-versions);
+12.3.0 and 12.4.0 record 12.2.0's set and adopt as that generation) — that is
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
 migrates in place). Ferrofin-own tables/indexes live in a collision-proof
 `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the pin.
@@ -363,15 +364,16 @@ never exists.
 ### Adoption has its own live check — `gates/adoption/`
 `gates/adoption/run.sh --image ferrofin:bench` (fixtures and work directory from `FERROFIN_GATES_DIR`, or
 `--fixtures DIR`) covers 10.11.8, 10.11.9,
-10.11.10, 10.11.11, 12.0.0, 12.1.0 and 12.2.0 databases, with separate 12.1 and 12.2
-fixtures upgraded from 10.11.8 and from 12.0.0.  Every fixture is **synthetic**: build them
+10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0, 12.3.0 and 12.4.0 databases. The 12.1 and 12.2
+fixtures are upgraded from 10.11.8 and from 12.0.0; the 12.3 and 12.4 fixtures from 10.11.8 and from
+the previous 12.x release; and 12.2, 12.3 and 12.4 each have a fresh install.  Every fixture is **synthetic**: build them
 once with `gates/adoption/build-fixtures.sh` (invented media; the official Jellyfin images seed and upgrade
 each database themselves); they are never committed.  Never point the suite at a real
 library or a network share — the scripts refuse a DIR on a network filesystem, because every
 fixture is booted and scanned repeatedly.  A build that fails part-way is never retried
 (seeding is not idempotent): build into a new DIR (`--fixtures`), or move the half-built
 one aside.  On fresh copies it checks
-generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
+generation, migrations, Jellyfin 12.4's normalised smoke summaries, file integrity and a
 repair-free second boot.  The [test record](gates/adoption/README.md#supported-and-tested-versions)
 identifies which versions passed and the image used.  Run it for any change to the migration
 chain, the adoption gate or the boot repairs, because those risk user data. This per-change

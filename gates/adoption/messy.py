@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Messy real-world rows: shapes long-lived Jellyfin databases carry that no API
 can produce, injected by SQL into a STOPPED copy of a finished fixture, each with the end state
-Jellyfin 12.2 gives it.
+the latest Jellyfin release (ORACLE_RELEASE, 12.4) gives it.
 
     messy.py build --fixtures DIR [--port N]    derive the messy fixtures, seed them, boot Jellyfin
-                                                12.2 on clean copies carrying each shape to record
+                                                12.4 on clean copies carrying each shape to record
                                                 what it does
     messy.py check DB FIXTURE_DIR               compare an adopted database with that record
 
@@ -25,13 +25,13 @@ Items that need a file are given one in a hard-linked copy of the shared media t
 
 Each is seeded into the latest 10.11.x fixture and the latest 12.x fixture (DERIVED), one per
 lineage (the 10.11 lineage runs the 0032 / FixIncorrectOwnerIdRelationships migrations on
-adoption; a 12.x database has already run them). The derived fixtures are copies, so the eleven clean
+adoption; a 12.x database has already run them). The derived fixtures are copies, so the clean
 paths and the smoke oracle recorded from a clean library stay the control.
 
-The expectation per shape is the state Jellyfin 12.2 itself leaves (messy-oracle.json: it boots a
+The expectation per shape is the state Jellyfin 12.4 itself leaves (messy-oracle.json: it boots a
 clean copy carrying that one shape and the harness reads the database afterwards). Where Ferrofin is
 expected to differ, DIVERGENCES says so, with the state it must reach and why; a difference not
-written down fails. Where 12.2 refuses a shape, the oracle records that, and Ferrofin's state is
+written down fails. Where 12.4 refuses a shape, the oracle records that, and Ferrofin's state is
 then whatever DIVERGENCES names. Stdlib plus the harness's own modules.
 """
 
@@ -55,9 +55,11 @@ SHAPES = ("deleted_user", "dangling_owner_extra", "duplicate_paths", "guid_casin
           "orphan_ancestor", "virtual_season", "gone_file_userdata", "non_ascii_names")
 #: Derived fixture -> (source fixture, lineage): the latest 10.11.x and the latest 12.x.
 DERIVED = (("jellyfin-10.11.11-messy", "jellyfin-10.11.11", "10.11"),
-           ("jellyfin-12.2-messy", "jellyfin-12.2-from-121", "12.x"))
-#: What Jellyfin 12.2 runs for the oracle (pulled, and its image id recorded, when it is built).
-ORACLE_IMAGE = "jellyfin/jellyfin:12.2"
+           ("jellyfin-12.4-messy", "jellyfin-12.4-from-123", "12.x"))
+#: The release whose end state is the expectation: always the latest Jellyfin release.
+ORACLE_RELEASE = "12.4"
+#: What that release runs for the oracle (pulled, and its image id recorded, when it is built).
+ORACLE_IMAGE = "jellyfin/jellyfin:" + ORACLE_RELEASE
 #: How long the oracle waits for Jellyfin to answer, the deadline Api.ready gives it; and the grace
 #: `docker stop` gives it to flush the database, the grace synthetic.server gives it.
 ORACLE_READY_S = 300
@@ -195,8 +197,8 @@ def seed_deleted_user(conn, manifest):
 def seed_dangling_owner_extra(conn, manifest):
     """A copy of an existing extra that sits in a directory of its own and names an owner that
     does not exist. Its file exists (a link to the extra's, in the messy media tree): Jellyfin 12.2
-    removes an item whose file is missing when it upgrades a 10.11 database, which would hide what
-    it does with the owner."""
+    and later remove an item whose file is missing when they upgrade a 10.11 database, which would
+    hide what the oracle does with the owner."""
     row = conn.execute('SELECT "Id", "OwnerId", "Path" FROM "BaseItems" WHERE "ExtraType" IS NOT NULL AND "ExtraType" <> 0 '
                        f'AND "Type" = ? AND {original("BaseItems")} ORDER BY "Id" LIMIT 1', (VIDEO_TYPE,)).fetchone()
     if row is None:
@@ -623,70 +625,72 @@ def read_state(db, entry):
 
 
 # ── what Ferrofin is expected to differ in ──────────────────────────────────
-# (shape, lineage) -> (the state Ferrofin must reach, why it differs from Jellyfin 12.2). A
-# difference from Jellyfin 12.2 that is not here fails the run. Read off the oracle's record
-# (messy-oracle.json) and a live adoption.
+# (shape, lineage) -> (the state Ferrofin must reach, why it differs from Jellyfin 12.4). A
+# difference from Jellyfin 12.4 that is not here fails the run. Read off the oracle's record
+# (messy-oracle.json) and a live adoption. Each was first read off Jellyfin 12.2's record; 12.3 and
+# 12.4 add no migration and change none of the code these shapes reach (v12.2..v12.4), so 12.4 is
+# expected to leave every shape as 12.2 did, and README.md's test record says what its record showed.
 NO_USER_ROWS = {table: 0 for table in USER_TABLES}
 NO_ORPHAN_ANCESTORS = {"missing_parent_rows": 0, "missing_item_rows": 0}
 DIVERGENCES = {
-    # Jellyfin 12.2 deletes only the Permissions and Preferences of a missing user (12.1's cleanup)
+    # Jellyfin 12.4 deletes only the Permissions and Preferences of a missing user (12.1's cleanup)
     # when it upgrades a 10.11 database, and nothing when it boots a 12.x one: UserData, Devices
     # and DisplayPreferences stay, rows ON DELETE CASCADE would have removed. Ferrofin's every-boot
     # foreign_key_check refuses such a database, so migration 0044 deletes them all (the owner's
     # decision, gl-438), with a per-table count in the boot log.
-    ("deleted_user", "10.11"): (NO_USER_ROWS, "0044 deletes every row of a missing user; Jellyfin 12.2 keeps some"),
-    ("deleted_user", "12.x"): (NO_USER_ROWS, "0044 deletes every row of a missing user; Jellyfin 12.2 keeps them all"),
-    # Jellyfin 12.2 keeps an extra whose owner is gone on a 12.x database (the routines that
+    ("deleted_user", "10.11"): (NO_USER_ROWS, "0044 deletes every row of a missing user; Jellyfin 12.4 keeps some"),
+    ("deleted_user", "12.x"): (NO_USER_ROWS, "0044 deletes every row of a missing user; Jellyfin 12.4 keeps them all"),
+    # Jellyfin 12.4 keeps an extra whose owner is gone on a 12.x database (the routines that
     # remove it ran when that database was upgraded), and boots. Ferrofin's foreign_key_check
     # refuses a dangling OwnerId, so migration 0045 hands the extra to the placeholder item and the
-    # boot repair removes it, as on the 10.11 lineage, where 12.2 deletes it too.
+    # boot repair removes it, as on the 10.11 lineage, where 12.4 deletes it too.
     ("dangling_owner_extra", "12.x"): ({"exists": False, "owner": None},
-                                       "Ferrofin removes a dangling-owner extra (as 12.2 does from 10.11); 12.2 keeps it on 12.x"),
-    # A 12.x database has already run Jellyfin's FixIncorrectOwnerIdRelationships, so 12.2 keeps both
+                                       "Ferrofin removes a dangling-owner extra (as 12.4 does from 10.11); 12.4 keeps it on 12.x"),
+    # A 12.x database has already run Jellyfin's FixIncorrectOwnerIdRelationships, so 12.4 keeps both
     # rows. Ferrofin runs its port once per adoption on any source and keeps the row that routine
     # keeps (children, then extras, then the newer one), deleting the other.
     ("duplicate_paths", "12.x"): ({"original": True, "duplicate": False},
-                                  "Ferrofin collapses duplicate paths at adoption; 12.2 does not re-run its routine on 12.x"),
-    # Jellyfin 12.2 leaves a 12.x database as written, because its upgrade routines ran
+                                  "Ferrofin collapses duplicate paths at adoption; 12.4 does not re-run its routine on 12.x"),
+    # Jellyfin 12.4 leaves a 12.x database as written, because its upgrade routines ran
     # when that database was upgraded; Ferrofin runs its ports once, whatever the source.
     # 0032 (a 10.11 source) upper-cases an OwnerId and nulls one that is not 36 characters, as
     # Jellyfin's ChangeOwnerIdToGuid does; 0045 does both for every other source (an owner that
     # exists in another case takes the id's spelling, a 32-character one becomes NULL). PrimaryVersionId
-    # is left as written, as 12.2 leaves it, though Ferrofin's own lookups of it are byte-exact: whether
+    # is left as written, as 12.4 leaves it, though Ferrofin's own lookups of it are byte-exact: whether
     # it should be re-spelled too is gl-752, and this expectation changes with that decision.
     ("guid_casing", "12.x"): ({"owner_lower36": {"owner": "upper36->item", "primary": "null"},
                               "owner_n32": {"owner": "null", "primary": "null"},
                               "primary_lower36": {"owner": "null", "primary": "lower36->item"},
                               "primary_n32": {"owner": "null", "primary": "n32lower->item"}},
-                             "0045 re-spells an owner in another case and nulls a 32-character one; 12.2 keeps them as written"),
+                             "0045 re-spells an owner in another case and nulls a 32-character one; 12.4 keeps them as written"),
     # MergeDuplicatePeople and MergeDuplicateMusicArtists (12.0) run once per adoption in Ferrofin, so a
     # case-only pair on a 12.x database is merged (people grouped by lower-cased name and type).
     ("case_duplicates", "12.x"): ({"person_item_ascii": 1, "people_ascii": {"rows": 1, "links": 1},
                                   "unicode": {"items": 1, "peoples": 1, "links": 1}, "artists": 1},
-                                 "Ferrofin merges case-only duplicates at adoption; 12.2 does not re-run its routines on 12.x"),
+                                 "Ferrofin merges case-only duplicates at adoption; 12.4 does not re-run its routines on 12.x"),
     # Migration 0044 deletes AncestorIds rows naming an item that is not there (what the key's cascade
-    # would have removed); Jellyfin 12.2 never looks at them and keeps both rows (Ferrofin's
+    # would have removed); Jellyfin 12.4 never looks at them and keeps both rows (Ferrofin's
     # every-boot foreign_key_check stays strict, so it cannot keep a row naming an item that is gone).
-    ("orphan_ancestor", "10.11"): (NO_ORPHAN_ANCESTORS, "0044 deletes ancestor rows naming a missing item; Jellyfin 12.2 keeps them"),
-    ("orphan_ancestor", "12.x"): (NO_ORPHAN_ANCESTORS, "0044 deletes ancestor rows naming a missing item; Jellyfin 12.2 keeps them"),
+    ("orphan_ancestor", "10.11"): (NO_ORPHAN_ANCESTORS, "0044 deletes ancestor rows naming a missing item; Jellyfin 12.4 keeps them"),
+    ("orphan_ancestor", "12.x"): (NO_ORPHAN_ANCESTORS, "0044 deletes ancestor rows naming a missing item; Jellyfin 12.4 keeps them"),
     # Ferrofin sets every user's NormalizedUsername to the name upper-cased as .NET's ToUpperInvariant
-    # does (normalized_usernames.rs), once, whatever is stored; Jellyfin 12.2 recomputes it only when
+    # does (normalized_usernames.rs), once, whatever is stored; Jellyfin 12.4 recomputes it only when
     # it upgrades a 10.11 database and keeps the stored value on a 12.x one.
     ("non_ascii_names", "12.x"): ({"users": {"decomposed": "ZOE\u0308", "dotted_capital_i": "\u0130STANBUL", "sharp_s": "STRA\u00dfE"},
                                   "people": {"decomposed": {"items": 1, "peoples": 1}}, "path": UNICODE_PATH},
-                                 "Ferrofin recomputes every user's normalised name at adoption; 12.2 keeps the stored value on 12.x"),
+                                 "Ferrofin recomputes every user's normalised name at adoption; 12.4 keeps the stored value on 12.x"),
 }
 
 
 def expected(shape, lineage, oracle):
-    """(state, source) Ferrofin must reach for `shape`: a written divergence, else Jellyfin 12.2's."""
+    """(state, source) Ferrofin must reach for `shape`: a written divergence, else the oracle release's."""
     if (shape, lineage) in DIVERGENCES:
         state, why = DIVERGENCES[(shape, lineage)]
         return state, "written divergence: " + why
     record = oracle["shapes"][shape]
     if record["outcome"] != "booted":
-        return None, f"Jellyfin 12.2 {record['outcome']} this shape ({record.get('reason', '')}) and no divergence says what Ferrofin should do"
-    return record["state"][shape], "Jellyfin 12.2"
+        return None, f"Jellyfin {ORACLE_RELEASE} {record['outcome']} this shape ({record.get('reason', '')}) and no divergence says what Ferrofin should do"
+    return record["state"][shape], f"Jellyfin {ORACLE_RELEASE}"
 
 
 def compare(state, entry, oracle, lineage):
@@ -724,9 +728,9 @@ def check(db, fixture):
     return shape_results(db, fixture)[1]
 
 
-# ── the oracle: Jellyfin 12.2 on a clean copy carrying one shape ────────────
+# ── the oracle: Jellyfin 12.4 on a clean copy carrying one shape ────────────
 def run_oracle_server(config, media, port, name="messy-oracle"):
-    """Boot Jellyfin 12.2 on `config`, let it settle, stop it; returns {"outcome", "reason"}:
+    """Boot the oracle release on `config`, let it settle, stop it; returns {"outcome", "reason"}:
     booted, or refused when the container exits before it answers."""
     cache = config.parent / (config.name + "-cache")
     cache.mkdir(exist_ok=True)
@@ -752,7 +756,7 @@ def run_oracle_server(config, media, port, name="messy-oracle"):
                 # Still running and not answering is not a refusal: a slow host must not be
                 # recorded as Jellyfin's behaviour.
                 if time.monotonic() >= end:
-                    raise CheckError(f"Jellyfin 12.2 did not answer within {ORACLE_READY_S} s and did not exit")
+                    raise CheckError(f"Jellyfin {ORACLE_RELEASE} did not answer within {ORACLE_READY_S} s and did not exit")
                 time.sleep(1)
         api.login(USERS[0]).idle()
         return {"outcome": "booted", "reason": ""}
@@ -782,7 +786,7 @@ def image_id():
 
 
 def record_oracle(root, source, entry_shapes, manifest, port):
-    """For each shape, boot Jellyfin 12.2 on a clean copy of `source` carrying only that shape and
+    """For each shape, boot the oracle release on a clean copy of `source` carrying only that shape and
     record the outcome and the end state; the combined fixture is booted last."""
     # A stale local tag would record a different release without complaint: pull it, and keep its id.
     subprocess.run(["docker", "pull", "-q", ORACLE_IMAGE], check=True, stdout=subprocess.DEVNULL)
@@ -813,7 +817,7 @@ def record_oracle(root, source, entry_shapes, manifest, port):
         # Ferrofin adopts the fixture carrying every shape, so the expectation must hold there too.
         detail = "; ".join(f"{shape}: alone {record['shapes'][shape]['state'][shape]}, with all {record['combined']['state'][shape]}"
                            for shape in differing)
-        raise CheckError("Jellyfin 12.2 handled " + ", ".join(differing) + " differently with all the shapes "
+        raise CheckError(f"Jellyfin {ORACLE_RELEASE} handled " + ", ".join(differing) + " differently with all the shapes "
                          f"present than with each alone ({detail}); the per-shape record would be the wrong expectation")
     return record
 

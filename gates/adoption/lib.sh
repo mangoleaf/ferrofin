@@ -73,7 +73,7 @@ adoption_check_db() {
 }
 
 # adoption_check_messy <jellyfin.db> <fixture copy>: one reason per line for each messy shape
-# (messy.py) whose end state is not what Jellyfin 12.2 left it, or the divergence written down for
+# (messy.py) whose end state is not what the oracle release (messy.ORACLE_RELEASE) left it, or the divergence written down for
 # it. A checker that cannot run is a reason too, never a pass.
 adoption_check_messy() {
   local out rc=0

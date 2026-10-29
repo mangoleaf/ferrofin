@@ -6,9 +6,9 @@ API; each supported release supplies its own expected responses before adoption.
 A few states no API produces (non-US ratings, conflicting user data, a dangling parent
 chain, legacy LinkedChildren entries) are written into the stopped 10.11.8 fixture and
 inherited by every later one, except that the 12.0 lineage (12.0, 12.1-from-12,
-12.2-from-12, 12.2-from-121) starts without the dangling chain, which Jellyfin 12.0
-cannot migrate (NO_ORPHAN_CLEANUP); for those, Jellyfin 12.2's own result is the
-expectation on every path.
+12.2-from-12, 12.2-from-121, 12.3-from-122, 12.4-from-123) starts without the dangling
+chain, which Jellyfin 12.0 cannot migrate (NO_ORPHAN_CLEANUP); for those, the oracle
+release's own result (preservation.ORACLE) is the expectation on every path.
 """
 
 import argparse
@@ -39,6 +39,12 @@ VERSIONS = (
     ("jellyfin-12.2-from-12", "12.2", "jellyfin-12.0"),
     ("jellyfin-12.2-from-121", "12.2", "jellyfin-12.1-from-12"),
     ("jellyfin-12.2-fresh", "12.2", None),
+    ("jellyfin-12.3-from-122", "12.3", "jellyfin-12.2-from-121"),
+    ("jellyfin-12.3-from-10", "12.3", "jellyfin-10.11.8"),
+    ("jellyfin-12.3-fresh", "12.3", None),
+    ("jellyfin-12.4-from-123", "12.4", "jellyfin-12.3-from-122"),
+    ("jellyfin-12.4-from-10", "12.4", "jellyfin-10.11.8"),
+    ("jellyfin-12.4-fresh", "12.4", None),
 )
 # Releases whose own migration cannot start on the seeded dangling chain; their copy
 # drops it first, and every fixture built from them inherits that (drop_dangling_chain).
@@ -48,7 +54,7 @@ NO_ORPHAN_CLEANUP = {"12.0"}
 # these carry no seeds: they are validated live by gates/adoption/run.sh (its FIXTURE_TABLE), which
 # proves the fresh-install EF id set and schema adopt, not by the seed-driven preservation
 # matrix (run_matrix), which has nothing to compare and skips them.
-FRESH_INSTALL = {"jellyfin-12.2-fresh"}
+FRESH_INSTALL = {"jellyfin-12.2-fresh", "jellyfin-12.3-fresh", "jellyfin-12.4-fresh"}
 
 
 def carries_chain(name):
@@ -132,7 +138,7 @@ def build(root, only, port):
             else:
                 manifest = seed(api.base)
                 # Only seed_database reads the live members, from 10.11's LinkedChildren JSON;
-                # 12.2 keeps them in their own table, where this wait would never see them.
+                # 12.x keeps them in their own table, where this wait would never see them.
                 if name not in FRESH_INSTALL:
                     wait_for_live_members(config / "data/jellyfin.db", manifest)
                 api = api.login(USERS[0])
@@ -153,15 +159,15 @@ def build(root, only, port):
                 manifest["seeds"] = seed_database(config / "data/jellyfin.db", manifest)
                 save(config / "synthetic.json", manifest)
             # What this release left of the seeds: its own boot and scan act on them first.
-            from preservation import seed_state, validate_oracle, validate_seed_state
+            from preservation import RUNS_12_2_ROUTINES, seed_state, validate_oracle, validate_seed_state
             state = seed_state(config / "data/jellyfin.db", manifest["seeds"])
             validate_seed_state(state, manifest["seeds"], version)
-            if version == "12.2":
-                validate_oracle(config / "data/jellyfin.db", manifest)
+            if version in RUNS_12_2_ROUTINES:
+                validate_oracle(config / "data/jellyfin.db", manifest, version)
                 # The chain's expectation (gone, history on the placeholder) is what real
-                # 12.2 must have done wherever it saw the chain.
+                # 12.2 and every later release must have done wherever it saw the chain.
                 if carries_chain(name) and (state["orphans"] or state["history"] != "placeholder"):
-                    raise CheckError(f"Jellyfin 12.2 left the dangling chain as {state['orphans']}, "
+                    raise CheckError(f"Jellyfin {version} left the dangling chain as {state['orphans']}, "
                                      f"history {state['history']}; the run's expectation is wrong")
             save(config / "seeds.json", state)
         require_populated(config / "data/jellyfin.db", SEEDED_ONLY if name in FRESH_INSTALL else ())

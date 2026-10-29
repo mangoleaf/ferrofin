@@ -213,7 +213,7 @@ const DEFAULT_PLUGIN_DOWNLOAD_MB: u32 = 128;
 /// It is the left-hand side of upstream's compatibility test
 /// `_applicationHost.ApplicationVersion < targetAbi`, so it decides which
 /// manifest versions a client is offered.
-const DEFAULT_APPLICATION_VERSION: &str = "12.2.0";
+const DEFAULT_APPLICATION_VERSION: &str = "12.4.0";
 
 /// Whether `url` points at a loopback host (`localhost`, `127.x`, `[::1]`).
 fn is_loopback_url(url: &str) -> bool {

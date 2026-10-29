@@ -190,15 +190,24 @@ def same_artwork(expected, actual):
             and all(abs(a - b) <= 3 for a, b in zip(expected["rgb"], actual["rgb"])))
 
 
-# The fixture whose Jellyfin 12.2 handling of the seeds is the expectation on every path
-# (built 10.11.8 -> 12.0 -> 12.1 -> 12.2, the fullest upgrade route). It never holds the
-# dangling chain (12.0 cannot migrate it; synthetic.NO_ORPHAN_CLEANUP), so the chain's
+# The release whose handling of the seeds is the expectation: always the latest Jellyfin
+# release, as for the smoke and messy-shape oracles.
+ORACLE_RELEASE = "12.4"
+# The fixture whose Jellyfin 12.4 handling of the seeds is the expectation on every path
+# (built 10.11.8 -> 12.0 -> 12.1 -> 12.2 -> 12.3 -> 12.4, the fullest upgrade route). It never
+# holds the dangling chain (12.0 cannot migrate it; synthetic.NO_ORPHAN_CLEANUP), so the chain's
 # expectation is not read from it: seed_failures requires that no chain item survives and,
-# where the source still held the history, that it sits on the placeholder. Only
-# jellyfin-12.2-from-10's seeds.json records what real Jellyfin 12.2 did with the chain.
-ORACLE = "jellyfin-12.2-from-121"
-# Snapshot keys whose expectation is what Jellyfin 12.2 serves rather than what the source
-# release served. Every 12.x deletes a 10.11 local alternate version stored as a Video
+# where the source still held the history, that it sits on the placeholder. Only the seeds.json
+# of the routes straight from 10.11 (12.1-from-10 and later) records what a real release did
+# with the chain.
+ORACLE = "jellyfin-12.4-from-123"
+# The releases that have run Jellyfin 12.2's routines on the seeds (the re-dated
+# MigrateRatingLevels, HarmonizeConflictingUserData): 12.2, and 12.3 and 12.4, which add no
+# migration of their own (v12.2..v12.4 changes no Migrations/ file). A fixture they built keeps
+# those routines' result, so it must hold the scored ratings and the harmonized user data.
+RUNS_12_2_ROUTINES = ("12.2", "12.3", "12.4")
+# Snapshot keys whose expectation is what the oracle release serves rather than what the
+# source release served. Every 12.x deletes a 10.11 local alternate version stored as a Video
 # (MigrateLinkedChildren.CleanupWrongTypeAlternateVersions) and its scan re-creates it under
 # the id its primary's type derives (LibraryManager.ResolveAlternateVersion), so a version
 # group's MediaSource ids change on every path from 10.11 and on none from 12.x.
@@ -206,9 +215,10 @@ FROM_ORACLE = ("versions",)
 MOVIE_TYPE = "MediaBrowser.Controller.Entities.Movies.Movie"
 PLACEHOLDER = "00000000000000000000000000000001"
 # The generation each release's database adopts as: the id SET the gate matches
-# (10.11.9 adds no migration; 10.11.10 adds 10.11.11's three).
+# (10.11.9 adds no migration; 10.11.10 adds 10.11.11's three; 12.3 and 12.4 add none to 12.2's).
 GENERATIONS = {"10.11.8": "10.11.8", "10.11.9": "10.11.8", "10.11.10": "10.11.11",
-               "10.11.11": "10.11.11", "12.0": "12.0.0", "12.1": "12.1.0", "12.2": "12.2.0"}
+               "10.11.11": "10.11.11", "12.0": "12.0.0", "12.1": "12.1.0", "12.2": "12.2.0",
+               "12.3": "12.2.0", "12.4": "12.2.0"}
 
 
 def scrub(value, ids):
@@ -220,14 +230,14 @@ def scrub(value, ids):
     return value
 
 
-# The real 10.11.8 -> 12.2 upgrade: the direct evidence for what 12.2 serves from a 10.11 source.
-UPGRADED_FROM_10 = "jellyfin-12.2-from-10"
+# The real 10.11.8 -> 12.4 upgrade: the direct evidence for what 12.4 serves from a 10.11 source.
+UPGRADED_FROM_10 = "jellyfin-12.4-from-10"
 
 
 def expectation(version, baseline, oracle, upgraded):
     """What Ferrofin must serve after adopting a source of `version` whose own release served
-    `baseline`. A 10.11 source takes the FROM_ORACLE keys from the 12.2 oracle (`oracle`),
-    provided the real 10.11 -> 12.2 upgrade (`upgraded`) serves the same; a 12.x source keeps
+    `baseline`. A 10.11 source takes the FROM_ORACLE keys from the 12.4 oracle (`oracle`),
+    provided the real 10.11 -> 12.4 upgrade (`upgraded`) serves the same; a 12.x source keeps
     its own release's baseline. Every stage is held to these post-scan values, including the
     pre-scan ones: Ferrofin's boot repair re-keys the version in place, where 12.x serves the
     primary alone until its scan re-creates the version."""
@@ -242,10 +252,10 @@ def expectation(version, baseline, oracle, upgraded):
 
 def comparable(data, seeds, orphans):
     """A snapshot as the per-release comparison sees it. Orphaned items leave every list
-    on adoption. Whether a seeded movie is visible follows Jellyfin 12.2's scores, and
-    whether the conflicting movie is resumable follows 12.2's harmonize, and the linked
-    containers' members follow 12.2's ResolveChildId; seed_failures compares those against
-    the 12.2 oracle instead of the source release."""
+    on adoption. Whether a seeded movie is visible follows the scores of Jellyfin 12.2's
+    rating tables, and whether the conflicting movie is resumable follows 12.2's harmonize,
+    and the linked containers' members follow 12.2's ResolveChildId, all of which 12.4 keeps;
+    seed_failures compares those against the 12.4 oracle instead of the source release."""
     data = scrub(data, orphans)
     data.pop("linked_children", None)
     if "visibility" in data:
@@ -342,9 +352,9 @@ def validate_seed_state(state, seeds, version):
     if sorted(state["conflict"]) != sorted(seeds["conflict"]["keys"]):
         raise CheckError(f"Jellyfin {version} did not keep the seeded conflicting user data")
     agree = all(row == rows[0] for row in rows)
-    if version == "12.2" and not agree:
-        raise CheckError("Jellyfin 12.2 did not harmonize the seeded conflicting user data")
-    if version != "12.2" and agree:
+    if version in RUNS_12_2_ROUTINES and not agree:
+        raise CheckError(f"Jellyfin {version} did not harmonize the seeded conflicting user data")
+    if version not in RUNS_12_2_ROUTINES and agree:
         raise CheckError(f"Jellyfin {version} changed the seeded conflicting user data")
     # A 10.11 save re-caches a stale ItemId from its path, after which nothing tests it. The
     # 10.11.8 fixture is seeded stopped; every later 10.11 boot runs the startup
@@ -367,37 +377,38 @@ def validate_seed_state(state, seeds, version):
             raise CheckError(f"Jellyfin {version} did not resolve the seeded {role} LinkedChildren as expected")
 
 
-def validate_oracle(db, manifest):
-    """A Jellyfin 12.2 fixture can serve as the seeds' oracle only if 12.2 scored every
-    seeded rating (each scores above zero; 10.11.8's tables score none of them)."""
+def validate_oracle(db, manifest, version=ORACLE_RELEASE):
+    """A fixture of a release that ran 12.2's routines (RUNS_12_2_ROUTINES) can serve as the
+    seeds' oracle only if its release scored every seeded rating (each scores above zero;
+    10.11.8's tables score none of them)."""
     seeds = manifest.get("seeds")
     if not seeds:
         raise CheckError("synthetic fixture lacks the database seeds")
     with closing(connect(db)) as conn:
         triples = rating_triples(conn)
     if any(triples.get(movie, [None, None])[1] in (None, 0) for movie in seeds["ratings"]):
-        raise CheckError("Jellyfin 12.2 left a seeded rating unscored")
+        raise CheckError(f"Jellyfin {version} left a seeded rating unscored")
 
 
 def seed_failures(conn, actual, seeds, state, oracle_conn, oracle):
-    """How the adopted database (conn) and API snapshot (actual) differ from Jellyfin 12.2's
-    handling of the seeds (oracle_conn, oracle: the oracle fixture's database and baseline).
+    """How the adopted database (conn) and API snapshot (actual) differ from the oracle
+    release's handling of the seeds (oracle_conn, oracle: the oracle fixture's database and baseline).
     state is what the source fixture still held (seed_state): the dangling chain's history
     and a linked container are checked only where the source still had them."""
     failures = []
     if rating_triples(conn) != rating_triples(oracle_conn):
-        failures.append("seeded ratings differ from Jellyfin 12.2")
+        failures.append(f"seeded ratings differ from Jellyfin {ORACLE_RELEASE}")
     if any((movie in actual["visibility"].get(name, [])) != (movie in oracle["visibility"].get(name, []))
            for movie in seeds["ratings"] for name in USERS[1:]):
-        failures.append("seeded rating visibility differs from Jellyfin 12.2")
+        failures.append(f"seeded rating visibility differs from Jellyfin {ORACLE_RELEASE}")
     seeded = [*seeds["ratings"], seeds["conflict"]["item"]]
     if any((movie in actual["views"][name]["resume"]) != (movie in oracle["views"][name]["resume"])
            for movie in seeded for name in USERS[1:]):
-        failures.append("seeded movie resume differs from Jellyfin 12.2")
+        failures.append(f"seeded movie resume differs from Jellyfin {ORACLE_RELEASE}")
     conflict = seeds["conflict"]
     if (user_data_state(conn, conflict["item"], conflict["user"])
             != user_data_state(oracle_conn, conflict["item"], conflict["user"])):
-        failures.append("seeded conflicting user data differs from Jellyfin 12.2")
+        failures.append(f"seeded conflicting user data differs from Jellyfin {ORACLE_RELEASE}")
     survivors = conn.execute('SELECT COUNT(*) FROM "BaseItems" WHERE lower(replace("Id", \'-\', \'\')) IN ({})'.format(
         ",".join("?" * len(seeds["orphans"]))), seeds["orphans"]).fetchone()[0]
     if survivors:
@@ -410,9 +421,9 @@ def seed_failures(conn, actual, seeds, state, oracle_conn, oracle):
         if state["linked_children"][role] not in (seed["entries"], seed["members"]):
             continue
         if linked_members(conn, seed["id"]) != linked_members(oracle_conn, seed["id"]):
-            failures.append(f"seeded {role} LinkedChildren differ from Jellyfin 12.2")
+            failures.append(f"seeded {role} LinkedChildren differ from Jellyfin {ORACLE_RELEASE}")
         if actual["linked_children"][role] != oracle["linked_children"][role]:
-            failures.append(f"seeded {role} LinkedChildren are served differently from Jellyfin 12.2")
+            failures.append(f"seeded {role} LinkedChildren are served differently from Jellyfin {ORACLE_RELEASE}")
     return failures
 
 
@@ -515,11 +526,11 @@ def _run_matrix(root, image, only, port, recorder):
     oracle_dir = root / ORACLE
     oracle_ready = oracle_dir / "synthetic-ready.json"
     if not oracle_ready.exists() or json.loads(oracle_ready.read_text()).get("recipe") != recipe():
-        raise CheckError("synthetic Jellyfin 12.2 oracle missing; build " + ORACLE + " first")
+        raise CheckError(f"synthetic Jellyfin {ORACLE_RELEASE} oracle missing; build {ORACLE} first")
     oracle = json.loads((oracle_dir / "preservation.json").read_text())
     upgraded_ready = root / UPGRADED_FROM_10 / "synthetic-ready.json"
     if not upgraded_ready.exists() or json.loads(upgraded_ready.read_text()).get("recipe") != recipe():
-        raise CheckError("synthetic Jellyfin 12.2 upgrade from 10.11 missing; build " + UPGRADED_FROM_10 + " first")
+        raise CheckError(f"synthetic Jellyfin {ORACLE_RELEASE} upgrade from 10.11 missing; build {UPGRADED_FROM_10} first")
     upgraded = json.loads((root / UPGRADED_FROM_10 / "preservation.json").read_text())
     for name, version, _ in VERSIONS:
         if only and only != name:
@@ -592,7 +603,7 @@ def _run_matrix(root, image, only, port, recorder):
                 changed = record("API answers match Jellyfin's", compare(comparable(expected, seeds, orphans), comparable(actual, seeds, orphans)))
                 with closing(metadata.connect(db)) as conn, \
                         closing(metadata.connect(oracle_dir / "data/jellyfin.db")) as oracle_conn:
-                    changed += record("seeded states end as Jellyfin 12.2 left them",
+                    changed += record(f"seeded states end as Jellyfin {ORACLE_RELEASE} left them",
                                       seed_failures(conn, actual, seeds, state, oracle_conn, oracle))
                 changed += record("user accounts", user_accounts.compare_database(accounts_before, user_accounts.database_snapshot(db)))
                 table_changed = table_digests.compare(

@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# gates/adoption/run.sh [--fixtures DIR] [--image IMAGE] [--only NAME] [--user USERNAME] [--oracle 12.1|12.2]
+# gates/adoption/run.sh [--fixtures DIR] [--image IMAGE] [--only NAME] [--user USERNAME] [--oracle 12.1|12.2|12.4]
 #
-# Adopts every Jellyfin release Ferrofin claims to support, 11 paths: 10.11.8, 10.11.9, 10.11.10,
-# 10.11.11, 12.0, 12.1 via both upgrade routes, 12.2 via all three (from 10.11, 12.0, 12.1), and a
-# 12.2 fresh install (not upgraded from 10.11), through one image, on a FRESH copy of each pristine
+# Adopts every Jellyfin release Ferrofin claims to support, 17 paths: 10.11.8, 10.11.9, 10.11.10,
+# 10.11.11, 12.0, 12.1 via both upgrade routes, 12.2 via all three (from 10.11, 12.0, 12.1), 12.3
+# from 10.11 and from 12.2, 12.4 from 10.11 and from 12.3, and a fresh install (not upgraded from
+# 10.11) of each of 12.2, 12.3 and 12.4, through one image, on a FRESH copy of each pristine
 # fixture under DIR, and checks each one
 # the same way:
 #   1. the boot log names the expected generation, applies every migration, logs no ERROR;
 #   2. smoke.sh answers match the oracle release's own answers on the same library
-#      (DIR/oracle/smoke-jellyfin-<oracle>.txt; --oracle or ADOPTION_ORACLE, default 12.2),
+#      (DIR/oracle/smoke-jellyfin-<oracle>.txt; --oracle or ADOPTION_ORACLE, default 12.4, the
+#      latest release; a fresh install answers DIR/oracle/smoke-jellyfin-<oracle>-fresh.txt, 12.4's
+#      with --oracle 12.1, which has no fresh-install fixture),
 #      ignoring lines that legitimately differ (server version, task/plugin lists, /Devices,
 #      folder order, activity-log count, image byte size); a 10.11 source compares /Persons
 #      after the scan in step 5 instead, when the whole smoke is compared again;
@@ -19,7 +22,7 @@
 #   7. every row of the Jellyfin-owned tables no other check covers (table_digests.py) survives
 #      each stage, bar the rewrites the migration chain makes by design.
 # After those, the "messy" fixtures (messy.py: rows of a deleted user, an extra with a dangling
-# owner, duplicate paths) are adopted too, each shape held to the end state Jellyfin 12.2 gave it,
+# owner, duplicate paths) are adopted too, each shape held to the end state Jellyfin 12.4 gave it,
 # and the table digests (check 7) checked beside them. --only NAME also selects a messy fixture,
 # by its directory name or by its generation (10.11.11, 12.2.0).
 # Last, the scale fixture (scale.py: the 10.11.11 library cloned up to 40,000 items) is adopted, after
@@ -30,7 +33,7 @@
 # ADOPTION_SCALE_TIMEOUT seconds (default 1800) to answer. --only selects it like a messy fixture.
 # Every check's verdict is recorded as it runs, and WORK/report.html (gates/adoption/adoption_report.py) is built from
 # those however the run ends: per fixture and stage, every check, the table-digest differences, the
-# messy shapes against Jellyfin 12.2 and the scale measurements. It opens from disk, and the shared
+# messy shapes against Jellyfin 12.4 and the scale measurements. It opens from disk, and the shared
 # viewer lists it (python3 gates/bench/report.py --serve). WORK/result.json beside it holds the same rows
 # in every gate's envelope (gates/result.py): what the gates session page and the release summary read.
 # One PASS/FAIL line per fixture; exit status is non-zero if any failed. Each fixture
@@ -46,12 +49,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=gates/adoption/lib.sh
 . "$HERE/lib.sh"
 FIXTURES=${FERROFIN_ADOPTION_FIXTURES:-}; IMAGE=${IMAGE:-ferrofin:bench}; ONLY=; USER_NAME=${ADOPTION_USER:-}
-ORACLE_VERSION=${ADOPTION_ORACLE:-12.2}
+ORACLE_VERSION=${ADOPTION_ORACLE:-12.4}
 while [ $# -gt 0 ]; do case $1 in
   --fixtures) FIXTURES=$2; shift 2;; --image) IMAGE=$2; shift 2;; --only) ONLY=$2; shift 2;; --user) USER_NAME=$2; shift 2;;
   --oracle) ORACLE_VERSION=$2; shift 2;;
-  -h|--help) sed -n 2,41p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
-case $ORACLE_VERSION in 12.1|12.2) ;; *) echo "run: --oracle must be 12.1 or 12.2, not '$ORACLE_VERSION'" >&2; exit 2;; esac
+  -h|--help) sed -n 2,45p "$0"; exit 0;; *) echo "run: unknown argument $1" >&2; exit 2;; esac; done
+case $ORACLE_VERSION in 12.1|12.2|12.4) ;; *) echo "run: --oracle must be 12.1, 12.2 or 12.4, not '$ORACLE_VERSION'" >&2; exit 2;; esac
 [ -n "$FIXTURES" ] || FIXTURES=$(adoption_fixtures_dir run) || exit 2
 [ -d "$FIXTURES" ] || { echo "run: $FIXTURES missing — run gates/adoption/build-fixtures.sh first" >&2; exit 2; }
 FIXTURES=$(cd "$FIXTURES" && pwd)
@@ -63,6 +66,10 @@ python3 -c 'from PIL import Image' 2>/dev/null || { echo "run: Python Pillow is 
 python3 -c 'import icu' 2>/dev/null || { echo "run: Python PyICU (python3-icu) is required for the CleanValue check" >&2; exit 2; }
 docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "run: image $IMAGE missing (docker build -t ferrofin:bench .)" >&2; exit 2; }
 ORACLE=$FIXTURES/oracle/smoke-jellyfin-$ORACLE_VERSION.txt
+# A first-run install answers the oracle release's answers on a first-run library; 12.1 has no
+# fresh-install fixture, so with --oracle 12.1 the fresh rows keep the latest release's.
+FRESH_VERSION=$ORACLE_VERSION; [ "$FRESH_VERSION" != 12.1 ] || FRESH_VERSION=12.4
+FRESH_ORACLE=$FIXTURES/oracle/smoke-jellyfin-$FRESH_VERSION-fresh.txt
 [ -f "$ORACLE" ] || { echo "run: $ORACLE missing — run gates/adoption/build-fixtures.sh first" >&2; exit 2; }
 # the probes must run as the account the oracle ran as; the builder records it
 [ -n "$USER_NAME" ] || [ ! -f "$FIXTURES/oracle/user.txt" ] || USER_NAME=$(cat "$FIXTURES/oracle/user.txt")
@@ -142,12 +149,13 @@ attach_tables() {
 }
 # name|fixture directory|host port
 # The generation is the id SET the gate matches, so 10.11.9 adopts as "10.11.8" (it adds no
-# migration) and 10.11.10 as "10.11.11" (both add the three NormalizedUsername ids). Every
-# jellyfin-*-from-* row is an upgraded database; jellyfin-12.2-fresh is a database created by a
-# Jellyfin 12.2 first run (not upgraded from 10.11), so it carries the fresh-install EF history
-# id set (105 ids, without the retired 10.11-era routines) and the fresh-install schema, yet
-# still adopts as generation 12.2.0 and answers Jellyfin 12.2's own smoke on that first-run
-# library (its own oracle, since a clean install is a distinct library from the seeded routes).
+# migration), 10.11.10 as "10.11.11" (both add the three NormalizedUsername ids), and 12.3 and 12.4
+# as "12.2.0" (neither adds a migration). Every jellyfin-*-from-* row is an upgraded database;
+# each jellyfin-*-fresh row is a database created by that release's first run (not upgraded from
+# 10.11), so it carries the fresh-install EF history id set (105 ids, without the retired
+# 10.11-era routines) and the fresh-install schema, yet still adopts as generation 12.2.0 and
+# answers the oracle release's smoke on a first-run library (an oracle of its own, since a clean
+# install is a distinct library from the seeded routes).
 FIXTURE_TABLE=(
   "10.11.8|jellyfin-10.11.8|18099"
   "10.11.8|jellyfin-10.11.9|18089"
@@ -160,6 +168,12 @@ FIXTURE_TABLE=(
   "12.2.0|jellyfin-12.2-from-12|18090"
   "12.2.0|jellyfin-12.2-from-121|18083"
   "12.2.0|jellyfin-12.2-fresh|18082"
+  "12.2.0|jellyfin-12.3-from-122|18078"
+  "12.2.0|jellyfin-12.3-from-10|18077"
+  "12.2.0|jellyfin-12.3-fresh|18076"
+  "12.2.0|jellyfin-12.4-from-123|18075"
+  "12.2.0|jellyfin-12.4-from-10|18074"
+  "12.2.0|jellyfin-12.4-fresh|18073"
 )
 wait_ready() { local port=$1; for _ in $(seq 1 300); do curl -sf "http://127.0.0.1:$port/System/Info/Public" >/dev/null && return 0; sleep 2; done; return 1; }
 # wait_up <container> <port> [seconds]: ready, or failed as soon as the container has exited (a server
@@ -216,11 +230,14 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   IFS='|' read -r expected src port <<<"$spec"
   [ -z "$ONLY" ] || [ "$ONLY" = "$src" ] || [ "$ONLY" = "$expected" ] || continue
   [ -d "$FIXTURES/$src" ] || { fixture_line path SKIP "$expected" "$src" "fixture missing"; continue; }
-  # A first-run install is a distinct, clean library (no aged seeds), so it always answers its
-  # own Jellyfin 12.2 oracle (it is a 12.2 database; --oracle does not apply to it). Every other
-  # row answers the shared ORACLE_VERSION oracle. Either way it is Jellyfin's own answers on the
-  # row's library, compared against Ferrofin's after adoption.
-  case $src in jellyfin-12.2-fresh) oracle=$FIXTURES/oracle/smoke-jellyfin-12.2-fresh.txt;; *) oracle=$ORACLE;; esac
+  # A first-run install is a distinct, clean library (no aged seeds), so it answers the
+  # fresh-install oracle (FRESH_ORACLE); every other row answers the shared ORACLE_VERSION
+  # oracle. Either way it is Jellyfin's own answers on the row's library, compared against
+  # Ferrofin's after adoption; `against` names that release in the checks and their reasons.
+  case $src in
+    jellyfin-*-fresh) oracle=$FRESH_ORACLE against=$FRESH_VERSION;;
+    *) oracle=$ORACLE against=$ORACLE_VERSION;;
+  esac
   [ -f "$oracle" ] || { fixture_line path SKIP "$expected" "$src" "oracle ${oracle##*/} missing — run build-fixtures.sh"; continue; }
   name=adopt-$src; dst=$WORK/$src
   record begin "$WORK" "$src" path "$expected"
@@ -265,8 +282,8 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   mapfile -t -O "${#why[@]}" why < <(adoption_check_boot_log "$dst.boot.log" "$expected")
   mark "after adoption" "boot log (generation, migrations, no ERROR)"
   "$HERE/smoke.sh" "http://127.0.0.1:$port" "$dst" "$USER_NAME" > "$dst.smoke.txt" 2>&1
-  mapfile -t -O "${#why[@]}" why < <(adoption_compare_smoke "$oracle" "$dst.smoke.txt" "$after_scan")
-  mark "after adoption" "answers match Jellyfin $ORACLE_VERSION"
+  mapfile -t -O "${#why[@]}" why < <(ORACLE_VERSION=$against adoption_compare_smoke "$oracle" "$dst.smoke.txt" "$after_scan")
+  mark "after adoption" "answers match Jellyfin $against"
   mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db")
   mark "after adoption" "integrity_check and foreign_key_check"
   metadata_check "after adoption" check
@@ -288,8 +305,8 @@ for spec in "${FIXTURE_TABLE[@]}"; do
   if [ -n "$after_scan" ]; then
     settle "$port" "$AUTH"
     "$HERE/smoke.sh" "http://127.0.0.1:$port" "$dst" "$USER_NAME" > "$dst.smoke-scan.txt" 2>&1
-    mapfile -t -O "${#why[@]}" why < <(adoption_compare_smoke "$oracle" "$dst.smoke-scan.txt" | sed 's/^/after scan: /')
-    mark "after scan" "answers match Jellyfin $ORACLE_VERSION"
+    mapfile -t -O "${#why[@]}" why < <(ORACLE_VERSION=$against adoption_compare_smoke "$oracle" "$dst.smoke-scan.txt" | sed 's/^/after scan: /')
+    mark "after scan" "answers match Jellyfin $against"
   fi
   mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db")
   mark "after scan" "integrity_check and foreign_key_check"
@@ -302,7 +319,7 @@ done
 # The messy fixtures (messy.py): a clean fixture plus the rows of shapes long-lived databases
 # carry and no API can produce (nine shapes: rows of a deleted user, an extra whose owner is gone,
 # two rows for one path, odd id spellings, names differing in case, ...). The same image adopts a
-# fresh copy of each, and every shape must end as Jellyfin 12.2 left it (DIR/<fixture>/messy-oracle.json)
+# fresh copy of each, and every shape must end as Jellyfin 12.4 left it (DIR/<fixture>/messy-oracle.json)
 # or as a divergence written down in messy.py. They
 # answer no smoke oracle: their library is the clean one plus rows no endpoint shows, so only the
 # boot, the file's integrity, a quiet second boot and the shapes are checked.
@@ -313,7 +330,7 @@ MESSY_MEDIA=("${MEDIA[@]}")
 # expected generation|fixture directory|host port
 MESSY_TABLE=(
   "10.11.11|jellyfin-10.11.11-messy|18081"
-  "12.2.0|jellyfin-12.2-messy|18080"
+  "12.2.0|jellyfin-12.4-messy|18080"
 )
 for spec in "${MESSY_TABLE[@]}"; do
   IFS='|' read -r expected src port <<<"$spec"
@@ -356,7 +373,7 @@ for spec in "${MESSY_TABLE[@]}"; do
   mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db")
   mark "after adoption" "integrity_check and foreign_key_check"
   mapfile -t -O "${#why[@]}" why < <(adoption_check_messy "$dst/data/jellyfin.db" "$dst")
-  mark "after adoption" "messy shapes end as Jellyfin 12.2 left them"
+  mark "after adoption" "messy shapes end as Jellyfin 12.4 left them"
   mapfile -t -O "${#why[@]}" why < <(adoption_check_tables "$dst/data/jellyfin.db" "$dst.tables.json" "$dst.tables-after-adoption.log" | sed 's/^/after adoption: /')
   mark "after adoption" "table digests"
   docker restart "$name" >/dev/null
@@ -370,7 +387,7 @@ for spec in "${MESSY_TABLE[@]}"; do
   mapfile -t -O "${#why[@]}" why < <(adoption_check_db "$dst/data/jellyfin.db" | sed 's/^/after restart: /')
   mark "after restart" "integrity_check and foreign_key_check"
   mapfile -t -O "${#why[@]}" why < <(adoption_check_messy "$dst/data/jellyfin.db" "$dst" | sed 's/^/after restart: /')
-  mark "after restart" "messy shapes end as Jellyfin 12.2 left them"
+  mark "after restart" "messy shapes end as Jellyfin 12.4 left them"
   mapfile -t -O "${#why[@]}" why < <(adoption_check_tables "$dst/data/jellyfin.db" "$dst.tables.json" "$dst.tables-after-restart.log" | sed 's/^/after restart: /')
   mark "after restart" "table digests"
   verdict=PASS; [ "${#why[@]}" = 0 ] || verdict=FAIL
