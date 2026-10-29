@@ -16,7 +16,12 @@
 Ferrofin speaks the **same HTTP API** as [Jellyfin](https://github.com/jellyfin/jellyfin), so
 existing Jellyfin clients (the web UI and native TV/mobile apps such as Swiftfin, Findroid, and
 Wolphin) connect to it **unchanged**. A client only ever sees an HTTP endpoint; it cannot tell
-the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopts it in place.
+the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopts it in place
+(one-way: back up first).
+
+Ferrofin is an independent project. It is not affiliated with or endorsed by the Jellyfin
+project. It exists because of the work of the Jellyfin team and contributors: the API it speaks,
+the clients that connect to it, and the server code it ports. Thank you.
 
 - **Want to try it?** → [Quickstart](#quickstart)
 - **Coming from Jellyfin?** → [Migrating from Jellyfin](#migrating-from-jellyfin) (read the
@@ -40,7 +45,7 @@ the server is Rust. Point Ferrofin at an existing Jellyfin database and it adopt
   the server process. Ferrofin does not, and will not. Third-party plugins run as
   sandboxed WASM with no filesystem or network access of their own. This is the one place
   Ferrofin deliberately diverges from Jellyfin; see [Plugins](#plugins-the-one-deliberate-divergence).
-- **Every route ported** All 412 operations in the Jellyfin API contract are wired to
+- **Every route ported.** All 412 operations in the Jellyfin API contract are wired to
   working handlers, developed by cross-checking responses against a real Jellyfin server.
   No `501` stubs, no fake `200`s.
 
@@ -60,7 +65,7 @@ Rust there was more code than I could read, and the agents made questionable dec
 times without asking. The performance gains over Jellyfin have been verified and the benchmarks back them
 up, but there is still room for improvement.
 
-Up until this first public release I have worked on Ferrofin solo. Most of my attention was on my 
+Up until this first public release I have worked on Ferrofin solo. Most of my attention was on my
 personal definition of the golden path. Areas that could use more attention include Live TV and the large number of settings.
 If something does not behave the way Jellyfin does, opening an issue describing the current and expected behaviour would be appreciated.
 PRs or plugin development are welcome too if anyone wants to get involved!
@@ -71,11 +76,24 @@ PRs or plugin development are welcome too if anyone wants to get involved!
 
 ```sh
 docker run -d --name ferrofin \
-  -p 8096:8096 \
+  -p 127.0.0.1:8096:8096 \
   -v ferrofin-data:/data \
   -v /path/to/media:/media:ro \
   ghcr.io/mangoleaf/ferrofin:latest
 ```
+
+This publishes the port on loopback only, because a fresh server's `admin` account has no
+password (see [below](#first-start-the-passwordless-admin)). Open `http://localhost:8096/web`
+on the Docker host and finish the setup wizard. Then recreate the container with
+`-p 8096:8096` so that other devices can reach it. For a headless install, add
+`-e FERROFIN_ADMIN_PASSWORD='<choose-a-password>'` to seed the password; the port can then be
+published on all interfaces from the start.
+
+`:latest` follows final releases only, never a release candidate. Adoption and the database
+migrations are one-way, so re-pulling `:latest` and recreating the container upgrades the
+install whether or not you planned to. For a long-running install, pin a release tag
+(`ghcr.io/mangoleaf/ferrofin:vX.Y.Z`, from the
+[releases page](https://github.com/mangoleaf/ferrofin/releases)) and upgrade on purpose.
 
 For automatic LAN server discovery, see [server discovery deployment](docs/SERVER_DISCOVERY.md).
 The TCP mapping above supports manual URL connections; it does not forward discovery broadcasts.
@@ -101,12 +119,14 @@ disables transcoding):
 cargo run -p ferrofin-server -- --data-dir ./data --bind 127.0.0.1 --port 8096
 ```
 
+### First start: the passwordless admin
+
 On a fresh database Ferrofin seeds an `admin` user **with no password**, as Jellyfin does,
 and logs a warning: the setup wizard at `/web` sets the password. Until it does, anyone who
-can reach the server can sign in as that administrator, so keep it bound to loopback (or,
-for the container image, which listens on all interfaces, keep its port unpublished) until
-setup is done, or set `FERROFIN_ADMIN_PASSWORD` to seed the password for a headless
-install. Then:
+can reach the server can sign in as that administrator. Keep it bound to loopback until setup
+is done: that is `--bind 127.0.0.1` from source, and for the container image, which listens
+on all interfaces, the `-p 127.0.0.1:8096:8096` mapping in the Docker command above. For a
+headless install, set `FERROFIN_ADMIN_PASSWORD` to seed the password instead. Then:
 
 ```sh
 curl http://localhost:8096/System/Info/Public   # smoke test
@@ -119,16 +139,17 @@ Configuration is via CLI flags, `FERROFIN_*` environment variables, or
 
 ## Migrating from Jellyfin
 
-Ferrofin reads Jellyfin's database directly. Point it at a data directory containing a
-Jellyfin **10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0 or 12.2.0** `jellyfin.db` and on first boot it detects the database,
-validates its migration set (and refuses loudly rather than half-adopting an unexpected version), and
-adopts it in place: **no re-scan, no re-import**. Users, watch state, playlists, and Live TV
-configuration carry forward. Ferrofin retains the `Users.NormalizedUsername` column and
-unique index from Jellyfin 10.11.10/10.11.11 and adds them to older databases. Login,
-creation, and renaming use Unicode-aware invariant uppercase keys compatible with
-Jellyfin, while the original spelling remains visible. If existing usernames collide
-under these rules, startup stops with the conflicting account IDs and names; resolve
-the names in the original server before retrying. Accounts are never merged.
+Ferrofin reads Jellyfin's database directly. Point it at a data directory containing a Jellyfin
+**10.11.8, 10.11.9, 10.11.10, 10.11.11, 12.0.0, 12.1.0 or 12.2.0** `jellyfin.db` and on first boot
+it detects the database, validates its migration set (and refuses loudly rather than half-adopting
+an unexpected version), and adopts it in place: **no re-scan, no re-import**. Users, watch state,
+playlists, and Live TV configuration carry forward. A 10.11 database also loses the items whose
+files are gone (see [below](#items-whose-files-are-gone-1011-databases)). Ferrofin retains the
+`Users.NormalizedUsername` column and unique index from Jellyfin 10.11.10/10.11.11 and adds them to
+older databases. Login, creation, and renaming use Unicode-aware invariant uppercase keys compatible
+with Jellyfin, while the original spelling remains visible. If existing usernames collide under
+these rules, startup stops with the conflicting account IDs and names; resolve the names in the
+original server before retrying. Accounts are never merged.
 
 Every release's gates session adopts each supported version and upgrade route, and the latest
 release's status is in [Results](#adopting-an-existing-jellyfin-database). Checks cover API
@@ -173,6 +194,18 @@ support for every 10.11.x or 12.x release.
 
 Existing Ferrofin databases upgrade in place across releases; steps that need operator
 action are listed in [`docs/UPGRADING.md`](docs/UPGRADING.md).
+
+### Items whose files are gone (10.11 databases)
+
+On the first boot of a database adopted from Jellyfin 10.11, Ferrofin removes the items whose
+file or folder is gone, and the items whose library was removed, as Jellyfin 12 does when it
+upgrades a 10.11 database. This also applies to a 10.11 database that Ferrofin 1.2.0 or later
+already adopted. Items under a media folder that is missing or empty are kept, because that
+looks the same as storage that did not mount. Play state for a removed item moves to a
+placeholder, as in Jellyfin, and no media file is touched. Before the first removal Ferrofin
+snapshots the database to `jellyfin.db.pre-missing-items`. Restoring that copy brings the items
+back in Ferrofin; it is not a way back to Jellyfin, which is `jellyfin.db.pre-ferrofin`. The
+details are in [`docs/UPGRADING.md`](docs/UPGRADING.md).
 
 ## Results
 
@@ -328,7 +361,7 @@ Releasing: [`RELEASE.md`](RELEASE.md).
 
 ## License
 
-**GPL-3.0-only.** Ferrofin is a source-level derivative of Jellyfin. The Jellyfin repository
-is internally inconsistent on this point (the root `LICENSE` is GPL-2.0, but the library
-`.csproj` packages being ported declare `GPL-3.0-only`); Ferrofin follows the
-`GPL-3.0-only` metadata on the specific crates it derives from. See [`LICENSE`](LICENSE).
+**GPL-3.0-only.** Ferrofin is a source-level derivative of Jellyfin. Jellyfin's root
+`LICENSE` is GPL-2.0, and the library `.csproj` packages that Ferrofin ports declare
+`GPL-3.0-only`. Ferrofin follows the `GPL-3.0-only` metadata of the packages it derives from.
+See [`LICENSE`](LICENSE).
