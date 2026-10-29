@@ -232,9 +232,9 @@ from.
      AB=$FERROFIN_GATES_DIR/runs/bench-gate-ab-<date>-<time>
    ```
 
-   `AB` is step 2's A/B gate session (its verdict cells give the README's graph against the previous
-   release). It writes `docs/results/vX.Y.Z/summary.json`, the graphs beside it and the README's
-   Results block, and refuses runs of different commits, images, hosts or fixtures. Regenerate
+   `AB` is step 2's A/B gate session (its verdict cells give the release page's graph against the previous
+   release). It writes `docs/results/vX.Y.Z/summary.json`, the graphs and the release's page
+   (`README.md`) beside it and the README's Results block, and refuses runs of different commits, images, hosts or fixtures. Regenerate
    `docs/BENCHMARKS.md` from the same three runs: `python3 gates/bench/report.py <run> <run> <run>`
    prints the tables, which replace everything between the file's two rules; update the date,
    commit and run notes above the first rule to match. Commit all of it to the release PR
