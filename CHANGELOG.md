@@ -128,6 +128,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   release (`oracle.py matches`). `oracle.py check` no longer takes `--gate`
 
 ### Parity
+- A playing session's `NowPlayingItem` (`GET /Sessions` and the WebSocket `Sessions` stream)
+  is the trimmed item Jellyfin sends. It no longer carries `People`, `MediaSources`, `Tags`,
+  `SortName`, `Etag`, `CanDelete`, `CanDownload`, `DisplayPreferencesId`,
+  `ProductionLocations`, `RemoteTrailers`, the lock settings or the counts. Its
+  `MediaStreams` and `RunTimeTicks` are now those of the media source the client reported
+  playing: the open live stream, or the version it named, the item's own file by default
 - The session WebSocket's `Sessions` stream is sent when a session starts or ends, playback
   starts or stops, a client reports progress or its capabilities, or a client's session,
   playback or SyncPlay request arrives after its session was idle for more than 10 s, as
@@ -597,6 +603,16 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   still run. The item it belongs to is asked as before
 
 ### Performance
+- A library scan keeps the remote answers it shares between items only as long as
+  Jellyfin's provider clients keep theirs, instead of until the scan ends. A TheMovieDb
+  season is kept for an hour after it was fetched, and the season cache holds at most
+  100,000 TheMovieDb records (a season counts itself, its people and its episodes), the
+  limits of Jellyfin's `TmdbClientManager`. A series' TheTVDB record and an episode's
+  TheTVDB still are kept for `FERROFIN_TVDB_CACHE_HOURS`. A scan that needs one of them
+  after that asks for it again, as Jellyfin does; the ids a series settled stay known to
+  its episodes either way. The image probes a scan reuses no longer
+  repeat each file's path, and a probe that cannot be reused (no width, height or
+  blurhash) is not kept
 - `/Persons` with a favourite filter: build the user's favourite-person set once per
   statement, as Jellyfin does, instead of probing it again for every person row. On the
   benchmark corpus (one debug build, before and after; the figures below too) that is
