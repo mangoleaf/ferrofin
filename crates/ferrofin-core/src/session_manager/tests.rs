@@ -12,6 +12,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::PermissionKind;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, SessionInfoDto};
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::{ClientCapabilities, MessageCommand, SessionMessageType};
@@ -73,8 +74,9 @@ impl ServerConfigurationManager for FixedConfig {
     }
 }
 
-/// A DTO service that is never invoked by the tested paths (the manager holds it
-/// only for the deferred now-playing-item enrichment).
+/// A DTO service for the tests that never build a `NowPlayingItem` (no session
+/// in them is playing when its sessions are listed); [`RecordingDtoService`]
+/// serves the ones that do.
 struct UnusedDtoService;
 
 #[async_trait]
@@ -4124,4 +4126,359 @@ fn the_idle_check_runs_every_fifth_minute() {
         .filter(|&minute| super::idle_check_due(minute))
         .collect();
     assert_eq!(due, [5, 10]);
+}
+
+/// A DTO service that records the options and user of each build and answers
+/// with the bare item (id, name, runtime). It sets `MediaStreams` to an empty
+/// list only when the options ask for it, so a test can tell the DTO's own
+/// streams from those the session manager puts on.
+#[derive(Default)]
+struct RecordingDtoService {
+    builds: Mutex<Vec<(DtoOptions, bool)>>,
+}
+
+impl RecordingDtoService {
+    /// The options of every build so far.
+    fn options(&self) -> Vec<DtoOptions> {
+        self.builds
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(options, _)| options.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl DtoService for RecordingDtoService {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unreachable!("not reached from get_sessions")
+    }
+    async fn get_base_item_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        unreachable!("not reached from get_sessions")
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.builds
+            .lock()
+            .unwrap()
+            .push((options.clone(), user.is_some()));
+        Ok(items
+            .iter()
+            .map(|row| BaseItemDto {
+                id: Uuid::parse_str(&row.id).expect("item id"),
+                name: row.name.clone(),
+                run_time_ticks: row.run_time_ticks,
+                media_streams: options
+                    .contains_field(ferrofin_model::querying::ItemFields::MediaStreams)
+                    .then(Vec::new),
+                ..BaseItemDto::default()
+            })
+            .collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        unreachable!("not reached from get_sessions")
+    }
+}
+
+/// A media-source manager over canned sources: the item's static sources and
+/// the open live streams. It counts the static lookups, so a test can tell
+/// that none was made.
+struct CannedSources {
+    static_sources: Vec<ferrofin_model::dto::MediaSourceInfo>,
+    live_streams: Vec<ferrofin_model::dto::MediaSourceInfo>,
+    static_lookups: Mutex<usize>,
+}
+
+#[async_trait]
+impl ferrofin_traits::library::MediaSourceManager for CannedSources {
+    async fn get_media_streams(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::entities_media::MediaStream>, ServiceError> {
+        unreachable!("not reached from get_sessions")
+    }
+    async fn get_media_attachments(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::entities_media::MediaAttachment>, ServiceError> {
+        unreachable!("not reached from get_sessions")
+    }
+    async fn get_playback_media_sources(
+        &self,
+        _item_id: Uuid,
+        _user_id: Uuid,
+        _allow_media_probe: bool,
+        _enable_path_substitution: bool,
+    ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
+        unreachable!("not reached from get_sessions")
+    }
+    async fn get_static_media_sources(
+        &self,
+        _item_id: Uuid,
+        enable_path_substitution: bool,
+        user_id: Option<Uuid>,
+    ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
+        // C# `GetMediaSource(…, enablePathSubstitution: false)` with no user.
+        assert!(!enable_path_substitution);
+        assert_eq!(user_id, None);
+        *self.static_lookups.lock().unwrap() += 1;
+        Ok(self.static_sources.clone())
+    }
+    async fn open_live_stream(
+        &self,
+        _request: &ferrofin_model::media_info::LiveStreamRequest,
+    ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
+        unreachable!("not reached from get_sessions")
+    }
+    async fn get_live_stream(
+        &self,
+        id: &str,
+    ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
+        self.live_streams
+            .iter()
+            .find(|s| s.live_stream_id.as_deref() == Some(id))
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound(format!("live stream {id}")))
+    }
+    async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// A source with one stream of `index` and the runtime `ticks`.
+fn canned_source(
+    id: &str,
+    live_stream_id: Option<&str>,
+    index: i32,
+    ticks: Option<i64>,
+) -> ferrofin_model::dto::MediaSourceInfo {
+    ferrofin_model::dto::MediaSourceInfo {
+        id: Some(id.to_owned()),
+        live_stream_id: live_stream_id.map(str::to_owned),
+        run_time_ticks: ticks,
+        media_streams: vec![ferrofin_model::entities_media::MediaStream {
+            index,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// The runtime the seeded item itself carries, which no canned source has.
+const ITEM_TICKS: i64 = 1_000;
+
+/// What a session playing an item of `kind` shows as its `NowPlayingItem`
+/// after a start report naming `media_source_id` and `live_stream_id`, and the
+/// options of every DTO build. `wired` attaches the media-source manager. The
+/// item's own source has stream 0 and 100 ticks, another version's has
+/// stream 1 and 200 ticks, and the open live stream `live-1` has stream 2 and
+/// no runtime.
+async fn now_playing_after(
+    kind: BaseItemKind,
+    media_source_id: Option<&str>,
+    live_stream_id: Option<&str>,
+    wired: bool,
+) -> (Option<BaseItemDto>, Vec<DtoOptions>, usize) {
+    use ferrofin_model::session::PlaybackStartInfo;
+
+    let db = test_db().await;
+    let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+        config: default_server_configuration(),
+    });
+    let dtos = Arc::new(RecordingDtoService::default());
+    let item_id = Uuid::new_v4();
+    let sources = Arc::new(CannedSources {
+        static_sources: vec![
+            canned_source(&item_id.simple().to_string(), None, 0, Some(100)),
+            canned_source("5d2c5a3e9b8f4c1aa0e1d2c3b4a59687", None, 1, Some(200)),
+        ],
+        live_streams: vec![canned_source("live-source", Some("live-1"), 2, None)],
+        static_lookups: Mutex::new(0),
+    });
+    let mut mgr = FerrofinSessionManager::new(
+        Arc::new(FerrofinUserManager::new(db.clone())),
+        Arc::new(FerrofinDeviceManager::new(db.clone())),
+        Arc::new(FerrofinUserDataManager::new(db.clone(), config)),
+        library_manager(&db),
+        Arc::clone(&dtos) as Arc<dyn DtoService>,
+        Arc::new(FerrofinEventManager::new()) as Arc<dyn ferrofin_traits::events::EventManager>,
+        db.clone(),
+        "server-1".to_owned(),
+    );
+    if wired {
+        mgr = mgr.with_media_sources(
+            Arc::clone(&sources) as Arc<dyn ferrofin_traits::library::MediaSourceManager>
+        );
+    }
+
+    crate::test_support::seed_item(&db, item_id, kind).await;
+    let mut row = crate::test_support::fetch_item(&db, item_id).await;
+    row.run_time_ticks = Some(ITEM_TICKS);
+    crate::test_support::save_item(&db, &row).await;
+    let user = seed_named_user(&db, Uuid::new_v4(), "watcher").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-now-playing", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id,
+        media_source_id: media_source_id.map(str::to_owned),
+        live_stream_id: live_stream_id.map(str::to_owned),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+
+    let listed = mgr
+        .get_sessions(Uuid::nil(), None, None, None, true)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    let item = listed.into_iter().next().unwrap().now_playing_item;
+    if let Some(item) = &item {
+        assert_eq!(item.id, item_id);
+    }
+    let lookups = *sources.static_lookups.lock().unwrap();
+    let built_for_user = dtos.builds.lock().unwrap().iter().any(|(_, user)| *user);
+    assert!(!built_for_user, "C# GetItemInfo builds with no user");
+    (item, dtos.options(), lookups)
+}
+
+/// The indices of the streams a `NowPlayingItem` carries, `None` when it has
+/// no `MediaStreams` at all.
+fn stream_indices(item: &BaseItemDto) -> Option<Vec<i32>> {
+    item.media_streams
+        .as_ref()
+        .map(|streams| streams.iter().map(|s| s.index).collect())
+}
+
+/// C# `SessionManager.GetItemInfo` builds a session's `NowPlayingItem` from
+/// every field but this list, with no program recording info, then puts the
+/// reported media source's streams on it. `UpdateNowPlayingItem` gives it
+/// that source's runtime.
+#[tokio::test]
+async fn the_now_playing_item_is_upstreams_trimmed_item_info() {
+    use ferrofin_model::querying::ItemFields;
+
+    let (item, options, _) = now_playing_after(
+        BaseItemKind::Movie,
+        Some("5D2C5A3E-9B8F-4C1A-A0E1-D2C3B4A59687"),
+        None,
+        true,
+    )
+    .await;
+    let item = item.expect("a NowPlayingItem");
+
+    // `GetItemInfo`'s removals, verbatim (`People` is removed twice upstream).
+    let removed = [
+        ItemFields::CanDelete,
+        ItemFields::CanDownload,
+        ItemFields::ChildCount,
+        ItemFields::CustomRating,
+        ItemFields::DateLastMediaAdded,
+        ItemFields::DateLastRefreshed,
+        ItemFields::DateLastSaved,
+        ItemFields::DisplayPreferencesId,
+        ItemFields::Etag,
+        ItemFields::ItemCounts,
+        ItemFields::MediaSourceCount,
+        ItemFields::MediaStreams,
+        ItemFields::MediaSources,
+        ItemFields::People,
+        ItemFields::PlayAccess,
+        ItemFields::People,
+        ItemFields::ProductionLocations,
+        ItemFields::RecursiveItemCount,
+        ItemFields::RemoteTrailers,
+        ItemFields::SeasonUserData,
+        ItemFields::Settings,
+        ItemFields::SortName,
+        ItemFields::Tags,
+    ];
+    let expected: Vec<ItemFields> = DtoOptions::all_fields()
+        .into_iter()
+        .filter(|field| !removed.contains(field))
+        .collect();
+    assert_eq!(options.len(), 1, "one build per playing session");
+    assert_eq!(options[0].fields, expected);
+    assert!(!options[0].add_program_recording_info);
+    let defaults = DtoOptions::default();
+    assert_eq!(options[0].image_types, defaults.image_types);
+    assert_eq!(options[0].image_type_limit, defaults.image_type_limit);
+    assert!(options[0].enable_images && options[0].enable_user_data);
+
+    // The named version, matched in any spelling of its guid.
+    assert_eq!(stream_indices(&item), Some(vec![1]));
+    assert_eq!(item.run_time_ticks, Some(200));
+}
+
+/// Which media source the item shows (C# `MediaSourceManager.GetMediaSource`
+/// from `UpdateNowPlayingItem`): an open live stream wins; an empty
+/// `MediaSourceId` is the item's own id; an id naming no source, an item that
+/// is not `IHasMediaSources` (a book) and a manager without media sources
+/// show none, and keep the item's own runtime.
+#[rstest::rstest]
+#[case::named(BaseItemKind::Movie, Some("5d2c5a3e9b8f4c1aa0e1d2c3b4a59687"), None, true, Some(vec![1]), Some(200), 1)]
+#[case::none_named(BaseItemKind::Movie, None, None, true, Some(vec![0]), Some(100), 1)]
+#[case::empty_named(BaseItemKind::Episode, Some(""), None, true, Some(vec![0]), Some(100), 1)]
+#[case::unknown(
+    BaseItemKind::Movie,
+    Some("no-such-source"),
+    None,
+    true,
+    None,
+    Some(ITEM_TICKS),
+    1
+)]
+#[case::live_stream(BaseItemKind::Movie, Some("ignored"), Some("live-1"), true, Some(vec![2]), None, 0)]
+#[case::closed_live_stream(
+    BaseItemKind::Movie,
+    None,
+    Some("live-9"),
+    true,
+    None,
+    Some(ITEM_TICKS),
+    0
+)]
+#[case::audio(BaseItemKind::Audio, None, None, true, Some(vec![0]), Some(100), 1)]
+#[case::book(BaseItemKind::Book, None, None, true, None, Some(ITEM_TICKS), 0)]
+#[case::not_wired(BaseItemKind::Movie, None, None, false, None, Some(ITEM_TICKS), 0)]
+#[tokio::test]
+async fn the_now_playing_item_shows_the_reported_media_source(
+    #[case] kind: BaseItemKind,
+    #[case] media_source_id: Option<&str>,
+    #[case] live_stream_id: Option<&str>,
+    #[case] wired: bool,
+    #[case] streams: Option<Vec<i32>>,
+    #[case] ticks: Option<i64>,
+    #[case] static_lookups: usize,
+) {
+    let (item, _, lookups) = now_playing_after(kind, media_source_id, live_stream_id, wired).await;
+    let item = item.expect("a NowPlayingItem");
+    assert_eq!(stream_indices(&item), streams);
+    assert_eq!(item.run_time_ticks, ticks);
+    assert_eq!(lookups, static_lookups);
 }

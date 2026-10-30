@@ -119,6 +119,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   release (`oracle.py matches`). `oracle.py check` no longer takes `--gate`
 
 ### Parity
+- A playing session's `NowPlayingItem` (`GET /Sessions` and the WebSocket `Sessions` stream)
+  is the trimmed item Jellyfin sends. It no longer carries `People`, `MediaSources`, `Tags`,
+  `SortName`, `Etag`, `CanDelete`, `CanDownload`, `DisplayPreferencesId`,
+  `ProductionLocations`, `RemoteTrailers`, the lock settings or the counts. Its
+  `MediaStreams` and `RunTimeTicks` are now those of the media source the client reported
+  playing: the open live stream, or the version it named, the item's own file by default
 - The session WebSocket's `Sessions` stream is sent when a session starts or ends, playback
   starts or stops, a client reports progress or its capabilities, or a client's session,
   playback or SyncPlay request arrives after its session was idle for more than 10 s, as
