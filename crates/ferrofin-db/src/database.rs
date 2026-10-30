@@ -640,10 +640,7 @@ impl Database {
     ) -> Result<Vec<(String, String, String)>> {
         let mut out = Vec::new();
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
                    WHERE "ItemId" IN ({placeholders})"#,
@@ -670,10 +667,7 @@ impl Database {
     pub async fn item_data_blobs(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Data" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Data" IS NOT NULL"#,
@@ -701,10 +695,7 @@ impl Database {
     pub async fn item_studios(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Studios" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Studios" IS NOT NULL AND "Studios" <> ''"#,
@@ -732,10 +723,7 @@ impl Database {
     pub async fn item_original_languages(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "OriginalLanguage" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "OriginalLanguage" IS NOT NULL"#,
@@ -767,10 +755,7 @@ impl Database {
     ) -> Result<Vec<(String, i64)>> {
         let mut out = Vec::new();
         for chunk in primary_ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             // The seeded placeholder row is excluded exactly as the full-row
             // read (`get_items_by_primary_version_batch`) excludes it.
             let sql = format!(
@@ -802,10 +787,7 @@ impl Database {
     pub async fn image_parent_rows(&self, ids: &[String]) -> Result<Vec<ImageParentRow>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Type", "ParentId", "OwnerId", "SeriesId", "SeasonId",
                           "AlbumArtists", "Path", "LUFS", "NormalizationGain"
@@ -860,10 +842,7 @@ impl Database {
     pub async fn photo_album_names(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Name" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders})
@@ -890,10 +869,7 @@ impl Database {
     pub async fn playlist_owners(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "PlaylistId", "OwnerUserId" FROM "FerrofinPlaylists"
                    WHERE "PlaylistId" IN ({placeholders}) AND "OwnerUserId" IS NOT NULL"#,

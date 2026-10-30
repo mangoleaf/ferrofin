@@ -2120,10 +2120,7 @@ impl FerrofinUserDataManager {
             return Ok(out);
         }
         for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
                    WHERE "ItemId" IN ({placeholders})"#,
@@ -2151,10 +2148,7 @@ impl FerrofinUserDataManager {
     ) -> Result<HashMap<Uuid, Vec<UserDataEntity>>, ServiceError> {
         let mut map: HashMap<Uuid, Vec<UserDataEntity>> = HashMap::with_capacity(item_ids.len());
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (2..=chunk.len() + 1)
-                .map(|index| format!("?{index}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = ferrofin_db::numbered_placeholders(2..=chunk.len() + 1);
             let sql = format!(
                 r#"SELECT * FROM "UserData" WHERE "UserId" = ?1 AND "ItemId" IN ({placeholders})"#
             );
