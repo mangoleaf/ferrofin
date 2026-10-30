@@ -2604,6 +2604,10 @@ struct PathScope<'a> {
     /// carries it for context only (the owner of a new extra). `None` before
     /// the moves are made.
     moved: Option<&'a std::collections::HashSet<Uuid>>,
+    /// Whether the items at the roots are what a refresh was asked for, whose
+    /// failure the scan ends with: an item's or a folder's own refresh, not
+    /// the library monitor's roots.
+    roots_requested: bool,
 }
 
 impl<'a> PathScope<'a> {
@@ -2618,7 +2622,31 @@ impl<'a> PathScope<'a> {
             carried: None,
             regrouped: None,
             moved: None,
+            roots_requested: false,
         }
+    }
+
+    /// This scope with its roots being what a refresh was asked for.
+    fn requested(self) -> Self {
+        Self {
+            roots_requested: true,
+            ..self
+        }
+    }
+
+    /// Whether `item` is an item a refresh was asked for: it stands at a
+    /// root. `ProviderManager.RefreshItem` awaits that item's `RefreshMetadata`
+    /// with no catch, while `LimitedConcurrencyLibraryScheduler.ProcessItem`
+    /// catches what the folder validates below it (`Folder.RunTasks`) and
+    /// `BaseItem.RefreshMetadata` what `RefreshedOwnedItems` throws.
+    fn is_requested(&self, item: &Planned) -> bool {
+        self.roots_requested
+            && item.entity.path.as_deref().is_some_and(|path| {
+                let path = path.trim_end_matches('/');
+                self.roots
+                    .iter()
+                    .any(|root| root.trim_end_matches('/') == path)
+            })
     }
 
     /// Whether `item` is a member of a covered video's local group that the
@@ -4957,7 +4985,7 @@ impl LibraryScanner {
     /// # Errors
     /// Propagates the item-store failure if planning the scan or sweeping
     /// user data fails. One item that cannot be read or written fails only
-    /// itself ([`ScanOutcome::skipped`]), unless an item refresh asked for it.
+    /// itself ([`ScanOutcome::skipped`]), unless a refresh asked for that item.
     pub async fn scan(&self, only: Option<Uuid>) -> Result<ScanOutcome, ServiceError> {
         self.scan_with(only, &MetadataRefreshOptions::default())
             .await
@@ -5009,8 +5037,8 @@ impl LibraryScanner {
             ScanTarget::All => self.scan_libraries(None, run).await,
             ScanTarget::Library(id) => self.scan_libraries(Some(*id), run).await,
             ScanTarget::Paths(paths) => {
-                self.scan_scoped(PathScope::of(paths, true), None, paths.len(), run)
-                    .await
+                let scope = PathScope::of(paths, true).requested();
+                self.scan_scoped(scope, None, paths.len(), run).await
             }
             ScanTarget::Changed(paths) => Box::pin(self.scan_changed(paths, run)).await,
             ScanTarget::Items(paths) => {
@@ -5031,8 +5059,8 @@ impl LibraryScanner {
                 // a kept item in `plan_movies`), covered by
                 // `plan_paths_tests`, plus a prune of only the `ExtraType`
                 // rows under that folder.
-                self.scan_scoped(PathScope::of(paths, false), None, paths.len(), run)
-                    .await
+                let scope = PathScope::of(paths, false).requested();
+                self.scan_scoped(scope, None, paths.len(), run).await
             }
             ScanTarget::Artist { id, path, folders } => {
                 // `RefreshArtist`: the artist folders' children, and the
@@ -6323,9 +6351,10 @@ impl LibraryScanner {
     /// so the next scan refreshes it whatever its file did. A new item that
     /// left no row takes what is planned below it along
     /// (`Folder.RefreshChildMetadata` recurses only into a child that
-    /// refreshed): those would hang off nothing. An item's own refresh
-    /// (`RefreshSingleItem`, which `Folder.RunTasks` does not wrap) still
-    /// ends with its failure, so a caller awaiting it hears of it.
+    /// refreshed): those would hang off nothing. A refresh of an item or a
+    /// folder still ends with that item's own failure, after the rest has
+    /// run, so a caller awaiting it hears of it
+    /// ([`PathScope::is_requested`]).
     // The scan loop reads best as one straight line; serving the priority
     // lane between items and choosing the closing passes tipped it over the
     // line count.
@@ -6550,12 +6579,10 @@ impl LibraryScanner {
         let mut due_playlists: Vec<playlists::DuePlaylist> = Vec::new();
         // The new items that failed and left no row.
         let mut unwritten: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
-        // The first failure of an item an item refresh was asked for, a part
-        // or version it carries included: `RefreshedOwnedItems` is awaited
-        // with no catch of its own.
+        // The first failure of an item a refresh was asked for
+        // ([`PathScope::is_requested`]).
         let mut target_failure: Option<ServiceError> = None;
-        let targeted =
-            |item: &Planned| scope.is_some_and(|scope| !scope.prune && scope.covers(item));
+        let targeted = |item: &Planned| scope.is_some_and(|scope| scope.is_requested(item));
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
             probes.pause_foreground();
@@ -31114,6 +31141,7 @@ mod tests {
             carried: None,
             regrouped: None,
             moved: None,
+            roots_requested: false,
         };
         let at = |id: u128, path: &str| super::Planned {
             id: uuid::Uuid::from_u128(id),

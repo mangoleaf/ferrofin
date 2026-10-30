@@ -980,8 +980,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    be read, and what the walk does when an item fails. ferrofin-core \
                    library_scan.rs run_scan (the item's error is counted in \
                    ScanOutcome::skipped, the walk goes on, a saved row loses its \
-                   DateLastRefreshed, a new item with no row takes its descendants along, an \
-                   item refresh still ends with its item's failure) \
+                   DateLastRefreshed, a new item with no row takes its descendants along, a \
+                   refresh of an item or folder ends with that item's own failure) \
                    ← parent_row (a failed read counts as \
                    no row, once per pass) ← sync_series_name (FindSeriesName), \
                    sync_season_name, remember_series_folder; apply_parental_rating_score and \
@@ -990,6 +990,8 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    LimitedConcurrencyLibraryScheduler.cs (ProcessItem), \
                    MediaBrowser.Controller/Entities/Folder.cs (RunTasks, \
                    RefreshChildMetadata), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (RefreshMetadata), \
+                   MediaBrowser.Providers/Manager/ProviderManager.cs (RefreshItem), \
                    MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata), \
                    MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \

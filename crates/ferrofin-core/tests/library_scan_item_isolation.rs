@@ -820,3 +820,175 @@ async fn an_item_refresh_ends_with_its_items_failure() {
     assert!(refreshed.is_err(), "{refreshed:?}");
     assert!(fx.names(&episode).await.is_none());
 }
+
+/// The options of an Identify's Apply, and of the folders above it.
+fn identify_options() -> (
+    ferrofin_traits::providers::MetadataRefreshOptions,
+    ferrofin_traits::providers::MetadataRefreshOptions,
+) {
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+    (
+        MetadataRefreshOptions {
+            replace_all_metadata: true,
+            metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+            ..MetadataRefreshOptions::default()
+        },
+        MetadataRefreshOptions {
+            metadata_refresh_mode: MetadataRefreshMode::None,
+            image_refresh_mode: MetadataRefreshMode::None,
+            ..MetadataRefreshOptions::default()
+        },
+    )
+}
+
+// A folder's Identify runs through `ScanTarget::Paths`, and
+// `ProviderManager.RefreshItem` awaits the folder's own `RefreshMetadata` with
+// no catch: the chosen ids are written by that save alone, so a caller told it
+// worked would have lost them for good.
+#[tokio::test]
+async fn a_folder_refresh_ends_with_the_folders_own_failure() {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    let fx = Fixture::new().await;
+    fx.episode("Show", 1);
+    let series = fx.shows.join("Show");
+    fx.scanner.scan_all().await.expect("first scan");
+    let (options, none) = identify_options();
+    fx.run(
+        r#"CREATE TRIGGER "refuse_series" BEFORE UPDATE OF "Name" ON "BaseItems"
+           WHEN OLD."Type" LIKE '%.Series'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+    )
+    .await;
+
+    let refreshed = fx
+        .scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![series.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await;
+
+    assert!(refreshed.is_err(), "{refreshed:?}");
+
+    // The same root spelled with a trailing slash.
+    let slashed = format!("{}/", series.to_string_lossy());
+    let refreshed = fx
+        .scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![slashed]),
+            ScanRun::new(&options, &none, &ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await;
+    assert!(refreshed.is_err(), "{refreshed:?}");
+}
+
+// The library monitor's roots are nothing a caller asked for: nobody awaits
+// them, and a failure at one must not turn its batch into a failed scan.
+#[tokio::test]
+async fn a_watcher_scan_skips_a_failed_item_at_its_root() {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    let fx = Fixture::new().await;
+    fx.episode("Show", 1);
+    let series = fx.shows.join("Show");
+    fx.scanner.scan_all().await.expect("first scan");
+    let (options, none) = identify_options();
+    fx.run(
+        r#"CREATE TRIGGER "refuse_series" BEFORE UPDATE OF "Name" ON "BaseItems"
+           WHEN OLD."Type" LIKE '%.Series'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+    )
+    .await;
+
+    let scan = fx
+        .scanner
+        .scan_target(
+            &ScanTarget::Changed(vec![series.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await
+        .expect("a watcher scan goes on");
+
+    assert_eq!(scan.skipped, 1);
+}
+
+// `BaseItem.RefreshMetadata` catches what `RefreshedOwnedItems` throws, so a
+// stacked movie's part that fails is logged and its Identify still succeeds.
+#[tokio::test]
+async fn a_refresh_survives_an_owned_parts_failure() {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    let fx = Fixture::new().await;
+    let folder = fx.movies.join("Stacked (2001)");
+    let first = folder.join("Stacked (2001) cd1.mkv");
+    let second = folder.join("Stacked (2001) cd2.mkv");
+    Fixture::write(&first, "");
+    Fixture::write(&second, "");
+    fx.scanner.scan_all().await.expect("first scan");
+    assert!(fx.names(&second).await.is_some(), "the part has a row");
+    let (options, none) = identify_options();
+    fx.run(&format!(
+        r#"CREATE TRIGGER "refuse_part" BEFORE UPDATE OF "Name" ON "BaseItems"
+           WHEN OLD."Path" = '{}'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+        second.to_string_lossy()
+    ))
+    .await;
+
+    let refreshed = fx
+        .scanner
+        .scan_target(
+            &ScanTarget::Items(vec![first.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await
+        .expect("the primary refreshed");
+
+    assert_eq!(refreshed.skipped, 1, "the part");
+}
+
+// A refresh stopped during its closing passes answers as stopped: its caller
+// is told it did not finish, whatever it got through.
+#[tokio::test]
+async fn a_stopped_refresh_answers_as_stopped_over_a_failure() {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    let fx = Fixture::new().await;
+    fx.episode("Show", 1);
+    let series = fx.shows.join("Show");
+    fx.scanner.scan_all().await.expect("first scan");
+    let (options, none) = identify_options();
+    fx.run(
+        r#"CREATE TRIGGER "refuse_series" BEFORE UPDATE OF "Name" ON "BaseItems"
+           WHEN OLD."Type" LIKE '%.Series'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+    )
+    .await;
+    let cancel = Arc::new(ScanCancel::new());
+    let stopper = Arc::clone(&cancel);
+    // Past the walk's 96 %, inside the closing passes.
+    let stop = move |percent: f64| {
+        if percent > 96.0 {
+            stopper.cancel();
+        }
+    };
+
+    let refreshed = fx
+        .scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![series.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &cancel)
+                .with_progress(&stop)
+                .with_passes(ferrofin_core::ScanPasses::Library),
+        )
+        .await
+        .expect("a stop is no failure");
+
+    assert!(refreshed.stopped);
+    assert_eq!(refreshed.skipped, 1);
+}
