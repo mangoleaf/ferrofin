@@ -1656,6 +1656,7 @@ dependencies = [
  "ferrofin-wasm",
  "flate2",
  "futures-util",
+ "http-body",
  "image",
  "opentelemetry",
  "opentelemetry-otlp",

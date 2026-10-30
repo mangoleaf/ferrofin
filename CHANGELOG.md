@@ -717,6 +717,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   copying any session or item
 
 ### Security
+- A connection can no longer be held open for free. As on Jellyfin's web server (Kestrel), a
+  connection that has no request under way is closed after 130 s, and a request whose headers
+  have not all arrived 30 s after its first byte is answered `408` and closed; before, either
+  could stay open forever, and enough of them used up the server's file descriptors. Nothing
+  changes for a running request: a download, an upload and a slow response keep their
+  connection for as long as they take, and so does a WebSocket. Accepted sockets also turn on
+  TCP keep-alive, so the system ends a connection whose peer vanished, on the host's own
+  schedule (about 2 hours and 10 minutes by Linux's defaults). See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - A server whose setup was completed no longer starts when its database is missing, empty or
   has no migration history, as Jellyfin 12.2 refuses. It created an empty database and seeded
   a new `admin`; without `FERROFIN_ADMIN_PASSWORD` that admin had no password, so anyone who
@@ -837,11 +846,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
-- **Refresh People** no longer deletes a locked person, or a person whose item a provider renamed
-  away from their credit: it decides by the id a credit derives, as Jellyfin 12 does, and a row
-  also stays while a credit carries its exact name or resolves to it by clean name, so it deletes
-  a subset of what it used to. It now creates the item a credit has none of and refreshes it.
-  Spellings sharing a clean name stay one person on one item
+- One item that cannot be read or written no longer ends a library scan: it is skipped, counted
+  in the scan's summary and refreshed again by the next scan, as Jellyfin does, while the rest of
+  the scan, the removal of deleted files, the closing passes and the client notification all run
+- A Series or Season row the database cannot decode no longer fails every later library scan at
+  its first child: its children keep the names and the parental rating they have, and new
+  episodes, later libraries and deleted files are all handled again
 - Two user-data changes to one item that overlap now both land. A progress report used to undo
   a favourite, like or played mark made while it waited for the database writer (for seconds
   during a library scan), and overlapping play starts counted once

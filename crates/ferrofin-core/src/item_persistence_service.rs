@@ -4061,6 +4061,42 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(written)
     }
 
+    async fn clear_date_last_refreshed(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let cleared =
+            sqlx::query(r#"UPDATE "BaseItems" SET "DateLastRefreshed" = NULL WHERE "Id" = ?1"#)
+                .bind(guid_to_db(item_id))
+                .execute(self.db.writer())
+                .await
+                .map_err(db_err)?;
+        Ok(cleared.rows_affected() > 0)
+    }
+
+    async fn presentation_unique_key(&self, item_id: Uuid) -> Result<Option<String>, ServiceError> {
+        let key: Option<Option<String>> = sqlx::query_scalar(
+            r#"SELECT "PresentationUniqueKey" FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(key.flatten())
+    }
+
+    async fn stored_rating_score(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<(i64, Option<i64>)>, ServiceError> {
+        let score: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
+            r#"SELECT "InheritedParentalRatingValue", "InheritedParentalRatingSubValue"
+               FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(score.and_then(|(value, sub)| Some((value?, sub))))
+    }
+
     async fn locked_fields_for_items(
         &self,
         item_ids: &[Uuid],
@@ -12678,6 +12714,34 @@ mod tests {
             row.date_last_saved,
             Some(at),
             "the refresh's save: upstream saves a first refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_the_refresh_stamp_moves_nothing_else() {
+        let db = test_db().await;
+        let service = FerrofinItemPersistenceService::new(db.clone());
+        let item = Uuid::new_v4();
+        seed_item(&db, item, BaseItemKind::Movie).await;
+        let at = chrono::Utc::now();
+        service
+            .stamp_date_last_refreshed(&[item], at)
+            .await
+            .unwrap();
+        let stamped = crate::test_support::fetch_item(&db, item).await;
+        assert!(stamped.date_last_refreshed.is_some());
+
+        assert!(service.clear_date_last_refreshed(item).await.unwrap());
+
+        let row = crate::test_support::fetch_item(&db, item).await;
+        assert_eq!(row.date_last_refreshed, None);
+        assert_eq!(row.date_last_saved, stamped.date_last_saved);
+        assert!(
+            !service
+                .clear_date_last_refreshed(Uuid::new_v4())
+                .await
+                .unwrap(),
+            "no such row"
         );
     }
 
