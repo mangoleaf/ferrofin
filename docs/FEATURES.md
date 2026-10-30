@@ -89,6 +89,11 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     the last user or administrator, and can hand a playlist to a deleted user.
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
+  - **Accepted divergence (a fix, not a gap):** when a *half top-and-bottom* 3D source is
+    transcoded to a requested width, Jellyfin's software scaler carries an unbalanced
+    bracket (`scale=(iw*2):ih)`), which ffmpeg's expression parser rejects, so the
+    transcode never starts. Ferrofin emits the balanced form, which Jellyfin's own image
+    extraction has used since 12.3.
 - **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,
   HDR→SDR tonemap and subtitle compositing all run on the GPU where the driver supports
   it, with the pipeline chosen from a runtime probe of the device rather than from
@@ -129,11 +134,6 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   off. Off by default, as in Jellyfin.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
-  - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half
-    top-and-bottom* 3D sources carries an unbalanced bracket (`scale=(iw*2):ih)`), which
-    ffmpeg's expression parser rejects outright — so chapter and thumbnail images cannot
-    be extracted for that layout there at all. Ferrofin emits the balanced form, the same
-    shape Jellyfin's own half-side-by-side case already has.
   - **Accepted divergence (a fix, not a gap):** Jellyfin passes every 3D scaler unquoted
     (`-vf {3}`), and those graphs contain spaces, so the command line is split apart and
     no 3D layout gets chapter or thumbnail images. Ferrofin quotes the filter graph.
