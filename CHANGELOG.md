@@ -11,6 +11,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 ## [Unreleased]
 
 ### Features
+- `POST /Ferrofin/Settings` (administrators only) saves changes to `config.toml`: each value is
+  checked by the rules the server applies at startup, the file keeps its comments, its layout and
+  every key the save does not name, and the server reports a pending restart. A setting a flag or
+  an environment variable sets, a read-only setting and an invalid value are refused with the
+  reason (`400`), a file or directory that cannot be written answers `409` naming the path, and
+  either way nothing is written (see [docs/CONFIG.md](docs/CONFIG.md#saving-from-the-web))
 - `GET /Ferrofin/Settings` (administrators only) reports every Ferrofin setting (each
   `config.toml` key and the OpenTelemetry variables) with the value in use, its default and
   where it comes from (flag, environment variable, `config.toml` or default), a value

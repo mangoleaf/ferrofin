@@ -1,7 +1,9 @@
 //! The Ferrofin settings page's server side: [`SETTINGS`], one row per
 //! bootstrap setting (CLI flag, `FERROFIN_*` environment variable,
 //! `config.toml` key), and [`FerrofinServerSettings`], which reports each
-//! one's running value and where it comes from over `GET /Ferrofin/Settings`.
+//! one's running value and where it comes from over `GET /Ferrofin/Settings`
+//! and saves the page's changes to `config.toml` over `POST /Ferrofin/Settings`
+//! (the `save` module).
 //!
 //! The table is the one description of the settings that the report, the
 //! page and saving read. Its tests tie it to what the loader reads
@@ -17,6 +19,7 @@
 //! (owner decision D1 of the settings-page milestone): one saved to
 //! `config.toml` underneath would not apply while it is set.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,7 +27,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ferrofin_core::system_manager::LifecycleController;
 use ferrofin_model::server_settings::{
     ServerSettingApplies as Applies, ServerSettingDto, ServerSettingGroup as Group,
-    ServerSettingKind, ServerSettingSource as Source, ServerSettingsDto,
+    ServerSettingKind, ServerSettingSource as Source, ServerSettingsDto, ServerSettingsUpdateDto,
+    ServerSettingsUpdateResultDto,
 };
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::plugins::PluginManager;
@@ -132,6 +136,11 @@ pub struct SettingSpec {
     /// them, as on Jellyfin's plugin pages). `null` when unset and the
     /// default applies.
     pub running: fn(&Config) -> Value,
+    /// A rule a value the page saves must meet beyond its kind: one the
+    /// server applies by warning and falling back to the default, which a save
+    /// refuses instead, so a value the server would ignore is never saved.
+    /// Given a value of the row's kind.
+    pub check: fn(&Value) -> Result<(), String>,
 }
 
 /// The note of the directories the server is started on.
@@ -203,6 +212,7 @@ const ROW: SettingSpec = SettingSpec {
     default: "",
     description: "",
     running: |_| Value::Null,
+    check: |_| Ok(()),
 };
 
 /// Every bootstrap setting, in the order the page lists them.
@@ -537,6 +547,14 @@ pub static SETTINGS: &[SettingSpec] = &[
         default: "info",
         description: "Log filter, in RUST_LOG syntax; RUST_LOG wins when it is set.",
         running: |c| json!(c.log_level),
+        // An invalid filter logs at `info` (`bootstrap::init_tracing`).
+        check: |value| {
+            value
+                .as_str()
+                .filter(|filter| tracing_subscriber::EnvFilter::try_new(filter).is_ok())
+                .map(drop)
+                .ok_or_else(|| "is not a log filter in RUST_LOG syntax, e.g. info".to_owned())
+        },
         ..ROW
     },
     SettingSpec {
@@ -552,6 +570,15 @@ pub static SETTINGS: &[SettingSpec] = &[
                 LogFormat::Json => "json",
                 LogFormat::Text => "text",
             })
+        },
+        // Anything else is json, with a warning (`config::resolve_log_format`).
+        check: |value| {
+            value
+                .as_str()
+                .map(|format| format.trim().to_ascii_lowercase())
+                .filter(|format| format == "json" || format == "text")
+                .map(drop)
+                .ok_or_else(|| "is json or text".to_owned())
         },
         ..ROW
     },
@@ -590,6 +617,15 @@ pub static SETTINGS: &[SettingSpec] = &[
         default: "1–2.5–5 per decade, 0.001 to 5000",
         description: "Bucket boundaries, in seconds, of the library-scan duration histograms.",
         running: |c| json!(c.metrics_scan_duration_buckets),
+        // An invalid list is the default, with a warning (`scan_metrics::install`).
+        check: |value| {
+            let buckets: Vec<f64> = value
+                .as_array()
+                .map(|list| list.iter().filter_map(Value::as_f64).collect())
+                .unwrap_or_default();
+            ferrofin_core::scan_metrics::validate_duration_buckets(&buckets)
+                .map_err(|why| format!("is not a list of bucket boundaries: {why}"))
+        },
         ..ROW
     },
     SettingSpec {
@@ -1121,13 +1157,23 @@ fn snapshot(
     };
     Ok(ServerSettingsDto {
         config_file: path.display().to_string(),
-        config_file_writable: directory_accepts_a_file(path),
+        config_file_writable: config_file_writable(path),
         restart_pending,
         settings: SETTINGS
             .iter()
             .map(|spec| setting(spec, running, env, &file_keys, saved.as_ref()))
             .collect(),
     })
+}
+
+/// Whether a save could write `config.toml` at `path`: the directory of the
+/// file it writes (through a link, the file the link names) takes a new file,
+/// and that file, when it exists, is not read-only. A save also opens the file
+/// for writing first ([`save`]); the report does not, so a page load never
+/// looks like a write to a tool watching the file.
+fn config_file_writable(path: &Path) -> bool {
+    save::write_target(path)
+        .is_ok_and(|target| directory_accepts_a_file(&target) && !save::is_read_only(&target))
 }
 
 /// Whether a new file can be created beside `path`, which a save needs (it
@@ -1164,8 +1210,14 @@ fn directory_accepts_a_file(path: &Path) -> bool {
     }
 }
 
-/// The settings manager behind `GET /Ferrofin/Settings`: the configuration
-/// this server lifetime runs with, and where each value comes from.
+/// Serializes saves, so two never interleave their read, check and rename of
+/// `config.toml`. One per process, not per manager: an in-process restart
+/// builds a new manager while the old lifetime's saves may still run.
+static SAVES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The settings manager behind `GET /Ferrofin/Settings` and
+/// `POST /Ferrofin/Settings`: the configuration this server lifetime runs
+/// with, where each value comes from, and saving changes to `config.toml`.
 pub struct FerrofinServerSettings {
     /// The configuration in use, with the flags it was loaded under.
     config: Config,
@@ -1179,7 +1231,8 @@ pub struct FerrofinServerSettings {
 
 impl FerrofinServerSettings {
     /// Reports `config`, which the process environment and the flags it
-    /// records were loaded into, with `lifecycle`'s restart flag; answers
+    /// records were loaded into, with `lifecycle`'s restart flag, and saves to
+    /// its `config.toml`, marking a restart pending in `lifecycle`; answers
     /// only while the Ferrofin plugin is enabled in `plugins`.
     #[must_use]
     pub fn new(
@@ -1228,7 +1281,62 @@ impl ServerSettingsManager for FerrofinServerSettings {
             .await
             .map_err(|err| ServiceError::backend(format!("settings report failed: {err}")))?
     }
+
+    async fn update(
+        &self,
+        update: ServerSettingsUpdateDto,
+    ) -> Result<ServerSettingsUpdateResultDto, ServiceError> {
+        self.ensure_enabled().await?;
+        let running = self.config.clone();
+        let env = Arc::clone(&self.env);
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let request = tracing::Span::current();
+        // A blocking task, which reads, writes and renames files, and which
+        // runs to its end even when the caller goes away: the lock is never
+        // let go, or the restart left unmarked, part-way through a save.
+        tokio::task::spawn_blocking(move || {
+            let _request = request.entered();
+            save_and_report(&running, env.as_ref(), lifecycle.as_ref(), &update.changes)
+        })
+        .await
+        .map_err(|err| ServiceError::backend(format!("settings save failed: {err}")))?
+    }
 }
+
+/// One save, under [`SAVES`]: `changes` go to `running`'s `config.toml`
+/// ([`save::save`]) and, when a key changed, `lifecycle` marks the restart and
+/// one line logs the keys. Blocks: call it from a blocking task.
+fn save_and_report(
+    running: &Config,
+    env: &dyn Env,
+    lifecycle: &dyn LifecycleController,
+    changes: &BTreeMap<String, Option<Value>>,
+) -> Result<ServerSettingsUpdateResultDto, ServiceError> {
+    let _one_save_at_a_time = SAVES.blocking_lock();
+    let saved = save::save(running, env, changes)?;
+    if saved.is_empty() {
+        return Ok(ServerSettingsUpdateResultDto::default());
+    }
+    lifecycle.mark_restart_required();
+    let keys: Vec<String> = saved.iter().map(|spec| spec.key.to_owned()).collect();
+    // Key names only: a value may be a key or a password (owner decision D3).
+    tracing::info!(
+        path = %running.config_file.display(),
+        keys = %keys.join(", "),
+        "server settings saved"
+    );
+    Ok(ServerSettingsUpdateResultDto {
+        changed: keys,
+        restart_required: true,
+        process_restart_required: saved
+            .iter()
+            .filter(|spec| spec.applies == Applies::ProcessRestart)
+            .map(|spec| spec.key.to_owned())
+            .collect(),
+    })
+}
+
+mod save;
 
 #[cfg(test)]
 mod tests;
