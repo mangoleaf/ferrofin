@@ -966,54 +966,89 @@ pub struct VerifiedSubsystem {
 /// compared against the upstream C# at [`UPSTREAM_TAG`] (or the earlier tag
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
-pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[VerifiedSubsystem {
-    key: "websocket-streams",
-    upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",
-    upstream_method: "HandleMessages",
-    ferrofin: "handlers/websocket.rs handle_socket → Streams::apply, event_stream, wake_due \
-               (drain, should_send); sessions_wake (session_event_forces), sessions_message → \
-               ferrofin-core session_manager.rs SessionEvent raises, with upsert_session's \
-               SessionActivity past SESSION_ACTIVITY_INTERVAL (LogSessionActivity, a new \
-               session included) and report_capabilities' CapabilitiesChanged \
-               (ReportCapabilities); activity_wake → ferrofin-core activity_manager.rs \
-               create_entry's entry-created raise (ActivityManager.CreateAsync EntryCreated); \
-               update_task_subscription, subscribe_tasks, task_transition_message, \
-               task_progress_wake → ferrofin-core scheduled_tasks.rs subscribe_task_updates, \
-               publish_snapshot from claim (TaskExecuting), record_result and stop_run \
-               (TaskCompleted), and \
-               TaskProgress::report's progress raise \
-               (ScheduledTaskWorker.OnProgressChanged TaskProgress). Compared with the \
-               Sessions listener \
-               (Jellyfin.Api/WebSocketListeners/SessionInfoWebSocketListener.cs), the \
-               ActivityLog listener \
-               (Jellyfin.Api/WebSocketListeners/ActivityLogWebSocketListener.cs) and the \
-               ScheduledTasks listener \
-               (Jellyfin.Api/WebSocketListeners/ScheduledTasksWebSocketListener.cs)",
-    date: "2026-10-29",
-    divergences: &[
-        "Events already queued for a socket are drained and answered with one Sessions or \
-         ActivityLogEntry frame, where upstream sends one per forced event: a burst yields \
-         fewer frames with the same final state.",
-        "A non-administrator's Sessions frames carry the hardware accelerator blanked, as \
-         GET /Sessions does; upstream's stream sends it as is.",
-        "A second SessionsStart, ActivityLogEntryStart or ScheduledTasksInfoStart on a \
-         socket replaces its subscription; upstream adds a second one and sends each frame \
-         twice.",
-        "ScheduledTasksInfoStart sends the current task list at once, where upstream's Start \
-         sends nothing until a task event, because jellyfin-web's scan button has no HTTP \
-         fallback; it costs one registry snapshot per subscribe and none per period, and counts \
-         as the stream's last send, so progress inside the first period is held back.",
-        "A task start or completion is sent with the task list captured at the transition, \
-         where upstream reads the list when it sends; a progress frame due while one is still \
-         queued is dropped, so a short run never shows out of order, and a later report sends \
-         once the period has passed.",
-        "A session list that cannot be built is logged and skipped and the subscription stays; \
-         upstream logs it and drops the connection's subscription.",
-        "A *Start whose Data is missing, has no second field or holds a field that does not \
-         parse as a whole number still subscribes, at jellyfin-web's 1500 ms when the period \
-         is at fault, where upstream's Start throws and makes no subscription.",
-    ],
-}];
+pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "websocket-streams",
+        upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",
+        upstream_method: "HandleMessages",
+        ferrofin: "handlers/websocket.rs handle_socket → Streams::apply, event_stream, wake_due \
+                   (drain, should_send); sessions_wake (session_event_forces), sessions_message → \
+                   ferrofin-core session_manager.rs SessionEvent raises, with upsert_session's \
+                   SessionActivity past SESSION_ACTIVITY_INTERVAL (LogSessionActivity, a new \
+                   session included) and report_capabilities' CapabilitiesChanged \
+                   (ReportCapabilities); activity_wake → ferrofin-core activity_manager.rs \
+                   create_entry's entry-created raise (ActivityManager.CreateAsync EntryCreated); \
+                   update_task_subscription, subscribe_tasks, task_transition_message, \
+                   task_progress_wake → ferrofin-core scheduled_tasks.rs subscribe_task_updates, \
+                   publish_snapshot from claim (TaskExecuting), record_result and stop_run \
+                   (TaskCompleted), and \
+                   TaskProgress::report's progress raise \
+                   (ScheduledTaskWorker.OnProgressChanged TaskProgress). Compared with the \
+                   Sessions listener \
+                   (Jellyfin.Api/WebSocketListeners/SessionInfoWebSocketListener.cs), the \
+                   ActivityLog listener \
+                   (Jellyfin.Api/WebSocketListeners/ActivityLogWebSocketListener.cs) and the \
+                   ScheduledTasks listener \
+                   (Jellyfin.Api/WebSocketListeners/ScheduledTasksWebSocketListener.cs)",
+        date: "2026-10-29",
+        divergences: &[
+            "Events already queued for a socket are drained and answered with one Sessions or \
+             ActivityLogEntry frame, where upstream sends one per forced event: a burst yields \
+             fewer frames with the same final state.",
+            "A non-administrator's Sessions frames carry the hardware accelerator blanked, as \
+             GET /Sessions does; upstream's stream sends it as is.",
+            "A second SessionsStart, ActivityLogEntryStart or ScheduledTasksInfoStart on a \
+             socket replaces its subscription; upstream adds a second one and sends each frame \
+             twice.",
+            "ScheduledTasksInfoStart sends the current task list at once, where upstream's Start \
+             sends nothing until a task event, because jellyfin-web's scan button has no HTTP \
+             fallback; it costs one registry snapshot per subscribe and none per period, and counts \
+             as the stream's last send, so progress inside the first period is held back.",
+            "A task start or completion is sent with the task list captured at the transition, \
+             where upstream reads the list when it sends; a progress frame due while one is still \
+             queued is dropped, so a short run never shows out of order, and a later report sends \
+             once the period has passed.",
+            "A session list that cannot be built is logged and skipped and the subscription stays; \
+             upstream logs it and drops the connection's subscription.",
+            "A *Start whose Data is missing, has no second field or holds a field that does not \
+             parse as a whole number still subscribes, at jellyfin-web's 1500 ms when the period \
+             is at fault, where upstream's Start throws and makes no subscription.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "images",
+        upstream_file: "src/Jellyfin.Drawing/ImageProcessor.cs",
+        upstream_method: "GetImageCacheTag",
+        ferrofin: "The image cache tags (ImageTags, BackdropImageTags, the Parent*, Series*, \
+                   Album* and People[] tags, ImageBlurHashes' keys, Chapters[].ImageTag, \
+                   search hints, GET /Items/{itemId}/Images, ChannelPrimaryImageTag, a user's \
+                   PrimaryImageTag); image serving and processing are compared per \
+                   operation. ferrofin-drawing processor.rs get_image_cache_tag (the owning \
+                   item's path, null as empty) and get_image_cache_tag_for_path (md5 of the \
+                   UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
+                   dto_service.rs image_tag, tag_and_fill_blur_hash (attach_images, \
+                   add_inherited_images, parent_primary_tag, attach_people with \
+                   person_paths), the chapter tags (the stored item path, \
+                   virtual_paths reverse); search_manager.rs fill_artwork; \
+                   handlers/images.rs image_info_dto; ferrofin-livetv manager.rs \
+                   channel_image_tags (a channel has no path); user_manager.rs get_user_dto \
+                   (the profile image's own path). Item paths as item_repository.rs mapped \
+                   reads them (BaseItemMapper.Map's ExpandVirtualPath). Compared with \
+                   Emby.Server.Implementations/Dto/DtoService.cs (GetImageCacheTag, \
+                   GetTagAndFillBlurhash, AddInheritedImages, AttachPeople), \
+                   Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
+                   Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
+                   Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
+                   src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag) and \
+                   Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto)",
+        date: "2026-10-30",
+        divergences: &[
+            "Timers, series timers and the new-timer defaults carry no image tags: \
+             LiveTvDtoService.FillImages (the program's and the library series' Primary, Thumb \
+             and Backdrop tags) is not ported. Fix path: gl-853.",
+        ],
+    },
+];
 
 /// One contract operation whose Ferrofin implementation was compared against
 /// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
@@ -1091,7 +1126,7 @@ pub const VERIFIED: &[Verified] = &[
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
         ],
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1104,7 +1139,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts, item_counts_by_clean_name)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1116,7 +1151,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_album_artists (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1129,7 +1164,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1141,7 +1176,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_music_genres (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1153,7 +1188,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1165,7 +1200,7 @@ pub const VERIFIED: &[Verified] = &[
                push_order_expression DatePlayed)",
         date: "2026-10-29",
         divergences: RESUME_DIVERGENCES,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "post",

@@ -41386,10 +41386,10 @@ mod tests {
         }
         async fn get_image_cache_tag(
             &self,
-            item_id: uuid::Uuid,
+            item_path: Option<&str>,
             image: &ferrofin_traits::options::ItemImageInfo,
         ) -> Result<Option<String>, ServiceError> {
-            self.inner.get_image_cache_tag(item_id, image).await
+            self.inner.get_image_cache_tag(item_path, image).await
         }
         async fn get_image_cache_tag_for_path(
             &self,
