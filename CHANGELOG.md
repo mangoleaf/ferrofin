@@ -612,6 +612,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Jellyfin answers `500`
 
 ### Performance
+- Authenticating a request copies only the four credential headers into its context instead of
+  every header the client sent, on every request including image and segment fetches
 - A JPEG's blur hash and its resized images decode at a reduced scale (1/8, 1/4 or 1/2 of
   each side, by DCT scaling, as Jellyfin's blur hash decodes through Skia) instead of at full
   size. A 24 MP baseline photo's blur hash peaks at about 2 MB of memory instead of 80 MB (a
