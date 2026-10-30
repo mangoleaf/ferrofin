@@ -4079,6 +4079,32 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         Ok(written)
     }
 
+    async fn presentation_unique_key(&self, item_id: Uuid) -> Result<Option<String>, ServiceError> {
+        let key: Option<Option<String>> = sqlx::query_scalar(
+            r#"SELECT "PresentationUniqueKey" FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(key.flatten())
+    }
+
+    async fn stored_rating_score(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<(i64, Option<i64>)>, ServiceError> {
+        let score: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
+            r#"SELECT "InheritedParentalRatingValue", "InheritedParentalRatingSubValue"
+               FROM "BaseItems" WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(item_id))
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        Ok(score.and_then(|(value, sub)| Some((value?, sub))))
+    }
+
     async fn locked_fields_for_items(
         &self,
         item_ids: &[Uuid],

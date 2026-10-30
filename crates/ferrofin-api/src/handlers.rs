@@ -933,7 +933,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// The subsystems a [`VERIFIED_SUBSYSTEMS`] row may cover, by key. Every
 /// operation crosses several of them, so one row states their divergences once
 /// and operation rows name it in [`Verified::refs`]. `websocket-streams` is
-/// the `/socket` dashboard streams, which no contract operation describes.
+/// the `/socket` dashboard streams, which no contract operation describes;
+/// `scan-failure-isolation` is what the library scan does about a row or a
+/// write that fails, which no operation's response shows.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -942,6 +944,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "images",
     "paging-sort",
     "websocket-streams",
+    "scan-failure-isolation",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -969,6 +972,31 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "scan-failure-isolation",
+        upstream_file: "MediaBrowser.Controller/Entities/TV/Episode.cs",
+        upstream_method: "FindSeriesName",
+        ferrofin: "What a child's refresh in the library scan does when its parent row cannot \
+                   be read. ferrofin-core library_scan.rs parent_row (a failed read counts as \
+                   no row, once per pass) ← sync_series_name (FindSeriesName), \
+                   sync_season_name, remember_series_folder; apply_parental_rating_score and \
+                   inherit_stored_rating; keep_stored_series_key. Compared with \
+                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
+                   MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
+        date: "2026-10-30",
+        divergences: &[
+            "An item whose parent chain cannot be read is scored from its own rating and \
+             country, an ancestor's custom rating not counting, else takes the score stored on \
+             its parent, and the children of an undecodable series keep the series key stored \
+             on its row. Upstream has no such row to fall back from: the read would throw into \
+             the per-child catch and the item would not refresh.",
+            "An episode whose season row is absent or unreadable keeps the season name it has, \
+             the planner's localized one, where FindSeasonName answers a literal \"Season N\" or \
+             \"Season Unknown\". Fix path: port that branch to sync_season_name for a row that \
+             is truly absent, leaving a row that fails to read out of it.",
+        ],
+    },
     VerifiedSubsystem {
         key: "websocket-streams",
         upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",

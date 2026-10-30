@@ -805,6 +805,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
+- A Series or Season row the database cannot decode no longer fails every later library scan at
+  its first child: its children keep the names and the parental rating they have, and new
+  episodes, later libraries and deleted files are all handled again
 - The web client's Next Up row loads again: jellyfin-web 12.x sends `nextUpDateCutoff` as a
   bare date, which Ferrofin answered with a `400`. Every `DateTime` query parameter now binds
   as Jellyfin's does: a date or an offset-less date-time is accepted and read as server

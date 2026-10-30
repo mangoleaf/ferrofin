@@ -1698,6 +1698,36 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(0)
     }
 
+    /// `item_id`'s stored `PresentationUniqueKey`, read as that one column so
+    /// a row the decoder rejects still answers. `None` for no row or no key.
+    ///
+    /// The default answers `None` (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn presentation_unique_key(&self, item_id: Uuid) -> Result<Option<String>, ServiceError> {
+        let _ = item_id;
+        Ok(None)
+    }
+
+    /// `item_id`'s stored `InheritedParentalRatingValue` and
+    /// `InheritedParentalRatingSubValue`, read as those two columns so a row
+    /// the decoder rejects still answers. `None` for no row or no score.
+    ///
+    /// The default answers `None` (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn stored_rating_score(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<(i64, Option<i64>)>, ServiceError> {
+        let _ = item_id;
+        Ok(None)
+    }
+
     /// The locked metadata fields (`BaseItemMetadataFields`, upstream's
     /// `BaseItem.LockedFields`) of each of `item_ids`, in field order. An
     /// item with none is absent from the map.
