@@ -13,7 +13,9 @@
 //!   `Uuid`. (SQLite has no native `Guid`, and sqlx's `Uuid` decoder expects a
 //!   16-byte `BLOB`, so the faithful storage shape here is the `TEXT` string.)
 //! - `TEXT` `DateTime` columns → [`DateTime<Utc>`](chrono::DateTime).
-//! - `REAL` columns → [`f64`]; `INTEGER` booleans → [`bool`].
+//! - `REAL` columns → [`f64`]; `INTEGER` booleans → [`bool`]. The `BaseItems`
+//!   rating and gain columns decode through [`finite_real::FiniteReal`], which
+//!   reads a non-finite value as `None` (Jellyfin 12.3's `FiniteOrNull`).
 //! - Enum-valued `INTEGER` columns are kept as [`i32`] discriminants here and
 //!   mapped onto the [`crate::enums`] / `ferrofin-model` enum types by the
 //!   conversion layer.
@@ -22,6 +24,7 @@
 pub mod activity;
 pub mod base_items;
 pub mod display_preferences;
+pub mod finite_real;
 pub mod playback;
 pub mod security;
 pub mod users;
@@ -420,6 +423,96 @@ mod tests {
         assert_eq!(item.run_time_ticks, Some(12000));
         assert_eq!(item.date_created, Some(now));
         assert_eq!(item.album, None);
+    }
+
+    /// Jellyfin 12.2 could store an infinite rating or gain (SQLite keeps an
+    /// infinity; a NaN is stored as NULL). From 12.3 the `BaseItem` setters'
+    /// `FiniteOrNull` also run when `BaseItemMapper` reads a row back, so it
+    /// is read as no value. So is a value past `float`'s range, which EF reads
+    /// into the `float` column as an infinity; a finite one is read as it is.
+    #[tokio::test]
+    async fn a_stored_non_finite_rating_or_gain_is_read_as_no_value() {
+        let db = Database::connect_in_memory().await.expect("connect");
+        db.run_migrations().await.expect("migrate");
+        let owner = Uuid::from_u128(0x10);
+        insert_base_item(&db, owner).await;
+        let infinite = Uuid::from_u128(0x12);
+        let finite = Uuid::from_u128(0x13);
+        let beyond_float = Uuid::from_u128(0x14);
+        for (id, critic, community, lufs, gain) in [
+            (infinite, "9e999", "-9e999", "9e999", "-9e999"),
+            (beyond_float, "1e39", "-1e39", "1e39", "-1e39"),
+            (finite, "80.0", "7.5", "-14.0", "-3.5"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                r#"INSERT INTO "BaseItems" (
+                    "Id", "IsFolder", "IsInMixedFolder", "IsLocked", "IsMovie",
+                    "IsRepeat", "IsSeries", "IsVirtualItem", "Type", "Name", "OwnerId",
+                    "CriticRating", "CommunityRating", "LUFS", "NormalizationGain"
+                ) VALUES (?1, 0, 0, 0, 1, 0, 0, 0, 'Movie', 'Rated', ?2,
+                    {critic}, {community}, {lufs}, {gain})"#
+            )))
+            .bind(guid_to_db(id))
+            .bind(guid_to_db(owner))
+            .execute(db.writer())
+            .await
+            .expect("insert base item");
+        }
+        let stored: f64 =
+            sqlx::query_scalar(r#"SELECT "CriticRating" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(guid_to_db(infinite))
+                .fetch_one(db.pool())
+                .await
+                .expect("raw read");
+        assert!(stored.is_infinite(), "SQLite keeps the infinity: {stored}");
+
+        let read = |id: Uuid| {
+            let db = db.clone();
+            async move {
+                sqlx::query_as::<_, BaseItemEntity>(r#"SELECT * FROM "BaseItems" WHERE "Id" = ?1"#)
+                    .bind(guid_to_db(id))
+                    .fetch_one(db.pool())
+                    .await
+                    .expect("read base item")
+            }
+        };
+        for id in [infinite, beyond_float] {
+            let item = read(id).await;
+            assert_eq!(
+                (
+                    item.critic_rating,
+                    item.community_rating,
+                    item.lufs,
+                    item.normalization_gain
+                ),
+                (None, None, None, None),
+                "{id}"
+            );
+        }
+        let item = read(finite).await;
+        assert_eq!(
+            (
+                item.critic_rating,
+                item.community_rating,
+                item.lufs,
+                item.normalization_gain
+            ),
+            (Some(80.0), Some(7.5), Some(-14.0), Some(-3.5))
+        );
+
+        let parents = db
+            .image_parent_rows(&[guid_to_db(infinite), guid_to_db(finite)])
+            .await
+            .expect("image parent rows");
+        let gains = |id: Uuid| {
+            parents
+                .iter()
+                .find(|row| row.id == guid_to_db(id))
+                .map(|row| (row.lufs, row.normalization_gain))
+                .expect("row")
+        };
+        assert_eq!(gains(infinite), (None, None));
+        assert_eq!(gains(finite), (Some(-14.0), Some(-3.5)));
     }
 
     #[tokio::test]

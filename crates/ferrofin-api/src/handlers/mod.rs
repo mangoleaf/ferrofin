@@ -875,17 +875,21 @@ pub const UPSTREAM_PIN_DATE: &str = "2026-10-28";
 /// Re-compare the row against [`UPSTREAM_TAG`], update its `date`, and remove it
 /// from this list. `v12.2` is commit `ca0f16eb7c`.
 pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
-    // Item DTOs: v12.3's FiniteOrNull rating setters also run on reads, so a
-    // stored non-finite rating is omitted upstream (gl-877 ports that read).
+    // The v12.4 re-check found a gap that v12.2 has too (the C# under these
+    // rows is unchanged); each leaves the list with its fix.
+    // gl-1034: a nil parentId is an empty page, not GetItemById's 400 (and
+    // gl-267's offset-less nextUpDateCutoff fix is not on this branch yet).
     ("get", "/Shows/NextUp", "v12.2"),
+    // gl-1037: a malformed minCommunityRating is ignored, not a 400; gl-884: a
+    // malformed genreIds/studioIds token is a 400, not dropped; gl-1038: a
+    // padded parentId/userId is a 400, not trimmed.
     ("get", "/Artists", "v12.2"),
     ("get", "/Artists/AlbumArtists", "v12.2"),
+    // gl-408: parameters these actions do not declare are bound (a 400 on a
+    // bad value); gl-1038: a padded parentId/userId is a 400, not trimmed.
     ("get", "/Genres", "v12.2"),
     ("get", "/MusicGenres", "v12.2"),
     ("get", "/Studios", "v12.2"),
-    ("get", "/UserItems/Resume", "v12.2"),
-    // The v12.4 re-check found a gap that v12.2 has too (the C# under these
-    // rows is unchanged); each leaves the list with its fix.
     // gl-1034: a nil item id is a 404, not GetItemById's 400.
     ("get", "/Audio/{itemId}/Lyrics", "v12.2"),
     ("delete", "/Audio/{itemId}/Lyrics", "v12.2"),
@@ -927,7 +931,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 
 /// The subsystems a [`VERIFIED_SUBSYSTEMS`] row may cover, by key. Every
 /// operation crosses several of them, so one row states their divergences once
-/// and operation rows name it in [`Verified::refs`].
+/// and operation rows name it in [`Verified::refs`]. `websocket-streams` is
+/// the `/socket` dashboard streams, which no contract operation describes.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -935,6 +940,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "access-filtering",
     "images",
     "paging-sort",
+    "websocket-streams",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -961,7 +967,31 @@ pub struct VerifiedSubsystem {
 /// compared against the upstream C# at [`UPSTREAM_TAG`] (or the earlier tag
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
-pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[];
+pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[VerifiedSubsystem {
+    key: "websocket-streams",
+    upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",
+    upstream_method: "HandleMessages",
+    ferrofin: "handlers/websocket.rs handle_socket → Streams::start_sessions, sessions_wake \
+               (drain, should_send, session_event_forces), sessions_message → ferrofin-core \
+               session_manager.rs SessionEvent raises; compared with the Sessions listener \
+               (Jellyfin.Api/WebSocketListeners/SessionInfoWebSocketListener.cs). \
+               CapabilitiesChanged and SessionActivity are not raised yet: TODO(gl-721). The \
+               ActivityLog and ScheduledTasks listeners still poll: TODO(gl-362, gl-722)",
+    date: "2026-10-29",
+    divergences: &[
+        "Events already queued for a socket are drained and answered with one Sessions frame, \
+         where upstream sends one per forced event: a burst yields fewer frames with the same \
+         final state.",
+        "A non-administrator's Sessions frames carry the hardware accelerator blanked, as \
+         GET /Sessions does; upstream's stream sends it as is.",
+        "A second SessionsStart on a socket replaces its subscription; upstream adds a second \
+         one and sends each frame twice.",
+        "A session list that cannot be built is logged and skipped and the subscription stays; \
+         upstream logs it and drops the connection's subscription.",
+        "The period is floored at FERROFIN_WS_MIN_STREAM_PERIOD_MS (100 ms by default), which \
+         upstream does not have, until the last stream stops polling: TODO(gl-723).",
+    ],
+}];
 
 /// One contract operation whose Ferrofin implementation was compared against
 /// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
@@ -1111,7 +1141,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/items.rs get_resume_items → ferrofin-core item_repository.rs \
                get_items → translate_query.rs (push_resumable_predicate, \
                push_order_expression DatePlayed)",
-        date: "2026-10-19",
+        date: "2026-10-29",
         divergences: RESUME_DIVERGENCES,
         refs: &[],
     },
@@ -1853,12 +1883,19 @@ const RESUME_DIVERGENCES: &[&str] = &[
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",
     "A resumable Series or Season row's UnplayedItemCount / PlayedPercentage / Played \
-     count each leaf's own played row; v12.2's ItemCountService counts a leaf played \
+     count each leaf's own played row; v12.4's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
      alternate-version arm in item_count_service's played statements (gl-441).",
     "Resume positions that Ferrofin builds before gl-46 saved for songs and for Sample, \
      ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
      until they are played again; new plays no longer save one. Fix path: gl-717.",
+    "`searchTerm`'s OriginalTitle arm lower-cases both sides (Unicode); v12.4 \
+     TranslateQuery matches the raw term with SQLite LIKE, which folds ASCII case only, so \
+     an OriginalTitle whose non-ASCII letters differ in case from the term matches here and \
+     not upstream. Fix path: gl-957.",
+    "The 400 (an API key with no userId, or a value the query binder cannot convert), \
+     403 (another user's id without the administrator role) and 404 (a userId naming no \
+     account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
 ];
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).

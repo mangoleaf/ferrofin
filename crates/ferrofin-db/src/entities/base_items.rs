@@ -52,9 +52,13 @@ pub struct BaseItemEntity {
     pub channel_id: Option<String>,
     /// The normalized (clean) name for lookups (`CleanName`), if any.
     pub clean_name: Option<String>,
-    /// The community rating (`CommunityRating`), if any.
+    /// The community rating (`CommunityRating`), if any (a non-finite one
+    /// reads as `None`).
+    #[sqlx(try_from = "crate::entities::finite_real::FiniteReal")]
     pub community_rating: Option<f64>,
-    /// The critic rating (`CriticRating`), if any.
+    /// The critic rating (`CriticRating`), if any (a non-finite one reads as
+    /// `None`).
+    #[sqlx(try_from = "crate::entities::finite_real::FiniteReal")]
     pub critic_rating: Option<f64>,
     /// The custom rating string (`CustomRating`), if any.
     pub custom_rating: Option<String>,
@@ -108,14 +112,17 @@ pub struct BaseItemEntity {
     pub is_series: bool,
     /// Whether the item is a virtual (placeholder) item (`IsVirtualItem`).
     pub is_virtual_item: bool,
-    /// The integrated loudness in LUFS (`LUFS`), if measured.
-    #[sqlx(rename = "LUFS")]
+    /// The integrated loudness in LUFS (`LUFS`), if measured (a non-finite
+    /// value reads as `None`).
+    #[sqlx(rename = "LUFS", try_from = "crate::entities::finite_real::FiniteReal")]
     pub lufs: Option<f64>,
     /// The media type (`MediaType`), if any.
     pub media_type: Option<String>,
     /// The item's display name (`Name`), if any.
     pub name: Option<String>,
-    /// The normalization gain in dB (`NormalizationGain`), if any.
+    /// The normalization gain in dB (`NormalizationGain`), if any (a
+    /// non-finite one reads as `None`).
+    #[sqlx(try_from = "crate::entities::finite_real::FiniteReal")]
     pub normalization_gain: Option<f64>,
     /// The official rating (`OfficialRating`), if any.
     pub official_rating: Option<String>,

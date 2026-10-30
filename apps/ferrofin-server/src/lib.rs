@@ -3,8 +3,8 @@
 //! Loads bootstrap [`config`], opens + migrates the SQLite DB, discovers ffmpeg,
 //! constructs the concrete `ferrofin-core` managers and injects them as the
 //! `Arc<dyn Trait>` fields of `ferrofin-api`'s `AppState`, seeds a default
-//! administrator on a fresh install, mounts the router, and serves with graceful
-//! shutdown.
+//! administrator (and the `library_roots` libraries) on a fresh install, mounts
+//! the router, and serves with graceful shutdown.
 //!
 //! The bring-up is split into small, independently-callable pieces so the binary
 //! (`main.rs`) and the First-Light integration test can each sequence them:
@@ -12,7 +12,8 @@
 //! - [`config`] — bootstrap configuration resolution (CLI > env > file > default).
 //! - [`bootstrap`] — startup side-effects (logging, database, ffmpeg discovery).
 //! - [`state::build_app_state`] — the manager-wiring composition root.
-//! - [`seed::seed_default_admin`] — fresh-install administrator seeding.
+//! - [`seed::seed_default_admin`] — fresh-install administrator seeding, and
+//!   [`seed::seed_library_roots`], the libraries `library_roots` names.
 //! - [`media_encoding`] — the ffmpeg-backed transcode/HLS + attachment pair.
 //! - [`run`] — the end-to-end boot-and-serve entry point the binary calls.
 //!
@@ -56,7 +57,7 @@ use crate::bootstrap::{
     FfmpegPaths, discover_ffmpeg, init_tracing, open_database, shutdown_tracing,
 };
 use crate::config::Config;
-use crate::seed::{SeedOutcome, seed_default_admin};
+use crate::seed::{SeedOutcome, seed_default_admin, seed_library_roots};
 use crate::state::{WiredApp, build_app_state};
 
 /// The version Ferrofin reports for itself (startup log line and the session
@@ -662,10 +663,11 @@ async fn serve_once(
     // Fresh-install seeding: on a database with no users, create the configured
     // default administrator (port of `UserManager.InitializeAsync` +
     // startup-wizard `UpdateStartupUser`). A no-op once any user exists.
-    match seed_default_admin(wired.state.users.as_ref(), config)
+    let seeded = seed_default_admin(wired.state.users.as_ref(), config)
         .await
-        .context("failed to seed the default administrator")?
-    {
+        .context("failed to seed the default administrator")?;
+    let fresh_install = seeded.is_fresh_install();
+    match seeded {
         SeedOutcome::AlreadyInitialized => {
             tracing::info!("existing users found — skipping fresh-install seeding");
         }
@@ -685,6 +687,22 @@ async fn serve_once(
                  wizard at /web, or set FERROFIN_ADMIN_PASSWORD for a headless install"
             );
         }
+    }
+    // `library_roots` seeds the libraries of that same fresh install, and never
+    // a later one: a library its administrator removed must stay removed.
+    if fresh_install {
+        seed_library_roots(
+            wired.state.virtual_folders.as_ref(),
+            wired.state.library_monitor.as_ref(),
+            wired.state.library.as_ref(),
+            &config.library_roots,
+        )
+        .await;
+    } else if !config.library_roots.is_empty() {
+        tracing::info!(
+            library_roots = config.library_roots.len(),
+            "library_roots is ignored: it only seeds a fresh install, and this server already has users"
+        );
     }
 
     ensure_startup_wizard_integrity(wired.state.users.as_ref(), wired.state.config.as_ref())

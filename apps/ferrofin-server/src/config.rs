@@ -64,10 +64,12 @@ const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u32 = 30;
 /// Minimum period, in milliseconds, between pushes of a dashboard WebSocket
 /// stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). The client names
 /// the period in its `*Start` subscription; Ferrofin floors it because it drives
-/// these streams on a timer — each tick recomputes and resends the full snapshot
-/// — unlike upstream's event-driven `BasePeriodicWebSocketListener`, where the
-/// period is only a debounce ceiling. 100 ms allows far faster updates than
-/// jellyfin-web's 1500 ms while bounding the worst case for a hostile client.
+/// the ScheduledTasksInfo and ActivityLogEntry streams on a timer — each tick
+/// recomputes and resends the full snapshot — unlike upstream's event-driven
+/// `BasePeriodicWebSocketListener`, where the period is only a throttle. The
+/// Sessions stream is event-driven; the floor applies to its throttle too.
+/// 100 ms allows far faster updates than jellyfin-web's 1500 ms while bounding
+/// the worst case for a hostile client.
 const DEFAULT_WS_MIN_STREAM_PERIOD_MS: u32 = 100;
 
 /// Command-line arguments — the highest-precedence configuration layer.

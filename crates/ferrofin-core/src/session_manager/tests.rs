@@ -1096,6 +1096,124 @@ async fn report_session_ended_removes_the_session() {
     assert!(sessions.is_empty(), "{sessions:?}");
 }
 
+/// Every session event raised since the last call.
+fn raised(
+    events: &mut tokio::sync::broadcast::Receiver<ferrofin_traits::session::SessionEvent>,
+) -> Vec<ferrofin_traits::session::SessionEvent> {
+    std::iter::from_fn(|| events.try_recv().ok()).collect()
+}
+
+/// The `ISessionManager` events `SessionInfoWebSocketListener` listens to are
+/// raised once per change: a new session starts one and a request on a known
+/// session none (`GetSessionInfo` → `OnSessionStarted` only on creation); each
+/// playback report raises its own, with `IsAutomated` carried through
+/// (`SessionManager.cs:961`); and a session ends once, however it leaves the
+/// pool, while ending an unknown one raises nothing (`ReportSessionEnded`).
+#[tokio::test]
+async fn each_session_change_raises_its_websocket_event_once() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
+    use ferrofin_traits::session::SessionEvent;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+
+    let session_id = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::SessionStarted]);
+    mgr.log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    assert_eq!(raised(&mut events), [], "a known session starts nothing");
+
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: Some(session_id.clone()),
+        item_id,
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::PlaybackStart]);
+    for is_automated in [false, true] {
+        let progress = PlaybackProgressInfo {
+            session_id: Some(session_id.clone()),
+            item_id,
+            ..PlaybackProgressInfo::default()
+        };
+        mgr.on_playback_progress(&progress, is_automated)
+            .await
+            .unwrap();
+        assert_eq!(
+            raised(&mut events),
+            [SessionEvent::PlaybackProgress { is_automated }]
+        );
+    }
+    mgr.on_playback_stopped(&PlaybackStopInfo {
+        session_id: Some(session_id.clone()),
+        item_id,
+        ..PlaybackStopInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::PlaybackStopped]);
+
+    mgr.close_if_needed(&session_id).await.unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::SessionEnded]);
+    mgr.report_session_ended(&session_id).await.unwrap();
+    assert_eq!(raised(&mut events), [], "an unknown session ends nothing");
+}
+
+/// A logout ends the device's session through `ReportSessionEnded`, so the
+/// `Sessions` stream hears of it like any other end.
+#[tokio::test]
+async fn a_logout_raises_session_ended() {
+    use ferrofin_traits::session::SessionEvent;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "alice").await;
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
+    let token = sign_in(&mgr, user_id, "dev-1").await;
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
+
+    mgr.logout(&token).await.unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::SessionEnded]);
+}
+
+/// The idle check stops a silent playback through `OnPlaybackStopped`, so the
+/// `Sessions` stream hears `PlaybackStopped` as for a client's own stop.
+#[tokio::test]
+async fn an_idle_playback_stop_raises_playback_stopped() {
+    use ferrofin_traits::session::SessionEvent;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let (session_id, _, _) = playing_session(&db, &mgr, "dev-idle", Some(1), false).await;
+    let now = Utc::now();
+    checked_in_at(&mgr, &session_id, now - chrono::Duration::seconds(301)).await;
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
+
+    mgr.check_for_idle_playback(now).await;
+    assert_eq!(raised(&mut events), [SessionEvent::PlaybackStopped]);
+}
+
 /// A [`UserDataManager`](ferrofin_traits::library::UserDataManager) decorator
 /// that counts the DTO reads the push path makes, delegating the rest to the
 /// real manager.
