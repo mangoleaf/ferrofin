@@ -724,9 +724,22 @@ fn sd_program_class(program: &SdProgram) -> ProgramClass {
     }
 }
 
+/// The programmes one channel's turn of the guide mirror created or updated,
+/// each with its end, for `PreCacheImages`.
+type RefreshedAirings = Vec<(Uuid, Option<DateTime<Utc>>)>;
+
+/// A guide write's rows, built as the write draws them.
+///
+/// Boxed so the iterator's closure types never reach the futures holding it
+/// across `write_program_rows`' awaits: as plain types they fail rustc's
+/// higher-ranked `Send` check on the `async_trait` refresh future ("not
+/// general enough"), with or without annotated closure arguments.
+type ProgramRows<'a> = Box<dyn Iterator<Item = ProgramRow<'a>> + Send + 'a>;
+
 /// One `(channel, programme)` binding ready to insert.
 struct ProgramRow<'a> {
-    id: String,
+    /// The programme item's id (`LiveTvDtoService.GetInternalProgramId`).
+    id: Uuid,
     channel_id: &'a String,
     /// The provider's programme id suffixed with `_{channelExternalId}`
     /// (`ListingsManager.GetProgramsAsync`) — the listings-facing id the item
@@ -1179,52 +1192,64 @@ impl FerrofinLiveTvManager {
     /// fetched on its first request instead. The Schedules Direct daily
     /// image limit upstream checks here has no provider to come from yet
     /// (gl-413).
-    async fn pre_cache_images(&self, programs: &[(Uuid, Option<DateTime<Utc>>)]) {
+    ///
+    /// `programs` come one group per channel, and each group's images are
+    /// read when its turn comes, as upstream pre-caches each channel's
+    /// programmes once it has stored them.
+    async fn pre_cache_images(&self, programs: &[RefreshedAirings]) {
         let (Some(store), Some(images)) = (self.item_store.get(), self.images.get()) else {
             return;
         };
         let max_cache_date = Utc::now() + chrono::Duration::days(PRE_CACHE_DAYS);
-        let ids: Vec<Uuid> = programs
-            .iter()
-            .filter(|(_, end)| end.is_some_and(|end| end < max_cache_date))
-            .map(|(id, _)| *id)
-            .collect();
-        let rows = match store.items.get_image_infos_batch(&ids).await {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(%error, "live tv: could not read the programme images to pre-cache");
-                return;
-            }
-        };
-        // Once per URL: many airings share a series' poster, and two downloads
-        // of one URL would race.
-        let paths: HashSet<String> = rows
-            .into_values()
-            .flatten()
-            .filter(|image| !image.is_local_file())
-            .map(|image| image.path)
-            .collect();
         let parallelism = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)
             .min(PRE_CACHE_PARALLELISM);
+        // Once per URL: many airings share a series' poster, and two downloads
+        // of one URL would race.
+        let mut seen: HashSet<String> = HashSet::new();
         let mut failed = 0_usize;
         let mut downloads = tokio::task::JoinSet::new();
-        for path in paths {
-            if downloads.len() >= parallelism
-                && let Some(Ok(false)) = downloads.join_next().await
-            {
-                failed += 1;
+        for group in programs {
+            let ids: Vec<Uuid> = group
+                .iter()
+                .filter(|(_, end)| end.is_some_and(|end| end < max_cache_date))
+                .map(|(id, _)| *id)
+                .collect();
+            if ids.is_empty() {
+                continue;
             }
-            let providers = Arc::clone(&images.providers);
-            downloads.spawn(async move {
-                providers
-                    .cached_remote_image(&path)
-                    .await
-                    .inspect_err(|error| {
-                        tracing::debug!(%error, "live tv: could not pre-cache a programme image");
-                    })
-                    .is_ok()
-            });
+            let rows = match store.items.get_image_infos_batch(&ids).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(%error, "live tv: could not read the programme images to pre-cache");
+                    break;
+                }
+            };
+            let paths = rows
+                .into_values()
+                .flatten()
+                .filter(|image| !image.is_local_file())
+                .map(|image| image.path);
+            for path in paths {
+                if !seen.insert(path.clone()) {
+                    continue;
+                }
+                if downloads.len() >= parallelism
+                    && let Some(Ok(false)) = downloads.join_next().await
+                {
+                    failed += 1;
+                }
+                let providers = Arc::clone(&images.providers);
+                downloads.spawn(async move {
+                    providers
+                        .cached_remote_image(&path)
+                        .await
+                        .inspect_err(|error| {
+                            tracing::debug!(%error, "live tv: could not pre-cache a programme image");
+                        })
+                        .is_ok()
+                });
+            }
         }
         while let Some(done) = downloads.join_next().await {
             if matches!(done, Ok(false)) {
@@ -1468,104 +1493,61 @@ impl FerrofinLiveTvManager {
     /// the mirror keeps them — the same "an unreachable source must not wipe the
     /// guide" property the channel half gets from its own cache fallback.
     ///
+    /// One channel at a time, as `RefreshChannelsInternal` stores them (v12.4
+    /// GuideManager.cs:232-339): a channel's guide rows and the items already
+    /// stored for them are read, merged, written and dropped before the next
+    /// channel's are read, so the mirror holds one channel's airings, not the
+    /// whole guide's. What builds up is per airing and small: the ids of the
+    /// airings the guide holds (upstream's `newProgramIdList`), for the
+    /// `CleanDatabase` at the end, which reads the stored ids alone
+    /// (`GetItemIdsList`, :346), and the id and end of each one written, for
+    /// `PreCacheImages`.
+    ///
     /// `listings` are the airings this pass wrote, with their listing's
     /// artwork: `GuideManager.UpdateImages` runs on those, as upstream runs it
-    /// on the programmes the listings returned. Returned are the programmes
-    /// created or updated, with their end, for `PreCacheImages`.
+    /// on the programmes the listings returned, and each channel takes its own
+    /// out of the map. Returned are the programmes created or updated, with
+    /// their end, one group per channel, for `PreCacheImages`.
     async fn sync_program_items(
         &self,
-        listings: &HashMap<String, ProgramImages>,
-    ) -> Result<Vec<(Uuid, Option<DateTime<Utc>>)>, ServiceError> {
+        mut listings: HashMap<Uuid, ProgramImages>,
+    ) -> Result<Vec<RefreshedAirings>, ServiceError> {
         let Some(store) = self.item_store.get() else {
             return Ok(Vec::new());
         };
         let view_id = self.live_tv_view_id().await;
-        let rows = crate::guide_repository::program_rows(&self.db).await?;
-        // The programme items already stored, read ONCE: the merge needs them
-        // (the C# loads `existingPrograms` before assigning) and so does
-        // `CleanDatabase`.
-        let stored = store
-            .items
-            .get_item_list(&InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::LiveTvProgram],
-                ..InternalItemsQuery::default()
-            })
-            .await?;
-        let by_id: HashMap<String, &BaseItemEntity> = stored
-            .iter()
-            .map(|row| (row.id.to_uppercase(), row))
-            .collect();
-        let mut save: Vec<BaseItemEntity> = Vec::new();
-        // The genres to (re)write as `ItemValues`, for the rows whose genre list
-        // actually moved. A guide's genres are what make `GET /Genres` list a
-        // by-name row a library never produced ("News"), and re-writing all of
-        // them every refresh would be several statements per airing on a table
-        // that is O(channels x guide-hours).
-        let mut genres_to_write: Vec<(Uuid, Vec<(i32, String)>)> = Vec::new();
-        // The programmes `CreateItems`/`UpdateItemsAsync` would write, by id,
-        // and every programme's end.
-        let mut written: HashSet<Uuid> = HashSet::new();
-        let mut ends: HashMap<Uuid, Option<DateTime<Utc>>> = HashMap::new();
-        for row in &rows {
-            let fresh = program_entity(row, parse_dt, view_id);
-            let stored_row = by_id.get(&fresh.id.to_uppercase());
-            // A new airing without genres has no links to replace and none to
-            // write; on a first import that is most of the guide.
-            let genres_changed = stored_row.map_or_else(
-                || fresh.genres.as_deref().is_some_and(|g| !g.is_empty()),
-                |prev| prev.genres != fresh.genres,
-            );
-            if let Ok(id) = Uuid::parse_str(&fresh.id) {
-                ends.insert(id, fresh.end_date);
+        // Upstream's `newProgramIdList`: every airing the guide still holds.
+        let mut kept: HashSet<Uuid> = HashSet::new();
+        let mut refreshed = Vec::new();
+        for channel_id in crate::guide_repository::all_channel_ids(&self.db).await? {
+            let rows = crate::guide_repository::channel_program_rows(&self.db, &channel_id).await?;
+            if rows.is_empty() {
+                continue;
             }
-            let saved_before = save.len();
-            match stored_row {
-                // `isNew` — `CreateItems` stores the item whole.
-                None => save.push(fresh.clone()),
-                // `isUpdated` — only the fields the listing owns are assigned
-                // onto the STORED row, and it is written back only when one of
-                // them actually changed.
-                Some(prev) => save.extend(program_item_update(prev, &fresh)),
-            }
-            if save.len() > saved_before
-                && let Ok(id) = Uuid::parse_str(&fresh.id)
-            {
-                written.insert(id);
-            }
-            if genres_changed && let Ok(id) = Uuid::parse_str(&fresh.id) {
-                genres_to_write.push((
-                    id,
-                    fresh
-                        .genres
-                        .as_deref()
-                        .map(|g| {
-                            g.split('|')
-                                .map(|genre| (i32::from(ItemValueType::Genre), genre.to_owned()))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                ));
+            kept.extend(rows.iter().filter_map(|row| Uuid::parse_str(&row.id).ok()));
+            let written =
+                Self::sync_channel_program_items(store, &rows, view_id, &mut listings).await?;
+            if !written.is_empty() {
+                refreshed.push(written);
             }
         }
-        for chunk in save.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
-            store.persistence.save_items(chunk).await?;
-        }
-        for chunk in genres_to_write.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
-            store.persistence.save_item_values_for_items(chunk).await?;
-        }
-        // `UpdateImages`, for the airings the listings returned. An image
-        // change alone also makes the programme "updated" upstream.
-        Self::sync_program_images(store, listings, &mut written).await?;
+        // What is left was written this pass and replaced since (a later
+        // provider rewrote its channel's guide): it has no guide row, so its
+        // item goes in the clean below.
+        drop(listings);
         // `CleanDatabase(newProgramIdList, [BaseItemKind.LiveTvProgram], …)`
         // (:147), guarded upstream only by the `cleanDatabase` flag a THROWN
         // refresh clears — see the channel half for why an empty set here is a
         // genuine empty set and not a swallowed failure.
-        let keep: std::collections::HashSet<String> =
-            rows.iter().map(|row| row.id.to_uppercase()).collect();
-        let stale: Vec<Uuid> = stored
-            .iter()
-            .filter(|row| !keep.contains(&row.id.to_uppercase()))
-            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+        let stale: Vec<Uuid> = store
+            .items
+            .get_item_ids(&InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::LiveTvProgram],
+                ..InternalItemsQuery::default()
+            })
+            .await?
+            .into_iter()
+            .filter(|id| !kept.contains(id))
             .collect();
         if !stale.is_empty() {
             tracing::info!(
@@ -1576,33 +1558,131 @@ impl FerrofinLiveTvManager {
                 store.persistence.delete_items(chunk).await?;
             }
         }
+        Ok(refreshed)
+    }
+
+    /// One channel's turn of [`Self::sync_program_items`]: `GetProgram` over
+    /// the channel's guide `rows` against the items already stored for them,
+    /// then `CreateItems` / `UpdateItemsAsync` and `UpdateImages` for what
+    /// changed. Returns the programmes it created or updated, with their end.
+    async fn sync_channel_program_items(
+        store: &LiveTvItemStore,
+        rows: &[GuideProgramRow],
+        view_id: Option<Uuid>,
+        listings: &mut HashMap<Uuid, ProgramImages>,
+    ) -> Result<RefreshedAirings, ServiceError> {
+        let ids: Vec<Uuid> = rows
+            .iter()
+            .filter_map(|row| Uuid::parse_str(&row.id).ok())
+            .collect();
+        // The programme items already stored for these airings: the merge
+        // needs them (the C# loads `existingPrograms` before assigning). They
+        // are read by id, so an airing finds its item whichever channel the
+        // item was stored under.
+        let stored: HashMap<Uuid, BaseItemEntity> = store
+            .items
+            .retrieve_items(&ids)
+            .await?
+            .into_iter()
+            .filter(|row| row.type_ == crate::projection::PROGRAM_TYPE_NAME)
+            .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
+            .collect();
+        let mut save: Vec<BaseItemEntity> = Vec::new();
+        // The genres to (re)write as `ItemValues`, for the rows whose genre list
+        // actually moved. A guide's genres are what make `GET /Genres` list a
+        // by-name row a library never produced ("News"), and re-writing all of
+        // them every refresh would be several statements per airing on a table
+        // that is O(channels x guide-hours).
+        let mut genres_to_write: Vec<(Uuid, Vec<(i32, String)>)> = Vec::new();
+        // The programmes `CreateItems`/`UpdateItemsAsync` would write, with
+        // their end.
+        let mut written: HashSet<Uuid> = HashSet::new();
+        let mut ends: HashMap<Uuid, Option<DateTime<Utc>>> = HashMap::new();
+        for row in rows {
+            let fresh = program_entity(row, parse_dt, view_id);
+            let id = Uuid::parse_str(&fresh.id).ok();
+            let stored_row = id.and_then(|id| stored.get(&id));
+            // A new airing without genres has no links to replace and none to
+            // write; on a first import that is most of the guide.
+            let genres_changed = stored_row.map_or_else(
+                || fresh.genres.as_deref().is_some_and(|g| !g.is_empty()),
+                |prev| prev.genres != fresh.genres,
+            );
+            if let Some(id) = id {
+                ends.insert(id, fresh.end_date);
+                if genres_changed {
+                    genres_to_write.push((
+                        id,
+                        fresh
+                            .genres
+                            .as_deref()
+                            .map(|g| {
+                                g.split('|')
+                                    .map(|genre| {
+                                        (i32::from(ItemValueType::Genre), genre.to_owned())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    ));
+                }
+            }
+            let item = match stored_row {
+                // `isNew` — `CreateItems` stores the item whole.
+                None => Some(fresh),
+                // `isUpdated` — only the fields the listing owns are assigned
+                // onto the STORED row, and it is written back only when one of
+                // them actually changed.
+                Some(prev) => program_item_update(prev, &fresh),
+            };
+            if let Some(item) = item {
+                if let Some(id) = id {
+                    written.insert(id);
+                }
+                save.push(item);
+            }
+        }
+        drop(stored);
+        for chunk in save.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
+            store.persistence.save_items(chunk).await?;
+        }
+        drop(save);
+        for chunk in genres_to_write.chunks(PROGRAM_ITEM_WRITE_CHUNK) {
+            store.persistence.save_item_values_for_items(chunk).await?;
+        }
+        // `UpdateImages`, for the airings the listings returned. An image
+        // change alone also makes the programme "updated" upstream.
+        let listed: Vec<(Uuid, ProgramImages)> = ids
+            .iter()
+            .filter_map(|id| listings.remove(id).map(|images| (*id, images)))
+            .collect();
+        Self::sync_program_images(store, &listed, &mut written).await?;
         Ok(written
             .into_iter()
             .map(|id| (id, ends.get(&id).copied().flatten()))
             .collect())
     }
 
-    /// `GuideManager.UpdateImages` over the airings in `listings`, writing
-    /// the image lists that change and adding their programmes to `written`
-    /// (the programmes created or updated this pass, which a removal alone
-    /// needs to be written).
+    /// `GuideManager.UpdateImages` over the airings in `listed`, writing the
+    /// image lists that change and adding their programmes to `written` (the
+    /// programmes created or updated this pass, which a removal alone needs
+    /// to be written).
     async fn sync_program_images(
         store: &LiveTvItemStore,
-        listings: &HashMap<String, ProgramImages>,
+        listed: &[(Uuid, ProgramImages)],
         written: &mut HashSet<Uuid>,
     ) -> Result<(), ServiceError> {
-        let listed: Vec<(Uuid, &ProgramImages)> = listings
-            .iter()
-            .filter_map(|(id, images)| Uuid::parse_str(id).ok().map(|id| (id, images)))
-            .collect();
+        if listed.is_empty() {
+            return Ok(());
+        }
         let ids: Vec<Uuid> = listed.iter().map(|(id, _)| *id).collect();
         let current = store.items.get_image_infos_batch(&ids).await?;
         let mut images_to_write: Vec<(Uuid, Vec<ItemImageInfo>)> = Vec::new();
         for (id, listing) in listed {
-            let stored = current.get(&id).map_or(&[][..], Vec::as_slice);
-            if let Some(images) = program_images_update(stored, listing, written.contains(&id)) {
-                images_to_write.push((id, images));
-                written.insert(id);
+            let stored = current.get(id).map_or(&[][..], Vec::as_slice);
+            if let Some(images) = program_images_update(stored, listing, written.contains(id)) {
+                images_to_write.push((*id, images));
+                written.insert(*id);
             }
         }
         store.persistence.save_items_images(&images_to_write).await
@@ -2129,14 +2209,14 @@ impl FerrofinLiveTvManager {
     /// airings inside the window are kept. A large IPTV guide carries
     /// thousands of channels nobody mapped, and parsing them all (upstream
     /// streams its cached file one channel at a time instead) held the whole
-    /// guide in memory. `document` is dropped once its rows are built.
+    /// guide in memory. `document` is dropped once its airings are read.
     async fn insert_programs(
         &self,
         document: XmlTvDocument,
         channels: &[XmltvChannel],
         provider: &ListingsProviderInfo,
         window: (DateTime<Utc>, DateTime<Utc>),
-    ) -> Result<Vec<(String, ProgramImages)>, ServiceError> {
+    ) -> Result<Vec<(Uuid, ProgramImages)>, ServiceError> {
         let classes = CategoryClasses::from_provider(provider);
         let (window_start, window_end) = window;
 
@@ -2171,64 +2251,60 @@ impl FerrofinLiveTvManager {
             )));
         }
 
-        // Flatten to one (channel, programme) row per binding, then insert in
-        // chunked multi-row statements (27 columns per row) instead of one
-        // round-trip per programme.
-        let rows: Vec<_> = guide
-            .programmes
-            .iter()
-            .flat_map(|prog| {
-                let channels = by_epg_channel
-                    .get(&prog.channel_id)
-                    .map_or(&[][..], Vec::as_slice);
-                let start = opt_datetime_to_db(prog.start.map(|d| d.with_timezone(&Utc)))
-                    .unwrap_or_default();
-                let end = opt_datetime_to_db(prog.stop.map(|d| d.with_timezone(&Utc)));
-                let genres = if prog.categories.is_empty() {
-                    None
-                } else {
-                    serde_json::to_string(&prog.categories).ok()
-                };
-                let class = classes.classify(prog);
-                channels.iter().map(move |(channel_id, channel_external)| {
-                    // `ListingsManager.GetProgramsAsync` (v10.11.8
-                    // ListingsManager.cs:151-155) suffixes the provider's id with
-                    // `"_" + channel.Id` — the tuner's external channel id — and
-                    // `LiveTvDtoService.GetInternalProgramId` hashes the result.
-                    let external_id = class
-                        .external_id
-                        .as_ref()
-                        .map(|base| format!("{base}_{channel_external}"));
-                    let id = external_id.as_deref().map_or_else(
-                        // No start attribute means upstream has no id to build
-                        // either; keep the row addressable rather than dropping
-                        // it, keyed on what it does have.
-                        || internal_program_id(&format!("{channel_external}_{}", prog.title)),
-                        internal_program_id,
-                    );
-                    ProgramRow {
-                        id: guid_to_db(id),
-                        channel_id,
-                        external_id,
-                        start: start.clone(),
-                        end: end.clone(),
-                        genres: genres.clone(),
-                        class: class.clone(),
-                        fields: ProgramFields::of_xmltv(prog),
-                        // `XmlTvListingsProvider.GetProgramInfo`'s `ImageUrl`,
-                        // `ThumbImageUrl` and `BackdropImageUrl`.
-                        images: ProgramImages {
-                            primary: prog.icon.clone(),
-                            thumb: prog.still_image.clone(),
-                            backdrop: prog.backdrop_image.clone(),
-                        },
-                    }
-                })
+        // One (channel, programme) row per binding, built as the write takes
+        // it: `write_program_rows` inserts them in chunked multi-row
+        // statements (27 columns per row) instead of one round-trip per
+        // programme, and holds one statement's rows at a time.
+        let rows: ProgramRows<'_> = Box::new(guide.programmes.iter().flat_map(|prog| {
+            let channels = by_epg_channel
+                .get(&prog.channel_id)
+                .map_or(&[][..], Vec::as_slice);
+            let start =
+                opt_datetime_to_db(prog.start.map(|d| d.with_timezone(&Utc))).unwrap_or_default();
+            let end = opt_datetime_to_db(prog.stop.map(|d| d.with_timezone(&Utc)));
+            let genres = if prog.categories.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&prog.categories).ok()
+            };
+            let class = classes.classify(prog);
+            channels.iter().map(move |(channel_id, channel_external)| {
+                // `ListingsManager.GetProgramsAsync` (v10.11.8
+                // ListingsManager.cs:151-155) suffixes the provider's id with
+                // `"_" + channel.Id` — the tuner's external channel id — and
+                // `LiveTvDtoService.GetInternalProgramId` hashes the result.
+                let external_id = class
+                    .external_id
+                    .as_ref()
+                    .map(|base| format!("{base}_{channel_external}"));
+                let id = external_id.as_deref().map_or_else(
+                    // No start attribute means upstream has no id to build
+                    // either; keep the row addressable rather than dropping
+                    // it, keyed on what it does have.
+                    || internal_program_id(&format!("{channel_external}_{}", prog.title)),
+                    internal_program_id,
+                );
+                ProgramRow {
+                    id,
+                    channel_id,
+                    external_id,
+                    start: start.clone(),
+                    end: end.clone(),
+                    genres: genres.clone(),
+                    class: class.clone(),
+                    fields: ProgramFields::of_xmltv(prog),
+                    // `XmlTvListingsProvider.GetProgramInfo`'s `ImageUrl`,
+                    // `ThumbImageUrl` and `BackdropImageUrl`.
+                    images: ProgramImages {
+                        primary: prog.icon.clone(),
+                        thumb: prog.still_image.clone(),
+                        backdrop: prog.backdrop_image.clone(),
+                    },
+                }
             })
-            .collect();
+        }));
 
-        self.write_program_rows(&rows, &touched).await?;
-        Ok(rows.into_iter().map(|row| (row.id, row.images)).collect())
+        self.write_program_rows(rows, &touched).await
     }
 
     /// Inserts the Schedules Direct airings fetched for one provider, binding
@@ -2243,7 +2319,7 @@ impl FerrofinLiveTvManager {
         channels: &[EpgChannel],
         programs: &HashMap<String, Vec<SdProgram>>,
         provider: &ListingsProviderInfo,
-    ) -> Result<Vec<(String, ProgramImages)>, ServiceError> {
+    ) -> Result<Vec<(Uuid, ProgramImages)>, ServiceError> {
         let by_station = self.bind_guide_channels(channels, provider).await?;
         let touched: Vec<String> = by_station
             .iter()
@@ -2253,46 +2329,42 @@ impl FerrofinLiveTvManager {
             .into_iter()
             .collect();
 
-        let rows: Vec<_> = programs
-            .iter()
-            .flat_map(|(station, airings)| {
-                let channels = by_station.get(station).map_or(&[][..], Vec::as_slice);
-                airings.iter().flat_map(move |program| {
-                    let start = datetime_to_db(program.start);
-                    let end = Some(datetime_to_db(program.end));
-                    let genres = if program.genres.is_empty() {
-                        None
-                    } else {
-                        serde_json::to_string(&program.genres).ok()
-                    };
-                    let class = sd_program_class(program);
-                    channels.iter().map(move |(channel_id, channel_external)| {
-                        // `ListingsManager.GetProgramsAsync`: `program.Id += "_" + channel.Id`.
-                        let external_id = format!("{}_{channel_external}", program.id);
-                        ProgramRow {
-                            id: guid_to_db(internal_program_id(&external_id)),
-                            channel_id,
-                            external_id: Some(external_id),
-                            start: start.clone(),
-                            end: end.clone(),
-                            genres: genres.clone(),
-                            class: class.clone(),
-                            fields: ProgramFields::of_schedules_direct(program),
-                            // `SchedulesDirect.GetProgram`'s `ImageUrl` and
-                            // `ThumbImageUrl`; it sets no backdrop.
-                            images: ProgramImages {
-                                primary: program.image_url.clone(),
-                                thumb: program.thumb_image_url.clone(),
-                                backdrop: None,
-                            },
-                        }
-                    })
+        let rows: ProgramRows<'_> = Box::new(programs.iter().flat_map(|(station, airings)| {
+            let channels = by_station.get(station).map_or(&[][..], Vec::as_slice);
+            airings.iter().flat_map(move |program| {
+                let start = datetime_to_db(program.start);
+                let end = Some(datetime_to_db(program.end));
+                let genres = if program.genres.is_empty() {
+                    None
+                } else {
+                    serde_json::to_string(&program.genres).ok()
+                };
+                let class = sd_program_class(program);
+                channels.iter().map(move |(channel_id, channel_external)| {
+                    // `ListingsManager.GetProgramsAsync`: `program.Id += "_" + channel.Id`.
+                    let external_id = format!("{}_{channel_external}", program.id);
+                    ProgramRow {
+                        id: internal_program_id(&external_id),
+                        channel_id,
+                        external_id: Some(external_id),
+                        start: start.clone(),
+                        end: end.clone(),
+                        genres: genres.clone(),
+                        class: class.clone(),
+                        fields: ProgramFields::of_schedules_direct(program),
+                        // `SchedulesDirect.GetProgram`'s `ImageUrl` and
+                        // `ThumbImageUrl`; it sets no backdrop.
+                        images: ProgramImages {
+                            primary: program.image_url.clone(),
+                            thumb: program.thumb_image_url.clone(),
+                            backdrop: None,
+                        },
+                    }
                 })
             })
-            .collect();
+        }));
 
-        self.write_program_rows(&rows, &touched).await?;
-        Ok(rows.into_iter().map(|row| (row.id, row.images)).collect())
+        self.write_program_rows(rows, &touched).await
     }
 
     /// Whether a refresh newer than `generation` has started.
@@ -2470,24 +2542,39 @@ impl FerrofinLiveTvManager {
         )))
     }
 
-    /// Replaces the airings on `touched` with `rows`, in one transaction.
+    /// Replaces the airings on `touched` with `rows`, in one transaction, and
+    /// returns each written airing's id with its listing's artwork.
     ///
     /// `clean_programs` first — a refresh is authoritative for the channels it
     /// covers — then the chunked multi-row upsert, which preserves each
     /// surviving airing's first-seen `DateCreated` (see
     /// [`PROGRAM_UPSERT_CONFLICT`]) the way upstream updates a programme item
     /// rather than recreating it.
+    ///
+    /// `rows` is drawn one statement's worth at a time, so the whole guide's
+    /// rows never exist at once; only the id and artwork of each are kept, for
+    /// the refresh's `CleanDatabase` and the item mirror's `UpdateImages`.
     async fn write_program_rows(
         &self,
-        rows: &[ProgramRow<'_>],
+        mut rows: ProgramRows<'_>,
         touched: &[String],
-    ) -> Result<(), ServiceError> {
+    ) -> Result<Vec<(Uuid, ProgramImages)>, ServiceError> {
         let now = datetime_to_db(Utc::now());
         let mut tx = self.db.writer().begin().await.map_err(db_err)?;
 
         let existing_dates = Self::clean_programs(&mut tx, touched).await?;
 
-        for chunk in rows.chunks(SQLITE_BIND_LIMIT / 27) {
+        let per_statement = SQLITE_BIND_LIMIT / 27;
+        let mut written = Vec::new();
+        let mut chunk: Vec<ProgramRow<'_>> = Vec::with_capacity(per_statement);
+        loop {
+            chunk.extend(rows.by_ref().take(per_statement));
+            if chunk.is_empty() {
+                break;
+            }
+            // A short chunk is the last: the iterator is not asked again
+            // after it has ended.
+            let last = chunk.len() < per_statement;
             let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 r#"INSERT INTO "FerrofinLiveTvPrograms"
                    ("Id","ChannelId","StartDate","EndDate","Title","EpisodeTitle","Overview",
@@ -2496,10 +2583,11 @@ impl FerrofinLiveTvManager {
                     "IsSports","IsLive","ExternalId","ExternalSeriesId","SeasonNumber",
                     "EpisodeNumber","DateCreated","ShowId") "#,
             );
-            qb.push_values(chunk, |mut b, row| {
+            qb.push_values(&chunk, |mut b, row| {
                 let prog = &row.fields;
                 let class = &row.class;
-                b.push_bind(&row.id)
+                let id = guid_to_db(row.id);
+                b.push_bind(&id)
                     .push_bind(row.channel_id)
                     .push_bind(&row.start)
                     .push_bind(&row.end)
@@ -2526,7 +2614,7 @@ impl FerrofinLiveTvManager {
                     .push_bind(class.episode_number)
                     .push_bind(
                         existing_dates
-                            .get(&row.id)
+                            .get(&id)
                             .and_then(Clone::clone)
                             .unwrap_or_else(|| now.clone()),
                     )
@@ -2534,9 +2622,13 @@ impl FerrofinLiveTvManager {
             });
             qb.push(PROGRAM_UPSERT_CONFLICT);
             qb.build().execute(&mut *tx).await.map_err(db_err)?;
+            written.extend(chunk.drain(..).map(|row| (row.id, row.images)));
+            if last {
+                break;
+            }
         }
         tx.commit().await.map_err(db_err)?;
-        Ok(())
+        Ok(written)
     }
 }
 
@@ -3326,9 +3418,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
             kept_channels.extend(self.replace_channels(id, channels).await?);
         }
         // The airings this pass wrote, with the artwork their listing gave
-        // them. A provider that could not be read writes none, so its cached
+        // them: upstream's `newProgramIdList`, plus what `UpdateImages` needs.
+        // A provider that could not be read writes none, so its cached
         // airings keep the images they have.
-        let mut kept_programs: HashMap<String, ProgramImages> = HashMap::new();
+        let mut kept_programs: HashMap<Uuid, ProgramImages> = HashMap::new();
         // By value: each document goes as soon as its airings are written,
         // rather than living through the item mirror below.
         for (provider, source) in guides {
@@ -3361,7 +3454,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             let stale: Vec<String> = crate::guide_repository::all_program_ids(&self.db)
                 .await?
                 .into_iter()
-                .filter(|id| !kept_programs.contains_key(id))
+                .filter(|id| !Uuid::parse_str(id).is_ok_and(|id| kept_programs.contains_key(&id)))
                 .collect();
             if !stale.is_empty() {
                 crate::guide_repository::delete_programs(&self.db, &stale).await?;
@@ -3375,7 +3468,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // Every provider has spoken, so the programme table now holds exactly
         // upstream's `newProgramIdList` across all services — the set its
         // `CleanDatabase(newProgramIdList, [LiveTvProgram])` is taken over.
-        let refreshed = self.sync_program_items(&kept_programs).await?;
+        let refreshed = self.sync_program_items(kept_programs).await?;
         // `RefreshGuide`'s tail: `RefreshSeriesTimers` then `RefreshTimers`
         // (v12.2 src/Jellyfin.LiveTv/Guide/GuideManager.cs:163-164).
         self.refresh_series_timers().await?;
@@ -6776,6 +6869,7 @@ fn db_err(e: sqlx::Error) -> ServiceError {
 
 #[cfg(test)]
 mod tests {
+    mod guide_mirror;
     mod schedules_direct;
 
     use std::collections::HashMap;
@@ -8278,6 +8372,8 @@ mod tests {
         items: Arc<dyn ferrofin_traits::persistence::ItemRepository>,
         view: Uuid,
         tuner: TunerHostInfo,
+        /// The playlist and guide bodies, swappable between refreshes.
+        sources: Arc<SwappableFetcher>,
     }
 
     async fn channel_item_lab() -> ChannelItemLab {
@@ -8287,13 +8383,27 @@ mod tests {
     /// [`channel_item_lab`] over the playlist `m3u`, plus a listings provider
     /// serving `xmltv` when there is one.
     async fn item_lab(m3u: &str, xmltv: Option<String>) -> ChannelItemLab {
+        item_lab_reading_through(m3u, xmltv, |items| items).await
+    }
+
+    /// [`item_lab`], with the guide refresh reading items through the
+    /// repository `wrap` returns over the real one; the lab's own `items`
+    /// stays the real one.
+    async fn item_lab_reading_through(
+        m3u: &str,
+        xmltv: Option<String>,
+        wrap: impl FnOnce(
+            Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+        ) -> Arc<dyn ferrofin_traits::persistence::ItemRepository>,
+    ) -> ChannelItemLab {
         let view = Uuid::from_u128(0x2b2b_ca16_aacc_8a14_d53a_11bb_829e_afa5);
         let mut sources = HashMap::new();
         sources.insert("http://tuner/playlist.m3u".to_owned(), m3u.to_owned());
         if let Some(xmltv) = &xmltv {
             sources.insert("http://guide/xmltv.xml".to_owned(), xmltv.clone());
         }
-        let mgr = manager_with(FakeFetcher(sources)).await;
+        let sources = Arc::new(SwappableFetcher(std::sync::Mutex::new(sources)));
+        let mgr = manager_with_fetcher(Arc::clone(&sources) as Arc<dyn SourceFetcher>).await;
         let item_type_lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
             Arc::new(ferrofin_core::ItemTypeLookup::new());
         let persistence: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> = Arc::new(
@@ -8317,7 +8427,7 @@ mod tests {
             .expect("live tv view");
         mgr.set_item_store(
             Arc::clone(&persistence),
-            Arc::clone(&items),
+            wrap(Arc::clone(&items)),
             Arc::new(FixedLiveTvView(view)),
         );
         let tuner = mgr
@@ -8346,6 +8456,7 @@ mod tests {
             items,
             view,
             tuner,
+            sources,
         }
     }
 
@@ -9058,7 +9169,7 @@ mod tests {
         let dtos = lab
             .mgr
             .program_dtos(
-                &crate::guide_repository::program_rows(&lab.mgr.db)
+                &crate::guide_repository::test_support::program_rows(&lab.mgr.db)
                     .await
                     .expect("rows"),
                 &DtoOptions {
