@@ -875,17 +875,21 @@ pub const UPSTREAM_PIN_DATE: &str = "2026-10-28";
 /// Re-compare the row against [`UPSTREAM_TAG`], update its `date`, and remove it
 /// from this list. `v12.2` is commit `ca0f16eb7c`.
 pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
-    // Item DTOs: v12.3's FiniteOrNull rating setters also run on reads, so a
-    // stored non-finite rating is omitted upstream (gl-877 ports that read).
+    // The v12.4 re-check found a gap that v12.2 has too (the C# under these
+    // rows is unchanged); each leaves the list with its fix.
+    // gl-1034: a nil parentId is an empty page, not GetItemById's 400 (and
+    // gl-267's offset-less nextUpDateCutoff fix is not on this branch yet).
     ("get", "/Shows/NextUp", "v12.2"),
+    // gl-1037: a malformed minCommunityRating is ignored, not a 400; gl-884: a
+    // malformed genreIds/studioIds token is a 400, not dropped; gl-1038: a
+    // padded parentId/userId is a 400, not trimmed.
     ("get", "/Artists", "v12.2"),
     ("get", "/Artists/AlbumArtists", "v12.2"),
+    // gl-408: parameters these actions do not declare are bound (a 400 on a
+    // bad value); gl-1038: a padded parentId/userId is a 400, not trimmed.
     ("get", "/Genres", "v12.2"),
     ("get", "/MusicGenres", "v12.2"),
     ("get", "/Studios", "v12.2"),
-    ("get", "/UserItems/Resume", "v12.2"),
-    // The v12.4 re-check found a gap that v12.2 has too (the C# under these
-    // rows is unchanged); each leaves the list with its fix.
     // gl-1034: a nil item id is a 404, not GetItemById's 400.
     ("get", "/Audio/{itemId}/Lyrics", "v12.2"),
     ("delete", "/Audio/{itemId}/Lyrics", "v12.2"),
@@ -1111,7 +1115,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/items.rs get_resume_items → ferrofin-core item_repository.rs \
                get_items → translate_query.rs (push_resumable_predicate, \
                push_order_expression DatePlayed)",
-        date: "2026-10-19",
+        date: "2026-10-29",
         divergences: RESUME_DIVERGENCES,
         refs: &[],
     },
@@ -1853,12 +1857,19 @@ const RESUME_DIVERGENCES: &[&str] = &[
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",
     "A resumable Series or Season row's UnplayedItemCount / PlayedPercentage / Played \
-     count each leaf's own played row; v12.2's ItemCountService counts a leaf played \
+     count each leaf's own played row; v12.4's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
      alternate-version arm in item_count_service's played statements (gl-441).",
     "Resume positions that Ferrofin builds before gl-46 saved for songs and for Sample, \
      ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
      until they are played again; new plays no longer save one. Fix path: gl-717.",
+    "`searchTerm`'s OriginalTitle arm lower-cases both sides (Unicode); v12.4 \
+     TranslateQuery matches the raw term with SQLite LIKE, which folds ASCII case only, so \
+     an OriginalTitle whose non-ASCII letters differ in case from the term matches here and \
+     not upstream. Fix path: gl-957.",
+    "The 400 (an API key with no userId, or a value the query binder cannot convert), \
+     403 (another user's id without the administrator role) and 404 (a userId naming no \
+     account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
 ];
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).

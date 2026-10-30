@@ -1986,6 +1986,10 @@ fn columns_of(
 ) -> Vec<(&'static str, Column)> {
     use Column::{Bool, Int, Real, Text};
     let text = |v: &Option<String>| Text(v.clone());
+    // The backstop for the `BaseItem` setters' `FiniteOrNull`: whatever
+    // built the entity, a NaN or infinite rating or gain is written as no
+    // value (SQLite would keep an infinity).
+    let real = |v: Option<f64>| Real(ferrofin_util::finite::finite_or_none(v));
     let date = |v: Option<chrono::DateTime<chrono::Utc>>| Text(opt_datetime_to_db(v));
     vec![
         ("Id", Text(Some(item.id.clone()))),
@@ -1995,8 +1999,8 @@ fn columns_of(
         ("Audio", Int(item.audio.map(i64::from))),
         ("ChannelId", text(&item.channel_id)),
         ("CleanName", Text(clean_name)),
-        ("CommunityRating", Real(item.community_rating)),
-        ("CriticRating", Real(item.critic_rating)),
+        ("CommunityRating", real(item.community_rating)),
+        ("CriticRating", real(item.critic_rating)),
         ("CustomRating", text(&item.custom_rating)),
         ("Data", text(&item.data)),
         ("DateCreated", date(item.date_created)),
@@ -2031,10 +2035,10 @@ fn columns_of(
         ("IsRepeat", Bool(item.is_repeat)),
         ("IsSeries", Bool(item.is_series)),
         ("IsVirtualItem", Bool(item.is_virtual_item)),
-        ("LUFS", Real(item.lufs)),
+        ("LUFS", real(item.lufs)),
         ("MediaType", text(&item.media_type)),
         ("Name", text(&item.name)),
-        ("NormalizationGain", Real(item.normalization_gain)),
+        ("NormalizationGain", real(item.normalization_gain)),
         ("OfficialRating", text(&item.official_rating)),
         ("OriginalLanguage", text(&item.original_language)),
         ("OriginalTitle", text(&item.original_title)),
@@ -8676,6 +8680,69 @@ mod tests {
             .await
             .expect("scan save");
         assert_eq!(read(db, id).await.original_language.as_deref(), Some("en"));
+    }
+
+    /// The backstop for `BaseItem`'s `FiniteOrNull` setters: whatever entry
+    /// point built the entity, a non-finite rating or gain is written as no
+    /// value by both statements (SQLite would store an infinity as one).
+    #[tokio::test]
+    async fn non_finite_ratings_and_gains_are_written_as_no_value() {
+        let db = test_db().await;
+        let svc = FerrofinItemPersistenceService::new(db.clone());
+        let entity = ferrofin_db::entities::base_items::BaseItemEntity {
+            community_rating: Some(f64::INFINITY),
+            critic_rating: Some(f64::NEG_INFINITY),
+            lufs: Some(f64::INFINITY),
+            normalization_gain: Some(f64::NAN),
+            ..named("Unrated")
+        };
+        let stored = |db: ferrofin_db::Database, id: String| async move {
+            sqlx::query_as::<_, (Option<f64>, Option<f64>, Option<f64>, Option<f64>)>(
+                r#"SELECT "CommunityRating", "CriticRating", "LUFS", "NormalizationGain"
+                   FROM "BaseItems" WHERE "Id" = ?1"#,
+            )
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .expect("row")
+        };
+        svc.save_items(std::slice::from_ref(&entity))
+            .await
+            .expect("save");
+        assert_eq!(
+            stored(db.clone(), entity.id.clone()).await,
+            (None, None, None, None)
+        );
+        let rescanned = ferrofin_db::entities::base_items::BaseItemEntity {
+            community_rating: Some(f64::NEG_INFINITY),
+            critic_rating: Some(f64::INFINITY),
+            // Past `float`'s range: an infinity in upstream's `float` column.
+            lufs: Some(1e39),
+            normalization_gain: Some(f64::INFINITY),
+            ..entity.clone()
+        };
+        svc.save_scanned_items(std::slice::from_ref(&rescanned))
+            .await
+            .expect("scan save");
+        assert_eq!(
+            stored(db.clone(), entity.id.clone()).await,
+            (None, None, None, None)
+        );
+        // A finite value is written as it is.
+        let rated = ferrofin_db::entities::base_items::BaseItemEntity {
+            community_rating: Some(7.5),
+            critic_rating: Some(80.0),
+            lufs: Some(-14.0),
+            normalization_gain: Some(-3.5),
+            ..entity.clone()
+        };
+        svc.save_items(std::slice::from_ref(&rated))
+            .await
+            .expect("save");
+        assert_eq!(
+            stored(db, entity.id).await,
+            (Some(7.5), Some(80.0), Some(-14.0), Some(-3.5))
+        );
     }
 
     // `ForcedSortName` short-circuits `CreateSortName` in C#: it is padded and
