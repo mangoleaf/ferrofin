@@ -5,7 +5,7 @@
 //! `axum::serve`, which is the only way to exercise the inbound framing (the
 //! part affected by the socket's read-buffer capacity), the authentication
 //! that decides whether the upgrade happens at all, and the event-driven
-//! `Sessions` stream.
+//! `Sessions` and `ActivityLogEntry` streams.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,13 +14,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ferrofin_api::state::AppState;
 use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
+use ferrofin_model::activity::ActivityLogEntry;
 use ferrofin_model::dto::SessionInfoDto;
+use ferrofin_model::querying::QueryResult;
 use ferrofin_model::session::{
     ClientCapabilities, GeneralCommand, MessageCommand, PlayRequest, PlaybackProgressInfo,
     PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, SessionUserInfo,
     TranscodingInfo,
 };
 use ferrofin_model::users::UserPolicy;
+use ferrofin_traits::activity::{ActivityLogCreate, ActivityLogQuery, ActivityManager};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::{AuthService, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
@@ -463,11 +466,30 @@ async fn assert_next_is_ack(socket: &mut Client) {
 /// Opens a socket over `sessions` as [`CALLER`] and subscribes it to the
 /// `Sessions` stream with `data` (`"initialDelayMs,periodMs"`).
 async fn subscribe(sessions: &Arc<StreamingSessions>, admin: bool, data: &str) -> Client {
-    let state = ferrofin_api::test_support::fake_state_with_sessions(
+    let mut socket = connect(state_over(sessions, admin)).await;
+    assert_eq!(
+        sessions.events.receiver_count(),
+        0,
+        "the socket subscribes at SessionsStart, not when it opens"
+    );
+    send_and_ack(&mut socket, "SessionsStart", data).await;
+    assert_eq!(sessions.events.receiver_count(), 1, "subscribed");
+    socket
+}
+
+/// A server state whose sockets resolve to a session of [`CALLER`] over
+/// `sessions`, as an administrator or not.
+fn state_over(sessions: &Arc<StreamingSessions>, admin: bool) -> AppState {
+    ferrofin_api::test_support::fake_state_with_sessions(
         Arc::new(TokenAuth { admin }),
         Arc::new(ferrofin_api::test_support::FakeConfig),
         Arc::clone(sessions) as Arc<dyn SessionManager>,
-    );
+    )
+}
+
+/// Serves `state` and opens a socket on it, past the connect-time
+/// `ForceKeepAlive`.
+async fn connect(state: AppState) -> Client {
     let addr = serve(state).await;
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/socket"))
         .await
@@ -476,20 +498,19 @@ async fn subscribe(sessions: &Arc<StreamingSessions>, admin: bool, data: &str) -
         next_json(&mut socket).await["MessageType"],
         "ForceKeepAlive"
     );
-    assert_eq!(
-        sessions.events.receiver_count(),
-        0,
-        "the socket subscribes at SessionsStart, not when it opens"
-    );
+    socket
+}
+
+/// Sends a `message_type` frame with `data` and waits for a `KeepAlive` ack,
+/// which proves it was handled and nothing was sent in reply.
+async fn send_and_ack(socket: &mut Client, message_type: &str, data: &str) {
     socket
         .send(Message::text(format!(
-            r#"{{"MessageType":"SessionsStart","Data":"{data}"}}"#
+            r#"{{"MessageType":"{message_type}","Data":"{data}"}}"#
         )))
         .await
-        .expect("subscribe");
-    assert_next_is_ack(&mut socket).await;
-    assert_eq!(sessions.events.receiver_count(), 1, "subscribed");
-    socket
+        .expect("send");
+    assert_next_is_ack(socket).await;
 }
 
 /// A session with this id and user.
@@ -651,4 +672,111 @@ async fn sessions_stop_ends_the_stream() {
     assert!(sessions.events.send(SessionEvent::PlaybackStart).is_err());
     assert_next_is_ack(&mut socket).await;
     assert_eq!(sessions.builds(), 0);
+}
+
+/// An activity manager for the `ActivityLogEntry` stream: [`raise`] stands
+/// for a created entry, and every activity-log query is counted.
+///
+/// [`raise`]: StreamingActivity::raise
+struct StreamingActivity {
+    created: broadcast::Sender<()>,
+    queries: AtomicUsize,
+}
+
+impl StreamingActivity {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            created: broadcast::channel(64).0,
+            queries: AtomicUsize::new(0),
+        })
+    }
+
+    fn raise(&self) {
+        self.created.send(()).expect("a subscribed socket");
+    }
+}
+
+#[async_trait::async_trait]
+impl ActivityManager for StreamingActivity {
+    async fn get_paged_result(
+        &self,
+        _query: &ActivityLogQuery,
+    ) -> Result<QueryResult<ActivityLogEntry>, ServiceError> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
+        Ok(QueryResult::default())
+    }
+    async fn create_entry(&self, _entry: ActivityLogCreate) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn clean(&self, _before: chrono::DateTime<chrono::Utc>) -> Result<u64, ServiceError> {
+        unimplemented!("fake")
+    }
+    fn subscribe_entry_created(&self) -> Option<broadcast::Receiver<()>> {
+        Some(self.created.subscribe())
+    }
+}
+
+/// Opens an administrator's socket whose activity manager is `activity` and
+/// subscribes it to the `ActivityLogEntry` stream with `data`.
+async fn subscribe_to_activity(activity: &Arc<StreamingActivity>, data: &str) -> Client {
+    let state = ferrofin_api::test_support::fake_state_with_streams(
+        Arc::new(TokenAuth { admin: true }),
+        Arc::new(ferrofin_api::test_support::FakeConfig),
+        StreamingSessions::new(Vec::new()),
+        Arc::clone(activity) as Arc<dyn ActivityManager>,
+        Arc::new(ferrofin_api::test_support::FakeTasks),
+    );
+    let mut socket = connect(state).await;
+    assert_eq!(
+        activity.created.receiver_count(),
+        0,
+        "the socket subscribes at ActivityLogEntryStart, not when it opens"
+    );
+    send_and_ack(&mut socket, "ActivityLogEntryStart", data).await;
+    assert_eq!(activity.created.receiver_count(), 1, "subscribed");
+    socket
+}
+
+/// B3 for the activity stream: while no entry is created the stream neither
+/// sends nor queries, however many periods pass. The clock is paused only
+/// while the periods pass, so the ack's timeout runs on real time.
+#[tokio::test]
+async fn an_idle_activity_subscription_sends_and_queries_nothing() {
+    let activity = StreamingActivity::new();
+    let mut socket = subscribe_to_activity(&activity, "0,1500").await;
+    tokio::time::pause();
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    tokio::time::resume();
+
+    assert_next_is_ack(&mut socket).await;
+    assert_eq!(activity.queries.load(Ordering::SeqCst), 0, "no query");
+}
+
+/// B3, B5 and B7 for the activity stream (`ActivityLogWebSocketListener`):
+/// subscribing sends nothing; each created entry sends `Data: []` at once,
+/// even inside the period of the previous frame, as `OnEntryCreated` ->
+/// `SendData(true)` with `GetDataToSend`'s empty array; entries queued
+/// together are answered with one frame; the stream never queries the
+/// activity log; and `ActivityLogEntryStop` unsubscribes.
+#[tokio::test]
+async fn created_entries_send_an_empty_activity_frame_and_never_query() {
+    let activity = StreamingActivity::new();
+    let mut socket = subscribe_to_activity(&activity, "0,60000").await;
+
+    activity.raise();
+    let frame = next_json(&mut socket).await;
+    assert_eq!(frame["MessageType"], "ActivityLogEntry", "{frame}");
+    assert_eq!(frame["Data"], serde_json::json!([]));
+    // No await between the raises, so all three queue before the socket task
+    // runs again (the test runtime is current-thread).
+    for _ in 0..3 {
+        activity.raise();
+    }
+    let frame = next_json(&mut socket).await;
+    assert_eq!(frame["Data"], serde_json::json!([]), "{frame}");
+    assert_next_is_ack(&mut socket).await;
+    assert_eq!(activity.queries.load(Ordering::SeqCst), 0, "no query");
+
+    send_and_ack(&mut socket, "ActivityLogEntryStop", "").await;
+    assert_eq!(activity.created.receiver_count(), 0, "unsubscribed");
 }

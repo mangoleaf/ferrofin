@@ -971,23 +971,27 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[VerifiedSubsystem {
     key: "websocket-streams",
     upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",
     upstream_method: "HandleMessages",
-    ferrofin: "handlers/websocket.rs handle_socket → Streams::start_sessions, sessions_wake \
-               (drain, should_send, session_event_forces), sessions_message → ferrofin-core \
-               session_manager.rs SessionEvent raises, with upsert_session's SessionActivity \
-               past SESSION_ACTIVITY_INTERVAL (LogSessionActivity, a new session included) and \
-               report_capabilities' CapabilitiesChanged (ReportCapabilities); compared with \
-               the Sessions listener \
-               (Jellyfin.Api/WebSocketListeners/SessionInfoWebSocketListener.cs). \
-               The ActivityLog and ScheduledTasks listeners still poll: TODO(gl-362, gl-722)",
+    ferrofin: "handlers/websocket.rs handle_socket → Streams::apply, event_stream, wake_due \
+               (drain, should_send); sessions_wake (session_event_forces), sessions_message → \
+               ferrofin-core session_manager.rs SessionEvent raises, with upsert_session's \
+               SessionActivity past SESSION_ACTIVITY_INTERVAL (LogSessionActivity, a new \
+               session included) and report_capabilities' CapabilitiesChanged \
+               (ReportCapabilities); activity_wake → ferrofin-core activity_manager.rs \
+               create_entry's entry-created raise (ActivityManager.CreateAsync EntryCreated). \
+               Compared with the Sessions listener \
+               (Jellyfin.Api/WebSocketListeners/SessionInfoWebSocketListener.cs) and the \
+               ActivityLog listener \
+               (Jellyfin.Api/WebSocketListeners/ActivityLogWebSocketListener.cs). The \
+               ScheduledTasks listener still polls: TODO(gl-722)",
     date: "2026-10-29",
     divergences: &[
-        "Events already queued for a socket are drained and answered with one Sessions frame, \
-         where upstream sends one per forced event: a burst yields fewer frames with the same \
-         final state.",
+        "Events already queued for a socket are drained and answered with one Sessions or \
+         ActivityLogEntry frame, where upstream sends one per forced event: a burst yields \
+         fewer frames with the same final state.",
         "A non-administrator's Sessions frames carry the hardware accelerator blanked, as \
          GET /Sessions does; upstream's stream sends it as is.",
-        "A second SessionsStart on a socket replaces its subscription; upstream adds a second \
-         one and sends each frame twice.",
+        "A second SessionsStart or ActivityLogEntryStart on a socket replaces its \
+         subscription; upstream adds a second one and sends each frame twice.",
         "A session list that cannot be built is logged and skipped and the subscription stays; \
          upstream logs it and drops the connection's subscription.",
         "The period is floored at FERROFIN_WS_MIN_STREAM_PERIOD_MS (100 ms by default), which \

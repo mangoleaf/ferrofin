@@ -125,6 +125,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   spaces out low-priority updates (session activity, and automated progress, which Ferrofin
   does not raise yet). A non-administrator's frames list only the sessions they are the user
   or an additional user of, no longer the sessions without a user
+- The session WebSocket's `ActivityLogEntry` stream is sent when an activity-log entry is
+  created (entries created together share one frame), with `Data: []`, as Jellyfin's
+  `ActivityLogWebSocketListener` does: a signal for the dashboard to refetch
+  `GET /System/ActivityLog/Entries`. It no longer queries the activity log every period, and
+  no longer carries the entries themselves
 - Report Jellyfin version 12.4.0 (was 12.2.0) in `/System/Info` and `/System/Info/Public`,
   built-in plugin versions and the plugin catalog's `targetAbi` filter: the newest Jellyfin
   release Ferrofin adopts
