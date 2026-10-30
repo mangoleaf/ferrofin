@@ -28,6 +28,7 @@ use ferrofin_traits::net::{AuthService, AuthorizationContext};
 use ferrofin_traits::plugins::{DisabledPluginManager, PluginManager};
 use ferrofin_traits::providers::ProviderManager;
 use ferrofin_traits::security::{ApiKeyManager, QuickConnect};
+use ferrofin_traits::server_settings::{DisabledServerSettings, ServerSettingsManager};
 use ferrofin_traits::session::SessionManager;
 use ferrofin_traits::stubs::DisabledHlsStreamManager;
 use ferrofin_traits::stubs::DisabledSubtitleEncoder;
@@ -243,6 +244,12 @@ pub struct Inner {
     /// the registry-backed `FerrofinPluginManager` via [`AppState::with_plugins`].
     pub plugins: Arc<dyn PluginManager>,
 
+    /// The Ferrofin bootstrap settings behind `GET /Ferrofin/Settings`, the
+    /// Ferrofin plugin's settings page. Defaults to the disabled stub (every
+    /// call `404`s); the composition root injects the real manager via
+    /// [`AppState::with_server_settings`].
+    pub server_settings: Arc<dyn ServerSettingsManager>,
+
     /// Synchronized group playback (`/SyncPlay/*`). `None` until the composition
     /// root wires a manager via [`AppState::with_sync_play`]; the SyncPlay routes
     /// return `501` while unset.
@@ -446,6 +453,9 @@ impl AppState {
             // Default to the disabled plugin manager; the composition root injects
             // the registry-backed `FerrofinPluginManager` via `with_plugins`.
             plugins: Arc::new(DisabledPluginManager),
+            // Default to the disabled settings manager; the composition root
+            // injects the real one via `with_server_settings`.
+            server_settings: Arc::new(DisabledServerSettings),
         })
     }
 
@@ -620,6 +630,21 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_plugins must be called before the state is shared");
         inner.plugins = plugins;
+        self
+    }
+
+    /// Replaces the default [`DisabledServerSettings`] with the composition
+    /// root's server settings manager, which backs `GET /Ferrofin/Settings`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the inner state is already shared (cloned) — only valid to call
+    /// at the composition root before the router is built.
+    #[must_use]
+    pub fn with_server_settings(mut self, server_settings: Arc<dyn ServerSettingsManager>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_server_settings must be called before the state is shared");
+        inner.server_settings = server_settings;
         self
     }
 

@@ -30,6 +30,7 @@ pub mod media_encoding;
 pub mod metrics_wiring;
 pub mod planner;
 pub mod seed;
+pub mod settings;
 mod startup;
 pub mod state;
 #[cfg(test)]

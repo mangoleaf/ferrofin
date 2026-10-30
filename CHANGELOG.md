@@ -10,6 +10,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ## [Unreleased]
 
+### Features
+- `GET /Ferrofin/Settings` (administrators only) reports every Ferrofin setting (each
+  `config.toml` key and the OpenTelemetry variables) with the value in use, its default and
+  where it comes from (flag, environment variable, `config.toml` or default), a value
+  `config.toml` holds that is not in use yet, and whether the settings page may change it, with
+  the reason when it may not. A **Ferrofin** plugin under Dashboard → Plugins carries it: the
+  route answers `404` while the plugin is disabled, and `FERROFIN_DISABLE_EXTENSIONS` leaves the
+  plugin registered (see [docs/CONFIG.md](docs/CONFIG.md#seeing-what-is-set))
+
 ### Database
 - Adopt Jellyfin 12.3 and 12.4 databases in place: neither release adds a migration, so each
   records 12.2's migration-id set and adopts as generation `12.2.0`. The adoption suite gains
@@ -240,6 +249,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `nameStartsWith` on `/Genres`, `/MusicGenres`, `/Studios`, `/Artists` and
   `/Artists/AlbumArtists` is a literal prefix of the sort name, as on `/Items`: `%` and `_` match
   only themselves, and a leading space is kept
+- `/Genres`, `/MusicGenres`, `/Studios`, `/Artists` and `/Artists/AlbumArtists` order rows that
+  tie on every sort key by item id, as Jellyfin's query does. Equally relevant search hits, and
+  names that share a sort name ("The Band" and "Band"), now come back in Jellyfin's order instead
+  of name order
 - Port Jellyfin's Screen Grabber (`VideoImageProvider`): a movie, episode, music video or
   home video with no Primary image after the local, remote and embedded providers gets a
   frame from its default video stream, 10 % into its runtime (10 s when the runtime is
@@ -623,6 +636,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   folders view, a season's episodes): compute each child's sort key once instead of on
   every comparison. Sorting 2,000 children made 95,896 heap allocations and now makes
   6,004; the order is unchanged
+- A request on a session that already exists no longer reads the device's options row or
+  copies its stored capabilities; only the request that creates the session does. Every
+  playback start, progress and stop report ran one `DeviceOptions` statement before, and
+  now runs none. Those reports also take just the session id and the fields they use,
+  where they built the session's DTO and copied the whole session
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
