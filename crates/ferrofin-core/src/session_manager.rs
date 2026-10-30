@@ -11,8 +11,9 @@
 //! - **Sibling managers are injected** (`Arc<dyn _>`): [`UserManager`],
 //!   [`DeviceManager`], [`UserDataManager`], [`LibraryManager`], [`DtoService`]
 //!   and the [`EventManager`] publish seam. The `IMusicManager` (instant-mix
-//!   `SendPlayCommand`) and `IMediaSourceManager` (closing live streams) are
-//!   attached with `with_music_manager` and `with_media_sources`. The
+//!   `SendPlayCommand`) and `IMediaSourceManager` (closing live streams, and
+//!   the media source a `NowPlayingItem` shows) are attached with
+//!   `with_music_manager` and `with_media_sources`. The
 //!   `IImageProcessor` behind user-image tags is not injected. TODO(gl-119):
 //!   fill `UserPrimaryImageTag` with the rest of the session's `PlayState`.
 //! - **The domain `SessionInfo` is modelled here**, not in `ferrofin-traits`
@@ -50,7 +51,7 @@
 //!   [`ServiceError::InvalidInput`].
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -65,8 +66,9 @@ use ferrofin_db::entities::security::DeviceEntity;
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::PermissionKind;
 use ferrofin_model::data::BaseItemKind;
-use ferrofin_model::dto::{SessionInfoDto, SortOrder};
+use ferrofin_model::dto::{BaseItemDto, MediaSourceInfo, SessionInfoDto, SortOrder};
 use ferrofin_model::live_tv::ItemSortBy;
+use ferrofin_model::querying::ItemFields;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::{
     ClientCapabilities, GeneralCommand, GeneralCommandType, MessageCommand, PlayCommand,
@@ -117,6 +119,60 @@ const SESSION_EVENT_CAPACITY: usize = 64;
 /// The default device name applied when a client reports an empty one (C#
 /// `CreateSessionInfo` → `"Network Device"`).
 const DEFAULT_DEVICE_NAME: &str = "Network Device";
+
+/// The fields C# `SessionManager.GetItemInfo` removes from the all-fields set
+/// for the item a session shows, in its order (it removes `People` twice).
+/// `MediaStreams` comes back from the reported media source
+/// ([`FerrofinSessionManager::get_item_info`]).
+const ITEM_INFO_EXCLUDED_FIELDS: [ItemFields; 22] = [
+    ItemFields::CanDelete,
+    ItemFields::CanDownload,
+    ItemFields::ChildCount,
+    ItemFields::CustomRating,
+    ItemFields::DateLastMediaAdded,
+    ItemFields::DateLastRefreshed,
+    ItemFields::DateLastSaved,
+    ItemFields::DisplayPreferencesId,
+    ItemFields::Etag,
+    ItemFields::ItemCounts,
+    ItemFields::MediaSourceCount,
+    ItemFields::MediaStreams,
+    ItemFields::MediaSources,
+    ItemFields::People,
+    ItemFields::PlayAccess,
+    ItemFields::ProductionLocations,
+    ItemFields::RecursiveItemCount,
+    ItemFields::RemoteTrailers,
+    ItemFields::SeasonUserData,
+    ItemFields::Settings,
+    ItemFields::SortName,
+    ItemFields::Tags,
+];
+
+/// The options C# `GetItemInfo` builds once and keeps
+/// (`_itemInfoDtoOptions`): every field but [`ITEM_INFO_EXCLUDED_FIELDS`],
+/// and no program recording info.
+static ITEM_INFO_DTO_OPTIONS: LazyLock<DtoOptions> = LazyLock::new(|| {
+    let mut options = DtoOptions {
+        add_program_recording_info: false,
+        ..DtoOptions::default()
+    };
+    options
+        .fields
+        .retain(|field| !ITEM_INFO_EXCLUDED_FIELDS.contains(field));
+    options
+});
+
+/// What a session's reports say is playing, copied out under the sessions
+/// lock so that the `NowPlayingItem` can be built after the lock is released.
+#[allow(clippy::struct_field_names)] // the report's `ItemId`, `MediaSourceId`, `LiveStreamId`
+struct NowPlaying {
+    item_id: Uuid,
+    /// The reported `MediaSourceId`, as stored.
+    media_source_id: Option<String>,
+    /// The reported `LiveStreamId`, as stored.
+    live_stream_id: Option<String>,
+}
 
 /// The in-memory session-state object the C# `SessionInfo` domain class becomes.
 ///
@@ -309,10 +365,8 @@ pub struct FerrofinSessionManager {
     device_manager: Arc<dyn DeviceManager>,
     user_data_manager: Arc<dyn UserDataManager>,
     library_manager: Arc<dyn LibraryManager>,
-    /// Injected DTO-assembly seam. Held for the deferred now-playing-item DTO
-    /// enrichment (C# `UpdateNowPlayingItem` builds a `BaseItemDto`); not yet
-    /// read because this unit stores only the now-playing item **id**.
-    #[allow(dead_code)]
+    /// Injected DTO-assembly seam: builds each playing session's
+    /// `NowPlayingItem` ([`Self::get_item_info`]).
     dto_service: Arc<dyn DtoService>,
     event_manager: Arc<dyn EventManager>,
     /// The database handle, used for the permission checks the injected traits
@@ -374,6 +428,9 @@ pub struct FerrofinSessionManager {
     /// table. `OnPlaybackStopped` closes the reported live stream through it
     /// (C# `CloseLiveStreamIfNeededAsync`); without it that close is a no-op and
     /// an abandoned live stream stays open until the client asks explicitly.
+    /// It also resolves the media source a session's reports name, whose
+    /// streams and runtime the `NowPlayingItem` shows
+    /// ([`Self::now_playing_item`]); without it the item shows neither.
     media_sources: Option<Arc<dyn MediaSourceManager>>,
     /// The music manager, when wired — used only by `SendPlayCommand`'s
     /// `PlayInstantMix` translation (C# `TranslateItemForInstantMix`). Without
@@ -449,7 +506,9 @@ impl FerrofinSessionManager {
     /// Wires the media-source manager (composition root only), so a
     /// playback-stopped report closes the live stream it names — the C#
     /// `OnPlaybackStopped` -> `CloseLiveStreamIfNeededAsync` path. Without it
-    /// live streams are only ever closed by an explicit `/LiveStreams/Close`.
+    /// live streams are only ever closed by an explicit `/LiveStreams/Close`,
+    /// and a session's `NowPlayingItem` carries no `MediaStreams` and the
+    /// item's own runtime.
     #[must_use]
     pub fn with_media_sources(mut self, media_sources: Arc<dyn MediaSourceManager>) -> Self {
         self.media_sources = Some(media_sources);
@@ -1356,12 +1415,96 @@ impl FerrofinSessionManager {
         ))
     }
 
+    /// A playing session's `NowPlayingItem`: the part of C#
+    /// `UpdateNowPlayingItem` that builds it. An `IHasMediaSources` item looks
+    /// up the media source the reports name through `GetMediaSource`. An empty
+    /// `MediaSourceId` means the item's own id, as upstream fills it in first.
+    /// [`Self::get_item_info`] builds the trimmed item with that source's
+    /// streams. `RunTimeTicks` is the source's runtime when a source was found,
+    /// else the item's.
+    ///
+    /// Upstream builds this once per item on the playback report and keeps it.
+    /// It is rebuilt here on each read, from the latest report (TODO(gl-1000)).
+    /// A lookup that fails costs the item its streams, and a failed build the
+    /// whole item. Upstream fails the report, which no `GET /Sessions` can.
+    async fn now_playing_item(
+        &self,
+        item: &BaseItemEntity,
+        now_playing: &NowPlaying,
+    ) -> Option<BaseItemDto> {
+        let item_id = now_playing.item_id;
+        let kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
+        let mut media_source = None;
+        if kind.is_some_and(crate::kinds::implements_has_media_sources)
+            && let Some(sources) = &self.media_sources
+        {
+            let media_source_id = now_playing
+                .media_source_id
+                .as_deref()
+                .filter(|id| !id.is_empty())
+                .map_or_else(|| item_id.simple().to_string(), str::to_owned);
+            match sources
+                .get_media_source(
+                    item_id,
+                    &media_source_id,
+                    now_playing.live_stream_id.as_deref(),
+                    false,
+                )
+                .await
+            {
+                Ok(found) => media_source = found,
+                Err(error) => {
+                    debug!(%error, %item_id, "now-playing media source not resolved");
+                }
+            }
+        }
+        let mut info = match self.get_item_info(item, media_source.as_ref()).await {
+            Ok(info) => info?,
+            Err(error) => {
+                debug!(%error, %item_id, "now-playing item not built");
+                return None;
+            }
+        };
+        info.run_time_ticks = media_source
+            .as_ref()
+            .map_or(item.run_time_ticks, |source| source.run_time_ticks);
+        Some(info)
+    }
+
+    /// Port of C# `SessionManager.GetItemInfo`: the item as a session shows it,
+    /// built with [`ITEM_INFO_DTO_OPTIONS`] and no user, its `MediaStreams`
+    /// those of `media_source` when there is one. `None` when the DTO service
+    /// builds nothing for the item.
+    async fn get_item_info(
+        &self,
+        item: &BaseItemEntity,
+        media_source: Option<&MediaSourceInfo>,
+    ) -> Result<Option<BaseItemDto>, ServiceError> {
+        let mut built = self
+            .dto_service
+            .get_base_item_dtos(
+                std::slice::from_ref(item),
+                &ITEM_INFO_DTO_OPTIONS,
+                None,
+                None,
+                true,
+            )
+            .await?;
+        let Some(mut info) = built.pop() else {
+            return Ok(None);
+        };
+        if let Some(source) = media_source {
+            info.media_streams = Some(source.media_streams.clone());
+        }
+        Ok(Some(info))
+    }
+
     /// Resolve device permissions once per session list, after releasing the
     /// session mutex; no device/database work runs under that lock.
     async fn retain_accessible_session_devices(
         &self,
         user: &UserEntity,
-        result: &mut Vec<(SessionInfoDto, Option<Uuid>)>,
+        result: &mut Vec<(SessionInfoDto, Option<NowPlaying>)>,
     ) -> Result<(), ServiceError> {
         let ids: Vec<&str> = result
             .iter()
@@ -2204,7 +2347,12 @@ impl SessionManager for FerrofinSessionManager {
                 info.hardware_acceleration_type =
                     Some(ferrofin_model::entities::HardwareAccelerationType::none);
             }
-            result.push((dto, session.now_playing_item_id));
+            let now_playing = session.now_playing_item_id.map(|item_id| NowPlaying {
+                item_id,
+                media_source_id: session.now_playing_media_source_id.clone(),
+                live_stream_id: session.now_playing_live_stream_id.clone(),
+            });
+            result.push((dto, now_playing));
         }
         drop(sessions); // release before the async NowPlayingItem enrichment below
 
@@ -2219,21 +2367,14 @@ impl SessionManager for FerrofinSessionManager {
         // Enrich NowPlayingItem: C# `UpdateNowPlayingItem` builds a BaseItemDto for the
         // session's current item. Done after dropping the sessions lock (async DTO build).
         let mut dtos = Vec::with_capacity(result.len());
-        for (mut dto, now_playing_id) in result {
-            if let Some(id) = now_playing_id
-                && let Some(item) = self.library_manager.get_item_by_id(id).await?
-                && let Ok(mut built) = self
-                    .dto_service
-                    .get_base_item_dtos(
-                        std::slice::from_ref(&item),
-                        &ferrofin_traits::options::DtoOptions::default(),
-                        None,
-                        None,
-                        true,
-                    )
-                    .await
+        for (mut dto, now_playing) in result {
+            if let Some(now_playing) = now_playing
+                && let Some(item) = self
+                    .library_manager
+                    .get_item_by_id(now_playing.item_id)
+                    .await?
             {
-                dto.now_playing_item = built.pop();
+                dto.now_playing_item = self.now_playing_item(&item, &now_playing).await;
             }
             dtos.push(dto);
         }

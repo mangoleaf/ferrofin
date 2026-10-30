@@ -81,6 +81,7 @@ use crate::refresh_plan::{
 };
 use crate::shortcut;
 use music::{MusicKind, MusicRefresh};
+use provider_cache::ProviderCache;
 
 /// Per-scan artwork lookup state, so a series is matched against TMDB once and
 /// its seasons/episodes reuse that match (and its per-season episode stills).
@@ -121,20 +122,25 @@ struct ArtworkCache {
     /// Series item id → matched TMDB series id.
     series_tmdb: std::collections::HashMap<String, i64>,
     /// (series item id, season number, language) → TMDB details, fetched
-    /// once per scan and locale. `/tv/{id}/season/{n}` carries the season poster, every
-    /// episode's still URL, AND every episode's name/overview, so the metadata
-    /// pass and the image pass share this one response instead of each paying
-    /// for it. A miss — and a failed request — is recorded too, so neither is
-    /// re-requested once per episode.
-    season_details: std::collections::HashMap<(String, i32, Option<String>), SeasonLookup>,
+    /// once per locale for as long as `TmdbClientManager` would keep the
+    /// response ([`tmdb_season_cache`]). `/tv/{id}/season/{n}` carries the
+    /// season poster, every episode's still URL, AND every episode's
+    /// name/overview, so the metadata pass and the image pass share this one
+    /// response instead of each paying for it. A miss — and a failed
+    /// request — is recorded too, so neither is re-requested once per
+    /// episode.
+    season_details: ProviderCache<SeasonKey, SeasonLookup>,
     /// Series item id → the matched TVDB series details (when the TVDB
-    /// provider answered for the series). Its `tvdb_id` lets episodes
+    /// provider answered for the series), kept for the TVDB plugin's
+    /// `CacheDurationInHours` ([`tvdb_cache`]). Its `tvdb_id` lets episodes
     /// resolve, and its artwork is reused by the image pass instead of
     /// re-fetching.
-    series_tvdb: std::collections::HashMap<String, ferrofin_providers::TvdbSeriesDetails>,
+    series_tvdb: ProviderCache<String, ferrofin_providers::TvdbSeriesDetails>,
     /// Episode item id → its TVDB still URL, cached during the metadata pass so
-    /// the image pass downloads it without a second episode fetch.
-    episode_tvdb_still: std::collections::HashMap<String, String>,
+    /// the image pass downloads it without a second episode fetch; kept as
+    /// long as the plugin keeps the episode record it came from
+    /// ([`tvdb_cache`]).
+    episode_tvdb_still: ProviderCache<String, String>,
     /// Item id → the external ids the metadata match yielded, so the image pass
     /// can key fanart off them (movies: `Tmdb`/`Imdb`) within the same scan.
     item_provider_ids: std::collections::HashMap<String, Vec<(String, String)>>,
@@ -145,8 +151,9 @@ struct ArtworkCache {
     /// (dimensions, blurhash, and the mtime they were computed from), read
     /// once for the whole scan. Keyed by PATH rather than by item because
     /// dimensions and a blurhash are functions of the file alone, so two rows
-    /// sharing one `folder.jpg` share the answer.
-    stored_images: std::collections::HashMap<String, StoredImageMetadata>,
+    /// sharing one `folder.jpg` share the answer. Only a complete probe is
+    /// kept ([`remember_probed_image`]): no other can be adopted.
+    stored_images: ProbedImages,
 }
 
 impl ArtworkCache {
@@ -176,6 +183,87 @@ enum SeasonLookup {
     /// The request failed. Every item that reads this entry counts the
     /// failure again, so none of them is stamped as a completed refresh.
     Failed,
+}
+
+/// The key [`ArtworkCache::season_details`] keeps a season under: the series
+/// item id, the season number and the TMDB language.
+type SeasonKey = (String, i32, Option<String>);
+
+/// How long a TMDB response is kept after it was fetched:
+/// `TmdbClientManager.CacheDurationInHours` (`TmdbClientManager.cs:26`), the
+/// absolute expiration it caches every response under (`:771-780`).
+const TMDB_CACHE_DURATION: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// The weight of TMDB responses kept at most:
+/// `TmdbClientManager.CacheSizeLimit` (`TmdbClientManager.cs:28-30,48`),
+/// counted in TMDB records ([`SeasonLookup::estimate_size`]) rather than in
+/// responses.
+const TMDB_CACHE_SIZE_LIMIT: u64 = 100_000;
+
+impl SeasonLookup {
+    /// `EstimateSize`'s `TvSeason` arm (`TmdbClientManager.cs:800-818`): one
+    /// for the season, plus its credited people and its episodes. The people
+    /// counted are the ones the scan keeps, after the TMDb settings' cast cap
+    /// and crew filter. A miss or a failure, which upstream does not cache,
+    /// weighs one, as `EstimateSize`'s fallback arm does.
+    fn estimate_size(&self) -> u64 {
+        match self {
+            Self::Found(details) => {
+                u64::try_from(1 + details.people.len() + details.episodes.len()).unwrap_or(u64::MAX)
+            }
+            Self::Missing | Self::Failed => 1,
+        }
+    }
+
+    /// A failed request counted into the reading item's own refresh (the
+    /// scope the original request ran in is the first reader's only).
+    fn count_failure(&self) {
+        if matches!(self, Self::Failed) {
+            ferrofin_providers::rate_limit::note_request_failure();
+        }
+    }
+}
+
+/// TMDB season responses, kept by `TmdbClientManager`'s rules: for
+/// [`TMDB_CACHE_DURATION`], and at most [`TMDB_CACHE_SIZE_LIMIT`] records.
+/// Upstream's one cache holds every TMDB response (series, movies, people,
+/// searches) within that limit; the scan keeps only seasons, so they have
+/// the whole of it.
+fn tmdb_season_cache() -> ProviderCache<SeasonKey, SeasonLookup> {
+    ProviderCache::bounded(
+        TMDB_CACHE_DURATION,
+        TMDB_CACHE_SIZE_LIMIT,
+        SeasonLookup::estimate_size,
+    )
+}
+
+/// TheTVDB responses, kept by the plugin's `TvdbClientManager` rules: for
+/// its `CacheDurationInHours` (`duration`, the client's
+/// [`cache_duration`](ferrofin_providers::TvdbClient::cache_duration)),
+/// with no size limit (`TvdbClientManager.cs:50,61`).
+fn tvdb_cache<V>(duration: std::time::Duration) -> ProviderCache<String, V> {
+    ProviderCache::new(duration)
+}
+
+impl Default for ProviderCache<SeasonKey, SeasonLookup> {
+    fn default() -> Self {
+        tmdb_season_cache()
+    }
+}
+
+impl Default for ProviderCache<String, ferrofin_providers::TvdbSeriesDetails> {
+    /// At the plugin's default duration; a scan keeps its client's.
+    fn default() -> Self {
+        tvdb_cache(ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION)
+    }
+}
+
+impl Default for ProviderCache<String, String> {
+    /// TheTVDB's episode stills ([`ArtworkCache::episode_tvdb_still`]), at
+    /// the plugin's default duration; a scan keeps its client's.
+    fn default() -> Self {
+        tvdb_cache(ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION)
+    }
 }
 
 /// What a remote metadata fetch yields for one item: the cast/crew to persist
@@ -7017,11 +7105,7 @@ impl LibraryScanner {
             }
         }
         match self.persistence.image_metadata_for_items(touched).await {
-            Ok(stored) => {
-                for image in stored {
-                    cache.stored_images.insert(image.path.clone(), image);
-                }
-            }
+            Ok(stored) => remember_stored_images(&mut cache.stored_images, stored),
             Err(err) => tracing::warn!(%err, "could not re-read the images a refresh touched"),
         }
         let series: Vec<Uuid> = touched
@@ -8474,6 +8558,14 @@ impl LibraryScanner {
         std::collections::HashSet<Uuid>,
         Vec<Uuid>,
     ) {
+        // TheTVDB's responses are kept as long as its client keeps its own
+        // (the plugin's one `CacheDurationInHours` covers them all).
+        let tvdb_duration = self
+            .tvdb
+            .as_ref()
+            .map_or(ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION, |tvdb| {
+                tvdb.cache_duration()
+            });
         // Carries matched series' TMDB ids + their episode-still URLs across
         // the scan so seasons/episodes resolve against the same series lookup,
         // pre-seeded with the external ids previous scans recorded.
@@ -8482,6 +8574,8 @@ impl LibraryScanner {
         // small (clippy's `large_futures` ceiling is the tripwire).
         let mut art_cache = Box::new(ArtworkCache {
             dirs: run.dirs.cloned(),
+            series_tvdb: tvdb_cache(tvdb_duration),
+            episode_tvdb_still: tvdb_cache(tvdb_duration),
             ..ArtworkCache::default()
         });
         self.preload_provider_ids(planned, &mut art_cache).await;
@@ -8529,11 +8623,7 @@ impl LibraryScanner {
         }
         let ids: Vec<Uuid> = planned.iter().map(|p| p.id).collect();
         match self.persistence.image_metadata_for_items(&ids).await {
-            Ok(stored) => {
-                for image in stored {
-                    art_cache.stored_images.insert(image.path.clone(), image);
-                }
-            }
+            Ok(stored) => remember_stored_images(&mut art_cache.stored_images, stored),
             Err(err) => tracing::warn!(%err, "could not preload stored image metadata"),
         }
     }
@@ -11272,11 +11362,12 @@ impl LibraryScanner {
         ) else {
             return None;
         };
-        let ep = self
-            .season_details_cached(cache, &series_id, season, lookup.tmdb_language().as_deref())
-            .await
-            .and_then(|d| episode_in_season(d, number))?
-            .clone();
+        let ep = {
+            let details = self
+                .season_details_cached(cache, &series_id, season, lookup.tmdb_language().as_deref())
+                .await?;
+            episode_in_season(&details, number)?.clone()
+        };
         let mut answer = RemoteAnswer::for_row(row, None);
         apply_tmdb_episode(&mut answer.item, &ep);
         // The episode's external ids, trailers and credits, in one request
@@ -11339,8 +11430,8 @@ impl LibraryScanner {
     /// this scan's match, the one TheTVDB carried, else the one recorded for
     /// the series ([`series_tmdb_id_of`]); without a number or a series id
     /// there is no answer and no request (`:53-56`). Its response is the
-    /// series' `/tv/{id}/season/{n}`, fetched at most once per scan and
-    /// shared with the season's episodes and its poster
+    /// series' `/tv/{id}/season/{n}`, fetched once while the cache keeps it
+    /// and shared with the season's episodes and its poster
     /// ([`season_details_cached`](Self::season_details_cached)), as
     /// upstream's `TmdbClientManager.GetSeasonAsync` serves the season
     /// provider, the episode provider and the image providers from one
@@ -11363,7 +11454,7 @@ impl LibraryScanner {
         let import_season_name = tmdb.import_season_name().await;
         Some(RemoteAnswer::of_result(
             row,
-            ferrofin_providers::season::tmdb_answer(details, number, import_season_name),
+            ferrofin_providers::season::tmdb_answer(&details, number, import_season_name),
             None,
         ))
     }
@@ -11656,25 +11747,21 @@ impl LibraryScanner {
     async fn stored_person_image_metadata(
         &self,
         written: &[ferrofin_traits::persistence::WrittenPerson],
-    ) -> std::collections::HashMap<String, StoredImageMetadata> {
+    ) -> ProbedImages {
+        let mut images = ProbedImages::new();
         let with_art: Vec<Uuid> = written
             .iter()
             .filter(|p| p.image_url.is_some())
             .map(|p| p.id)
             .collect();
         if with_art.is_empty() {
-            return std::collections::HashMap::new();
+            return images;
         }
         match self.persistence.image_metadata_for_items(&with_art).await {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|row| (row.path.clone(), row))
-                .collect(),
-            Err(err) => {
-                tracing::warn!(%err, "could not read stored person image metadata");
-                std::collections::HashMap::new()
-            }
+            Ok(rows) => remember_stored_images(&mut images, rows),
+            Err(err) => tracing::warn!(%err, "could not read stored person image metadata"),
         }
+        images
     }
 
     /// The stored row and `LockedFields` of every credited person whose
@@ -12465,16 +12552,7 @@ impl LibraryScanner {
             .finish_artwork(entity, &mut images, stored, dirs.as_deref())
             .await;
         for image in &images {
-            art_cache.stored_images.insert(
-                image.path.clone(),
-                StoredImageMetadata {
-                    path: image.path.clone(),
-                    width: image.width,
-                    height: image.height,
-                    blur_hash: image.blur_hash.clone(),
-                    date_modified: image.date_modified,
-                },
-            );
+            remember_settled_image(&mut art_cache.stored_images, image);
         }
         // Validation that finds none of the stored images any more removes
         // them (`ValidateImages` drops the deleted ones and saves), so an
@@ -13562,13 +13640,17 @@ impl LibraryScanner {
                 // of a type supplies it, the later ones fill the types it
                 // lacks. The stored Tvdb id also keys Fanart on an image-only
                 // refresh.
+                // One instant for the check and the read (as in
+                // `season_details_cached`): a record stored after it is
+                // still live then.
+                let now = std::time::Instant::now();
                 let tvdb_id = cache
                     .series_tvdb
-                    .get(&entity.id)
+                    .get_at(&entity.id, now)
                     .map(|d| d.tvdb_id)
                     .or_else(|| recorded_provider_id(cache, &entity.id, "Tvdb"));
                 if policy.image_enabled(short, fetcher_names::TVDB)
-                    && !cache.series_tvdb.contains_key(&entity.id)
+                    && !cache.series_tvdb.contains_key_at(&entity.id, now)
                     && let (Some(tvdb), Some(id)) = (&self.tvdb, tvdb_id)
                     && let Some(details) = tvdb
                         .series_details(id, &self.three_letter_country(&locale.1))
@@ -13578,7 +13660,7 @@ impl LibraryScanner {
                 }
                 let tvdb_art = policy
                     .image_enabled(short, fetcher_names::TVDB)
-                    .then(|| cache.series_tvdb.get(&entity.id))
+                    .then(|| cache.series_tvdb.get_at(&entity.id, now))
                     .flatten();
                 let mut sources = vec![(
                     fetcher_names::TVDB,
@@ -13655,8 +13737,9 @@ impl LibraryScanner {
             .await
     }
 
-    /// The `/tv/{id}/season/{n}` response for one season, fetched at most once
-    /// per scan.
+    /// The `/tv/{id}/season/{n}` response for one season, fetched once while
+    /// the scan's TMDB cache keeps it (`TmdbClientManager`'s rules,
+    /// [`tmdb_season_cache`]): an hour, within its size limit.
     ///
     /// That single response carries the season poster, every episode's still
     /// URL, and every episode's name/overview — so the metadata pass (episode
@@ -13677,9 +13760,12 @@ impl LibraryScanner {
         series_id: &str,
         season: i32,
         language: Option<&str>,
-    ) -> Option<&'a ferrofin_providers::tmdb::SeasonDetails> {
+    ) -> Option<std::borrow::Cow<'a, ferrofin_providers::tmdb::SeasonDetails>> {
         let key = (series_id.to_owned(), season, language.map(str::to_owned));
-        if !cache.season_details.contains_key(&key) {
+        // One instant for the check and the read, so an entry that expires
+        // between them cannot read as a miss nothing was asked for.
+        let now = std::time::Instant::now();
+        if !cache.season_details.contains_key_at(&key, now) {
             let tmdb = self.tmdb.as_ref()?;
             // No series match yet → no request to make, and no miss to record.
             let tmdb_id = series_tmdb_id_of(cache, series_id)?;
@@ -13692,17 +13778,23 @@ impl LibraryScanner {
                 None if failures > 0 => SeasonLookup::Failed,
                 None => SeasonLookup::Missing,
             };
-            cache.season_details.insert(key.clone(), lookup);
-        }
-        match cache.season_details.get(&key)? {
-            SeasonLookup::Found(details) => Some(details),
-            SeasonLookup::Missing => None,
-            SeasonLookup::Failed => {
-                // Counted into the reading item's own refresh (the scope the
-                // original request ran in is the first reader's only).
-                ferrofin_providers::rate_limit::note_request_failure();
-                None
+            // A response the cache has no room for is not kept (the next
+            // reader asks again), but it still answers this one, as
+            // `GetSeasonAsync` returns what it fetched whether or not its
+            // `MemoryCache` kept it.
+            if let Some(unkept) = cache.season_details.insert(key.clone(), lookup) {
+                unkept.count_failure();
+                return match unkept {
+                    SeasonLookup::Found(details) => Some(std::borrow::Cow::Owned(details)),
+                    SeasonLookup::Missing | SeasonLookup::Failed => None,
+                };
             }
+        }
+        let lookup = cache.season_details.get_at(&key, now)?;
+        lookup.count_failure();
+        match lookup {
+            SeasonLookup::Found(details) => Some(std::borrow::Cow::Borrowed(details)),
+            SeasonLookup::Missing | SeasonLookup::Failed => None,
         }
     }
 
@@ -22913,7 +23005,13 @@ fn image_item_kind(type_: &str) -> ImageItemKind {
 /// Whether an image row already carries everything the DTO layer needs, so
 /// nothing has to decode the file.
 fn image_metadata_is_complete(image: &ItemImageInfo) -> bool {
-    image.width > 0 && image.height > 0 && image.blur_hash.as_ref().is_some_and(|b| !b.is_empty())
+    probe_is_complete(image.width, image.height, image.blur_hash.as_deref())
+}
+
+/// The first test of `ImageNeedsRefresh`: a width, a height and a non-empty
+/// blurhash are all recorded.
+fn probe_is_complete(width: i32, height: i32, blur_hash: Option<&str>) -> bool {
+    width > 0 && height > 0 && blur_hash.is_some_and(|b| !b.is_empty())
 }
 
 /// Copies a previous scan's dimensions and blurhash onto each discovered image
@@ -22924,10 +23022,7 @@ fn image_metadata_is_complete(image: &ItemImageInfo) -> bool {
 /// selecting only the `ImageNeedsRefresh` images: upstream's `BaseItem` already
 /// holds the previous values in memory, so it simply leaves the untouched ones
 /// alone. Here they come from the scan's one-query image preread.
-fn adopt_stored_image_metadata(
-    images: &mut [ItemImageInfo],
-    stored: &std::collections::HashMap<String, StoredImageMetadata>,
-) {
+fn adopt_stored_image_metadata(images: &mut [ItemImageInfo], stored: &ProbedImages) {
     if stored.is_empty() {
         return;
     }
@@ -22942,6 +23037,93 @@ fn adopt_stored_image_metadata(
     }
 }
 
+/// Image file path → what a probe recorded for that file
+/// ([`remember_probed_image`]).
+type ProbedImages = HashMap<String, ProbedImage>;
+
+/// What a probe recorded for one image file: a stored row
+/// ([`StoredImageMetadata`]), or an image the scan just finished, without
+/// the path the map holding it is keyed by.
+#[derive(Debug, Clone)]
+struct ProbedImage {
+    /// The pixel width (`0` when never probed).
+    width: i32,
+    /// The pixel height (`0` when never probed).
+    height: i32,
+    /// The blurhash, absent when never computed.
+    blur_hash: Option<String>,
+    /// The file mtime the values were computed from.
+    date_modified: chrono::DateTime<Utc>,
+}
+
+impl ProbedImage {
+    /// A stored row's probe, and the path it is of.
+    fn of_row(row: StoredImageMetadata) -> (String, Self) {
+        let StoredImageMetadata {
+            path,
+            width,
+            height,
+            blur_hash,
+            date_modified,
+        } = row;
+        (
+            path,
+            Self {
+                width,
+                height,
+                blur_hash,
+                date_modified,
+            },
+        )
+    }
+
+    /// What the scan settled for `image`.
+    fn of_image(image: &ItemImageInfo) -> Self {
+        Self {
+            width: image.width,
+            height: image.height,
+            blur_hash: image.blur_hash.clone(),
+            date_modified: image.date_modified,
+        }
+    }
+
+    /// [`probe_is_complete`]: a probe without a width, a height or a
+    /// blurhash is never adopted ([`image_metadata_is_current`]).
+    fn is_complete(&self) -> bool {
+        probe_is_complete(self.width, self.height, self.blur_hash.as_deref())
+    }
+}
+
+/// Records `image` as the probe of the file at `path`. Only a complete one
+/// is kept, as no other can be adopted; an incomplete one removes what the
+/// path held, as replacing it would.
+fn remember_probed_image(images: &mut ProbedImages, path: String, image: ProbedImage) {
+    if image.is_complete() {
+        images.insert(path, image);
+    } else {
+        images.remove(&path);
+    }
+}
+
+/// Records what the scan settled for `image` as its file's probe, as
+/// [`remember_probed_image`] would, cloning only a probe it keeps.
+fn remember_settled_image(images: &mut ProbedImages, image: &ItemImageInfo) {
+    if image_metadata_is_complete(image) {
+        images.insert(image.path.clone(), ProbedImage::of_image(image));
+    } else {
+        images.remove(&image.path);
+    }
+}
+
+/// Records each stored row's probe ([`remember_probed_image`]), later rows
+/// over earlier ones.
+fn remember_stored_images(images: &mut ProbedImages, rows: Vec<StoredImageMetadata>) {
+    for row in rows {
+        let (path, image) = ProbedImage::of_row(row);
+        remember_probed_image(images, path, image);
+    }
+}
+
 /// Whether `stored` still describes the file, so its dimensions and blurhash
 /// can be reused instead of re-probing.
 ///
@@ -22952,13 +23134,8 @@ fn adopt_stored_image_metadata(
 /// one-second tolerance is upstream's, and it is load-bearing — a filesystem
 /// that stores mtimes at whole-second resolution would otherwise never agree
 /// with a sub-second timestamp Ferrofin wrote.
-fn image_metadata_is_current(
-    stored: &StoredImageMetadata,
-    file_modified: chrono::DateTime<Utc>,
-) -> bool {
-    stored.width > 0
-        && stored.height > 0
-        && stored.blur_hash.as_ref().is_some_and(|b| !b.is_empty())
+fn image_metadata_is_current(stored: &ProbedImage, file_modified: chrono::DateTime<Utc>) -> bool {
+    stored.is_complete()
         && stored
             .date_modified
             .signed_duration_since(file_modified)
@@ -23040,6 +23217,7 @@ mod missing_episodes;
 mod music;
 mod obsolete_episodes;
 mod playlists;
+mod provider_cache;
 mod trickplay;
 
 #[cfg(test)]
@@ -32694,6 +32872,249 @@ mod tests {
         assert!(cache.season_details.is_empty());
     }
 
+    // A season's response is kept for `TmdbClientManager.CacheDurationInHours`
+    // after it was fetched, then asked for again, as `GetSeasonAsync` asks
+    // once its `MemoryCache` entry has expired. Before, the scan kept every
+    // season it fetched until it ended.
+    #[tokio::test]
+    async fn a_season_is_fetched_again_once_the_tmdb_cache_duration_has_passed() {
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        let guesses = super::ResolverGuesses::default();
+        let season_requests = || hits.load(std::sync::atomic::Ordering::SeqCst);
+        let second = std::time::Duration::from_secs(1);
+
+        let first = scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &guesses)
+            .await
+            .expect("the first read");
+        assert_eq!(first.item.name.as_deref(), Some("Winter Is Coming"));
+        cache
+            .season_details
+            .pass(super::TMDB_CACHE_DURATION.saturating_sub(second));
+        scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &guesses)
+            .await
+            .expect("a read within the hour");
+        assert_eq!(season_requests(), 1, "kept for the hour");
+
+        cache.season_details.pass(second);
+        let again = scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &guesses)
+            .await
+            .expect("a read after the hour");
+        assert_eq!(again.item.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(season_requests(), 2, "expired, so asked again");
+        scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &guesses)
+            .await
+            .expect("a read of the new response");
+        assert_eq!(season_requests(), 2, "kept for an hour from then");
+    }
+
+    // A season the cache has no room for is not kept, but still answers the
+    // item that fetched it, as `GetSeasonAsync` returns what it fetched
+    // whether or not its `MemoryCache` kept it; the next reader asks again.
+    // A miss and a failure it could not keep answer `None` the same way, and
+    // the failure still counts against the reading item.
+    #[tokio::test]
+    async fn a_season_the_cache_cannot_keep_still_answers_its_reader() {
+        use std::io::{Read as _, Write as _};
+        let no_room = || {
+            super::ProviderCache::bounded(
+                super::TMDB_CACHE_DURATION,
+                0,
+                super::SeasonLookup::estimate_size,
+            )
+        };
+        let guesses = super::ResolverGuesses::default();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (scanner, mut cache, episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        cache.season_details = no_room();
+        for read in 1..=2 {
+            let answer = scanner
+                .fetch_tmdb_episode(&episode, &mut cache, &guesses)
+                .await
+                .expect("the fetched season answers");
+            assert_eq!(answer.item.name.as_deref(), Some("Winter Is Coming"));
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), read);
+        }
+        assert!(cache.season_details.is_empty(), "nothing kept");
+
+        let (base, hits, _all) = spawn_tmdb_server(None, Some(CREDITS_JSON));
+        let (scanner, mut cache, _episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        cache.season_details = no_room();
+        for read in 1..=2 {
+            assert!(
+                scanner
+                    .season_details_cached(&mut cache, "SERIES", 1, None)
+                    .await
+                    .is_none(),
+                "a miss"
+            );
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), read);
+        }
+
+        // TMDB refuses every request: a failure.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+            }
+        });
+        let (scanner, mut cache, _episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        cache.season_details = no_room();
+        let (found, failures) = ferrofin_providers::rate_limit::count_request_failures(Box::pin(
+            scanner.season_details_cached(&mut cache, "SERIES", 1, None),
+        ))
+        .await;
+        assert!(found.is_none());
+        assert_eq!(failures, 1, "the reader counts the failure");
+    }
+
+    // The scan's season cache holds at most `TmdbClientManager.CacheSizeLimit`
+    // TMDB records, each season weighed by `EstimateSize` (the season and its
+    // episodes and people). A season it has no room for is not kept, and the
+    // least recently read go until it is back under 95% of the limit, as
+    // `MemoryCache` does over capacity.
+    #[test]
+    fn the_season_cache_holds_at_most_the_tmdb_size_limit_in_records() {
+        use super::{SeasonLookup, TMDB_CACHE_SIZE_LIMIT};
+        use ferrofin_providers::tmdb::{EpisodeDetails, SeasonDetails};
+
+        let season = |records: u64| {
+            SeasonLookup::Found(SeasonDetails {
+                episodes: vec![EpisodeDetails::default(); usize::try_from(records - 1).unwrap()],
+                ..SeasonDetails::default()
+            })
+        };
+        let key = |number: i32| ("SERIES".to_owned(), number, None);
+        assert_eq!(season(20).estimate_size(), 20);
+        assert_eq!(SeasonLookup::Missing.estimate_size(), 1);
+        assert_eq!(SeasonLookup::Failed.estimate_size(), 1);
+
+        let mut cache = super::ArtworkCache::default();
+        let details = &mut cache.season_details;
+        assert!(
+            details
+                .insert(key(1), season(TMDB_CACHE_SIZE_LIMIT - 10))
+                .is_none()
+        );
+        assert!(details.insert(key(2), SeasonLookup::Missing).is_none());
+        assert!(
+            details.insert(key(3), season(20)).is_some(),
+            "past the limit: not kept, handed back to the reader"
+        );
+        assert!(
+            details.get(&key(1)).is_none(),
+            "the least recently read went"
+        );
+        assert!(details.get(&key(2)).is_some());
+        assert!(details.get(&key(3)).is_none());
+        assert!(
+            details.insert(key(3), season(20)).is_none(),
+            "the next reader's store has room"
+        );
+    }
+
+    // A series' TheTVDB record and an episode's TheTVDB still are kept as long
+    // as the plugin's `TvdbClientManager` keeps the responses they come from:
+    // its `CacheDurationInHours`, the duration the scan's TVDB client is
+    // configured with (`FERROFIN_TVDB_CACHE_HOURS`).
+    #[tokio::test]
+    async fn the_scan_keeps_tvdb_responses_for_its_clients_cache_duration() {
+        let (base, _hits, _all) = spawn_tmdb_server(None, None);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, _cache, _episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        let duration = std::time::Duration::from_hours(3);
+        let scanner = scanner.with_tvdb(Arc::new(
+            ferrofin_providers::TvdbClient::new().with_cache_duration(duration),
+        ));
+        let (mut cache, _, _) = scanner.scan_prereads(&[], super::ScanRun::defaults()).await;
+        let series = "SERIES".to_owned();
+        cache.series_tvdb.insert(
+            series.clone(),
+            ferrofin_providers::TvdbSeriesDetails {
+                tvdb_id: 121_361,
+                ..Default::default()
+            },
+        );
+        cache
+            .episode_tvdb_still
+            .insert("EPISODE".to_owned(), "https://tvdb/still.jpg".to_owned());
+        let second = std::time::Duration::from_secs(1);
+        cache.series_tvdb.pass(duration.saturating_sub(second));
+        cache
+            .episode_tvdb_still
+            .pass(duration.saturating_sub(second));
+        assert!(cache.series_tvdb.get(&series).is_some());
+        assert!(cache.episode_tvdb_still.get("EPISODE").is_some());
+        cache.series_tvdb.pass(second);
+        cache.episode_tvdb_still.pass(second);
+        assert!(cache.series_tvdb.get(&series).is_none(), "expired");
+        assert!(cache.episode_tvdb_still.get("EPISODE").is_none());
+    }
+
+    // The scan's image cache keeps a probe only when it can be adopted, keyed
+    // by the file's path alone: an incomplete one (no width, height or
+    // blurhash) is never adopted, so it is not kept, and it removes a complete
+    // probe of the same file as replacing it did.
+    #[test]
+    fn the_scan_keeps_only_the_image_probes_it_can_adopt() {
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        use ferrofin_traits::persistence::StoredImageMetadata;
+
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let row = |path: &str, width: i32| StoredImageMetadata {
+            path: path.to_owned(),
+            width,
+            height: 1500,
+            blur_hash: Some("LEHV6nWB2yk8".to_owned()),
+            date_modified: at,
+        };
+        let folder = "/tv/GoT/folder.jpg";
+        let mut probes = super::ProbedImages::new();
+        super::remember_stored_images(
+            &mut probes,
+            vec![row(folder, 1000), row("/tv/GoT/backdrop.jpg", 0)],
+        );
+        assert_eq!(probes.len(), 1, "the incomplete probe is not kept");
+        let shared = || {
+            vec![ItemImageInfo {
+                path: folder.to_owned(),
+                image_type: ImageType::Primary,
+                date_modified: at,
+                ..Default::default()
+            }]
+        };
+        // The series' and the season's rows share the file's one probe.
+        let mut series = shared();
+        let mut season = shared();
+        super::adopt_stored_image_metadata(&mut series, &probes);
+        super::adopt_stored_image_metadata(&mut season, &probes);
+        assert_eq!((series[0].width, series[0].height), (1000, 1500));
+        assert_eq!(season[0].blur_hash.as_deref(), Some("LEHV6nWB2yk8"));
+
+        // A later incomplete probe of the file, as the walk settles one,
+        // leaves nothing to adopt.
+        super::remember_settled_image(&mut probes, &shared()[0]);
+        assert!(probes.is_empty());
+        let mut later = shared();
+        super::adopt_stored_image_metadata(&mut later, &probes);
+        assert_eq!(later[0].width, 0, "decoded again");
+    }
+
     /// A TVDB stand-in: `/login` issues a token, `/search` answers from
     /// `search`, and `/series/…`/`/episodes/…` from `details`. A `None` body
     /// 404s, which is how a miss is expressed.
@@ -41268,11 +41689,10 @@ mod tests {
     // from the file's mtime by MORE than one second.
     #[test]
     fn image_metadata_is_current_matches_jellyfins_image_needs_refresh() {
-        use ferrofin_traits::persistence::StoredImageMetadata;
+        use super::ProbedImage;
 
         let base = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let complete = |dm: chrono::DateTime<chrono::Utc>| StoredImageMetadata {
-            path: "/m/poster.jpg".to_owned(),
+        let complete = |dm: chrono::DateTime<chrono::Utc>| ProbedImage {
             width: 1000,
             height: 1500,
             blur_hash: Some("LEHV6nWB2yk8".to_owned()),
@@ -41299,28 +41719,28 @@ mod tests {
         for (label, broken) in [
             (
                 "no width",
-                StoredImageMetadata {
+                ProbedImage {
                     width: 0,
                     ..complete(base)
                 },
             ),
             (
                 "no height",
-                StoredImageMetadata {
+                ProbedImage {
                     height: 0,
                     ..complete(base)
                 },
             ),
             (
                 "no blurhash",
-                StoredImageMetadata {
+                ProbedImage {
                     blur_hash: None,
                     ..complete(base)
                 },
             ),
             (
                 "empty blurhash",
-                StoredImageMetadata {
+                ProbedImage {
                     blur_hash: Some(String::new()),
                     ..complete(base)
                 },
