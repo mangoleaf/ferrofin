@@ -355,8 +355,9 @@ pub async fn build_app_state(
         .await
         .context("failed to provision the aggregate root folder")?;
     // Adopted Jellyfin rows store the metadata/data directories as
-    // `%MetadataPath%`/`%AppDataPath%`; every reader of image paths expands
-    // them against this server's directories (`BaseItemRepository.Map`).
+    // `%MetadataPath%`/`%AppDataPath%`; every reader of item and image paths
+    // expands them against this server's directories (`BaseItemRepository.Map`),
+    // and the item save keeps a stored token the path it writes expands from.
     let virtual_paths =
         ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(Arc::clone(&paths));
     // Live TV is built after the repository and must not be owned by it, so the
@@ -378,7 +379,9 @@ pub async fn build_app_state(
             .with_root_ids(root_folder_ids)
             .with_visibility(Arc::clone(&scope_visibility)),
     );
-    let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let item_persistence_impl = Arc::new(
+        FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(virtual_paths.clone()),
+    );
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
         Arc::clone(&item_persistence_impl) as _;
     // One-shot (12.0 `RefreshCleanNamesAndValues`): move every stored

@@ -136,7 +136,7 @@ impl ItemVisibility {
     }
 
     /// [`Self::visible_item`], with the rows the check read: the item's chain, item
-    /// included, as stored and without the placeholder row, as
+    /// included, without the placeholder row and with their paths expanded, as
     /// `ItemRepository::retrieve_item` returns them. A caller takes a row above the item
     /// from it instead of reading that row again (gl-982).
     ///
@@ -181,7 +181,18 @@ impl ItemVisibility {
             .load_known(std::slice::from_ref(&item), chain, Some(user), None)
             .await?;
         let row = context.rows.get(&id).unwrap_or(&item);
-        Ok(context.standalone(row)?.then_some((item, kept)))
+        if !context.standalone(row)? {
+            return Ok(None);
+        }
+        // Handed out as `ItemRepository::retrieve_item` hands rows out: with
+        // the path expanded (`BaseItemMapper.Map`), after the check, which
+        // reads the stored rows.
+        let mut item = item;
+        let mut kept = kept;
+        for row in std::iter::once(&mut item).chain(&mut kept) {
+            self.paths.expand_in_place(&mut row.path);
+        }
+        Ok(Some((item, kept)))
     }
 
     /// `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck)` for each row,
@@ -1299,7 +1310,7 @@ mod tests {
     /// one read returned, each as `retrieve_item` reads it: a season's series among them, the
     /// placeholder row never (gl-982).
     #[tokio::test]
-    async fn visible_item_with_chain_hands_back_the_stored_chain() {
+    async fn visible_item_with_chain_hands_back_the_chain_as_retrieve_item_reads_it() {
         let f = Fixture::new().await;
         let library = f
             .item(
@@ -1354,7 +1365,11 @@ mod tests {
         assert_eq!(ids, [row_id(&library), row_id(&series), row_id(&season)]);
         for row in &chain {
             let stored = f.service.items.retrieve_item(row_id(row)).await;
-            assert_eq!(Some(row), stored.expect("read").as_ref(), "as stored");
+            assert_eq!(
+                Some(row),
+                stored.expect("read").as_ref(),
+                "as retrieve_item reads it"
+            );
         }
         set_permission(&f.db, &f.user.id, PermissionKind::EnableAllFolders, false)
             .await
@@ -2135,6 +2150,64 @@ mod tests {
         assert!(!f.visible(&movie).await);
         f.user.max_parental_rating_sub_score = None;
         assert!(f.visible(&movie).await);
+    }
+
+    /// gl-848: `visible_item` hands its rows out as `ItemRepository::retrieve_item`
+    /// does, with the path expanded (`BaseItemMapper.Map`); the chain rows too.
+    #[tokio::test]
+    async fn visible_item_hands_out_expanded_paths() {
+        let mut f = Fixture::new().await;
+        f.service.paths = crate::virtual_paths::VirtualPathExpander::from_paths(Arc::new(
+            crate::app_paths::FerrofinServerApplicationPaths::new(
+                "/server",
+                "/server/log",
+                "/server/config",
+                "/server/cache",
+                "/server/web",
+            ),
+        ));
+        let library = f
+            .item(
+                87,
+                BaseItemKind::CollectionFolder,
+                Some("/views/recordings"),
+                None,
+            )
+            .await;
+        let folder = f
+            .item(
+                88,
+                BaseItemKind::Folder,
+                Some("%AppDataPath%/livetv/recordings"),
+                Some(&library),
+            )
+            .await;
+        let recording = f
+            .item(
+                89,
+                BaseItemKind::Movie,
+                Some("%AppDataPath%/livetv/recordings/a.ts"),
+                Some(&folder),
+            )
+            .await;
+        let (found, chain) = f
+            .service
+            .visible_item_with_chain(row_id(&recording), &f.user)
+            .await
+            .expect("lookup")
+            .expect("visible");
+        assert_eq!(
+            found.path.as_deref(),
+            Some("/server/data/livetv/recordings/a.ts")
+        );
+        let folder_row = chain
+            .iter()
+            .find(|row| row_id(row) == row_id(&folder))
+            .expect("the folder in the chain");
+        assert_eq!(
+            folder_row.path.as_deref(),
+            Some("/server/data/livetv/recordings")
+        );
     }
 
     #[tokio::test]

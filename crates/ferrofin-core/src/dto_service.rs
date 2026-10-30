@@ -2898,12 +2898,17 @@ impl FerrofinDtoService {
         }
         if options.contains_field(ItemFields::Path) {
             // `DtoService.GetMappedPath` (`DtoService.cs:1827`): a file-protocol
-            // path after the network substitutions.
-            dto.path = item.path.as_deref().map(|path| {
-                if crate::media_info_resolver::is_file_protocol(path) {
-                    path_after_network_substitution(path, &prefetched.path_substitutions)
+            // path after the network substitutions, of the path as
+            // `BaseItemMapper.Map` reads it (`ExpandVirtualPath`: an adopted
+            // genre's `%MetadataPath%/Genre/Action` is a real path). The item
+            // repository's rows are expanded already; this also covers the
+            // rows other readers hand the projection.
+            dto.path = item.path.as_deref().map(|stored| {
+                let path = self.virtual_paths.expanded(stored);
+                if crate::media_info_resolver::is_file_protocol(&path) {
+                    path_after_network_substitution(&path, &prefetched.path_substitutions)
                 } else {
-                    path.to_owned()
+                    path.into_owned()
                 }
             });
         }
@@ -5848,6 +5853,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dto.path.as_deref(), Some("http://origin/stream"));
+    }
+
+    /// gl-848: `BaseItemMapper.Map` expands the stored `Path`
+    /// (`ExpandVirtualPath`) before `GetMappedPath` substitutes it. A row a
+    /// reader outside the item repository hands over with Jellyfin's token is
+    /// served expanded, then substituted.
+    #[tokio::test]
+    async fn path_is_expanded_before_the_path_substitutions() {
+        let db = test_db().await;
+        let config_dir = tempfile::tempdir().expect("tmp");
+        let root = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc = service(db.clone())
+            .with_configuration(
+                crate::test_support::configuration_with_path_substitution(
+                    config_dir.path(),
+                    &metadata,
+                    "//nas/metadata",
+                )
+                .await,
+            )
+            .with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let id = Uuid::new_v4();
+        crate::test_support::seed_named_item(&db, id, BaseItemKind::Genre, "Action").await;
+        let mut genre = fetch_item(&db, id).await;
+        genre.path = Some("%MetadataPath%/Genre/Action".to_owned());
+        let options = DtoOptions {
+            fields: vec![ItemFields::Path],
+            ..DtoOptions::default()
+        };
+        let dto = svc
+            .get_base_item_dto(&genre, &options, None, None)
+            .await
+            .unwrap();
+        assert_eq!(dto.path.as_deref(), Some("//nas/metadata/Genre/Action"));
     }
 
     /// `Playlist.SupportsPlayedStatus => MediaType == Video` (`Playlist.cs:73`):

@@ -320,9 +320,12 @@ impl FerrofinUserViewManager {
         if let Some(row) = &mut previous
             && let Some(path) = &row.path
         {
-            // BaseItemRepository.Map expands virtual paths upstream. This row
-            // seam otherwise returns adopted token paths verbatim; compare the
-            // resolved path so a warm adopted view does not get saved every read.
+            // BaseItemRepository.Map expands virtual paths upstream, and so
+            // does the item repository the composition root wires (its rows
+            // come back expanded, so this is the identity there). A
+            // repository built without the server's paths returns the token
+            // verbatim; compare the resolved path either way, so a warm
+            // adopted view does not get saved every read.
             let path = crate::virtual_paths::replace_ignore_ascii_case(
                 path,
                 "%MetadataPath%",
