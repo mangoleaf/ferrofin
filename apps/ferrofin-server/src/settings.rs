@@ -357,18 +357,6 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     SettingSpec {
-        key: "websocket_min_stream_period_ms",
-        env: Some("FERROFIN_WS_MIN_STREAM_PERIOD_MS"),
-        env_read: PARSED_U32,
-        group: Group::Network,
-        kind: U32,
-        default: "100",
-        description: "Smallest period, in milliseconds, between pushes of a dashboard WebSocket \
-                      stream.",
-        running: |c| json!(c.websocket_min_stream_period_ms),
-        ..ROW
-    },
-    SettingSpec {
         key: "quick_connect_pending_per_ip",
         env: Some("FERROFIN_QUICK_CONNECT_PENDING_PER_IP"),
         env_read: PARSED_U32,

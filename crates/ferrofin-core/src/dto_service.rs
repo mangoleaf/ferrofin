@@ -248,35 +248,39 @@ struct Prefetched {
     /// Image rows per parent id in [`Self::image_parents`], read in the
     /// page's one `BaseItemImageInfos` query.
     parent_images: HashMap<Uuid, Vec<ItemImageInfo>>,
-    /// Ids that some item on the page lists as a merged alternate version.
-    /// Their `media_streams` entry is read again while projecting that OTHER
-    /// item, so it must survive its own item's projection — see
-    /// [`FerrofinDtoService::attach_basic_fields`]'s `MediaStreams` read.
+    /// Ids that some item on the page lists as a version or a primary (every
+    /// row in `versions`). Their `media_streams` and `media_attachments`
+    /// entries are read again while projecting that OTHER item, so they must
+    /// survive their own item's projection — see [`take_or_clone`].
     alt_referenced: std::collections::HashSet<Uuid>,
 }
 
 /// Takes an item's prefetched entry instead of cloning it, when this is the
 /// item's only occurrence on the page.
 ///
-/// A prefetched map is built once per page and read once per item, so the
-/// clone the read used to make was pure waste — the map is dropped right after
-/// the page is projected. The exception is a page that repeats an item (a
-/// playlist may legitimately list the same track twice, and `/Items?ids=` can
-/// be handed the same id twice): there the entry is read once per occurrence,
-/// so a repeated id keeps cloning and only unique ids move.
+/// A prefetched map is built once per page and, with the exceptions below,
+/// read once per item, so the clone the read used to make was pure waste — the
+/// map is dropped right after the page is projected. One exception is a page
+/// that repeats an item (a playlist may legitimately list the same track twice,
+/// and `/Items?ids=` can be handed the same id twice): there the entry is read
+/// once per occurrence, so a repeated id keeps cloning and only unique ids move.
 ///
 /// **Only safe where no reader of that id remains after this point.** For most
 /// maps that is trivially true — they have exactly one read site, keyed by the
-/// item's own id. `media_streams` is the exception and needs care: it is read
-/// up to three times (the `MediaSources` block, once more there per merged
-/// alternate keyed by the *alternate's* id, and the `MediaStreams` field — which
-/// reads the item's own source instead when the DTO has one, and the map only
-/// otherwise). It may be drained ONLY at the last of those, the `MediaStreams`
-/// field, and only when
-/// `repeated` also folds in `Prefetched::alt_referenced` — otherwise a page item
-/// that lists this id as its alternate is projected later and finds the entry
-/// gone. Do not drain it at the `MediaSources` block: that read comes first, and
-/// doing so empties `MediaStreams` on every `/Items/{id}`.
+/// item's own id. `media_streams` and `media_attachments` are the exception and
+/// need care. The `MediaSources` block reads both for the item's own source and
+/// once more per version, keyed by the *version's* id, and `media_streams` is
+/// read once more by the `MediaStreams` field, which reads the item's own
+/// source instead when the DTO has one, and the map only otherwise. So:
+/// - the `MediaSources` block may move the item's OWN entry, because the
+///   `MediaStreams` field then reads the source it built, never the map. Keep
+///   it that way: when that field read the map after the sources were built,
+///   moving the entry here emptied `MediaStreams` on every `/Items/{id}`;
+/// - it never moves a version's entry, which every page item whose group
+///   reaches that version reads;
+/// - either site moves an entry only when `repeated` also folds in
+///   `Prefetched::alt_referenced`. Otherwise a page item that lists this id as
+///   its version or primary is projected later and finds the entry gone.
 fn take_or_clone<V: Clone>(map: &mut HashMap<Uuid, V>, id: &Uuid, repeated: bool) -> Option<V> {
     if repeated {
         map.get(id).cloned()
@@ -2543,14 +2547,24 @@ impl FerrofinDtoService {
             // the static sources directly — no per-item retrieve_item +
             // streams_dto. Every version of the item is a source, its own
             // first (`GetStaticMediaSources` → `Video.GetMediaSources`).
-            let streams = &prefetched.media_streams;
-            let attachments = &prefetched.media_attachments;
+            //
+            // The item's own streams and attachments move into its source
+            // unless something on the page reads them again: its next
+            // occurrence, or another page item whose group lists it
+            // (`alt_referenced`). A version's rows are copied, since every
+            // page item whose group reaches that version reads them. Nothing
+            // later reads the item's own entry: with its sources on the DTO,
+            // the `MediaStreams` field reads its own source instead.
+            let own_pinned = repeated || prefetched.alt_referenced.contains(&item_id);
+            let streams = &mut prefetched.media_streams;
+            let attachments = &mut prefetched.media_attachments;
             let mut sources = prefetched.versions.media_sources(item, |row| {
                 let id = row_id(row);
+                let pinned = own_pinned || id != item_id;
                 crate::media_source_manager::FerrofinMediaSourceManager::static_source(
                     row,
-                    streams.get(&id).cloned().unwrap_or_default(),
-                    attachments.get(&id).cloned().unwrap_or_default(),
+                    take_or_clone(streams, &id, pinned).unwrap_or_default(),
+                    take_or_clone(attachments, &id, pinned).unwrap_or_default(),
                 )
             });
             // `GetStaticMediaSources(item, true, user)`: the DTO always asks for
@@ -3126,9 +3140,11 @@ impl FerrofinDtoService {
         // so no reader remains and the entry can be moved out rather than cloned —
         // unless one does: a repeated id is projected again, and an id some
         // other page item lists as a merged alternate is read while projecting
-        // THAT item, both after this point. (The earlier `MediaSources` read,
-        // when its field is requested and the kind is video/audio, already took
-        // its own copy; when it is not, there was no earlier read at all.)
+        // THAT item, both after this point. (When the `MediaSources` block ran —
+        // its field requested, the kind video or audio — the item's own source
+        // is on the DTO and is read instead, so the map is not read here: that
+        // block may already have moved the entry into the source. When it did
+        // not run, there was no earlier read at all.)
         if options.contains_field(ItemFields::MediaStreams) {
             if is_live_tv_channel(kind) {
                 // C# assigns for every `IHasMediaSources`, and a channel's
@@ -7588,10 +7604,11 @@ mod tests {
             item_ids: &[Uuid],
         ) -> Result<HashMap<Uuid, Vec<MediaStream>>, ServiceError> {
             // Non-empty so the prefetched `media_streams` map is actually
-            // populated in these tests: it is read TWICE per video DTO
-            // (MediaSources, then the MediaStreams field) plus once per merged
-            // alternate keyed by the alternate's id, which is why it may only
-            // be drained at its last read. An empty map would hide a regression there.
+            // populated in these tests: it is read by the MediaSources block
+            // (the item's own source, then once per merged alternate keyed by
+            // the alternate's id) and by the MediaStreams field when the DTO
+            // has no sources, which is why each site may move only what no
+            // later read needs. An empty map would hide a regression there.
             if let Some(streams) = &self.streams {
                 return Ok(item_ids.iter().map(|id| (*id, streams.clone())).collect());
             }
@@ -9678,8 +9695,8 @@ mod tests {
                 ItemFields::ProviderIds,
                 ItemFields::Chapters,
                 ItemFields::Trickplay,
-                // `media_streams` is drained at its LAST read (the
-                // MediaStreams field), and a repeated id is read again by its
+                // Without MediaSources, `media_streams` is read only by the
+                // MediaStreams field, and a repeated id is read again by its
                 // next occurrence — so that half of the guard is covered here.
                 ItemFields::MediaStreams,
             ],
@@ -9750,10 +9767,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_video_requesting_both_media_sources_and_streams_gets_both() {
-        // `media_streams` is drained only at its LAST read (the MediaStreams
-        // field). Item detail asks for MediaSources AND MediaStreams, so the map
-        // is read twice for the same id; draining at the FIRST (MediaSources)
-        // read would silently empty `MediaStreams` on every `/Items/{id}` —
+        // Item detail asks for MediaSources AND MediaStreams. The MediaSources
+        // block moves the item's prefetched streams into its own source, so
+        // the MediaStreams field must read that source: reading the map after
+        // the move would silently empty `MediaStreams` on every `/Items/{id}` —
         // killing audio/subtitle track selection in every client — and no other
         // test notices. This pins that ordering.
         let db = test_db().await;
@@ -9981,6 +9998,186 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One page holding every way an id's prefetched streams and attachments
+    /// are read more than once, and one item that nothing reads again:
+    /// `lone` has no versions; `primary` has a merged version `cut` that is
+    /// not on the page; `twice` is listed twice; `holder` lists `listed` as
+    /// its version and both are on the page, so each one's sources read the
+    /// other's rows. `cut` and `listed` have no subtitle stream, so a source
+    /// handed another id's streams shows.
+    struct VersionsPage {
+        svc: FerrofinDtoService,
+        rows: Vec<BaseItemEntity>,
+        lone: Uuid,
+        primary: Uuid,
+        cut: Uuid,
+        twice: Uuid,
+        holder: Uuid,
+        listed: Uuid,
+    }
+
+    async fn versions_page() -> VersionsPage {
+        let db = test_db().await;
+        let [lone, primary, cut, twice, holder, listed] =
+            [0xB01, 0xB02, 0xB03, 0xB04, 0xB05, 0xB06].map(Uuid::from_u128);
+        for (id, name) in [
+            (lone, "Lone"),
+            (primary, "Primary"),
+            (cut, "Primary Cut"),
+            (twice, "Twice"),
+            (holder, "Holder"),
+            (listed, "Holder Cut"),
+        ] {
+            seed_named_item(&db, id, BaseItemKind::Movie, name).await;
+        }
+        link_alternate_version(&db, cut, primary).await;
+        link_alternate_version(&db, listed, holder).await;
+        let mut rows = Vec::new();
+        for id in [lone, primary, twice, holder, twice, listed] {
+            rows.push(fetch_item(&db, id).await);
+        }
+        let svc = service_with_sources(
+            db.clone(),
+            FakeSources {
+                stored_alternates: Some(db),
+                without_subtitles: [cut, listed].into_iter().collect(),
+                ..FakeSources::default()
+            },
+        );
+        VersionsPage {
+            svc,
+            rows,
+            lone,
+            primary,
+            cut,
+            twice,
+            holder,
+            listed,
+        }
+    }
+
+    fn sources_and_streams() -> DtoOptions {
+        DtoOptions {
+            fields: vec![ItemFields::MediaSources, ItemFields::MediaStreams],
+            ..DtoOptions::default()
+        }
+    }
+
+    /// The `MediaSources` block moves an item's own prefetched streams and
+    /// attachments into its source when nothing on the page reads them
+    /// again — the `MediaStreams` field then reads that source, not the map —
+    /// and copies them otherwise: a version's rows (every page item whose
+    /// group reaches it reads them), a repeated item's (its next occurrence),
+    /// and the rows of an item another page item lists as its version or
+    /// primary. Moving any of those would strand a later reader.
+    #[tokio::test]
+    async fn media_sources_move_only_the_rows_no_later_reader_needs() {
+        let page = versions_page().await;
+        let options = sources_and_streams();
+        let mut prefetched = page
+            .svc
+            .prefetch(&page.rows, &options, None, None, false, true)
+            .await
+            .unwrap();
+        for item in &page.rows {
+            let id = row_id(item);
+            let repeated = id == page.twice;
+            page.svc
+                .build_dto(item, &options, None, None, &mut prefetched, repeated)
+                .await
+                .unwrap();
+        }
+
+        for moved in [page.lone, page.primary] {
+            assert!(
+                !prefetched.media_streams.contains_key(&moved),
+                "{moved}'s streams were copied, not moved"
+            );
+            assert!(
+                !prefetched.media_attachments.contains_key(&moved),
+                "{moved}'s attachments were copied, not moved"
+            );
+        }
+        for kept in [page.cut, page.twice, page.holder, page.listed] {
+            assert!(
+                prefetched.media_streams.contains_key(&kept),
+                "{kept}'s streams were moved out from under a later reader"
+            );
+            assert!(
+                prefetched.media_attachments.contains_key(&kept),
+                "{kept}'s attachments were moved out from under a later reader"
+            );
+        }
+    }
+
+    /// Every source on that page carries its own id's streams and
+    /// attachments, the `MediaStreams` field is the item's own source's, and
+    /// both occurrences of the repeated item are the same DTO.
+    #[tokio::test]
+    async fn every_source_on_a_page_of_versions_and_repeats_has_its_own_rows() {
+        let page = versions_page().await;
+
+        let dtos = page
+            .svc
+            .get_base_item_dtos(&page.rows, &sources_and_streams(), None, None, false)
+            .await
+            .unwrap();
+
+        let groups = [
+            (page.lone, vec![page.lone]),
+            (page.primary, vec![page.primary, page.cut]),
+            (page.twice, vec![page.twice]),
+            (page.holder, vec![page.holder, page.listed]),
+            (page.twice, vec![page.twice]),
+            (page.listed, vec![page.listed, page.holder]),
+        ];
+        assert_eq!(dtos.len(), groups.len());
+        for (dto, (id, group)) in dtos.iter().zip(groups) {
+            assert_eq!(dto.id, id);
+            let sources = dto.media_sources.as_ref().expect("MediaSources requested");
+            let mut source_ids: Vec<String> = sources.iter().filter_map(|s| s.id.clone()).collect();
+            source_ids.sort();
+            let mut expected: Vec<String> = group.iter().map(|g| g.simple().to_string()).collect();
+            expected.sort();
+            assert_eq!(source_ids, expected, "{id}'s sources");
+            for source in sources {
+                let source_id = source.id.as_deref().expect("source id");
+                let subtitled = ![page.cut, page.listed]
+                    .iter()
+                    .any(|v| v.simple().to_string() == source_id);
+                assert_eq!(
+                    source.media_streams.len(),
+                    if subtitled { 2 } else { 1 },
+                    "{id}'s source {source_id} carries another id's streams"
+                );
+                assert_eq!(
+                    source
+                        .media_attachments
+                        .iter()
+                        .map(|a| a.file_name.clone())
+                        .collect::<Vec<_>>(),
+                    vec![Some(format!("{source_id}.ttf"))],
+                    "{id}'s source {source_id} carries another id's attachments"
+                );
+            }
+            let own = id.simple().to_string();
+            let own_source = sources
+                .iter()
+                .find(|s| s.id.as_deref() == Some(own.as_str()))
+                .expect("the item's own source");
+            assert_eq!(
+                dto.media_streams.as_ref(),
+                Some(&own_source.media_streams),
+                "{id}'s MediaStreams are its own source's"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&dtos[2]).unwrap(),
+            serde_json::to_value(&dtos[4]).unwrap(),
+            "the repeated item's second occurrence is the same DTO"
+        );
     }
 
     #[tokio::test]
