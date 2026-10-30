@@ -80,6 +80,15 @@ that muxer), falling back to `fpcalc`; without either, the analyzers that need n
 (chapters, black frames) still run. The precise per-plugin list is in
 [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
 
+### The Ferrofin extension
+
+Beside the ports, one extension is Ferrofin's own: **Ferrofin**
+(`crates/ferrofin-extensions/src/ferrofin_settings.rs`). It ports no plugin and has no tasks,
+hooks or providers; it gives the server's own settings (`GET /Ferrofin/Settings`, see
+[`CONFIG.md`](CONFIG.md#seeing-what-is-set)) a plugin identity and an enabled flag, so the
+dashboard's Disable toggle turns them off. Its version is the server's release.
+`FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.
+
 ## Adding an extension
 
 Porting a Jellyfin plugin as a compiled-in extension follows the shape of the three

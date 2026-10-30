@@ -89,8 +89,9 @@ gates_dir() {
 # Stopping a gate. Bash 5.2 drops a trapped signal that arrives while it parses a $( … ): it prints
 # "trap: line 2: unexpected EOF while looking for matching `)'" and carries on, and the gates parse them all
 # the time, so a Ctrl-C or a TERM could go unanswered until every deadline had run out (gl-968; bash 5.3 is
-# not affected, and a trap that only sets a flag fails the same way). gates/adoption/run.sh has a
-# supervisor of its own (gl-920), which builds its report itself.
+# not affected, and a trap that only sets a flag fails the same way). Under set -e that parse error exits
+# the shell at once with status 2 instead: its EXIT trap still runs, but its trap for the signal never
+# does (gl-989). gates/adoption/run.sh has a supervisor of its own (gl-920), which builds its report itself.
 #
 # gates_supervise <dir> <script> <args…>: the first thing a gate script does. It runs the script again
 # as a worker, from <dir> (where the caller started it, so relative arguments still resolve), in a session
@@ -140,9 +141,10 @@ gates_supervise() {
 gates_ack() { [ -z "${GATES_ACK_DIR:-}" ] || { : > "$GATES_ACK_DIR/$BASHPID"; } 2>/dev/null || true; }
 
 # gates_stop <pid>: wait for a background child shell of the worker that keeps its own traps. It had
-# the TERM gates_supervise sent the whole worker group; if it dropped it, it is sent again every second
-# until its teardown has run gates_ack or it has ended. Never at once, and never once it has acked: its
-# teardown may have given TERM back its default action, and a TERM then would cut it short.
+# the TERM gates_supervise sent the whole worker group; if it dropped it (under set -e bash 5.2 exits it
+# with status 2 instead), it is sent again every second until its teardown has run gates_ack or it has
+# ended. Never at once, and never once it has acked: its teardown may have given TERM back its default
+# action, and a TERM then would cut it short.
 gates_stop() {
   local ack=${GATES_ACK_DIR:-}/$1
   while [ -n "${GATES_ACK_DIR:-}" ] && kill -0 "$1" 2>/dev/null; do

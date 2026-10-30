@@ -32,9 +32,11 @@ scripts/check-workspace-deps.py        # every dependency through [workspace.dep
 ```
 
 Every `pub` item needs a `///` doc and pedantic clippy must pass (warnings are
-errors in CI). New code needs tests: Ferrofin ports Jellyfin behavior faithfully,
-so where upstream ships xUnit `[Theory]/[InlineData]` cases, transliterate them
-into `rstest` `#[case]` tests — the C# expected values are the oracle.
+errors in CI). Under `src/`, a module with children is a self-named `foo.rs`
+beside `foo/`, never `foo/mod.rs` (clippy's `mod_module_files`). New code needs
+tests: Ferrofin ports Jellyfin behavior faithfully, so where upstream ships
+xUnit `[Theory]/[InlineData]` cases, transliterate them into `rstest` `#[case]`
+tests — the C# expected values are the oracle.
 
 **The parity record is part of done.** A change to a handler or a core path either
 adds or updates the parity row it touches, after comparing that code against the

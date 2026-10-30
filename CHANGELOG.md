@@ -10,6 +10,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ## [Unreleased]
 
+### Features
+- `GET /Ferrofin/Settings` (administrators only) reports every Ferrofin setting (each
+  `config.toml` key and the OpenTelemetry variables) with the value in use, its default and
+  where it comes from (flag, environment variable, `config.toml` or default), a value
+  `config.toml` holds that is not in use yet, and whether the settings page may change it, with
+  the reason when it may not. A **Ferrofin** plugin under Dashboard → Plugins carries it: the
+  route answers `404` while the plugin is disabled, and `FERROFIN_DISABLE_EXTENSIONS` leaves the
+  plugin registered (see [docs/CONFIG.md](docs/CONFIG.md#seeing-what-is-set))
+
 ### Database
 - Adopt Jellyfin 12.3 and 12.4 databases in place: neither release adds a migration, so each
   records 12.2's migration-id set and adopts as generation `12.2.0`. The adoption suite gains
@@ -119,6 +128,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   release (`oracle.py matches`). `oracle.py check` no longer takes `--gate`
 
 ### Parity
+- A playing session's `NowPlayingItem` (`GET /Sessions` and the WebSocket `Sessions` stream)
+  is the trimmed item Jellyfin sends. It no longer carries `People`, `MediaSources`, `Tags`,
+  `SortName`, `Etag`, `CanDelete`, `CanDownload`, `DisplayPreferencesId`,
+  `ProductionLocations`, `RemoteTrailers`, the lock settings or the counts. Its
+  `MediaStreams` and `RunTimeTicks` are now those of the media source the client reported
+  playing: the open live stream, or the version it named, the item's own file by default
 - The session WebSocket's `Sessions` stream is sent when a session starts or ends, playback
   starts or stops, a client reports progress or its capabilities, or a client's session,
   playback or SyncPlay request arrives after its session was idle for more than 10 s, as
@@ -588,6 +603,16 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   still run. The item it belongs to is asked as before
 
 ### Performance
+- A library scan keeps the remote answers it shares between items only as long as
+  Jellyfin's provider clients keep theirs, instead of until the scan ends. A TheMovieDb
+  season is kept for an hour after it was fetched, and the season cache holds at most
+  100,000 TheMovieDb records (a season counts itself, its people and its episodes), the
+  limits of Jellyfin's `TmdbClientManager`. A series' TheTVDB record and an episode's
+  TheTVDB still are kept for `FERROFIN_TVDB_CACHE_HOURS`. A scan that needs one of them
+  after that asks for it again, as Jellyfin does; the ids a series settled stay known to
+  its episodes either way. The image probes a scan reuses no longer
+  repeat each file's path, and a probe that cannot be reused (no width, height or
+  blurhash) is not kept
 - `/Persons` with a favourite filter: build the user's favourite-person set once per
   statement, as Jellyfin does, instead of probing it again for every person row. On the
   benchmark corpus (one debug build, before and after; the figures below too) that is
@@ -632,6 +657,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   playback start, progress and stop report ran one `DeviceOptions` statement before, and
   now runs none. Those reports also take just the session id and the fields they use,
   where they built the session's DTO and copied the whole session
+- A Live TV guide refresh stores its airings as items one channel at a time, as Jellyfin
+  does: it reads a channel's guide rows and stored programmes, writes them, and lets them go
+  before it reads the next channel's. It used to hold every airing and every stored programme
+  item of the whole guide at once. The guide rows are built as they are written instead of
+  all first. What the refresh stores is unchanged; its memory was not measured
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
