@@ -116,7 +116,7 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FERROFIN_LIBRARY_ROOTS` | none | Library root paths to seed on a fresh install. |
+| `FERROFIN_LIBRARY_ROOTS` | none | Folders a fresh install starts with as libraries, separated by the OS path-list separator (`:` on Linux); in `config.toml`, `library_roots` is an array of paths. On the boot that creates the database's administrator, each folder becomes a library named after it (`/media/Movies` → `Movies`; a name already taken gets a number, `Movies2`), with no content type (mixed content) and Jellyfin's default library options (real-time monitoring off), both changeable in the dashboard; then one library scan starts in the background. A folder that does not exist, is not a directory or is already a library's location is skipped with a warning. Every later boot, and an adopted Jellyfin database, ignores the setting, so a library removed in the dashboard does not come back. |
 | `FERROFIN_DB_POOL` | `auto` | SQLite connection count, or `auto` (sizes to cores — the measured optimum). |
 | `FERROFIN_SCAN_PROGRESS_EVERY` | built-in | Items between scan-progress log lines. |
 | `FERROFIN_PLAYBACK_METRICS_QUEUE` | `1024` | Depth of the playback-metrics write queue, in events. Each PlaybackInfo decision and playstate start/stop is handed to this queue and written by one background task, so a SQLite WAL checkpoint can never stall a playback request. A full queue drops the event with a warning rather than blocking — raise it if `playback-metrics queue full` appears in the log under a load spike. |
