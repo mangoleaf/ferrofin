@@ -1410,6 +1410,7 @@ dependencies = [
  "ferrofin-chromaprint",
  "ferrofin-core",
  "ferrofin-db",
+ "ferrofin-health",
  "ferrofin-model",
  "ferrofin-traits",
  "ferrofin-util",

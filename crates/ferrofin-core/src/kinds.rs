@@ -387,6 +387,21 @@ pub fn has_media_sources(kind: BaseItemKind) -> bool {
     !is_folder(kind) && !is_item_by_name(kind)
 }
 
+/// C# `item is IHasMediaSources`: `Video` and `Audio` with their subclasses,
+/// and `LiveTvChannel` (both spellings of its kind).
+///
+/// Narrower than [`has_media_sources`], which asks whether a row can own
+/// stream rows and so admits a `Book` or a `Photo`. Those two are plain
+/// `BaseItem`s upstream, so code that branches on the interface leaves them
+/// out (`SessionManager.UpdateNowPlayingItem` resolves no media source for
+/// them).
+#[must_use]
+pub fn implements_has_media_sources(kind: BaseItemKind) -> bool {
+    is_video(kind)
+        || is_audio(kind)
+        || matches!(kind, BaseItemKind::LiveTvChannel | BaseItemKind::TvChannel)
+}
+
 /// Whether items of this kind can have theme songs/videos
 /// (C# `BaseItem.SupportsThemeMedia`, `true` for `Folder` and `Video`).
 #[must_use]
@@ -817,12 +832,12 @@ mod people_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        collection_type_of, is_folder, is_item_by_name, is_video,
-        latest_items_index_container_kind, photo_auto_orients, presentation_unique_key,
-        saved_sort_name, series_presentation_unique_key, series_user_data_keys,
-        supports_adding_to_playlist, supports_ancestors, supports_inherited_parent_images,
-        supports_played_status, supports_position_ticks_resume, supports_similarity,
-        supports_theme_media,
+        collection_type_of, has_media_sources, implements_has_media_sources, is_folder,
+        is_item_by_name, is_video, latest_items_index_container_kind, photo_auto_orients,
+        presentation_unique_key, saved_sort_name, series_presentation_unique_key,
+        series_user_data_keys, supports_adding_to_playlist, supports_ancestors,
+        supports_inherited_parent_images, supports_played_status, supports_position_ticks_resume,
+        supports_similarity, supports_theme_media,
     };
     use ferrofin_model::data::MediaType;
     use ferrofin_model::data::{BaseItemKind, CollectionType};
@@ -1191,6 +1206,35 @@ mod tests {
     #[test]
     fn folders_support_theme_media() {
         assert!(supports_theme_media(BaseItemKind::Series));
+    }
+
+    /// `IHasMediaSources` is implemented by `Video`, `Audio` and
+    /// `LiveTvChannel` only: a book and a photo own stream rows here
+    /// ([`has_media_sources`]) but are plain `BaseItem`s upstream.
+    #[rstest]
+    #[case(BaseItemKind::Movie, true)]
+    #[case(BaseItemKind::Episode, true)]
+    #[case(BaseItemKind::Video, true)]
+    #[case(BaseItemKind::MusicVideo, true)]
+    #[case(BaseItemKind::Trailer, true)]
+    #[case(BaseItemKind::Audio, true)]
+    #[case(BaseItemKind::AudioBook, true)]
+    #[case(BaseItemKind::LiveTvChannel, true)]
+    #[case(BaseItemKind::TvChannel, true)]
+    #[case(BaseItemKind::Book, false)]
+    #[case(BaseItemKind::Photo, false)]
+    #[case(BaseItemKind::LiveTvProgram, false)]
+    #[case(BaseItemKind::Series, false)]
+    #[case(BaseItemKind::MusicAlbum, false)]
+    #[case(BaseItemKind::Genre, false)]
+    fn the_has_media_sources_interface_is_video_audio_and_channels(
+        #[case] kind: BaseItemKind,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(implements_has_media_sources(kind), expected);
+        if expected {
+            assert!(has_media_sources(kind), "{kind:?} owns stream rows too");
+        }
     }
 
     /// The v12 `SupportsInheritedParentImages` override table, one case per
