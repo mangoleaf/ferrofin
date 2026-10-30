@@ -2185,28 +2185,35 @@ async fn the_channel_cap_is_the_chosen_profiles_own(
     );
 }
 
-/// gl-1019: with no transcoding profile chosen (the source can neither be
-/// transcoded nor remuxed), the URL names no segment container, as
-/// `StreamInfo.ToUrl` writes none for an empty container, and the source keeps
-/// its own `TranscodingContainer`. A transcoding URL is still built because the
-/// `SupportsTranscoding` that `SetDeviceSpecificData` recomputes is true: the
-/// source already names a `TranscodingContainer`, and the profile has a video
-/// transcoding profile. The source's `mkv` is one no profile here and no
-/// container rule would produce.
+/// gl-1019, gl-1023: with no transcoding profile chosen (the source can neither
+/// be transcoded nor remuxed), the stream keeps `StreamInfo`'s defaults, no
+/// container and the `http` sub-protocol, so `StreamInfo.ToUrl` builds a bare
+/// `/videos/{id}/stream` URL naming no container, and the source keeps its own
+/// `TranscodingContainer` and `TranscodingSubProtocol`, which only a chosen
+/// profile stamps (`SetStreamInfoOptionsFromTranscodingProfile`). A
+/// transcoding URL is still built because the `SupportsTranscoding` that
+/// `SetDeviceSpecificData` recomputes is true: the source already names a
+/// `TranscodingContainer`, and the profile has a video transcoding profile.
+/// The source's `mkv` is one no profile here and no container rule would
+/// produce.
 #[tokio::test]
-async fn without_a_chosen_profile_no_segment_container_is_named() {
-    let mut source = mkv_source(&Uuid::from_u128(0x1019).simple().to_string(), "hevc");
+async fn without_a_chosen_profile_the_url_names_no_container() {
+    let id = Uuid::from_u128(0x1019);
+    let mut source = mkv_source(&id.simple().to_string(), "hevc");
     source.supports_transcoding = false;
     source.supports_direct_stream = false;
     source.transcoding_container = Some("mkv".to_owned());
+    source.transcoding_sub_protocol = ferrofin_model::data::MediaStreamProtocol::hls;
     let source = negotiate(
         source,
         &serde_json::json!({"DeviceProfile": hls_client(("mp4", "h264"), &[("ts", "h264")])}),
     )
     .await;
     let url = source["TranscodingUrl"].as_str().expect("a transcode");
+    assert!(url.starts_with(&format!("/videos/{id}/stream?")), "{url}");
     assert_eq!(url_param(url, "SegmentContainer"), None, "{url}");
     assert_eq!(source["TranscodingContainer"], "mkv", "{source}");
+    assert_eq!(source["TranscodingSubProtocol"], "hls", "{source}");
 }
 
 /// gl-1019: a profile with no video transcoding profile gets no transcode for a
@@ -2228,4 +2235,70 @@ async fn a_profile_without_transcoding_profiles_gets_no_transcode() {
     assert_eq!(source["SupportsDirectStream"], false, "{source}");
     assert_eq!(source["SupportsTranscoding"], false, "{source}");
     assert!(source.get("TranscodingUrl").is_none(), "{source}");
+}
+
+/// gl-1023: a transcode negotiated against an `http` (progressive) profile is
+/// delivered with that profile's protocol, as `StreamInfo.ToUrl` builds it:
+/// `/videos/{id}/stream.{container}` with the start position and no HLS
+/// segment container, and the profile's own video codecs (the HLS codec filter
+/// applies only to an `hls` profile, so `webm` keeps VP8). An external
+/// subtitle's `DeliveryUrl` starts at the same position, since the progressive
+/// output starts there (`GetSubtitleProfiles`; an HLS one starts at 0). The
+/// profiles have the shape of the `Chrome-NoHLS` and Tizen fixtures' `http`
+/// ones.
+#[rstest::rstest]
+#[case::mp4("mp4", "h264", "aac", "hevc", "h264")]
+#[case::webm("webm", "vp8,vp9", "vorbis,opus", "vp9", "vp8,vp9")]
+#[tokio::test]
+async fn an_http_profile_is_streamed_progressively(
+    #[case] container: &str,
+    #[case] video: &str,
+    #[case] audio: &str,
+    #[case] source_video: &str,
+    #[case] video_codec: &str,
+) {
+    let id = Uuid::from_u128(0x1019);
+    let profile = serde_json::json!({
+        "DirectPlayProfiles": [
+            {"Container": "mp4", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac"}
+        ],
+        "TranscodingProfiles": [{
+            "Container": container, "Type": "Video", "VideoCodec": video,
+            "AudioCodec": audio, "Protocol": "http", "Context": "Streaming"
+        }],
+        "SubtitleProfiles": [{"Format": "vtt", "Method": "External"}],
+    });
+    let mut source = mkv_source(&id.simple().to_string(), source_video);
+    source
+        .media_streams
+        .push(ferrofin_model::entities_media::MediaStream {
+            stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
+            index: 2,
+            codec: Some("subrip".to_owned()),
+            supports_external_stream: true,
+            ..ferrofin_model::entities_media::MediaStream::default()
+        });
+    let source = negotiate(
+        source,
+        &serde_json::json!({"DeviceProfile": profile, "StartTimeTicks": 600_000_000}),
+    )
+    .await;
+    let subtitle = &source["MediaStreams"][2];
+    assert_eq!(subtitle["DeliveryMethod"], "External", "{subtitle}");
+    let delivery = subtitle["DeliveryUrl"].as_str().expect("a delivery URL");
+    assert!(
+        delivery.contains("/Subtitles/2/600000000/Stream.vtt"),
+        "{delivery}"
+    );
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+    assert_eq!(source["TranscodingSubProtocol"], "http", "{source}");
+    assert_eq!(source["TranscodingContainer"], container, "{source}");
+    let url = source["TranscodingUrl"].as_str().expect("a transcode");
+    assert!(
+        url.starts_with(&format!("/videos/{id}/stream.{container}?")),
+        "{url}"
+    );
+    assert_eq!(url_param(url, "SegmentContainer"), None, "{url}");
+    assert_eq!(url_param(url, "StartTimeTicks"), Some("600000000"), "{url}");
+    assert_eq!(url_param(url, "VideoCodec"), Some(video_codec), "{url}");
 }
