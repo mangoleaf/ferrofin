@@ -1067,6 +1067,17 @@ pub async fn build_app_state(
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
     trickplay_impl.attach_virtual_folders(Arc::clone(&virtual_folders));
+    // A bare `CollectionFolder` an older build made for the Collections library
+    // becomes the real library: before any scan, and before the sweep below
+    // reads the libraries' locations.
+    ferrofin_core::adoption_repairs::run_merge_legacy_collections_library(
+        db,
+        &virtual_folders_impl,
+        &id_derivation,
+        (&paths.data_path(), &paths.root_folder_path()),
+        &virtual_paths,
+    )
+    .await;
     // One-shot (Jellyfin 12.2 `20260915120000_MigrateRatingLevels`): recompute
     // every row's inherited parental-rating columns from its OWN
     // `OfficialRating` through `GetRatingScore`, so a rating string an older
@@ -1604,7 +1615,10 @@ pub async fn build_app_state(
         .with_providers(Arc::clone(&providers))
         .with_self_writes(Arc::clone(&self_writes_guard))
         // …and names a new Collections library in the server's language.
-        .with_localization(Arc::clone(&localization)),
+        .with_localization(Arc::clone(&localization))
+        // …which the first box set makes, like any library.
+        .with_virtual_folders(Arc::clone(&virtual_folders))
+        .with_virtual_paths(virtual_paths.clone()),
     );
     library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);

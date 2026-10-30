@@ -25,6 +25,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   setting itself (it is served anonymously) and disappears with the plugin when it is disabled
 
 ### Database
+- The Collections library is a real library, as in Jellyfin: the first box set makes
+  `root/default/Collections` with a shortcut to `{data}/collections`, `boxsets` as its type and
+  metadata saved locally, so it appears under Dashboard → Libraries and in
+  `GET /Library/VirtualFolders` and takes library settings. Box sets hang off the plain folder
+  for that directory, so their `ParentId` is the one Jellyfin answers. A boot repair moves an
+  older database's bare `CollectionFolder` row onto that shape, with users' library preferences,
+  and merges it into a Collections library already there, after copying the database to
+  `<database>.pre-collections-library`; a failure leaves the old row in use and the next boot
+  tries again (see [docs/UPGRADING.md](docs/UPGRADING.md))
 - Adopt Jellyfin 12.3 and 12.4 databases in place: neither release adds a migration, so each
   records 12.2's migration-id set and adopts as generation `12.2.0`. The adoption suite gains
   their routes (from 10.11.8, from the previous 12.x release, and a fresh install of each), checks

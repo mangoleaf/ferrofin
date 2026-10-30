@@ -8,6 +8,33 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — the Collections library becomes a real library
+
+Usually nothing to do. A server that has made a collection stored its Collections library as a
+bare database row at `{data}/collections`, which the dashboard did not list and which had no
+settings. The first boot on this release replaces it with a library like Jellyfin's:
+`root/default/Collections` with a shortcut to `{data}/collections`, listed under Dashboard →
+Libraries, with box sets under a plain folder for that directory.
+
+- The library's id changes, and with it the `ParentId` of every box set. Users keep their access:
+  a user's enabled and blocked libraries and their other library lists move to the new id, and
+  so do the old row's user data and image.
+- A library that already lists `{data}/collections`, such as one adopted from Jellyfin, is kept
+  under its own name, and the box sets of both rows end up together in it. Otherwise the new
+  library takes the old row's name. If a library of yours with other locations already has that
+  name, it is left alone and the new one is numbered (`Collections2`), as Jellyfin numbers it.
+- Removing the Collections library from the dashboard now removes its box sets from the
+  database at the next scan, as it does on Jellyfin. Unlike Jellyfin, Ferrofin does not read
+  them back from `{data}/collections` when the library is made again (gl-1072), so do not remove
+  it to rename or reset it. Their folders on disk stay.
+- Before it changes anything, the boot copies the database beside itself as
+  `<database>.pre-collections-library` (`ferrofin.db.pre-collections-library` on most servers). It
+  is safe to delete once the server has run well on this release. It is not a way back to Jellyfin:
+  that is `jellyfin.db.pre-ferrofin`.
+- If the library cannot be made (the `root` directory is read-only, for one) or the copy cannot be
+  written, the log says so with a warning, the server starts and works as it did, and the next boot
+  tries again.
+
 ## Unreleased — every image tag changes once; clients download artwork again once
 
 Nothing to do. An image's cache tag (`ImageTags`, `BackdropImageTags`, the blurhash keys and
@@ -114,7 +141,8 @@ upgrade.
   `0007`, `0032` and `0044`, and the adoption copy `jellyfin.db.pre-ferrofin`, still stop
   the boot when they cannot be written.
 - **No cut-short copies.** Every copy (`jellyfin.db.pre-ferrofin`, `.pre-NNNN`, and the boot
-  repairs' `.pre-rehome`, `.pre-season-ids`, `.pre-playlist-folders` and `.pre-harmonize`)
+  repairs' `.pre-rehome`, `.pre-season-ids`, `.pre-playlist-folders`, `.pre-collections-library`
+  and `.pre-harmonize`)
   is written to `<name>.partial`, flushed to disk and only then renamed. A full disk or a
   killed server therefore never leaves a partial file under the real name. The next attempt
   at that copy deletes a leftover `.partial`; you can also delete one yourself while the
