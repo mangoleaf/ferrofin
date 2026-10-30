@@ -582,14 +582,9 @@ impl RemoteSearchProvider for OmdbSearchProvider {
         // supply one. Skipped on the id branch, exactly as in C#, where the
         // whole block sits under `if (string.IsNullOrWhiteSpace(imdbId))`.
         let (name, year) = if known.imdb_id.is_none() && !raw_name.trim().is_empty() {
-            let options = naming_options();
-            let parsed = ferrofin_naming::video::video_resolver::clean_date_time(raw_name, options);
-            let cleaned = ferrofin_naming::video::video_resolver::try_clean_string(
-                Some(&parsed.name),
-                options,
-            )
-            .unwrap_or(parsed.name);
-            (cleaned, search_info.year.or(parsed.year))
+            let parsed =
+                ferrofin_naming::video::video_resolver::parse_name(raw_name, naming_options());
+            (parsed.name, search_info.year.or(parsed.year))
         } else {
             (raw_name.to_owned(), search_info.year)
         };
@@ -619,7 +614,8 @@ impl RemoteSearchProvider for OmdbSearchProvider {
     }
 }
 
-/// The shared naming options backing the OMDb provider's `ParseName` port.
+/// The shared naming options the providers' `ParseName` runs by (the OMDb
+/// Identify search, the TVDB search).
 ///
 /// [`NamingOptions::new`] compiles the whole clean-name regex table, so it is
 /// built once for the process rather than per search request.

@@ -89,13 +89,9 @@ pub fn resolve(
     let mut year: Option<i32> = None;
 
     if parse_name {
-        let clean = clean_date_time(&name, naming_options);
-        name = clean.name;
-        year = clean.year;
-
-        if let Some(new_name) = try_clean_string(Some(&name), naming_options) {
-            name = new_name;
-        }
+        let parsed = self::parse_name(&name, naming_options);
+        name = parsed.name;
+        year = parsed.year;
     }
 
     let container = container.filter(|c| !c.is_empty());
@@ -145,6 +141,19 @@ pub fn try_clean_string(name: Option<&str>, naming_options: &NamingOptions) -> O
 #[must_use]
 pub fn clean_date_time(name: &str, naming_options: &NamingOptions) -> CleanDateTimeResult {
     clean_date_time_parser::clean(name, &naming_options.clean_date_time_regexes)
+}
+
+/// Splits a name into the title and the year it carries — port of
+/// `LibraryManager.ParseName` (`LibraryManager.cs:3430-3440`): the year comes
+/// out first ([`clean_date_time`]), then the release clutter is cut from what
+/// is left ([`try_clean_string`]). The metadata providers search by it,
+/// because an item's name is its file or folder name, `Movie (2016)`
+/// included.
+#[must_use]
+pub fn parse_name(name: &str, naming_options: &NamingOptions) -> CleanDateTimeResult {
+    let parsed = clean_date_time(name, naming_options);
+    let name = try_clean_string(Some(&parsed.name), naming_options).unwrap_or(parsed.name);
+    CleanDateTimeResult::new(name, parsed.year)
 }
 
 #[cfg(test)]

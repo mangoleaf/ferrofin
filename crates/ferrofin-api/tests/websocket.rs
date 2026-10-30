@@ -563,6 +563,34 @@ async fn an_idle_subscription_sends_and_builds_nothing() {
     assert_eq!(sessions.builds(), 0, "no session list was built");
 }
 
+/// B8: the period has no floor, as upstream's `IntervalMs` has none. A client
+/// asking for "0,1" causes no work while idle, and each throttled event 2 ms
+/// after the last frame, past the 1 ms period, sends one frame: a floor would
+/// drop it.
+/// The clock is paused only while no frame is in flight.
+#[tokio::test]
+async fn a_one_millisecond_period_idles_and_sends_one_frame_per_event() {
+    let sessions = StreamingSessions::new(vec![session("a", CALLER)]);
+    let mut socket = subscribe(&sessions, true, "0,1").await;
+
+    tokio::time::pause();
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    tokio::time::resume();
+    assert_next_is_ack(&mut socket).await;
+    assert_eq!(sessions.builds(), 0, "idle: no session list was built");
+
+    for builds in 1..=3 {
+        sessions.raise(SessionEvent::SessionActivity);
+        assert_eq!(ids(&next_json(&mut socket).await), ["a"]);
+        assert_next_is_ack(&mut socket).await;
+        assert_eq!(sessions.builds(), builds, "one frame per event");
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_millis(2)).await;
+        tokio::time::resume();
+    }
+}
+
 /// B1 and B2: upstream's throttle per socket. Automated progress is
 /// `SendData(false)`: the first passes (nothing was sent yet), the rest inside
 /// the period are dropped with no trailing send. Every other event is forced

@@ -284,13 +284,13 @@ impl FileSystem for DirectoryCache {
 /// only image files are stat'ed; every other entry reports length `0`. A
 /// link counts as what it points to, as the listing classifies it.
 impl ferrofin_providers::DirectoryService for DirectoryCache {
-    fn file_system_entries(&self, path: &str) -> Vec<FileSystemMetadata> {
+    fn file_system_entries(&self, path: &str) -> Arc<[FileSystemMetadata]> {
         let (hit, generation) = {
             let state = self.state();
             (state.metadata.get(path).map(Arc::clone), state.generation)
         };
         if let Some(hit) = hit {
-            return hit.to_vec();
+            return hit;
         }
         let entries: Arc<[FileSystemMetadata]> = self
             .shared_file_system_entries(path)
@@ -305,7 +305,7 @@ impl ferrofin_providers::DirectoryService for DirectoryCache {
             state.records += entries.len() + 1;
         }
         drop(state);
-        entries.to_vec()
+        entries
     }
 }
 
@@ -459,7 +459,7 @@ mod tests {
         std::fs::write(tmp.path().join("poster.jpg"), b"jpeg").unwrap();
         std::fs::write(tmp.path().join("fanart.png"), b"").unwrap();
         std::fs::create_dir(tmp.path().join("extrafanart")).unwrap();
-        let mut entries = cache.file_system_entries(&dir);
+        let mut entries = cache.file_system_entries(&dir).to_vec();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let lengths: Vec<_> = entries
             .iter()
@@ -477,6 +477,18 @@ mod tests {
         assert_eq!(entries[3].extension.as_deref(), Some(".jpg"));
         cache.file_system_entries(&dir);
         cache.get_file_system_entries(&dir);
+        assert_eq!(fs.listings(), 1);
+    }
+
+    #[test]
+    fn image_entries_are_shared_not_copied() {
+        let (_tmp, dir, fs, cache) = cache();
+        let first = cache.file_system_entries(&dir);
+        let second = cache.file_system_entries(&dir);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a cached listing is handed out as the one shared copy"
+        );
         assert_eq!(fs.listings(), 1);
     }
 
