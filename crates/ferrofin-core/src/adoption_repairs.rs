@@ -828,6 +828,8 @@ pub async fn repair_alternate_version_links(db: &Database) -> Result<(usize, usi
         };
         primary_by_child.entry(child).or_insert(parent);
     }
+    // The loop removes from the map it would otherwise borrow.
+    #[allow(clippy::needless_collect)]
     for child in primary_by_child
         .iter()
         .filter(|(child, parent)| child == parent)
@@ -924,6 +926,9 @@ async fn set_primary(
 /// primary and drops that id's own link.
 fn resolve_primaries(primary_by_child: &mut BTreeMap<Uuid, Uuid>) {
     let mut resolved: BTreeMap<Uuid, Uuid> = BTreeMap::new();
+    // The walk reads the map and removes a loop's primary link, so it cannot
+    // borrow the keys it iterates.
+    #[allow(clippy::needless_collect)]
     for start in primary_by_child.keys().copied().collect::<Vec<_>>() {
         if resolved.contains_key(&start) {
             continue;
