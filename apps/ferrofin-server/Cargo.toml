@@ -43,6 +43,8 @@ axum = { workspace = true, features = ["ws", "macros"] }
 tower.workspace = true        # outer path-canonicalization layer (case-insensitive routing)
 tower-http.workspace = true   # ServeDir/ServeFile for the static web client
 socket2 = { workspace = true }
+http-body.workspace = true     # the response body wrapper of `connection_limits`
+futures-util.workspace = true  # `connection_limits`: the waker of a parked read
 rustls.workspace = true
 tokio-rustls.workspace = true
 p12-keystore.workspace = true
@@ -91,7 +93,6 @@ sqlx.workspace = true
 tracing-opentelemetry.workspace = true
 # first_light, elevation: drive the session WebSocket over a real loopback connection.
 tokio-tungstenite.workspace = true
-futures-util.workspace = true
 # item_refresh_generated_images: writes the artwork a collage is drawn from and
 # reads the drawn pixels back.
 image.workspace = true

@@ -685,6 +685,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   now runs 14 statements for the push instead of 44; the message is unchanged
 
 ### Security
+- A connection can no longer be held open for free. As on Jellyfin's web server (Kestrel), a
+  connection that has no request under way is closed after 130 s, and a request whose headers
+  have not all arrived 30 s after its first byte is answered `408` and closed; before, either
+  could stay open forever, and enough of them used up the server's file descriptors. Nothing
+  changes for a running request: a download, an upload and a slow response keep their
+  connection for as long as they take, and so does a WebSocket. Accepted sockets also turn on
+  TCP keep-alive, so the system ends a connection whose peer vanished, on the host's own
+  schedule (about 2 hours and 10 minutes by Linux's defaults). See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - A server whose setup was completed no longer starts when its database is missing, empty or
   has no migration history, as Jellyfin 12.2 refuses. It created an empty database and seeded
   a new `admin`; without `FERROFIN_ADMIN_PASSWORD` that admin had no password, so anyone who
