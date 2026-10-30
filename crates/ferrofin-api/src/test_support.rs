@@ -98,6 +98,37 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
+/// The zone [`rerun_in_time_zone`] runs a test in: +05:30 all year, so an
+/// offset-less date read as server time never matches its UTC reading.
+pub const TEST_TIME_ZONE: &str = "Asia/Kolkata";
+
+/// Re-runs the test named `test` (its full path in the test binary) in a child
+/// process with `TZ` set to [`TEST_TIME_ZONE`], and returns `true` in the parent,
+/// which then returns. Offset-less dates bind as server-local time, which a UTC
+/// host cannot tell from UTC; the child owns its environment, so concurrent
+/// tests never see the changed zone.
+///
+/// # Panics
+/// When the child cannot start, fails, or does not run exactly that test.
+#[must_use]
+pub fn rerun_in_time_zone(test: &str) -> bool {
+    if std::env::var("TZ").as_deref() == Ok(TEST_TIME_ZONE) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env("TZ", TEST_TIME_ZONE)
+        .output()
+        .expect("child test process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{test} in {TEST_TIME_ZONE}:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 /// Builds an [`AppState`] whose every manager is a fake test double.
 ///
 /// The authorization traits behave sensibly (anonymous context / unauthorized);

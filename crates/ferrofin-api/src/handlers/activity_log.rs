@@ -34,10 +34,16 @@ struct GetLogEntriesQuery {
     #[serde(default)]
     limit: Option<i32>,
     /// The minimum entry date (inclusive).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time"
+    )]
     min_date: Option<DateTime<Utc>>,
     /// The maximum entry date (inclusive).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time"
+    )]
     max_date: Option<DateTime<Utc>>,
     /// Keep only entries that have (or lack) a user id.
     #[serde(default)]

@@ -219,7 +219,10 @@ struct NextUpParams {
     #[serde(default)]
     enable_user_data: Option<bool>,
     /// Only consider episodes aired on or after this cutoff.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time"
+    )]
     next_up_date_cutoff: Option<chrono::DateTime<chrono::Utc>>,
     /// Whether to compute the total record count (defaults `true`).
     #[serde(default)]
@@ -483,11 +486,11 @@ async fn get_episodes(
         .await?
         .display_specials_within_seasons;
     let (series_key, selected_season, actual_series_id) = if let Some(season_id) = query.season_id {
-        let season = state
+        let (season, chain) = state
             .library
-            .get_item_by_id_for_user(season_id, user.as_ref())
+            .get_item_by_id_for_user_with_chain(season_id, user.as_ref())
             .await?
-            .filter(|item| item.type_.ends_with("Season"))
+            .filter(|(item, _)| item.type_.ends_with("Season"))
             .ok_or_else(|| ApiError::NotFound(format!("No season exists with Id {season_id}")))?;
         // Season.GetEpisodes follows its actual Series, even when the route's
         // series id names another row. An orphan season has no episodes.
@@ -500,12 +503,17 @@ async fn get_episodes(
                 Vec::new(),
             )));
         };
-        let Some(series) = state
-            .library
-            .get_item_by_id(actual_series)
-            .await?
-            .filter(|item| item.type_.ends_with("Series"))
-        else {
+        // The season's visibility check read the chain above it, the series
+        // among it: read the series only when the chain does not hold it, as
+        // when the check read none (a user-less request) (gl-982).
+        let series = match chain
+            .into_iter()
+            .find(|row| Uuid::parse_str(&row.id).ok() == Some(actual_series))
+        {
+            Some(series) => Some(series),
+            None => state.library.get_item_by_id(actual_series).await?,
+        };
+        let Some(series) = series.filter(|item| item.type_.ends_with("Series")) else {
             return Ok(Json(QueryResult::new(
                 query.start_index,
                 Some(0),

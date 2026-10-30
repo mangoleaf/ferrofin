@@ -392,3 +392,76 @@ fn fuzzy_comparison_populated(
     let new_url = si.to_url(Some(BASE_URL), Some("api-key"), None);
     assert_eq!(legacy.to_lowercase(), new_url.to_lowercase());
 }
+
+/// A transcoder that can extract an embedded subtitle, so a text subtitle can
+/// be delivered on its own.
+struct ExtractsSubtitles;
+
+impl ferrofin_model::dlna::TranscoderSupport for ExtractsSubtitles {
+    fn can_encode_to_audio_codec(&self, _codec: &str) -> bool {
+        false
+    }
+    fn can_encode_to_subtitle_codec(&self, _codec: &str) -> bool {
+        false
+    }
+    fn can_extract_subtitles(&self, _codec: &str) -> bool {
+        true
+    }
+}
+
+/// `GetSubtitleStreamInfo` hands `GetSubtitleProfile` the stream's own
+/// `SubProtocol` (`StreamInfo.cs`): an HLS transcode never embeds the
+/// subtitle, not even in an `mkv` segment container, where a progressive
+/// `mkv` transcode does. Not one of upstream's `StreamInfoTests`.
+#[rstest]
+#[case::hls(MediaStreamProtocol::hls, SubtitleDeliveryMethod::External)]
+#[case::progressive(MediaStreamProtocol::http, SubtitleDeliveryMethod::Embed)]
+fn a_subtitle_delivery_follows_the_streams_sub_protocol(
+    #[case] sub_protocol: MediaStreamProtocol,
+    #[case] expected: SubtitleDeliveryMethod,
+) {
+    use ferrofin_model::dlna::SubtitleProfile;
+    use ferrofin_model::dto::MediaSourceInfo;
+    use ferrofin_model::entities::MediaStreamType;
+    use ferrofin_model::entities_media::MediaStream;
+
+    let profile = DeviceProfile {
+        subtitle_profiles: vec![
+            SubtitleProfile {
+                format: Some("subrip".to_owned()),
+                method: SubtitleDeliveryMethod::Embed,
+                container: Some("mkv".to_owned()),
+                ..SubtitleProfile::default()
+            },
+            SubtitleProfile {
+                format: Some("vtt".to_owned()),
+                method: SubtitleDeliveryMethod::External,
+                ..SubtitleProfile::default()
+            },
+        ],
+        ..DeviceProfile::default()
+    };
+    let mut si = StreamInfo::new(profile);
+    si.media_type = DlnaProfileType::Video;
+    si.play_method = PlayMethod::Transcode;
+    si.sub_protocol = sub_protocol;
+    si.container = Some("mkv".to_owned());
+    si.subtitle_stream_index = Some(2);
+    si.media_source = Some(MediaSourceInfo {
+        media_streams: vec![MediaStream {
+            stream_type: MediaStreamType::Subtitle,
+            index: 2,
+            codec: Some("subrip".to_owned()),
+            supports_external_stream: true,
+            ..MediaStream::default()
+        }],
+        ..MediaSourceInfo::default()
+    });
+
+    let delivered: Vec<SubtitleDeliveryMethod> = si
+        .get_subtitle_profiles(&ExtractsSubtitles, true, false, "", None)
+        .iter()
+        .map(|info| info.delivery_method)
+        .collect();
+    assert_eq!(delivered, vec![expected]);
+}

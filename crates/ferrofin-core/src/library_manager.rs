@@ -2645,6 +2645,23 @@ impl LibraryManager for FerrofinLibraryManager {
         }
     }
 
+    /// [`Self::get_item_by_id_for_user`], with the chain its one read returned
+    /// ([`crate::item_visibility::ItemVisibility::visible_item_with_chain`]); without a
+    /// user or a visibility service, [`Self::get_item_by_id_for_user`]'s answer and no chain.
+    async fn get_item_by_id_for_user_with_chain(
+        &self,
+        id: Uuid,
+        user: Option<&ferrofin_db::entities::users::UserEntity>,
+    ) -> Result<Option<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+        match (user, &self.visibility) {
+            (Some(user), Some(visibility)) => visibility.visible_item_with_chain(id, user).await,
+            _ => Ok(self
+                .get_item_by_id_for_user(id, user)
+                .await?
+                .map(|item| (item, Vec::new()))),
+        }
+    }
+
     async fn containing_folder_path(&self, item: &BaseItemEntity) -> Option<String> {
         self.item_containing_folder(item).await
     }
@@ -5828,6 +5845,48 @@ mod tests {
                 .expect("nil")
                 .is_none()
         );
+    }
+
+    /// The lookup with its chain: the visibility service's one read for a user, the raw row
+    /// with no chain without one, and `get_item_by_id_for_user`'s answer without the service
+    /// (gl-982).
+    #[tokio::test]
+    async fn scoped_lookup_hands_back_the_chain_its_check_read() {
+        let db = test_db().await;
+        let data = tempfile::tempdir().unwrap();
+        let [series, season] = [0x7401, 0x7402].map(Uuid::from_u128);
+        seed_named_item(&db, series, BaseItemKind::Series, "Show").await;
+        crate::test_support::seed_child_item(&db, season, BaseItemKind::Season, "S1", series).await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x7403)).await;
+        let base = manager(&db);
+        let raw = base.get_item_by_id(season).await.unwrap();
+        assert_eq!(
+            base.get_item_by_id_for_user_with_chain(season, None)
+                .await
+                .unwrap(),
+            raw.clone().map(|item| (item, Vec::new()))
+        );
+        assert!(
+            base.get_item_by_id_for_user_with_chain(season, Some(&user))
+                .await
+                .is_err(),
+            "no visibility service: the lookup's own refusal"
+        );
+        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            base.items.clone(),
+            Arc::new(crate::LocalizationManager::new("US")),
+            data.path().to_string_lossy().into_owned(),
+        ));
+        let library = base.with_visibility(visibility);
+        let (item, chain) = library
+            .get_item_by_id_for_user_with_chain(season, Some(&user))
+            .await
+            .unwrap()
+            .expect("visible");
+        assert_eq!(Some(item), raw);
+        let series_row = library.get_item_by_id(series).await.unwrap();
+        assert!(chain.iter().any(|row| Some(row) == series_row.as_ref()));
     }
 
     #[tokio::test]

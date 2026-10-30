@@ -6,6 +6,7 @@
 //! is the oracle).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::*;
 use crate::container_types::{FileSystemMetadata, LocalImageInfo};
@@ -63,8 +64,10 @@ impl FakeDirectoryService {
 }
 
 impl DirectoryService for FakeDirectoryService {
-    fn file_system_entries(&self, path: &str) -> Vec<FileSystemMetadata> {
-        self.dirs.get(path).cloned().unwrap_or_default()
+    fn file_system_entries(&self, path: &str) -> Arc<[FileSystemMetadata]> {
+        self.dirs
+            .get(path)
+            .map_or_else(|| Arc::from([]), |entries| Arc::from(entries.as_slice()))
     }
 }
 
@@ -153,6 +156,18 @@ fn empty_files_are_ignored() {
     let mut fs = FakeDirectoryService::new();
     fs.empty_file("/media/movie", "poster.png");
     let images = LocalImageProvider::get_images(&folder_item(ImageItemKind::Movie), &fs);
+    assert!(images.is_empty(), "{images:?}");
+}
+
+// An item with no containing folder (`GetFiles`' non-file-protocol exit) finds
+// nothing, even when a folder of artwork sits where it would have looked.
+#[test]
+fn item_without_containing_folder_finds_no_images() {
+    let mut dir = FakeDirectoryService::new();
+    dir.file("/media/movie", "poster.jpg");
+    let mut item = folder_item(ImageItemKind::Movie);
+    item.containing_folder_path = None;
+    let images = LocalImageProvider::get_images(&item, &dir);
     assert!(images.is_empty(), "{images:?}");
 }
 
@@ -466,10 +481,9 @@ fn fs_directory_service_reads_real_temp_dir() {
 }
 
 // `FsDirectoryService` memoizes each listing for the lifetime of the instance,
-// exactly like the upstream `DirectoryService._cache`. Without the memo the
-// episode provider pays two full `readdir` sweeps of the same folder per
-// episode (`files(parent)` then `directories(parent)`), which is O(items ×
-// entries) syscalls across a scan.
+// exactly like the upstream `DirectoryService._cache`. Without the memo every
+// lookup of a folder pays its own full `readdir` sweep, which across the items
+// of a folder sharing one instance is O(items × entries) syscalls.
 //
 // The memo is proved by deleting the directory between the two calls: a cached
 // service still answers from the first listing, an uncached one returns empty.
@@ -503,6 +517,28 @@ fn fs_directory_service_memoizes_each_listing() {
             .is_empty(),
         "the memo must not outlive the instance"
     );
+}
+
+// The memo hands out the listing it holds, not a copy: upstream's
+// `GetFileSystemEntries` returns the cached array itself, and its `GetFiles` /
+// `GetDirectories` list references into it. A copy per call cost the providers
+// three `String`s per entry for every item in the folder.
+#[test]
+fn fs_directory_service_shares_the_memoized_listing() {
+    let base = std::env::temp_dir().join(format!("ferrofin-dss-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&base).expect("create temp dir");
+    std::fs::write(base.join("a.png"), b"x").expect("write a");
+    let path = base.to_string_lossy().into_owned();
+
+    let service = FsDirectoryService::new();
+    let first = service.file_system_entries(&path);
+    let second = service.file_system_entries(&path);
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "both calls must share the one memoized listing"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
 }
 
 // A directory that does not exist memoizes as an empty listing (the upstream
