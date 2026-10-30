@@ -973,10 +973,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[VerifiedSubsystem {
     upstream_method: "HandleMessages",
     ferrofin: "handlers/websocket.rs handle_socket → Streams::start_sessions, sessions_wake \
                (drain, should_send, session_event_forces), sessions_message → ferrofin-core \
-               session_manager.rs SessionEvent raises; compared with the Sessions listener \
+               session_manager.rs SessionEvent raises, with upsert_session's SessionActivity \
+               past SESSION_ACTIVITY_INTERVAL (LogSessionActivity, a new session included) and \
+               report_capabilities' CapabilitiesChanged (ReportCapabilities); compared with \
+               the Sessions listener \
                (Jellyfin.Api/WebSocketListeners/SessionInfoWebSocketListener.cs). \
-               CapabilitiesChanged and SessionActivity are not raised yet: TODO(gl-721). The \
-               ActivityLog and ScheduledTasks listeners still poll: TODO(gl-362, gl-722)",
+               The ActivityLog and ScheduledTasks listeners still poll: TODO(gl-362, gl-722)",
     date: "2026-10-29",
     divergences: &[
         "Events already queued for a socket are drained and answered with one Sessions frame, \

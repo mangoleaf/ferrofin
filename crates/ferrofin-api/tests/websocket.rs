@@ -572,6 +572,33 @@ async fn throttled_events_inside_a_period_send_once_and_forced_events_always() {
     );
 }
 
+/// `SessionActivity` is `SendData(false)` and `CapabilitiesChanged`
+/// `SendData(true)` (`SessionInfoWebSocketListener.cs:111-119`): activity
+/// inside the period is dropped, and sends again once the period has passed
+/// since the last frame, while a capabilities report sends at once. The
+/// period is skipped by advancing the clock, paused only while no frame is in
+/// flight: left paused, it would also run out `next_json`'s timeout. The
+/// period stays under the 45 s keep-alive watchdog.
+#[tokio::test]
+async fn session_activity_is_throttled_and_capabilities_changed_is_forced() {
+    let sessions = StreamingSessions::new(vec![session("a", CALLER)]);
+    let mut socket = subscribe(&sessions, true, "0,30000").await;
+
+    sessions.raise(SessionEvent::SessionActivity);
+    assert_eq!(ids(&next_json(&mut socket).await), ["a"]);
+    sessions.raise(SessionEvent::SessionActivity);
+    assert_next_is_ack(&mut socket).await;
+    sessions.raise(SessionEvent::CapabilitiesChanged);
+    assert_eq!(ids(&next_json(&mut socket).await), ["a"]);
+
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    tokio::time::resume();
+    sessions.raise(SessionEvent::SessionActivity);
+    assert_eq!(ids(&next_json(&mut socket).await), ["a"]);
+    assert_eq!(sessions.builds(), 3, "the dropped activity built nothing");
+}
+
 /// B4: a non-administrator's frames list only their own sessions and those
 /// they joined as an additional user (`SessionInfoWebSocketListener
 /// .GetDataToSendForConnection`); a session with no user is not theirs. An

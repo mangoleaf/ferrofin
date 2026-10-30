@@ -114,8 +114,8 @@ pub enum SessionEvent {
     },
     /// A client reported its capabilities (`CapabilitiesChanged`).
     CapabilitiesChanged,
-    /// A request arrived on a session that had been idle for a while
-    /// (`SessionActivity`).
+    /// A request arrived on a session that had been idle for a while, or
+    /// created it (`SessionActivity`).
     SessionActivity,
 }
 

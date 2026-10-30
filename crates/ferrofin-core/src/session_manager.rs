@@ -98,6 +98,11 @@ use crate::user_entity_ext::has_permission;
 /// hardcodes it, with no setting.
 const USER_ACTIVITY_STAMP_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
 
+/// How long a session must have been idle for a request on it to raise
+/// [`SessionEvent::SessionActivity`] (`SessionManager.cs:281`,
+/// `TotalSeconds > 10`). Upstream hardcodes it, with no setting.
+const SESSION_ACTIVITY_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::seconds(10);
+
 /// Capacity of the [`SessionEvent`] broadcast; a fixed constant, not a setting
 /// (owner decision).
 ///
@@ -342,8 +347,6 @@ pub struct FerrofinSessionManager {
     /// The C# `event` fields `SessionInfoWebSocketListener` subscribes to, as
     /// one broadcast ([`SessionManager::subscribe_session_events`]). Raised by
     /// [`Self::raise`] after each state change, outside the sessions lock.
-    /// `CapabilitiesChanged` and `SessionActivity` are not raised yet:
-    /// TODO(gl-721).
     session_events: tokio::sync::broadcast::Sender<SessionEvent>,
 }
 
@@ -712,6 +715,12 @@ impl FerrofinSessionManager {
             }
         });
 
+        // `LogSessionActivity` raises `SessionActivity` when the session had
+        // been idle past the interval. `CreateSessionInfo` leaves a new
+        // session's `LastActivityDate` at `DateTime.MinValue`, so a new one
+        // raises it too.
+        let was_idle = is_new || now - session.last_activity_date > SESSION_ACTIVITY_INTERVAL;
+
         // Refresh the mutable per-activity fields (C# `GetSessionInfo` tail).
         session.user_id = user_id;
         session.user_name = user_name;
@@ -747,6 +756,9 @@ impl FerrofinSessionManager {
         // concurrency conflict, which this write cannot raise, is swallowed.
         if let Some(user) = user {
             self.stamp_user_activity(user, user_id, now).await?;
+        }
+        if was_idle {
+            self.raise(SessionEvent::SessionActivity);
         }
 
         Ok(dto)
@@ -1993,6 +2005,10 @@ impl SessionManager for FerrofinSessionManager {
             session.capabilities = capabilities.clone();
             session.device_id.clone()
         };
+        // Upstream raises it before saving (`ReportCapabilities`,
+        // `saveCapabilities: true`); a new session's inherited capabilities
+        // take the `false` path in `upsert_session` and raise nothing.
+        self.raise(SessionEvent::CapabilitiesChanged);
         // Persist through the device manager (C# `_deviceManager.SaveCapabilities`).
         self.device_manager
             .save_capabilities(&device_id, capabilities)

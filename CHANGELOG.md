@@ -116,14 +116,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ### Parity
 - The session WebSocket's `Sessions` stream is sent when a session starts or ends, playback
-  starts or stops, or a client reports progress, as Jellyfin's `SessionInfoWebSocketListener`
-  does, instead of rebuilding and resending the session list every period whether or not
-  anything changed. An idle server with the dashboard open now sends nothing and builds no
-  session list, and `SessionsStart` sends nothing until the first event. The client's period
-  no longer paces the stream: it will only space out low-priority updates (automated
-  progress, session activity), which Ferrofin does not raise yet. A non-administrator's
-  frames list only the sessions they are the user or an additional user of, no longer the
-  sessions without a user
+  starts or stops, a client reports progress or its capabilities, or a client's session,
+  playback or SyncPlay request arrives after its session was idle for more than 10 s, as
+  Jellyfin's `SessionInfoWebSocketListener` does, instead of rebuilding and resending the
+  session list every period whether or not anything changed. An idle server with the
+  dashboard open now sends nothing and builds no session list, and `SessionsStart` sends
+  nothing until the first event. The client's period no longer paces the stream: it only
+  spaces out low-priority updates (session activity, and automated progress, which Ferrofin
+  does not raise yet). A non-administrator's frames list only the sessions they are the user
+  or an additional user of, no longer the sessions without a user
 - Report Jellyfin version 12.4.0 (was 12.2.0) in `/System/Info` and `/System/Info/Public`,
   built-in plugin versions and the plugin catalog's `targetAbi` filter: the newest Jellyfin
   release Ferrofin adopts
