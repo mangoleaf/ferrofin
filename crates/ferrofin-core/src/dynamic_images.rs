@@ -960,12 +960,7 @@ pub(crate) fn drop_missing_images(images: &mut Vec<ItemImageInfo>) -> bool {
     images.len() != before
 }
 
-/// The file's modification time, or now when it cannot be read.
-pub(crate) fn file_date_modified(path: &Path) -> DateTime<Utc> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
-}
+pub(crate) use ferrofin_providers::local_images::file_date_modified;
 
 /// `BaseDynamicImageProvider.CreateSingleImage`: copies the source into the
 /// item's folder as `primary.<source extension>`, replacing any earlier Primary.
