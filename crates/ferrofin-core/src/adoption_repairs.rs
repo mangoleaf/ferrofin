@@ -2952,7 +2952,7 @@ const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
 /// and `run_rekey_virtual_seasons`, called from
 /// `apps/ferrofin-server/src/state.rs`, which fold through [`rekey_rows`]).
 /// Every save brings them back into agreement, as upstream's
-/// `SaveUserData` does (`FerrofinUserDataManager::upsert_row`); keeping a fold itself
+/// `SaveUserData` does (`FerrofinUserDataManager::mutate_row`); keeping a fold itself
 /// in agreement is open work item gl-714.
 ///
 /// Returns the number of rows updated, and logs one summary when it
