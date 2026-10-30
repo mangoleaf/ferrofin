@@ -10,12 +10,20 @@
 //! anything acts on it. Replacing the condition in `build_app_state` with
 //! `false` left all 117 server unit tests green.
 
+use ferrofin_extensions::ferrofin_settings::EXTENSION_ID as FERROFIN_SETTINGS;
 use ferrofin_server::config::Config;
 use ferrofin_server::state::build_app_state;
 
-/// Boots the composition root with the switch in the given position and returns
-/// how many plugin descriptors and scheduled tasks it ends up with.
-async fn wired_counts(disable_extensions: bool) -> (usize, usize) {
+/// What the composition root ends up with for one position of the switch.
+struct Wired {
+    plugins: Vec<ferrofin_traits::plugins::PluginDescriptor>,
+    tasks: usize,
+    /// Whether `GET /Ferrofin/Settings`' manager answered.
+    settings_answer: bool,
+}
+
+/// Boots the composition root with the switch in the given position.
+async fn wired(disable_extensions: bool) -> Wired {
     let temp = tempfile::tempdir().expect("temp dir");
     for d in ["config", "data", "cache"] {
         std::fs::create_dir_all(temp.path().join(d)).expect("dir");
@@ -40,21 +48,22 @@ async fn wired_counts(disable_extensions: bool) -> (usize, usize) {
         .await
         .expect("wire app state");
 
-    let plugins = wired
-        .state
-        .plugins
-        .list_plugins()
-        .await
-        .expect("plugins")
-        .len();
+    let plugins = wired.state.plugins.list_plugins().await.expect("plugins");
     let tasks = wired.state.tasks.get_tasks().await.expect("tasks").len();
-    (plugins, tasks)
+    let settings_answer = wired.state.server_settings.snapshot().await.is_ok();
+    Wired {
+        plugins,
+        tasks,
+        settings_answer,
+    }
 }
 
 #[tokio::test]
 async fn disabling_extensions_removes_their_plugins_and_tasks() {
-    let (on_plugins, on_tasks) = wired_counts(false).await;
-    let (off_plugins, off_tasks) = wired_counts(true).await;
+    let on = wired(false).await;
+    let off = wired(true).await;
+    let (on_plugins, on_tasks) = (on.plugins.len(), on.tasks);
+    let (off_plugins, off_tasks) = (off.plugins.len(), off.tasks);
 
     assert!(
         off_plugins < on_plugins,
@@ -73,4 +82,20 @@ async fn disabling_extensions_removes_their_plugins_and_tasks() {
         off_tasks > 0,
         "the server's own scheduled tasks must remain, only the extensions' go"
     );
+
+    // The Ferrofin settings stay either way (owner decision D4): the server's
+    // own settings page, with no task or hook to fire in a measurement.
+    for (position, wired) in [("on", &on), ("off", &off)] {
+        assert!(
+            wired
+                .plugins
+                .iter()
+                .any(|p| p.id == FERROFIN_SETTINGS && p.name == "Ferrofin"),
+            "extensions {position}: /Plugins must list Ferrofin"
+        );
+        assert!(
+            wired.settings_answer,
+            "extensions {position}: /Ferrofin/Settings must answer"
+        );
+    }
 }

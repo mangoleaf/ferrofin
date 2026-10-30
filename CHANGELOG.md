@@ -10,6 +10,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 
 ## [Unreleased]
 
+### Features
+- `GET /Ferrofin/Settings` (administrators only) reports every Ferrofin setting (each
+  `config.toml` key and the OpenTelemetry variables) with the value in use, its default and
+  where it comes from (flag, environment variable, `config.toml` or default), a value
+  `config.toml` holds that is not in use yet, and whether the settings page may change it, with
+  the reason when it may not. A **Ferrofin** plugin under Dashboard → Plugins carries it: the
+  route answers `404` while the plugin is disabled, and `FERROFIN_DISABLE_EXTENSIONS` leaves the
+  plugin registered (see [docs/CONFIG.md](docs/CONFIG.md#seeing-what-is-set))
+
 ### Database
 - Adopt Jellyfin 12.3 and 12.4 databases in place: neither release adds a migration, so each
   records 12.2's migration-id set and adopts as generation `12.2.0`. The adoption suite gains

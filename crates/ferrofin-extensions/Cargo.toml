@@ -20,6 +20,8 @@ ferrofin-traits.workspace = true
 ferrofin-core.workspace = true
 ferrofin-model.workspace = true
 ferrofin-db.workspace = true
+# The Ferrofin plugin's version: the server's release (`build_version`).
+ferrofin-health.workspace = true
 async-trait.workspace = true
 regex.workspace = true
 reqwest.workspace = true

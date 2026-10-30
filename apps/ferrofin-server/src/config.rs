@@ -328,6 +328,11 @@ pub struct Config {
     /// Whether [`config_file`](Self::config_file) existed and was read.
     pub config_file_found: bool,
 
+    /// The command-line flags this configuration was loaded under, so the
+    /// settings report (`crate::settings`) can tell a value a flag set,
+    /// which the settings page then locks.
+    pub cli: Cli,
+
     /// What loading noticed and set aside without failing, e.g. a key the
     /// file may not set. Loading runs before logging starts, so the server
     /// logs these once it has (at boot, and after each in-process restart),
@@ -502,7 +507,9 @@ pub struct Config {
     pub enable_metrics: Option<bool>,
 
     /// Suppress the compiled-in extensions (intro skipper, file
-    /// transformation, merge versions) — `true` registers none of them.
+    /// transformation, merge versions) — `true` registers none of them but
+    /// the Ferrofin settings extension, the server's own settings page
+    /// (`ferrofin_extensions::registered_extensions`).
     ///
     /// This exists for measurement. A benchmark leg has to compare like with
     /// like, and the Jellyfin leg runs with no plugins installed; leaving
@@ -749,7 +756,8 @@ impl Config {
     // One linear layering of CLI > env > file > default per knob; it grows by a
     // line per config field, so the length is inherent (cf. `build_app_state`).
     #[allow(clippy::too_many_lines)]
-    fn load_from(cli: Cli, env: &dyn Env) -> anyhow::Result<Self> {
+    pub(crate) fn load_from(cli: Cli, env: &dyn Env) -> anyhow::Result<Self> {
+        let flags = cli.clone();
         let env = &WarningEnv {
             env,
             warnings: std::cell::RefCell::default(),
@@ -942,6 +950,7 @@ impl Config {
             data_dir,
             config_file,
             config_file_found,
+            cli: flags,
             load_warnings: Vec::new(),
             config_dir,
             cache_dir,
@@ -1223,6 +1232,7 @@ impl Config {
             data_dir: root.join("data"),
             config_file: root.join("data").join(CONFIG_FILE_NAME),
             config_file_found: false,
+            cli: Cli::default(),
             load_warnings: Vec::new(),
             config_dir: root.join("config"),
             cache_dir: root.join("cache"),
@@ -1489,7 +1499,7 @@ fn resolve_trickplay_concurrency(
 /// The keys `config.toml` may hold: [`FileConfig`]'s field names, as its
 /// derived `Deserialize` hands them to the deserializer, so no list is kept
 /// by hand.
-fn file_config_keys() -> &'static [&'static str] {
+pub(crate) fn file_config_keys() -> &'static [&'static str] {
     use serde::de::{self, Visitor};
 
     /// Carries the field names out of `deserialize_struct`.
@@ -1575,31 +1585,58 @@ fn unknown_key_warnings<'a>(table: impl IntoIterator<Item = &'a String>) -> Vec<
 /// it holds that is not a setting ([`unknown_key_warnings`]). A missing file
 /// yields an empty (all-`None`) config — never an error.
 fn load_file_config(path: &Path) -> anyhow::Result<(FileConfig, bool, Vec<String>)> {
-    if !path.exists() {
+    let Some(settings) = read_config_file(path)? else {
         return Ok((FileConfig::default(), false, Vec::new()));
-    }
+    };
+    let warnings = unknown_key_warnings(top_level_keys(&settings, path)?.keys());
+    let file = settings
+        .try_deserialize()
+        .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))?;
+    Ok((file, true, warnings))
+}
 
-    let settings = config::Config::builder()
+/// The keys `config.toml` at `path` holds at its top level, read as
+/// [`Config::load`] reads the file; none when it does not exist.
+///
+/// # Errors
+///
+/// As [`Config::load`], when the file exists but does not parse.
+pub(crate) fn config_file_keys(path: &Path) -> anyhow::Result<Vec<String>> {
+    let Some(settings) = read_config_file(path)? else {
+        return Ok(Vec::new());
+    };
+    Ok(top_level_keys(&settings, path)?.into_keys().collect())
+}
+
+/// Reads `config.toml` at `path` through the `config` crate, or `None` when
+/// it does not exist. A parse error never quotes the file
+/// ([`without_source_lines`]).
+fn read_config_file(path: &Path) -> anyhow::Result<Option<config::Config>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    config::Config::builder()
         .add_source(config::File::from(path))
         .build()
+        .map(Some)
         .map_err(|e| {
             anyhow::anyhow!(
                 "failed to read config file `{}`: {}",
                 path.display(),
                 without_source_lines(&e.to_string())
             )
-        })?;
-    let warnings = unknown_key_warnings(
-        settings
-            .clone()
-            .try_deserialize::<std::collections::HashMap<String, config::Value>>()
-            .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))?
-            .keys(),
-    );
-    let file = settings
-        .try_deserialize()
-        .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))?;
-    Ok((file, true, warnings))
+        })
+}
+
+/// `settings`' top-level table, keyed by the keys as written.
+fn top_level_keys(
+    settings: &config::Config,
+    path: &Path,
+) -> anyhow::Result<std::collections::HashMap<String, config::Value>> {
+    settings
+        .clone()
+        .try_deserialize::<std::collections::HashMap<String, config::Value>>()
+        .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))
 }
 
 /// A TOML parse error without the lines of the file it quotes: the line at
@@ -1662,7 +1699,7 @@ fn split_list(value: &str) -> Vec<PathBuf> {
 ///
 /// Kept object-safe (no generic methods) so it can be threaded as `&dyn Env`;
 /// typed parsing lives in the free [`parse_var`] helper.
-trait Env {
+pub(crate) trait Env {
     /// Returns the value of `key`, or `None` if unset or non-UTF-8.
     fn var(&self, key: &str) -> Option<String>;
 
@@ -1692,7 +1729,7 @@ impl Env for WarningEnv<'_> {
 /// ignored), yielding `None` when the var is unset or blank, and when it does
 /// not parse, which also warns ([`Env::warn`]) so the operator learns the
 /// value did nothing.
-fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Option<T> {
+pub(crate) fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Option<T> {
     let raw = env.var(key)?;
     let value = raw.trim();
     if value.is_empty() {
@@ -1716,7 +1753,7 @@ fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Option<T> {
 /// and said nothing. Accepted here, case-insensitively: `1`/`0`, `true`/`false`,
 /// `yes`/`no`, `on`/`off`. Blank is unset; anything else is `None` too, with a
 /// warning ([`Env::warn`]).
-fn parse_bool_var(env: &dyn Env, key: &str) -> Option<bool> {
+pub(crate) fn parse_bool_var(env: &dyn Env, key: &str) -> Option<bool> {
     let raw = env.var(key)?;
     match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -1733,7 +1770,7 @@ fn parse_bool_var(env: &dyn Env, key: &str) -> Option<bool> {
 }
 
 /// The real process environment.
-struct EnvProvider;
+pub(crate) struct EnvProvider;
 
 impl Env for EnvProvider {
     fn var(&self, key: &str) -> Option<String> {
@@ -2304,6 +2341,15 @@ mod tests {
             let key = key_of(var);
             if var != "FERROFIN_CONFIG_FILE" && !keys.contains(&key.as_str()) {
                 problems.push(format!("{var}: config.toml has no key `{key}`"));
+            }
+            if var != "FERROFIN_CONFIG_FILE"
+                && !crate::settings::SETTINGS
+                    .iter()
+                    .any(|row| row.key == key && row.env == Some(var.as_str()))
+            {
+                problems.push(format!(
+                    "{var}: no settings row has key `{key}` and this variable"
+                ));
             }
         }
         for key in keys {

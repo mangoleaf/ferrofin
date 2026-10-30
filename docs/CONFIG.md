@@ -39,6 +39,21 @@ The startup log's `paths` line names the file (`config_file`) and whether it was
 Everything below has a working default except where noted; a bare `cargo run -p ferrofin-server`
 boots.
 
+### Seeing what is set
+
+`GET /Ferrofin/Settings` (administrators only) reports every setting below with the value in
+use, its default, and where that value comes from: a flag, a variable, `config.toml` or the
+default. A value `config.toml` holds that is not in use (the file changed since the server
+started, or a flag or variable outranks it) is reported beside it. Each setting also says
+whether the Ferrofin settings page may change it, and when it may not, why: a flag or a variable
+sets it (change those where the server is started), or it is one the web never changes (the
+directories, the ffmpeg and ffprobe executables, the first-boot seed settings,
+`disable_extensions`, `wasm_private_http_allow`), or one jellyfin-web's own Networking and
+General pages cover. Secrets (the provider keys, the TheTVDB PIN, the seed admin password) are
+reported in plain text, as Jellyfin's plugin settings are, and never logged. The route belongs
+to the **Ferrofin** plugin under Dashboard → Plugins and answers `404` while that plugin is
+disabled.
+
 ### When a change applies
 
 A change to `config.toml` applies at the next restart, whether that is a restart of the server
@@ -199,7 +214,7 @@ not replace the account needed for subtitle downloads.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
+| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. The **Ferrofin** plugin stays: it is the server's own settings, with no task or hook. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
 
 ## WASM plugins (Tier 1b)
 
