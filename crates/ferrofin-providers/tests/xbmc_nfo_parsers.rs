@@ -407,6 +407,70 @@ fn movie_community_rating_comma() {
     assert_eq!(result.item.community_rating, Some(7.5));
 }
 
+// MovieNfoParserTests.Parse_Ratings_NotFinite_Ignored (v12.4): `float.TryParse`
+// reads `NaN` and `Infinity`, and the `BaseItem` setters' `FiniteOrNull` stores
+// them as no value.
+#[test]
+fn movie_ratings_not_finite_ignored() {
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Movie);
+    fetch_movie(
+        &mut result,
+        "Test Data/Ratings_NotFinite.nfo",
+        &read_fixture("Test Data/Ratings_NotFinite.nfo"),
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(result.item.community_rating, None);
+    assert_eq!(result.item.critic_rating, None);
+}
+
+/// .NET's `float.TryParse` reads the `NaN` and `Infinity` symbols in any case
+/// and whatever the `NumberStyles`, so upstream still assigns: the setter turns
+/// the value into no value, which clears a rating an earlier element set
+/// (`BaseNfoParser.cs` v12.4 :291-293, :537-539 and :969-983). Rust's parser
+/// also reads `inf`, which .NET does not; that spelling is the parsers'
+/// accepted sets differing, not `FiniteOrNull`, so it is not a case here.
+#[rstest::rstest]
+#[case::rating("<communityrating>7.5</communityrating><rating>nan</rating>")]
+#[case::criticrating(
+    r#"<ratings><rating name="tomatometerallcritics"><value>80</value></rating></ratings>
+       <criticrating>Infinity</criticrating>"#
+)]
+// `<criticrating>` parses with the default `Float` styles, which read an
+// exponent, and .NET Core rounds an overflow to infinity. (`<rating>` and
+// `<ratings><value>` allow only a decimal point, so `1e40` fails to parse there
+// and upstream keeps the earlier value.)
+#[case::criticrating_overflow(
+    r#"<ratings><rating name="tomatometerallcritics"><value>80</value></rating></ratings>
+       <criticrating>1e40</criticrating>"#
+)]
+#[case::ratings_community(
+    r#"<rating>7.5</rating><ratings><rating name="imdb"><value>NaN</value></rating></ratings>"#
+)]
+#[case::ratings_critic(
+    r#"<criticrating>80</criticrating>
+       <ratings><rating name="tomatometerallcritics"><value>-Infinity</value></rating></ratings>"#
+)]
+fn a_non_finite_rating_clears_an_earlier_one(#[case] elements: &str) {
+    let nfo = format!(r#"<?xml version="1.0" encoding="utf-8"?><movie>{elements}</movie>"#);
+    let external_ids = StaticExternalIds::new(["Tmdb"]);
+    let mut result = new_result(NfoItemKind::Movie);
+    fetch_movie(
+        &mut result,
+        "Test Data/Ratings_Cleared.nfo",
+        &nfo,
+        &NfoConfiguration::default(),
+        &external_ids,
+        &NoDirectoryService,
+    )
+    .expect("fetch succeeds");
+    assert_eq!(result.item.community_rating, None);
+    assert_eq!(result.item.critic_rating, None);
+}
+
 // ---------------------------------------------------------------------------
 // MusicVideoNfoParserTests (reuses the movie parser)
 // ---------------------------------------------------------------------------

@@ -347,7 +347,9 @@ impl AudioNormalizationTask {
         if lufs.is_none() {
             tracing::warn!("failed to find LUFS value in ffmpeg output");
         }
-        Ok(lufs)
+        // The reading is assigned to `BaseItem.LUFS`, whose setter runs
+        // `FiniteOrNull`: a `nan` or infinite one is no measurement.
+        Ok(ferrofin_util::finite::finite_or_none(lufs))
     }
 
     /// Stores a measured LUFS value on an item.
@@ -2277,6 +2279,46 @@ mod tests {
         let calls = runner.calls.lock().expect("lock");
         assert_eq!(calls.len(), 3);
         assert!(calls[0].iter().any(|a| a == "concat"));
+    }
+
+    /// The measured value is assigned to `BaseItem.LUFS`, whose setter runs
+    /// `FiniteOrNull`: a `nan` or infinite reading is no measurement, so
+    /// nothing is stored and the next run measures again.
+    #[tokio::test]
+    async fn a_non_finite_lufs_reading_is_no_measurement() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        for (reading, expected) in [
+            ("nan", None),
+            ("-inf", None),
+            ("inf", None),
+            ("-21.5", Some(-21.5)),
+        ] {
+            let task = AudioNormalizationTask::new(
+                db.clone(),
+                library_manager_over(db.clone()),
+                Arc::new(FakeFolders(Vec::new())),
+                Arc::new(FakeEncoder {
+                    fail_extract: false,
+                }),
+                Arc::new(FakeRunner {
+                    stderr: format!("    I:         {reading} LUFS\n"),
+                    calls: Mutex::new(Vec::new()),
+                }),
+                Arc::new(crate::FerrofinServerApplicationPaths::new(
+                    media.path().join("data"),
+                    media.path().join("logs"),
+                    media.path().join("config"),
+                    media.path().join("cache"),
+                    media.path().join("web"),
+                )),
+            );
+            let measured = task
+                .measure(vec!["-i".to_owned(), "t.flac".to_owned()])
+                .await
+                .expect("measure");
+            assert_eq!(measured, expected, "{reading}");
+        }
     }
 
     #[allow(clippy::too_many_lines)]

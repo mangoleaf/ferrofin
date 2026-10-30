@@ -8,8 +8,10 @@
 //! defaults Jellyfin's outbound requests inherit, [`panic`](mod@panic)
 //! reads a caught panic's message where upstream's `catch` reads
 //! `Exception.Message`, and [`stable_sort`] is LINQ `OrderBy`'s tolerance of a
-//! comparer that is not a total order. With the `tokio` feature, `keyed_locks`
-//! is the async keyed lock the C# takes from `AsyncKeyedLock`.
+//! comparer that is not a total order. [`finite`] is `BaseItem.FiniteOrNull`,
+//! shared by every crate that assigns a rating or gain. With the `tokio`
+//! feature, `keyed_locks` is the async keyed lock the C# takes from
+//! `AsyncKeyedLock`.
 
 pub mod copy_to_extensions;
 pub mod current_culture;
@@ -18,6 +20,7 @@ pub mod directory_path;
 pub mod enumerable_extensions;
 pub mod error;
 pub mod file_helper;
+pub mod finite;
 pub mod formatting_stream_writer;
 pub mod guid_extensions;
 pub mod http_client;

@@ -52,10 +52,13 @@ pub struct ImageParentRow {
     pub album_artists: Option<String>,
     /// The on-disk path (`Path`), if any.
     pub path: Option<String>,
-    /// The integrated loudness in LUFS (`LUFS`), if measured.
-    #[sqlx(rename = "LUFS")]
+    /// The integrated loudness in LUFS (`LUFS`), if measured (a non-finite
+    /// value reads as `None`).
+    #[sqlx(rename = "LUFS", try_from = "crate::entities::finite_real::FiniteReal")]
     pub lufs: Option<f64>,
-    /// The stored normalization gain (`NormalizationGain`), if any.
+    /// The stored normalization gain (`NormalizationGain`), if any (a
+    /// non-finite one reads as `None`).
+    #[sqlx(try_from = "crate::entities::finite_real::FiniteReal")]
     pub normalization_gain: Option<f64>,
 }
 
