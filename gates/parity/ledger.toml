@@ -968,6 +968,14 @@ kind = "value"
 issue = 220
 reason = "The bundled ListenBrainz plugin is missing, so the plugin rows shift."
 
+# Ferrofin's own plugin, its settings, is listed beside the in-tree ones, so the list is one longer.
+[[entry]]
+request = "GetPlugins"
+path = "$"
+kind = "length"
+issue = 539
+reason = "Ferrofin's own plugin, its settings, is listed beside the in-tree ones, so the list is one longer."
+
 # Ferrofin does not read the task history an adopted Jellyfin data directory keeps.
 [[entry]]
 request = "GetTasks"

@@ -172,6 +172,10 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
 - **Lints are workspace-wide** (`[workspace.lints]`): `missing_docs` and `clippy::pedantic`
   are warnings, and CI treats warnings as errors. So **every `pub` item needs a `///` doc**,
   and pedantic clippy must pass.
+- **Modules are self-named files.** Under `src/`, a module with children is `foo.rs` beside
+  `foo/`, never `foo/mod.rs`; clippy's `mod_module_files` enforces it. The lint does not look
+  outside `src/`: integration-test helpers live at `tests/<name>/mod.rs` (a `tests/common.rs`
+  would compile as a test binary of its own) or come in with `#[path = "…"]`.
 - **Match the surrounding code.** New HTTP crates mirror the existing `ferrofin-api` shape
   (`create_router`, `AppState`, `error.rs` with `IntoResponse`, a `utoipa` `ApiDoc`).
 - **Port faithfully.** When implementing behavior that mirrors Jellyfin, port it faithfully

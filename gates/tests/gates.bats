@@ -215,7 +215,8 @@ fake_tools() { # docker and taskset that do nothing, first on PATH, so a script 
 # records the status it ended with, and a loop that parses a $( … ) as fast as it can, the shape that loses
 # a trapped TERM under bash 5.2 (gl-968). It writes its worker's PID to out/worker once it loops. The loop
 # never ends by itself: a dropped signal can break the parse of the $( … ) it landed in too, and a loop that
-# tested the result (or ran under set -e) would then end with its own status instead of the TERM's.
+# tested the result would then end with its own status instead of the TERM's. It runs without set -e: with
+# it, bash 5.2 would not drop the signal but exit at once with status 2, and the teardown would see 2 (bencher).
 looper() {
   mkdir -p "$TMP/out"
   cat > "$TMP/looper.sh" <<'SH'
@@ -274,10 +275,15 @@ session_pids() {
   set +m
 }
 
-# bencher: bench/run.sh's shape under gates_supervise, in $TMP/bencher.sh: the worker's top level traps a
-# signal and relays it (interrupt_run → gates_stop) to a background shell that loops on $( … ) and keeps its
-# own traps, whose teardown gives TERM its default action back and takes a moment (a TERM sent to it again
-# then would kill it before it wrote out/teardown).
+# bencher: bench/run.sh's shape under gates_supervise, in $TMP/bencher.sh <out> <bench|drop>: the worker's top
+# level traps a signal and relays it (interrupt_run → gates_stop) to a background shell that loops on $( … ) and
+# keeps its own traps, whose teardown gives TERM its default action back and takes a moment (a TERM sent to it
+# again then would kill it before it wrote out/teardown). Bash 5.2 handles a TERM whose trap runs mid-parse in
+# one of two ways (gl-989), and the second argument picks the server for each:
+# - bench: bench's run_server, under set -e. There the trap's parse error exits the shell at once with status 2,
+#   its EXIT trap included, so the teardown sees 2 instead of 143.
+# - drop: a shell without set -e, which bash 5.2 lets drop the TERM. This one drops its first TERM every time,
+#   so gates_stop has to send it again.
 bencher() {
   mkdir -p "$TMP/out"
   cat > "$TMP/bencher.sh" <<'SH'
@@ -289,15 +295,15 @@ OUT=$1
 run_server() {
   cleanup() { local rc=$?; set +e; gates_ack; trap - EXIT INT TERM; sleep 0.5; echo "$rc" > "$OUT/teardown"; }
   trap cleanup EXIT
-  trap 'exit 143' TERM
+  if [ "$1" = drop ]; then set +e; trap 'trap "exit 143" TERM' TERM; else trap 'exit 143' TERM; fi
   echo "$BASHPID" > "$OUT/server"
-  while :; do x=$(echo true) || :; done   # never ends by itself, set -e or not (looper)
+  while :; do x=$(echo true) || :; done   # never ends by itself (looper)
 }
 SERVER_PID=
 interrupt_run() { gates_ack; trap - INT TERM; [ -z "$SERVER_PID" ] || gates_stop "$SERVER_PID"; exit 130; }
 trap interrupt_run INT TERM
 echo "$BASHPID" > "$OUT/worker"
-run_server &
+run_server "$2" &
 SERVER_PID=$!
 wait "$SERVER_PID"
 SH
@@ -306,20 +312,30 @@ SH
 @test "gates_stop: bench's relay reaches a background shell looping on \$( … ), and its slow teardown is never cut short" {
   bencher
   export GATES
-  for how in group pid group pid group pid; do
+  # group and pid, each with bench's server (a TERM can land mid-parse) and with one that drops its first TERM
+  for how in group:bench pid:bench group:drop pid:drop group:bench pid:bench; do
     rm -f out/worker out/server out/teardown
-    setsid bash bencher.sh "$TMP/out" & leader=$!
+    LC_ALL=C setsid bash bencher.sh "$TMP/out" "${how#*:}" 2> out/err & leader=$!   # LC_ALL: bash's own messages
     for _ in $(seq 1 100); do [ ! -s out/server ] || break; sleep 0.05; done
     worker=$(cat out/worker)
     sleep "0.$((RANDOM % 3))"
-    if [ "$how" = group ]; then kill -TERM -- "-$leader"; else kill -TERM "$leader"; fi
+    if [ "${how%:*}" = group ]; then kill -TERM -- "-$leader"; else kill -TERM "$leader"; fi
     for _ in $(seq 1 40); do kill -0 "$leader" 2>/dev/null || break; sleep 0.1; done
     if kill -0 "$leader" 2>/dev/null; then
-      kill -KILL -- "-$leader" "-$worker" 2>/dev/null; echo "$how: still running 4 s after the TERM" >&2; return 1
+      kill -KILL -- "-$leader" "-$worker" 2>/dev/null; echo "$how: still running 4 s after the TERM" >&2; cat out/err >&2
+      return 1
     fi
     status=0; wait "$leader" || status=$?
-    [ "$status" -eq 143 ] || { echo "$how: exit $status" >&2; return 1; }
-    [ "$(cat out/teardown 2>/dev/null)" = 143 ] || { echo "$how: the server's teardown did not finish" >&2; return 1; }
-    [ -z "$(session_pids "$worker")" ] || { echo "$how: the worker's session outlived it" >&2; return 1; }
+    [ "$status" -eq 143 ] || { echo "$how: exit $status" >&2; cat out/err >&2; return 1; }
+    # The teardown writes the status it saw only after its slow part: a TERM sent again then would leave nothing.
+    [ -s out/teardown ] || { echo "$how: the server's teardown did not finish" >&2; cat out/err >&2; return 1; }
+    # 143 is the TERM's own trap. Under set -e, bash 5.2 exits 2 instead when that trap fails to parse, and says so.
+    teardown=$(cat out/teardown)
+    [ "$teardown" = 143 ] || {
+      [ "${how#*:}" = bench ] && [ "$teardown" = 2 ] &&
+        grep -q "^bencher.sh: trap: line [0-9]*: unexpected EOF while looking for matching" out/err &&
+        echo "# $how: the TERM's trap did not parse (bash 5.2); the server's teardown saw 2" >&3
+    } || { echo "$how: the server's teardown saw $teardown" >&2; cat out/err >&2; return 1; }
+    [ -z "$(session_pids "$worker")" ] || { echo "$how: the worker's session outlived it" >&2; cat out/err >&2; return 1; }
   done
 }

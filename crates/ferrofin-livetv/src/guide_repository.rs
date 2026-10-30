@@ -111,20 +111,38 @@ pub async fn channel_rows_by_ids(
     Ok(out)
 }
 
-/// Every stored guide programme, channel-joined.
+/// One channel's stored guide programmes, channel-joined.
 ///
-/// The mirror's source of truth: whatever `insert_programs` left in
-/// `FerrofinLiveTvPrograms` after the whole refresh is exactly upstream's
-/// `newProgramIdList` accumulated across every service.
+/// The guide mirror's unit of work. Whatever `insert_programs` left in
+/// `FerrofinLiveTvPrograms` after the whole refresh is upstream's
+/// `newProgramIdList` across every service, and upstream stores it one channel
+/// at a time: `RefreshChannelsInternal` reads each channel's existing
+/// programmes (`ChannelIds = [currentChannel.Id]`, v12.4
+/// src/Jellyfin.LiveTv/Guide/GuideManager.cs:250-255) and creates or updates
+/// them before it moves on. Reading the table one channel at a time keeps the
+/// mirror's memory to one channel's airings rather than the whole guide's. The
+/// `("ChannelId", "StartDate")` index serves it.
 ///
 /// # Errors
 ///
 /// Fails when the database read fails.
-pub async fn program_rows(db: &Database) -> Result<Vec<ProgramRow>, ServiceError> {
-    sqlx::query_as(PROGRAM_SELECT)
+pub async fn channel_program_rows(
+    db: &Database,
+    channel_id: &str,
+) -> Result<Vec<ProgramRow>, ServiceError> {
+    channel_program_rows_query(channel_id)
+        .build_query_as()
         .fetch_all(db.pool())
         .await
         .map_err(db_err)
+}
+
+/// [`channel_program_rows`]'s statement, shared with its plan pin.
+fn channel_program_rows_query(channel_id: &str) -> sqlx::QueryBuilder<sqlx::Sqlite> {
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> = sqlx::QueryBuilder::new(PROGRAM_SELECT);
+    qb.push(r#" WHERE p."ChannelId" = "#);
+    qb.push_bind(channel_id.to_owned());
+    qb
 }
 
 /// The guide programmes among `ids`, keyed by their `Uuid`.
@@ -303,7 +321,8 @@ pub async fn tuner_lineup(
 /// Every channel id currently cached.
 ///
 /// Backs the `CleanDatabase(newChannelIdList, [LiveTvChannel], …)` half of the
-/// guide refresh.
+/// guide refresh, and the programme mirror's walk over the lineup, one channel
+/// at a time.
 ///
 /// # Errors
 ///
@@ -583,8 +602,40 @@ fn db_err(e: sqlx::Error) -> ServiceError {
 #[cfg(test)]
 #[allow(clippy::missing_errors_doc)] // test seeding helpers; every error is "the write failed"
 pub mod test_support {
-    use super::{Database, db_err};
+    use super::{Database, PROGRAM_SELECT, ProgramRow, db_err};
     use ferrofin_traits::error::ServiceError;
+
+    /// Every stored guide programme, channel-joined, in one read.
+    pub async fn program_rows(db: &Database) -> Result<Vec<ProgramRow>, ServiceError> {
+        sqlx::query_as(PROGRAM_SELECT)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)
+    }
+
+    /// The `EXPLAIN QUERY PLAN` details of [`super::channel_program_rows`]'s
+    /// statement, in plan order.
+    pub async fn channel_program_rows_plan(
+        db: &Database,
+        channel_id: &str,
+    ) -> Result<Vec<String>, ServiceError> {
+        use sqlx::Execute as _;
+        let mut qb = super::channel_program_rows_query(channel_id);
+        let mut query = qb.build();
+        let args = query
+            .take_arguments()
+            .map_err(|e| ServiceError::Backend(e.to_string()))?
+            .unwrap_or_default();
+        let sql = format!("EXPLAIN QUERY PLAN {}", query.sql().as_str());
+        let rows = sqlx::query_with(sqlx::AssertSqlSafe(sql), args)
+            .fetch_all(db.pool())
+            .await
+            .map_err(db_err)?;
+        Ok(rows
+            .iter()
+            .map(|row| sqlx::Row::get::<String, _>(row, "detail"))
+            .collect())
+    }
 
     /// Overwrites a configuration row's `Data` with JSON that no longer parses;
     /// `table` is [`super::TUNER_HOSTS_TABLE`] or

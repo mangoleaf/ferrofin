@@ -765,6 +765,14 @@ impl TvdbClient {
         self
     }
 
+    /// How long this client reuses what it resolved: the plugin's
+    /// `CacheDurationInHours`, the one duration its `TvdbClientManager`
+    /// keeps every response for.
+    #[must_use]
+    pub fn cache_duration(&self) -> std::time::Duration {
+        self.cache_duration
+    }
+
     /// Sets how old the bearer token may get before the client logs in again
     /// ([`DEFAULT_TOKEN_MAX_AGE`] unless set).
     #[must_use]

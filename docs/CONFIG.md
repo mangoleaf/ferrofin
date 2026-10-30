@@ -38,6 +38,21 @@ The startup log's `paths` line names the file (`config_file`) and whether it was
 Everything below has a working default except where noted; a bare `cargo run -p ferrofin-server`
 boots.
 
+### Seeing what is set
+
+`GET /Ferrofin/Settings` (administrators only) reports every setting below with the value in
+use, its default, and where that value comes from: a flag, a variable, `config.toml` or the
+default. A value `config.toml` holds that is not in use (the file changed since the server
+started, or a flag or variable outranks it) is reported beside it. Each setting also says
+whether the Ferrofin settings page may change it, and when it may not, why: a flag or a variable
+sets it (change those where the server is started), or it is one the web never changes (the
+directories, the ffmpeg and ffprobe executables, the first-boot seed settings,
+`disable_extensions`, `wasm_private_http_allow`), or one jellyfin-web's own Networking and
+General pages cover. Secrets (the provider keys, the TheTVDB PIN, the seed admin password) are
+reported in plain text, as Jellyfin's plugin settings are, and never logged. The route belongs
+to the **Ferrofin** plugin under Dashboard → Plugins and answers `404` while that plugin is
+disabled.
+
 ### When a change applies
 
 A change to `config.toml` applies at the next restart, whether that is a restart of the server
@@ -182,7 +197,7 @@ Jellyfin's shared keys. The settings below are optional overrides or additions.
 | `FERROFIN_OMDB_KEY` | Optional OMDb API key override; unset or blank uses Jellyfin's shared key. The `config.toml` key is `omdb_api_key`. |
 | `FERROFIN_TVDB_KEY` | Optional TheTVDB API key override; unset or blank uses Jellyfin's shared key. The `config.toml` key is `tvdb_api_key`. |
 | `FERROFIN_TVDB_PIN` | Optional TheTVDB subscriber PIN, for a paid subscription. The `config.toml` key is `tvdb_subscriber_pin`. |
-| `FERROFIN_TVDB_CACHE_HOURS` | How long TheTVDB lookups are reused, in whole hours (default `1`, the TVDB plugin's `CacheDurationInHours`): an episode's TVDB id, and the season list of a series a season's TVDB id is read from. A longer duration saves requests when a library is refreshed again within that time. The `config.toml` key is `tvdb_cache_hours`. A value that is not a whole number above zero is refused with a warning at startup and the default is used. |
+| `FERROFIN_TVDB_CACHE_HOURS` | How long TheTVDB lookups are reused, in whole hours (default `1`, the TVDB plugin's `CacheDurationInHours`): an episode's TVDB id, and the season list of a series a season's TVDB id is read from. Within one library scan it also bounds how long a series' TheTVDB record and an episode's TheTVDB still are kept for the items after them: after that, the series' image pass and the episode's read them from TheTVDB again. A longer duration saves requests when a library is refreshed again within that time. The `config.toml` key is `tvdb_cache_hours`. A value that is not a whole number above zero is refused with a warning at startup and the default is used. |
 | `FERROFIN_TVDB_TOKEN_DAYS` | How old TheTVDB's sign-in token may get before Ferrofin signs in again, in whole days (default `25`, the TVDB plugin's value). TheTVDB expires a token after a month, so the value must be from 1 to 29. The `config.toml` key is `tvdb_token_days`. Any other value is refused with a warning at startup and the default is used. |
 | `FERROFIN_FANART_KEY` | Optional fanart.tv personal key, sent alongside the shared project key. The `config.toml` key is `fanart_personal_api_key`. |
 | `FERROFIN_MUSICBRAINZ_URL` | MusicBrainz base URL override (self-hosted mirror). The `config.toml` key is `musicbrainz_base_url`. |
@@ -197,7 +212,7 @@ not replace the account needed for subtitle downloads.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
+| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. The **Ferrofin** plugin stays: it is the server's own settings, with no task or hook. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
 
 ## WASM plugins (Tier 1b)
 
