@@ -142,6 +142,36 @@ pub trait SessionManager: Send + Sync {
         user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError>;
 
+    /// Records session activity exactly as
+    /// [`log_session_activity`](Self::log_session_activity) does, returning
+    /// only the session id (C# `RequestHelpers.GetSessionId`): what the
+    /// playstate and session handlers want on every report, without building
+    /// the session DTO. `None` when the session has no id.
+    ///
+    /// The default reads the id off `log_session_activity`'s DTO; the concrete
+    /// session manager overrides it to skip that DTO.
+    async fn log_session_activity_id(
+        &self,
+        app_name: &str,
+        app_version: &str,
+        device_id: &str,
+        device_name: &str,
+        remote_endpoint: &str,
+        user: Option<&UserEntity>,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(self
+            .log_session_activity(
+                app_name,
+                app_version,
+                device_id,
+                device_name,
+                remote_endpoint,
+                user,
+            )
+            .await?
+            .id)
+    }
+
     /// Updates the reported device name of a session.
     async fn update_device_name(
         &self,

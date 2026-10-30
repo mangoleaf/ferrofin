@@ -613,6 +613,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   on its own rows instead of building the user's whole watch history first. On the
   benchmark corpus (release builds before and after, requests interleaved) a series' two
   counts went from 0.61 to 0.15 ms, and a 7,490-leaf folder's from 34 to 19 ms
+- A request on a session that already exists no longer reads the device's options row or
+  copies its stored capabilities; only the request that creates the session does. Every
+  playback start, progress and stop report ran one `DeviceOptions` statement before, and
+  now runs none. Those reports also take just the session id and the fields they use,
+  where they built the session's DTO and copied the whole session
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
