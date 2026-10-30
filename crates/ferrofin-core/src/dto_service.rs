@@ -888,7 +888,7 @@ impl ImageParent {
             path: row
                 .path
                 .as_deref()
-                .map(|path| paths.expanded(path).into_owned()),
+                .map(|path| paths.expand_cow(path).into_owned()),
             lufs: row.lufs,
             normalization_gain: row.normalization_gain,
         }
@@ -908,7 +908,7 @@ impl ImageParent {
             path: item
                 .path
                 .as_deref()
-                .map(|path| paths.expanded(path).into_owned()),
+                .map(|path| paths.expand_cow(path).into_owned()),
             lufs: item.lufs,
             normalization_gain: item.normalization_gain,
         }
@@ -2711,7 +2711,7 @@ impl FerrofinDtoService {
         let item_path = item
             .path
             .as_deref()
-            .map(|stored| self.virtual_paths.expanded(stored));
+            .map(|stored| self.virtual_paths.expand_cow(stored));
 
         // `if (item is IHasCollectionType hasCollectionType) dto.CollectionType =
         // hasCollectionType.CollectionType;` (DtoService.cs:1061-1064) — set for
@@ -4819,7 +4819,7 @@ impl FerrofinDtoService {
                 .filter_map(|row| {
                     let id = Uuid::parse_str(&row.id).ok()?;
                     let path = row.path?;
-                    Some((id, self.virtual_paths.expanded(&path).into_owned()))
+                    Some((id, self.virtual_paths.expand_cow(&path).into_owned()))
                 })
                 .collect()
         };

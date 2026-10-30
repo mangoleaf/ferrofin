@@ -69,24 +69,34 @@ impl VirtualPathExpander {
     }
 
     /// [`Self::expand`] on a row's stored path, in place: `BaseItemMapper.Map`'s
-    /// `dto.Path = appHost.ExpandVirtualPath(entity.Path)`. A path with no
-    /// `%` holds neither token and is left as it is, without a copy.
+    /// `dto.Path = appHost.ExpandVirtualPath(entity.Path)`. A path holding
+    /// neither token is left as it is, without a copy ([`Self::expand_cow`]).
     pub fn expand_in_place(&self, path: &mut Option<String>) {
         if let Some(stored) = path.as_deref()
-            && let Cow::Owned(expanded) = self.expanded(stored)
+            && let Cow::Owned(expanded) = self.expand_cow(stored)
         {
             *path = Some(expanded);
         }
     }
 
-    /// [`Self::expand`], borrowing `path` back when it holds no `%` (so no
-    /// token) or there are no directories to expand to.
+    /// [`Self::expand`] without a copy when there is nothing to expand: `path` itself, borrowed,
+    /// when it holds neither token in any case (every path Ferrofin writes, every media path),
+    /// else [`Self::expand`]'s string. The text is [`Self::expand`]'s either way.
     #[must_use]
-    pub fn expanded<'a>(&self, path: &'a str) -> Cow<'a, str> {
-        if self.paths.is_none() || !path.contains('%') {
-            return Cow::Borrowed(path);
+    pub fn expand_cow<'p>(&self, path: &'p str) -> Cow<'p, str> {
+        let holds = |token: &str| {
+            path.as_bytes()
+                .windows(token.len())
+                .any(|window| window.eq_ignore_ascii_case(token.as_bytes()))
+        };
+        if self.paths.is_some()
+            && (holds(FerrofinServerApplicationPaths::VIRTUAL_DATA_PATH)
+                || holds(FerrofinServerApplicationPaths::VIRTUAL_INTERNAL_METADATA_PATH))
+        {
+            Cow::Owned(self.expand(path))
+        } else {
+            Cow::Borrowed(path)
         }
-        Cow::Owned(self.expand(path))
     }
 
     /// The write half, `ReverseVirtualPath` (`ApplicationHost.cs:299-305`):
@@ -238,21 +248,21 @@ mod tests {
     }
 
     #[test]
-    fn expanded_borrows_a_path_with_no_token() {
+    fn expand_cow_borrows_for_the_identity_and_expands_a_by_name_path() {
         assert!(matches!(
-            expander().expanded("/srv/media/a.mkv"),
+            expander().expand_cow("/srv/media/a.mkv"),
             Cow::Borrowed("/srv/media/a.mkv")
         ));
         assert!(matches!(
-            VirtualPathExpander::identity().expanded("%MetadataPath%/x"),
+            VirtualPathExpander::identity().expand_cow("%MetadataPath%/x"),
             Cow::Borrowed("%MetadataPath%/x")
         ));
         assert_eq!(
-            expander().expanded("/media/100%/a.mkv"),
+            expander().expand_cow("/media/100%/a.mkv"),
             "/media/100%/a.mkv"
         );
         assert_eq!(
-            expander().expanded("%MetadataPath%/People/A/Amanda Adams"),
+            expander().expand_cow("%MetadataPath%/People/A/Amanda Adams"),
             "/var/lib/ferrofin/data/metadata/People/A/Amanda Adams"
         );
     }
@@ -264,5 +274,39 @@ mod tests {
             expander().expand_opt(Some("%MetadataPath%/x")).as_deref(),
             Some("/var/lib/ferrofin/data/metadata/x")
         );
+    }
+
+    /// `expand_cow` reads as `expand` and copies only a path holding a token, in any case; the
+    /// identity expander copies nothing (gl-1001).
+    #[test]
+    fn expand_cow_copies_only_a_path_with_a_token() {
+        let server = expander();
+        for path in [
+            "/srv/media/a.mkv",
+            "",
+            "%AppData%/x",
+            "/a/100%/b",
+            "%Metadata",
+        ] {
+            let expanded = server.expand_cow(path);
+            assert!(matches!(expanded, Cow::Borrowed(p) if p == path), "{path}");
+            assert_eq!(expanded, server.expand(path), "{path}");
+        }
+        for path in [
+            "%AppDataPath%/collections/x",
+            "%appdatapath%/x",
+            "%MetadataPath%/library/x.jpg",
+            "/x/%METADATAPATH%",
+            "%AppDataPath%/%MetadataPath%",
+        ] {
+            let expanded = server.expand_cow(path);
+            assert!(matches!(expanded, Cow::Owned(_)), "{path}");
+            assert_eq!(expanded, server.expand(path), "{path}");
+        }
+        let stored = "%MetadataPath%/library/x.jpg";
+        assert!(matches!(
+            VirtualPathExpander::identity().expand_cow(stored),
+            Cow::Borrowed(p) if p == stored
+        ));
     }
 }
