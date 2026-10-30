@@ -601,6 +601,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   no identity of its own online, so a lookup by its file name filled it with another title's
   overview, people or Primary image. Its local readers, embedded images and extracted frames
   still run. The item it belongs to is asked as before
+- A whitespace-only `lyricId` (`GET /Providers/Lyrics/{lyricId}`,
+  `POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}`) or `displayPreferencesId`
+  (`GET` and `POST /DisplayPreferences/{displayPreferencesId}`) answers Jellyfin's `400`
+  validation problem ("The lyricId field is required."), after the permission check and before
+  the item or the preferences are read. The lyric routes answered `404`, and the display
+  preferences routes read and saved preferences under the blank id
 
 ### Performance
 - A library scan keeps the remote answers it shares between items only as long as

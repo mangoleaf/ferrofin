@@ -31,9 +31,17 @@ use uuid::Uuid;
 
 use crate::auth::{RequireAuth, RequireLyricManagement};
 use crate::error::ApiError;
-use crate::extract::{Query, upload_body_limit};
+use crate::extract::{Query, RequiredRouteString, RouteParameter, upload_body_limit};
 use crate::handlers::{queue_high_priority_refresh, run_item_refresh};
 use crate::state::AppState;
+
+/// `{lyricId}`, the `[FromRoute, Required] string` of `DownloadRemoteLyrics`
+/// and `GetRemoteLyrics`: a blank one is the binder's `400`, before the action.
+struct LyricId;
+
+impl RouteParameter for LyricId {
+    const NAME: &'static str = "lyricId";
+}
 
 /// Ensures the item exists **and is an audio item**, returning `404` otherwise.
 ///
@@ -207,9 +215,10 @@ async fn search_remote_lyrics(
 
 /// `POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}` — download a remote lyric.
 ///
-/// Port of `LyricsController.DownloadRemoteLyrics`: `404` for a missing item or
-/// when the provider yields nothing; otherwise the downloaded lyric (and a
-/// high-priority metadata refresh is queued).
+/// Port of `LyricsController.DownloadRemoteLyrics`: `400` for a blank
+/// `lyricId` (model validation, before the item check), `404` for a missing
+/// item or when the provider yields nothing; otherwise the downloaded lyric
+/// (and a high-priority metadata refresh is queued).
 #[utoipa::path(
     post,
     path = "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
@@ -226,7 +235,8 @@ async fn search_remote_lyrics(
 async fn download_remote_lyrics(
     State(state): State<AppState>,
     RequireLyricManagement(auth): RequireLyricManagement,
-    Path((item_id, lyric_id)): Path<(Uuid, String)>,
+    Path((item_id, _)): Path<(Uuid, String)>,
+    RequiredRouteString(lyric_id, _): RequiredRouteString<LyricId>,
 ) -> Result<Json<LyricDto>, ApiError> {
     require_item(&state, item_id, &auth).await?;
     match state.lyrics.download_lyrics(item_id, &lyric_id).await? {
@@ -240,8 +250,8 @@ async fn download_remote_lyrics(
 
 /// `GET /Providers/Lyrics/{lyricId}` — fetch a remote lyric by id.
 ///
-/// Port of `LyricsController.GetRemoteLyrics`: `404` when the provider has no
-/// such lyric.
+/// Port of `LyricsController.GetRemoteLyrics`: `400` for a blank `lyricId`
+/// (model validation), `404` when the provider has no such lyric.
 #[utoipa::path(
     get,
     path = "/Providers/Lyrics/{lyricId}",
@@ -255,7 +265,7 @@ async fn download_remote_lyrics(
 async fn get_remote_lyrics(
     State(state): State<AppState>,
     RequireLyricManagement(_auth): RequireLyricManagement,
-    Path(lyric_id): Path<String>,
+    RequiredRouteString(lyric_id, _): RequiredRouteString<LyricId>,
 ) -> Result<Json<LyricDto>, ApiError> {
     // `LyricManager.GetRemoteLyricsAsync`: route the namespaced id to its
     // provider, fetch + parse, no item and no sidecar write. `null` → 404.

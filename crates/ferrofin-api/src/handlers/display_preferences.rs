@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
-use crate::extract::{JsonBody, Query};
+use crate::extract::{JsonBody, Query, RequiredRouteString, RouteParameter};
 use crate::handlers::items::effective_user_id;
 use crate::state::AppState;
 
@@ -68,6 +68,14 @@ struct DisplayPreferencesParams {
     /// The required client name.
     #[serde(default)]
     client: Option<String>,
+}
+
+/// `{displayPreferencesId}`, the `[FromRoute, Required] string` of both
+/// actions: a blank one is the binder's `400`, before the action.
+struct DisplayPreferencesId;
+
+impl RouteParameter for DisplayPreferencesId {
+    const NAME: &'static str = "displayPreferencesId";
 }
 
 /// Resolves a `displayPreferencesId` into an item id: parse it as a `Guid`, else
@@ -152,7 +160,7 @@ fn parse_dotnet_bool(value: &str) -> Option<bool> {
 async fn get_display_preferences(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(display_preferences_id): Path<String>,
+    RequiredRouteString(display_preferences_id, _): RequiredRouteString<DisplayPreferencesId>,
     Query(params): Query<DisplayPreferencesParams>,
 ) -> Result<Json<DisplayPreferencesDto>, ApiError> {
     // C# `userId = RequestHelpers.GetUserId(User, userId)` — a named user other
@@ -267,7 +275,7 @@ async fn get_display_preferences(
 async fn update_display_preferences(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Path(display_preferences_id): Path<String>,
+    RequiredRouteString(display_preferences_id, _): RequiredRouteString<DisplayPreferencesId>,
     Query(params): Query<DisplayPreferencesParams>,
     JsonBody(mut dto): JsonBody<DisplayPreferencesDto>,
 ) -> Result<StatusCode, ApiError> {

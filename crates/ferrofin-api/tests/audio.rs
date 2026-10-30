@@ -966,6 +966,73 @@ async fn lyrics_upload_without_an_extension_is_400(#[case] file_name: &str) {
     assert!(saved.lock().unwrap().is_none());
 }
 
+/// gl-1028: `DownloadRemoteLyrics` and `GetRemoteLyrics` bind
+/// `[FromRoute, Required] string lyricId`. ASP.NET's `SimpleTypeModelBinder`
+/// reads a route value of nothing but white space as null
+/// (`ConvertEmptyStringToNull`), `[Required]` fails, and `[ApiController]`
+/// answers a `400` `ValidationProblemDetails` keyed `lyricId` before the
+/// action runs: before the item check, but after the `LyricManagement`
+/// policy. Ferrofin looked the blank id up and answered `404`.
+#[rstest::rstest]
+#[case::download_space("POST", "/Audio/ITEM/RemoteSearch/Lyrics/%20")]
+#[case::download_tab("POST", "/Audio/ITEM/RemoteSearch/Lyrics/%09")]
+#[case::download_no_break_space("POST", "/Audio/ITEM/RemoteSearch/Lyrics/%C2%A0")]
+#[case::download_for_a_non_audio_item("POST", "/Audio/MOVIE/RemoteSearch/Lyrics/%20")]
+#[case::remote_space("GET", "/Providers/Lyrics/%20")]
+#[case::remote_spaces("GET", "/Providers/Lyrics/%20%20%20")]
+#[case::remote_line_feed("GET", "/Providers/Lyrics/%0A")]
+#[tokio::test]
+async fn remote_lyric_routes_refuse_a_blank_lyric_id(#[case] method: &str, #[case] path: &str) {
+    let canned = || CannedLyrics {
+        stored: None,
+        remote: None,
+        deleted: Arc::default(),
+        saved: Arc::default(),
+    };
+    let path = path
+        .replace("ITEM", &ITEM_ID.to_string())
+        .replace("MOVIE", &MOVIE_ID.to_string());
+
+    let (_dir, media) = temp_media();
+    let (status, body) = call(state(&media, Arc::new(canned())), method, &path).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}");
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        problem,
+        serde_json::json!({
+            "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+            "title": "One or more validation errors occurred.",
+            "status": 400,
+            "errors": { "lyricId": ["The lyricId field is required."] },
+        }),
+        "{method} {path}"
+    );
+
+    // The policy runs first: without the permission it is still the `403`.
+    let (_dir, media) = temp_media();
+    let app = state_as(&media, Arc::new(canned()), false, false);
+    let (status, _) = call(app, method, &path).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+}
+
+/// The binder drops only a value that is all white space: a padded id is
+/// looked up as sent (the string binder does not trim).
+#[tokio::test]
+async fn remote_lyrics_look_a_padded_id_up_as_sent() {
+    let (_dir, media) = temp_media();
+    let app = state(
+        &media,
+        Arc::new(CannedLyrics {
+            stored: None,
+            remote: Some((" abc_1".to_owned(), LyricDto::default())),
+            deleted: Arc::default(),
+            saved: Arc::default(),
+        }),
+    );
+    let (status, _) = call(app, "GET", "/Providers/Lyrics/%20abc_1").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn lyrics_remote_search_is_empty_list() {
     let (_dir, path) = temp_media();
