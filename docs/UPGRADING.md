@@ -54,6 +54,17 @@ you was wrong in two ways. If you run the chart, read this once.
   [chart README](../charts/ferrofin/README.md#storage-one-node-at-a-time) shows, before your next
   upgrade.
 
+## Unreleased — idle connections are closed after 130 s
+
+Usually nothing to do. A connection with no request under way is now closed after 130 s, and a
+request whose headers have not all arrived 30 s after its first byte is answered `408` and closed.
+These are the limits of Jellyfin's web server (Kestrel's `KeepAliveTimeout` and
+`RequestHeadersTimeout`), and clients reconnect on their own, as they do with Jellyfin. They do not
+apply while a request runs or to a WebSocket. A reverse proxy that keeps idle upstream connections
+open for longer than 130 s (nginx `keepalive_timeout` under `upstream`, Traefik's or HAProxy's idle
+timeouts) may reuse one just as Ferrofin closes it. Keep that timeout below 130 s, as you would for
+Jellyfin.
+
 ## Unreleased — every image tag changes once; clients download artwork again once
 
 Nothing to do. An image's cache tag (`ImageTags`, `BackdropImageTags`, the blurhash keys and

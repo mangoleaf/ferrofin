@@ -717,6 +717,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   copying any session or item
 
 ### Security
+- A connection can no longer be held open for free. As on Jellyfin's web server (Kestrel), a
+  connection that has no request under way is closed after 130 s, and a request whose headers
+  have not all arrived 30 s after its first byte is answered `408` and closed; before, either
+  could stay open forever, and enough of them used up the server's file descriptors. Nothing
+  changes for a running request: a download, an upload and a slow response keep their
+  connection for as long as they take, and so does a WebSocket. Accepted sockets also turn on
+  TCP keep-alive, so the system ends a connection whose peer vanished, on the host's own
+  schedule (about 2 hours and 10 minutes by Linux's defaults). See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - A server whose setup was completed no longer starts when its database is missing, empty or
   has no migration history, as Jellyfin 12.2 refuses. It created an empty database and seeded
   a new `admin`; without `FERROFIN_ADMIN_PASSWORD` that admin had no password, so anyone who
@@ -826,7 +835,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   (an admin search/replace whose replace text multiplies the file, or another plugin's
   transform) is skipped with one warning, leaving the file as it was before that step
 - Dependencies with published RustSec advisories are upgraded: wasmtime and wasmtime-wasi
-  49.0.0 → 49.0.4 (25 advisories against the WASM plugin host, among them a WASI symlink-rename
+  49.0.0 → 49.0.5 (29 advisories against the WASM plugin host, among them a WASI symlink-rename
   sandbox escape, an aarch64 Cranelift miscompile and fuel-limit bypasses), zip 8 → 9 (three
   extraction advisories), h2, tokio, ctutils, event-listener, webpki-root-certs (distrusted CA
   roots), and quinn-proto, which Cargo.lock records although nothing builds it
