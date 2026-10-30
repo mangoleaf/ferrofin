@@ -644,8 +644,9 @@ impl LibraryScanner {
     }
 
     /// Season `number` of the series' TMDb record: the walk's cached
-    /// response for it in `language`, else a request of its own. [`None`]
-    /// when TMDb has no such season or the request failed.
+    /// response for it in `language`, else a request of its own (as after
+    /// a scan longer than the cache keeps a season). [`None`] when TMDb has
+    /// no such season or the request failed.
     async fn season_for_missing_episodes(
         &self,
         cache: &ArtworkCache,

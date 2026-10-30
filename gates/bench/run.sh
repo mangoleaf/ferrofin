@@ -620,8 +620,9 @@ rc=0; SERVER_PID=""
 interrupt_run() {
   gates_ack
   trap - INT TERM
-  # the server's shell had the TERM too (gates_supervise sends it to the whole worker group) and may have
-  # dropped it under bash 5.2: gates_stop sends it again until it lands
+  # the server's shell had the TERM too (gates_supervise sends it to the whole worker group). Under bash 5.2
+  # one that lands mid-parse exits it at once with status 2 (set -e), through its cleanup, which then records
+  # "exit 2". gates_stop waits for that cleanup, and would send the TERM again to a shell that dropped it.
   [ -z "$SERVER_PID" ] || gates_stop "$SERVER_PID"
   exit 130
 }

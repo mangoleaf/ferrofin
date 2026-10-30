@@ -1893,6 +1893,20 @@ impl FerrofinItemRepository {
         // derived table is aliased `bi` and carries `bi.*`, so they still
         // resolve.
         crate::translate_query::append_order_by(&mut qb, filter);
+        // Then `Id`, last. `GetItemValues` loads the page through
+        // `ApplyNavigations` over `AsSingleQuery()` (`ByName.cs:269-283`), and
+        // EF Core orders single-query collection includes by the principal key
+        // after the caller's ordering. Jellyfin 12.4's statement for
+        // `/Artists?searchTerm=…` ends `ORDER BY "b1"."c", "b1"."Id", …`, and
+        // with no search `ORDER BY "b1"."SortName", "b1"."Id", …`. So rows
+        // that tie on every key come back by `Id`, never in the order the
+        // representative window yields them. Upstream picks a full page's
+        // rows by the caller's keys alone, so which tied rows reach a page cut
+        // is engine-defined there; taking them by `Id` too is one valid
+        // instance of that. No index can serve this `ORDER BY` (it sorts a
+        // derived table that holds a window function), so the extra key
+        // changes no plan.
+        qb.push(r#", bi."Id" ASC"#);
         if let Some(limit) = filter.limit {
             qb.push(" LIMIT ").push_bind(i64::from(limit));
             let offset = filter.start_index.unwrap_or(0);
@@ -8368,6 +8382,94 @@ mod tests {
             .filter_map(|i| i.item.name.as_deref())
             .collect();
         assert_eq!(names, oldest_first);
+    }
+
+    /// Gives the by-name rows of `kind` named `names` the ids `first`,
+    /// `first + 1`, … in that order. The seeding write path draws them at
+    /// random, and a by-name list reaches its rows through `CleanName`, so
+    /// renumbering them leaves every link intact.
+    async fn renumber_by_name_rows(db: &Database, kind: BaseItemKind, names: &[&str], first: u128) {
+        for (id, name) in (first..).zip(names) {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Id" = ?1 WHERE "Type" = ?2 AND "Name" = ?3"#)
+                .bind(guid_to_db(Uuid::from_u128(id)))
+                .bind(stored_type_name(kind).expect("stored type"))
+                .bind(*name)
+                .execute(db.writer())
+                .await
+                .expect("renumber by-name row");
+        }
+    }
+
+    /// The names of a by-name list, in the order it returned them.
+    fn by_name_names(result: &QueryResult<ItemWithCounts>) -> Vec<&str> {
+        result
+            .items
+            .iter()
+            .filter_map(|i| i.item.name.as_deref())
+            .collect()
+    }
+
+    /// A by-name search with no `sortBy` breaks ties between equally relevant
+    /// hits by `Id`, as v12.4 does: `GetItemValues` loads the page through
+    /// `ApplyNavigations` over `AsSingleQuery()` (`ByName.cs:269-283`), and
+    /// EF Core orders single-query collection includes by the principal key
+    /// after the caller's ordering. Jellyfin 12.4's SQL for
+    /// `/Artists?searchTerm=…` ends `ORDER BY "b1"."c", "b1"."Id", …`.
+    /// Ferrofin left the ties in the representative window's order, which is
+    /// name order here.
+    #[tokio::test]
+    async fn by_name_search_breaks_equal_relevance_ties_by_id() {
+        let db = test_db().await;
+        let album = Uuid::from_u128(0xA121);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+        // Ids are given in reverse name order, so the two tiebreaks disagree.
+        let substring_hits = ["Rising Fires", "Green Fires", "Blue Fires", "Ancient Fires"];
+        for artist in ["Fires Of Spring"].iter().chain(&substring_hits) {
+            seed_item_value(&db, album, ItemValueType::Artist, artist).await;
+        }
+        renumber_by_name_rows(&db, BaseItemKind::MusicArtist, &substring_hits, 0xA131).await;
+        renumber_by_name_rows(&db, BaseItemKind::MusicArtist, &["Fires Of Spring"], 0xA13F).await;
+
+        let artists = repo(&db)
+            .get_artists(&InternalItemsQuery {
+                search_term: Some("fires".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("artists");
+        // The word-prefix hit leads whatever its id; the substring hits tie.
+        assert_eq!(
+            by_name_names(&artists),
+            [
+                "Fires Of Spring",
+                "Rising Fires",
+                "Green Fires",
+                "Blue Fires",
+                "Ancient Fires"
+            ]
+        );
+    }
+
+    /// With no search and no `sortBy`, v12.4's by-name ordering is
+    /// `OrderBy(SortName)` followed by the same `Id` key, so two rows with one
+    /// `SortName` ("The Band" and "Band" both sort as "band") come back in
+    /// `Id` order.
+    #[tokio::test]
+    async fn by_name_list_breaks_sort_name_ties_by_id() {
+        let db = test_db().await;
+        let album = Uuid::from_u128(0xA141);
+        seed_named_item(&db, album, BaseItemKind::MusicAlbum, "Album").await;
+        let id_order = ["The Band", "Band"];
+        for artist in id_order {
+            seed_item_value(&db, album, ItemValueType::Artist, artist).await;
+        }
+        renumber_by_name_rows(&db, BaseItemKind::MusicArtist, &id_order, 0xA151).await;
+
+        let artists = repo(&db)
+            .get_artists(&InternalItemsQuery::default())
+            .await
+            .expect("artists");
+        assert_eq!(by_name_names(&artists), id_order);
     }
 
     /// The same v12.2 rule on the item query (`/UserItems/Resume?searchTerm=…`
