@@ -612,6 +612,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Jellyfin answers `500`
 
 ### Performance
+- A request whose path needs no rewriting, which covers image, segment and `/web/*` fetches, costs
+  no allocation for path-case routing, and the route is found by a binary search instead of a
+  walk of the whole route table
 - Authenticating a request copies only the four credential headers into its context instead of
   every header the client sent, on every request including image and segment fetches
 - A JPEG's blur hash and its resized images decode at a reduced scale (1/8, 1/4 or 1/2 of
