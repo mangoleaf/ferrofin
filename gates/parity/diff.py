@@ -72,8 +72,11 @@ VERIFIED_SOURCE = "crates/ferrofin-api/src/handlers.rs"
 #: The per-request timeout defaults to 30 s and may be set from 10 to 120 s (run.sh holds the same range).
 REQUEST_TIMEOUT_DEFAULT_S = 30
 REQUEST_TIMEOUT_RANGE_S = (10, 120)
-#: Each difference is one of these.
-KINDS = ("status", "value", "type", "null", "missing", "extra", "length")
+#: Each difference is one of these. `order`: an array holds the same items in another order, reported once
+#: at the array, its items then compared by identity (Comparison.reordered).
+KINDS = ("status", "value", "type", "null", "missing", "extra", "length", "order")
+#: The fields that identify an array's object items, first match wins: one present and unique on both sides.
+ITEM_KEYS = ("Id", "ItemId", "Key")
 RULE_KINDS = ("opaque", "opaque-keys", "unordered")
 #: The methods the harness sends; a write runs on a fresh database copy, after every read.
 WRITES = ("POST", "DELETE")
@@ -581,6 +584,11 @@ class Difference:
         return {"path": self.path, "at": self.at, "kind": self.kind, "oracle": self.oracle, "ferrofin": self.ferrofin}
 
 
+def same_id(value):
+    """An id with dashes and case set aside: `0123-ABCD` is the item `0123abcd` is."""
+    return str(value).replace("-", "").lower()
+
+
 def root(path):
     """A rule's path as the comparison walks it: `$`, the whole body, is the empty path of its root."""
     return "" if path == "$" else path
@@ -643,6 +651,11 @@ class Comparison:
                 self.add(path, at, "type", a, b)
                 return
             a, b = sorted(a, key=lambda x: str(x[key])), sorted(b, key=lambda x: str(x[key]))
+        elif (pairs := self.reordered(a, b, f"{path}[]")) is not None:
+            self.add(path, at, "order", *pairs[0])
+            for index, (x, y) in enumerate(pairs[1]):
+                self.walk(x, y, f"{path}[]", f"{at}[{index}]")
+            return
         if len(a) != len(b):
             self.add(path, at, "length", a, b)
         for index, (x, y) in enumerate(zip(a, b)):
@@ -654,14 +667,44 @@ class Comparison:
             else:
                 self.walk(x, y, child, where)
 
+    def reordered(self, a, b, path):
+        """When two arrays hold the same items in another order: `((oracle, ferrofin), pairs)`, the two
+        sides' items at the first position where the orders part, and each item paired with its own, in the
+        oracle's order; else None. Objects are the same item by the first of ITEM_KEYS that every item on both
+        sides has and no rule makes opaque (dashes and case set aside); if that key repeats on a side, they
+        compare by position (the next key is not tried). Scalars are the same by value. Arrays a rule names
+        are left to it (`unordered` pairs by its own `by`), and a rule on the items keeps position."""
+        if len(a) != len(b) or len(a) < 2 or path in self.by_path:
+            return None
+        if all(isinstance(x, dict) for x in a + b):
+            field = next((f for f in ITEM_KEYS if all(f in x for x in a + b)
+                          and not ((r := self.by_path.get(f"{path}.{f}")) and r.kind == "opaque")), None)
+            if field is None:
+                return None
+            identity = lambda x: same_id(x[field])
+        elif not any(isinstance(x, (dict, list)) for x in a + b):
+            identity = lambda x: json.dumps(x, sort_keys=True)
+        else:
+            return None
+        ka, kb = [identity(x) for x in a], [identity(y) for y in b]
+        if ka == kb or sorted(ka) != sorted(kb):
+            return None
+        if len(set(ka)) != len(ka) and isinstance(a[0], dict):   # a repeated key would pair the wrong items
+            return None
+        by_key = {}
+        for k, y in zip(kb, b):
+            by_key.setdefault(k, []).append(y)
+        at = next(i for i, (x, y) in enumerate(zip(ka, kb)) if x != y)
+        shown = lambda keys: f"[{at}] {keys[at]} of {len(keys)}"
+        return (shown(ka), shown(kb)), [(x, by_key[k].pop(0)) for k, x in zip(ka, a)]
+
     def other_items(self, x, y, path):
         """Whether two array elements are different items: objects whose ids differ, also once dashes and
         case are set aside (a format difference is reported at the id, the fields still compared), where no
         rule applies to the element or makes its id opaque."""
         if not (isinstance(x, dict) and isinstance(y, dict) and "Id" in x and "Id" in y) or path in self.by_path:
             return False
-        same = lambda v: str(v).replace("-", "").lower()
-        if same(x["Id"]) == same(y["Id"]):
+        if same_id(x["Id"]) == same_id(y["Id"]):
             return False
         rule = self.by_path.get(f"{path}.Id")
         return not (rule and rule.kind == "opaque")
@@ -1283,7 +1326,7 @@ def write_results(out, summary):
 
 # ── result.json (the overview) ──────────────────────────────────────────────
 #: A request's outcome in the overview, in the order they are shown.
-OUTCOMES = ("identical", "accepted", "filed", "new", "oracle_failed")
+OUTCOMES = ("identical", "order", "accepted", "filed", "new", "oracle_failed")
 
 
 def gate_result():
@@ -1297,9 +1340,12 @@ def gate_result():
 
 
 def outcome(result):
-    """What one request's comparison came to: identical; accepted (every difference is in the ledger);
-    filed (every difference the ledger does not accept is filed as an issue); new; or oracle failed
-    (Jellyfin did not answer as the request expects, so nothing was compared: never counted identical)."""
+    """What one request's comparison came to: identical; order (the same answer in another order, which the
+    ledger accepts: never counted identical); accepted (every difference is in the ledger); filed (every
+    difference the ledger does not accept is filed as an issue); new; or oracle failed (Jellyfin did not
+    answer as the request expects, so nothing was compared: never counted identical)."""
+    if result["state"] == "ledgered" and all(d["kind"] == "order" for d in result["differences"]):
+        return "order"
     if result["state"] in ("match", "ledgered", "oracle failed"):
         return {"match": "identical", "ledgered": "accepted", "oracle failed": "oracle_failed"}[result["state"]]
     unaccepted = [d for d in result["differences"] if not d["ledger"]]

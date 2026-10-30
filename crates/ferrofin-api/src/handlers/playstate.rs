@@ -48,8 +48,11 @@ struct MarkPlayedQuery {
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
     user_id: Option<Uuid>,
-    /// Optional date the item was played (ISO-8601); defaults to now.
-    #[serde(default)]
+    /// Optional date the item was played; defaults to now.
+    #[serde(
+        default,
+        deserialize_with = "crate::handlers::query_date_time::deserialize_optional_legacy_date_time"
+    )]
     date_played: Option<chrono::DateTime<chrono::Utc>>,
 }
 

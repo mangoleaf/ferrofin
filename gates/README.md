@@ -36,7 +36,9 @@ gates/run all --dry-run          # the preflight and every gate's command; nothi
 docker build --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t IMAGE .   # the image the preflight names
 gates/run all                    # verify, adoption, parity, bench, in that order
 gates/run adoption               # one gate: a session all the same
-gates/run bench --previous ghcr.io/mangoleaf/ferrofin:vPREV   # bench as the release A/B gate
+gates/run bench --previous ghcr.io/mangoleaf/ferrofin:vPREV   # bench as the release A/B gate: vPREV is the latest
+                                 # release of the minor line before (v1.4.1: v1.3.2), enforced for a release:
+                                 # a release/vX.Y.Z branch, or --release vX.Y.Z (a patch cut from main)
 ```
 
 The image defaults to `ferrofin:<the commit, as git describe names it>`, and must carry the checked-out
@@ -67,8 +69,8 @@ never stop a run with `kill -9`: its worker would run on. Ctrl-Z suspends only t
 builds the report itself ([its README](adoption/README.md)).
 
 The root [`Makefile`](../Makefile) offers the same as targets: `make run-gates` for all four, and
-`make run-verify`, `make run-adoption`, `make run-parity` or `make run-bench` for one, with `IMAGE=`
-and `PREVIOUS=` passed through from the command line (`make run-gates IMAGE=ferrofin:v1.4.0-rc
+`make run-verify`, `make run-adoption`, `make run-parity` or `make run-bench` for one, with `IMAGE=`,
+`PREVIOUS=` and `RELEASE=` passed through from the command line (`make run-gates IMAGE=ferrofin:v1.4.0-rc
 PREVIOUS=ghcr.io/mangoleaf/ferrofin:v1.3.2`); a bare `make` only lists them. `make test-gates-offline`
 runs the gates' own tests, which need no docker, server or fixtures, as CI's shell-tests job does:
 shellcheck, the bats tests and every gate's Python tests. They need `bats`, `shellcheck`, `sqlite3`,
@@ -101,54 +103,69 @@ Every gate is moving to one structured result, `<run>/result.json`, in the envel
 `fixture`), `started`, `ended`, and `detail`, the gate's own data. Its HTML report, this page and the
 viewer read that file, never the gate's internal files. Every gate writes one.
 
-The page also shows the README's graphs for the session's own results ([`publish.py`](publish.py), inline,
+The page also shows the release page's graphs for the session's own results ([`publish.py`](publish.py), inline,
 in the reader's light or dark theme): the adoption grid, the parity overview, and for a Jellyfin-comparison
 benchmark the speed and memory graphs of that one run.
 
 ## Publishing the results
 
-The README's Results section shows each release's numbers against Jellyfin, drawn from one small file per
+The README's Results section summarises each release's numbers against Jellyfin, and the release's own page,
+`docs/results/<version>/README.md`, holds every graph and table. Both are drawn from one small file per
 release that stays in the repository, `docs/results/<version>/summary.json`. The release operator chooses the
 local runs it is made from; nothing is picked automatically, and nothing here runs a gate:
 
 ```bash
-make publish-results VERSION=v1.4.0 SESSION="$FERROFIN_GATES_DIR/runs/<session>" BENCH="<run> <run> <run>" [AB=<A/B session>]
+make publish-results VERSION=v1.4.0 SESSION="$FERROFIN_GATES_DIR/runs/<session>" BENCH="<run> <run> <run>" [AB=<A/B session>] [MEASURED_BEFORE_TAG=1]
 ```
 
 That runs [`publish.py`](publish.py) twice:
 - `summarise` reads each named benchmark run's `result.json`, and the session's `adoption/result.json` and
   `parity/result.json`, and writes the summary. It holds only the numbers the README shows, each with its source: the run
-  folders, commit, image digest, Jellyfin version, run count, host class (cores and memory) and fixture
-  hash. It also holds the adoption status of every row of the session and its parity overview, with the
+  folders, commit, image digest, Jellyfin version, run count, host class (cores and memory), fixture
+  hash and the library's size (its movies, series, episodes and HDR videos; summaries from before v1.4.1 lack it,
+  and the README then leaves it out). It also holds the adoption status of every row of the session and its parity overview, with the
   session's commit and date.
   It refuses fewer than three Jellyfin-comparison runs, and runs of different images, hosts or fixtures. It
   also refuses a session of uncommitted code, one that measured another commit than the runs, and one
   whose adoption ran nothing or whose parity run is missing or did not send every request it planned.
+  The release's tag must exist in the checkout, and every result must record the tag's commit. A result
+  records the commit of the harness checkout it ran from, so build the image from that same checkout. A
+  release re-cut after its runs is published by running them again on the new commit. With
+  `MEASURED_BEFORE_TAG=1` (`--measured-before-tag`), the earlier commit's results are published anyway,
+  and the README's Results block opens by saying which commit they measured.
 - `readme` draws every graph of the newest summary into `docs/results/<version>/`, a light and a dark SVG
-  each, and replaces the block between the `BEGIN`/`END GENERATED RESULTS` markers in `README.md`. The same
-  summary files give byte-identical output, and `publish.py readme --check` exits 1 when the block or the
-  images differ from what they give.
+  each, writes the release's page beside them, and replaces the block between the `BEGIN`/`END GENERATED
+  RESULTS` markers in `README.md`. The same summary files give byte-identical output, and
+  `publish.py readme --check` exits 1 when the block, the page or the images differ from what they give.
+  Neither names a gates session or a private issue: a run is cited by its commit, image and fixture.
+
+The README block is short: the headline, with the library and the one-host caveat; the graphs of the screens at
+5 screens/s, time to first screen and memory; one plain sentence naming what was withheld (search, when it is);
+one paragraph each on adoption and parity; and a link to the release's page. The page holds the rest.
 
 Every graph follows one style: Ferrofin in blue and Jellyfin in grey. Ferrofin's bar turns amber where it is
 slower. Each bar carries its value, each axis its unit, and each graph a caption naming its source. Every
 comparable cell is drawn, the biggest speed-up first. A cell the servers answered differently, or whose
-evidence is incomplete, is withheld and listed with its reason under the graphs. The graphs are:
+evidence is incomplete, is withheld and listed with its reason on the release's page. The page's graphs are:
 - p50 per screen and endpoint at the loaded and stress levels;
 - time to first screen;
 - peak and idle memory;
 - CPU per completed screen, where the work matched.
 
-With `AB=` (the release A/B gate's session, `gates/bench/gate.py ab` or `gates/run --previous`), a graph
-follows of the release against the previous one: every gated cell as how many times better the candidate
+With `AB=` (the release A/B gate's session, `gates/bench/gate.py ab` or `gates/run --previous`), the page
+adds a graph of the release against the previous one (a maintainers' release check, so not in the README): every gated cell as how many times better the candidate
 is, coloured by the gate's verdict (improved, within noise, regressed; the biggest gain first), with a table
 of every cell and the reason a cell was not comparable.
 
 Below them, a grid gives the adoption status of every supported Jellyfin version and upgrade route:
 passed, failed, skipped (a fixture that was not built) or unfinished, with a table of the reasons. Then the
-parity overview: of the requests jellyfin-web makes, how many Ferrofin answers identically, with an accepted
-difference, with a difference filed as an issue, or with a new one, and how many could not be compared because
+parity overview: of the requests jellyfin-web makes, how many Ferrofin answers identically, with the same answer
+in another order (counted from releases whose run recorded it), with a known difference (each recorded in the parity
+ledger with the issue that tracks it, or the parity row that accepts it), with a difference filed as an issue, or with
+a new one, and how many could not be compared because
 Jellyfin itself failed them, as one stacked bar per API area (the busiest twelve, then the rest as one) and a
-table of every area. Last, one graph follows the headline numbers (cold start, the median p50 of the comparable
-screens at 5 screens/s, peak and idle memory) over every release published, each against the Jellyfin release it
-was measured with; a release measured on another host class or benchmark fixture starts a new line, so a moved
-host never reads as a regression or a win. It is drawn from every summary file into `docs/results/history.svg`.
+table of every area. Last, once two releases are published, the README draws one graph of the headline numbers
+(cold start, the median p50 of the comparable screens at 5 screens/s, peak and idle memory) over every release,
+each against the Jellyfin release it was measured with; a release measured on another host class or benchmark
+fixture starts a new line, so a moved host never reads as a regression or a win. It is drawn from every summary
+file into `docs/results/history.svg`.
