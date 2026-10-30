@@ -18,6 +18,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   the reason when it may not. A **Ferrofin** plugin under Dashboard → Plugins carries it: the
   route answers `404` while the plugin is disabled, and `FERROFIN_DISABLE_EXTENSIONS` leaves the
   plugin registered (see [docs/CONFIG.md](docs/CONFIG.md#seeing-what-is-set))
+- The **Ferrofin** plugin's settings page in jellyfin-web: its Settings link under Dashboard →
+  Plugins and a Ferrofin entry in the dashboard menu open a read-only list of every Ferrofin
+  setting by group, with its value, default, source badge, variable and flag, and a lock with the
+  reason on each one the page may not change; secrets are marked as secrets. The page holds no
+  setting itself (it is served anonymously) and disappears with the plugin when it is disabled
 
 ### Database
 - Adopt Jellyfin 12.3 and 12.4 databases in place: neither release adds a migration, so each
@@ -601,8 +606,20 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   no identity of its own online, so a lookup by its file name filled it with another title's
   overview, people or Primary image. Its local readers, embedded images and extracted frames
   still run. The item it belongs to is asked as before
+- `POST /LiveTv/ListingProviders` with an XMLTV provider whose `Path` is empty answers `404`,
+  as Jellyfin's `XmlTvListingsProvider.Validate` does (no file has that name), instead of
+  `400`. Nothing is saved either way. A provider with no `Path` at all is still a `400`, where
+  Jellyfin answers `500`
 
 ### Performance
+- A JPEG's blur hash and its resized images decode at a reduced scale (1/8, 1/4 or 1/2 of
+  each side, by DCT scaling, as Jellyfin's blur hash decodes through Skia) instead of at full
+  size. A 24 MP baseline photo's blur hash peaks at about 2 MB of memory instead of 80 MB (a
+  progressive JPEG still holds its full-size DCT coefficients while it decodes); a resized
+  image decodes at the smallest scale still twice its size and stays close to the full
+  decode. Blur hashes computed from now on can differ from the full decode's by one
+  quantisation step, no closer to or further from Jellyfin's; this change recomputes no
+  stored hash. Other formats decode as before
 - A library scan keeps the remote answers it shares between items only as long as
   Jellyfin's provider clients keep theirs, instead of until the scan ends. A TheMovieDb
   season is kept for an hour after it was fetched, and the season cache holds at most
@@ -662,6 +679,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   before it reads the next channel's. It used to hold every airing and every stored programme
   item of the whole guide at once. The guide rows are built as they are written instead of
   all first. What the refresh stores is unchanged; its memory was not measured
+- The `UserDataChanged` push reads the user data of the items it lists together, where it
+  read each item on its own (four to six statements per item and per parent). Only a
+  folder's played counts are still read per folder. Marking a five-episode series played
+  now runs 14 statements for the push instead of 44; the message is unchanged
 - A playing session's `NowPlayingItem` is built once, on the start or progress report that
   first names the item, and kept until another item plays or playback stops, as Jellyfin's
   `UpdateNowPlayingItem` does. `GET /Sessions` and the WebSocket `Sessions` stream used to
@@ -1092,6 +1113,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   matched nothing, so a movie in the usual `Name (Year)` layout with no NFO or id tag got no
   metadata. The year in the name is the search year when the item has none, and OMDb gets the
   title with its punctuation
+- A season takes its artwork from its series folder, as Jellyfin does: `season01-poster.jpg`,
+  `season01-fanart.jpg`, `season01-banner.jpg` and `season01-landscape.jpg` (`season-specials-*`
+  for season 0, or the season's name, `season1-poster.jpg`) are its Primary, Backdrop, Banner and
+  Thumb, ahead of the images in its own folder. A season with no folder of its own (episodes
+  directly in the series folder) gets them too, on a scan and on its own refresh. A season that
+  holds another Primary takes the local file on the next scan, and a scan stores only the first
+  local image of each single-image type, as Jellyfin's `MergeImages` does
 
 ## [1.0.0] - 2026-09-05
 

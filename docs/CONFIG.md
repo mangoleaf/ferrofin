@@ -1,5 +1,9 @@
 # Configuration
 
+Every runtime setting below is listed in jellyfin-web under **Dashboard → Plugins → Ferrofin →
+Settings** ([Seeing what is set](#seeing-what-is-set)). The page is read-only so far: a setting
+is changed in one of the three places below.
+
 Ferrofin is configured three ways, **highest precedence first**:
 
 1. **CLI flags** — `--data-dir`, `--bind`, `--port`, `--published-url`, `--ffmpeg`, `--config`.
@@ -52,6 +56,12 @@ General pages cover. Secrets (the provider keys, the TheTVDB PIN, the seed admin
 reported in plain text, as Jellyfin's plugin settings are, and never logged. The route belongs
 to the **Ferrofin** plugin under Dashboard → Plugins and answers `404` while that plugin is
 disabled.
+
+That plugin's settings page shows the report: open it from the plugin's Settings link or the
+dashboard menu's **Ferrofin** entry. It lists the settings in groups (Paths, Network and
+identity, ffmpeg, Library and database, Observability, Metadata providers, WASM plugins), each
+with its value, default, source, variable and flag, and the reason for any it may not change;
+secrets are marked as secrets. Disabling the plugin hides the page and the menu entry.
 
 ### When a change applies
 

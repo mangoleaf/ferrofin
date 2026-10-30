@@ -8,6 +8,18 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — every image tag changes once; clients download artwork again once
+
+Nothing to do. An image's cache tag (`ImageTags`, `BackdropImageTags`, the blurhash keys and
+every other `*ImageTag`) now hashes the path of the item that owns the image, as Jellyfin's
+does, where it hashed the image file's path. Every tag therefore changes once after the
+upgrade, and clients, which cache artwork by tag, fetch each image again the first time they
+show it. The tags are then the ones Jellyfin serves for the same database, so a client that
+talks to both servers, or one carried over from Jellyfin by adopting its database, shares
+cached artwork with it. The server's own resized-image cache is keyed on the image file, not on
+the tag, and is kept. A user's profile image keeps its tag (Jellyfin hashes the image's own path
+there too).
+
 ## Unreleased — the WebSocket minimum stream period setting is gone
 
 Usually nothing to do. `FERROFIN_WS_MIN_STREAM_PERIOD_MS` (`websocket_min_stream_period_ms` in

@@ -87,19 +87,25 @@ pub trait ImageProcessor: Send + Sync {
         image_dimensions: ImageDimensions,
     ) -> Result<String, ServiceError>;
 
-    /// Computes the cache tag for an item's image row, or `None` when the image
-    /// cannot be tagged. Port of the several `GetImageCacheTag` overloads
-    /// (`BaseItem`/`BaseItemDto` + `ItemImageInfo`/`ChapterInfo`), collapsed to
-    /// one id-plus-[`ItemImageInfo`] form.
+    /// Computes the cache tag of an item's image row, or `None` when the image
+    /// cannot be tagged. Port of `GetImageCacheTag(BaseItem item,
+    /// ItemImageInfo image)` and its `BaseItemDto` twin, `=>
+    /// GetImageCacheTag(item.Path, image.DateModified)`: the tag hashes the
+    /// OWNING item's path — `item_path`, as the item read expands it
+    /// (`ExpandVirtualPath`) — with the image's modification time, never the
+    /// image file's path. `None` (a path-less item) hashes as the empty
+    /// string, as the C# concatenation does.
     async fn get_image_cache_tag(
         &self,
-        item_id: Uuid,
+        item_path: Option<&str>,
         image: &ItemImageInfo,
     ) -> Result<Option<String>, ServiceError>;
 
-    /// Computes the cache tag for an image path plus its modification time.
-    /// Port of the `GetImageCacheTag(string baseItemPath, DateTime
-    /// imageDateModified)` overload.
+    /// Computes the cache tag for an item path plus an image's modification
+    /// time. Port of the `GetImageCacheTag(string baseItemPath, DateTime
+    /// imageDateModified)` overload, which the chapter tags
+    /// (`ChapterRepository`) and the user profile image
+    /// (`GetImageCacheTag(User)`, the image's own path) use directly.
     async fn get_image_cache_tag_for_path(
         &self,
         base_item_path: &str,

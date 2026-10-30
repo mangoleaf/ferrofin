@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>Ferrofin</title>
+</head>
+
+<body>
+    <!--
+        The Ferrofin plugin's settings page, authored in this repository (not
+        vendored from a Jellyfin plugin). jellyfin-web keeps only the
+        `data-role="page"` element and runs the scripts inside it, so the
+        styles and the script live in it too.
+
+        The page is served anonymously (`GET /web/ConfigurationPage`), so it
+        holds no setting: everything it shows comes from the admin-only
+        `GET /Ferrofin/Settings`, and every string from that response is set
+        as text or as an attribute, never parsed as HTML.
+    -->
+    <div data-role="page" class="page type-interior pluginConfigurationPage ferrofinSettingsPage"
+        data-require="emby-input,emby-button,emby-checkbox">
+        <div data-role="content">
+            <div class="content-primary">
+                <div class="verticalSection">
+                    <div class="sectionTitleContainer flex align-items-center">
+                        <h2 class="sectionTitle">Ferrofin</h2>
+                    </div>
+                    <p class="fieldDescription">
+                        The server's own settings: the value each one has now, its default, and where
+                        that value comes from. A setting set by an environment variable or a
+                        command-line flag is changed where the server is started.
+                    </p>
+                </div>
+                <div class="ferrofinNotice ferrofinRestartPending hide" role="status">
+                    <span class="material-icons restart_alt" aria-hidden="true"></span>
+                    <span>A server restart is pending.</span>
+                </div>
+                <div class="ferrofinNotice ferrofinError hide" role="alert">
+                    <span class="material-icons error" aria-hidden="true"></span>
+                    <span class="ferrofinErrorText"></span>
+                </div>
+                <p class="ferrofinConfigFile hide">
+                    Settings file: <code class="ferrofinConfigFilePath"></code>
+                </p>
+                <div class="ferrofinGroups"></div>
+            </div>
+        </div>
+
+        <style>
+            .ferrofinSettingsPage .ferrofinNotice {
+                display: flex;
+                align-items: flex-start;
+                gap: 0.6em;
+                margin: 1em 0;
+                padding: 0.8em 1em;
+                border-radius: 0.3em;
+                background: rgba(128, 128, 128, 0.15);
+            }
+
+            .ferrofinSettingsPage .ferrofinGroup {
+                margin-top: 2em;
+            }
+
+            .ferrofinSettingsPage .ferrofinSetting {
+                padding: 0.9em 0;
+                border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+            }
+
+            .ferrofinSettingsPage .ferrofinSettingHeader {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 0.5em;
+            }
+
+            .ferrofinSettingsPage .ferrofinSettingKey {
+                margin: 0;
+                font-family: monospace;
+                font-size: 1.05em;
+            }
+
+            .ferrofinSettingsPage .ferrofinBadge {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.25em;
+                padding: 0.1em 0.6em;
+                border: 1px solid currentColor;
+                border-radius: 1em;
+                font-size: 0.8em;
+                opacity: 0.85;
+            }
+
+            .ferrofinSettingsPage .ferrofinBadgeSecret {
+                border-style: dashed;
+            }
+
+            .ferrofinSettingsPage .material-icons {
+                font-size: 1.2em;
+            }
+
+            .ferrofinSettingsPage .ferrofinBadge .material-icons {
+                font-size: 1.1em;
+            }
+
+            .ferrofinSettingsPage .ferrofinFacts {
+                display: grid;
+                grid-template-columns: max-content 1fr;
+                gap: 0.3em 1em;
+                margin: 0.6em 0 0;
+            }
+
+            .ferrofinSettingsPage .ferrofinFacts dt {
+                opacity: 0.7;
+            }
+
+            .ferrofinSettingsPage .ferrofinFacts dd {
+                margin: 0;
+                overflow-wrap: anywhere;
+            }
+
+            .ferrofinSettingsPage code {
+                font-family: monospace;
+                overflow-wrap: anywhere;
+            }
+
+            .ferrofinSettingsPage .ferrofinListItem {
+                display: block;
+            }
+
+            .ferrofinSettingsPage .ferrofinSecretValue {
+                padding: 0 0.3em;
+                border: 1px dashed currentColor;
+                border-radius: 0.2em;
+            }
+
+            .ferrofinSettingsPage .ferrofinUnset {
+                font-style: italic;
+                opacity: 0.7;
+            }
+
+            .ferrofinSettingsPage .ferrofinNote {
+                display: flex;
+                align-items: flex-start;
+                gap: 0.5em;
+                margin: 0.6em 0 0;
+            }
+        </style>
+
+        <script type="text/javascript">
+            (function () {
+                'use strict';
+
+                // The groups and sources the server names, as the page titles
+                // them. A name missing here is shown as the server sends it,
+                // so a new group or source needs no page change (`titled`).
+                var GROUP_TITLES = {
+                    Paths: 'Paths',
+                    Network: 'Network and identity',
+                    Ffmpeg: 'ffmpeg',
+                    Library: 'Library and database',
+                    Observability: 'Observability',
+                    Providers: 'Metadata providers',
+                    Wasm: 'WASM plugins'
+                };
+                var SOURCE_NAMES = {
+                    Default: 'Default',
+                    ConfigFile: 'config.toml',
+                    Environment: 'Environment',
+                    Flag: 'Flag'
+                };
+
+                /** `names[name]` when the page titles that name, else `name` itself. */
+                function titled(names, name) {
+                    return Object.prototype.hasOwnProperty.call(names, name) ? names[name] : name;
+                }
+
+                /** A new `tag` element with `className` and, if given, `text` as its text. */
+                function element(tag, className, text) {
+                    var node = document.createElement(tag);
+                    if (className) {
+                        node.className = className;
+                    }
+                    if (text !== undefined && text !== null) {
+                        node.textContent = String(text);
+                    }
+                    return node;
+                }
+
+                /** A material icon (jellyfin-web ships the font). */
+                function icon(name) {
+                    var node = element('span', 'material-icons ' + name);
+                    node.setAttribute('aria-hidden', 'true');
+                    return node;
+                }
+
+                /** Appends `text` to `node`, each `quoted` name in it as code, all as text. */
+                function withCode(node, text) {
+                    String(text).split('`').forEach(function (part, index) {
+                        if (part) {
+                            node.appendChild(index % 2 === 1 ? element('code', null, part) : document.createTextNode(part));
+                        }
+                    });
+                    return node;
+                }
+
+                function clear(node) {
+                    while (node.firstChild) {
+                        node.removeChild(node.firstChild);
+                    }
+                }
+
+                function badge(text, className, iconName) {
+                    var node = element('span', 'ferrofinBadge' + (className ? ' ' + className : ''));
+                    if (iconName) {
+                        node.appendChild(icon(iconName));
+                    }
+                    node.appendChild(element('span', null, text));
+                    return node;
+                }
+
+                /** One value (a list's item) as text; an object as its JSON. */
+                function scalar(value) {
+                    if (typeof value === 'string') {
+                        return value;
+                    }
+                    if (value !== null && typeof value === 'object') {
+                        return JSON.stringify(value);
+                    }
+                    return String(value);
+                }
+
+                /** A value as the page shows it; a secret's is marked as one. */
+                function valueNode(value, secret) {
+                    var node = element('span');
+                    var items = Array.isArray(value) ? value : [value];
+                    if (items.length === 0) {
+                        node.appendChild(element('span', 'ferrofinUnset', 'An empty list'));
+                        return node;
+                    }
+                    items.forEach(function (item) {
+                        if (item === '') {
+                            node.appendChild(element('span', 'ferrofinUnset', 'Empty'));
+                            return;
+                        }
+                        var code = element('code', secret ? 'ferrofinSecretValue' : null, scalar(item));
+                        if (Array.isArray(value)) {
+                            code.classList.add('ferrofinListItem');
+                        }
+                        node.appendChild(code);
+                    });
+                    return node;
+                }
+
+                function fact(list, label, content) {
+                    list.appendChild(element('dt', null, label));
+                    var dd = element('dd');
+                    if (typeof content === 'string') {
+                        dd.textContent = content;
+                    } else {
+                        dd.appendChild(content);
+                    }
+                    list.appendChild(dd);
+                }
+
+                function note(iconName, text, className) {
+                    var node = element('p', 'ferrofinNote fieldDescription' + (className ? ' ' + className : ''));
+                    node.appendChild(icon(iconName));
+                    node.appendChild(withCode(element('span'), text));
+                    return node;
+                }
+
+                /** Where the `config.toml` value of a setting stands beside the one in use. */
+                function savedNote(setting) {
+                    if (setting.Source === 'Environment') {
+                        return 'not used while the environment variable sets it';
+                    }
+                    if (setting.Source === 'Flag') {
+                        return 'not used while the command-line flag sets it';
+                    }
+                    return 'applies after restart';
+                }
+
+                function renderSetting(setting) {
+                    var secret = setting.Kind === 'Secret';
+                    var row = element('div', 'ferrofinSetting');
+                    row.setAttribute('data-key', setting.Key);
+
+                    var header = element('div', 'ferrofinSettingHeader');
+                    header.appendChild(element('h4', 'ferrofinSettingKey', setting.Key));
+                    header.appendChild(badge(titled(SOURCE_NAMES, setting.Source), 'ferrofinBadgeSource'));
+                    if (secret) {
+                        header.appendChild(badge('Secret', 'ferrofinBadgeSecret', 'key'));
+                    }
+                    if (!setting.Editable) {
+                        header.appendChild(badge('Read-only', 'ferrofinBadgeLocked', 'lock'));
+                    }
+                    row.appendChild(header);
+
+                    if (setting.Description) {
+                        row.appendChild(withCode(element('div', 'fieldDescription'), setting.Description));
+                    }
+
+                    var facts = element('dl', 'ferrofinFacts');
+                    if (setting.Value === undefined || setting.Value === null) {
+                        fact(facts, 'Value', element('span', 'ferrofinUnset',
+                            setting.Default ? 'Not set: the default applies' : 'Not set'));
+                    } else {
+                        fact(facts, 'Value', valueNode(setting.Value, secret));
+                    }
+                    if (setting.SavedValue !== undefined && setting.SavedValue !== null) {
+                        var saved = element('span');
+                        saved.appendChild(valueNode(setting.SavedValue, secret));
+                        saved.appendChild(element('span', null, ' (' + savedNote(setting) + ')'));
+                        fact(facts, 'Saved in config.toml', saved);
+                    }
+                    if (setting.Default) {
+                        fact(facts, 'Default', setting.Default);
+                    }
+                    if (setting.EnvVar) {
+                        fact(facts, 'Environment variable', element('code', null, setting.EnvVar));
+                    }
+                    if (setting.Flag) {
+                        fact(facts, 'Flag', element('code', null, setting.Flag));
+                    }
+                    row.appendChild(facts);
+
+                    if (!setting.Editable && setting.LockedReason) {
+                        row.appendChild(note('lock', setting.LockedReason, 'ferrofinLockedReason'));
+                    }
+                    if (setting.Applies === 'ProcessRestart') {
+                        row.appendChild(note('restart_alt',
+                            'Needs a full process restart: the dashboard\'s restart keeps the value the process started with.',
+                            'ferrofinProcessRestart'));
+                    }
+                    return row;
+                }
+
+                function render(page, response) {
+                    var groups = page.querySelector('.ferrofinGroups');
+                    clear(groups);
+                    page.querySelector('.ferrofinError').classList.add('hide');
+                    page.querySelector('.ferrofinRestartPending').classList.toggle('hide', !response.RestartPending);
+                    page.querySelector('.ferrofinConfigFilePath').textContent = response.ConfigFile || '';
+                    page.querySelector('.ferrofinConfigFile').classList.toggle('hide', !response.ConfigFile);
+
+                    // One section per group, in the order the server lists them.
+                    var sections = Object.create(null);
+                    (response.Settings || []).forEach(function (setting) {
+                        var section = sections[setting.Group];
+                        if (!section) {
+                            section = element('div', 'verticalSection ferrofinGroup');
+                            section.setAttribute('data-group', setting.Group);
+                            section.appendChild(element('h3', 'sectionTitle', titled(GROUP_TITLES, setting.Group)));
+                            sections[setting.Group] = section;
+                            groups.appendChild(section);
+                        }
+                        section.appendChild(renderSetting(setting));
+                    });
+                }
+
+                function showError(page, text) {
+                    clear(page.querySelector('.ferrofinGroups'));
+                    page.querySelector('.ferrofinConfigFile').classList.add('hide');
+                    page.querySelector('.ferrofinRestartPending').classList.add('hide');
+                    var message = page.querySelector('.ferrofinErrorText');
+                    clear(message);
+                    withCode(message, text);
+                    page.querySelector('.ferrofinError').classList.remove('hide');
+                }
+
+                /** The message for a failed load; `failure` is the fetch's Response, or an Error. */
+                function failureText(failure) {
+                    if (failure instanceof Error) {
+                        return Promise.resolve('Could not load the Ferrofin settings: ' + failure.message);
+                    }
+                    if (!failure || typeof failure.status !== 'number') {
+                        return Promise.resolve('Could not load the Ferrofin settings: the server did not answer.');
+                    }
+                    switch (failure.status) {
+                        case 401:
+                            return Promise.resolve('Sign in again to see the Ferrofin settings.');
+                        case 403:
+                            return Promise.resolve('Only administrators can see the Ferrofin settings.');
+                        case 404:
+                            return Promise.resolve('The Ferrofin plugin is disabled. Enable it under Dashboard → Plugins to see its settings.');
+                        default: {
+                            var prefix = 'Could not load the Ferrofin settings (HTTP ' + failure.status + ')';
+                            return failure.json().then(function (body) {
+                                return body && body.error ? prefix + ': ' + body.error : prefix + '.';
+                            }, function () {
+                                return prefix + '.';
+                            });
+                        }
+                    }
+                }
+
+                function load(page) {
+                    Dashboard.showLoadingMsg();
+                    ApiClient.fetch({
+                        url: ApiClient.getUrl('Ferrofin/Settings'),
+                        type: 'GET',
+                        dataType: 'json'
+                    }).then(function (response) {
+                        render(page, response);
+                    }).catch(function (failure) {
+                        return failureText(failure).then(function (text) {
+                            showError(page, text);
+                        });
+                    }).finally(function () {
+                        Dashboard.hideLoadingMsg();
+                    });
+                }
+
+                // jellyfin-web keeps earlier views in the document, so this
+                // script binds only the page it was loaded with: the one not
+                // bound yet. `pageshow` fires on each visit, a return to the
+                // cached view included, and reloads the settings.
+                document.querySelectorAll('.ferrofinSettingsPage').forEach(function (page) {
+                    if (page.getAttribute('data-ferrofin-bound') === 'true') {
+                        return;
+                    }
+                    page.setAttribute('data-ferrofin-bound', 'true');
+                    page.addEventListener('pageshow', function () {
+                        load(page);
+                    });
+                });
+            }());
+        </script>
+    </div>
+</body>
+
+</html>

@@ -74,7 +74,7 @@ pub struct FerrofinItemRepository {
     /// composition root (see [`FerrofinItemRepository::with_root_ids`]).
     roots: Option<RootFolderIds>,
     /// Expands the `%MetadataPath%`/`%AppDataPath%` tokens an adopted Jellyfin
-    /// database stores in image paths (see
+    /// database stores in item and image paths (see
     /// [`FerrofinItemRepository::with_virtual_paths`]).
     virtual_paths: VirtualPathExpander,
     /// The files Live TV is writing right now, bound late by the composition
@@ -283,6 +283,7 @@ impl FerrofinItemRepository {
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)
+        .map(|rows| self.mapped_rows(rows))
     }
 
     /// Creates a repository over the given database and kind-lookup tables.
@@ -311,14 +312,36 @@ impl FerrofinItemRepository {
         self
     }
 
-    /// Installs the server's [`VirtualPathExpander`], so image rows adopted
-    /// from Jellyfin (`%MetadataPath%/library/…`) come back as real paths —
-    /// the read half of `BaseItemRepository.Map`. Called once by the
-    /// composition root; without it stored tokens pass through verbatim.
+    /// Installs the server's [`VirtualPathExpander`], so item and image rows
+    /// adopted from Jellyfin (`%MetadataPath%/Genre/…`,
+    /// `%MetadataPath%/library/…`) come back as real paths — the read half of
+    /// `BaseItemRepository.Map`. Called once by the composition root; without
+    /// it stored tokens pass through verbatim.
     #[must_use]
     pub fn with_virtual_paths(mut self, virtual_paths: VirtualPathExpander) -> Self {
         self.virtual_paths = virtual_paths;
         self
+    }
+
+    /// The row as the domain reads it, its `Path` expanded
+    /// ([`VirtualPathExpander::expand_in_place`]): upstream's
+    /// `DeserializeBaseItem` maps every row through `BaseItemMapper.Map`,
+    /// whose `dto.Path = appHost.ExpandVirtualPath(entity.Path)` turns an
+    /// adopted by-name item's `%MetadataPath%/Genre/Action`, or the playlists
+    /// folder's `%AppDataPath%/playlists`, into a real path. Every row an
+    /// [`ItemRepository`] read returns goes through here; the save keeps the
+    /// stored token form (`FerrofinItemPersistenceService::upsert_item`).
+    fn mapped(&self, mut row: BaseItemEntity) -> BaseItemEntity {
+        self.virtual_paths.expand_in_place(&mut row.path);
+        row
+    }
+
+    /// [`Self::mapped`] over every row.
+    fn mapped_rows(&self, mut rows: Vec<BaseItemEntity>) -> Vec<BaseItemEntity> {
+        for row in &mut rows {
+            self.virtual_paths.expand_in_place(&mut row.path);
+        }
+        rows
     }
 
     /// Installs the slot the composition root later fills with Live TV's
@@ -1420,7 +1443,7 @@ impl FerrofinItemRepository {
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)?;
-        Ok(rows)
+        Ok(self.mapped_rows(rows))
     }
 
     /// Runs a translated query returning only the id and clean-name columns.
@@ -1950,7 +1973,7 @@ impl FerrofinItemRepository {
                     .and_then(|name| counts_by_clean_name.get(name))
                     .copied()
                     .unwrap_or_default(),
-                item: r.item,
+                item: self.mapped(r.item),
             })
             .collect();
         Ok(QueryResult::new(Some(start_index), Some(total), items))
@@ -3452,7 +3475,7 @@ impl ItemRepository for FerrofinItemRepository {
         .fetch_optional(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(row)
+        Ok(row.map(|row| self.mapped(row)))
     }
 
     async fn retrieve_items(&self, ids: &[Uuid]) -> Result<Vec<BaseItemEntity>, ServiceError> {
@@ -3468,7 +3491,7 @@ impl ItemRepository for FerrofinItemRepository {
             }
             rows.extend(query.fetch_all(self.db.pool()).await.map_err(db_err)?);
         }
-        Ok(rows)
+        Ok(self.mapped_rows(rows))
     }
 
     async fn locked_item_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
@@ -3523,6 +3546,7 @@ impl ItemRepository for FerrofinItemRepository {
         let deduped = rows
             .into_iter()
             .filter(|r| seen.insert(r.id.clone()))
+            .map(|r| self.mapped(r))
             .collect();
         Ok(Some(deduped))
     }
@@ -3649,7 +3673,7 @@ impl ItemRepository for FerrofinItemRepository {
             .map(|rows| {
                 rows.into_iter()
                     .map(|row| FolderChild {
-                        item: row.item,
+                        item: self.mapped(row.item),
                         linked: row.linked,
                     })
                     .collect()
@@ -3697,7 +3721,9 @@ impl ItemRepository for FerrofinItemRepository {
             // `limit` series — see `latest_tv_repository`. A Season or Series
             // is a folder, so the caller lists it on its own; an Episode
             // groups under its series as before.
-            return crate::latest_tv_repository::latest_tv_show_items(&self.db, filter).await;
+            return crate::latest_tv_repository::latest_tv_show_items(&self.db, filter)
+                .await
+                .map(|rows| self.mapped_rows(rows));
         }
         if collection_type == CollectionType::movies {
             return self.latest_movie_items(filter).await;
@@ -3713,6 +3739,7 @@ impl ItemRepository for FerrofinItemRepository {
             .fetch_all(self.db.pool())
             .await
             .map_err(db_err)
+            .map(|rows| self.mapped_rows(rows))
     }
 
     async fn item_exists(&self, id: Uuid) -> Result<bool, ServiceError> {
@@ -3749,7 +3776,7 @@ impl ItemRepository for FerrofinItemRepository {
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
-        Ok(rows)
+        Ok(self.mapped_rows(rows))
     }
 
     async fn get_merged_version_ids(&self, primary_id: Uuid) -> Result<Vec<Uuid>, ServiceError> {
@@ -3800,7 +3827,7 @@ impl ItemRepository for FerrofinItemRepository {
                     .as_deref()
                     .and_then(|s| Uuid::parse_str(s).ok())
                 {
-                    map.entry(primary).or_default().push(row);
+                    map.entry(primary).or_default().push(self.mapped(row));
                 }
             }
         }
@@ -3811,7 +3838,11 @@ impl ItemRepository for FerrofinItemRepository {
         &self,
         primary_ids: &[Uuid],
     ) -> Result<HashMap<Uuid, Vec<(BaseItemEntity, bool)>>, ServiceError> {
-        rows_by_primary_flagged(&self.db, primary_ids).await
+        let mut map = rows_by_primary_flagged(&self.db, primary_ids).await?;
+        for (row, _) in map.values_mut().flatten() {
+            self.virtual_paths.expand_in_place(&mut row.path);
+        }
+        Ok(map)
     }
 
     async fn get_items_with_provider_id(
@@ -4242,7 +4273,7 @@ impl ItemRepository for FerrofinItemRepository {
             share_can_edit: first.can_edit,
         });
         Ok(PlaylistItemsWithAccess {
-            items: rows.into_iter().map(|r| r.item).collect(),
+            items: rows.into_iter().map(|r| self.mapped(r.item)).collect(),
             access,
         })
     }
@@ -7427,6 +7458,85 @@ mod tests {
                 ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths)
             )
         );
+    }
+
+    /// gl-848: an adopted by-name item stores its path as
+    /// `%MetadataPath%/Genre/<name>` and the playlists folder as
+    /// `%AppDataPath%/playlists`; every item read expands them, as
+    /// `BaseItemMapper.Map` does (`ExpandVirtualPath`), and leaves a media
+    /// path alone.
+    #[tokio::test]
+    async fn item_reads_expand_jellyfin_virtual_paths() {
+        let db = test_db().await;
+        let genre = Uuid::from_u128(0x9201);
+        let folder = Uuid::from_u128(0x9202);
+        let movie = Uuid::from_u128(0x9203);
+        seed_named_item(&db, genre, BaseItemKind::Genre, "Action").await;
+        seed_named_item(&db, folder, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        seed_named_item(&db, movie, BaseItemKind::Movie, "Film").await;
+        for (id, path) in [
+            (genre, "%MetadataPath%/Genre/Action"),
+            (folder, "%AppDataPath%/playlists"),
+            (movie, "/media/movies/Film.mkv"),
+        ] {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(path)
+                .execute(db.writer())
+                .await
+                .expect("path");
+        }
+        let raw = repo(&db).retrieve_item(genre).await.expect("read");
+        assert_eq!(
+            raw.and_then(|row| row.path).as_deref(),
+            Some("%MetadataPath%/Genre/Action"),
+            "without an expander the token passes through"
+        );
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let data = ferrofin_traits::system::ServerApplicationPaths::data_path(&*paths);
+        let repository =
+            repo(&db).with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let expected = HashMap::from([
+            (genre, format!("{metadata}/Genre/Action")),
+            (folder, format!("{data}/playlists")),
+            (movie, "/media/movies/Film.mkv".to_owned()),
+        ]);
+        let path_of = |row: &BaseItemEntity| {
+            (
+                Uuid::parse_str(&row.id).expect("id"),
+                row.path.clone().expect("path"),
+            )
+        };
+
+        let one = repository
+            .retrieve_item(genre)
+            .await
+            .expect("read")
+            .expect("row");
+        assert_eq!(one.path.as_deref(), Some(expected[&genre].as_str()));
+        let batch: HashMap<Uuid, String> = repository
+            .retrieve_items(&[genre, folder, movie])
+            .await
+            .expect("read")
+            .iter()
+            .map(path_of)
+            .collect();
+        assert_eq!(batch, expected);
+        let listed: HashMap<Uuid, String> = repository
+            .get_item_list(&InternalItemsQuery {
+                item_ids: vec![genre, folder, movie],
+                ..InternalItemsQuery::default()
+            })
+            .await
+            .expect("query")
+            .iter()
+            .map(path_of)
+            .collect();
+        assert_eq!(listed, expected);
     }
 
     #[tokio::test]

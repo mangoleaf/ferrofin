@@ -1091,6 +1091,10 @@ pub struct FerrofinItemPersistenceService {
     /// root ([`FerrofinItemPersistenceService::set_localization`]); unset,
     /// the copy leaves the stored scores alone.
     localization: std::sync::OnceLock<Arc<dyn ferrofin_traits::localization::LocalizationManager>>,
+    /// The server's directories, for keeping an adopted row's stored
+    /// `%MetadataPath%`/`%AppDataPath%` path on a save
+    /// ([`FerrofinItemPersistenceService::with_virtual_paths`]).
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
 }
 
 impl std::fmt::Debug for FerrofinItemPersistenceService {
@@ -1101,14 +1105,35 @@ impl std::fmt::Debug for FerrofinItemPersistenceService {
 }
 
 impl FerrofinItemPersistenceService {
-    /// Creates the service over the given database.
+    /// Creates the service over the given database. Without
+    /// [`Self::with_virtual_paths`] a save writes every path as given, so a
+    /// save of an adopted row read back expanded rewrites its stored token:
+    /// the composition root wires the expander, and the other constructions
+    /// only create rows or delete them.
     #[must_use]
     pub fn new(db: Database) -> Self {
         Self {
             db,
             changed: std::sync::OnceLock::new(),
             localization: std::sync::OnceLock::new(),
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
         }
+    }
+
+    /// Installs the server's [`VirtualPathExpander`], so a save keeps the
+    /// `%MetadataPath%`/`%AppDataPath%` form an adopted row stores while the
+    /// saved path is still its expansion ([`Self::upsert_item`]). Called once
+    /// by the composition root; without it every save writes the path it is
+    /// given.
+    ///
+    /// [`VirtualPathExpander`]: crate::virtual_paths::VirtualPathExpander
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// Attaches the rating tables the owned-video copy scores the ratings it
@@ -1834,14 +1859,22 @@ impl FerrofinItemPersistenceService {
     /// re-import from `Data` would make real. A scan's save of a playlist
     /// without a `FerrofinPlaylists` row first imports one from the `Data` it
     /// wrote ([`crate::item_data::import_playlist_meta_if_missing_in`]).
+    ///
+    /// The `Path` written is the stored one when that is a virtual-path form
+    /// of the item's ([`Self::stored_virtual_path`]).
     async fn upsert_item(
         &self,
         item: &BaseItemEntity,
         sql: &'static str,
         scan: bool,
     ) -> Result<(), ServiceError> {
+        let stored_path = self.stored_virtual_path(item).await?;
         let mut query = sqlx::query(sql);
-        for (_, value) in written_columns(item) {
+        for (name, value) in written_columns(item) {
+            let value = match (name, &stored_path) {
+                ("Path", Some(stored)) => Column::Text(Some(stored.clone())),
+                _ => value,
+            };
             query = match value {
                 Column::Text(v) => query.bind(v),
                 Column::Int(v) => query.bind(v),
@@ -1877,6 +1910,38 @@ impl FerrofinItemPersistenceService {
             self.push_name_to_children(item).await?;
         }
         Ok(())
+    }
+
+    /// The `Path` an adopted row stores, when the save of `item` must keep
+    /// it: Jellyfin stores a path in its data or metadata directory as
+    /// `%AppDataPath%/…` or `%MetadataPath%/…` (`ReverseVirtualPath`), and
+    /// every read expands it (`FerrofinItemRepository`'s rows, as
+    /// `BaseItemMapper.Map`), so a row read and saved back carries the
+    /// expansion. Ferrofin writes resolved paths (`virtual_paths`), so the
+    /// stored token form is kept only while it still expands to the path
+    /// saved; a path the save changes is written as given.
+    ///
+    /// Reads the stored path only for a path inside one of those directories
+    /// (one a token could stand for): a media item's save reads nothing more.
+    async fn stored_virtual_path(
+        &self,
+        item: &BaseItemEntity,
+    ) -> Result<Option<String>, ServiceError> {
+        let Some(path) = item.path.as_deref() else {
+            return Ok(None);
+        };
+        if self.virtual_paths.reverse(path) == path {
+            return Ok(None);
+        }
+        let stored: Option<Option<String>> =
+            sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+                .bind(&item.id)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(stored
+            .flatten()
+            .filter(|stored| stored != path && self.virtual_paths.expand(stored) == path))
     }
 
     /// `BeforeSaveInternal` names an episode or a season after its parents
@@ -8343,6 +8408,78 @@ mod tests {
                 .await
                 .expect("query");
         assert_eq!(clean.as_deref(), Some("amelie"));
+    }
+
+    /// gl-848: a row adopted from Jellyfin stores `%MetadataPath%/Genre/…`,
+    /// which the item read expands; saving the row back (every save of a read
+    /// row, a scan's included) keeps the stored form, while a save that moves
+    /// the item, or a server with no directories to expand to, writes the
+    /// path it is given.
+    #[tokio::test]
+    async fn a_save_keeps_the_stored_virtual_path_it_expands_from() {
+        let db = test_db().await;
+        let root = tempfile::tempdir().expect("tempdir");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc = FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(
+            crate::virtual_paths::VirtualPathExpander::from_paths(std::sync::Arc::clone(&paths)),
+        );
+        let stored_path = |id: String| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#,
+                )
+                .bind(id)
+                .fetch_one(db.pool())
+                .await
+                .expect("path")
+            }
+        };
+        let mut genre = ferrofin_db::entities::base_items::BaseItemEntity {
+            id: ferrofin_db::store::guid_to_db(Uuid::new_v4()),
+            type_: "MediaBrowser.Controller.Entities.Genre".to_owned(),
+            name: Some("Action".to_owned()),
+            path: Some("%MetadataPath%/Genre/Action".to_owned()),
+            ..ferrofin_db::entities::base_items::BaseItemEntity::default()
+        };
+        svc.save_items(std::slice::from_ref(&genre))
+            .await
+            .expect("adopt");
+
+        genre.path = Some(format!("{metadata}/Genre/Action"));
+        genre.overview = Some("edited".to_owned());
+        svc.save_items(std::slice::from_ref(&genre))
+            .await
+            .expect("save");
+        svc.save_scanned_items(std::slice::from_ref(&genre))
+            .await
+            .expect("scan save");
+        assert_eq!(
+            stored_path(genre.id.clone()).await.as_deref(),
+            Some("%MetadataPath%/Genre/Action")
+        );
+
+        genre.path = Some(format!("{metadata}/Genre/Action Movies"));
+        svc.save_items(std::slice::from_ref(&genre))
+            .await
+            .expect("move");
+        assert_eq!(stored_path(genre.id.clone()).await, genre.path);
+
+        let plain = FerrofinItemPersistenceService::new(db.clone());
+        let mut adopted = genre.clone();
+        adopted.path = Some("%MetadataPath%/Genre/Drama".to_owned());
+        plain
+            .save_items(std::slice::from_ref(&adopted))
+            .await
+            .expect("adopt");
+        adopted.path = Some(format!("{metadata}/Genre/Drama"));
+        plain
+            .save_items(std::slice::from_ref(&adopted))
+            .await
+            .expect("save");
+        assert_eq!(stored_path(adopted.id.clone()).await, adopted.path);
     }
 
     /// Saves `entity` and returns the `SortName` the write path persisted.

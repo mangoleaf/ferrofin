@@ -1292,8 +1292,11 @@ impl FerrofinLiveTvManager {
                 continue;
             };
             // `GetImageTag` logs and answers null on a failure. Debug, not
-            // upstream's error: it would repeat on every guide page.
-            match images.processor.get_image_cache_tag(id, primary).await {
+            // upstream's error: it would repeat on every guide page. The tag
+            // hashes the channel item's path, and a channel item has none
+            // (`GuideManager.GetChannel` sets no `Path`; nor does
+            // `projection::channel_entity`), so its row is not read for it.
+            match images.processor.get_image_cache_tag(None, primary).await {
                 Ok(Some(tag)) => {
                     tags.insert(id, tag);
                 }
@@ -1964,17 +1967,17 @@ impl FerrofinLiveTvManager {
     /// Port of `XmlTvListingsProvider.Validate`: a save is an explicit retry,
     /// so the path's download backoff is dropped; a local path (anything not
     /// starting with `http`) must name an existing file, or the save is
-    /// `FileNotFoundException` (`404`).
+    /// `FileNotFoundException` (`404`). The test reads the raw string, so an
+    /// empty or blank `Path` is that `404` too: no file has that name.
     ///
     /// A missing `Path` is a `400` here; upstream dereferences it and answers
     /// a `NullReferenceException` `500`, a Jellyfin bug not ported.
     async fn validate_xmltv(&self, info: &ListingsProviderInfo) -> Result<(), ServiceError> {
-        let path = info.path.as_deref().unwrap_or_default();
-        if path.is_empty() {
+        let Some(path) = info.path.as_deref() else {
             return Err(ServiceError::InvalidInput(
                 "listing provider Path is required".into(),
             ));
-        }
+        };
         self.xmltv.forget_failure(path);
         // `File.Exists`: false for a directory, and for anything unreadable.
         if !crate::fetch::is_http(path)
@@ -7581,6 +7584,40 @@ mod tests {
         assert_eq!(mgr.get_listing_providers().await.expect("list").len(), 2);
     }
 
+    /// `XmlTvListingsProvider.Validate` (v12.4 :333-349) tests the raw string:
+    /// an empty or blank `Path` does not start with `http` and `File.Exists`
+    /// is false for it, so the save is `FileNotFoundException` (`404`) and
+    /// nothing is stored. Only a missing `Path` differs: upstream dereferences
+    /// the null (a `500`), Ferrofin answers `400`.
+    #[tokio::test]
+    async fn an_xmltv_provider_with_an_empty_or_blank_path_is_not_found() {
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+        let provider = |path: Option<&str>| {
+            as_xmltv(ListingsProviderInfo {
+                path: path.map(str::to_owned),
+                ..ListingsProviderInfo::default()
+            })
+        };
+
+        for path in ["", " ", "\t"] {
+            let err = mgr
+                .save_listing_provider(provider(Some(path)), false, false)
+                .await
+                .expect_err("refused");
+            assert!(
+                matches!(err, ServiceError::NotFound(_)),
+                "{path:?}: {err:?}"
+            );
+        }
+        let err = mgr
+            .save_listing_provider(provider(None), false, false)
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, ServiceError::InvalidInput(_)), "{err:?}");
+        let listing_providers = mgr.get_listing_providers().await.expect("list");
+        assert!(listing_providers.is_empty(), "{listing_providers:?}");
+    }
+
     /// `XmlTvListingsProvider.GetLanguage`: a guide is read in its provider's
     /// `PreferredLanguage`, else in the server's `PreferredMetadataLanguage`,
     /// read as it is when the guide is read.
@@ -9058,10 +9095,13 @@ mod tests {
         }
         async fn get_image_cache_tag(
             &self,
-            _item_id: Uuid,
+            item_path: Option<&str>,
             image: &ferrofin_traits::options::ItemImageInfo,
         ) -> Result<Option<String>, ServiceError> {
-            Ok(Some(format!("tag:{}", image.path)))
+            Ok(Some(match item_path {
+                Some(owner) => format!("tag:{}@{owner}", image.path),
+                None => format!("tag:{}", image.path),
+            }))
         }
         async fn get_image_cache_tag_for_path(
             &self,
