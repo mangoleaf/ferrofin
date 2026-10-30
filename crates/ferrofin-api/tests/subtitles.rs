@@ -1034,7 +1034,10 @@ async fn a_font_from_before_the_epoch_keeps_its_date() {
     );
 }
 
-/// Oracle: Jellyfin 12.4, every case run against its `PhysicalFile`.
+/// Oracle: Jellyfin 12.4's `PhysicalFile`, but for two cases. `modified_since_later`
+/// was not run (the file was dated the day it ran), so its 304 is inferred from the
+/// same-date case. `no_entity_tag_to_match` sends together two headers that were
+/// run singly, each a 200.
 #[rstest::rstest]
 #[case::modified_since_the_same_date(&[("If-Modified-Since", FONT_DATE)], StatusCode::NOT_MODIFIED)]
 #[case::modified_since_rfc_850(&[("If-Modified-Since", "Monday, 01-Jan-24 00:00:00 GMT")], StatusCode::NOT_MODIFIED)]
