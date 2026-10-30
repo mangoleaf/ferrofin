@@ -130,6 +130,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `ActivityLogWebSocketListener` does: a signal for the dashboard to refetch
   `GET /System/ActivityLog/Entries`. It no longer queries the activity log every period, and
   no longer carries the entries themselves
+- The session WebSocket's `ScheduledTasksInfo` stream sends a running task's progress when the
+  task reports it, at most once per period, as Jellyfin's `ScheduledTasksWebSocketListener`
+  does, instead of reading the task list every period whether or not a task runs. A task's
+  start and completion are still sent at once, and subscribing still sends the current task
+  list once (Jellyfin sends nothing until a task event, but the dashboard's scan button needs
+  it). An idle dashboard now costs no task-list reads
 - Report Jellyfin version 12.4.0 (was 12.2.0) in `/System/Info` and `/System/Info/Public`,
   built-in plugin versions and the plugin catalog's `targetAbi` filter: the newest Jellyfin
   release Ferrofin adopts

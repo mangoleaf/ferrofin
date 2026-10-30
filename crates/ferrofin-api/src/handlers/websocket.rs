@@ -315,7 +315,8 @@ enum Inbound {
     SessionsStart(Duration),
     /// `SessionsStop` — stop the session stream.
     SessionsStop,
-    /// `ScheduledTasksInfoStart` — stream the task list every `period`.
+    /// `ScheduledTasksInfoStart` — send the task list now, on each task start
+    /// and completion, and on progress at most once per `period`.
     TasksStart(Duration),
     /// `ScheduledTasksInfoStop` — stop the task stream.
     TasksStop,
@@ -383,23 +384,18 @@ const DEFAULT_STREAM_MILLIS: u64 = 1500;
 /// backs a bare [`crate::AppState::new`] so client-chosen periods are floored
 /// even then.
 ///
-/// The floor exists because Ferrofin still drives the task stream on a
-/// timer — each tick recomputes and sends the full snapshot — whereas
-/// upstream's `BasePeriodicWebSocketListener` is event-driven and sends only
-/// when an event fires (the client period is a throttle there, never a poll
-/// clock). Without a floor a client could ask for a 1 ms period and turn each
-/// tick into back-to-back task work. The `Sessions` and `ActivityLogEntry`
-/// streams are event-driven already; their throttle is floored too until the
-/// task stream is, though every `ActivityLogEntry` send is forced, so the
-/// period never holds one back.
+/// The floor dates from when the task and activity streams ran on a timer,
+/// where a 1 ms period meant back-to-back reads. Every stream is now
+/// event-driven, as upstream's `BasePeriodicWebSocketListener` is, and the
+/// period only spaces out low-priority updates (session activity, task
+/// progress); upstream has no floor. Removing it is TODO(gl-723).
 pub(crate) const DEFAULT_WS_MIN_STREAM_PERIOD: Duration = Duration::from_millis(100);
 
 /// Parses the `"initialDelayMs,periodMs"` subscription payload (the C#
 /// `BasePeriodicWebSocketListener` Data convention) into the stream period.
-/// For the `Sessions` and `ActivityLogEntry` streams it is upstream's throttle
-/// interval (`WebSocketListenerState.IntervalMs`); the task stream still polls
-/// at it, first one period after subscribing. The initial delay is ignored,
-/// as upstream stores `InitialDelayMs` and never reads it.
+/// It is upstream's throttle interval (`WebSocketListenerState.IntervalMs`)
+/// for every stream. The initial delay is ignored, as upstream stores
+/// `InitialDelayMs` and never reads it.
 fn subscription_period(data: Option<&str>) -> Duration {
     let millis = data
         .and_then(|d| d.split(',').nth(1))
@@ -609,7 +605,6 @@ async fn handle_socket(
     // subscribe — the streams answer as the socket's user — and the activity
     // stream is an administrator's alone (`may_subscribe`).
     let mut streams = Streams::new(state.websocket_min_stream_period);
-    let mut task_updates = None;
 
     if open {
         loop {
@@ -635,7 +630,7 @@ async fn handle_socket(
                     Action::Inbound(inbound) => {
                         log_task_subscription(inbound, caller.is_some());
                         if caller.as_ref().is_some_and(|c| may_subscribe(c, inbound)) {
-                            let message = update_task_subscription(&state, inbound, &mut task_updates).await;
+                            let message = update_task_subscription(&state, inbound, &mut streams).await;
                             if !send_optional(&mut socket, message, &overflowed).await {
                                 break;
                             }
@@ -671,14 +666,14 @@ async fn handle_socket(
                         break;
                     }
                 }
-                update = next_task_update(&mut task_updates) => {
-                    let msg = task_transition_message(&state, update, &mut task_updates).await;
+                update = next_task_update(&mut streams.task_updates) => {
+                    let msg = task_transition_message(&state, update, &mut streams).await;
                     if !send_optional(&mut socket, msg, &overflowed).await {
                         break;
                     }
                 }
-                () = tick(&mut streams.tasks) => {
-                    let message = periodic_tasks_message(&state, task_updates.as_ref()).await;
+                first = next_event(&mut streams.tasks) => {
+                    let message = task_progress_wake(&state, &mut streams, first).await;
                     if !send_optional(&mut socket, message, &overflowed).await {
                         break;
                     }
@@ -850,7 +845,10 @@ async fn keep_alive_watchdog(
 /// The armed dashboard streams of one socket.
 struct Streams {
     sessions: Option<EventStream<SessionEvent>>,
-    tasks: Option<tokio::time::Interval>,
+    /// One `()` per progress report of a running task.
+    tasks: Option<EventStream<()>>,
+    /// The task starts and completions captured since the subscribe snapshot.
+    task_updates: Option<TaskUpdateReceiver>,
     /// One `()` per created activity-log entry.
     activity: Option<EventStream<()>>,
     /// The floor every armed stream's period is clamped up to (see
@@ -865,40 +863,30 @@ impl Streams {
         Self {
             sessions: None,
             tasks: None,
+            task_updates: None,
             activity: None,
             min_period,
         }
     }
 
-    /// Arms or cancels a stream for one subscription message.
+    /// Arms or cancels a stream for one subscription message; the task
+    /// stream is [`update_task_subscription`]'s.
     fn apply(
         &mut self,
         inbound: Inbound,
         sessions: &dyn SessionManager,
         activity: &dyn ActivityManager,
     ) {
-        // Floor the client-chosen period: a tiny period would otherwise make
-        // each tick recompute and resend the full snapshot back to back.
-        let min_period = self.min_period;
-        let arm = |period: Duration| {
-            let mut interval = tokio::time::interval(period.max(min_period));
-            // First send one period from now, not immediately.
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.reset();
-            Some(interval)
-        };
         match inbound {
             Inbound::SessionsStart(p) => {
                 self.sessions = self.event_stream(sessions.subscribe_session_events(), p);
             }
             Inbound::SessionsStop => self.sessions = None,
-            Inbound::TasksStart(p) => self.tasks = arm(p),
-            Inbound::TasksStop => self.tasks = None,
             Inbound::ActivityStart(p) => {
                 self.activity = self.event_stream(activity.subscribe_entry_created(), p);
             }
             Inbound::ActivityStop => self.activity = None,
-            Inbound::KeepAlive => {}
+            Inbound::TasksStart(_) | Inbound::TasksStop | Inbound::KeepAlive => {}
         }
     }
 
@@ -1082,17 +1070,6 @@ fn activity_wake(
     Some(envelope("ActivityLogEntry", &serde_json::json!([])))
 }
 
-/// Awaits the next tick of an armed stream; pends forever when unarmed (so the
-/// select branch never fires for a stream the client hasn't subscribed to).
-async fn tick(stream: &mut Option<tokio::time::Interval>) {
-    match stream {
-        Some(interval) => {
-            interval.tick().await;
-        }
-        None => std::future::pending().await,
-    }
-}
-
 /// One outbound envelope: `{MessageType, MessageId, Data}` with the required
 /// `MessageId` (strict Kotlin-SDK clients crash without it), spelled as every
 /// Jellyfin guid is (`JsonGuidConverter`: 32 hex digits).
@@ -1183,58 +1160,108 @@ fn task_snapshot_message(tasks: Vec<ferrofin_model::tasks::TaskInfo>) -> Option<
 
 type TaskUpdateReceiver = tokio::sync::broadcast::Receiver<Vec<ferrofin_model::tasks::TaskInfo>>;
 
-/// An initial snapshot and its subscription are acquired atomically by the registry.
+/// `ScheduledTasksInfoStart` and `ScheduledTasksInfoStop` for the task
+/// stream, the port of `ScheduledTasksWebSocketListener`. A start subscribes
+/// to the registry's transitions and progress and sends the current task
+/// list at once, an accepted divergence: upstream's `Start` sends nothing
+/// until a task event, but jellyfin-web's scan button has no HTTP fallback.
 async fn update_task_subscription(
     state: &AppState,
     inbound: Inbound,
-    receiver: &mut Option<TaskUpdateReceiver>,
+    streams: &mut Streams,
 ) -> Option<String> {
     match inbound {
-        Inbound::TasksStart(_) => match state.tasks.subscribe_task_updates() {
-            Some(subscription) => {
-                *receiver = Some(subscription.updates);
-                task_snapshot_message(subscription.snapshot)
+        Inbound::TasksStart(period) => {
+            let (message, progress) = subscribe_tasks(state, &mut streams.task_updates).await;
+            streams.tasks = streams.event_stream(progress, period);
+            if message.is_some() {
+                mark_sent(&mut streams.tasks);
             }
-            None => tasks_message(state).await,
-        },
+            message
+        }
         Inbound::TasksStop => {
-            *receiver = None;
+            streams.task_updates = None;
+            streams.tasks = None;
             None
         }
         _ => None,
     }
 }
 
-async fn task_transition_message(
+/// Subscribes to the task registry, which takes the snapshot and the
+/// subscription atomically, so a short run cannot slip between them. Returns
+/// the snapshot frame and the progress signal. A registry that raises no
+/// events is read instead, and leaves both streams unarmed.
+async fn subscribe_tasks(
     state: &AppState,
-    update: Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError>,
-    receiver: &mut Option<TaskUpdateReceiver>,
-) -> Option<String> {
-    match update {
-        Ok(tasks) => task_snapshot_message(tasks),
-        // Resubscribe atomically after lag, dropping obsolete queued snapshots.
-        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-            update_task_subscription(state, Inbound::TasksStart(Duration::ZERO), receiver).await
+    updates: &mut Option<TaskUpdateReceiver>,
+) -> (Option<String>, Option<tokio::sync::broadcast::Receiver<()>>) {
+    match state.tasks.subscribe_task_updates() {
+        Some(subscription) => {
+            *updates = Some(subscription.updates);
+            (
+                task_snapshot_message(subscription.snapshot),
+                Some(subscription.progress),
+            )
         }
-        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-            *receiver = None;
-            None
-        }
+        None => (tasks_message(state).await, None),
     }
 }
 
-async fn periodic_tasks_message(
+/// A captured task start or completion (`TaskExecuting`, `TaskCompleted`):
+/// `SendData(true)`, so it sends at once, with the snapshot captured at the
+/// transition.
+async fn task_transition_message(
     state: &AppState,
-    receiver: Option<&TaskUpdateReceiver>,
+    update: Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError>,
+    streams: &mut Streams,
 ) -> Option<String> {
-    let message = tasks_message(state).await;
-    // A transition may race the read. Drain captured transitions before sending
-    // any newer periodic snapshot, otherwise a short run can appear out of order.
-    if receiver.is_some_and(|updates| !updates.is_empty()) {
-        None
-    } else {
-        message
+    let message = match update {
+        Ok(tasks) => task_snapshot_message(tasks),
+        // Resubscribe atomically after lag, dropping obsolete queued
+        // snapshots; the progress subscription stays as it is.
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            subscribe_tasks(state, &mut streams.task_updates).await.0
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            streams.task_updates = None;
+            None
+        }
+    };
+    if message.is_some() {
+        mark_sent(&mut streams.tasks);
     }
+    message
+}
+
+/// One wake of the task stream's progress (`OnTaskProgress`,
+/// `SendData(false)`): throttled by the period, and the task list is read
+/// only for a frame that is due. A captured transition still queued goes
+/// first and the progress frame is dropped, checked before the read and again
+/// after it: a transition may race the read, and a newer snapshot sent ahead
+/// of it would show a short run out of order.
+async fn task_progress_wake(
+    state: &AppState,
+    streams: &mut Streams,
+    first: Result<(), tokio::sync::broadcast::error::RecvError>,
+) -> Option<String> {
+    let transitions_queued = |streams: &Streams| {
+        streams
+            .task_updates
+            .as_ref()
+            .is_some_and(|updates| !updates.is_empty())
+    };
+    if !wake_due(&mut streams.tasks, first, |()| false) || transitions_queued(streams) {
+        return None;
+    }
+    let message = tasks_message(state).await;
+    if transitions_queued(streams) {
+        return None;
+    }
+    if message.is_some() {
+        mark_sent(&mut streams.tasks);
+    }
+    message
 }
 
 async fn next_task_update(
@@ -1294,20 +1321,14 @@ mod tests {
 
     #[tokio::test]
     async fn stream_period_is_floored_at_the_configured_minimum() {
-        // A hostile or misconfigured client asks for a 1 ms period on every
-        // stream; each must be clamped up to the floor so a tick cannot become
-        // back-to-back task work.
+        // A hostile or misconfigured client asks for a 1 ms period; the
+        // subscription is clamped up to the floor (`event_stream`, which every
+        // stream's subscription goes through).
         let floor = Duration::from_millis(100);
         let mut streams = Streams::new(floor);
         let (_events, receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
         streams.sessions = streams.event_stream(Some(receiver), Duration::from_millis(1));
-        streams.apply(
-            Inbound::TasksStart(Duration::from_millis(1)),
-            &FakeSessions,
-            &FakeActivity,
-        );
         assert_eq!(streams.sessions.as_ref().unwrap().period, floor);
-        assert_eq!(streams.tasks.as_ref().unwrap().period(), floor);
     }
 
     #[tokio::test]
@@ -1440,8 +1461,12 @@ mod tests {
         );
     }
 
+    /// A progress frame is dropped while a captured transition is queued, so
+    /// a short run never shows out of order; once the transition is sent,
+    /// progress sends again. `ScheduledTasksInfoStop` drops both receivers.
+    /// The period is zero, so the throttle never holds a frame back here.
     #[tokio::test]
-    async fn captured_transitions_precede_periodic_snapshots_and_stop_unsubscribes() {
+    async fn captured_transitions_precede_progress_snapshots_and_stop_unsubscribes() {
         use crate::test_support::{
             FakeLibrary, RecordingTasks, elevated_state_with_library_monitor_and_tasks,
         };
@@ -1451,28 +1476,39 @@ mod tests {
             Arc::new(ferrofin_traits::stubs::NoopLibraryMonitor),
             Arc::new(RecordingTasks::default()),
         );
-        let (sender, receiver) = tokio::sync::broadcast::channel(4);
-        let mut receiver = Some(receiver);
-        sender.send(Vec::new()).unwrap();
+        let mut streams = Streams::new(Duration::ZERO);
+        let (transitions, receiver) = tokio::sync::broadcast::channel(4);
+        let (progress, progress_receiver) = tokio::sync::broadcast::channel(4);
+        streams.task_updates = Some(receiver);
+        streams.tasks = streams.event_stream(Some(progress_receiver), Duration::ZERO);
+
+        transitions.send(Vec::new()).unwrap();
+        progress.send(()).unwrap();
+        let first = super::next_event(&mut streams.tasks).await;
         assert!(
-            super::periodic_tasks_message(&state, receiver.as_ref())
+            super::task_progress_wake(&state, &mut streams, first)
                 .await
-                .is_none()
+                .is_none(),
+            "the queued transition goes first"
         );
-        let update = super::next_task_update(&mut receiver).await;
+        let update = super::next_task_update(&mut streams.task_updates).await;
         assert!(
-            super::task_transition_message(&state, update, &mut receiver)
+            super::task_transition_message(&state, update, &mut streams)
                 .await
                 .is_some()
         );
+        progress.send(()).unwrap();
+        let first = super::next_event(&mut streams.tasks).await;
         assert!(
-            super::periodic_tasks_message(&state, receiver.as_ref())
+            super::task_progress_wake(&state, &mut streams, first)
                 .await
                 .is_some()
         );
-        super::update_task_subscription(&state, Inbound::TasksStop, &mut receiver).await;
-        assert!(receiver.is_none());
-        assert_eq!(sender.receiver_count(), 0);
+
+        super::update_task_subscription(&state, Inbound::TasksStop, &mut streams).await;
+        assert!(streams.task_updates.is_none() && streams.tasks.is_none());
+        assert_eq!(transitions.receiver_count(), 0);
+        assert_eq!(progress.receiver_count(), 0);
     }
 
     /// A client that stops reading must not make the server buffer without

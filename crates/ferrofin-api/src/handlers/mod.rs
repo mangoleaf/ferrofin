@@ -977,12 +977,19 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[VerifiedSubsystem {
                SessionActivity past SESSION_ACTIVITY_INTERVAL (LogSessionActivity, a new \
                session included) and report_capabilities' CapabilitiesChanged \
                (ReportCapabilities); activity_wake → ferrofin-core activity_manager.rs \
-               create_entry's entry-created raise (ActivityManager.CreateAsync EntryCreated). \
-               Compared with the Sessions listener \
-               (Jellyfin.Api/WebSocketListeners/SessionInfoWebSocketListener.cs) and the \
+               create_entry's entry-created raise (ActivityManager.CreateAsync EntryCreated); \
+               update_task_subscription, subscribe_tasks, task_transition_message, \
+               task_progress_wake → ferrofin-core scheduled_tasks.rs subscribe_task_updates, \
+               publish_snapshot from claim (TaskExecuting), record_result and stop_run \
+               (TaskCompleted), and \
+               TaskProgress::report's progress raise \
+               (ScheduledTaskWorker.OnProgressChanged TaskProgress). Compared with the \
+               Sessions listener \
+               (Jellyfin.Api/WebSocketListeners/SessionInfoWebSocketListener.cs), the \
                ActivityLog listener \
-               (Jellyfin.Api/WebSocketListeners/ActivityLogWebSocketListener.cs). The \
-               ScheduledTasks listener still polls: TODO(gl-722)",
+               (Jellyfin.Api/WebSocketListeners/ActivityLogWebSocketListener.cs) and the \
+               ScheduledTasks listener \
+               (Jellyfin.Api/WebSocketListeners/ScheduledTasksWebSocketListener.cs)",
     date: "2026-10-29",
     divergences: &[
         "Events already queued for a socket are drained and answered with one Sessions or \
@@ -990,12 +997,21 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[VerifiedSubsystem {
          fewer frames with the same final state.",
         "A non-administrator's Sessions frames carry the hardware accelerator blanked, as \
          GET /Sessions does; upstream's stream sends it as is.",
-        "A second SessionsStart or ActivityLogEntryStart on a socket replaces its \
-         subscription; upstream adds a second one and sends each frame twice.",
+        "A second SessionsStart, ActivityLogEntryStart or ScheduledTasksInfoStart on a \
+         socket replaces its subscription; upstream adds a second one and sends each frame \
+         twice.",
+        "ScheduledTasksInfoStart sends the current task list at once, where upstream's Start \
+         sends nothing until a task event, because jellyfin-web's scan button has no HTTP \
+         fallback; it costs one registry snapshot per subscribe and none per period, and counts \
+         as the stream's last send, so progress inside the first period is held back.",
+        "A task start or completion is sent with the task list captured at the transition, \
+         where upstream reads the list when it sends; a progress frame due while one is still \
+         queued is dropped, so a short run never shows out of order, and a later report sends \
+         once the period has passed.",
         "A session list that cannot be built is logged and skipped and the subscription stays; \
          upstream logs it and drops the connection's subscription.",
         "The period is floored at FERROFIN_WS_MIN_STREAM_PERIOD_MS (100 ms by default), which \
-         upstream does not have, until the last stream stops polling: TODO(gl-723).",
+         upstream does not have: TODO(gl-723).",
     ],
 }];
 

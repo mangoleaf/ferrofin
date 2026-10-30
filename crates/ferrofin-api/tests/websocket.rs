@@ -5,7 +5,7 @@
 //! `axum::serve`, which is the only way to exercise the inbound framing (the
 //! part affected by the socket's read-buffer capacity), the authentication
 //! that decides whether the upgrade happens at all, and the event-driven
-//! `Sessions` and `ActivityLogEntry` streams.
+//! `Sessions`, `ActivityLogEntry` and `ScheduledTasksInfo` streams.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ use ferrofin_model::session::{
     PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, SessionUserInfo,
     TranscodingInfo,
 };
+use ferrofin_model::tasks::{TaskInfo, TaskTriggerInfo};
 use ferrofin_model::users::UserPolicy;
 use ferrofin_traits::activity::{ActivityLogCreate, ActivityLogQuery, ActivityManager};
 use ferrofin_traits::error::ServiceError;
@@ -30,6 +31,7 @@ use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::session::{
     AuthenticationRequest, AuthenticationResultData, SessionEvent, SessionManager,
 };
+use ferrofin_traits::tasks::{TaskManager, TaskSubscription};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -779,4 +781,139 @@ async fn created_entries_send_an_empty_activity_frame_and_never_query() {
 
     send_and_ack(&mut socket, "ActivityLogEntryStop", "").await;
     assert_eq!(activity.created.receiver_count(), 0, "unsubscribed");
+}
+
+/// A task manager for the `ScheduledTasksInfo` stream: a test raises task
+/// transitions and progress reports, and every task-list read is counted.
+/// Its subscribe snapshot is taken with the subscription, so it is no read.
+struct StreamingTasks {
+    transitions: broadcast::Sender<Vec<TaskInfo>>,
+    progress: broadcast::Sender<()>,
+    reads: AtomicUsize,
+}
+
+impl StreamingTasks {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            transitions: broadcast::channel(64).0,
+            progress: broadcast::channel(64).0,
+            reads: AtomicUsize::new(0),
+        })
+    }
+
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskManager for StreamingTasks {
+    fn subscribe_task_updates(&self) -> Option<TaskSubscription> {
+        Some(TaskSubscription {
+            snapshot: Vec::new(),
+            updates: self.transitions.subscribe(),
+            progress: self.progress.subscribe(),
+        })
+    }
+    async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+    async fn get_task(&self, _task_id: &str) -> Result<Option<TaskInfo>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn start_task(&self, _task_id: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn cancel_task(&self, _task_id: &str) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn update_triggers(
+        &self,
+        _task_id: &str,
+        _triggers: &[TaskTriggerInfo],
+    ) -> Result<(), ServiceError> {
+        unimplemented!("fake")
+    }
+}
+
+/// Opens an administrator's socket whose task manager is `tasks`, subscribes
+/// it to the `ScheduledTasksInfo` stream with `data` and reads the subscribe
+/// snapshot, which upstream does not send (an accepted divergence: the
+/// dashboard's scan button has no HTTP fallback).
+async fn subscribe_to_tasks(tasks: &Arc<StreamingTasks>, data: &str) -> Client {
+    let state = ferrofin_api::test_support::fake_state_with_streams(
+        Arc::new(TokenAuth { admin: true }),
+        Arc::new(ferrofin_api::test_support::FakeConfig),
+        StreamingSessions::new(Vec::new()),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        Arc::clone(tasks) as Arc<dyn TaskManager>,
+    );
+    let mut socket = connect(state).await;
+    socket
+        .send(Message::text(format!(
+            r#"{{"MessageType":"ScheduledTasksInfoStart","Data":"{data}"}}"#
+        )))
+        .await
+        .expect("subscribe");
+    assert_eq!(
+        next_json(&mut socket).await["MessageType"],
+        "ScheduledTasksInfo",
+        "the subscribe snapshot"
+    );
+    assert_eq!(tasks.progress.receiver_count(), 1, "subscribed");
+    socket
+}
+
+/// B3 for the task stream: with no task running, a subscribed socket gets
+/// nothing after its subscribe snapshot and reads no task list, however many
+/// periods pass. The clock is paused only while the periods pass.
+#[tokio::test]
+async fn an_idle_task_subscription_sends_and_reads_nothing() {
+    let tasks = StreamingTasks::new();
+    let mut socket = subscribe_to_tasks(&tasks, "0,1500").await;
+    tokio::time::pause();
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    tokio::time::resume();
+
+    assert_next_is_ack(&mut socket).await;
+    assert_eq!(tasks.reads(), 0, "no task list was read");
+}
+
+/// B6 (`ScheduledTasksWebSocketListener`): progress is `SendData(false)`, so
+/// a report inside the period of the last frame is dropped without reading
+/// the task list, and one after it reads and sends; a task start or
+/// completion is `SendData(true)` and sends at once, inside the period too.
+/// The period is skipped by advancing a clock paused only while no frame is
+/// in flight; it stays under the 45 s keep-alive watchdog.
+#[tokio::test]
+async fn task_progress_is_throttled_and_transitions_are_forced() {
+    let tasks = StreamingTasks::new();
+    let mut socket = subscribe_to_tasks(&tasks, "0,30000").await;
+
+    tasks.progress.send(()).expect("a subscribed socket");
+    assert_next_is_ack(&mut socket).await;
+    assert_eq!(tasks.reads(), 0, "dropped progress reads nothing");
+    tasks
+        .transitions
+        .send(Vec::new())
+        .expect("a subscribed socket");
+    assert_eq!(
+        next_json(&mut socket).await["MessageType"],
+        "ScheduledTasksInfo"
+    );
+
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    tokio::time::resume();
+    tasks.progress.send(()).expect("a subscribed socket");
+    assert_eq!(
+        next_json(&mut socket).await["MessageType"],
+        "ScheduledTasksInfo"
+    );
+    assert_eq!(tasks.reads(), 1, "only the sent progress read the list");
+
+    send_and_ack(&mut socket, "ScheduledTasksInfoStop", "").await;
+    assert_eq!(tasks.progress.receiver_count(), 0, "unsubscribed");
+    assert_eq!(tasks.transitions.receiver_count(), 0);
 }

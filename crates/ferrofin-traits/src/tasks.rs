@@ -32,6 +32,10 @@ pub struct TaskSubscription {
     pub snapshot: Vec<TaskInfo>,
     /// Subsequent lifecycle transitions in registry order.
     pub updates: tokio::sync::broadcast::Receiver<Vec<TaskInfo>>,
+    /// One `()` each time a running task reported progress (upstream's
+    /// `IScheduledTaskWorker.TaskProgress` event); the progress itself is read
+    /// through [`TaskManager::get_tasks`].
+    pub progress: tokio::sync::broadcast::Receiver<()>,
 }
 
 /// Enumerates the server's scheduled tasks and runs one on demand.
@@ -40,9 +44,10 @@ pub struct TaskSubscription {
 /// held as `Arc<dyn TaskManager>`.
 #[async_trait]
 pub trait TaskManager: Send + Sync {
-    /// Subscribes to captured task-start and terminal snapshots in transition order.
-    /// Periodic progress remains available through `get_tasks`. Implementations
-    /// without live transitions return `None` and retain periodic polling.
+    /// Subscribes to captured task-start and terminal snapshots in transition
+    /// order, and to the running tasks' progress reports. Implementations
+    /// without live transitions return `None`: the `ScheduledTasksInfo`
+    /// stream then sends only its subscribe snapshot, read from `get_tasks`.
     fn subscribe_task_updates(&self) -> Option<TaskSubscription> {
         None
     }

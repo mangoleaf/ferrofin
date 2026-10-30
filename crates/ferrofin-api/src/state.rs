@@ -124,9 +124,9 @@ pub struct Inner {
     pub network: Option<Arc<std::sync::RwLock<ferrofin_networking::NetworkManager>>>,
     /// Floor for a dashboard WebSocket stream's push period (Sessions /
     /// ScheduledTasksInfo / ActivityLogEntry). The client names the period in
-    /// its `*Start` subscription and it is clamped up to this value, because
-    /// Ferrofin drives the task stream on a timer rather than off events (the
-    /// `Sessions` and `ActivityLogEntry` streams' throttle is floored too). Set by
+    /// its `*Start` subscription and it is clamped up to this value. Every
+    /// stream is event-driven and the period only spaces out low-priority
+    /// updates; the floor dates from when the task stream polled. Set by
     /// the composition root from `FERROFIN_WS_MIN_STREAM_PERIOD_MS` via
     /// [`AppState::with_websocket_min_stream_period`]; defaults to
     /// [`crate::handlers::websocket::DEFAULT_WS_MIN_STREAM_PERIOD`].
