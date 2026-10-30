@@ -89,6 +89,7 @@ ferrofin-api = { path = "crates/ferrofin-api" }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
+httpdate = "1.0.3"
 # Decoders for the response-compression tests only (the server never decodes a
 # response it just encoded). Streaming readers validate the wire response.
 flate2 = "1.1.10"

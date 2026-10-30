@@ -1884,6 +1884,121 @@ pub const VERIFIED: &[Verified] = &[
         ],
         refs: &[],
     },
+    Verified {
+        method: "get",
+        path: "/Environment/DirectoryContents",
+        upstream_file: "Jellyfin.Api/Controllers/EnvironmentController.cs",
+        upstream_method: "GetDirectoryContents",
+        ferrofin: "handlers/environment.rs get_directory_contents → ferrofin-core file_system.rs \
+               try_get_file_system_entries",
+        date: "2026-10-30",
+        divergences: &[
+            "The 400 (no path, or a flag that is no boolean), 404 (the path is no directory) and \
+         500 (the listing failed) bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Environment/ValidatePath",
+        upstream_file: "Jellyfin.Api/Controllers/EnvironmentController.cs",
+        upstream_method: "ValidatePath",
+        ferrofin: "handlers/environment.rs validate_path → ferrofin-core file_system.rs \
+               file_exists, directory_exists, validate_writable",
+        date: "2026-10-30",
+        divergences: &[
+            "The 400 (no body) and the writable check's 404 and 500 bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Environment/Drives",
+        upstream_file: "Jellyfin.Api/Controllers/EnvironmentController.cs",
+        upstream_method: "GetDrives",
+        ferrofin: "handlers/environment.rs get_drives → ferrofin-core file_system.rs get_drives, \
+               drive_probe.rs, mount_table.rs",
+        date: "2026-10-30",
+        divergences: &[
+            "A mount that does not answer in time (drive_probe.rs DRIVE_PROBE_TIMEOUT) is left \
+         out of that listing, a hung one and one merely that slow, where upstream's request \
+         waits for it for as long as the mount takes. Deliberate (gl-26): upstream's thread \
+         pool grows, and a hung statvfs cannot be cancelled.",
+            "With no readable mount table, or no mount that qualifies, the list is `/`; \
+         upstream's is empty.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/System/Logs",
+        upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
+        upstream_method: "GetServerLogs",
+        ferrofin: "handlers/system.rs get_server_logs → ferrofin-core file_system.rs get_files",
+        date: "2026-10-30",
+        divergences: &[],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/System/Logs/Log",
+        upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
+        upstream_method: "GetLogFile",
+        ferrofin: "handlers/system.rs get_log_file → ferrofin-core file_system.rs get_files, \
+               open_file → handlers/streaming.rs opened_file_response",
+        date: "2026-10-30",
+        divergences: &[
+            "A log that grows while it is read stops at the length the headers declared; \
+         upstream copies to the end of the stream, past that length, which Kestrel aborts. \
+         Jellyfin bug not ported.",
+            "The 400 (no name), 404 (no such log, or one gone before it was opened) and 500 (one \
+         that cannot be opened) bodies are Ferrofin's error shape, not upstream's (a \
+         \"Log file not found.\" string for the first 404). Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/FallbackFont/Fonts",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "GetFallbackFontList",
+        ferrofin: "handlers/subtitles.rs get_fallback_font_list → ferrofin-core file_system.rs \
+               get_files",
+        date: "2026-10-30",
+        divergences: &[
+            "With no FallbackFontPath, upstream also sets EnableFallbackFont to false on the \
+         cached EncodingOptions object, unsaved, so that a later read of the configuration \
+         reports false until the next restart. Jellyfin bug not ported: a GET does not \
+         change the configuration here.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/FallbackFont/Fonts/{name}",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "GetFallbackFont",
+        ferrofin: "handlers/subtitles.rs get_fallback_font → ferrofin-core file_system.rs \
+               get_files, open_file → handlers/streaming.rs opened_file_response, \
+               physical_file_precondition",
+        date: "2026-10-30",
+        divergences: &[
+            "A precondition date outside HTTP's three formats or before 1970 is ignored; \
+         ASP.NET's date parser takes both (a numeric offset, for one). No client sends one, \
+         short of echoing the Last-Modified of a font dated before 1970, which then gets a \
+         200 where upstream sends a 304.",
+            "The MIME type comes from mime_types.rs plus the font rows of the MimeTypes \
+         package; a font under an extension that package knows and this list does not is \
+         application/octet-stream. The list route serves four extensions, all covered.",
+            "The EnableFallbackFont side effect of a missing FallbackFontPath is not ported, as \
+         on GET /FallbackFont/Fonts.",
+            "The 400 (no name) and the 404 and 500 of a font that cannot be opened have \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
 ];
 
 /// What `/Artists` and `/Artists/AlbumArtists` do differently from v12's
