@@ -2804,13 +2804,24 @@ pub fn fake_state_with(
     auth: Arc<dyn AuthService>,
     config: Arc<dyn ServerConfigurationManager>,
 ) -> AppState {
+    fake_state_with_sessions(auth, config, Arc::new(FakeSessions))
+}
+
+/// [`fake_state_with`] over the given session manager too, for the session
+/// socket's streams.
+#[must_use]
+pub fn fake_state_with_sessions(
+    auth: Arc<dyn AuthService>,
+    config: Arc<dyn ServerConfigurationManager>,
+    sessions: Arc<dyn SessionManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         Arc::new(FakeUsers),
         Arc::new(FakeUserViews),
         Arc::new(FakeUserData),
         Arc::new(FakeMediaSources),
-        Arc::new(FakeSessions),
+        sessions,
         Arc::new(FakeSystem),
         Arc::new(FakeAppHost),
         config,

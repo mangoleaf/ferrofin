@@ -1847,7 +1847,8 @@ fn dynamic_answer(
     let item = &mut answer.item;
     item.overview = text(result.overview);
     item.production_year = result.production_year.map(i64::from);
-    item.community_rating = result.community_rating;
+    // The fresh item's `CommunityRating` setter runs `FiniteOrNull`.
+    item.community_rating = ferrofin_util::finite::finite_or_none(result.community_rating);
     item.genres = list(&result.genres);
     item.tagline = text(result.tagline);
     item.studios = list(&result.studios);
@@ -36738,6 +36739,37 @@ mod tests {
             assert_eq!(temp.overview.as_deref(), Some(overview), "{preferred}");
             assert_eq!(temp.tagline.as_deref(), Some(tagline), "{preferred}");
         }
+    }
+
+    /// A plugin's rating lands on the provider's fresh item, whose
+    /// `CommunityRating` setter runs `FiniteOrNull`: a NaN or infinite rating
+    /// supplies nothing, so a later provider can still fill it.
+    #[test]
+    fn a_plugin_answer_with_a_non_finite_rating_supplies_none() {
+        use ferrofin_traits::providers::DynamicMetadataResult;
+        let row = BaseItemEntity {
+            id: "movie".into(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".into(),
+            ..BaseItemEntity::default()
+        };
+        for rating in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let plugin = super::dynamic_answer(
+                &row,
+                DynamicMetadataResult {
+                    community_rating: Some(rating),
+                    ..DynamicMetadataResult::default()
+                },
+            );
+            assert_eq!(plugin.item.community_rating, None, "{rating}");
+        }
+        let plugin = super::dynamic_answer(
+            &row,
+            DynamicMetadataResult {
+                community_rating: Some(6.5),
+                ..DynamicMetadataResult::default()
+            },
+        );
+        assert_eq!(plugin.item.community_rating, Some(6.5));
     }
 
     #[rstest::rstest]
