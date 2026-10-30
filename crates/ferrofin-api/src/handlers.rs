@@ -900,11 +900,10 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
         "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
         "v12.2",
     ),
+    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
     // gl-1031: a malformed unrelated query parameter is a 400.
     ("post", "/UserImage", "v12.2"),
     ("delete", "/UserImage", "v12.2"),
-    // gl-1027: a padded lyric extension is trimmed and saved.
-    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
     // gl-1026: an XMLTV provider with an empty Path is a 400, not a 404.
     ("post", "/LiveTv/ListingProviders", "v12.2"),
     // gl-762: livetv lists tuners and listing providers by id, not as added.
@@ -1228,18 +1227,24 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Audio/{itemId}/Lyrics",
         upstream_file: "Jellyfin.Api/Controllers/LyricsController.cs",
         upstream_method: "UploadLyrics",
-        ferrofin: "handlers/lyrics.rs upload_lyrics (upload_format, queue_high_priority_refresh) \
-               → ferrofin-core lyric_manager.rs save_lyric (decode_stream_text, save_targets, \
-               try_save_to_files)",
+        ferrofin: "handlers/lyrics.rs upload_lyrics (require_item, an empty body by its \
+               size hint, upload_format, then the Bytes read under upload_body_limit; \
+               queue_high_priority_refresh) → ferrofin-core lyric_manager.rs save_lyric \
+               (decode_stream_text, parse_by_format on the format as given, save_targets \
+               with save_extension, try_save_to_files)",
         date: "2026-10-24",
         divergences: &[
             "An upload with no Content-Length (a chunked body) is read and saved; upstream \
          tests Request.ContentLength and answers every chunked upload 400 \"No lyrics \
          uploaded\". Jellyfin bug not ported.",
             "A body past Kestrel's 30,000,000-byte default (MAX_UPLOAD_BODY_BYTES, the same \
-         cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
-         Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
-         Jellyfin bug not ported.",
+         cap) is a 413 once the item, the empty-body and the extension checks pass, where \
+         upstream reads it too; upstream's ExceptionMiddleware maps no \
+         BadHttpRequestException, so Kestrel's \"request body too large\" reaches the \
+         client as a plain-text 500. Jellyfin bug not ported.",
+            "The 400 (an empty body, a file name without an extension, a format no parser \
+         reads, a missing or blank fileName) and 404 (no such item, or one the caller may \
+         not see) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },

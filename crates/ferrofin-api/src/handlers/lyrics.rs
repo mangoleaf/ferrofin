@@ -21,9 +21,11 @@
 //! metadata refresh re-probes its lyric streams, as the C# flow does: upload
 //! and download queue it at high priority, delete awaits it.
 
-use axum::extract::{Path, State};
+use axum::body::{Bytes, HttpBody as _};
+use axum::extract::{FromRequest as _, Path, Request, State};
 use axum::handler::Handler;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse as _, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_model::lyrics::{LyricDto, RemoteLyricInfoDto};
@@ -106,9 +108,12 @@ struct UploadLyricsQuery {
 ///
 /// Port of `LyricsController.UploadLyrics`: the request body is the lyric
 /// file's bytes, in any encoding the manager's reader takes (a UTF-16 file
-/// is no `400`); the format is the uploaded file's extension. `400` when the
-/// body is empty or the file name has no extension; `404` for a missing item.
-/// On success queues a high-priority metadata refresh (as the C# does).
+/// is no `400`); the format is the uploaded file's extension. `404` for a
+/// missing item, then `400` when the body is empty or the file name has no
+/// extension, and only then is the body read, so a body past the upload limit
+/// is a `413` only once those checks pass, as Kestrel enforces its limit on
+/// the action's read. On success queues a high-priority metadata refresh (as
+/// the C# does).
 #[utoipa::path(
     post,
     path = "/Audio/{itemId}/Lyrics",
@@ -128,11 +133,14 @@ async fn upload_lyrics(
     RequireLyricManagement(auth): RequireLyricManagement,
     Path(item_id): Path<Uuid>,
     Query(query): Query<UploadLyricsQuery>,
-    body: axum::body::Bytes,
-) -> Result<Json<LyricDto>, ApiError> {
+    request: Request,
+) -> Result<Response, ApiError> {
     require_item(&state, item_id, &auth).await?;
-    if body.is_empty() {
-        return Err(ApiError::BadRequest("no lyrics uploaded".to_owned()));
+    // `Request.ContentLength.GetValueOrDefault(0) == 0`, for a body known to
+    // be empty. A chunked one has no length: it is read below, and an empty
+    // one is refused after the read (see the row's divergence).
+    if request.body().size_hint().exact() == Some(0) {
+        return Err(no_lyrics_uploaded());
     }
     let format = upload_format(&query.file_name);
     if format.is_empty() {
@@ -140,14 +148,29 @@ async fn upload_lyrics(
             "extension is required on filename".to_owned(),
         ));
     }
+    // Upstream copies `Request.Body` only now. The route's
+    // `upload_body_limit` sets the cap this read applies, and a body past it
+    // is the read's own `413` rejection.
+    let body = match Bytes::from_request(request, &state).await {
+        Ok(body) => body,
+        Err(rejection) => return Ok(rejection.into_response()),
+    };
+    if body.is_empty() {
+        return Err(no_lyrics_uploaded());
+    }
 
     match state.lyrics.save_lyric(item_id, format, &body).await? {
         Some(dto) => {
             queue_high_priority_refresh(&state, item_id).await?;
-            Ok(Json(dto))
+            Ok(Json(dto).into_response())
         }
         None => Err(ApiError::BadRequest("could not save lyrics".to_owned())),
     }
+}
+
+/// `BadRequest("No lyrics uploaded")`: the upload has an empty body.
+fn no_lyrics_uploaded() -> ApiError {
+    ApiError::BadRequest("no lyrics uploaded".to_owned())
 }
 
 /// The lyric format an uploaded file name gives:
