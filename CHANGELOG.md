@@ -593,6 +593,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `FERROFIN_ROW_CACHE_TTL_SECS` and `FERROFIN_AUTH_CACHE_TTL_SECS`
   (5–300, default 30) bound how long a change made outside the server, in the database
   itself, goes unseen
+- Non-recursive folder listings sorted by `SortName` or `Name` (`/Items?parentId=…`, the
+  folders view, a season's episodes): compute each child's sort key once instead of on
+  every comparison. Sorting 2,000 children made 95,896 heap allocations and now makes
+  6,004; the order is unchanged
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

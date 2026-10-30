@@ -504,7 +504,15 @@ impl FerrofinItemRepository {
         use ferrofin_model::entities_media::AiredEpisodeOrder;
         use ferrofin_model::live_tv::ItemSortBy;
         use ferrofin_util::stable_sort::stable_sort_by;
-        type Keyed = (Option<AiredEpisodeOrder>, BaseItemEntity);
+        /// A child with the keys its sort compares, each computed once for
+        /// the row rather than on every comparison (gl-1002); a key the
+        /// request does not name stays `None` and is never compared.
+        struct Keyed {
+            aired: Option<AiredEpisodeOrder>,
+            name: Option<String>,
+            sort_name: Option<String>,
+            row: BaseItemEntity,
+        }
         if rows.is_empty() || filter.order_by.is_empty() {
             return Ok(rows);
         }
@@ -518,34 +526,37 @@ impl FerrofinItemRepository {
                     | ItemSortBy::Unrecognized(_)
             )
         }) {
+            let sorts_by = |key: ItemSortBy| filter.order_by.iter().any(|(by, _)| *by == key);
             // `AiredEpisodeOrderComparer` positions episodes only, so the aired
             // fields are read once per episode row; any other row has none.
-            let aired = filter
-                .order_by
-                .iter()
-                .any(|(by, _)| *by == ItemSortBy::AiredEpisodeOrder);
+            let aired = sorts_by(ItemSortBy::AiredEpisodeOrder);
+            let by_name = sorts_by(ItemSortBy::Name);
+            let by_sort_name = sorts_by(ItemSortBy::SortName);
             let episode = stored_type_name(BaseItemKind::Episode);
             let mut keyed: Vec<Keyed> = rows
                 .into_iter()
-                .map(|row| {
-                    let key =
-                        (aired && Some(row.type_.as_str()) == episode).then(|| aired_order(&row));
-                    (key, row)
+                .map(|row| Keyed {
+                    aired: (aired && Some(row.type_.as_str()) == episode)
+                        .then(|| aired_order(&row)),
+                    name: row
+                        .name
+                        .as_deref()
+                        .filter(|_| by_name)
+                        .map(folder_ordinal_key),
+                    sort_name: by_sort_name.then(|| folder_ordinal_key(&folder_sort_name(&row))),
+                    row,
                 })
                 .collect();
-            let compare = |(a_aired, a): &Keyed, (b_aired, b): &Keyed| {
+            let compare = |a: &Keyed, b: &Keyed| {
                 for (by, direction) in &filter.order_by {
                     let ordering = match by {
-                        ItemSortBy::Name => {
-                            folder_ordinal_compare(a.name.as_deref(), b.name.as_deref())
-                        }
-                        ItemSortBy::SortName => folder_ordinal_compare(
-                            Some(&folder_sort_name(a)),
-                            Some(&folder_sort_name(b)),
-                        ),
+                        // `folder_ordinal_compare` over the precomputed keys:
+                        // a missing name sorts first.
+                        ItemSortBy::Name => a.name.cmp(&b.name),
+                        ItemSortBy::SortName => a.sort_name.cmp(&b.sort_name),
                         // `AiredEpisodeOrderComparer.Compare`: a non-episode
                         // sorts after every episode and equal to another one.
-                        ItemSortBy::AiredEpisodeOrder => match (a_aired, b_aired) {
+                        ItemSortBy::AiredEpisodeOrder => match (&a.aired, &b.aired) {
                             (Some(a), Some(b)) => a.compare(b),
                             (Some(_), None) => std::cmp::Ordering::Less,
                             (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -572,7 +583,7 @@ impl FerrofinItemRepository {
             } else {
                 keyed.sort_by(compare);
             }
-            return Ok(keyed.into_iter().map(|(_, row)| row).collect());
+            return Ok(keyed.into_iter().map(|keyed| keyed.row).collect());
         }
         // Keep the existing consumer for other sort fields. Its broader
         // comparator parity is a separate query review, not this display flag.
@@ -3127,8 +3138,16 @@ pub(crate) fn folder_ordinal_compare(
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(left), Some(right)) => upper_invariant(left).cmp(&upper_invariant(right)),
+        (Some(left), Some(right)) => folder_ordinal_key(left).cmp(&folder_ordinal_key(right)),
     }
+}
+
+/// The ordinal case-insensitive key [`folder_ordinal_compare`] compares, the
+/// .NET invariant upper case: comparing two values is comparing their keys
+/// byte-wise, so a sort can compute each row's key once instead of on every
+/// comparison.
+pub(crate) fn folder_ordinal_key(value: &str) -> String {
+    upper_invariant(value)
 }
 
 pub(crate) fn folder_sort_name(row: &BaseItemEntity) -> String {
@@ -14629,3 +14648,7 @@ mod is_airing_tests;
 #[cfg(test)]
 #[path = "item_repository/linked_library_scope_tests.rs"]
 mod linked_library_scope_tests;
+
+#[cfg(test)]
+#[path = "item_repository/folder_sort_key_tests.rs"]
+mod folder_sort_key_tests;
