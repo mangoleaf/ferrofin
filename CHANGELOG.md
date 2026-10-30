@@ -805,6 +805,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
+- Two user-data changes to one item that overlap now both land. A progress report used to undo
+  a favourite, like or played mark made while it waited for the database writer (for seconds
+  during a library scan), and overlapping play starts counted once
+- A stop report with no position now marks a video's other versions played too, as a stop with
+  one does
 - The web client's Next Up row loads again: jellyfin-web 12.x sends `nextUpDateCutoff` as a
   bare date, which Ferrofin answered with a `400`. Every `DateTime` query parameter now binds
   as Jellyfin's does: a date or an offset-less date-time is accepted and read as server

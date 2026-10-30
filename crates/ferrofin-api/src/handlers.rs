@@ -1050,6 +1050,33 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              and Backdrop tags) is not ported. Fix path: gl-853.",
         ],
     },
+    VerifiedSubsystem {
+        key: "user-data",
+        upstream_file: "Emby.Server.Implementations/Library/UserDataManager.cs",
+        upstream_method: "SaveUserData",
+        ferrofin: "The write path only. ferrofin-core user_data_manager.rs mutate_row \
+                   (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
+                   save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
+                   save_play_state and apply_play_report (UpdatePlayState), \
+                   reset_playback_stream_selections (ResetPlaybackStreamSelections), \
+                   record_playback_start, set_likes, mark_item_played, mark_item_unplayed, \
+                   clear_own_play_state and propagate_played_state. Compared with \
+                   Emby.Server.Implementations/Session/SessionManager.cs (OnPlaybackStart, \
+                   OnPlaybackProgress, UpdatePlaybackSettings, OnPlaybackStopped), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
+                   MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
+                   Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
+                   UpdateUserItemRatingInternal)",
+        date: "2026-10-30",
+        divergences: &[
+            "Each change reads the row inside its write transaction, so two overlapping saves of \
+             one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
+             writes every column back, so there the later save undoes the earlier one.",
+            "Marking a container unplayed also clears the play state on the container's own rows, \
+             which earlier Ferrofin builds wrote; upstream's MarkUnplayed leaves them, so a Played \
+             set on a container through the UserData API survives it there. Fix path: gl-1064.",
+        ],
+    },
 ];
 
 /// One contract operation whose Ferrofin implementation was compared against
