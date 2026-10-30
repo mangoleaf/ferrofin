@@ -612,6 +612,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Jellyfin answers `500`
 
 ### Performance
+- The client's address is resolved once per request, at the IP gate, instead of walking
+  `X-Forwarded-For` again for the auth layer and each policy check behind it
 - `GET /Items` reads the caller's tag whitelist from the policy the request already holds instead
   of cloning the whole cached user DTO for it
 - A request whose path needs no rewriting, which covers image, segment and `/web/*` fetches, costs

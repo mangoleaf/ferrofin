@@ -4,13 +4,14 @@
 //! parser reads and no others: copying a browser's whole header set for a parser
 //! that reads four was a constant tax on every image and segment fetch.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use ferrofin_api::router::create_router;
 use ferrofin_api::test_support::{FakeConfig, fake_state_with};
+use ferrofin_networking::{NetworkConfiguration, NetworkManager};
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::{AuthService, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
@@ -108,4 +109,45 @@ async fn repeated_credential_headers_keep_their_order() {
     assert_eq!(context.header("authorization"), Some("first"));
     let values: Vec<&str> = context.headers.iter().map(|(_, v)| v.as_str()).collect();
     assert_eq!(values, ["first", "second"]);
+}
+
+/// Behind a known proxy the context names the forwarded client, the address the
+/// IP gate in front of the auth layer filtered.
+#[tokio::test]
+async fn the_auth_context_names_the_client_the_ip_gate_resolved() {
+    let auth = Arc::new(RecordingAuth::default());
+    let network = NetworkManager::with_defaults(
+        NetworkConfiguration {
+            known_proxies: vec!["10.0.0.0/8".to_owned()],
+            ..NetworkConfiguration::default()
+        },
+        "",
+    );
+    let state = fake_state_with(
+        Arc::clone(&auth) as Arc<dyn AuthService>,
+        Arc::new(FakeConfig),
+    )
+    .with_network(Arc::new(RwLock::new(network)));
+    let mut request = Request::builder()
+        .uri("/Users/Me")
+        .header("x-forwarded-for", "203.0.113.7")
+        .body(Body::empty())
+        .expect("request");
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "10.4.0.9:5000"
+            .parse::<std::net::SocketAddr>()
+            .expect("peer"),
+    ));
+    let response = create_router(state)
+        .oneshot(request)
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let context = auth
+        .seen
+        .lock()
+        .expect("lock")
+        .take()
+        .expect("authenticated");
+    assert_eq!(context.remote_endpoint.as_deref(), Some("203.0.113.7"));
 }
