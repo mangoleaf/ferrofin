@@ -959,6 +959,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   naming them), and a file that no longer loads is logged and leaves the previous
   configuration running. A `config.toml` parse error names the line and column but no longer
   quotes the line, which may hold a password
+- `FERROFIN_LIBRARY_ROOTS` (`library_roots` in `config.toml`) does what it is documented to do:
+  a fresh install starts with one library per listed folder, named after it, and scans them.
+  Nothing read the setting before, so a headless install that set it started with no libraries.
+  A later boot, or an adopted Jellyfin database, adds none
 
 ## [1.0.0] - 2026-09-05
 
