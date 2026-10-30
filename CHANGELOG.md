@@ -18,6 +18,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   the reason when it may not. A **Ferrofin** plugin under Dashboard → Plugins carries it: the
   route answers `404` while the plugin is disabled, and `FERROFIN_DISABLE_EXTENSIONS` leaves the
   plugin registered (see [docs/CONFIG.md](docs/CONFIG.md#seeing-what-is-set))
+- The **Ferrofin** plugin's settings page in jellyfin-web: its Settings link under Dashboard →
+  Plugins and a Ferrofin entry in the dashboard menu open a read-only list of every Ferrofin
+  setting by group, with its value, default, source badge, variable and flag, and a lock with the
+  reason on each one the page may not change; secrets are marked as secrets. The page holds no
+  setting itself (it is served anonymously) and disappears with the plugin when it is disabled
 
 ### Database
 - Adopt Jellyfin 12.3 and 12.4 databases in place: neither release adds a migration, so each

@@ -150,6 +150,14 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
 
 Wired and working, with a documented limitation or lighter verification:
 
+- **Ferrofin settings page** — Ferrofin's own, with no Jellyfin counterpart, so checked in
+  jellyfin-web only. Dashboard → Plugins → **Ferrofin** → Settings, or the dashboard menu's
+  Ferrofin entry, lists every Ferrofin setting in groups with the value in use, its default, where
+  it comes from (default, `config.toml`, environment variable or flag), its variable and flag,
+  and, for each one the page may not change, why and where it is changed instead. Secrets are
+  shown to administrators, marked as secrets. Read-only so far: settings change in `config.toml`,
+  the environment or the command line ([`CONFIG.md`](CONFIG.md#seeing-what-is-set)). Disabling the
+  Ferrofin plugin hides the page.
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
