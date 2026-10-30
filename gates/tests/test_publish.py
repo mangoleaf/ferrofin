@@ -462,6 +462,33 @@ class PublishTests(unittest.TestCase):
                      "| jellyfin-12.1-from-12 | path | 12.1.0 | skipped | fixture not built |"):
             self.assertIn(text, page)
 
+    def restamp(self, path, started):
+        doc = json.loads(path.read_text())
+        doc["started"] = started
+        path.write_text(json.dumps(doc))
+
+    def test_each_run_is_dated_by_its_own_start_in_utc(self):
+        # session.json is stamped in local time, every gate's result.json in UTC: a session started at 17:00 in
+        # UTC-6 (23:00 UTC) whose gates started after midnight UTC dates those gates the next day
+        s = adoption_session(self.root, ADOPTION)
+        self.restamp(s / "session.json", "2026-10-25T17:00:00-06:00")
+        self.restamp(s / "adoption" / "result.json", "2026-10-26T00:10:00+00:00")
+        self.restamp(s / "parity" / "result.json", "2026-10-26T01:00:00+00:00")
+        doc = publish.summarise("v1.4.0", self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)]), str(s))
+        self.assertEqual((doc["adoption"]["source"]["date"], doc["parity"]["source"]["date"]), ("2026-10-26", "2026-10-26"))
+
+    def test_a_run_without_its_own_start_is_dated_by_the_session_start_in_utc(self):
+        s = adoption_session(self.root, ADOPTION)   # its parity result records no start
+        self.restamp(s / "session.json", "2026-10-25T19:30:00-06:00")   # 01:30 UTC the next day
+        doc = publish.summarise("v1.4.0", self.runs([bench_result(x) for x in (1.0, 1.1, 0.9)]), str(s))
+        self.assertEqual(doc["parity"]["source"]["date"], "2026-10-26")
+
+    def test_a_timestamp_is_read_as_its_utc_date(self):
+        for stamp, day in (("2026-10-25T19:30:00-06:00", "2026-10-26"), ("2026-10-26T01:30:05+00:00", "2026-10-26"),
+                           ("2026-10-26T08:30:00+09:00", "2026-10-25"), ("2026-10-25T19:30:00", "2026-10-25"),
+                           ("2026-10-25", "2026-10-25"), ("", None), (None, None)):
+            self.assertEqual(publish.utc_date(stamp), day, stamp)
+
     def test_a_summary_from_before_the_library_size_names_none_and_a_bad_one_is_refused(self):
         doc = self.summary()
         del doc["bench"]["source"]["library"]   # v1.4.0's summary
