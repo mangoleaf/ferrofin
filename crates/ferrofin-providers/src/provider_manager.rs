@@ -2512,6 +2512,29 @@ impl LocalProviderManager {
         // item with no file has no file change, probe or local reader to
         // monitor.
         let library = self.library_options_for(&stored).await;
+        // `ValidateImages` (`MetadataService.cs:121-143`) runs first, whatever
+        // the lock or the fetcher checkboxes: the local image providers. With
+        // "Save artwork into media folders" and "Replace existing images"
+        // upstream registers no new local file
+        // (`IsSaveLocalMetadataEnabled() && ReplaceAllImages`).
+        let saves_local_and_replaces = options.replace_all_images
+            && library
+                .as_ref()
+                .is_some_and(|library| library.save_local_metadata);
+        // A failed validation is logged and the refresh goes on without the
+        // remote image providers, unstamped (`localImagesFailed`,
+        // `MetadataService.cs:127-143,195-198`).
+        let (local_images, local_images_failed) = if saves_local_and_replaces {
+            (false, false)
+        } else {
+            match self.validate_virtual_season_images(item_id, &stored).await {
+                Ok(saved) => (saved, false),
+                Err(err) => {
+                    tracing::warn!(%item_id, %err, "could not validate the item's local images");
+                    (false, true)
+                }
+            }
+        };
         let request = RefreshRequest {
             options,
             force_save: options.force_save,
@@ -2538,7 +2561,9 @@ impl LocalProviderManager {
         let gated = self.gated_options(&stored, options).await;
         let fetch = Fetch {
             metadata: plan.remote_metadata && wants_fetch(gated.metadata_refresh_mode),
-            images: plan.remote_images != ImageFetch::None && wants_fetch(gated.image_refresh_mode),
+            images: !local_images_failed
+                && plan.remote_images != ImageFetch::None
+                && wants_fetch(gated.image_refresh_mode),
         };
         let chosen_name = options
             .search_result
@@ -2649,6 +2674,7 @@ impl LocalProviderManager {
             },
             None => (None, 0),
         };
+        failures += u32::from(local_images_failed);
         let fetched = fetched.unwrap_or_default();
         // A box set or playlist (`EnableUpdatingOfficialRatingFromChildren`)
         // scores ratings against its `GetPreferredMetadataCountryCode()`.
@@ -2811,7 +2837,11 @@ impl LocalProviderManager {
             plan,
             &request,
             PassOutcome {
-                changed: metadata_changed || ids_changed || image_saved || generated,
+                changed: metadata_changed
+                    || ids_changed
+                    || image_saved
+                    || generated
+                    || local_images,
                 failed: failures > 0,
             },
         );
@@ -2890,7 +2920,7 @@ impl LocalProviderManager {
             || request.options.replace_all_metadata
         {
             ItemUpdateType::MetadataDownload
-        } else if image_saved || generated {
+        } else if image_saved || generated || local_images {
             ItemUpdateType::ImageUpdate
         } else {
             ItemUpdateType::None
@@ -2899,6 +2929,68 @@ impl LocalProviderManager {
             self.save_metadata(item_id, update).await?;
         }
         Ok(update)
+    }
+
+    /// `ImageProvider.ValidateImages` for a season with no folder of its own:
+    /// `LocalImageProvider` reads its images from its series' folder (the
+    /// `LocationType.Virtual` branch of `Supports`,
+    /// `PopulateSeasonImagesFromSeriesFolder`). What it finds merges onto the
+    /// stored images by `MergeImages`' rule, as the library scan merges a
+    /// season's. `CanRefreshImages` enables every `ILocalImageProvider` before
+    /// the lock and the fetcher checkboxes, so neither gates it. Returns
+    /// whether the images were saved.
+    async fn validate_virtual_season_images(
+        &self,
+        item_id: Uuid,
+        row: &BaseItemEntity,
+    ) -> Result<bool, ServiceError> {
+        use crate::local_images::{
+            FsDirectoryService, ImageItem, LocalImageProvider, local_image_infos,
+            merge_local_images,
+        };
+        if BaseItemKind::from_stored_type_name(&row.type_) != Some(BaseItemKind::Season)
+            || row.path.as_deref().is_some_and(|path| !path.is_empty())
+        {
+            return Ok(false);
+        }
+        let (Some(items), Some(store)) = (&self.items, &self.image_store) else {
+            return Ok(false);
+        };
+        let Some(series_id) = row
+            .series_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            return Ok(false);
+        };
+        let series_folder = items
+            .retrieve_item(series_id)
+            .await?
+            .and_then(|series| series.path)
+            .filter(|path| !path.is_empty());
+        let season = ImageItem {
+            name: row.name.clone().unwrap_or_default(),
+            ..ImageItem::default()
+        }
+        .with_season(row.index_number, series_folder);
+        if !LocalImageProvider::supports(&season) {
+            return Ok(false);
+        }
+        let found = local_image_infos(LocalImageProvider::get_images(
+            &season,
+            &FsDirectoryService::new(),
+        ));
+        if found.is_empty() {
+            return Ok(false);
+        }
+        let Some(mut images) = self.stored_images(item_id).await else {
+            return Ok(false);
+        };
+        if !merge_local_images(&mut images, &found) {
+            return Ok(false);
+        }
+        store.save_item_images(item_id, &images).await?;
+        Ok(true)
     }
 
     /// Remote and dynamic image providers share one ordered acquisition pass.
@@ -7250,6 +7342,8 @@ mod tests {
         copied: std::sync::Mutex<Vec<(Vec<Uuid>, bool, bool)>>,
         /// Each refresh `copy_owner_metadata_to_extras` was asked for.
         extras_copied: std::sync::Mutex<Vec<OwnerExtrasRefresh>>,
+        /// Refuses every `save_item_images`, as a store that cannot write.
+        fail_image_saves: bool,
     }
 
     #[async_trait]
@@ -7259,6 +7353,9 @@ mod tests {
             item_id: Uuid,
             images: &[ItemImageInfo],
         ) -> Result<(), ServiceError> {
+            if self.fail_image_saves {
+                return Err(ServiceError::backend("the image store refuses writes"));
+            }
             let mut stored = self.images.lock().unwrap();
             stored.retain(|(id, _)| *id != item_id);
             stored.extend(images.iter().cloned().map(|image| (item_id, image)));
@@ -11066,6 +11163,224 @@ mod tests {
         assert_eq!(row.overview.as_deref(), Some("Stored."));
         assert!(row.date_last_refreshed.is_some(), "no provider failed");
         assert!(season.people.written.lock().expect("lock").is_empty());
+    }
+
+    /// A season with no folder of its own, under a series whose folder holds
+    /// `season01-poster.jpg`, `season01-fanart.jpg`, another season's poster
+    /// and the series' own poster, stored with a downloaded Primary, in a
+    /// library saved with `options`; refreshed before, so a Default refresh
+    /// runs no remote provider, and with its sort key settled, so a refresh
+    /// changes nothing but its images.
+    struct SeriesArtSeason {
+        show: tempfile::TempDir,
+        season_id: Uuid,
+        /// The season's stored `DateLastRefreshed`.
+        refreshed: chrono::DateTime<chrono::Utc>,
+        store: Arc<RecordingStore>,
+        mgr: LocalProviderManager,
+    }
+
+    impl SeriesArtSeason {
+        fn new(options: ferrofin_model::configuration::LibraryOptions) -> Self {
+            Self::with_store(options, RecordingStore::default())
+        }
+
+        fn with_store(
+            options: ferrofin_model::configuration::LibraryOptions,
+            store: RecordingStore,
+        ) -> Self {
+            let show = tempfile::tempdir().expect("tmp");
+            for file in [
+                "season01-poster.jpg",
+                "season01-fanart.jpg",
+                "season02-poster.jpg",
+                "poster.jpg",
+            ] {
+                std::fs::write(show.path().join(file), b"jpeg").expect("art");
+            }
+            let library_id = Uuid::new_v4();
+            let series_id = Uuid::new_v4();
+            let mut series = row("TV.Series", "Show");
+            series.id = series_id.to_string();
+            series.path = Some(show.path().to_string_lossy().into_owned());
+            let season_id = Uuid::new_v4();
+            let mut season = row("TV.Season", "Season 1");
+            season.id = season_id.to_string();
+            season.series_id = Some(series_id.to_string());
+            season.top_parent_id = Some(library_id.to_string());
+            season.index_number = Some(1);
+            let refreshed = chrono::Utc::now() - chrono::Duration::days(1);
+            season.date_last_refreshed = Some(refreshed);
+            crate::metadata_merge::settle_sort_name(&mut season);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let items = Arc::new(FakeItems {
+                rows: HashMap::from([(series_id, series), (season_id, season)]),
+                seen: tx,
+            });
+            let store = Arc::new(store);
+            store.images.lock().expect("lock").push((
+                season_id,
+                ItemImageInfo {
+                    path: "/metadata/library/ab/primary.jpg".to_owned(),
+                    image_type: ImageType::Primary,
+                    ..ItemImageInfo::default()
+                },
+            ));
+            let mgr = LocalProviderManager::default()
+                .with_remote_images(
+                    Arc::new(crate::tmdb::TmdbClient::new().with_base_url("http://127.0.0.1:9")),
+                    items,
+                )
+                .with_image_store(Arc::clone(&store) as Arc<_>, std::env::temp_dir())
+                .with_virtual_folders(Arc::new(FakeLibraries {
+                    item_id: library_id,
+                    options,
+                }));
+            Self {
+                show,
+                season_id,
+                refreshed,
+                store,
+                mgr,
+            }
+        }
+
+        /// The path of `file` in the series folder.
+        fn art(&self, file: &str) -> String {
+            self.show.path().join(file).to_string_lossy().into_owned()
+        }
+
+        /// The season's stored images.
+        fn images(&self) -> Vec<(String, ImageType)> {
+            self.store
+                .images
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(id, _)| *id == self.season_id)
+                .map(|(_, image)| (image.path.clone(), image.image_type))
+                .collect()
+        }
+    }
+
+    /// A season with no folder of its own takes its series folder's
+    /// `season01-*` files on a refresh through this route, with no remote
+    /// provider running: `ValidateImages` runs the local image providers
+    /// first, and `LocalImageProvider` supports a virtual season whose series
+    /// is on the file system. The downloaded Primary gives way to the local
+    /// poster (`MergeImages`); another season's files and the series' own
+    /// poster are not the season's. A second refresh finds nothing new.
+    #[tokio::test]
+    async fn a_virtual_seasons_refresh_takes_its_series_folder_artwork() {
+        let season = SeriesArtSeason::new(ferrofin_model::configuration::LibraryOptions::default());
+        let update = season
+            .mgr
+            .refresh_single_item(season.season_id, &Opts::default())
+            .await
+            .expect("refresh");
+        assert_eq!(update, ItemUpdateType::ImageUpdate);
+        assert_eq!(
+            season.images(),
+            [
+                (season.art("season01-poster.jpg"), ImageType::Primary),
+                (season.art("season01-fanart.jpg"), ImageType::Backdrop),
+            ]
+        );
+        assert_eq!(
+            season.store.saved.lock().expect("lock").len(),
+            1,
+            "the item is saved"
+        );
+
+        let update = season
+            .mgr
+            .refresh_single_item(season.season_id, &Opts::default())
+            .await
+            .expect("second refresh");
+        assert_eq!(update, ItemUpdateType::None);
+        assert_eq!(season.store.saved.lock().expect("lock").len(), 1);
+    }
+
+    /// A local image validation that fails (here the image store refuses the
+    /// write) does not fail the refresh: upstream logs it and goes on
+    /// without the remote image providers, and the item is saved unstamped
+    /// (`localImagesFailed`, `MetadataService.cs:127-143,195-198`). The same
+    /// forced save with a store that writes stamps the refresh.
+    #[rstest::rstest]
+    #[case::store_refuses_writes(true)]
+    #[case::store_writes(false)]
+    #[tokio::test]
+    async fn a_failed_local_image_validation_leaves_the_refresh_unstamped(
+        #[case] fail_image_saves: bool,
+    ) {
+        let season = SeriesArtSeason::with_store(
+            ferrofin_model::configuration::LibraryOptions::default(),
+            RecordingStore {
+                fail_image_saves,
+                ..RecordingStore::default()
+            },
+        );
+        let stored = season.images();
+        let forced = Opts {
+            force_save: true,
+            ..Opts::default()
+        };
+        season
+            .mgr
+            .refresh_single_item(season.season_id, &forced)
+            .await
+            .expect("the refresh goes on");
+        let saved = season
+            .store
+            .saved
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .expect("a forced save");
+        if fail_image_saves {
+            assert_eq!(season.images(), stored);
+            assert_eq!(saved.date_last_refreshed, Some(season.refreshed));
+        } else {
+            assert_ne!(season.images(), stored);
+            assert!(saved.date_last_refreshed > Some(season.refreshed));
+        }
+    }
+
+    /// "Replace existing images" in a library that saves artwork into its
+    /// media folders registers no local file: upstream only validates the
+    /// stored images then (`IsSaveLocalMetadataEnabled() &&
+    /// ReplaceAllImages`, `MetadataService.cs:121-125`). The same refresh in a
+    /// library that does not save artwork beside the media registers them.
+    #[rstest::rstest]
+    #[case::saves_artwork_beside_the_media(true, false)]
+    #[case::keeps_artwork_in_the_metadata_folder(false, true)]
+    #[tokio::test]
+    async fn replacing_all_images_registers_local_files_unless_the_library_saves_them(
+        #[case] save_local_metadata: bool,
+        #[case] registered: bool,
+    ) {
+        let season = SeriesArtSeason::new(ferrofin_model::configuration::LibraryOptions {
+            save_local_metadata,
+            ..Default::default()
+        });
+        let replace_images = Opts {
+            image_refresh_mode: Mode::FullRefresh,
+            replace_all_images: true,
+            ..Opts::default()
+        };
+        season
+            .mgr
+            .refresh_single_item(season.season_id, &replace_images)
+            .await
+            .expect("refresh");
+        let poster = (season.art("season01-poster.jpg"), ImageType::Primary);
+        assert_eq!(
+            season.images().contains(&poster),
+            registered,
+            "{:?}",
+            season.images()
+        );
     }
 
     /// Both season providers failing under "Replace all metadata" (which

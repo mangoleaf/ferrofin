@@ -1048,6 +1048,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   matched nothing, so a movie in the usual `Name (Year)` layout with no NFO or id tag got no
   metadata. The year in the name is the search year when the item has none, and OMDb gets the
   title with its punctuation
+- A season takes its artwork from its series folder, as Jellyfin does: `season01-poster.jpg`,
+  `season01-fanart.jpg`, `season01-banner.jpg` and `season01-landscape.jpg` (`season-specials-*`
+  for season 0, or the season's name, `season1-poster.jpg`) are its Primary, Backdrop, Banner and
+  Thumb, ahead of the images in its own folder. A season with no folder of its own (episodes
+  directly in the series folder) gets them too, on a scan and on its own refresh. A season that
+  holds another Primary takes the local file on the next scan, and a scan stores only the first
+  local image of each single-image type, as Jellyfin's `MergeImages` does
 
 ## [1.0.0] - 2026-09-05
 

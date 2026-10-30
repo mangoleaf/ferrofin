@@ -45,6 +45,9 @@ use ferrofin_naming::common::NamingOptions;
 use ferrofin_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
 use ferrofin_naming::video::video_resolver;
 use ferrofin_providers::library_options::fetcher_names;
+use ferrofin_providers::local_images::{
+    file_date_modified, first_of_each_singular_type, local_image_infos, merge_local_images,
+};
 #[cfg(test)]
 use ferrofin_providers::metadata_merge::audio_sort_name;
 use ferrofin_providers::metadata_merge::{
@@ -102,6 +105,10 @@ struct ArtworkCache {
     /// Final series names for season and episode `BeforeSaveInternal`, read
     /// once per pass.
     series_names: HashMap<String, Option<String>>,
+    /// Series item id → its folder (`None` when it has no path), which its
+    /// seasons' local images are read from besides their own folder
+    /// ([`LibraryScanner::remember_series_folder`]).
+    series_folders: HashMap<String, Option<String>>,
     /// Parent metadata overrides read once per scan, without retaining rows.
     locale_parents: HashMap<String, LocaleParent>,
     /// The libraries and their options the parental-score resolver reads,
@@ -151,11 +158,17 @@ struct ArtworkCache {
 
 impl ArtworkCache {
     /// [`discover_local_images`] over the run's listings, or over listings
-    /// of its own when the run has none.
+    /// of its own when the run has none, with a season's series folder from
+    /// [`series_folders`](Self::series_folders).
     fn discover_local_images(&self, entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
+        let series_folder = entity
+            .series_id
+            .as_ref()
+            .and_then(|id| self.series_folders.get(id))
+            .and_then(Option::as_deref);
         match &self.dirs {
-            Some(dirs) => discover_local_images(entity, dirs.as_ref()),
-            None => discover_local_images(entity, &FsDirectoryService::new()),
+            Some(dirs) => discover_local_images(entity, series_folder, dirs.as_ref()),
+            None => discover_local_images(entity, series_folder, &FsDirectoryService::new()),
         }
     }
 }
@@ -596,21 +609,6 @@ fn episode_in_season(
     number: i32,
 ) -> Option<&ferrofin_providers::tmdb::EpisodeDetails> {
     details.episodes.iter().find(|e| e.episode_number == number)
-}
-
-/// The image file's mtime as UTC, falling back to [`Utc::now`] when the stat
-/// fails. Port of Jellyfin's `IFileSystem.GetLastWriteTimeUtc`, which stamps
-/// `ItemImageInfo.DateModified`.
-///
-/// This MUST be the file's mtime, not the scan time: `date_modified` feeds both
-/// the client-facing `ImageTags` (`md5(path + ticks)`) and the resized-image
-/// cache key. A rescan of an unchanged file has to reproduce the same timestamp,
-/// or every scan changes every poster URL (busting the clients' year-long
-/// immutable image caches) and invalidates the entire server-side resize cache.
-fn file_date_modified(path: &Path) -> DateTime<Utc> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
 }
 
 /// Downloads each [`RemoteImage`] into `item_dir` (as `{type}.jpg`) and returns
@@ -7751,6 +7749,8 @@ impl LibraryScanner {
         }
         self.sync_series_name(&mut entity, state.art_cache).await?;
         self.sync_season_name(&mut entity, state.art_cache).await?;
+        self.remember_series_folder(&entity, state.art_cache)
+            .await?;
         // `EpisodeMetadataService.BeforeSaveInternal`'s range guard: an
         // episode cannot end before it starts.
         ferrofin_providers::episode::discard_invalid_episode_range(&mut entity);
@@ -8573,7 +8573,7 @@ impl LibraryScanner {
         for (&id, album) in &albums {
             touched.extend(Box::pin(self.serve_lane(run)).await);
             let images = off_runtime(|| {
-                let mut images = discover_local_images(album, &FsDirectoryService::new());
+                let mut images = discover_local_images(album, None, &FsDirectoryService::new());
                 self.append_art_dir_images(album, &mut images);
                 images
             });
@@ -10776,6 +10776,41 @@ impl LibraryScanner {
                     if let Some(name) = cache.series_names.get(key) {
                         row.series_name.clone_from(name);
                     }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Records in the pass's cache the folder of the series `row` is, or
+    /// that a season `row` hangs off (`Season.Series`): `LocalImageProvider`
+    /// reads the season's `seasonNN-poster`-style images from it
+    /// (`PopulateSeasonImagesFromSeriesFolder`). A series this pass scans
+    /// records its own path, before its seasons; a season whose series it
+    /// did not scan reads the stored series once.
+    async fn remember_series_folder(
+        &self,
+        row: &BaseItemEntity,
+        cache: &mut ArtworkCache,
+    ) -> Result<(), ServiceError> {
+        let folder = |path: Option<String>| path.filter(|path| !path.is_empty());
+        match item_type_lookup::kind_from_type_name(&row.type_) {
+            Some(BaseItemKind::Series) => {
+                cache
+                    .series_folders
+                    .insert(row.id.clone(), folder(row.path.clone()));
+            }
+            Some(BaseItemKind::Season) => {
+                if let Some(key) = row.series_id.as_ref()
+                    && !cache.series_folders.contains_key(key)
+                    && let Some(items) = &self.item_repository
+                    && let Some(id) = parse_id(key)
+                {
+                    let series = items.retrieve_item(id).await?;
+                    cache
+                        .series_folders
+                        .insert(key.clone(), folder(series.and_then(|series| series.path)));
                 }
             }
             _ => {}
@@ -13180,7 +13215,7 @@ impl LibraryScanner {
             return Ok(false);
         };
         let dir = FsDirectoryService::new();
-        let mut found = discover_local_images(&row, &dir);
+        let mut found = discover_local_images(&row, None, &dir);
         if let Some(mut library) = local_image_item(&row) {
             // Its own folder is the first of upstream's `PhysicalLocations`,
             // and already read above.
@@ -22819,73 +22854,6 @@ impl SeasonNames {
     }
 }
 
-/// Port of `ItemImageProvider.MergeImages` for images found on disk: for each
-/// singular type, the first found image replaces the item's first image of
-/// that type when the paths differ (ignoring case). Found backdrops are added
-/// as `BaseItem.AddImages` adds them: one not stored yet is appended, and
-/// none is removed or reordered. An image found again at the path it is
-/// stored under is refreshed (`refresh_found`). Returns whether anything is to
-/// be written.
-fn merge_local_images(images: &mut Vec<ItemImageInfo>, found: &[ItemImageInfo]) -> bool {
-    let mut changed = false;
-    let mut singular: Vec<ImageType> = Vec::new();
-    for image in found {
-        if image.image_type != ImageType::Backdrop && !singular.contains(&image.image_type) {
-            singular.push(image.image_type);
-        }
-    }
-    for image_type in singular {
-        let Some(new) = found.iter().find(|i| i.image_type == image_type) else {
-            continue;
-        };
-        match images.iter_mut().find(|i| i.image_type == image_type) {
-            Some(current) if current.path.eq_ignore_ascii_case(&new.path) => {
-                changed |= refresh_found(current, new);
-            }
-            Some(current) => {
-                *current = new.clone();
-                changed = true;
-            }
-            None => {
-                images.push(new.clone());
-                changed = true;
-            }
-        }
-    }
-    for new in found.iter().filter(|i| i.image_type == ImageType::Backdrop) {
-        if let Some(current) = images
-            .iter_mut()
-            .find(|i| i.image_type == ImageType::Backdrop && i.path.eq_ignore_ascii_case(&new.path))
-        {
-            changed |= refresh_found(current, new);
-        } else {
-            images.push(new.clone());
-            changed = true;
-        }
-    }
-    changed
-}
-
-/// An image found again at the path it is stored under: when its file's
-/// modification time moved by more than a second and it has stored
-/// dimensions, they are cleared and the time taken, and the row is to be
-/// written. A smaller difference is the database's precision, not a change
-/// (`MergeImages`/`AddImages`: "an exact comparison would treat every
-/// unchanged image as modified").
-fn refresh_found(current: &mut ItemImageInfo, new: &ItemImageInfo) -> bool {
-    let moved = (current.date_modified - new.date_modified)
-        .num_milliseconds()
-        .abs()
-        > 1000;
-    if moved && (current.width > 0 || current.height > 0) {
-        current.width = 0;
-        current.height = 0;
-        current.date_modified = new.date_modified;
-        return true;
-    }
-    false
-}
-
 fn image_item_kind(type_: &str) -> ImageItemKind {
     match type_.rsplit('.').next().unwrap_or(type_) {
         "Movie" => ImageItemKind::Movie,
@@ -22973,21 +22941,31 @@ fn image_metadata_is_current(
 /// Dimensions are left `0` (unknown) here; they are filled in afterwards, either
 /// by adopting a previous scan's probe or by decoding the file. Episodes use the
 /// episode provider; everything the generic provider supports uses it;
-/// unsupported kinds yield nothing.
+/// unsupported kinds yield nothing. `series_folder` is a season's series
+/// folder ([`season_image_item`]); other kinds ignore it. Of what the provider
+/// lists, the first image of each singular type is kept, as `MergeImages`
+/// keeps it ([`first_of_each_singular_type`]): the rows the scan stores are
+/// the item's images, so a second Primary must not reach them.
 fn discover_local_images<D: ferrofin_providers::DirectoryService>(
     entity: &BaseItemEntity,
+    series_folder: Option<&str>,
     dir: &D,
 ) -> Vec<ItemImageInfo> {
-    let Some(item) = local_image_item(entity) else {
+    let item = if image_item_kind(&entity.type_) == ImageItemKind::Season {
+        Some(season_image_item(entity, series_folder))
+    } else {
+        local_image_item(entity)
+    };
+    let Some(item) = item else {
         return Vec::new();
     };
-    local_image_infos(if item.kind == ImageItemKind::Episode {
+    first_of_each_singular_type(local_image_infos(if item.kind == ImageItemKind::Episode {
         EpisodeLocalImageProvider::get_images(&item, dir)
     } else if LocalImageProvider::supports(&item) {
         LocalImageProvider::get_images(&item, dir)
     } else {
         Vec::new()
-    })
+    }))
 }
 
 /// The item as the local image providers see it: its kind, name, path,
@@ -23018,19 +22996,20 @@ fn local_image_item(entity: &BaseItemEntity) -> Option<ImageItem> {
     Some(item)
 }
 
-/// Image rows for images a local provider found, dated by their files.
-fn local_image_infos(found: Vec<ferrofin_providers::LocalImageInfo>) -> Vec<ItemImageInfo> {
-    found
-        .into_iter()
-        .map(|local| ItemImageInfo {
-            date_modified: file_date_modified(Path::new(&local.file_info.full_name)),
-            path: local.file_info.full_name,
-            image_type: local.type_,
-            width: 0,
-            height: 0,
-            blur_hash: None,
+/// A season as the local image provider sees it: [`local_image_item`], plus
+/// what `PopulateSeasonImagesFromSeriesFolder` reads, its `IndexNumber` and
+/// its series' folder (`Season.Series.ContainingFolderPath`), whose
+/// `seasonNN-poster`-style images come before its own folder's. A season with
+/// no folder of its own (`LocationType.Virtual`) has no path or folder, so
+/// only its series' folder is read.
+fn season_image_item(entity: &BaseItemEntity, series_folder: Option<&str>) -> ImageItem {
+    local_image_item(entity)
+        .filter(|_| !is_path_less(entity))
+        .unwrap_or_else(|| ImageItem {
+            name: entity.name.clone().unwrap_or_default(),
+            ..ImageItem::default()
         })
-        .collect()
+        .with_season(entity.index_number, series_folder.map(str::to_owned))
 }
 
 mod artwork;
