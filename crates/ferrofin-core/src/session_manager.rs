@@ -85,7 +85,9 @@ use ferrofin_traits::library::{
 };
 use ferrofin_traits::net::WebSocketConnection;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
-use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
+use ferrofin_traits::session::{
+    AuthenticationRequest, AuthenticationResultData, SessionEvent, SessionManager,
+};
 use ferrofin_traits::session_bus::SessionMessageBus;
 
 use crate::db_error::db_err;
@@ -95,6 +97,17 @@ use crate::user_entity_ext::has_permission;
 /// stamps it again (`SessionManager.cs:265`, `TotalSeconds > 60`). Upstream
 /// hardcodes it, with no setting.
 const USER_ACTIVITY_STAMP_INTERVAL: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
+
+/// Capacity of the [`SessionEvent`] broadcast; a fixed constant, not a setting
+/// (owner decision).
+///
+/// The exact value does not matter much. A `Sessions` subscriber drains every
+/// queued event on each wake and sends at most one snapshot, and a subscriber
+/// that falls further behind than this sees `Lagged`, which it treats as a
+/// forced send: overflow costs one extra snapshot and loses no state, because
+/// the snapshot is rebuilt from the session pool, never from the events. 64 is
+/// the capacity the scheduled-task broadcast already uses.
+const SESSION_EVENT_CAPACITY: usize = 64;
 
 /// The default device name applied when a client reports an empty one (C#
 /// `CreateSessionInfo` → `"Network Device"`).
@@ -326,6 +339,12 @@ pub struct FerrofinSessionManager {
     /// `PlayInstantMix` translation (C# `TranslateItemForInstantMix`). Without
     /// it a cast instant-mix falls back to playing the seed item itself.
     music_manager: Option<Arc<dyn MusicManager>>,
+    /// The C# `event` fields `SessionInfoWebSocketListener` subscribes to, as
+    /// one broadcast ([`SessionManager::subscribe_session_events`]). Raised by
+    /// [`Self::raise`] after each state change, outside the sessions lock.
+    /// `CapabilitiesChanged` and `SessionActivity` are not raised yet:
+    /// TODO(gl-721).
+    session_events: tokio::sync::broadcast::Sender<SessionEvent>,
 }
 
 impl std::fmt::Debug for FerrofinSessionManager {
@@ -370,7 +389,15 @@ impl FerrofinSessionManager {
             media_sources: None,
             music_manager: None,
             bus: None,
+            session_events: tokio::sync::broadcast::channel(SESSION_EVENT_CAPACITY).0,
         }
+    }
+
+    /// Raises `event` to the `Sessions` stream subscribers. Called after the
+    /// change it reports and outside the sessions lock, so a snapshot built on
+    /// receipt shows it. Nobody subscribed is not an error.
+    fn raise(&self, event: SessionEvent) {
+        let _ = self.session_events.send(event);
     }
 
     /// Attaches the session message bus, so sessions whose WebSocket registered
@@ -713,6 +740,7 @@ impl FerrofinSessionManager {
             // C# `OnSessionStarted` publishes `SessionStarted`; consumers are
             // registered on the injected event manager.
             let _ = self.event_manager.publish("SessionStarted", &payload).await;
+            self.raise(SessionEvent::SessionStarted);
         }
         // Upstream saves the user after `GetSessionInfo` has registered (and
         // announced) the session, and a failed save fails the request; only a
@@ -1421,6 +1449,7 @@ impl SessionManager for FerrofinSessionManager {
 
         let payload = playback_event_payload(&session, info.item_id, info.position_ticks);
         let _ = self.event_manager.publish("PlaybackStart", &payload).await;
+        self.raise(SessionEvent::PlaybackStart);
         Ok(())
     }
 
@@ -1501,6 +1530,7 @@ impl SessionManager for FerrofinSessionManager {
             .event_manager
             .publish("PlaybackProgress", &payload)
             .await;
+        self.raise(SessionEvent::PlaybackProgress { is_automated });
         Ok(())
     }
 
@@ -1615,6 +1645,7 @@ impl SessionManager for FerrofinSessionManager {
             .event_manager
             .publish("PlaybackStopped", &payload)
             .await;
+        self.raise(SessionEvent::PlaybackStopped);
         saved.and(released)
     }
 
@@ -1655,6 +1686,7 @@ impl SessionManager for FerrofinSessionManager {
                 .event_manager
                 .publish("SessionEnded", &session_started_payload(&session))
                 .await;
+            self.raise(SessionEvent::SessionEnded);
         }
         Ok(())
     }
@@ -2276,6 +2308,10 @@ impl SessionManager for FerrofinSessionManager {
             error!(%live_stream_id, %err, "error closing live stream");
         }
         Ok(())
+    }
+
+    fn subscribe_session_events(&self) -> Option<tokio::sync::broadcast::Receiver<SessionEvent>> {
+        Some(self.session_events.subscribe())
     }
 
     async fn has_active_playback(&self) -> Result<bool, ServiceError> {

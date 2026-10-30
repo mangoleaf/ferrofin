@@ -741,9 +741,10 @@ async fn next_message_of(socket: &mut ClientSocket, message_type: &str) -> serde
 /// `SessionWebSocketListener.ProcessWebSocketConnectedAsync` →
 /// `RequestHelpers.GetSession`: a socket authenticated with an API key gets a
 /// session with no user (`LogSessionActivity(..., user: null)`), so it is
-/// greeted with `ForceKeepAlive` and its `SessionsStart` subscription is armed.
-/// An API key sees every session (`SessionInfoWebSocketListener` filters only a
-/// non-admin user), its own user-less one among them.
+/// greeted with `ForceKeepAlive` and its `SessionsStart` subscription is armed:
+/// the next session event sends it the list. An API key sees every session
+/// (`SessionInfoWebSocketListener` filters only a non-admin user), its own
+/// user-less one among them.
 #[tokio::test]
 async fn an_api_key_socket_gets_a_user_less_session() {
     use futures_util::SinkExt as _;
@@ -782,8 +783,9 @@ async fn an_api_key_socket_gets_a_user_less_session() {
         .await
         .expect("bind loopback");
     let addr = listener.local_addr().expect("local addr");
+    let served = router.clone();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        let _ = axum::serve(listener, served).await;
     });
 
     let mut socket = open_socket(addr, &format!("?ApiKey={key}"), None)
@@ -796,6 +798,30 @@ async fn an_api_key_socket_gets_a_user_less_session() {
         ))
         .await
         .expect("subscribe");
+    // The socket handles frames in order, so the ack proves it subscribed.
+    socket
+        .send(Message::Text(r#"{"MessageType":"KeepAlive"}"#.into()))
+        .await
+        .expect("keep-alive");
+    next_message_of(&mut socket, "KeepAlive").await;
+    // Upstream sends nothing on `SessionsStart`, only on a session event: a
+    // sign-in from a second device starts a session.
+    let second_device = Request::builder()
+        .method("POST")
+        .uri("/Users/AuthenticateByName")
+        .header(
+            header::AUTHORIZATION,
+            r#"MediaBrowser Client="First Light", Device="Second Rig", DeviceId="rig-2", Version="1.0.0""#,
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({ "Username": ADMIN_USER, "Pw": ADMIN_PASSWORD }).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        router.oneshot(second_device).await.unwrap().status(),
+        StatusCode::OK
+    );
     let sessions = next_message_of(&mut socket, "Sessions").await;
     let sessions = sessions["Data"].as_array().expect("a session list");
     assert!(
