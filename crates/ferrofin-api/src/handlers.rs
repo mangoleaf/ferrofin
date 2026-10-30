@@ -1127,6 +1127,9 @@ pub const VERIFIED: &[Verified] = &[
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
+            "The 400 (an API key with no userId, or a value the query binder cannot convert), \
+         403 (another user's id without the administrator role) and 404 (a userId naming no \
+         account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &["images"],
     },

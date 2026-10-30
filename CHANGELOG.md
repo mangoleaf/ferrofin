@@ -612,6 +612,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Jellyfin answers `500`
 
 ### Performance
+- `/Shows/NextUp` no longer reads every series' last watched and next episodes in full and
+  copies each pick: the picks are decided, ordered and counted from the episode projection,
+  which now also carries the premiere date, and only the regular episodes on the requested page
+  are read in full. While specials are displayed within seasons, every special of the requested
+  series is still read in full, since the merge needs its `Data`. Items, order, paging and
+  `TotalRecordCount` are unchanged. A regular episode's row that cannot be decoded outside the
+  page no longer fails the request; a corrupt `PremiereDate` on any episode of a requested
+  series now does, as a corrupt play date already did
 - A JPEG's blur hash and its resized images decode at a reduced scale (1/8, 1/4 or 1/2 of
   each side, by DCT scaling, as Jellyfin's blur hash decodes through Skia) instead of at full
   size. A 24 MP baseline photo's blur hash peaks at about 2 MB of memory instead of 80 MB (a
