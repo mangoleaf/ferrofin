@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gates/run <verify|adoption|parity|bench|all>[,<gate>…] [--image IMAGE] [--previous IMAGE] [--out ROOT] [--dry-run]
+# gates/run <verify|adoption|parity|bench|all>[,<gate>…] [--image IMAGE] [--previous IMAGE [--release vX.Y.Z]] [--out ROOT] [--dry-run]
 #
 # One validation of one commit: a preflight of the host, then each chosen gate against one Ferrofin
 # image, all of it in one session folder under the output root (gates/lib.sh):
@@ -17,7 +17,11 @@
 #                     it>. It must carry the checked-out commit in its revision label:
 #                       docker build --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t IMAGE .
 #   --previous IMAGE  the previous release's image: bench runs the release A/B gate against it
-#                     (gates/bench/gate.py ab) instead of the comparison with Jellyfin (run.sh)
+#                     (gates/bench/gate.py ab) instead of the comparison with Jellyfin (run.sh). For a
+#                     release it must be the latest release of the minor line before it, by tag (v1.4.1
+#                     against the newest v1.3.*; a vX.0.0 against the newest v(X-1).*; gates/bench/baseline.py)
+#   --release vX.Y.Z  the release the A/B gate is for, when it is not the checkout's release/vX.Y.Z
+#                     branch (a patch cut from main)
 #   --out ROOT        the output root, in place of FERROFIN_GATES_DIR (one of the two is required)
 #   --dry-run         the preflight and the commands; nothing is started or created
 #
@@ -36,14 +40,15 @@ gates_supervise "$CALLER" "$0" "$@"   # the run itself goes to a worker (gates/l
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$SELF"; }
 ORDER=(verify adoption parity bench)
-SELECTION=; IMAGE=; PREVIOUS=; DRY_RUN=false
+SELECTION=; IMAGE=; PREVIOUS=; RELEASE=; DRY_RUN=false
 while [ $# -gt 0 ]; do
   case $1 in
-    --image|--previous|--out) [ $# -ge 2 ] || { echo "run: $1 needs a value" >&2; exit 2; };;
+    --image|--previous|--release|--out) [ $# -ge 2 ] || { echo "run: $1 needs a value" >&2; exit 2; };;
   esac
   case $1 in
     --image) IMAGE=$2; shift 2;;
     --previous) PREVIOUS=$2; shift 2;;
+    --release) RELEASE=$2; shift 2;;
     --out) case $2 in /*) FERROFIN_GATES_DIR=$2;; *) FERROFIN_GATES_DIR=$CALLER/${2#./};; esac; export FERROFIN_GATES_DIR; shift 2;;
     --dry-run) DRY_RUN=true; shift;;
     -h|--help) usage; exit 0;;
@@ -98,6 +103,12 @@ fi
 ! wants parity || need parity curl timeout taskset
 ! wants bench || need bench k6 taskset curl sha256sum timeout ffprobe
 [ -z "$PREVIOUS" ] || wants bench || problem "--previous is for the bench gate, which is not selected"
+[ -z "$RELEASE" ] || [ -n "$PREVIOUS" ] || problem "--release names the release an A/B gate is for: give --previous too"
+# A release is A/B-gated against the latest release of the minor line before it (owner decision 2026-10-29);
+# an A/B of work in progress, on no release branch and with no --release, may name any image.
+if [ -n "$PREVIOUS" ] && ! why=$(python3 gates/bench/baseline.py check "$PREVIOUS" ${RELEASE:+--release "$RELEASE"} 2>&1); then
+  problem "$why"
+fi
 image_id() { docker image inspect -f '{{.Id}}' "$1" 2>/dev/null; }
 IMAGE_ID='' PREVIOUS_ID=''
 if ! docker info >/dev/null 2>&1; then
@@ -158,7 +169,8 @@ set_command() { # set_command <gate>: CMD, the gate's own command, writing into 
     adoption) CMD=(env ADOPTION_WORK_DIR="$S/adoption" gates/adoption/run.sh --fixtures "$ADOPTION_FIXTURES" --image "$IMAGE");;
     parity) CMD=(gates/parity/run.sh --oracle "$ORACLE_IMAGE" --ferrofin "$IMAGE" --out "$S/parity"
                  --requests gates/parity/requests/sweep --requests gates/parity/requests/edge);;
-    bench) if [ -n "$PREVIOUS" ]; then CMD=(python3 gates/bench/gate.py ab "$PREVIOUS" "$IMAGE" --out "$S/bench")
+    bench) if [ -n "$PREVIOUS" ]; then CMD=(python3 gates/bench/gate.py ab "$PREVIOUS" "$IMAGE" --out "$S/bench"
+                                            ${RELEASE:+--release "$RELEASE"})
            else CMD=(env FERROFIN_BENCH_IMAGE="$IMAGE" gates/bench/run.sh --out "$S/bench"); fi;;
   esac
 }

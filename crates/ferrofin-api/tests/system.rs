@@ -812,6 +812,35 @@ async fn activity_log_binds_query_and_returns_entries() {
     assert_eq!(q.has_user_id, Some(true));
 }
 
+/// `[FromQuery] DateTime? minDate, maxDate` bind through ASP.NET's default
+/// binder; EF's `ToUniversalTime` reads an offset-less value as server time.
+#[tokio::test]
+async fn activity_log_binds_offsetless_and_date_only_bounds_as_server_time() {
+    if ferrofin_api::test_support::rerun_in_time_zone(
+        "activity_log_binds_offsetless_and_date_only_bounds_as_server_time",
+    ) {
+        return;
+    }
+    let activity = Arc::new(StubActivity::default());
+    let app = state_with_activity(activity.clone());
+    let (status, _) = get(
+        app,
+        "/System/ActivityLog/Entries?minDate=2026-10-01&maxDate=2026-10-28T12:00:00.5Z",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let q = activity.last_query.lock().unwrap().clone().unwrap();
+    // Midnight in Asia/Kolkata (+05:30).
+    assert_eq!(
+        q.min_date,
+        Some("2026-09-30T18:30:00Z".parse().expect("date"))
+    );
+    assert_eq!(
+        q.max_date,
+        Some("2026-10-28T12:00:00.5Z".parse().expect("date"))
+    );
+}
+
 /// `[FromQuery] ActivityLogSortBy[]? sortBy, SortOrder[]? sortOrder` and
 /// `LogLevel? severity`, as Jellyfin 12.2 binds them (measured on the oracle).
 #[tokio::test]

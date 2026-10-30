@@ -6,7 +6,7 @@
 #
 #   request   the request id, or a glob over request ids (`GetItems.*`)
 #   path      the field path as the report prints it (`Items[].UserData.Key`); `$status` for the status
-#   kind      one kind or a list of status, value, type, null, missing, extra, length
+#   kind      one kind or a list of status, value, type, null, missing, extra, length, order
 #   issue     the GitLab issue number
 #
 # [[filed]]

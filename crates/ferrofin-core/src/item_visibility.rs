@@ -129,20 +129,59 @@ impl ItemVisibility {
         id: Uuid,
         user: &UserEntity,
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
+        Ok(self
+            .visible_item_in(id, user, false)
+            .await?
+            .map(|(item, _)| item))
+    }
+
+    /// [`Self::visible_item`], with the rows the check read: the item's chain, item
+    /// included, as stored and without the placeholder row, as
+    /// `ItemRepository::retrieve_item` returns them. A caller takes a row above the item
+    /// from it instead of reading that row again (gl-982).
+    ///
+    /// # Errors
+    /// Returns storage errors or an error for cyclic hierarchy/channel corruption.
+    pub async fn visible_item_with_chain(
+        &self,
+        id: Uuid,
+        user: &UserEntity,
+    ) -> Result<Option<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
+        self.visible_item_in(id, user, true).await
+    }
+
+    /// [`Self::visible_item`]'s check; `keep_chain` copies the chain before the check
+    /// takes it, for [`Self::visible_item_with_chain`].
+    async fn visible_item_in(
+        &self,
+        id: Uuid,
+        user: &UserEntity,
+        keep_chain: bool,
+    ) -> Result<Option<(BaseItemEntity, Vec<BaseItemEntity>)>, ServiceError> {
         // `ItemRepository::retrieve_item`'s rows: never the nil id or the placeholder row
         // (`ferrofin_db::PLACEHOLDER_ITEM_ID`, `00000000-0000-0000-0000-000000000001`).
-        if id.is_nil() || id == Uuid::from_u128(1) {
+        let placeholder = Uuid::from_u128(1);
+        if id.is_nil() || id == placeholder {
             return Ok(None);
         }
         let chain = repository::reachable(&self.db, &[id]).await?;
         let Some(item) = chain.iter().find(|row| row_id(row) == id).cloned() else {
             return Ok(None);
         };
+        let kept = if keep_chain {
+            chain
+                .iter()
+                .filter(|row| row_id(row) != placeholder)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let context = self
             .load_known(std::slice::from_ref(&item), chain, Some(user), None)
             .await?;
         let row = context.rows.get(&id).unwrap_or(&item);
-        Ok(context.standalone(row)?.then_some(item))
+        Ok(context.standalone(row)?.then_some((item, kept)))
     }
 
     /// `BaseItem.IsParentalAllowed(user, skipAllowedTagsCheck)` for each row,
@@ -1253,6 +1292,80 @@ mod tests {
                 .await
                 .expect("lookup")
                 .is_none()
+        );
+    }
+
+    /// `visible_item_with_chain` answers as `visible_item` does and hands back the rows its
+    /// one read returned, each as `retrieve_item` reads it: a season's series among them, the
+    /// placeholder row never (gl-982).
+    #[tokio::test]
+    async fn visible_item_with_chain_hands_back_the_stored_chain() {
+        let f = Fixture::new().await;
+        let library = f
+            .item(
+                40,
+                BaseItemKind::CollectionFolder,
+                Some("/views/shows"),
+                None,
+            )
+            .await;
+        let series = f
+            .item(
+                41,
+                BaseItemKind::Series,
+                Some("/media/show"),
+                Some(&library),
+            )
+            .await;
+        let mut season = f
+            .item(
+                42,
+                BaseItemKind::Season,
+                Some("/media/show/s1"),
+                Some(&series),
+            )
+            .await;
+        season.series_id = Some(series.id.clone());
+        season.channel_id = Some(ferrofin_db::PLACEHOLDER_ITEM_ID.to_owned());
+        f.save(&season).await;
+        let (item, chain) = f
+            .service
+            .visible_item_with_chain(row_id(&season), &f.user)
+            .await
+            .expect("lookup")
+            .expect("visible");
+        assert_eq!(
+            Some(&item),
+            f.service
+                .visible_item(row_id(&season), &f.user)
+                .await
+                .expect("lookup")
+                .as_ref()
+        );
+        let walked = repository::reachable(&f.db, &[row_id(&season)])
+            .await
+            .expect("walk");
+        assert!(
+            walked.iter().any(|row| row_id(row) == Uuid::from_u128(1)),
+            "the walk reaches the placeholder through ChannelId"
+        );
+        let mut ids: Vec<Uuid> = chain.iter().map(row_id).collect();
+        ids.sort();
+        assert_eq!(ids, [row_id(&library), row_id(&series), row_id(&season)]);
+        for row in &chain {
+            let stored = f.service.items.retrieve_item(row_id(row)).await;
+            assert_eq!(Some(row), stored.expect("read").as_ref(), "as stored");
+        }
+        set_permission(&f.db, &f.user.id, PermissionKind::EnableAllFolders, false)
+            .await
+            .expect("permission");
+        assert!(
+            f.service
+                .visible_item_with_chain(row_id(&season), &f.user)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "hidden"
         );
     }
 

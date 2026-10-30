@@ -157,7 +157,8 @@ struct EpisodePos {
     /// The latest play date credited to this row for rewatching mode's "last
     /// played by date" pick: C# `playedByGroupPrimary` credits every Played
     /// row to `PrimaryVersionId ?? Id`, so the row's own Played rows (when it
-    /// is no version) and its versions' Played rows.
+    /// is no version) and its versions' Played rows. The versions' half is
+    /// read only when the batch is rewatching, the one time this is read.
     last_played: Option<DateTime<Utc>>,
 }
 
@@ -174,7 +175,8 @@ impl EpisodePos {
 /// virtual, primary version id, played, resume position, last played,
 /// accessible, played through a linked version, a version has a Played row,
 /// the latest date of those rows)`. The three user-data columns come off a
-/// `LEFT JOIN`, so they are `NULL` for an episode the user has no data on.
+/// `LEFT JOIN`, so they are `NULL` for an episode the user has no data on;
+/// the last two are `0, NULL` unless rewatching asked for them.
 type ProjectionRow = (
     String,
     String,
@@ -215,6 +217,7 @@ struct ProjectedEpisode {
     played_by: bool,
     /// Whether any Played row is credited to this row for the rewatching pick
     /// (see [`EpisodePos::last_played`]); a row with none is not a candidate.
+    /// Like that date, its versions' half is read only for rewatching.
     rewatch_played: bool,
     user_data: NextUpEpisodeUserData,
 }
@@ -265,6 +268,8 @@ impl NextUpService for FerrofinNextUpService {
         query.fetch_all(self.db.pool()).await.map_err(db_err)
     }
 
+    // `NextUpService.GetNextUpEpisodesBatch`'s one flow, in its order.
+    #[allow(clippy::too_many_lines)]
     async fn get_next_up_episodes_batch(
         &self,
         filter: &InternalItemsQuery,
@@ -295,7 +300,13 @@ impl NextUpService for FerrofinNextUpService {
 
         // ── One projection query feeds every position-based decision below ──
         let projected = self
-            .episode_projection(episode_type, &user.id, series_keys, &access)
+            .episode_projection(
+                episode_type,
+                &user.id,
+                series_keys,
+                &access,
+                include_watched_for_rewatching,
+            )
             .await?;
 
         // The user-data facts of every projected episode, with the resume
@@ -443,19 +454,21 @@ impl FerrofinNextUpService {
     /// the `LinkedChildren` arm of `IsPlayedBy` and the version half of
     /// `playedByGroupPrimary` (`NextUpService.cs:134-150`); both read rows that
     /// may sit under another series key, so they are SQL, not a pass over the
-    /// projection.
+    /// projection. The latter is read only for `rewatching`, as C# reads it.
     async fn episode_projection(
         &self,
         episode_type: &'static str,
         user_id: &str,
         series_keys: &[String],
         access: &Access<'_>,
+        rewatching: bool,
     ) -> Result<Vec<ProjectedEpisode>, ServiceError> {
-        let rows: Vec<ProjectionRow> = projection_query(episode_type, user_id, series_keys, access)
-            .build_query_as()
-            .fetch_all(self.db.pool())
-            .await
-            .map_err(db_err)?;
+        let rows: Vec<ProjectionRow> =
+            projection_query(episode_type, user_id, series_keys, access, rewatching)
+                .build_query_as()
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
 
         let mut out: Vec<ProjectedEpisode> = Vec::new();
         let mut slot_of: HashMap<Uuid, usize> = HashMap::new();
@@ -562,12 +575,16 @@ fn chain_root(id: Uuid, primary_of: &HashMap<Uuid, Uuid>) -> Uuid {
 }
 
 /// The episode-projection statement of [`FerrofinNextUpService`]'s batch
-/// (see `episode_projection`).
+/// (see `episode_projection`). The played-version flag and its latest date
+/// are probed only for `rewatching`, their one reader
+/// (`last_played_per_series`), as C# builds `playedByGroupPrimary` only then;
+/// otherwise they are `0, NULL`.
 fn projection_query(
     episode_type: &'static str,
     user_id: &str,
     series_keys: &[String],
     access: &Access<'_>,
+    rewatching: bool,
 ) -> QueryBuilder<Sqlite> {
     let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
         r#"SELECT bi."SeriesPresentationUniqueKey", bi."Id",
@@ -588,25 +605,31 @@ fn projection_query(
     .push_bind(i32::from(LinkedChildType::LinkedAlternateVersion))
     .push(r#") AND cu."UserId" = "#)
     .push_bind(user_id.to_owned())
-    // `CROSS JOIN`: a plan pin. Left to itself the planner starts the two
-    // version probes from every Played row of the user's and filters by
-    // `PrimaryVersionId`, costing each episode the whole watch history; pinned,
-    // they seek the episode's versions and then each version's row.
-    .push(
-        r#" AND cu."Played" = 1),
+    .push(r#" AND cu."Played" = 1),"#);
+    if rewatching {
+        // `CROSS JOIN`: a plan pin. Left to itself the planner starts the two
+        // version probes from every Played row of the user's and filters by
+        // `PrimaryVersionId`, costing each episode the whole watch history;
+        // pinned, they seek the episode's versions and then each version's row.
+        qb.push(
+            r#"
             EXISTS (SELECT 1 FROM "BaseItems" v CROSS JOIN "UserData" r ON r."ItemId" = v."Id"
                     WHERE v."PrimaryVersionId" = bi."Id" AND r."UserId" = "#,
-    )
-    .push_bind(user_id.to_owned())
-    .push(
-        r#" AND r."Played" = 1),
+        )
+        .push_bind(user_id.to_owned())
+        .push(
+            r#" AND r."Played" = 1),
             (SELECT MAX(r."LastPlayedDate") FROM "BaseItems" v
              CROSS JOIN "UserData" r ON r."ItemId" = v."Id"
              WHERE v."PrimaryVersionId" = bi."Id" AND r."UserId" = "#,
-    )
-    .push_bind(user_id.to_owned())
-    .push(
-        r#" AND r."Played" = 1)
+        )
+        .push_bind(user_id.to_owned())
+        .push(r#" AND r."Played" = 1)"#);
+    } else {
+        qb.push(" 0, NULL");
+    }
+    qb.push(
+        r#"
            FROM "BaseItems" bi
            LEFT JOIN "UserData" ud ON ud."ItemId" = bi."Id" AND ud."UserId" = "#,
     )
@@ -618,20 +641,22 @@ fn projection_query(
 }
 
 /// The episode-projection statement the next-up batch sends for
-/// `series_keys` keys, confined to `top_parents` and restricted as `filter`
-/// says — the SQL text only, for the plan pin in `tests/`.
+/// `series_keys` keys, confined to `top_parents`, restricted as `filter`
+/// says, with or without `rewatching` — the SQL text only, for the plan pin
+/// in `tests/`.
 #[must_use]
 pub fn next_up_projection_sql(
     filter: &InternalItemsQuery,
     top_parents: &[Uuid],
     series_keys: usize,
+    rewatching: bool,
 ) -> String {
     let keys: Vec<String> = (0..series_keys).map(|n| n.to_string()).collect();
     let access = Access {
         filter,
         top_parents,
     };
-    projection_query("Episode", "user", &keys, &access)
+    projection_query("Episode", "user", &keys, &access, rewatching)
         .sql()
         .as_str()
         .to_owned()

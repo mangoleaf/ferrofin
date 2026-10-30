@@ -293,8 +293,14 @@ const MIN_FFMPEG_NOISE_BSF_DROP: FfmpegVersion = FfmpegVersion::new(5, 0);
 ///
 /// Port of `GetCopiedAudioTrimBsf`. Returns the bare filter expression
 /// (without `-bsf:a`); `None` when the job does not qualify.
+///
+/// Upstream cuts at the seek on the source's timeline, which its `-copyts`
+/// keeps. `timeline_origin_ticks` is the source time the filtered packets
+/// count from instead: 0 under `-copyts`, the input seek (`-ss`) without it,
+/// so the cutoff is the seek less that origin.
 fn copied_audio_trim_bsf(
     state: &EncodingJobInfo,
+    timeline_origin_ticks: i64,
     ffmpeg_version: Option<FfmpegVersion>,
 ) -> Option<String> {
     if state.transcoding_type != TranscodingJobType::Hls
@@ -311,7 +317,7 @@ fn copied_audio_trim_bsf(
     }
     let ticks = state.base_request.start_time_ticks.filter(|&t| t > 0)?;
     #[allow(clippy::cast_precision_loss, reason = "tick → seconds, f64 is fine")]
-    let seek_seconds = ticks as f64 / 10_000_000.0;
+    let seek_seconds = ticks.saturating_sub(timeline_origin_ticks) as f64 / 10_000_000.0;
     Some(format!("noise=drop='lt(pts*tb\\,{seek_seconds:.3})'"))
 }
 
@@ -322,17 +328,20 @@ fn copied_audio_trim_bsf(
 /// source's container (upstream's `MediaSource.Container`, which is the same
 /// as `state.InputContainer` in production but passed separately so the
 /// container-fixup check reads it independently of the noise-bsf's wtv
-/// gate). Returns the full argument (e.g. `"-bsf:a
-/// noise=drop='…',aac_adtstoasc"`), ready for `push_split`.
+/// gate). `timeline_origin_ticks` is the source time the job's packet
+/// timestamps start from (see `copied_audio_trim_bsf`). Returns the full
+/// argument (e.g. `"-bsf:a noise=drop='…',aac_adtstoasc"`), ready for
+/// `push_split`.
 #[must_use]
 pub fn audio_bit_stream_arguments(
     state: &EncodingJobInfo,
     segment_container: &str,
     media_source_container: &str,
+    timeline_origin_ticks: i64,
     ffmpeg_version: Option<FfmpegVersion>,
 ) -> Option<String> {
     let mut filters: Vec<&str> = Vec::new();
-    let noise = copied_audio_trim_bsf(state, ffmpeg_version);
+    let noise = copied_audio_trim_bsf(state, timeline_origin_ticks, ffmpeg_version);
     if let Some(ref f) = noise {
         filters.push(f);
     }
@@ -837,7 +846,8 @@ mod tests {
 
     /// Port of `EncodingHelperAudioBitStreamTests.AudioBitStreamArguments_AppliesGates`.
     /// Upstream passes `mediaSourceContainer` separately from
-    /// `state.InputContainer` (in production they are the same value).
+    /// `state.InputContainer` (in production they are the same value), and
+    /// its timeline is the source's (`-copyts`): origin 0.
     #[rstest]
     #[case::hls_aac_ts_to_mp4(TranscodingJobType::Hls, ("libx264", "copy", "aac", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "ts"), BOTH_FILTERS)]
     #[case::hls_aac_aac_to_mp4(TranscodingJobType::Hls, ("libx264", "copy", "aac", "ts"), DEFAULT_SEEK_TICKS, (5, 0), ("mp4", "aac"), BOTH_FILTERS)]
@@ -871,8 +881,14 @@ mod tests {
         );
         let version = Some(FfmpegVersion::new(ffmpeg_ver.0, ffmpeg_ver.1));
         assert_eq!(
-            audio_bit_stream_arguments(&state, segment_container, media_source_container, version)
-                .as_deref(),
+            audio_bit_stream_arguments(
+                &state,
+                segment_container,
+                media_source_container,
+                0,
+                version
+            )
+            .as_deref(),
             Some(expected),
         );
     }
@@ -892,9 +908,39 @@ mod tests {
         );
         state.audio_stream = None;
         assert_eq!(
-            audio_bit_stream_arguments(&state, "mp4", "ts", Some(FfmpegVersion::new(5, 0)),)
+            audio_bit_stream_arguments(&state, "mp4", "ts", 0, Some(FfmpegVersion::new(5, 0)),)
                 .as_deref(),
             Some(NOISE_ONLY),
+        );
+    }
+
+    /// Without `-copyts` the packets count from the input seek, so the cut
+    /// is the seek less that origin: 0 at the seek itself, the rest when the
+    /// seek was clamped earlier (gl-1018).
+    #[rstest]
+    #[case::at_the_seek(DEFAULT_SEEK_TICKS, "0.000")]
+    #[case::clamped_earlier(DEFAULT_SEEK_TICKS - 30_000_000, "3.000")]
+    fn copied_audio_trim_counts_from_the_timeline_origin(
+        #[case] origin_ticks: i64,
+        #[case] cutoff: &str,
+    ) {
+        let state = audio_bsf_state(
+            TranscodingJobType::Hls,
+            "libx264",
+            "copy",
+            "ac3",
+            "mkv",
+            DEFAULT_SEEK_TICKS,
+        );
+        assert_eq!(
+            audio_bit_stream_arguments(
+                &state,
+                "mp4",
+                "mkv",
+                origin_ticks,
+                Some(FfmpegVersion::new(5, 0))
+            ),
+            Some(format!("-bsf:a noise=drop='lt(pts*tb\\,{cutoff})'")),
         );
     }
 }
