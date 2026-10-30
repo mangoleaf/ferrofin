@@ -3429,7 +3429,7 @@ async fn remote_control_permission_gates_delivery_and_saved_changes() {
     mgr.remove_additional_user(&target, alice_id).await.unwrap();
     mgr.assert_can_control("", &target).await.unwrap();
     let public = mgr
-        .upsert_session("Public", "1", "shared", "Shared", "e", None)
+        .log_session_activity("Public", "1", "shared", "Shared", "e", None)
         .await
         .unwrap()
         .id
@@ -3462,7 +3462,7 @@ async fn shared_device_filter_uses_the_requested_user_and_device_access() {
     .await
     .unwrap();
     let public = mgr
-        .upsert_session("Public", "1", "shared", "Shared", "e", None)
+        .log_session_activity("Public", "1", "shared", "Shared", "e", None)
         .await
         .unwrap()
         .id
@@ -4125,3 +4125,7 @@ fn the_idle_check_runs_every_fifth_minute() {
         .collect();
     assert_eq!(due, [5, 10]);
 }
+
+/// What a session request reads from its device: only the request that
+/// creates the session reads it.
+mod device_reads;

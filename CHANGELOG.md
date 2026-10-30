@@ -240,6 +240,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `nameStartsWith` on `/Genres`, `/MusicGenres`, `/Studios`, `/Artists` and
   `/Artists/AlbumArtists` is a literal prefix of the sort name, as on `/Items`: `%` and `_` match
   only themselves, and a leading space is kept
+- `/Genres`, `/MusicGenres`, `/Studios`, `/Artists` and `/Artists/AlbumArtists` order rows that
+  tie on every sort key by item id, as Jellyfin's query does. Equally relevant search hits, and
+  names that share a sort name ("The Band" and "Band"), now come back in Jellyfin's order instead
+  of name order
 - Port Jellyfin's Screen Grabber (`VideoImageProvider`): a movie, episode, music video or
   home video with no Primary image after the local, remote and embedded providers gets a
   frame from its default video stream, 10 % into its runtime (10 s when the runtime is
@@ -623,6 +627,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   folders view, a season's episodes): compute each child's sort key once instead of on
   every comparison. Sorting 2,000 children made 95,896 heap allocations and now makes
   6,004; the order is unchanged
+- A request on a session that already exists no longer reads the device's options row or
+  copies its stored capabilities; only the request that creates the session does. Every
+  playback start, progress and stop report ran one `DeviceOptions` statement before, and
+  now runs none. Those reports also take just the session id and the fields they use,
+  where they built the session's DTO and copied the whole session
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
