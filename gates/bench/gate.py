@@ -31,6 +31,13 @@
 --testdata defaults to $FERROFIN_GATES_DIR/fixtures/bench-testdata and --out to
 $FERROFIN_GATES_DIR/runs/bench-gate-<mode>-<date>-<time> (the output root's layout is in gates/lib.sh).
 
+Every mode that takes PREVIOUS also takes `--release vX.Y.Z`. For a release (that flag, or the
+checkout's release/vX.Y.Z branch), PREVIOUS must be the latest release of the minor line before it
+(`baseline.py`, owner decision 2026-10-29): v1.4.1 against the newest v1.3.*. Anything else is
+refused before the session starts, `--dry-run` included; an A/B of work in progress may name any image.
+On a release branch every A/B is that release's: to compare two builds while chasing a regression, use
+`run.sh --servers ferrofin --only loaded` on each, or run from a checkout of another branch.
+
 Before anything starts, `oracle.check` reads the Jellyfin oracle pin (UPSTREAM_TAG and its
 digest); a pin it cannot read refuses the session. A release is measured against the Jellyfin
 release its branch pins (owner decision 2026-10-25, which replaced the earlier refusal of a pin
@@ -64,6 +71,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
+import baseline
 import endpoints
 import oracle
 import ramp
@@ -700,7 +708,7 @@ def main(argv):
         print(md)
         return 1 if block else 0
     # One soak pair: each is an hour long (D7 of the "Benchmark coverage" milestone).
-    opts = {"--runs": "6", "--pairs": "1" if mode == "soak" else "3", "--testdata": None, "--out": None}
+    opts = {"--runs": "6", "--pairs": "1" if mode == "soak" else "3", "--testdata": None, "--out": None, "--release": None}
     flags, positional = {"--dry-run"} & set(args), []
     rest = [a for a in args if a != "--dry-run"]
     while rest:
@@ -711,8 +719,15 @@ def main(argv):
             sys.exit(f"unknown option {a}\n{__doc__}")
         else:
             positional.append(a)
-    if len(positional) != (1 if mode == "aa" else 2):
+    if len(positional) != (1 if mode == "aa" else 2) or (mode == "aa" and opts["--release"]):
         sys.exit(__doc__)
+    if mode != "aa":
+        try:
+            why = baseline.check(positional[0], opts["--release"])
+        except ValueError as err:
+            why = str(err)
+        if why:
+            sys.exit(f"gate: refusing: {why}")
     count = opts["--runs"] if mode == "aa" else opts["--pairs"]
     # The A/A is judged in two interleaved halves; the D4 majority needs at least one pair.
     if not (count.isascii() and count.isdigit()) or int(count) < 1 or (mode == "aa" and int(count) % 2):

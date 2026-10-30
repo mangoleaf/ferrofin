@@ -36,7 +36,9 @@ gates/run all --dry-run          # the preflight and every gate's command; nothi
 docker build --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" -t IMAGE .   # the image the preflight names
 gates/run all                    # verify, adoption, parity, bench, in that order
 gates/run adoption               # one gate: a session all the same
-gates/run bench --previous ghcr.io/mangoleaf/ferrofin:vPREV   # bench as the release A/B gate
+gates/run bench --previous ghcr.io/mangoleaf/ferrofin:vPREV   # bench as the release A/B gate: vPREV is the latest
+                                 # release of the minor line before (v1.4.1: v1.3.2), enforced for a release:
+                                 # a release/vX.Y.Z branch, or --release vX.Y.Z (a patch cut from main)
 ```
 
 The image defaults to `ferrofin:<the commit, as git describe names it>`, and must carry the checked-out
@@ -67,8 +69,8 @@ never stop a run with `kill -9`: its worker would run on. Ctrl-Z suspends only t
 builds the report itself ([its README](adoption/README.md)).
 
 The root [`Makefile`](../Makefile) offers the same as targets: `make run-gates` for all four, and
-`make run-verify`, `make run-adoption`, `make run-parity` or `make run-bench` for one, with `IMAGE=`
-and `PREVIOUS=` passed through from the command line (`make run-gates IMAGE=ferrofin:v1.4.0-rc
+`make run-verify`, `make run-adoption`, `make run-parity` or `make run-bench` for one, with `IMAGE=`,
+`PREVIOUS=` and `RELEASE=` passed through from the command line (`make run-gates IMAGE=ferrofin:v1.4.0-rc
 PREVIOUS=ghcr.io/mangoleaf/ferrofin:v1.3.2`); a bare `make` only lists them. `make test-gates-offline`
 runs the gates' own tests, which need no docker, server or fixtures, as CI's shell-tests job does:
 shellcheck, the bats tests and every gate's Python tests. They need `bats`, `shellcheck`, `sqlite3`,

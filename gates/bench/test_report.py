@@ -1409,6 +1409,7 @@ class GateTests(unittest.TestCase):
         before = signal.getsignal(signal.SIGTERM)
         self.addCleanup(signal.signal, signal.SIGTERM, before)
         with patch.object(gate.oracle, 'check', return_value=({'tag': 'v12.2', 'image': 'jf@sha256:x'}, None)), \
+                patch.object(gate.baseline, 'check', return_value=None), \
                 patch.object(gate, 'image_ref', return_value='sha256:img'), \
                 patch.object(gate, 'run_session'), patch.object(gate, 'render', return_value=('', [])):
             gate.main(['ab', 'old', 'new', '--out', str(self.root / 'session'), '--testdata', str(self.root / 'td')])
@@ -1660,9 +1661,30 @@ class GateTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r"fewer items.*'episodes': '7489 \(fixture 7490\)'"):
             scan.counts(api, 'u', summary)
 
+    def test_a_release_gate_against_another_baseline_is_refused_before_anything_starts(self):
+        # A release is compared with the latest release of the minor line before it (baseline.py).
+        tags = lambda *args: 'v1.3.2\nv1.4.0\n' if args[0] == 'tag' else 'main\n'
+        for mode in ('ab', 'scan', 'ramp', 'soak', 'endpoints'):
+            out = self.root / f'refused-{mode}'
+            with self.subTest(mode), patch.object(gate.baseline, 'git', side_effect=tags), \
+                    patch.object(gate.oracle, 'check', side_effect=AssertionError('oracle read')), \
+                    patch.object(gate, 'image_ref', side_effect=AssertionError('docker touched')):
+                with self.assertRaisesRegex(SystemExit, 'refusing: the release A/B gate of v1.4.1 compares against '
+                                                        'v1.3.2.*ferrofin:v1.3.2 as the previous image'):
+                    gate.main([mode, 'ghcr.io/mangoleaf/ferrofin:v1.4.0', 'new', '--release', 'v1.4.1', '--dry-run',
+                               '--out', str(out)])
+            self.assertFalse(out.exists())
+        with patch.object(gate.baseline, 'git', side_effect=tags), patch('sys.stdout', new_callable=io.StringIO):
+            self.assertEqual(gate.main(['ab', 'ghcr.io/mangoleaf/ferrofin:v1.3.2', 'new', '--release', 'v1.4.1',
+                                        '--dry-run', '--out', str(self.root / 'ok')]), 0)
+            self.assertEqual(gate.main(['ab', 'anything', 'new', '--dry-run', '--out', str(self.root / 'wip')]), 0)
+        with self.assertRaises(SystemExit):
+            gate.main(['aa', 'one', '--release', 'v1.4.1'])   # an A/A compares with nothing
+
     def test_a_gate_run_refuses_an_unreadable_oracle_pin_before_anything_starts(self):
         out = self.root / 'session'
         with patch.object(gate.oracle, 'check', side_effect=ValueError('UPSTREAM_TAG v12.3-rc1 is not a release')), \
+                patch.object(gate.baseline, 'check', return_value=None), \
                 patch.object(gate, 'image_ref', side_effect=AssertionError('docker touched')):
             with self.assertRaisesRegex(SystemExit, 'cannot read the Jellyfin oracle pin.*v12.3-rc1'):
                 gate.main(['ab', 'old', 'new', '--out', str(out), '--testdata', str(self.root / 'td')])
@@ -1676,6 +1698,7 @@ class GateTests(unittest.TestCase):
                      'note': 'measured against Jellyfin v12.2, the release this branch pins; v12.3 is out'}):
             out = self.root / f'session-{len(pin)}'
             with self.subTest(pin), patch.object(gate.oracle, 'check', return_value=pin), \
+                    patch.object(gate.baseline, 'check', return_value=None), \
                     patch.object(gate, 'image_ref', return_value='sha256:img'), \
                     patch.object(gate, 'run_session') as ran, patch.object(gate, 'render', return_value=('', [])), \
                     patch('sys.stdout', new_callable=io.StringIO) as printed:

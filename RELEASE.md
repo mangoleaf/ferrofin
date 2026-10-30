@@ -59,6 +59,16 @@ from.
    the interleaved A/B gate in [`gates/bench/gate.py`](gates/bench/gate.py). The gate measures Ferrofin
    only; Jellyfin is not part of it.
 
+   `vPREV`, here and below, is **the latest release of the minor line before the release** (owner
+   decision 2026-10-29): v1.4.1 and v1.4.2 compare against the newest `v1.3.*` (v1.3.2), v1.5.0
+   against the newest `v1.4.*`, and a `vX.0.0` against the newest release of major X-1, never against
+   an earlier release of their own minor line. Every command below that takes it refuses any other
+   image before it starts and names the right one ([`gates/bench/baseline.py`](gates/bench/baseline.py),
+   from the checkout's tags: fetch them first). It knows the release from the `release/vX.Y.Z` branch;
+   for a patch cut from `main`, or a checkout of the release commit that is detached, add
+   `--release vX.Y.Z` to each `gate.py` command (`gates/run --release`, `make run-gates RELEASE=`):
+   without either, a command takes it for work in progress and checks nothing.
+
    ```bash
    export FERROFIN_GATES_DIR=/srv/gates                    # the gates' output root: the corpus and every session (gates/lib.sh)
    docker build -t ferrofin:vX.Y.Z-rc .                    # the frozen release commit
