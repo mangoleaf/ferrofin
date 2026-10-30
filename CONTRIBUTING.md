@@ -104,6 +104,37 @@ about forty minutes. `gates/bench/README.md` has the complete recipe.
 > stateful path, **run the binary and exercise it over real HTTP** — several
 > bugs here passed their tests and were only caught by hitting the server.
 
+## Migrations and one-shot repairs
+
+The Helm chart's default is a rolling update, so **a migration or a one-shot `FerrofinMeta`
+repair runs while the previous version can still be writing the same database**, until the
+new pod is ready ([what that means for operators](charts/ferrofin/README.md#upgrades-and-the-database)).
+Nothing serializes the two: Ferrofin takes no lock across processes and sqlx's SQLite
+migration lock is a no-op. Only SQLite's own file locks apply. Write for that:
+
+- **A statement sees only the rows that exist when it runs.** The previous version can save
+  a row in the old shape a moment later, and a one-shot never comes back for it. Keep the new
+  code able to read the old shape, or normalise it on the next save, instead of assuming the
+  data is converted. `MediaSegmentManager`'s `legacy_ids` keeps serving and clearing what `0037`
+  moved, and scan saves keep doing what `sync_child_parent_names` did once.
+- **The previous version's queries keep running against your schema.** Prefer additive changes.
+  A dropped or renamed column, or a rebuilt table, fails what the old binary still asks for
+  until its pod goes.
+- **Keep write transactions short.** The other version waits 30 seconds for the write lock (the
+  busy timeout), then its request fails.
+- **A repair's transaction that reads before it writes takes the lock first**
+  (`begin_with("BEGIN IMMEDIATE")`). A deferred one fails at once with `SQLITE_BUSY_SNAPSHOT`
+  if the previous version commits in between, whatever the busy timeout, and fails the boot.
+- **Never answer this with a refusal or a process-long lock.** With `maxUnavailable: 0` the old
+  pod stays until the new one is ready, so a new pod that waits for the old one to leave never
+  starts. Boot-time safety checks need a fallback that cannot wedge a rollout, plus a warning.
+- **Say so in `docs/UPGRADING.md`** when a migration or repair is heavy, or when rows written
+  during the overlap stay wrong, so Kubernetes users know to
+  [stop the old pod first](docs/UPGRADING.md#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
+
+Nothing tests two versions running against one database at the same time, so a review is the
+only check on this.
+
 ## Commits: Conventional Commits + sign-off
 
 Commit messages follow [Conventional Commits](https://www.conventionalcommits.org)

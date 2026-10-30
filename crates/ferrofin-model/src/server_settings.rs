@@ -1,10 +1,13 @@
 //! The Ferrofin settings page's wire types: what `GET /Ferrofin/Settings`
 //! reports about each bootstrap setting (CLI flags, `FERROFIN_*` environment
-//! variables, `config.toml`).
+//! variables, `config.toml`), and what `POST /Ferrofin/Settings` saves to
+//! `config.toml`.
 //!
 //! Not a Jellyfin contract type: the route is Ferrofin's own, read by the
 //! Ferrofin plugin's settings page. Its JSON is PascalCase, like the rest of
 //! the API.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -18,7 +21,8 @@ pub struct ServerSettingsDto {
     pub config_file: String,
 
     /// Whether a save could write [`config_file`](Self::config_file): its
-    /// directory accepts a new file, which is then renamed over it.
+    /// directory accepts a new file, which is then renamed over it, and the
+    /// file, when it exists, is not read-only.
     pub config_file_writable: bool,
 
     /// Whether a restart is pending (`GET /System/Info`'s `HasPendingRestart`).
@@ -193,6 +197,45 @@ pub enum ServerSettingApplies {
     ProcessRestart,
 }
 
+/// The changes `POST /Ferrofin/Settings` saves to `config.toml`.
+///
+/// `Debug` lists the keys only: a value may be a key or a password.
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct ServerSettingsUpdateDto {
+    /// The settings to change, by `config.toml` key ([`ServerSettingDto::key`]).
+    /// A value sets the key; `null` removes it from `config.toml`, so the
+    /// setting goes back to its default.
+    pub changes: BTreeMap<String, Option<serde_json::Value>>,
+}
+
+impl std::fmt::Debug for ServerSettingsUpdateDto {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerSettingsUpdateDto")
+            .field("changes", &self.changes.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// What a `POST /Ferrofin/Settings` saved.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "PascalCase")]
+pub struct ServerSettingsUpdateResultDto {
+    /// The keys whose entry in `config.toml` the save set or removed, in key
+    /// order. Removing a key the file does not hold changes nothing.
+    pub changed: Vec<String>,
+
+    /// Whether a restart is needed before the saved values apply: whenever a
+    /// key changed. The server then reports a pending restart
+    /// (`GET /System/Info`'s `HasPendingRestart`).
+    pub restart_required: bool,
+
+    /// The changed keys only a restart of the server process applies
+    /// ([`ServerSettingApplies::ProcessRestart`]): the in-process restart keeps
+    /// their running value.
+    pub process_restart_required: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +298,50 @@ mod tests {
         assert_eq!(json["Settings"][0]["Key"], "omdb_api_key");
         let back: ServerSettingsDto = serde_json::from_value(json).expect("round trip");
         assert_eq!(back, all);
+    }
+
+    #[test]
+    fn an_update_reads_its_changes_and_debug_shows_only_their_keys() {
+        let update: ServerSettingsUpdateDto = serde_json::from_value(serde_json::json!({
+            "Changes": { "omdb_api_key": "hunter2", "db_pool": 4, "tvdb_token_days": null }
+        }))
+        .expect("deserialize");
+        assert_eq!(
+            update.changes.get("omdb_api_key"),
+            Some(&Some(serde_json::json!("hunter2")))
+        );
+        assert_eq!(
+            update.changes.get("db_pool"),
+            Some(&Some(serde_json::json!(4)))
+        );
+        assert_eq!(
+            update.changes.get("tvdb_token_days"),
+            Some(&None),
+            "null removes"
+        );
+
+        let debug = format!("{update:?}");
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("omdb_api_key"), "{debug}");
+    }
+
+    #[test]
+    fn an_update_result_serializes_pascal_case() {
+        let result = ServerSettingsUpdateResultDto {
+            changed: vec!["log_level".to_owned(), "scan_probe_concurrency".to_owned()],
+            restart_required: true,
+            process_restart_required: vec!["log_level".to_owned()],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "Changed": ["log_level", "scan_probe_concurrency"],
+                "RestartRequired": true,
+                "ProcessRestartRequired": ["log_level"]
+            })
+        );
+        let back: ServerSettingsUpdateResultDto = serde_json::from_value(json).expect("round trip");
+        assert_eq!(back, result);
     }
 }

@@ -17,8 +17,7 @@ use std::time::Instant;
 use axum::Router;
 use ferrofin_metrics::MetricsHandle;
 use ferrofin_model::session::PlayMethod;
-use ferrofin_traits::session::SessionManager;
-use uuid::Uuid;
+use ferrofin_traits::session::{SessionManager, SessionSummary};
 
 use ferrofin_db::Database;
 
@@ -186,22 +185,18 @@ pub fn spawn_sampler(
                 ("write".to_owned(), idle(&db, true)),
             ]));
 
-            // Session-derived gauges: one all-sessions admin snapshot per tick.
-            match sessions
-                .get_sessions(Uuid::nil(), None, None, None, true)
-                .await
-            {
+            // Session-derived gauges: one summary of every session per tick.
+            match sessions.get_session_summaries().await {
                 Ok(list) => {
-                    let playing = list.iter().filter(|s| s.now_playing_item.is_some()).count();
-                    sessions_active.set(i64::try_from(list.len()).unwrap_or(i64::MAX));
-                    streams_active.set(i64::try_from(playing).unwrap_or(i64::MAX));
-                    transcode_active.set(
-                        i64::try_from(list.iter().filter(|s| s.transcoding_info.is_some()).count())
-                            .unwrap_or(i64::MAX),
-                    );
-                    streams_by_method.set(streams_by_method_counts(&list));
+                    let gauges = SessionGauges::of(&list);
+                    sessions_active.set(gauges.sessions);
+                    streams_active.set(gauges.streams);
+                    transcode_active.set(gauges.transcodes);
+                    streams_by_method.set(gauges.streams_by_method);
                 }
-                Err(e) => tracing::debug!(error = %e, "metrics sampler: get_sessions failed"),
+                Err(e) => {
+                    tracing::debug!(error = %e, "metrics sampler: get_session_summaries failed");
+                }
             }
 
             // Library counts: expensive full-table group-by, only every Nth tick.
@@ -226,22 +221,36 @@ fn idle(db: &Database, writer: bool) -> i64 {
     i64::try_from(pool.num_idle()).unwrap_or(i64::MAX)
 }
 
-/// Groups the playing sessions by `PlayMethod` into a bounded label→count map.
-fn streams_by_method_counts(
-    sessions: &[ferrofin_model::dto::SessionInfoDto],
-) -> HashMap<String, i64> {
-    let mut counts: HashMap<String, i64> = HashMap::new();
-    for session in sessions {
-        if session.now_playing_item.is_none() {
-            continue;
-        }
-        if let Some(method) = session.play_state.as_ref().and_then(|p| p.play_method) {
-            *counts
+/// The session-derived gauge values of one sampler tick.
+#[derive(Debug, PartialEq, Eq)]
+struct SessionGauges {
+    /// Every session.
+    sessions: i64,
+    /// The sessions showing a now-playing item.
+    streams: i64,
+    /// The sessions carrying transcoding info.
+    transcodes: i64,
+    /// The playing sessions by `PlayMethod`, a bounded label→count map.
+    streams_by_method: HashMap<String, i64>,
+}
+
+impl SessionGauges {
+    fn of(sessions: &[SessionSummary]) -> Self {
+        let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+        let playing = || sessions.iter().filter(|s| s.now_playing_item_id.is_some());
+        let mut streams_by_method: HashMap<String, i64> = HashMap::new();
+        for method in playing().filter_map(|s| s.play_method) {
+            *streams_by_method
                 .entry(play_method_label(method).to_owned())
                 .or_default() += 1;
         }
+        Self {
+            sessions: count(sessions.len()),
+            streams: count(playing().count()),
+            transcodes: count(sessions.iter().filter(|s| s.is_transcoding).count()),
+            streams_by_method,
+        }
     }
-    counts
 }
 
 /// The bounded `method` label value for a [`PlayMethod`] (Jellyfin's names).
@@ -251,5 +260,50 @@ fn play_method_label(method: PlayMethod) -> &'static str {
         PlayMethod::DirectStream => "DirectStream",
         PlayMethod::DirectPlay => "DirectPlay",
         PlayMethod::Unrecognized(_) => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn session(
+        now_playing: Option<u128>,
+        play_method: Option<PlayMethod>,
+        is_transcoding: bool,
+    ) -> SessionSummary {
+        SessionSummary {
+            user_id: Uuid::from_u128(1),
+            now_playing_item_id: now_playing.map(Uuid::from_u128),
+            play_method,
+            is_transcoding,
+        }
+    }
+
+    /// Streams and their methods count only the sessions showing an item;
+    /// transcodes count every session carrying transcoding info.
+    #[test]
+    fn session_gauges_count_sessions_streams_transcodes_and_methods() {
+        let gauges = SessionGauges::of(&[
+            session(Some(10), Some(PlayMethod::Transcode), true),
+            session(Some(11), Some(PlayMethod::DirectPlay), false),
+            session(Some(12), None, false),
+            session(None, Some(PlayMethod::DirectStream), true),
+            session(None, None, false),
+        ]);
+        assert_eq!(
+            gauges,
+            SessionGauges {
+                sessions: 5,
+                streams: 3,
+                transcodes: 2,
+                streams_by_method: HashMap::from([
+                    ("Transcode".to_owned(), 1),
+                    ("DirectPlay".to_owned(), 1),
+                ]),
+            }
+        );
+        assert_eq!(SessionGauges::of(&[]).streams_by_method, HashMap::new());
     }
 }
