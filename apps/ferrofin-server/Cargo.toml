@@ -53,6 +53,7 @@ uuid.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 config.workspace = true
+toml_edit.workspace = true      # the settings page's save edits config.toml keeping its comments
 serde.workspace = true
 serde_json.workspace = true   # best-effort system.json pre-read for log retention
 tracing.workspace = true

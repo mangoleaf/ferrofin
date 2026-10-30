@@ -2864,12 +2864,9 @@ struct SessionLibraryAudience {
 #[async_trait::async_trait]
 impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
     async fn active_user_ids(&self) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
-        // The admin view of the session table (`_sessionManager.Sessions`):
-        // a nil user id with the api-key flag is the unfiltered enumeration.
-        let sessions = self
-            .sessions
-            .get_sessions(Uuid::nil(), None, None, None, true)
-            .await?;
+        // The session table itself (`_sessionManager.Sessions`): only the
+        // user ids are read, so no session DTO is copied out.
+        let sessions = self.sessions.get_session_summaries().await?;
         let mut seen = std::collections::HashSet::new();
         Ok(sessions
             .into_iter()

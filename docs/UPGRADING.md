@@ -8,6 +8,52 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Kubernetes: stop the old pod first for heavy migrations
+
+The Helm chart's default rolling update keeps the old pod serving and writing the database
+until the new one is ready, so the two versions overlap for the whole of the new pod's
+migrations and one-shot repairs. The
+[chart README](../charts/ferrofin/README.md#upgrades-and-the-database) lists what can happen in
+that window. Docker, the Debian package and a tarball install have no overlap: the old server
+stops before the new one starts.
+
+**Stop the old pod first** for an upgrade with heavy migrations: one whose notes in this file
+name a numbered migration or a one-time repair. Skipping releases adds up the notes of every
+release you skip. If in doubt and you can afford the stop, stop first. Add
+`--set strategy.type=Recreate` to that one `helm upgrade`:
+
+```bash
+helm upgrade ferrofin oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin --version <new> \
+  -n ferrofin -f my-values.yaml --set strategy.type=Recreate
+```
+
+Kubernetes then stops the old pod before it starts the new one, so playback stops for the whole
+boot and only one version ever touches the database. Your next `helm upgrade` without the `--set`
+is a rolling update again, unless it uses `--reuse-values`. If your values live in Git (Argo CD, Flux), set
+`strategy.type: Recreate` for that sync.
+
+If you pass `--wait`, give it a `--timeout` longer than the migrations: past it the Helm release
+is marked failed while the migration goes on running. Do not use `--atomic` or
+`--rollback-on-failure` for such an upgrade. They roll back to a version that cannot open a
+database the new one has already migrated.
+
+Back up the data directory first, as for any major upgrade.
+
+## Unreleased — the Helm chart's notes on rolling updates and RWX volumes are corrected
+
+Nothing changes in the chart's behaviour, and the default stays `RollingUpdate`, but what it told
+you was wrong in two ways. If you run the chart, read this once.
+
+- **Concurrent access during a rolling update is not simply "safe".** SQLite's locks keep the
+  file intact on one node, but the old and new versions overlap, as described under
+  [Kubernetes](#kubernetes-stop-the-old-pod-first-for-heavy-migrations) above.
+- **RWX across nodes was never safe.** The chart used to accept RWX as a way to mount the volume
+  twice. SQLite's write-ahead log cannot be shared between hosts, so a surge pod on a second node
+  over NFS or CephFS can corrupt the database. If that describes your release, set
+  `strategy.type: Recreate`, or keep both pods on one node as the
+  [chart README](../charts/ferrofin/README.md#storage-one-node-at-a-time) shows, before your next
+  upgrade.
+
 ## Unreleased — the first Refresh People may create people and look them up
 
 Nothing to do. The **Refresh People** task now creates the person item a credit has none of,
@@ -139,7 +185,9 @@ upgrade.
   update), the write-ahead log cannot be folded into the file first. After waiting up to 30
   seconds, Ferrofin then takes the copy with SQLite's `VACUUM INTO`, which still holds every
   committed change, and logs a warning that names the cause. Before, such a copy missed what
-  was still in the write-ahead log, and could be unreadable. Stop the other program before
+  was still in the write-ahead log, and could be unreadable. If the other program writes while
+  an ordinary copy is being made, Ferrofin takes the copy again the same way, because it could
+  hold half of a checkpoint. Stop the other program before
   you upgrade anyway, and always before you adopt: the migrations run with it attached, and
   adopting a database Jellyfin is still using is not safe even with a good copy.
 

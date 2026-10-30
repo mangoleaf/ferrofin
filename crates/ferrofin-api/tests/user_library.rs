@@ -43,7 +43,9 @@ use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{
     AuthorizationInfo, DeleteOptions, DtoOptions, InternalItemsQuery, InternalPeopleQuery,
 };
-use ferrofin_traits::session::{AuthenticationRequest, AuthenticationResultData, SessionManager};
+use ferrofin_traits::session::{
+    AuthenticationRequest, AuthenticationResultData, SessionManager, SessionSummary,
+};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -1969,7 +1971,8 @@ impl LibraryManager for RecordingResumeLibrary {
     }
 }
 
-/// A [`SessionManager`] whose only live method is `get_sessions`.
+/// A [`SessionManager`] whose only live method is `get_session_summaries`:
+/// `excludeActiveSessions` reads ids, so it never lists the full sessions.
 struct ResumeSessions;
 
 #[async_trait]
@@ -2124,19 +2127,22 @@ impl SessionManager for ResumeSessions {
         _controllable_user_to_check: Option<Uuid>,
         _is_api_key: bool,
     ) -> Result<Vec<SessionInfoDto>, ServiceError> {
-        // Alice's session plays the ALTERNATE version; another user's session
-        // plays something else and must be ignored.
-        let playing = |user_id: Uuid, item: Uuid| SessionInfoDto {
+        unreachable!("excludeActiveSessions reads the session summaries")
+    }
+    async fn get_session_summaries(&self) -> Result<Vec<SessionSummary>, ServiceError> {
+        // Alice's session plays the ALTERNATE version and her other session
+        // plays nothing; another user's session plays something else and must
+        // be ignored.
+        let session = |user_id: Uuid, item: Option<Uuid>| SessionSummary {
             user_id,
-            now_playing_item: Some(BaseItemDto {
-                id: item,
-                ..BaseItemDto::default()
-            }),
-            ..SessionInfoDto::default()
+            now_playing_item_id: item,
+            play_method: None,
+            is_transcoding: false,
         };
         Ok(vec![
-            playing(USER_ID, ALTERNATE_ID),
-            playing(Uuid::from_u128(0x0B0B), OTHER_USERS_ITEM_ID),
+            session(USER_ID, Some(ALTERNATE_ID)),
+            session(USER_ID, None),
+            session(Uuid::from_u128(0x0B0B), Some(OTHER_USERS_ITEM_ID)),
         ])
     }
     async fn get_session_by_authentication_token(
