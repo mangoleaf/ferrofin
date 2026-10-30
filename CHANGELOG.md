@@ -662,6 +662,16 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   before it reads the next channel's. It used to hold every airing and every stored programme
   item of the whole guide at once. The guide rows are built as they are written instead of
   all first. What the refresh stores is unchanged; its memory was not measured
+- A playing session's `NowPlayingItem` is built once, on the start or progress report that
+  first names the item, and kept until another item plays or playback stops, as Jellyfin's
+  `UpdateNowPlayingItem` does. `GET /Sessions` and the WebSocket `Sessions` stream used to
+  rebuild it for every playing session on every read: an item lookup, a media-source lookup
+  and an item build each. So, as in Jellyfin, the session keeps showing the item as it was
+  built until another item plays or playback restarts: a metadata edit made while it plays,
+  a progress report naming another version of the same item, and the item's deletion do not
+  change it. `GET /UserItems/Resume?excludeActiveSessions=true`, the library-change notices
+  and the metrics sampler now read each session's user and shown item id only, without
+  copying any session or item
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
