@@ -182,6 +182,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Refuse a `POST /Users/{userId}/Policy` body that leaves out `AuthenticationProviderId` or
   `PasswordResetProviderId`, or sends either blank, with Jellyfin's `400` naming each missing
   member, instead of saving the user's providers as empty strings
+- A `POST /Users/{userId}/Policy` body that leaves a member out saves Jellyfin's default for
+  it (`new UserPolicy()`: playback, all libraries, all devices, remote access and the rest
+  allowed, no login lockout), not `false`/`0`. Such a save used to strip the user's access,
+  set a 3-attempt lockout and sign the user out of every device
 - `GET /Items` honours `seriesStatus` (jellyfin-web's TV Status filter), `minOfficialRating`,
   `maxOfficialRating`, `personTypes`, `isPlaceHolder` and `hasOfficialRating`, and
   `hasParentalRating=false` returns only the unrated items, as Jellyfin 12.2's `TranslateQuery`

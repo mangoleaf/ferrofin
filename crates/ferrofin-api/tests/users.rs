@@ -124,6 +124,9 @@ struct MemUsers {
     deleted: Mutex<Option<Uuid>>,
     /// Makes `delete_user` refuse, as the last user or the last admin.
     refuse_delete: std::sync::atomic::AtomicBool,
+    /// Makes `get_user_dto` answer the policy last saved for that user, so the
+    /// device check after a policy save reads what was saved.
+    echo_saved_policy: std::sync::atomic::AtomicBool,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -220,16 +223,23 @@ impl UserManager for MemUsers {
     ) -> Result<UserDto, ServiceError> {
         // The admin user reports IsAdministrator; everyone else does not.
         let is_admin = user.id == ADMIN_ID.to_string();
+        let saved = self
+            .echo_saved_policy
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| self.updated_policy.lock().unwrap().clone())
+            .flatten()
+            .filter(|(id, _)| id.to_string() == user.id)
+            .map(|(_, policy)| policy);
         Ok(UserDto {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
-            policy: Some(UserPolicy {
+            policy: Some(saved.unwrap_or_else(|| UserPolicy {
                 is_administrator: is_admin,
                 // This account fixture has no device restrictions.
                 enable_all_devices: true,
                 ..UserPolicy::default()
-            }),
+            })),
             configuration: Some(UserConfiguration::default()),
             ..UserDto::default()
         })
@@ -1819,6 +1829,65 @@ async fn update_policy_records_and_guards_last_admin() {
     let recorded = users.updated_policy.lock().unwrap().clone().unwrap();
     assert_eq!(recorded.0, BOB_ID);
     assert_eq!(recorded.1.max_active_sessions, 5);
+}
+
+/// Upstream binds the body into `new UserPolicy()`, so a member it leaves out
+/// keeps the constructor's value (`UserPolicy.cs`), not `false`/`0`. With
+/// `EnableAllDevices` kept, `DeviceAccessHost` signs no device out: the saved
+/// policy is what the device check reads here, and a check that went on to the
+/// devices would reach `FakeDevices`, which panics.
+#[tokio::test]
+async fn update_policy_partial_body_keeps_the_constructor_defaults() {
+    let users = Arc::new(MemUsers::default());
+    users
+        .echo_saved_policy
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let body = serde_json::json!({
+        "AuthenticationProviderId": "a",
+        "PasswordResetProviderId": "b",
+        "IsDisabled": false,
+    });
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{BOB_ID}/Policy"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (_, saved) = users.updated_policy.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        saved,
+        UserPolicy {
+            is_hidden: true,
+            enable_user_preference_access: true,
+            enable_shared_device_control: true,
+            enable_remote_access: true,
+            enable_live_tv_management: true,
+            enable_live_tv_access: true,
+            enable_media_playback: true,
+            enable_audio_playback_transcoding: true,
+            enable_video_playback_transcoding: true,
+            enable_playback_remuxing: true,
+            enable_content_downloading: true,
+            enable_sync_transcoding: true,
+            enable_media_conversion: true,
+            enable_all_devices: true,
+            enable_all_channels: true,
+            enable_all_folders: true,
+            login_attempts_before_lockout: -1,
+            enable_public_sharing: true,
+            authentication_provider_id: "a".to_owned(),
+            password_reset_provider_id: "b".to_owned(),
+            ..UserPolicy::default()
+        }
+    );
 }
 
 /// A policy whose two `[Required]` provider ids are set, as every client that

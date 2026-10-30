@@ -180,8 +180,11 @@ pub struct PinRedeemResult {
 }
 
 /// A user's access policy.
+// A member a request body leaves out takes upstream's constructor value
+// (`constructor_policy`), as System.Text.Json binds it. `Default` stays
+// all-`false`/`0`, the base the code builds its own policies on.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "PascalCase", default)]
+#[serde(rename_all = "PascalCase", default = "constructor_policy")]
 #[allow(clippy::struct_excessive_bools)]
 pub struct UserPolicy {
     /// Gets or sets a value indicating whether this instance is administrator.
@@ -348,6 +351,35 @@ pub struct UserPolicy {
     pub sync_play_access: SyncPlayUserAccessType,
 }
 
+/// `new UserPolicy()` (`UserPolicy.cs`'s constructor): the members it sets to
+/// `true`, `LoginAttemptsBeforeLockout = -1` (unlimited) and `SyncPlayAccess =
+/// CreateAndJoinGroups`. The rest are the C# defaults: `false`, `0`, empty
+/// arrays, and `null` provider ids (`""`).
+fn constructor_policy() -> UserPolicy {
+    UserPolicy {
+        is_hidden: true,
+        enable_user_preference_access: true,
+        enable_shared_device_control: true,
+        enable_remote_access: true,
+        enable_live_tv_management: true,
+        enable_live_tv_access: true,
+        enable_media_playback: true,
+        enable_audio_playback_transcoding: true,
+        enable_video_playback_transcoding: true,
+        enable_playback_remuxing: true,
+        enable_content_downloading: true,
+        enable_sync_transcoding: true,
+        enable_media_conversion: true,
+        enable_all_devices: true,
+        enable_all_channels: true,
+        enable_all_folders: true,
+        login_attempts_before_lockout: -1,
+        enable_public_sharing: true,
+        sync_play_access: SyncPlayUserAccessType::CreateAndJoinGroups,
+        ..UserPolicy::default()
+    }
+}
+
 /// A C# `string` member under `#nullable disable`: System.Text.Json binds a
 /// `null` to it, so it reads as `""` here rather than failing the body.
 fn null_as_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
@@ -386,6 +418,31 @@ mod sync_play_access_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A member the body leaves out binds `new UserPolicy()`'s value; one it
+    /// sends, `false` and `0` included, binds as sent.
+    #[test]
+    fn user_policy_binds_omitted_members_to_the_constructor_values() {
+        let omitted: super::UserPolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted, super::constructor_policy());
+        assert!(omitted.enable_all_devices && omitted.enable_media_playback);
+        assert_eq!(omitted.login_attempts_before_lockout, -1);
+        assert_eq!(
+            omitted.sync_play_access,
+            super::SyncPlayUserAccessType::CreateAndJoinGroups
+        );
+
+        let sent: super::UserPolicy = serde_json::from_str(
+            r#"{"EnableMediaPlayback":false,"EnableAllDevices":false,"LoginAttemptsBeforeLockout":0}"#,
+        )
+        .unwrap();
+        assert!(!sent.enable_media_playback && !sent.enable_all_devices);
+        assert_eq!(sent.login_attempts_before_lockout, 0);
+        assert!(
+            sent.enable_all_folders,
+            "the members it leaves out still default"
+        );
+    }
+
     #[test]
     fn access_schedule_accepts_a_new_row_without_database_identity() {
         let schedule: super::AccessSchedule = serde_json::from_value(serde_json::json!({

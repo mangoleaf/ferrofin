@@ -1418,12 +1418,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Users/{userId}/Policy",
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "UpdateUserPolicy",
-        ferrofin: "handlers/users.rs update_user_policy (policy_validation: UserPolicy's \
-               [Required(AllowEmptyStrings = false)] provider ids) → ferrofin-core \
+        ferrofin: "handlers/users.rs update_user_policy (ferrofin-model UserPolicy's serde \
+               default constructor_policy: new UserPolicy()'s values for a member the body \
+               leaves out; policy_validation: UserPolicy's [Required(AllowEmptyStrings = false)] \
+               provider ids) → ferrofin-core \
                user_manager.rs update_policy_guarded (save_policy: UserManager.UpdatePolicyAsync \
                behind ferrofin-traits policy_update_refusal) → session_manager.rs \
                revoke_user_tokens; handlers/users.rs refresh_device_access (DeviceAccessHost)",
-        date: "2026-10-25",
+        date: "2026-10-29",
         divergences: &[
             "The three guards (the last administrator, an administrator disabled, the last \
          enabled user) are read inside the transaction that saves, and a newly disabled \
