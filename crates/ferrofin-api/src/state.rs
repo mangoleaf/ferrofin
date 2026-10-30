@@ -125,7 +125,8 @@ pub struct Inner {
     /// Floor for a dashboard WebSocket stream's push period (Sessions /
     /// ScheduledTasksInfo / ActivityLogEntry). The client names the period in
     /// its `*Start` subscription and it is clamped up to this value, because
-    /// Ferrofin drives these streams on a timer rather than off events. Set by
+    /// Ferrofin drives the task and activity streams on a timer rather than off
+    /// events (the `Sessions` stream's throttle is floored too). Set by
     /// the composition root from `FERROFIN_WS_MIN_STREAM_PERIOD_MS` via
     /// [`AppState::with_websocket_min_stream_period`]; defaults to
     /// [`crate::handlers::websocket::DEFAULT_WS_MIN_STREAM_PERIOD`].

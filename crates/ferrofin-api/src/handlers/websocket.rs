@@ -35,6 +35,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ferrofin_traits::options::AuthorizationInfo;
+use ferrofin_traits::session::{SessionEvent, SessionManager};
 use tokio::sync::mpsc;
 
 use crate::auth::AuthenticatedIdentity;
@@ -308,7 +309,8 @@ enum Action {
 enum Inbound {
     /// `KeepAlive` — the client's periodic ping; answered with a `KeepAlive` ack.
     KeepAlive,
-    /// `SessionsStart` — stream the session list every `period`.
+    /// `SessionsStart` — send the session list on each session event, at most
+    /// one non-forced send per `period`.
     SessionsStart(Duration),
     /// `SessionsStop` — stop the session stream.
     SessionsStop,
@@ -379,17 +381,22 @@ const DEFAULT_STREAM_MILLIS: u64 = 1500;
 /// backs a bare [`crate::AppState::new`] so client-chosen periods are floored
 /// even then.
 ///
-/// The floor exists because Ferrofin drives these streams on a timer — each
-/// tick recomputes and sends the full snapshot — whereas upstream's
-/// `BasePeriodicWebSocketListener` is event-driven and sends only when a
-/// session/playback event fires (the client period is a debounce ceiling
-/// there, never a poll clock). Without a floor a client could ask for a 1 ms
-/// period and turn each tick into back-to-back `get_sessions`/activity work.
+/// The floor exists because Ferrofin still drives the task and activity
+/// streams on a timer — each tick recomputes and sends the full snapshot —
+/// whereas upstream's `BasePeriodicWebSocketListener` is event-driven and
+/// sends only when an event fires (the client period is a throttle there,
+/// never a poll clock). Without a floor a client could ask for a 1 ms period
+/// and turn each tick into back-to-back task/activity work. The `Sessions`
+/// stream is event-driven already; its throttle is floored too until the
+/// other two are.
 pub(crate) const DEFAULT_WS_MIN_STREAM_PERIOD: Duration = Duration::from_millis(100);
 
 /// Parses the `"initialDelayMs,periodMs"` subscription payload (the C#
 /// `BasePeriodicWebSocketListener` Data convention) into the stream period.
-/// The initial delay is folded into the period (first send after one period).
+/// For the `Sessions` stream it is upstream's throttle interval
+/// (`WebSocketListenerState.IntervalMs`); the task and activity streams still
+/// poll at it, first one period after subscribing. The initial delay is
+/// ignored, as upstream stores `InitialDelayMs` and never reads it.
 fn subscription_period(data: Option<&str>) -> Duration {
     let millis = data
         .and_then(|d| d.split(',').nth(1))
@@ -629,7 +636,7 @@ async fn handle_socket(
                             if !send_optional(&mut socket, message, &overflowed).await {
                                 break;
                             }
-                            streams.apply(inbound);
+                            streams.apply(inbound, state.sessions.as_ref());
                         }
                     }
                 },
@@ -654,11 +661,10 @@ async fn handle_socket(
                         break;
                     }
                 }
-                () = tick(&mut streams.sessions) => {
-                    if let Some(c) = caller.as_ref()
-                        && let Some(msg) = sessions_message(&state, c.user_id, c.is_api_key).await
-                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                    {
+                first = next_event(&mut streams.sessions) => {
+                    let message =
+                        sessions_wake(&state, caller.as_ref(), &mut streams.sessions, first).await;
+                    if !send_optional(&mut socket, message, &overflowed).await {
                         break;
                     }
                 }
@@ -838,9 +844,9 @@ async fn keep_alive_watchdog(
     }
 }
 
-/// The armed periodic streams of one socket.
+/// The armed dashboard streams of one socket.
 struct Streams {
-    sessions: Option<tokio::time::Interval>,
+    sessions: Option<EventStream<SessionEvent>>,
     tasks: Option<tokio::time::Interval>,
     activity: Option<tokio::time::Interval>,
     /// Only activity entries created after this instant are streamed (advanced
@@ -865,7 +871,7 @@ impl Streams {
     }
 
     /// Arms or cancels a stream for one subscription message.
-    fn apply(&mut self, inbound: Inbound) {
+    fn apply(&mut self, inbound: Inbound, sessions: &dyn SessionManager) {
         // Floor the client-chosen period: a tiny period would otherwise make
         // each tick recompute and resend the full snapshot back to back.
         let min_period = self.min_period;
@@ -877,7 +883,9 @@ impl Streams {
             Some(interval)
         };
         match inbound {
-            Inbound::SessionsStart(p) => self.sessions = arm(p),
+            Inbound::SessionsStart(p) => {
+                self.start_sessions(sessions.subscribe_session_events(), p);
+            }
             Inbound::SessionsStop => self.sessions = None,
             Inbound::TasksStart(p) => self.tasks = arm(p),
             Inbound::TasksStop => self.tasks = None,
@@ -889,6 +897,149 @@ impl Streams {
             Inbound::KeepAlive => {}
         }
     }
+
+    /// `SessionsStart`: subscribes to `events` with a fresh throttle state,
+    /// replacing any earlier subscription. `None` (a manager that raises no
+    /// events) leaves the stream unarmed, so it sends nothing.
+    fn start_sessions(
+        &mut self,
+        events: Option<tokio::sync::broadcast::Receiver<SessionEvent>>,
+        period: Duration,
+    ) {
+        self.sessions = events.map(|events| EventStream {
+            events,
+            period: period.max(self.min_period),
+            last_sent: None,
+        });
+    }
+}
+
+/// One socket's subscription to an event-driven stream: the port of the
+/// `(Connection, CancellationTokenSource, WebSocketListenerState)` entry
+/// `BasePeriodicWebSocketListener.Start` adds for the connection. Dropping it
+/// (`*Stop`, another `*Start`, the socket closing) drops the receiver, which
+/// unsubscribes, as `Stop` → `DisposeConnection` removes the entry.
+struct EventStream<E> {
+    events: tokio::sync::broadcast::Receiver<E>,
+    /// `WebSocketListenerState.IntervalMs`: the least time between two sends
+    /// of a non-forced change.
+    period: Duration,
+    /// `DateLastSendUtc`. `None` before the first send (upstream's
+    /// `DateTime.MinValue`), so the first non-forced change sends.
+    last_sent: Option<tokio::time::Instant>,
+}
+
+/// Upstream's force flag for one session event
+/// (`SessionInfoWebSocketListener.cs:111-144`): `SessionActivity` is
+/// `SendData(false)`, progress is `SendData(!e.IsAutomated)`, and the other
+/// five are `SendData(true)`.
+fn session_event_forces(event: SessionEvent) -> bool {
+    !matches!(
+        event,
+        SessionEvent::SessionActivity | SessionEvent::PlaybackProgress { is_automated: true }
+    )
+}
+
+/// What one wake of an event stream found, once its queue is drained.
+#[derive(Debug, PartialEq, Eq)]
+struct Wake {
+    /// `Some(force)` when an event or a lag arrived: whether any of them
+    /// forces a send. One snapshot answers them all, where upstream sends one
+    /// per forced event; a burst yields fewer frames with the same final
+    /// state (an accepted divergence).
+    pending: Option<bool>,
+    /// The manager dropped its sender, so nothing can arrive any more.
+    closed: bool,
+}
+
+/// Drains the events queued behind `first` without waiting and ORs their
+/// force flags (`forces`). A lag counts as forced, since the missed events
+/// may have been: it costs one extra snapshot and loses nothing, because the
+/// snapshot is rebuilt from the manager's state, never from the events.
+fn drain<E: Clone>(
+    first: Result<E, tokio::sync::broadcast::error::RecvError>,
+    events: &mut tokio::sync::broadcast::Receiver<E>,
+    forces: impl Fn(E) -> bool,
+) -> Wake {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    let mut wake = Wake {
+        pending: None,
+        closed: false,
+    };
+    let mut next = Some(first);
+    while let Some(received) = next {
+        match received {
+            Ok(event) => wake.pending = Some(wake.pending == Some(true) || forces(event)),
+            Err(RecvError::Lagged(_)) => wake.pending = Some(true),
+            Err(RecvError::Closed) => {
+                wake.closed = true;
+                break;
+            }
+        }
+        next = match events.try_recv() {
+            Ok(event) => Some(Ok(event)),
+            Err(TryRecvError::Lagged(missed)) => Some(Err(RecvError::Lagged(missed))),
+            Err(TryRecvError::Closed) => Some(Err(RecvError::Closed)),
+            Err(TryRecvError::Empty) => None,
+        };
+    }
+    wake
+}
+
+/// Upstream's send-or-drop rule (`BasePeriodicWebSocketListener.cs:177`): a
+/// forced change always sends; any other only when at least `period` has
+/// passed since this socket's last send, and is otherwise dropped, with no
+/// trailing send.
+fn should_send(
+    force: bool,
+    last_sent: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    period: Duration,
+) -> bool {
+    force || last_sent.is_none_or(|sent| now.duration_since(sent) >= period)
+}
+
+/// Awaits the next event of an armed stream; pends forever when unarmed (so
+/// the select branch never fires for a stream the client hasn't subscribed
+/// to). `recv` is cancel-safe, so losing a `select!` race loses no event.
+async fn next_event<E: Clone>(
+    stream: &mut Option<EventStream<E>>,
+) -> Result<E, tokio::sync::broadcast::error::RecvError> {
+    match stream {
+        Some(stream) => stream.events.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// One wake of the `Sessions` stream: the port of `HandleMessages` for one
+/// connection. Drains the queue, applies the throttle and returns the
+/// snapshot to send, if any. `last_sent` is stamped once the snapshot is
+/// built, just before it is written; upstream stamps it after the write
+/// completes. A failed write here ends the socket, so only the start of the
+/// throttle window moves, by the time one write takes.
+async fn sessions_wake(
+    state: &AppState,
+    caller: Option<&SocketCaller>,
+    stream: &mut Option<EventStream<SessionEvent>>,
+    first: Result<SessionEvent, tokio::sync::broadcast::error::RecvError>,
+) -> Option<String> {
+    let subscription = stream.as_mut()?;
+    let wake = drain(first, &mut subscription.events, session_event_forces);
+    let now = tokio::time::Instant::now();
+    let due = wake
+        .pending
+        .is_some_and(|force| should_send(force, subscription.last_sent, now, subscription.period));
+    let message = match caller {
+        Some(caller) if due => sessions_message(state, caller).await,
+        _ => None,
+    };
+    if message.is_some() {
+        subscription.last_sent = Some(tokio::time::Instant::now());
+    }
+    if wake.closed {
+        *stream = None;
+    }
+    message
 }
 
 /// Awaits the next tick of an armed stream; pends forever when unarmed (so the
@@ -914,20 +1065,49 @@ fn envelope(message_type: &str, data: &serde_json::Value) -> String {
     .to_string()
 }
 
-/// The `Sessions` stream payload: the session list as the subscribing user
-/// sees it (the session manager applies the caller's visibility; an API key
-/// sees every session).
-async fn sessions_message(
-    state: &AppState,
-    user_id: uuid::Uuid,
-    is_api_key: bool,
-) -> Option<String> {
-    let sessions = state
+/// The `Sessions` stream payload, the port of
+/// `SessionInfoWebSocketListener.GetDataToSendForConnection`: an
+/// administrator or API key sees every session, anyone else only the
+/// sessions they are the user or an additional user of, so a session with no
+/// user is not theirs. The list comes from `get_sessions`, which also blanks
+/// the hardware accelerator for a non-administrator, an accepted divergence:
+/// upstream's stream sends it, while its `GET /Sessions` blanks it.
+///
+/// A list that cannot be built is logged and skipped, and the subscription
+/// stays, so the next event tries again; upstream logs it and drops the
+/// connection's subscription.
+async fn sessions_message(state: &AppState, caller: &SocketCaller) -> Option<String> {
+    let mut sessions = match state
         .sessions
-        .get_sessions(user_id, None, None, None, is_api_key)
+        .get_sessions(caller.user_id, None, None, None, caller.is_api_key)
         .await
-        .ok()?;
-    Some(envelope("Sessions", &serde_json::to_value(sessions).ok()?))
+    {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(%error, "websocket Sessions snapshot could not be built");
+            return None;
+        }
+    };
+    if !caller.is_admin && !caller.is_api_key {
+        sessions.retain(|session| is_session_member(session, caller.user_id));
+    }
+    match serde_json::to_value(sessions) {
+        Ok(data) => Some(envelope("Sessions", &data)),
+        Err(error) => {
+            tracing::warn!(%error, "websocket Sessions snapshot could not be serialized");
+            None
+        }
+    }
+}
+
+/// Upstream's `s.UserId.Equals(userId) || s.ContainsUser(userId)`.
+fn is_session_member(session: &ferrofin_model::dto::SessionInfoDto, user_id: uuid::Uuid) -> bool {
+    session.user_id == user_id
+        || session
+            .additional_users
+            .iter()
+            .flatten()
+            .any(|user| user.user_id == user_id)
 }
 
 /// The `ScheduledTasksInfo` stream payload: the current task list.
@@ -1088,10 +1268,11 @@ fn force_keep_alive_message() -> String {
 mod tests {
     use super::{
         Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_FORCE_AFTER_SECS, KEEPALIVE_LOST_SECS,
-        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, SocketCaller, Streams, action_for,
-        force_keep_alive_message, keep_alive_ack, keep_alive_action, may_subscribe, parse_inbound,
-        push_sink, visible_tasks,
+        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, SessionEvent, SocketCaller, Streams, Wake,
+        action_for, drain, force_keep_alive_message, keep_alive_ack, keep_alive_action,
+        may_subscribe, parse_inbound, push_sink, session_event_forces, should_send, visible_tasks,
     };
+    use crate::test_support::FakeSessions;
     use axum::extract::ws::Message;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -1100,13 +1281,17 @@ mod tests {
     async fn stream_period_is_floored_at_the_configured_minimum() {
         // A hostile or misconfigured client asks for a 1 ms period on every
         // stream; each must be clamped up to the floor so a tick cannot become
-        // back-to-back `get_sessions`/activity work.
+        // back-to-back task/activity work.
         let floor = Duration::from_millis(100);
         let mut streams = Streams::new(floor);
-        streams.apply(Inbound::SessionsStart(Duration::from_millis(1)));
-        streams.apply(Inbound::TasksStart(Duration::from_millis(1)));
-        streams.apply(Inbound::ActivityStart(Duration::from_millis(1)));
-        assert_eq!(streams.sessions.as_ref().unwrap().period(), floor);
+        let (_events, receiver) = tokio::sync::broadcast::channel(1);
+        streams.start_sessions(Some(receiver), Duration::from_millis(1));
+        streams.apply(Inbound::TasksStart(Duration::from_millis(1)), &FakeSessions);
+        streams.apply(
+            Inbound::ActivityStart(Duration::from_millis(1)),
+            &FakeSessions,
+        );
+        assert_eq!(streams.sessions.as_ref().unwrap().period, floor);
         assert_eq!(streams.tasks.as_ref().unwrap().period(), floor);
         assert_eq!(streams.activity.as_ref().unwrap().period(), floor);
     }
@@ -1116,10 +1301,127 @@ mod tests {
         // jellyfin-web subscribes with 1500 ms, comfortably above the floor, so
         // the floor must not slow a well-behaved client down.
         let mut streams = Streams::new(Duration::from_millis(100));
-        streams.apply(Inbound::SessionsStart(Duration::from_millis(1500)));
+        let (_events, receiver) = tokio::sync::broadcast::channel(1);
+        streams.start_sessions(Some(receiver), Duration::from_millis(1500));
         assert_eq!(
-            streams.sessions.as_ref().unwrap().period(),
+            streams.sessions.as_ref().unwrap().period,
             Duration::from_millis(1500)
+        );
+    }
+
+    /// A second `SessionsStart` replaces the first: a new receiver, the new
+    /// period and a fresh throttle, so its first non-forced change sends.
+    /// `SessionsStop` drops the receiver. A manager that raises no events
+    /// leaves the stream unarmed.
+    #[tokio::test]
+    async fn a_second_sessions_start_replaces_the_subscription() {
+        let mut streams = Streams::new(Duration::from_millis(100));
+        let (events, receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
+        streams.start_sessions(Some(receiver), Duration::from_millis(1500));
+        streams.sessions.as_mut().unwrap().last_sent = Some(tokio::time::Instant::now());
+
+        streams.start_sessions(Some(events.subscribe()), Duration::from_secs(5));
+        let subscription = streams.sessions.as_ref().unwrap();
+        assert_eq!(subscription.period, Duration::from_secs(5));
+        assert_eq!(subscription.last_sent, None);
+        assert_eq!(events.receiver_count(), 1, "the first receiver is gone");
+
+        streams.apply(Inbound::SessionsStop, &FakeSessions);
+        assert!(streams.sessions.is_none());
+        assert_eq!(events.receiver_count(), 0);
+
+        streams.apply(
+            Inbound::SessionsStart(Duration::from_secs(1)),
+            &FakeSessions,
+        );
+        assert!(streams.sessions.is_none(), "FakeSessions raises no events");
+    }
+
+    /// `SessionInfoWebSocketListener.cs:111-144`: only `SessionActivity` and
+    /// automated progress are throttled; every other event forces a send.
+    #[test]
+    fn only_session_activity_and_automated_progress_are_throttled() {
+        for (event, forced) in [
+            (SessionEvent::SessionStarted, true),
+            (SessionEvent::SessionEnded, true),
+            (SessionEvent::PlaybackStart, true),
+            (SessionEvent::PlaybackStopped, true),
+            (
+                SessionEvent::PlaybackProgress {
+                    is_automated: false,
+                },
+                true,
+            ),
+            (SessionEvent::PlaybackProgress { is_automated: true }, false),
+            (SessionEvent::CapabilitiesChanged, true),
+            (SessionEvent::SessionActivity, false),
+        ] {
+            assert_eq!(session_event_forces(event), forced, "{event:?}");
+        }
+    }
+
+    /// `BasePeriodicWebSocketListener.cs:177`: `force || (now -
+    /// DateLastSendUtc) >= IntervalMs`, with `DateLastSendUtc` unset before the
+    /// first send.
+    #[test]
+    fn a_throttled_change_sends_only_once_the_period_has_passed() {
+        let period = Duration::from_millis(1500);
+        let sent = tokio::time::Instant::now();
+        assert!(should_send(false, None, sent, period), "nothing sent yet");
+        assert!(should_send(true, Some(sent), sent, period), "forced");
+        assert!(!should_send(
+            false,
+            Some(sent),
+            sent + Duration::from_millis(1499),
+            period
+        ));
+        assert!(should_send(false, Some(sent), sent + period, period));
+    }
+
+    /// One wake drains everything queued and ORs the force flags; a lag is
+    /// forced; a closed channel says so once the queue is empty.
+    #[tokio::test]
+    async fn a_wake_drains_the_queue_into_one_decision() {
+        use tokio::sync::broadcast::error::RecvError;
+        let throttled = SessionEvent::SessionActivity;
+        let (events, mut receiver) = tokio::sync::broadcast::channel(2);
+
+        events.send(throttled).unwrap();
+        let first = receiver.recv().await;
+        let wake = drain(first, &mut receiver, session_event_forces);
+        assert_eq!(
+            wake,
+            Wake {
+                pending: Some(false),
+                closed: false
+            }
+        );
+
+        events.send(throttled).unwrap();
+        events.send(SessionEvent::PlaybackStart).unwrap();
+        let first = receiver.recv().await;
+        let wake = drain(first, &mut receiver, session_event_forces);
+        assert_eq!(wake.pending, Some(true), "a queued forced event forces");
+        assert!(receiver.is_empty(), "the queue is drained");
+
+        for _ in 0..3 {
+            events.send(throttled).unwrap();
+        }
+        let first = receiver.recv().await;
+        assert!(matches!(first, Err(RecvError::Lagged(1))), "{first:?}");
+        let wake = drain(first, &mut receiver, session_event_forces);
+        assert_eq!(wake.pending, Some(true), "a lag is forced");
+
+        events.send(throttled).unwrap();
+        drop(events);
+        let first = receiver.recv().await;
+        let wake = drain(first, &mut receiver, session_event_forces);
+        assert_eq!(
+            wake,
+            Wake {
+                pending: Some(false),
+                closed: true
+            }
         );
     }
 

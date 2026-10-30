@@ -15,8 +15,12 @@
 //!   assembled at the API layer from this data. The `ToSessionInfoDto` /
 //!   `OnSessionControllerConnected` mapping helpers that take the un-ported
 //!   `SessionInfo` are dropped.
-//! - .NET `event`s (`PlaybackStart`, `SessionStarted`, …) are dropped; event
-//!   wiring lives in `ferrofin-core`.
+//! - The .NET `event`s `SessionInfoWebSocketListener` subscribes to
+//!   (`SessionStarted`, `PlaybackStart`, …) become one [`SessionEvent`]
+//!   broadcast, [`SessionManager::subscribe_session_events`]. Their payloads
+//!   are dropped: the listener only asks "send now, or throttled?", and the
+//!   domain [`EventManager`](crate::events::EventManager) still carries the
+//!   payloads for its own consumers.
 //! - Generic overloads (`SendSyncPlayGroupUpdate<T>`,
 //!   `SendMessageToUserSessions<T>`, `SendMessageToAdminSessions<T>`) collapse to
 //!   a single method taking a pre-serialized JSON payload (a `&str`), which keeps
@@ -86,6 +90,33 @@ pub struct AuthenticationRequest {
 
     /// The remote endpoint (client IP) the request came from.
     pub remote_endpoint: Option<String>,
+}
+
+/// A change the WebSocket `Sessions` stream reacts to: one of the
+/// `ISessionManager` events `SessionInfoWebSocketListener` subscribes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// A session was created (`SessionStarted`).
+    SessionStarted,
+    /// A session left the pool: ended, closed or logged out (`SessionEnded`).
+    SessionEnded,
+    /// A client reported the start of playback (`PlaybackStart`).
+    PlaybackStart,
+    /// A client reported the end of playback, or the idle check stopped it
+    /// (`PlaybackStopped`).
+    PlaybackStopped,
+    /// Playback progress (`PlaybackProgress`); `is_automated` is upstream's
+    /// `PlaybackProgressEventArgs.IsAutomated`: the server's own one-second
+    /// estimate rather than a client check-in.
+    PlaybackProgress {
+        /// The server estimated this progress rather than a client reporting it.
+        is_automated: bool,
+    },
+    /// A client reported its capabilities (`CapabilitiesChanged`).
+    CapabilitiesChanged,
+    /// A request arrived on a session that had been idle for a while
+    /// (`SessionActivity`).
+    SessionActivity,
 }
 
 /// Orchestrates client sessions: activity, playback reporting, and remote
@@ -359,6 +390,17 @@ pub trait SessionManager: Send + Sync {
     /// leaning on this default silently disables the playback guard.
     async fn has_active_playback(&self) -> Result<bool, ServiceError> {
         Ok(false)
+    }
+
+    /// Subscribes to the session events the WebSocket `Sessions` stream sends
+    /// on (the C# `event` fields `SessionInfoWebSocketListener` attaches to).
+    /// Only events raised after the call are received.
+    ///
+    /// `None`, the default kept for test fakes, means this manager raises no
+    /// events, so a `Sessions` subscriber is sent nothing. It is not a polling
+    /// fallback.
+    fn subscribe_session_events(&self) -> Option<tokio::sync::broadcast::Receiver<SessionEvent>> {
+        None
     }
 }
 

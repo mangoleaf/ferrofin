@@ -927,7 +927,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 
 /// The subsystems a [`VERIFIED_SUBSYSTEMS`] row may cover, by key. Every
 /// operation crosses several of them, so one row states their divergences once
-/// and operation rows name it in [`Verified::refs`].
+/// and operation rows name it in [`Verified::refs`]. `websocket-streams` is
+/// the `/socket` dashboard streams, which no contract operation describes.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -935,6 +936,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "access-filtering",
     "images",
     "paging-sort",
+    "websocket-streams",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -961,7 +963,31 @@ pub struct VerifiedSubsystem {
 /// compared against the upstream C# at [`UPSTREAM_TAG`] (or the earlier tag
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
-pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[];
+pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[VerifiedSubsystem {
+    key: "websocket-streams",
+    upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",
+    upstream_method: "HandleMessages",
+    ferrofin: "handlers/websocket.rs handle_socket → Streams::start_sessions, sessions_wake \
+               (drain, should_send, session_event_forces), sessions_message → ferrofin-core \
+               session_manager.rs SessionEvent raises; compared with the Sessions listener \
+               (Jellyfin.Api/WebSocketListeners/SessionInfoWebSocketListener.cs). \
+               CapabilitiesChanged and SessionActivity are not raised yet: TODO(gl-721). The \
+               ActivityLog and ScheduledTasks listeners still poll: TODO(gl-362, gl-722)",
+    date: "2026-10-29",
+    divergences: &[
+        "Events already queued for a socket are drained and answered with one Sessions frame, \
+         where upstream sends one per forced event: a burst yields fewer frames with the same \
+         final state.",
+        "A non-administrator's Sessions frames carry the hardware accelerator blanked, as \
+         GET /Sessions does; upstream's stream sends it as is.",
+        "A second SessionsStart on a socket replaces its subscription; upstream adds a second \
+         one and sends each frame twice.",
+        "A session list that cannot be built is logged and skipped and the subscription stays; \
+         upstream logs it and drops the connection's subscription.",
+        "The period is floored at FERROFIN_WS_MIN_STREAM_PERIOD_MS (100 ms by default), which \
+         upstream does not have, until the last stream stops polling: TODO(gl-723).",
+    ],
+}];
 
 /// One contract operation whose Ferrofin implementation was compared against
 /// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
