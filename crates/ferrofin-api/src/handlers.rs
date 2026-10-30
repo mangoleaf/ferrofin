@@ -1102,6 +1102,33 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              and Backdrop tags) is not ported. Fix path: gl-853.",
         ],
     },
+    VerifiedSubsystem {
+        key: "user-data",
+        upstream_file: "Emby.Server.Implementations/Library/UserDataManager.cs",
+        upstream_method: "SaveUserData",
+        ferrofin: "The write path only. ferrofin-core user_data_manager.rs mutate_row \
+                   (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
+                   save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
+                   save_play_state and apply_play_report (UpdatePlayState), \
+                   reset_playback_stream_selections (ResetPlaybackStreamSelections), \
+                   record_playback_start, set_likes, mark_item_played, mark_item_unplayed, \
+                   clear_own_play_state and propagate_played_state. Compared with \
+                   Emby.Server.Implementations/Session/SessionManager.cs (OnPlaybackStart, \
+                   OnPlaybackProgress, UpdatePlaybackSettings, OnPlaybackStopped), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
+                   MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
+                   Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
+                   UpdateUserItemRatingInternal)",
+        date: "2026-10-30",
+        divergences: &[
+            "Each change reads the row inside its write transaction, so two overlapping saves of \
+             one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
+             writes every column back, so there the later save undoes the earlier one.",
+            "Marking a container unplayed also clears the play state on the container's own rows, \
+             which earlier Ferrofin builds wrote; upstream's MarkUnplayed leaves them, so a Played \
+             set on a container through the UserData API survives it there. Fix path: gl-1064.",
+        ],
+    },
 ];
 
 /// One contract operation whose Ferrofin implementation was compared against
@@ -1179,6 +1206,9 @@ pub const VERIFIED: &[Verified] = &[
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
+            "The 400 (an API key with no userId, or a value the query binder cannot convert), \
+         403 (another user's id without the administrator role) and 404 (a userId naming no \
+         account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &["images"],
     },
@@ -1249,12 +1279,29 @@ pub const VERIFIED: &[Verified] = &[
         path: "/UserItems/Resume",
         upstream_file: "Jellyfin.Api/Controllers/ItemsController.cs",
         upstream_method: "GetResumeItems",
-        ferrofin: "handlers/items.rs get_resume_items → ferrofin-core item_repository.rs \
-               get_items → translate_query.rs (push_resumable_predicate, \
+        ferrofin: "handlers/items.rs get_resume_items (active_session_item_ids → \
+               ferrofin-core session_manager.rs get_session_summaries) → ferrofin-core \
+               item_repository.rs get_items → translate_query.rs (push_resumable_predicate, \
                push_order_expression DatePlayed)",
-        date: "2026-10-29",
+        date: "2026-10-30",
         divergences: RESUME_DIVERGENCES,
         refs: &["images"],
+    },
+    Verified {
+        method: "get",
+        path: "/Sessions",
+        upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
+        upstream_method: "GetSessions",
+        ferrofin: "handlers/session.rs get_sessions (items.rs effective_user_id) → \
+               ferrofin-core session_manager.rs get_sessions (shared_device_control_for, \
+               retain_accessible_session_devices, to_dto → session_info_to_dto) \
+               (SessionManager.GetSessions, ToSessionInfoDto); the NowPlayingItem it copies \
+               is built by on_playback_start and on_playback_progress \
+               (kept_now_playing_item, now_playing_item → get_item_info; UpdateNowPlayingItem, \
+               GetItemInfo) and cleared by on_playback_stopped (RemoveNowPlayingItem)",
+        date: "2026-10-30",
+        divergences: SESSIONS_DIVERGENCES,
+        refs: &[],
     },
     Verified {
         method: "post",
@@ -1991,6 +2038,32 @@ const NO_USER_USER_DATA_FILTER_DIVERGENCE: &str = "A user-data filter (`isFavori
      IsPlayed, IsUnplayed) with no user (an API key without userId) is ignored and the list is \
      unfiltered (200); upstream's TranslateQuery dereferences the null User for the user-data \
      subqueries and fails (500). Jellyfin bug not ported.";
+
+/// The accepted divergences of `GET /Sessions`.
+const SESSIONS_DIVERGENCES: &[&str] = &[
+    "PlayState carries only PositionTicks, IsPaused and a CanSeek derived from the \
+     now-playing item, NowPlayingQueue is always empty, TranscodingInfo is never cleared, \
+     and PlaylistItemId, NowViewingItem and UserPrimaryImageTag are never filled, where \
+     upstream's UpdateNowPlayingItem, RemoveNowPlayingItem and LogSessionActivity keep them. \
+     Fix path: gl-119.",
+    "LastPlaybackCheckIn starts at the session's creation, where upstream's is \
+     0001-01-01 until a playback report; NowPlayingQueueFullItems is sent as [], a member \
+     v12.4's SessionInfoDto no longer has. Fix path: gl-837.",
+    "A playback report's own Item is ignored and the NowPlayingItem is always built from the \
+     library item; upstream shows a reported Item as sent. Fix path: gl-1062.",
+    "A NowPlayingItem whose media source lookup fails is shown without its streams, and one \
+     whose build fails is not shown, while the report itself succeeds and saves the user's \
+     progress; the next report naming the item builds it again. Upstream fails the report, \
+     which keeps the session's previous NowPlayingItem.",
+    "A non-administrator's response carries the hardware accelerator blanked, and only that \
+     response; upstream blanks it on the stored session's TranscodingInfo, so every later \
+     reader, an administrator included, sees it blanked until the next transcoding report \
+     replaces it (the websocket-streams row records the Sessions stream's side). Jellyfin \
+     bug not ported.",
+    "The 403 (controllableByUserId naming another user without the administrator role) and \
+     400 (a value the query binder cannot convert) bodies are Ferrofin's error shape, not \
+     upstream's. Fix path: gl-666.",
+];
 
 /// What `/UserItems/Resume` — and its legacy twin `/Users/{userId}/Items/Resume`,
 /// the same handler with the user from the route, which is hidden from the

@@ -2405,12 +2405,24 @@ fn log_scoped_item(item: &Planned, reason: &'static str, saved: bool) {
 }
 
 /// The `pruned` lines of a path-scoped scan ([`log_scoped_item`]'s), one per
-/// removed row.
-fn log_pruned(removed: &[(Uuid, Option<String>)]) {
-    for (id, path) in removed {
+/// removed row. The paths come from the `rows` the prune read, then the
+/// `children` it found under the stale ones.
+fn log_pruned(
+    removed: &[Uuid],
+    rows: &[ItemPathRow],
+    children: &[ferrofin_traits::persistence::ItemChildLink],
+) {
+    let mut paths: HashMap<Uuid, Option<&str>> = rows
+        .iter()
+        .map(|row| (row.id, row.path.as_deref()))
+        .collect();
+    for child in children {
+        paths.entry(child.id).or_insert(child.path.as_deref());
+    }
+    for id in removed {
         tracing::debug!(
             item_id = %id,
-            path = path.as_deref().unwrap_or_default(),
+            path = paths.get(id).copied().flatten().unwrap_or_default(),
             reason = "pruned",
             saved = false,
             "path-scoped scan item"
@@ -9856,7 +9868,7 @@ impl LibraryScanner {
                     ))
                     && keep_on_disk(row)
             };
-            let Some((ids, paths)) = self
+            let Some((ids, children)) = self
                 .stale_rows(cf, &existing, &live, &keep_row, &listed, &own)
                 .await
             else {
@@ -9870,11 +9882,7 @@ impl LibraryScanner {
             match self.persistence.delete_items(&ids).await {
                 Ok(deleted) => {
                     if scope.is_some() {
-                        let gone: Vec<(Uuid, Option<String>)> = deleted
-                            .iter()
-                            .map(|id| (*id, paths.get(id).cloned().flatten()))
-                            .collect();
-                        log_pruned(&gone);
+                        log_pruned(&deleted, &existing, &children);
                     }
                     tracing::info!(library = %cf, removed = deleted.len(), "pruned missing or excluded items");
                     removed.push((cf, deleted));
@@ -9918,7 +9926,7 @@ impl LibraryScanner {
     /// folders (`own`), and not still on disk (unless invented at a location,
     /// [`LibraryFolders::invented`]) — less the ones still holding
     /// a row this scan keeps ([`hold_back_kept_children`]). Returns the ids
-    /// to delete and the paths of the rows read, for the report; `None` when
+    /// to delete and the rows found under them, for the report; `None` when
     /// the rows under them could not be read, when nothing is pruned.
     async fn stale_rows(
         &self,
@@ -9928,7 +9936,7 @@ impl LibraryScanner {
         keep_on_disk: &(dyn Fn(&ItemPathRow) -> bool + Sync),
         listed: &(dyn Fn(Option<&str>) -> bool + Sync),
         own: &LibraryFolders<'_>,
-    ) -> Option<(Vec<Uuid>, HashMap<Uuid, Option<String>>)> {
+    ) -> Option<(Vec<Uuid>, Vec<ferrofin_traits::persistence::ItemChildLink>)> {
         // A path-less row sits in its parent's folder: it is known only
         // where that folder is — a parent that is unknown or has no path of
         // its own leaves it unknown. And only a virtual season, which this
@@ -9985,7 +9993,7 @@ impl LibraryScanner {
             );
         }
         if stale.is_empty() {
-            return Some((Vec::new(), HashMap::new()));
+            return Some((Vec::new(), Vec::new()));
         }
         // What the deletes would take with them: never a row this scan keeps.
         let ids: Vec<Uuid> = stale.iter().copied().collect();
@@ -10023,14 +10031,7 @@ impl LibraryScanner {
             .map(|row| row.id)
             .filter(|id| stale.contains(id))
             .collect();
-        let mut paths: HashMap<Uuid, Option<String>> = existing
-            .iter()
-            .map(|row| (row.id, row.path.clone()))
-            .collect();
-        for child in &children {
-            paths.entry(child.id).or_insert_with(|| child.path.clone());
-        }
-        Some((ids, paths))
+        Some((ids, children))
     }
 
     /// Releases the stacked parts and local alternate versions (owned, no

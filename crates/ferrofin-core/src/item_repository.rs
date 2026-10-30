@@ -3887,10 +3887,7 @@ impl ItemRepository for FerrofinItemRepository {
         let mut map: std::collections::HashMap<Uuid, Vec<ItemImageInfo>> =
             std::collections::HashMap::with_capacity(item_ids.len());
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(
                 images_of_items_sql(&placeholders),
             ));
@@ -4472,10 +4469,7 @@ pub(crate) async fn select_item_rows_on(
 ) -> Result<Vec<BaseItemEntity>, ServiceError> {
     let mut rows = Vec::new();
     for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-        let marks = (1..=chunk.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = ferrofin_db::numbered_placeholders(1..=chunk.len());
         let sql = format!(r#"SELECT * FROM "BaseItems" WHERE {column} IN ({marks})"#);
         let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql));
         for id in chunk {

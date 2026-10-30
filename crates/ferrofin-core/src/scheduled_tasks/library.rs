@@ -245,7 +245,10 @@ impl FfmpegRunner for TokioFfmpegRunner {
             .wait_with_output()
             .await
             .map_err(|e| ServiceError::backend(format!("failed to run {program}: {e}")))?;
-        Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+        // ffmpeg's log is UTF-8 unless a tag in it is not, so normally this keeps
+        // the buffer rather than copying it: a long file's `framelog` is megabytes.
+        Ok(String::from_utf8(output.stderr)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
     }
 }
 
@@ -1741,6 +1744,25 @@ mod tests {
             .await
             .expect("sh runs");
         assert_eq!(stderr.trim().parse::<i32>().expect("a number"), expected);
+    }
+
+    /// ffmpeg's log is text, and a stray byte in it (a tag in a legacy encoding)
+    /// must not cost the summary after it.
+    #[tokio::test]
+    async fn stderr_with_a_stray_byte_is_still_read() {
+        let script = r"printf 'title: caf\351\n    I: -23.1 LUFS\n' >&2";
+        let stderr = super::TokioFfmpegRunner
+            .run_stderr("sh", &["-c".to_owned(), script.to_owned()])
+            .await
+            .expect("sh runs");
+        assert_eq!(stderr, "title: caf\u{fffd}\n    I: -23.1 LUFS\n");
+        assert_eq!(parse_lufs(&stderr), Some(-23.1));
+
+        let clean = super::TokioFfmpegRunner
+            .run_stderr("sh", &["-c".to_owned(), "printf 'ok' >&2".to_owned()])
+            .await
+            .expect("sh runs");
+        assert_eq!(clean, "ok");
     }
 
     // -- pure helpers -------------------------------------------------------

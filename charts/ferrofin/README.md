@@ -9,6 +9,10 @@ release to Ferrofin is near-zero churn. Two intentional differences:
 - the app config block is `ferrofin:` (not `jellyfin:`), with no `enableDLNA` (Ferrofin has no DLNA);
 - config mounts at `/data` (Ferrofin's data dir), not `/config`.
 
+Stop Jellyfin before Ferrofin first boots on its database: adopting a database Jellyfin is
+still using is not safe, and adoption is one-way (see
+[the upgrade notes](../../docs/UPGRADING.md)).
+
 ## Install
 
 The chart is published as an OCI artifact next to the image:
@@ -35,10 +39,11 @@ registry, set `image.repository` and `imagePullSecrets` in your values.
 | `persistence.config.enabled` | `true` | Persist the data dir; `false` → emptyDir |
 | `persistence.config.mountPath` | `/data` | Where the data dir mounts |
 | `persistence.config.existingClaim` | `""` | Use an existing PVC instead of a chart-created one |
+| `persistence.config.accessMode` | `ReadWriteOnce` | Access mode of the chart-created PVC; RWX does not make a rolling update safe across nodes (see [Upgrades and the database](#upgrades-and-the-database)) |
 | `volumes` / `volumeMounts` | `[]` | Extra media/host volumes |
 | `ferrofin.env` / `ferrofin.envFrom` / `ferrofin.args` | `[]` | Config via `FERROFIN_*` env or CLI flags |
 | `livenessProbe` / `readinessProbe` | `/health/live` / `/health/ready` | Ferrofin's health endpoints |
-| `strategy` | RollingUpdate, surge 1 / unavailable 0 | Upgrade without dropping playback; set `type: Recreate` if the config PVC can't be mounted twice |
+| `strategy` | RollingUpdate, surge 1 / unavailable 0 | Upgrade without dropping playback, with two versions on one database until the new pod is ready; `type: Recreate` stops the old pod first (see [Upgrades and the database](#upgrades-and-the-database)) |
 | `ingress.enabled` | `false` | Standard `Ingress` (most clusters expose Ferrofin this way) |
 | `httpRoute.enabled` | `false` | Gateway API `HTTPRoute` (alternative to ingress) |
 | `networkPolicy.enabled` | `false` | Pod isolation (needs a policy-enforcing CNI) |
@@ -73,6 +78,80 @@ Health probes target Ferrofin's real endpoints: `GET /health/live` is process-on
 `GET /health/ready` checks that the database answers. Jellyfin's own `/health` (plain-text
 `Healthy`, or `Unhealthy` with a 503) runs the same check, so healthchecks written for
 Jellyfin keep working.
+
+## Upgrades and the database
+
+The default `RollingUpdate` (surge 1, unavailable 0) keeps playback going through an
+upgrade because the old pod runs until the new one is ready. Ferrofin's database is one
+SQLite file that both pods open, so the two versions overlap, and that has a cost.
+
+**The old version keeps serving and writing for the whole of the new pod's boot.** The new
+pod binds its port, then adopts and migrates the database and runs its one-shot repairs, and
+only then does `/health/ready` pass. On a small database with nothing to migrate that takes
+seconds; a heavy migration on a large database can take minutes. Nothing makes one version
+wait for the other: SQLite's locks keep the file intact on one node, but they protect the
+file, not the logic. During that window:
+
+- **Rows the old version writes can miss a one-shot repair or data migration for good.**
+  Each runs once. A row saved after it ran stays in the old shape; many of these heal on the
+  next scan or save.
+- **The old version can answer with errors.** A write waits 30 seconds for the lock and then
+  fails, so a migration or repair transaction longer than that surfaces as a `500`. A
+  transaction that read before it writes can fail straight away when the other version commits
+  in between. The old version also runs against a schema it was not built for once a migration
+  has changed a table it reads.
+- **The old version cannot restart once a migration has been applied.** A database migrated by
+  a newer version does not open under an older one, so an old pod that restarts after that point
+  stays down until the new pod is ready. For the same reason, `helm rollback` after a migration
+  also needs the database restored from a backup.
+- **The new pod can fail and restart.** If a repair loses a race with the old version, the boot
+  fails and Kubernetes starts the pod again, while the old pod keeps serving. Each migration is
+  a transaction, and one that fails leaves nothing behind.
+
+To opt out, stop the old pod first with `type: Recreate`. Only one version ever touches the
+database, and playback stops for the whole boot:
+
+```yaml
+strategy:
+  type: Recreate
+```
+
+You can keep the default and stop first only for an upgrade that needs it, by adding
+`--set strategy.type=Recreate` to that one `helm upgrade` (with `--reuse-values` it stays set
+for later upgrades too). [`docs/UPGRADING.md`](../../docs/UPGRADING.md#kubernetes-stop-the-old-pod-first-for-heavy-migrations)
+says when to do that.
+
+### Storage: one node at a time
+
+**Never let two nodes run Ferrofin on one database.** SQLite's WAL mode keeps a shared-memory
+index (the `-shm` file) that every process using the database must share, so
+[all of them must be on the same host](https://www.sqlite.org/wal.html). Over NFS, CephFS or
+any other RWX volume, a surge pod on a second node sees a different index from the old pod,
+and that can corrupt the database. The chart cannot tell where your volume lives and does not
+check this. What keeps you safe:
+
+| Your volume | Rolling update | What happens |
+|---|---|---|
+| `ReadWriteOnce` | Works if the surge pod lands on the old pod's node, which the scheduler does not aim for: use the `affinity` below | On any other node the surge pod waits for the volume and the rollout stalls, which does no harm but needs you to fix it |
+| `ReadWriteOnce` on node-local storage, or a pod pinned to one node | Works | Both pods are on that node |
+| `ReadWriteOncePod` | Stalls | The volume admits one pod, so use `Recreate` |
+| `ReadWriteMany` (NFS, CephFS) | **Only with both pods held on one node** | Otherwise the surge pod can land on a second node: use `Recreate` |
+
+To keep a surge pod on the old pod's node, use the `affinity` value. The first pod of a release
+still schedules: Kubernetes lets a pod satisfy its own affinity when nothing matches yet. Use
+your release's name:
+
+```yaml
+affinity:
+  podAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/instance: <release>
+        topologyKey: kubernetes.io/hostname
+```
+
+The surge pod then waits if that node has no room for it, so leave room or use `Recreate`.
 
 ## Grafana dashboards
 

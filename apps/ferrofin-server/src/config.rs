@@ -1619,7 +1619,7 @@ fn top_level_keys(
 /// in-process restart logs it) and the terminal. What is left names the line
 /// and column and the problem, e.g. `TOML parse error at line 3, column 18:
 /// invalid basic string`.
-fn without_source_lines(message: &str) -> String {
+pub(crate) fn without_source_lines(message: &str) -> String {
     let quotes_the_file = |line: &str| {
         line.trim_start()
             .trim_start_matches(|c: char| c.is_ascii_digit())
