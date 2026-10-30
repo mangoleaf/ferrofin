@@ -10,7 +10,7 @@
 #   path      the field path as the report prints it (`MediaSources[].Size`); `$status` for the
 #             status code, `$` for the whole body; `<tag>` stands for every image-tag key of a map
 #             (`Items[].ImageBlurHashes.Primary.<tag>`)
-#   kind      required: one kind or a list of status, value, type, null, missing, extra, length. An
+#   kind      required: one kind or a list of status, value, type, null, missing, extra, length, order. An
 #             entry accepts only the kinds it names, so a harmless value difference cannot also hide
 #             a null, a type change or a Ferrofin timeout at the same path
 #
@@ -207,12 +207,22 @@ kind = "value"
 issue = 861
 reason = "Equal sort keys (many seasons share a name) come back in a different order: Jellyfin's row order after SortName."
 
+# The glob holds only requests with Resume's own date-played sort: a request naming a SortBy needs its own
+# entries, since a reorder against the key it names is a real difference.
+[[entry]]
+request = "GetResumeItems*"
+path = "Items"
+kind = "order"
+issue = 861
+reason = "Equal sort keys (many seasons share a name) come back in a different order: Jellyfin's row order after SortName."
+
+# Paged, the different tie order puts other items on the page.
 [[entry]]
 request = "GetResumeItems*"
 path = "Items[].Id"
 kind = "value"
 issue = 861
-reason = "Equal sort keys (many seasons share a name) come back in a different order: Jellyfin's row order after SortName."
+reason = "Equal sort keys (many seasons share a name) come back in a different order, so a page holds other items."
 
 # The page follows the difference gl-827 tracks.
 [[entry]]
@@ -977,10 +987,17 @@ reason = "Ferrofin does not read the task history an adopted Jellyfin data direc
 # A task's raw key stands in for its name, so it sorts elsewhere and the task rows shift.
 [[entry]]
 request = "GetTasks"
-path = "[].Id"
-kind = "value"
+path = "$"
+kind = "order"
 issue = 428
 reason = "A task's raw key stands in for its name, so it sorts elsewhere and the task rows shift."
+
+[[entry]]
+request = "GetTasks"
+path = "[].Name"
+kind = "value"
+issue = 428
+reason = "A task's raw key stands in for its name: its Name differs from Jellyfin's display name."
 
 # The obsolete SystemInfo members are not upstream's constants, and PackageName is set.
 [[entry]]
@@ -1102,8 +1119,8 @@ reason = "Ferrofin names its log files differently, so the oracle's log name is 
 # A Jellyfin bug not ported: its /Years total counts the items scanned and lists years in first-appearance order.
 [[entry]]
 request = "GetYears"
-path = "Items[].Id"
-kind = "value"
+path = "Items"
+kind = "order"
 issue = 862
 reason = "A Jellyfin bug not ported: its /Years total counts the items scanned and lists years in first-appearance order."
 
@@ -1166,6 +1183,165 @@ path = "SessionInfo.NowPlayingQueueFullItems"
 kind = "extra"
 issue = 837
 reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
+
+# The same two session fields in every session list the sweep reads back (GET /Sessions and the setup reads of the session commands).
+[[entry]]
+request = "GetSessions"
+path = "[].LastPlaybackCheckIn"
+kind = "value"
+issue = 837
+reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
+
+[[entry]]
+request = "*/session"
+path = "[].LastPlaybackCheckIn"
+kind = "value"
+issue = 837
+reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
+
+[[entry]]
+request = "*"
+path = "[].NowPlayingQueueFullItems"
+kind = "extra"
+issue = 837
+reason = "Ferrofin stamps the check-in at session creation and sends a queue member 12.2 does not have."
+
+# Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo).
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.CanDelete"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.CanDownload"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.DisplayPreferencesId"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.Etag"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.ForcedSortName"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.LockData"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.LockedFields"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.MediaSources"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.People"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.ProductionLocations"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.RemoteTrailers"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.SortName"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.Tags"
+kind = "extra"
+issue = 991
+reason = "Ferrofin sends the session's NowPlayingItem with every field; Jellyfin trims it (SessionManager.GetItemInfo)."
+
+# Image cache tags hash the image file's path where Jellyfin hashes the item's path, so every image tag differs.
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.BackdropImageTags[]"
+kind = "value"
+issue = 849
+reason = "Image cache tags hash the image file's path where Jellyfin hashes the item's path, so every image tag differs."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].NowPlayingItem.ImageTags.Primary"
+kind = "value"
+issue = 849
+reason = "Image cache tags hash the image file's path where Jellyfin hashes the item's path, so every image tag differs."
+
+# Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem).
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].PlayState.MediaSourceId"
+kind = "missing"
+issue = 119
+reason = "Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].PlayState.PlayMethod"
+kind = "missing"
+issue = 119
+reason = "Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem)."
+
+[[entry]]
+request = "screen-playback-start/sessions"
+path = "[].PlayState.VolumeLevel"
+kind = "missing"
+issue = 119
+reason = "Ferrofin's session PlayState does not carry the reported MediaSourceId, PlayMethod and VolumeLevel (SessionManager.UpdateNowPlayingItem)."
+
+# A Jellyfin bug not ported: a never-written item's UserData.Key is the key Jellyfin cached for the item's first request (its GUID when that request loaded no provider ids); Ferrofin computes it from the item's provider ids.
+[[entry]]
+request = "edge-fields-all"
+path = "Items[].UserData.Key"
+kind = "value"
+issue = 862
+reason = "A Jellyfin bug not ported: a never-written item's UserData.Key is the key Jellyfin cached for the item's first request (its GUID when that request loaded no provider ids); Ferrofin computes it from the item's provider ids."
 
 # Jellyfin answers a just-created box set from memory without DateLastMediaAdded; Ferrofin answers the stored value, as Jellyfin does once it reads the row.
 [[entry]]

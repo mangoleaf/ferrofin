@@ -609,7 +609,9 @@ pub struct Config {
 
     /// How long, in seconds, the per-user access check may serve a user's
     /// policy rows and the libraries' rows and options from its cache
-    /// (`ferrofin_db::row_cache`). `None` = 30 s (`ROW_CACHE_TTL`). As for
+    /// (`ferrofin_db::row_cache`), which the user-library scope and every
+    /// lookup of a library's physical folders also read. `None` = 30 s
+    /// (`ROW_CACHE_TTL`). As for
     /// the auth cache, it only bounds edits made outside the server. Resolved
     /// `FERROFIN_ROW_CACHE_TTL_SECS` env > `row_cache_ttl_secs` in
     /// `config.toml` > default; must be within [`CACHE_TTL_RANGE_SECS`].

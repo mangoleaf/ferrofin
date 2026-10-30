@@ -1933,3 +1933,402 @@ async fn the_subtitle_extraction_setting_decides_external_delivery_in_a_transcod
         );
     }
 }
+
+/// An `mkv` source with `video` video and 5.1 AC3 audio, as a scan reports one.
+fn mkv_source(id: &str, video: &str) -> MediaSourceInfo {
+    use ferrofin_model::entities::MediaStreamType;
+    use ferrofin_model::entities_media::MediaStream;
+    MediaSourceInfo {
+        id: Some(id.to_owned()),
+        path: Some(format!("/media/{id}.mkv")),
+        container: Some("mkv".to_owned()),
+        bitrate: Some(8_000_000),
+        supports_direct_play: true,
+        supports_direct_stream: true,
+        supports_transcoding: true,
+        default_audio_stream_index: Some(1),
+        media_streams: vec![
+            MediaStream {
+                stream_type: MediaStreamType::Video,
+                index: 0,
+                codec: Some(video.to_owned()),
+                ..MediaStream::default()
+            },
+            MediaStream {
+                stream_type: MediaStreamType::Audio,
+                index: 1,
+                codec: Some("ac3".to_owned()),
+                channels: Some(6),
+                ..MediaStream::default()
+            },
+        ],
+        ..MediaSourceInfo::default()
+    }
+}
+
+/// A profile that direct plays the `direct_play` containers with its video
+/// codecs and transcodes to the HLS `hls` profiles, each a container with its
+/// video codecs, in order. Every profile takes AAC and AC3 audio.
+fn hls_client(direct_play: (&str, &str), hls: &[(&str, &str)]) -> serde_json::Value {
+    let transcoding: Vec<serde_json::Value> = hls
+        .iter()
+        .map(|(container, video)| {
+            serde_json::json!({
+                "Container": container, "Type": "Video", "VideoCodec": video,
+                "AudioCodec": "aac,ac3", "Protocol": "hls", "Context": "Streaming"
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "DirectPlayProfiles": [{
+            "Container": direct_play.0, "Type": "Video",
+            "VideoCodec": direct_play.1, "AudioCodec": "aac,ac3"
+        }],
+        "TranscodingProfiles": transcoding,
+    })
+}
+
+/// The value of the `name` query parameter in `url`.
+fn url_param<'a>(url: &'a str, name: &str) -> Option<&'a str> {
+    url.split(['?', '&'])
+        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
+}
+
+/// POSTs `body` to the PlaybackInfo of an item whose one source is `source`,
+/// as a user who may transcode, and returns that source.
+async fn negotiate(source: MediaSourceInfo, body: &serde_json::Value) -> serde_json::Value {
+    let item_id = Uuid::from_u128(0x1019);
+    let state = ok_state_parts(
+        item_id,
+        versioned(vec![source]),
+        Arc::new(OkUsers),
+        Arc::new(TranscodingAuth),
+        Arc::new(TranscodingAuth),
+        Arc::new(ferrofin_api::test_support::FakeDevices),
+    )
+    .with_encoder_support(Arc::new(ferrofin_api::test_support::CommonEncoders));
+    let json = post_playback(state, item_id, Some(body)).await;
+    json["MediaSources"][0].clone()
+}
+
+/// The source's transcoding URL's `SegmentContainer` and `VideoCodec`, and
+/// its `TranscodingContainer`, checking that it transcodes over HLS.
+fn hls_transcode(source: &serde_json::Value) -> (&str, &str, &str) {
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+    assert_eq!(source["TranscodingSubProtocol"], "hls", "{source}");
+    let url = source["TranscodingUrl"].as_str().expect("a transcode");
+    (
+        url_param(url, "SegmentContainer").expect("a segment container"),
+        url_param(url, "VideoCodec").expect("the video codecs"),
+        source["TranscodingContainer"]
+            .as_str()
+            .expect("a transcoding container"),
+    )
+}
+
+/// gl-1019: the HLS segment container is the one the StreamBuilder
+/// negotiated, the chosen transcoding profile's: upstream's `StreamInfo.ToUrl`
+/// writes `playlistItem.Container` as `SegmentContainer`, with no override for
+/// the source's video codec. `SetDeviceSpecificData` also switches the
+/// builder's direct stream off, so a source the client cannot direct play is
+/// negotiated against the transcoding profiles and never hands back its own
+/// container (`mkv`). The first two cases are Jellyfin for Android 2.7.3's
+/// profile, the report's: Jellyfin 12.2 sends it h264 in MPEG-TS segments.
+#[rstest::rstest]
+#[case::a_ts_profile_gets_hevc_transcoded_into_ts(
+    ("mp4,mkv", "h264"),
+    &[("ts", "h264"), ("mkv", "h264")],
+    "hevc",
+    "ts",
+    "h264"
+)]
+#[case::a_ts_profile_gets_av1_transcoded_into_ts(
+    ("mp4,mkv", "h264"),
+    &[("ts", "h264"), ("mkv", "h264")],
+    "av1",
+    "ts",
+    "h264"
+)]
+#[case::an_mp4_profile_gets_hevc_copied_into_fmp4(
+    ("mp4,m4v", "h264,hevc"),
+    &[("mp4", "hevc,h264"), ("ts", "h264")],
+    "hevc",
+    "mp4",
+    "hevc,h264"
+)]
+#[case::hevc_without_an_mp4_profile_is_transcoded_into_ts(
+    ("mp4,m4v", "h264,hevc"),
+    &[("ts", "h264")],
+    "hevc",
+    "ts",
+    "h264"
+)]
+#[case::the_source_container_is_never_the_segment_container(
+    ("mp4", "h264"),
+    &[("mp4", "h264")],
+    "h264",
+    "mp4",
+    "h264"
+)]
+#[case::a_profile_that_can_copy_the_video_ranks_first(
+    ("mp4,m4v", "h264,hevc"),
+    &[("ts", "h264"), ("mp4", "hevc,h264")],
+    "hevc",
+    "mp4",
+    "hevc,h264"
+)]
+#[tokio::test]
+async fn the_hls_segment_container_is_the_negotiated_one(
+    #[case] direct_play: (&str, &str),
+    #[case] hls: &[(&str, &str)],
+    #[case] source_video: &str,
+    #[case] segment_container: &str,
+    #[case] video_codec: &str,
+) {
+    let source = negotiate(
+        mkv_source(&Uuid::from_u128(0x1019).simple().to_string(), source_video),
+        &serde_json::json!({"DeviceProfile": hls_client(direct_play, hls)}),
+    )
+    .await;
+    assert_eq!(
+        hls_transcode(&source),
+        (segment_container, video_codec, segment_container),
+        "{source}"
+    );
+}
+
+/// gl-1019: `SetDeviceSpecificData` hands the client's `AllowVideoStreamCopy`
+/// to the StreamBuilder, which ranks a profile that can copy the video first
+/// only while copying is allowed; with it vetoed the profiles keep their order.
+#[tokio::test]
+async fn a_stream_copy_veto_keeps_the_profiles_in_their_order() {
+    let profile = hls_client(
+        ("mp4,m4v", "h264,hevc"),
+        &[("ts", "h264"), ("mp4", "hevc,h264")],
+    );
+    let source = negotiate(
+        mkv_source(&Uuid::from_u128(0x1019).simple().to_string(), "hevc"),
+        &serde_json::json!({"DeviceProfile": profile, "AllowVideoStreamCopy": false}),
+    )
+    .await;
+    assert_eq!(hls_transcode(&source), ("ts", "h264", "ts"), "{source}");
+}
+
+/// A profile that direct plays h264 in `mp4` and transcodes to HLS `ts` with
+/// AAC, then HLS `mp4` with AC3 or AAC.
+fn ac3_copy_client() -> serde_json::Value {
+    serde_json::json!({
+        "DirectPlayProfiles": [
+            {"Container": "mp4", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac"}
+        ],
+        "TranscodingProfiles": [
+            {"Container": "ts", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac",
+             "Protocol": "hls", "Context": "Streaming"},
+            {"Container": "mp4", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "ac3,aac",
+             "Protocol": "hls", "Context": "Streaming"}
+        ]
+    })
+}
+
+/// gl-1019: the StreamBuilder also ranks a profile that can copy the audio
+/// first (the source's AC3 here), but only while the client's
+/// `AllowAudioStreamCopy` lets it; vetoed, the profiles keep their order.
+#[rstest::rstest]
+#[case::copy_allowed(true, "mp4")]
+#[case::copy_vetoed(false, "ts")]
+#[tokio::test]
+async fn a_profile_that_can_copy_the_audio_ranks_first_while_copying_is_allowed(
+    #[case] allow_audio_stream_copy: bool,
+    #[case] segment_container: &str,
+) {
+    let source = negotiate(
+        mkv_source(&Uuid::from_u128(0x1019).simple().to_string(), "h264"),
+        &serde_json::json!({
+            "DeviceProfile": ac3_copy_client(),
+            "AllowAudioStreamCopy": allow_audio_stream_copy,
+        }),
+    )
+    .await;
+    assert_eq!(
+        hls_transcode(&source),
+        (segment_container, "h264", segment_container),
+        "{source}"
+    );
+}
+
+/// gl-1019: the transcode takes the audio-channel cap of the profile the
+/// StreamBuilder chose (`SetStreamInfoOptionsFromTranscodingProfile`), and
+/// never one borrowed from another HLS profile.
+#[rstest::rstest]
+#[case::the_chosen_profile_caps_the_channels(Some("2"), None, Some("2"))]
+#[case::another_profiles_cap_is_not_borrowed(None, Some("2"), None)]
+#[tokio::test]
+async fn the_channel_cap_is_the_chosen_profiles_own(
+    #[case] ts_cap: Option<&str>,
+    #[case] mp4_cap: Option<&str>,
+    #[case] expected: Option<&str>,
+) {
+    let mut profile = hls_client(("mp4", "h264"), &[("ts", "h264"), ("mp4", "h264")]);
+    profile["TranscodingProfiles"][0]["MaxAudioChannels"] = serde_json::json!(ts_cap);
+    profile["TranscodingProfiles"][1]["MaxAudioChannels"] = serde_json::json!(mp4_cap);
+    let source = negotiate(
+        mkv_source(&Uuid::from_u128(0x1019).simple().to_string(), "h264"),
+        &serde_json::json!({"DeviceProfile": profile}),
+    )
+    .await;
+    assert_eq!(hls_transcode(&source).0, "ts", "{source}");
+    let url = source["TranscodingUrl"].as_str().expect("a transcode");
+    assert_eq!(
+        url_param(url, "TranscodingMaxAudioChannels"),
+        expected,
+        "{url}"
+    );
+}
+
+/// gl-1019, gl-1023: with no transcoding profile chosen (the source can neither
+/// be transcoded nor remuxed), the stream keeps `StreamInfo`'s defaults, no
+/// container and the `http` sub-protocol, so `StreamInfo.ToUrl` builds a bare
+/// `/videos/{id}/stream` URL naming no container, and the source keeps its own
+/// `TranscodingContainer` and `TranscodingSubProtocol`, which only a chosen
+/// profile stamps (`SetStreamInfoOptionsFromTranscodingProfile`). A
+/// transcoding URL is still built because the `SupportsTranscoding` that
+/// `SetDeviceSpecificData` recomputes is true: the source already names a
+/// `TranscodingContainer`, and the profile has a video transcoding profile.
+/// The source's `mkv` is one no profile here and no container rule would
+/// produce.
+#[tokio::test]
+async fn without_a_chosen_profile_the_url_names_no_container() {
+    let id = Uuid::from_u128(0x1019);
+    let mut source = mkv_source(&id.simple().to_string(), "hevc");
+    source.supports_transcoding = false;
+    source.supports_direct_stream = false;
+    source.transcoding_container = Some("mkv".to_owned());
+    source.transcoding_sub_protocol = ferrofin_model::data::MediaStreamProtocol::hls;
+    let source = negotiate(
+        source,
+        &serde_json::json!({"DeviceProfile": hls_client(("mp4", "h264"), &[("ts", "h264")])}),
+    )
+    .await;
+    let url = source["TranscodingUrl"].as_str().expect("a transcode");
+    assert!(url.starts_with(&format!("/videos/{id}/stream?")), "{url}");
+    assert_eq!(url_param(url, "SegmentContainer"), None, "{url}");
+    assert_eq!(source["TranscodingContainer"], "mkv", "{source}");
+    assert_eq!(source["TranscodingSubProtocol"], "hls", "{source}");
+}
+
+/// gl-1019: a profile with no video transcoding profile gets no transcode for a
+/// source it cannot direct play, as from Jellyfin, whose PlaybackInfo never
+/// offers the builder's direct stream. Ferrofin used to hand it an HLS remux.
+#[tokio::test]
+async fn a_profile_without_transcoding_profiles_gets_no_transcode() {
+    let profile = serde_json::json!({
+        "DirectPlayProfiles": [
+            {"Container": "mp4", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac,ac3"}
+        ]
+    });
+    let source = negotiate(
+        mkv_source(&Uuid::from_u128(0x1019).simple().to_string(), "h264"),
+        &serde_json::json!({"DeviceProfile": profile}),
+    )
+    .await;
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+    assert_eq!(source["SupportsDirectStream"], false, "{source}");
+    assert_eq!(source["SupportsTranscoding"], false, "{source}");
+    assert!(source.get("TranscodingUrl").is_none(), "{source}");
+}
+
+/// gl-1023: a transcode negotiated against an `http` (progressive) profile is
+/// delivered with that profile's protocol, as `StreamInfo.ToUrl` builds it:
+/// `/videos/{id}/stream.{container}` with the start position and no HLS
+/// segment container, and the profile's own video codecs (the HLS codec filter
+/// applies only to an `hls` profile, so `webm` keeps VP8). An external
+/// subtitle's `DeliveryUrl` starts at the same position, since the progressive
+/// output starts there (`GetSubtitleProfiles`; an HLS one starts at 0). The
+/// profiles have the shape of the `Chrome-NoHLS` and Tizen fixtures' `http`
+/// ones.
+#[rstest::rstest]
+#[case::mp4("mp4", "h264", "aac", "hevc", "h264")]
+#[case::webm("webm", "vp8,vp9", "vorbis,opus", "vp9", "vp8,vp9")]
+#[tokio::test]
+async fn an_http_profile_is_streamed_progressively(
+    #[case] container: &str,
+    #[case] video: &str,
+    #[case] audio: &str,
+    #[case] source_video: &str,
+    #[case] video_codec: &str,
+) {
+    let id = Uuid::from_u128(0x1019);
+    let profile = serde_json::json!({
+        "DirectPlayProfiles": [
+            {"Container": "mp4", "Type": "Video", "VideoCodec": "h264", "AudioCodec": "aac"}
+        ],
+        "TranscodingProfiles": [{
+            "Container": container, "Type": "Video", "VideoCodec": video,
+            "AudioCodec": audio, "Protocol": "http", "Context": "Streaming"
+        }],
+        "SubtitleProfiles": [{"Format": "vtt", "Method": "External"}],
+    });
+    let mut source = mkv_source(&id.simple().to_string(), source_video);
+    source
+        .media_streams
+        .push(ferrofin_model::entities_media::MediaStream {
+            stream_type: ferrofin_model::entities::MediaStreamType::Subtitle,
+            index: 2,
+            codec: Some("subrip".to_owned()),
+            supports_external_stream: true,
+            ..ferrofin_model::entities_media::MediaStream::default()
+        });
+    let source = negotiate(
+        source,
+        &serde_json::json!({"DeviceProfile": profile, "StartTimeTicks": 600_000_000}),
+    )
+    .await;
+    let subtitle = &source["MediaStreams"][2];
+    assert_eq!(subtitle["DeliveryMethod"], "External", "{subtitle}");
+    let delivery = subtitle["DeliveryUrl"].as_str().expect("a delivery URL");
+    assert!(
+        delivery.contains("/Subtitles/2/600000000/Stream.vtt"),
+        "{delivery}"
+    );
+    assert_eq!(source["SupportsDirectPlay"], false, "{source}");
+    assert_eq!(source["TranscodingSubProtocol"], "http", "{source}");
+    assert_eq!(source["TranscodingContainer"], container, "{source}");
+    let url = source["TranscodingUrl"].as_str().expect("a transcode");
+    assert!(
+        url.starts_with(&format!("/videos/{id}/stream.{container}?")),
+        "{url}"
+    );
+    assert_eq!(url_param(url, "SegmentContainer"), None, "{url}");
+    assert_eq!(url_param(url, "StartTimeTicks"), Some("600000000"), "{url}");
+    assert_eq!(url_param(url, "VideoCodec"), Some(video_codec), "{url}");
+}
+
+/// gl-1022: `SetDeviceSpecificData` applies the client's `EnableDirectPlay=false`
+/// to the source only (`SupportsDirectPlay = false`), so the builder still
+/// evaluates the direct-play profiles and reports why they fail: an `mkv` the
+/// client plays only in `mp4` transcodes with `ContainerNotSupported`, vetoed
+/// or not, and one it could direct play (jellyfin-web's forced transcode)
+/// with `DirectPlayError`, as `GetVideoDirectPlayProfile` reports a profile
+/// that fits but whose method is vetoed.
+#[rstest::rstest]
+#[case::container_not_supported(("mp4", "h264"), true, "ContainerNotSupported")]
+#[case::container_not_supported_vetoed(("mp4", "h264"), false, "ContainerNotSupported")]
+#[case::direct_playable_vetoed(("mkv", "h264"), false, "DirectPlayError")]
+#[tokio::test]
+async fn a_direct_play_veto_keeps_the_direct_play_transcode_reasons(
+    #[case] direct_play_profile: (&str, &str),
+    #[case] direct_play: bool,
+    #[case] reasons: &str,
+) {
+    let source = negotiate(
+        mkv_source(&Uuid::from_u128(0x1019).simple().to_string(), "h264"),
+        &serde_json::json!({
+            "DeviceProfile": hls_client(direct_play_profile, &[("ts", "h264")]),
+            "EnableDirectPlay": direct_play,
+        }),
+    )
+    .await;
+    assert_eq!(hls_transcode(&source).0, "ts", "{source}");
+    let url = source["TranscodingUrl"].as_str().expect("a transcode");
+    assert_eq!(url_param(url, "TranscodeReasons"), Some(reasons), "{url}");
+}

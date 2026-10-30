@@ -162,7 +162,6 @@ pub(crate) mod image_upload;
 pub mod images;
 pub mod instant_mix;
 pub mod intro_skipper;
-mod item_dates;
 pub mod item_lookup;
 pub mod item_update;
 pub mod items;
@@ -180,6 +179,7 @@ pub mod persons;
 pub mod playlists;
 pub mod playstate;
 pub mod plugins;
+mod query_date_time;
 pub(crate) mod query_parse;
 pub mod quick_connect;
 pub mod remote_images;
@@ -878,8 +878,7 @@ pub const UPSTREAM_PIN_DATE: &str = "2026-10-28";
 pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     // The v12.4 re-check found a gap that v12.2 has too (the C# under these
     // rows is unchanged); each leaves the list with its fix.
-    // gl-1034: a nil parentId is an empty page, not GetItemById's 400 (and
-    // gl-267's offset-less nextUpDateCutoff fix is not on this branch yet).
+    // gl-1034: a nil parentId is an empty page, not GetItemById's 400.
     ("get", "/Shows/NextUp", "v12.2"),
     // gl-1037: a malformed minCommunityRating is ignored, not a 400; gl-884: a
     // malformed genreIds/studioIds token is a 400, not dropped; gl-1038: a

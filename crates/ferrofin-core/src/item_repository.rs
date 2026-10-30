@@ -424,7 +424,7 @@ impl FerrofinItemRepository {
             let mut enabled = Vec::with_capacity(rows.len());
             for row in rows {
                 if Some(row.type_.as_str()) != stored_type_name(BaseItemKind::CollectionFolder)
-                    || library_enabled(row.path.as_deref()).await
+                    || library_enabled(&self.db, &row.id, row.path.as_deref()).await
                 {
                     enabled.push(row);
                 }
@@ -504,7 +504,15 @@ impl FerrofinItemRepository {
         use ferrofin_model::entities_media::AiredEpisodeOrder;
         use ferrofin_model::live_tv::ItemSortBy;
         use ferrofin_util::stable_sort::stable_sort_by;
-        type Keyed = (Option<AiredEpisodeOrder>, BaseItemEntity);
+        /// A child with the keys its sort compares, each computed once for
+        /// the row rather than on every comparison (gl-1002); a key the
+        /// request does not name stays `None` and is never compared.
+        struct Keyed {
+            aired: Option<AiredEpisodeOrder>,
+            name: Option<String>,
+            sort_name: Option<String>,
+            row: BaseItemEntity,
+        }
         if rows.is_empty() || filter.order_by.is_empty() {
             return Ok(rows);
         }
@@ -518,34 +526,37 @@ impl FerrofinItemRepository {
                     | ItemSortBy::Unrecognized(_)
             )
         }) {
+            let sorts_by = |key: ItemSortBy| filter.order_by.iter().any(|(by, _)| *by == key);
             // `AiredEpisodeOrderComparer` positions episodes only, so the aired
             // fields are read once per episode row; any other row has none.
-            let aired = filter
-                .order_by
-                .iter()
-                .any(|(by, _)| *by == ItemSortBy::AiredEpisodeOrder);
+            let aired = sorts_by(ItemSortBy::AiredEpisodeOrder);
+            let by_name = sorts_by(ItemSortBy::Name);
+            let by_sort_name = sorts_by(ItemSortBy::SortName);
             let episode = stored_type_name(BaseItemKind::Episode);
             let mut keyed: Vec<Keyed> = rows
                 .into_iter()
-                .map(|row| {
-                    let key =
-                        (aired && Some(row.type_.as_str()) == episode).then(|| aired_order(&row));
-                    (key, row)
+                .map(|row| Keyed {
+                    aired: (aired && Some(row.type_.as_str()) == episode)
+                        .then(|| aired_order(&row)),
+                    name: row
+                        .name
+                        .as_deref()
+                        .filter(|_| by_name)
+                        .map(folder_ordinal_key),
+                    sort_name: by_sort_name.then(|| folder_ordinal_key(&folder_sort_name(&row))),
+                    row,
                 })
                 .collect();
-            let compare = |(a_aired, a): &Keyed, (b_aired, b): &Keyed| {
+            let compare = |a: &Keyed, b: &Keyed| {
                 for (by, direction) in &filter.order_by {
                     let ordering = match by {
-                        ItemSortBy::Name => {
-                            folder_ordinal_compare(a.name.as_deref(), b.name.as_deref())
-                        }
-                        ItemSortBy::SortName => folder_ordinal_compare(
-                            Some(&folder_sort_name(a)),
-                            Some(&folder_sort_name(b)),
-                        ),
+                        // `folder_ordinal_compare` over the precomputed keys:
+                        // a missing name sorts first.
+                        ItemSortBy::Name => a.name.cmp(&b.name),
+                        ItemSortBy::SortName => a.sort_name.cmp(&b.sort_name),
                         // `AiredEpisodeOrderComparer.Compare`: a non-episode
                         // sorts after every episode and equal to another one.
-                        ItemSortBy::AiredEpisodeOrder => match (a_aired, b_aired) {
+                        ItemSortBy::AiredEpisodeOrder => match (&a.aired, &b.aired) {
                             (Some(a), Some(b)) => a.compare(b),
                             (Some(_), None) => std::cmp::Ordering::Less,
                             (None, Some(_)) => std::cmp::Ordering::Greater,
@@ -572,7 +583,7 @@ impl FerrofinItemRepository {
             } else {
                 keyed.sort_by(compare);
             }
-            return Ok(keyed.into_iter().map(|(_, row)| row).collect());
+            return Ok(keyed.into_iter().map(|keyed| keyed.row).collect());
         }
         // Keep the existing consumer for other sort fields. Its broader
         // comparator parity is a separate query review, not this display flag.
@@ -2308,6 +2319,15 @@ fn push_representative_rank(
 /// children too, and grouping on the raw `ParentId` reports 0 for every
 /// library on an adopted database Ferrofin has not scanned yet. Reads that
 /// scope a library by `TopParentId` take [`library_top_parents_by_view`].
+///
+/// The rows come from the library set the visibility check caches
+/// (`ferrofin_db::row_cache`) when one is live: it holds every
+/// `CollectionFolder` row, `Data` included, and the library mutation hooks keep
+/// it current. Upstream reads the same ids off the in-memory
+/// `CollectionFolder.PhysicalFolderIds`. One request asks this several times
+/// (`/Users/{id}/Views` three: the playlists probe's scope, that probe's own
+/// query and the views' child counts), and each was a statement (gl-981). With
+/// none cached the rows are read.
 pub(crate) async fn physical_folders_by_view(
     db: &Database,
     ids: &[Uuid],
@@ -2315,6 +2335,23 @@ pub(crate) async fn physical_folders_by_view(
     let Some(collection_folder) = stored_type_name(BaseItemKind::CollectionFolder) else {
         return Ok(HashMap::new());
     };
+    if let Some(set) = db.cached_libraries() {
+        let wanted: std::collections::HashSet<Uuid> = ids.iter().copied().collect();
+        return Ok(set
+            .rows
+            .iter()
+            .filter_map(|row| {
+                let id = Uuid::parse_str(&row.id).ok()?;
+                // The read's own match: the stored id is the GUID text bound
+                // for a wanted id.
+                if !wanted.contains(&id) || guid_to_db(id) != row.id {
+                    return None;
+                }
+                let folders = parse_physical_folder_ids(row.data.as_deref()?);
+                (!folders.is_empty()).then_some((id, folders))
+            })
+            .collect());
+    }
     let mut by_view = HashMap::new();
     // Chunked: a count batch passes a whole unpaged page, which can exceed
     // SQLite's bind limit.
@@ -2946,25 +2983,30 @@ async fn visible_view_rows(
     .await
     .map_err(db_err)?;
 
-    // CollectionFolder.IsVisible checks Enabled even for administrators.
-    // Read the saved option on every request, as the direct visibility path
-    // does, so a dashboard toggle takes effect without a scan or restart.
-    let mut active = Vec::with_capacity(rows.len());
-    for row in rows {
-        if row.1 != collection_folder || library_enabled(row.2.as_deref()).await {
-            active.push(row);
-        }
-    }
-
     // Live TV is a view only while Live TV exists — see
     // `live_tv_enabled_for`. Jellyfin leaves it out of `GetUserViews`
     // otherwise, so it is out of this scope too. The row is looked for
-    // first: most databases have none, and then neither of the gate's two
-    // queries needs to run at all.
-    let live_tv_view = match live_tv_view_id(db).await? {
+    // first, among the `UserView` rows just read: most databases have none,
+    // and then neither of the gate's two queries needs to run at all.
+    let live_tv_view = match live_tv_view_among(
+        rows.iter()
+            .map(|(id, type_, path, _)| (id.as_str(), type_.as_str(), path.as_deref())),
+        user_view,
+    ) {
         Some(id) if !live_tv_enabled_for(db, &user.id).await? => Some(id),
         _ => None,
     };
+
+    // CollectionFolder.IsVisible checks Enabled even for administrators.
+    // Read the saved option as the direct visibility path does (see
+    // `library_enabled`), so a dashboard toggle takes effect without a scan or
+    // restart.
+    let mut active = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.1 != collection_folder || library_enabled(db, &row.0, row.2.as_deref()).await {
+            active.push(row);
+        }
+    }
     let blocked = folder_preference(db, user, PreferenceKind::BlockedMediaFolders).await?;
     let enabled = if blocked.is_empty()
         && !cached_permission(db, &user.id, PermissionKind::EnableAllFolders).await?
@@ -3018,10 +3060,31 @@ async fn visible_view_rows(
 
 /// The saved CollectionFolder option, including adopted XML and constructor
 /// defaults. This read does not create files or repair the database.
-async fn library_enabled(path: Option<&str>) -> bool {
+///
+/// From the library set the visibility check caches (`ferrofin_db::row_cache`)
+/// when one is live and holds the library's options, as upstream's
+/// `CollectionFolder.GetLibraryOptions` serves them from memory: an options
+/// write drops the set (`update_library_options`), so a dashboard toggle takes
+/// effect on the next request. The scope asks this for every library on every
+/// unscoped query, and each was a read and a parse of the options file
+/// (gl-981). Otherwise the file is read.
+///
+/// The set's options were read at the library's expanded path
+/// (`ItemVisibility::rating_libraries`), while the file read below takes the
+/// stored path as it is. The two read the same file whenever the path holds no
+/// `%AppDataPath%`/`%MetadataPath%` token, so only a path without a `%` takes
+/// the set's options: any other keeps the file read below, whatever is cached.
+async fn library_enabled(db: &Database, id: &str, path: Option<&str>) -> bool {
     let Some(path) = path else {
         return true;
     };
+    if !path.contains('%')
+        && let Some(set) = db.cached_libraries()
+        && let Ok(id) = Uuid::parse_str(id)
+        && let Some(options) = set.options.get(&id)
+    {
+        return options.enabled;
+    }
     // Only `Enabled` is read, so the media paths need no expanding.
     crate::virtual_folder_manager::FerrofinVirtualFolderManager::read_options(
         std::path::Path::new(path),
@@ -3031,35 +3094,42 @@ async fn library_enabled(path: Option<&str>) -> bool {
     .enabled
 }
 
-/// The `UserView` row that is the Live TV view, if this database has one.
+/// The Live TV view among `rows` (`Id`, `Type`, `Path`), if one of them is it.
 ///
 /// Identified by its **path** — see
 /// [`crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX`]. The name is the
 /// localized `HeaderLiveTV` string ("TV en direct", "ライブTV", …), so
 /// matching on it would silently do nothing on most servers and would
 /// misfire on a library a user happened to call "Live TV".
-async fn live_tv_view_id(db: &Database) -> Result<Option<Uuid>, ServiceError> {
-    let Some(user_view) = stored_type_name(BaseItemKind::UserView) else {
-        return Ok(None);
+///
+/// Both separators: C# builds the path with `Path.Combine`, so a database
+/// adopted from a Windows Jellyfin stores `…\views\livetv` and a POSIX-only
+/// match would never fire — on exactly the adoption case this gate exists for.
+/// The match is the statement it replaces (gl-981), `"Type" = <UserView> AND
+/// ("Path" LIKE '%/views/livetv' OR "Path" LIKE '%\views\livetv') ORDER BY
+/// "Id" LIMIT 1`: a `UserView` whose path ends in the suffix in one separator
+/// or the other, ASCII case ignored as `LIKE` ignores it, and of several the
+/// lowest id.
+fn live_tv_view_among<'a>(
+    rows: impl IntoIterator<Item = (&'a str, &'a str, Option<&'a str>)>,
+    user_view: &str,
+) -> Option<Uuid> {
+    let posix = crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX;
+    let windows = posix.replace('/', "\\");
+    // Bytes, not chars: a multi-byte character's bytes are never ASCII, so
+    // they never match the suffix's.
+    let ends_with = |path: &str, suffix: &str| {
+        path.len() >= suffix.len()
+            && path.as_bytes()[path.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
     };
-    // Both separators: C# builds the path with `Path.Combine`, so a
-    // database adopted from a Windows Jellyfin stores `…\views\livetv`
-    // and a POSIX-only pattern would never fire — on exactly the adoption
-    // case this gate exists for. (`LIKE` is `%`/`_` only, so a backslash
-    // needs no escaping.)
-    let suffix = crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX;
-    let id: Option<String> = sqlx::query_scalar(
-        r#"SELECT "Id" FROM "BaseItems"
-           WHERE "Type" = ?1 AND ("Path" LIKE ?2 OR "Path" LIKE ?3)
-           ORDER BY "Id" LIMIT 1"#,
-    )
-    .bind(user_view)
-    .bind(format!("%{suffix}"))
-    .bind(format!("%{}", suffix.replace('/', "\\")))
-    .fetch_optional(db.pool())
-    .await
-    .map_err(db_err)?;
-    Ok(id.and_then(|id| Uuid::parse_str(&id).ok()))
+    rows.into_iter()
+        .filter(|(_, type_, path)| {
+            *type_ == user_view
+                && path.is_some_and(|path| ends_with(path, posix) || ends_with(path, &windows))
+        })
+        .map(|(id, _, _)| id)
+        .min()
+        .and_then(|id| Uuid::parse_str(id).ok())
 }
 
 /// ICU's root secondary strength is invariant linguistic comparison ignoring
@@ -3127,8 +3197,16 @@ pub(crate) fn folder_ordinal_compare(
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(left), Some(right)) => upper_invariant(left).cmp(&upper_invariant(right)),
+        (Some(left), Some(right)) => folder_ordinal_key(left).cmp(&folder_ordinal_key(right)),
     }
+}
+
+/// The ordinal case-insensitive key [`folder_ordinal_compare`] compares, the
+/// .NET invariant upper case: comparing two values is comparing their keys
+/// byte-wise, so a sort can compute each row's key once instead of on every
+/// comparison.
+pub(crate) fn folder_ordinal_key(value: &str) -> String {
+    upper_invariant(value)
 }
 
 pub(crate) fn folder_sort_name(row: &BaseItemEntity) -> String {
@@ -10898,6 +10976,201 @@ mod tests {
         );
     }
 
+    /// The Live TV view is found among the rows the scope has read, by exactly
+    /// the match of the statement that used to look it up (gl-981). That
+    /// statement is the oracle here, run over the same rows: two views and a
+    /// library on the path, the lower view id written last.
+    #[rstest::rstest]
+    #[case::posix("/meta/views/livetv", true)]
+    #[case::windows(r"C:\ProgramData\Jellyfin\metadata\views\livetv", true)]
+    #[case::ascii_case_ignored("/META/Views/LiveTV", true)]
+    #[case::only_the_suffix("/views/livetv", true)]
+    #[case::non_ascii_case_kept("/meta/views/lİvetv", false)]
+    #[case::trailing_separator("/meta/views/livetv/", false)]
+    #[case::mixed_separators(r"/meta/views\livetv", false)]
+    #[case::longer_name("/meta/views/livetvx", false)]
+    #[case::no_leading_separator("views/livetv", false)]
+    #[tokio::test]
+    async fn the_live_tv_view_is_matched_as_its_path_like_matched(
+        #[case] path: &str,
+        #[case] found: bool,
+    ) {
+        let db = test_db().await;
+        let user_view = stored_type_name(BaseItemKind::UserView).expect("type");
+        for (id, kind) in [
+            (0x9812, BaseItemKind::UserView),
+            (0x9811, BaseItemKind::UserView),
+            (0x9810, BaseItemKind::CollectionFolder),
+        ] {
+            let id = Uuid::from_u128(id);
+            seed_named_item(&db, id, kind, "Live TV").await;
+            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(path)
+                .execute(db.writer())
+                .await
+                .expect("path");
+        }
+        let suffix = crate::user_view_manager::LIVE_TV_VIEW_PATH_SUFFIX;
+        let oracle: Option<String> = sqlx::query_scalar(
+            r#"SELECT "Id" FROM "BaseItems"
+               WHERE "Type" = ?1 AND ("Path" LIKE ?2 OR "Path" LIKE ?3)
+               ORDER BY "Id" LIMIT 1"#,
+        )
+        .bind(user_view)
+        .bind(format!("%{suffix}"))
+        .bind(format!("%{}", suffix.replace('/', "\\")))
+        .fetch_optional(db.pool())
+        .await
+        .expect("oracle");
+        assert_eq!(oracle.is_some(), found, "the oracle on {path}");
+        let rows: Vec<(String, String, Option<String>)> =
+            sqlx::query_as(r#"SELECT "Id", "Type", "Path" FROM "BaseItems""#)
+                .fetch_all(db.pool())
+                .await
+                .expect("rows");
+        assert_eq!(
+            live_tv_view_among(
+                rows.iter()
+                    .map(|(id, type_, path)| (id.as_str(), type_.as_str(), path.as_deref())),
+                user_view,
+            ),
+            oracle.map(|id| Uuid::parse_str(&id).expect("id")),
+            "{path}"
+        );
+    }
+
+    /// Caches the library set as the visibility check does, `options` standing
+    /// for what the libraries' option files said when it was read.
+    async fn cache_library_set(
+        db: &Database,
+        options: HashMap<Uuid, ferrofin_model::configuration::LibraryOptions>,
+    ) {
+        let rows = crate::item_visibility_repository::libraries(db)
+            .await
+            .expect("libraries");
+        let _ = db
+            .begin_library_load()
+            .store(ferrofin_db::row_cache::LibrarySet {
+                rows,
+                ancestors: Vec::new(),
+                options,
+            });
+        assert!(db.cached_libraries().is_some(), "the set is cached");
+    }
+
+    /// With the library set cached, the libraries' physical folders come from
+    /// its rows and answer as the read they replace (gl-981): only a library
+    /// carrying `PhysicalFolderIds` is in the map. A write the mutation hooks
+    /// report is seen at once; one they never hear of waits for the set to
+    /// go, which is what shows the set answering.
+    #[tokio::test]
+    async fn physical_folders_come_from_the_cached_library_set() {
+        let db = test_db().await;
+        db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+        let adopted = Uuid::from_u128(0x9820);
+        let scanned = Uuid::from_u128(0x9821);
+        let folder = Uuid::from_u128(0x9822);
+        let (physical, moved) = (Uuid::from_u128(0x9823), Uuid::from_u128(0x9824));
+        seed_named_item(&db, adopted, BaseItemKind::CollectionFolder, "Adopted").await;
+        seed_named_item(&db, scanned, BaseItemKind::CollectionFolder, "Scanned").await;
+        seed_named_item(&db, folder, BaseItemKind::Folder, "Not a library").await;
+        let set_data = async |id: Uuid, physical: Uuid| {
+            sqlx::query(r#"UPDATE "BaseItems" SET "Data" = ?2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(id))
+                .bind(collection_folder_data(physical))
+                .execute(db.writer())
+                .await
+                .expect("data");
+        };
+        set_data(adopted, physical).await;
+        set_data(folder, physical).await;
+        let ids = [adopted, scanned, folder, Uuid::from_u128(0x9825)];
+
+        let read = physical_folders_by_view(&db, &ids).await.expect("read");
+        assert_eq!(read, HashMap::from([(adopted, vec![physical])]));
+        cache_library_set(&db, HashMap::new()).await;
+        assert_eq!(
+            physical_folders_by_view(&db, &ids).await.expect("cached"),
+            read,
+            "the set answers as the read did"
+        );
+
+        set_data(adopted, moved).await;
+        assert_eq!(
+            physical_folders_by_view(&db, &ids)
+                .await
+                .expect("unreported"),
+            read,
+            "an unreported write waits for the set to go"
+        );
+        db.note_items_written([guid_to_db(adopted).as_str()]);
+        assert_eq!(
+            physical_folders_by_view(&db, &ids).await.expect("reported"),
+            HashMap::from([(adopted, vec![moved])]),
+            "a reported write to the library drops the set"
+        );
+    }
+
+    /// The scope takes a library's `Enabled` from the cached library set when
+    /// it holds the library's options, as the direct visibility check does,
+    /// and from the options file otherwise (gl-981). A library stored under a
+    /// virtual-path token keeps the file read: the set's options were read at
+    /// the expanded path, the file read takes the stored one.
+    #[tokio::test]
+    async fn the_scope_reads_a_library_s_enabled_option_from_the_cached_set() {
+        let db = test_db().await;
+        db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+        let repository = repo(&db);
+        let (first, second, _user_id, user) = two_libraries(&db).await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(second))
+            .bind("%AppDataPath%/collections")
+            .execute(db.writer())
+            .await
+            .expect("tokenized path");
+        let dir = tempfile::tempdir().expect("library dir");
+        let disabled = ferrofin_model::configuration::LibraryOptions {
+            enabled: false,
+            ..Default::default()
+        };
+        std::fs::write(
+            dir.path().join("options.json"),
+            serde_json::to_vec(&disabled).expect("options"),
+        )
+        .expect("write options");
+        crate::test_support::set_item_path(&db, first, &dir.path().to_string_lossy()).await;
+        assert_eq!(
+            unscoped_names(&repository, &user).await,
+            ["In Second"],
+            "nothing cached: the file disables the first library"
+        );
+
+        cache_library_set(
+            &db,
+            HashMap::from([
+                (
+                    first,
+                    ferrofin_model::configuration::LibraryOptions::default(),
+                ),
+                (second, disabled.clone()),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            unscoped_names(&repository, &user).await,
+            ["In First", "In Second"],
+            "the set's options answer for the first library; the tokenized \
+             second keeps its file read"
+        );
+        db.invalidate_libraries();
+        assert_eq!(
+            unscoped_names(&repository, &user).await,
+            ["In Second"],
+            "the set gone, the file is read again"
+        );
+    }
+
     /// The by-name tabs and the counts are confined to the user's libraries,
     /// exactly as a browse is.
     ///
@@ -14629,3 +14902,7 @@ mod is_airing_tests;
 #[cfg(test)]
 #[path = "item_repository/linked_library_scope_tests.rs"]
 mod linked_library_scope_tests;
+
+#[cfg(test)]
+#[path = "item_repository/folder_sort_key_tests.rs"]
+mod folder_sort_key_tests;

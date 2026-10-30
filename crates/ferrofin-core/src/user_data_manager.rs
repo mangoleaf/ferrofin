@@ -1536,7 +1536,7 @@ impl UserDataManager for FerrofinUserDataManager {
             .filter_map(|item| Uuid::parse_str(&item.id).ok())
             .collect();
         let mut stored = self.stored_user_data_rows(&ids, user_id).await?;
-        let mut children: Vec<String> = items
+        let children: Vec<&BaseItemEntity> = items
             .iter()
             .filter(|item| {
                 matches!(
@@ -1544,10 +1544,7 @@ impl UserDataManager for FerrofinUserDataManager {
                     Some(BaseItemKind::Season | BaseItemKind::Episode)
                 )
             })
-            .filter_map(|item| Uuid::parse_str(&item.id).ok().map(guid_to_db))
             .collect();
-        children.sort_unstable();
-        children.dedup();
         let series_keys = if children.is_empty() {
             HashMap::new()
         } else {
@@ -4468,6 +4465,46 @@ mod tests {
             }
         }
     }
+
+    /// A page's rows are not read again for their series (gl-982): the series an episode row
+    /// names is the one its keys derive from, read in the same walk as every other page row's,
+    /// even when the stored row has since moved to another series.
+    #[tokio::test]
+    async fn page_rows_name_their_series_without_being_read_again() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        let named = Uuid::from_u128(0xF030);
+        let stored = Uuid::from_u128(0xF031);
+        let episode = Uuid::from_u128(0xF032);
+        seed_user(&db, user).await;
+        for (id, kind) in [
+            (named, BaseItemKind::Series),
+            (stored, BaseItemKind::Series),
+            (episode, BaseItemKind::Episode),
+        ] {
+            seed_item(&db, id, kind).await;
+        }
+        seed_provider_id(&db, named, "Tvdb", "named-series").await;
+        seed_provider_id(&db, stored, "Tvdb", "stored-series").await;
+        let point = |series: Uuid| {
+            sqlx::query(r#"UPDATE "BaseItems" SET "SeriesId" = ?2, "ParentIndexNumber" = 1, "IndexNumber" = 2 WHERE "Id" = ?1"#)
+                .bind(guid_to_db(episode))
+                .bind(guid_to_db(series))
+                .execute(db.writer())
+        };
+        point(named).await.unwrap();
+        let row = fetch_item(&db, episode).await;
+        point(stored).await.unwrap();
+        let manager = FerrofinUserDataManager::new(db.clone(), config());
+        for hydrated in [false, true] {
+            let selected = manager
+                .get_user_data_dtos_for_rows(std::slice::from_ref(&row), user, hydrated)
+                .await
+                .unwrap();
+            assert_eq!(selected[&episode].key, "named-series001002");
+        }
+    }
+
     #[tokio::test]
     async fn child_series_parent_resolution_terminates_on_self_and_cyclic_parent_graphs() {
         let db = test_db().await;
