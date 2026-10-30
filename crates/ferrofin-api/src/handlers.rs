@@ -1010,8 +1010,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[VerifiedSubsystem {
          once the period has passed.",
         "A session list that cannot be built is logged and skipped and the subscription stays; \
          upstream logs it and drops the connection's subscription.",
-        "The period is floored at FERROFIN_WS_MIN_STREAM_PERIOD_MS (100 ms by default), which \
-         upstream does not have: TODO(gl-723).",
+        "A *Start whose Data is missing, has no second field or holds a field that does not \
+         parse as a whole number still subscribes, at jellyfin-web's 1500 ms when the period \
+         is at fault, where upstream's Start throws and makes no subscription.",
     ],
 }];
 

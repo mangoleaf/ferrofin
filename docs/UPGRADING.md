@@ -8,12 +8,21 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — the WebSocket minimum stream period setting is gone
+
+Usually nothing to do. `FERROFIN_WS_MIN_STREAM_PERIOD_MS` (`websocket_min_stream_period_ms` in
+`config.toml`), added in 1.4.0, floored the period a dashboard WebSocket stream was pushed at.
+Every stream is now sent when something happens, as Jellyfin's are, and a client's period only
+spaces out low-priority updates (session activity, task progress), so there is nothing left to
+floor. Remove the variable and the key: the variable is no longer read, and the key is ignored
+with a startup warning.
+
 ## Unreleased — `config.toml` warns about the keys it ignores
 
 Usually nothing to do. A key the server cannot use, a misspelling or a variable's stem written
 where the key is spelled otherwise (`tvdb_pin`, `omdb_key`, `log`, …), never applied; it is now
 a warning at startup that names it and, for a stem, the key to use. Rename such keys as the
-warning says (the seven keys that are not their variable's stem are listed in
+warning says (the six keys that are not their variable's stem are listed in
 `docs/CONFIG.md`). A number or on/off variable that does not parse (`FERROFIN_PORT=80g`) is
 still ignored and now warns too; one with blanks around the value (`" 45 "`) is now read.
 

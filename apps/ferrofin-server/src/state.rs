@@ -2625,9 +2625,6 @@ pub async fn build_app_state(
     );
 
     let state = state.with_request_culture(&server_config.ui_culture)?;
-    let state = state.with_websocket_min_stream_period(std::time::Duration::from_millis(
-        u64::from(config.websocket_min_stream_period_ms),
-    ));
 
     // ---- media-encoding pair (real transcode/HLS + attachments) -----------
     // Replace the disabled stubs `AppState::new` installed with the

@@ -136,6 +136,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start and completion are still sent at once, and subscribing still sends the current task
   list once (Jellyfin sends nothing until a task event, but the dashboard's scan button needs
   it). An idle dashboard now costs no task-list reads
+- The WebSocket minimum stream period setting added in 1.4.0
+  (`FERROFIN_WS_MIN_STREAM_PERIOD_MS`, `websocket_min_stream_period_ms`) is gone. Every
+  dashboard stream is now sent on events, so a client's period only spaces out low-priority
+  updates and has no floor, as in Jellyfin; a period of 0 or below now sends every update,
+  where it used to fall back to 1500 ms. A `config.toml` that still sets the key loads, with a
+  warning that it is ignored
 - Report Jellyfin version 12.4.0 (was 12.2.0) in `/System/Info` and `/System/Info/Public`,
   built-in plugin versions and the plugin catalog's `targetAbi` filter: the newest Jellyfin
   release Ferrofin adopts
@@ -984,7 +990,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   spelled otherwise (`tvdb_pin` for `tvdb_subscriber_pin`), is a startup warning naming it and
   the key to use, and so is a number or on/off variable that does not parse
   (`FERROFIN_PORT=80g`); both used to be dropped without a word. `docs/CONFIG.md` lists the
-  seven keys that are not their variable's stem, and documents `FERROFIN_DISABLE_EXTENSIONS`
+  six keys that are not their variable's stem, and documents `FERROFIN_DISABLE_EXTENSIONS`
   and `FERROFIN_MAX_PLUGIN_DOWNLOAD_MB`. The startup log's `admin_password_set` no longer
   reports a blank password as set
 - The metadata-provider request limits and the stdout log format are `config.toml` settings
