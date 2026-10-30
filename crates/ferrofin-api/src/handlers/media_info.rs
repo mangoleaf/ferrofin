@@ -933,6 +933,16 @@ fn apply_stream_decision(
     let policy_allows_transcoding = policy.enable_audio_playback_transcoding
         || (!is_audio
             && (policy.enable_video_playback_transcoding || policy.enable_playback_remuxing));
+    // The client's vetoes go onto the source, as `SetDeviceSpecificData`
+    // writes them. The builder still evaluates the direct-play profiles, and
+    // reports why they fail in `TranscodeReasons`, but never picks a vetoed
+    // method; the audio builder's direct stream reads only this flag.
+    if !flags.enable_direct_play {
+        source.supports_direct_play = false;
+    }
+    if !flags.enable_direct_stream || !flags.allow_video_stream_copy {
+        source.supports_direct_stream = false;
+    }
     if !policy_allows_transcoding || !flags.enable_transcoding {
         source.supports_transcoding = false;
         source.transcoding_url = None;
@@ -945,9 +955,6 @@ fn apply_stream_decision(
     options.media_source_id.clone_from(&source.id);
     options.device_id = device_id.map(str::to_owned);
     options.max_bitrate = max_streaming_bitrate;
-    // The client's direct-play veto (EnableDirectPlay): the builder never picks
-    // a vetoed method.
-    options.enable_direct_play = flags.enable_direct_play;
     // `SetDeviceSpecificData` switches the builder's direct stream off unless it
     // is forced ("direct-stream http streaming is currently broken"), and
     // PlaybackInfo never forces it. So a video that cannot be direct played is
@@ -1073,10 +1080,11 @@ fn apply_stream_decision(
 }
 
 /// `MediaInfoHelper.SetDeviceSpecificData` for an audio item that is not
-/// direct played. A `DirectStream` (container remux over HTTP, which the
-/// server does not offer — `EnableDirectStream` is off) and a transcode both
-/// become a transcode at the stream's own `/audio/{id}/stream.{container}` (or
-/// `master.m3u8`) URL, with the profile's container and sub-protocol.
+/// direct played. A `DirectStream` (a container remux over HTTP, which the
+/// server does not stream as such: `MediaOptions.EnableDirectStream` is off)
+/// and a transcode both become a transcode at the stream's own
+/// `/audio/{id}/stream.{container}` (or `master.m3u8`) URL, with the
+/// profile's container and sub-protocol.
 fn audio_transcode_decision(
     source: &mut MediaSourceInfo,
     mut stream: ferrofin_model::dlna::StreamInfo,
@@ -2026,8 +2034,12 @@ mod tests {
                         enable_playback_remuxing: true,
                         ..ferrofin_model::users::UserPolicy::default()
                     };
+                    // The client also vetoes direct stream (gl-1022): the veto
+                    // reaches the builder, and the response's flag is the
+                    // recomputed one, true again for a direct play.
                     let flags = super::PlaybackFlags {
                         enable_direct_play: direct,
+                        enable_direct_stream: false,
                         ..super::PlaybackFlags::default()
                     };
                     super::apply_stream_decision(
@@ -2046,6 +2058,7 @@ mod tests {
                     )
                     .expect("a profile the builder can evaluate");
                     assert_eq!(source.supports_direct_play, direct && !(is_remote && force));
+                    assert_eq!(source.supports_direct_stream, source.supports_direct_play);
                     let url = source.transcoding_url.as_deref().unwrap_or_default();
                     assert_eq!(
                         url.contains("AllowVideoStreamCopy=false"),
@@ -2166,12 +2179,16 @@ mod tests {
                         "video={is_video} bits={bits}"
                     );
                     assert_eq!(source.transcoding_url.is_some(), expected);
-                    // An audio source that cannot transcode gets no decision at
-                    // all (`GetOptimalAudioStream` returns null) and keeps the
-                    // static source's flags, as upstream; every other case
-                    // decides, and none of these direct plays.
+                    // The client vetoed direct play, which `SetDeviceSpecificData`
+                    // writes onto the source before negotiating: none of these
+                    // direct plays, including an audio source that cannot
+                    // transcode and so gets no decision at all
+                    // (`GetOptimalAudioStream` returns null).
+                    assert!(!source.supports_direct_play, "video={is_video} bits={bits}");
+                    // Every decision recomputes `SupportsDirectStream` to false;
+                    // the undecided audio source keeps its static (unvetoed) one.
                     assert_eq!(
-                        source.supports_direct_play,
+                        source.supports_direct_stream,
                         !is_video && !expected,
                         "video={is_video} bits={bits}"
                     );
@@ -2467,6 +2484,95 @@ mod tests {
             assert!(!denied.supports_transcoding);
             assert!(denied.transcoding_url.is_none());
         }
+    }
+
+    /// gl-1022: `SetDeviceSpecificData` writes the client's direct-stream veto
+    /// (`EnableDirectStream=false`, or `AllowVideoStreamCopy=false`) onto the
+    /// source, the only gate the audio builder's direct stream reads: an MP3
+    /// in an `mkv` the client plays only as `mp3` is remuxed into `ts` with no
+    /// codec named (`GetOptimalAudioStream`'s remux branch) without the veto, and
+    /// transcoded to the client's AAC profile with it. The video-copy veto
+    /// counts for an audio item too: upstream clears `SupportsDirectStream` on
+    /// `!enableDirectStream || !allowVideoStreamCopy` whatever the item type.
+    /// Either way the response's flags are the ones `SetDeviceSpecificData`
+    /// recomputes after negotiating: neither direct play nor direct stream.
+    #[rstest::rstest]
+    #[case::no_veto(true, true, "ts", None)]
+    #[case::direct_stream_vetoed(false, true, "aac", Some("aac"))]
+    #[case::video_copy_vetoed(true, false, "aac", Some("aac"))]
+    fn a_direct_stream_veto_stops_the_audio_remux(
+        #[case] enable_direct_stream: bool,
+        #[case] allow_video_stream_copy: bool,
+        #[case] container: &str,
+        #[case] audio_codec: Option<&str>,
+    ) {
+        use ferrofin_model::dlna::{DirectPlayProfile, EncodingContext};
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: "mp3".to_owned(),
+                audio_codec: Some("mp3".to_owned()),
+                video_codec: None,
+                profile_type: DlnaProfileType::Audio,
+            }],
+            transcoding_profiles: vec![TranscodingProfile {
+                container: "aac".to_owned(),
+                audio_codec: "aac".to_owned(),
+                profile_type: DlnaProfileType::Audio,
+                protocol: MediaStreamProtocol::http,
+                context: EncodingContext::Streaming,
+                ..TranscodingProfile::default()
+            }],
+            ..DeviceProfile::default()
+        };
+        let mut source = MediaSourceInfo {
+            id: Some("0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a".to_owned()),
+            container: Some("mkv".to_owned()),
+            bitrate: Some(256_000),
+            media_streams: vec![MediaStream {
+                stream_type: MediaStreamType::Audio,
+                codec: Some("mp3".to_owned()),
+                channels: Some(2),
+                ..MediaStream::default()
+            }],
+            ..MediaSourceInfo::default()
+        };
+        let flags = super::PlaybackFlags {
+            enable_direct_stream,
+            allow_video_stream_copy,
+            ..super::PlaybackFlags::default()
+        };
+        let decision = super::apply_stream_decision(
+            &mut source,
+            &profile,
+            uuid::Uuid::from_u128(0xA0D10),
+            None,
+            None,
+            None,
+            super::StreamSelection::default(),
+            "ps-audio",
+            flags,
+            &ferrofin_model::users::UserPolicy {
+                enable_audio_playback_transcoding: true,
+                ..ferrofin_model::users::UserPolicy::default()
+            },
+            true,
+            &support(),
+        )
+        .expect("a profile the builder can evaluate")
+        .expect("a decision");
+        assert_eq!(decision.play_method, "Transcode");
+        assert!(!source.supports_direct_play && !source.supports_direct_stream);
+        let url = source.transcoding_url.as_deref().expect("a transcode URL");
+        assert!(
+            url.starts_with(&format!(
+                "/audio/00000000-0000-0000-0000-0000000a0d10/stream.{container}?"
+            )),
+            "{url}"
+        );
+        let named = url
+            .split(['?', '&'])
+            .find_map(|pair| pair.strip_prefix("AudioCodec="));
+        assert_eq!(named, audio_codec, "{url}");
     }
 
     /// `MediaEncoder` as `ITranscoderSupport`: an audio codec is encodable

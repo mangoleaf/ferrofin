@@ -2302,3 +2302,33 @@ async fn an_http_profile_is_streamed_progressively(
     assert_eq!(url_param(url, "StartTimeTicks"), Some("600000000"), "{url}");
     assert_eq!(url_param(url, "VideoCodec"), Some(video_codec), "{url}");
 }
+
+/// gl-1022: `SetDeviceSpecificData` applies the client's `EnableDirectPlay=false`
+/// to the source only (`SupportsDirectPlay = false`), so the builder still
+/// evaluates the direct-play profiles and reports why they fail: an `mkv` the
+/// client plays only in `mp4` transcodes with `ContainerNotSupported`, vetoed
+/// or not, and one it could direct play (jellyfin-web's forced transcode)
+/// with `DirectPlayError`, as `GetVideoDirectPlayProfile` reports a profile
+/// that fits but whose method is vetoed.
+#[rstest::rstest]
+#[case::container_not_supported(("mp4", "h264"), true, "ContainerNotSupported")]
+#[case::container_not_supported_vetoed(("mp4", "h264"), false, "ContainerNotSupported")]
+#[case::direct_playable_vetoed(("mkv", "h264"), false, "DirectPlayError")]
+#[tokio::test]
+async fn a_direct_play_veto_keeps_the_direct_play_transcode_reasons(
+    #[case] direct_play_profile: (&str, &str),
+    #[case] direct_play: bool,
+    #[case] reasons: &str,
+) {
+    let source = negotiate(
+        mkv_source(&Uuid::from_u128(0x1019).simple().to_string(), "h264"),
+        &serde_json::json!({
+            "DeviceProfile": hls_client(direct_play_profile, &[("ts", "h264")]),
+            "EnableDirectPlay": direct_play,
+        }),
+    )
+    .await;
+    assert_eq!(hls_transcode(&source).0, "ts", "{source}");
+    let url = source["TranscodingUrl"].as_str().expect("a transcode");
+    assert_eq!(url_param(url, "TranscodeReasons"), Some(reasons), "{url}");
+}
