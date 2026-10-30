@@ -1890,6 +1890,94 @@ async fn update_policy_partial_body_keeps_the_constructor_defaults() {
     );
 }
 
+/// `UserManager.GetUserById(Guid.Empty)` throws `ArgumentException`, a `400`:
+/// a nil route id, a nil `?userId=`, or an API key's empty user claim when
+/// `userId` is left out (`userId ?? User.GetUserId()`).
+#[rstest::rstest]
+#[case::get("GET", "/Users/00000000-0000-0000-0000-000000000000", "", false)]
+#[case::delete("DELETE", "/Users/00000000-0000-0000-0000-000000000000", "", false)]
+#[case::policy(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Policy",
+    r#"{"AuthenticationProviderId":"a","PasswordResetProviderId":"b"}"#,
+    false
+)]
+#[case::update(
+    "POST",
+    "/Users?userId=00000000-0000-0000-0000-000000000000",
+    r#"{"Name":"bob","Policy":null}"#,
+    false
+)]
+#[case::update_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000",
+    r#"{"Name":"bob","Policy":null}"#,
+    false
+)]
+#[case::configuration(
+    "POST",
+    "/Users/Configuration?userId=00000000-0000-0000-0000-000000000000",
+    "{}",
+    false
+)]
+#[case::configuration_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Configuration",
+    "{}",
+    false
+)]
+#[case::password_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Password",
+    r#"{"ResetPassword":true}"#,
+    false
+)]
+#[case::password(
+    "POST",
+    "/Users/Password?userId=00000000-0000-0000-0000-000000000000",
+    r#"{"ResetPassword":true}"#,
+    false
+)]
+#[case::api_key_update("POST", "/Users", r#"{"Name":"bob","Policy":null}"#, true)]
+#[case::api_key_configuration("POST", "/Users/Configuration", "{}", true)]
+#[case::api_key_password("POST", "/Users/Password", r#"{"ResetPassword":true}"#, true)]
+#[tokio::test]
+async fn a_nil_user_id_is_a_bad_request(
+    #[case] method: &str,
+    #[case] uri: &str,
+    #[case] body: &str,
+    #[case] api_key: bool,
+) {
+    let users = Arc::new(MemUsers::default());
+    let auth: Arc<dyn AuthService> = if api_key {
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService)
+    } else {
+        Arc::new(AdminAuth)
+    };
+    let router = create_router(state_with_auth(
+        users.clone(),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        auth,
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(users.updated_policy.lock().unwrap().is_none());
+    assert!(users.deleted.lock().unwrap().is_none());
+    assert!(users.updated_configuration.lock().unwrap().is_none());
+}
+
 /// A policy whose two `[Required]` provider ids are set, as every client that
 /// echoes a `GET /Users/{id}` policy back sends it.
 fn complete_policy() -> UserPolicy {
@@ -1925,6 +2013,7 @@ fn complete_policy() -> UserPolicy {
     &["PasswordResetProviderId"]
 )]
 #[case::unknown_user(r"{}", Uuid::from_u128(0xDEAD), &["AuthenticationProviderId", "PasswordResetProviderId"])]
+#[case::nil_user(r"{}", Uuid::nil(), &["AuthenticationProviderId", "PasswordResetProviderId"])]
 #[tokio::test]
 async fn update_policy_requires_both_provider_ids(
     #[case] body: &str,
@@ -2146,7 +2235,8 @@ async fn authenticate_by_name_returns_authentication_result() {
 
 /// The obsolete `UserController.AuthenticateUser` (`POST /Users/{userId}/
 /// Authenticate?pw=`, hidden from the OpenAPI document but served): anonymous,
-/// 404 for an unknown user, `[Required] pw`, else `AuthenticateUserByName`.
+/// 400 for a nil id, 404 for an unknown user, `[Required] pw`, else
+/// `AuthenticateUserByName`.
 #[tokio::test]
 async fn authenticate_by_id_signs_in_as_that_user() {
     let post = |uri: String| async move {
@@ -2172,6 +2262,12 @@ async fn authenticate_by_id_signs_in_as_that_user() {
     ))
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = post(format!("/Users/{}/Authenticate?pw=secret", Uuid::nil())).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "GetUserById(Guid.Empty) throws"
+    );
     let response = post(format!("/Users/{USER_ID}/Authenticate")).await;
     assert_eq!(
         response.status(),
