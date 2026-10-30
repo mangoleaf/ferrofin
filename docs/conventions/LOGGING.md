@@ -11,8 +11,8 @@
 Ferrofin logs through `tracing` to two sinks: **structured JSON on stdout** (default;
 Alloy → Loki) and a **plain-text daily-rotating file** under `{data_dir}/log`
 (always text — `GET /System/Logs` renders it in the dashboard, a parity surface).
-`FERROFIN_LOG_FORMAT=text` switches stdout to the human-readable tee for interactive
-dev. Neither of these may change.
+`FERROFIN_LOG_FORMAT=text` (`log_format = "text"` in `config.toml`) switches stdout to the
+human-readable tee for interactive dev. Neither of these may change.
 
 ## 1. Levels mean things
 

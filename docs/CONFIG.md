@@ -48,7 +48,7 @@ held for the life of the process, so they need the process itself to restart:
 
 - the directories: `data_dir`, `config_dir`, `cache_dir` (`web_dir` is not among them: the
   in-process restart serves the web client from its new value);
-- `log_level` (logging is set up once per process);
+- `log_level` and `log_format` (logging is set up once per process);
 - `metrics_scan_duration_buckets` (the metrics pipeline is set up once per process).
 
 When one of them has changed, the in-process restart keeps its current value and logs a warning
@@ -84,6 +84,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
 | `FERROFIN_WS_MIN_STREAM_PERIOD_MS` | `100` | Smallest period, in milliseconds, between pushes of a dashboard WebSocket stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). A client names the period in its `*Start` subscription; Ferrofin drives these streams on a timer (each tick recomputes and resends the full snapshot), so the client's period is clamped up to this floor to stop a tiny period becoming back-to-back `get_sessions`/activity work. Well-behaved clients ask for 1500 ms and are unaffected. The `config.toml` key is `websocket_min_stream_period_ms`. |
 | `FERROFIN_LOG` | `info` | Log filter, `RUST_LOG`/`EnvFilter` syntax; `RUST_LOG` wins when set. The `config.toml` key is `log_level`. |
+| `FERROFIN_LOG_FORMAT` | `json` | Stdout log lines: `json` (one JSON object per line, with the request's `trace_id`, for a log pipeline) or `text` (human-readable, for running the server by hand). Any other value logs a warning and is `json`. The log file under `{data_dir}/log` is always plain text. The `config.toml` key is `log_format`. |
 | `FERROFIN_QUICK_CONNECT_PENDING_PER_IP` | `10` | How many unauthorized Quick Connect requests one client IP may hold at once. `POST /QuickConnect/Initiate` needs no sign-in, so past this cap the IP's oldest pending request is dropped and its code stops working. Jellyfin has no cap. Behind a reverse proxy that is not in **Known proxies**, every client shares the proxy's IP, so the cap then counts all clients together. The cap is per address, so an IPv6 client can spread requests across its prefix. `0` means the default. The `config.toml` key is `quick_connect_pending_per_ip`. |
 
 ### HTTPS
@@ -155,16 +156,21 @@ proxy's `X-Forwarded-Proto`, but not yet its `X-Forwarded-Host` (gl-813).
 | `FERROFIN_METRICS_SAMPLE_INTERVAL` | built-in | Seconds between process-metric samples. |
 | `FERROFIN_METRICS_SCAN_DURATION_BUCKETS` | 1–2.5–5 per decade, `0.001` … `5000` | Bucket boundaries, in seconds, of the library-scan duration histograms (`ferrofin_library_scan_duration_seconds`, `ferrofin_library_scan_pass_duration_seconds`). The env var is comma-separated (`0.01,0.1,1,10,60,300,1800,7200`); the `config.toml` key `metrics_scan_duration_buckets` is an array (`[0.01, 0.1, 1, 10]`). A list that is empty, non-numeric, non-finite, not above zero or not strictly increasing is refused with a warning at startup and the default is used. |
 | `FERROFIN_SHUTDOWN_TIMEOUT_SECS` | `30` | Seconds a graceful shutdown or in-process restart (`POST /System/Restart`, backup restore) waits for in-flight requests before aborting the remaining connections — ASP.NET's `ShutdownTimeout` default. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | Enable OTLP trace export (gRPC) to this endpoint (off by default). An `https://` endpoint, or a bare `host:port` unless `OTEL_EXPORTER_OTLP_INSECURE` (or `OTEL_EXPORTER_OTLP_TRACES_INSECURE`) is `true`, is reached over TLS, and the collector's certificate is checked against the system trust store; `SSL_CERT_FILE` or `SSL_CERT_DIR` replace that store. The startup log says whether export is on, or why the exporter could not be built. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | none | Environment only. Enable OTLP trace export (gRPC) to this endpoint (off by default). An `https://` endpoint, or a bare `host:port` unless `OTEL_EXPORTER_OTLP_INSECURE` (or `OTEL_EXPORTER_OTLP_TRACES_INSECURE`) is `true`, is reached over TLS, and the collector's certificate is checked against the system trust store; `SSL_CERT_FILE` or `SSL_CERT_DIR` replace that store. The startup log says whether export is on, or why the exporter could not be built. |
+| `OTEL_TRACES_SAMPLER_ARG` | `0.25` | Environment only. Share of traces exported when OTLP export is on, `0` to `1`; a value outside is clamped, and one that is not a number uses the default. |
+
+The `OTEL_*` variables are OpenTelemetry's standard ones, which every OpenTelemetry SDK reads, so
+they are environment only on purpose: they have no `config.toml` key. A change to them applies
+when the server process restarts.
 
 ## Provider request limits
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FERROFIN_PROVIDER_TIMEOUT_SECONDS` | `20` | Default per-attempt HTTP timeout, clamped to 10–60 seconds. Explicit request timeouts take precedence. |
-| `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` | `60` | Maximum pending pacing/quota wait before skipping a lookup, clamped to 30–300 seconds. Open circuits skip immediately until a probe is permitted. |
+| `FERROFIN_PROVIDER_TIMEOUT_SECONDS` | `20` | Default per-attempt HTTP timeout, clamped to 10–60 seconds (a value outside logs a warning). Explicit request timeouts take precedence. The `config.toml` key is `provider_timeout_seconds`. |
+| `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` | `60` | Maximum pending pacing/quota wait before skipping a lookup, clamped to 30–300 seconds (a value outside logs a warning). Open circuits skip immediately until a probe is permitted. The `config.toml` key is `provider_max_wait_seconds`. |
 
-These are read when provider limiters are constructed; restart to apply changes.
+A change applies at the next restart, the dashboard's in-process restart included.
 See [provider rate limiting](PROVIDER_RATE_LIMITING.md) for retry and cooldown policy.
 
 ## Remote metadata provider keys

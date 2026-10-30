@@ -534,6 +534,15 @@ pub async fn build_app_state(
     // environment): the end-to-end scan test points every provider a scan
     // reaches at its mock server. Unset, each client keeps its public host.
     let endpoints = &config.provider_endpoints;
+    // Every provider limiter's timeout and longest wait, set before any request
+    // of this lifetime, so a changed `config.toml` applies on an in-process
+    // restart (the image limiters live for the whole process).
+    ferrofin_providers::rate_limit::set_request_limits(
+        ferrofin_providers::rate_limit::RequestLimits::from_seconds(
+            config.provider_timeout_seconds,
+            config.provider_max_wait_seconds,
+        ),
+    );
     let mut tmdb_client = ferrofin_providers::TmdbClient::new();
     if let Some(base) = endpoints.tmdb.as_deref() {
         tmdb_client = tmdb_client.with_base_url(base);

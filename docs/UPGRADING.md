@@ -37,8 +37,8 @@ still ignored and now warns too; one with blanks around the value (`" 45 "`) is 
 - **Dashboard → Restart applies `config.toml`.** The in-process restart used to come back
   on the configuration the process started with; it now loads `config.toml` again, so an
   edit made and forgotten applies at the next dashboard restart. The data, configuration and
-  cache directories, `log_level` and `metrics_scan_duration_buckets` still need a restart of
-  the process (the log names any that changed). A `config.toml` that no longer loads is logged as an error
+  cache directories, `log_level`, `log_format` and `metrics_scan_duration_buckets` still need a
+  restart of the process (the log names any that changed). A `config.toml` that no longer loads is logged as an error
   and the server comes back on its previous configuration.
 
 ## Unreleased — Live TV sources and guides follow Jellyfin more closely

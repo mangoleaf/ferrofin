@@ -295,8 +295,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// line, so a changed `config.toml` applies on `POST /System/Restart`.
 ///
 /// What the process holds for its whole life (the directories, the log
-/// filter, the scan-duration histogram buckets) keeps its running value, with
-/// a warning naming each such setting that changed
+/// filter and format, the scan-duration histogram buckets) keeps its running
+/// value, with a warning naming each such setting that changed
 /// ([`Config::for_restart`]). A reload that fails (a `config.toml` that no
 /// longer parses or validates) is logged as an error naming the file, and the
 /// next lifetime runs on the configuration this one ran on: a server with no

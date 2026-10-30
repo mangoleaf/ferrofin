@@ -19,6 +19,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use ferrofin_providers::rate_limit::RequestLimits;
 use serde::Deserialize;
 
 /// Default TCP port for the HTTP endpoint.
@@ -158,12 +159,15 @@ struct FileConfig {
     tvdb_token_days: Option<String>,
     fanart_personal_api_key: Option<String>,
     musicbrainz_base_url: Option<String>,
+    provider_timeout_seconds: Option<u64>,
+    provider_max_wait_seconds: Option<u64>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     ffmpeg_img_extract_perf_tradeoff: Option<bool>,
     library_roots: Option<Vec<PathBuf>>,
     server_name: Option<String>,
     log_level: Option<String>,
+    log_format: Option<String>,
     admin_user: Option<String>,
     admin_password: Option<String>,
     db_pool: Option<DbPoolFileValue>,
@@ -279,6 +283,18 @@ impl ProviderEndpoints {
             lrclib: nowhere,
         }
     }
+}
+
+/// How log lines are written to stdout. The log file is always plain text:
+/// `GET /System/Logs` shows it in the dashboard's log viewer as written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    /// One JSON object per line, carrying the request span's `trace_id` (for a
+    /// log pipeline such as Alloy and Loki). The default.
+    #[default]
+    Json,
+    /// Human-readable lines, for running the server by hand.
+    Text,
 }
 
 /// The resolved bootstrap configuration, after layering CLI > env > file >
@@ -411,6 +427,23 @@ pub struct Config {
     /// 1 req/sec limit).
     pub musicbrainz_base_url: String,
 
+    /// Default per-attempt timeout of a metadata-provider request, in seconds
+    /// (a request that sets its own keeps it). Resolved
+    /// `FERROFIN_PROVIDER_TIMEOUT_SECONDS` env > `provider_timeout_seconds` in
+    /// `config.toml` > 20, clamped to
+    /// [`RequestLimits::TIMEOUT_SECONDS`](ferrofin_providers::rate_limit::RequestLimits::TIMEOUT_SECONDS)
+    /// with a warning. The server hands it to every provider limiter for each
+    /// lifetime (`ferrofin_providers::rate_limit::set_request_limits`).
+    pub provider_timeout_seconds: u64,
+
+    /// Longest pending pacing or quota wait before a metadata lookup is
+    /// skipped, in seconds. Resolved `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` env >
+    /// `provider_max_wait_seconds` in `config.toml` > 60, clamped to
+    /// [`RequestLimits::MAX_WAIT_SECONDS`](ferrofin_providers::rate_limit::RequestLimits::MAX_WAIT_SECONDS)
+    /// with a warning; applied as
+    /// [`provider_timeout_seconds`](Self::provider_timeout_seconds) is.
+    pub provider_max_wait_seconds: u64,
+
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
     pub ffmpeg_path: Option<PathBuf>,
@@ -437,6 +470,11 @@ pub struct Config {
 
     /// Log filter in `EnvFilter` (RUST_LOG) syntax.
     pub log_level: String,
+
+    /// How stdout log lines are written. Resolved `FERROFIN_LOG_FORMAT` env >
+    /// `log_format` in `config.toml` (`json` or `text`, any case) > JSON; any
+    /// other value warns and is JSON. Logging is set up once per process.
+    pub log_format: LogFormat,
 
     /// Administrator username seeded on a fresh install.
     pub admin_user: String,
@@ -841,6 +879,23 @@ impl Config {
             .or(file.musicbrainz_base_url)
             .unwrap_or_default();
 
+        let provider_timeout_seconds = resolve_provider_seconds(
+            env,
+            "FERROFIN_PROVIDER_TIMEOUT_SECONDS",
+            "provider_timeout_seconds",
+            file.provider_timeout_seconds,
+            RequestLimits::DEFAULT_TIMEOUT_SECONDS,
+            RequestLimits::TIMEOUT_SECONDS,
+        );
+        let provider_max_wait_seconds = resolve_provider_seconds(
+            env,
+            "FERROFIN_PROVIDER_MAX_WAIT_SECONDS",
+            "provider_max_wait_seconds",
+            file.provider_max_wait_seconds,
+            RequestLimits::DEFAULT_MAX_WAIT_SECONDS,
+            RequestLimits::MAX_WAIT_SECONDS,
+        );
+
         let ffmpeg_path = cli
             .ffmpeg_path
             .or_else(|| env.var("FERROFIN_FFMPEG_PATH").map(PathBuf::from))
@@ -866,6 +921,8 @@ impl Config {
             .var("FERROFIN_LOG")
             .or(file.log_level)
             .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
+
+        let log_format = resolve_log_format(env, file.log_format);
 
         let admin_user = env
             .var("FERROFIN_ADMIN_USER")
@@ -903,6 +960,8 @@ impl Config {
             tvdb_token_days,
             fanart_personal_api_key,
             musicbrainz_base_url,
+            provider_timeout_seconds,
+            provider_max_wait_seconds,
             ffmpeg_path,
             ffprobe_path,
             ffmpeg_img_extract_perf_tradeoff: parse_bool_var(
@@ -914,6 +973,7 @@ impl Config {
             library_roots,
             server_name,
             log_level,
+            log_format,
             admin_user,
             admin_password,
             db_pool,
@@ -1085,7 +1145,8 @@ impl Config {
     ///
     /// Held for the process's life: the data, configuration and cache
     /// directories (the database, configuration and caches never move under a
-    /// running process), the log filter (`init_tracing` installs it once), and
+    /// running process), the log filter and format (`init_tracing` installs
+    /// them once), and
     /// the scan-duration histogram buckets (the metrics pipeline installs them
     /// once; kept even before metrics were first enabled, so the setting
     /// always applies on a process restart). The test seams that are no
@@ -1104,6 +1165,12 @@ impl Config {
         );
         keep_running(&mut next.cache_dir, &self.cache_dir, "cache_dir", &mut kept);
         keep_running(&mut next.log_level, &self.log_level, "log_level", &mut kept);
+        keep_running(
+            &mut next.log_format,
+            &self.log_format,
+            "log_format",
+            &mut kept,
+        );
         // Compared bit for bit: an unparsable entry is NaN, which never equals
         // itself, and an unchanged list must not read as a change.
         let bits = |buckets: &Option<Vec<f64>>| {
@@ -1174,12 +1241,15 @@ impl Config {
             tvdb_token_days: None,
             fanart_personal_api_key: String::new(),
             musicbrainz_base_url: OFFLINE_PROVIDER_URL.to_owned(),
+            provider_timeout_seconds: RequestLimits::DEFAULT_TIMEOUT_SECONDS,
+            provider_max_wait_seconds: RequestLimits::DEFAULT_MAX_WAIT_SECONDS,
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_img_extract_perf_tradeoff: false,
             library_roots: Vec::new(),
             server_name: "ferrofin-test".to_owned(),
             log_level: "info".to_owned(),
+            log_format: LogFormat::Json,
             admin_user: "admin".to_owned(),
             admin_password: String::new(),
             db_pool: None,
@@ -1224,6 +1294,54 @@ fn keep_running<T: Clone + PartialEq>(
     if next != running {
         next.clone_from(running);
         kept.push(key);
+    }
+}
+
+/// Resolves a provider request limit in seconds: the `env_key` env var >
+/// `file_key` in `config.toml` > `default`, clamped to `range`. A value
+/// outside the range warns ([`Env::warn`]) and takes the nearest bound, as
+/// the limit always did; one that does not parse warns and is unset.
+fn resolve_provider_seconds(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u64>,
+    default: u64,
+    range: std::ops::RangeInclusive<u64>,
+) -> u64 {
+    let seconds = parse_var(env, env_key).or(file).unwrap_or(default);
+    let clamped = seconds.clamp(*range.start(), *range.end());
+    if clamped != seconds {
+        env.warn(format!(
+            "{env_key} / {file_key} `{seconds}` is outside {} to {} seconds; using {clamped}",
+            range.start(),
+            range.end()
+        ));
+    }
+    clamped
+}
+
+/// Resolves the stdout log format: the `FERROFIN_LOG_FORMAT` env var when it
+/// is not blank, else `log_format` in `config.toml`, else JSON. `json` and
+/// `text` match in any case; anything else warns ([`Env::warn`]) and is JSON,
+/// as it always was.
+fn resolve_log_format(env: &dyn Env, file: Option<String>) -> LogFormat {
+    let Some(raw) = env
+        .var("FERROFIN_LOG_FORMAT")
+        .filter(|raw| !raw.trim().is_empty())
+        .or(file)
+    else {
+        return LogFormat::Json;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "json" => LogFormat::Json,
+        "text" => LogFormat::Text,
+        _ => {
+            env.warn(format!(
+                "FERROFIN_LOG_FORMAT / log_format `{raw}` is neither `json` nor `text`; using json"
+            ));
+            LogFormat::Json
+        }
     }
 }
 
@@ -2233,6 +2351,61 @@ mod tests {
             "{:?}",
             cfg.load_warnings
         );
+    }
+
+    /// The provider request limits and the log format are settings of the
+    /// file too, not unknown keys.
+    #[test]
+    fn the_provider_limits_and_the_log_format_are_config_toml_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "provider_timeout_seconds = 30\nprovider_max_wait_seconds = 120\nlog_format = \"text\"\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(cfg.provider_timeout_seconds, 30);
+        assert_eq!(cfg.provider_max_wait_seconds, 120);
+        assert_eq!(cfg.log_format, LogFormat::Text);
+
+        // The variables win; out of range is clamped with a warning, an
+        // unknown format warns and is JSON.
+        let env = FakeEnv::new()
+            .with("FERROFIN_PROVIDER_TIMEOUT_SECONDS", "5")
+            .with("FERROFIN_PROVIDER_MAX_WAIT_SECONDS", "45")
+            .with("FERROFIN_LOG_FORMAT", "pretty");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(cfg.provider_timeout_seconds, 10);
+        assert_eq!(cfg.provider_max_wait_seconds, 45);
+        assert_eq!(cfg.log_format, LogFormat::Json);
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("FERROFIN_PROVIDER_TIMEOUT_SECONDS"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert!(
+            cfg.load_warnings[1].contains("`pretty`"),
+            "{:?}",
+            cfg.load_warnings
+        );
+
+        // Unset: the defaults, which the provider crate defines.
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            (cfg.provider_timeout_seconds, cfg.provider_max_wait_seconds),
+            (
+                RequestLimits::DEFAULT_TIMEOUT_SECONDS,
+                RequestLimits::DEFAULT_MAX_WAIT_SECONDS
+            )
+        );
+        assert_eq!(cfg.log_format, LogFormat::Json);
     }
 
     /// The config file is TOML: a file named for another format is refused,
