@@ -913,7 +913,8 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
         "/DisplayPreferences/{displayPreferencesId}",
         "v12.2",
     ),
-    // gl-1026: an XMLTV provider with an empty Path is a 400, not a 404.
+    // gl-1059: "EnabledTuners": null or "ChannelMappings": null is a 400, not
+    // bound.
     ("post", "/LiveTv/ListingProviders", "v12.2"),
     // gl-762: livetv lists tuners and listing providers by id, not as added.
     ("get", "/System/Configuration/{key}", "v12.2"),
@@ -1404,13 +1405,21 @@ pub const VERIFIED: &[Verified] = &[
                SchedulesDirect.Validate)",
         date: "2026-10-21",
         divergences: &[
-            "An XMLTV provider without a Path is a 400; upstream's Validate dereferences \
-         the null path and answers a NullReferenceException 500. Jellyfin bug not ported.",
+            "An XMLTV provider with no Path, or a null one, is a 400; upstream's Validate \
+         dereferences the null path and answers a NullReferenceException 500 (an empty or \
+         blank Path is the FileNotFoundException 404 on both). Jellyfin bug not ported.",
             "Schedules Direct's /token body is serialized, so a username with a quote or a \
          backslash stays valid JSON; upstream concatenates it into the body raw. Jellyfin \
          bug not ported.",
             "SchedulesDirect.GetTokenInternal logs the session token at info; Ferrofin never \
          logs the password, its hash or the token. Jellyfin bug not ported.",
+            "A body with \"EnabledTuners\": null or \"ChannelMappings\": null is a 400; \
+         upstream binds the null and saves the provider (200). Fix path: gl-1059.",
+            "The 400 (an XMLTV provider with no Path, a Schedules Direct save missing its \
+         Username, Password or ListingsId, or a query value the binder cannot convert), 401 \
+         (Schedules Direct refuses the login) and 404 (an unknown or missing Type, or an \
+         XMLTV file that is not there) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
         ],
         refs: &[],
     },

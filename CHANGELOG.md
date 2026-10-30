@@ -601,6 +601,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   no identity of its own online, so a lookup by its file name filled it with another title's
   overview, people or Primary image. Its local readers, embedded images and extracted frames
   still run. The item it belongs to is asked as before
+- `POST /LiveTv/ListingProviders` with an XMLTV provider whose `Path` is empty answers `404`,
+  as Jellyfin's `XmlTvListingsProvider.Validate` does (no file has that name), instead of
+  `400`. Nothing is saved either way. A provider with no `Path` at all is still a `400`, where
+  Jellyfin answers `500`
 
 ### Performance
 - A library scan keeps the remote answers it shares between items only as long as
