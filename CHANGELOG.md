@@ -683,6 +683,16 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   read each item on its own (four to six statements per item and per parent). Only a
   folder's played counts are still read per folder. Marking a five-episode series played
   now runs 14 statements for the push instead of 44; the message is unchanged
+- A playing session's `NowPlayingItem` is built once, on the start or progress report that
+  first names the item, and kept until another item plays or playback stops, as Jellyfin's
+  `UpdateNowPlayingItem` does. `GET /Sessions` and the WebSocket `Sessions` stream used to
+  rebuild it for every playing session on every read: an item lookup, a media-source lookup
+  and an item build each. So, as in Jellyfin, the session keeps showing the item as it was
+  built until another item plays or playback restarts: a metadata edit made while it plays,
+  a progress report naming another version of the same item, and the item's deletion do not
+  change it. `GET /UserItems/Resume?excludeActiveSessions=true`, the library-change notices
+  and the metrics sampler now read each session's user and shown item id only, without
+  copying any session or item
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
