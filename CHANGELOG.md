@@ -657,6 +657,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   playback start, progress and stop report ran one `DeviceOptions` statement before, and
   now runs none. Those reports also take just the session id and the fields they use,
   where they built the session's DTO and copied the whole session
+- A Live TV guide refresh stores its airings as items one channel at a time, as Jellyfin
+  does: it reads a channel's guide rows and stored programmes, writes them, and lets them go
+  before it reads the next channel's. It used to hold every airing and every stored programme
+  item of the whole guide at once. The guide rows are built as they are written instead of
+  all first. What the refresh stores is unchanged; its memory was not measured
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
