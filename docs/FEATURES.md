@@ -345,7 +345,7 @@ the season's folder change asks the season providers.
   refreshing (no `DateLastRefreshed`), which is refreshed in full, probe and providers
   included. Later scans of an unchanged library save nothing. See the same section.
 - With metrics on (`FERROFIN_ENABLE_METRICS=true`), `ferrofin_library_scan_items_total`
-  counts each scan's items by outcome (`created`, `updated`, `unchanged`, `removed`),
+  counts each scan's items by outcome (`created`, `updated`, `unchanged`, `removed`, `skipped`),
   `ferrofin_media_probe_total` its ffprobe runs and
   `ferrofin_metadata_provider_requests_total` its provider requests; the
   [Library scans dashboard](../contrib/metrics/README.md#library-scans-dashboard) plots them.

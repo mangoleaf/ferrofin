@@ -1022,8 +1022,13 @@ impl ScanWorker {
             self.progress.send_modify(|n| *n = n.wrapping_add(1));
         }
         let elapsed_ms = started.elapsed().as_millis();
-        let (created, updated, unchanged, removed) =
-            (total.created, total.updated, total.unchanged, total.removed);
+        let (created, updated, unchanged, removed, skipped) = (
+            total.created,
+            total.updated,
+            total.unchanged,
+            total.removed,
+            total.skipped,
+        );
         // A drain that included a stopped pass did not complete.
         if total.stopped {
             tracing::info!(
@@ -1031,6 +1036,7 @@ impl ScanWorker {
                 updated,
                 unchanged,
                 removed,
+                skipped,
                 elapsed_ms,
                 "library scan stopped"
             );
@@ -1040,6 +1046,7 @@ impl ScanWorker {
                 updated,
                 unchanged,
                 removed,
+                skipped,
                 elapsed_ms,
                 "library scan complete"
             );
@@ -1098,6 +1105,7 @@ impl ScanWorker {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "library scan stopped before it finished"
                 );
                 (ScanResult::Stopped, Some(pass))
@@ -1112,6 +1120,7 @@ impl ScanWorker {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "library scan pass complete"
                 );
                 (ScanResult::Completed, Some(pass))
@@ -1189,6 +1198,7 @@ impl PriorityLane for QueueLane {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "item refresh served inside the running scan"
                 );
                 ScanResult::Completed
