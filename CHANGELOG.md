@@ -240,6 +240,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - `nameStartsWith` on `/Genres`, `/MusicGenres`, `/Studios`, `/Artists` and
   `/Artists/AlbumArtists` is a literal prefix of the sort name, as on `/Items`: `%` and `_` match
   only themselves, and a leading space is kept
+- `/Genres`, `/MusicGenres`, `/Studios`, `/Artists` and `/Artists/AlbumArtists` order rows that
+  tie on every sort key by item id, as Jellyfin's query does. Equally relevant search hits, and
+  names that share a sort name ("The Band" and "Band"), now come back in Jellyfin's order instead
+  of name order
 - Port Jellyfin's Screen Grabber (`VideoImageProvider`): a movie, episode, music video or
   home video with no Primary image after the local, remote and embedded providers gets a
   frame from its default video stream, 10 % into its runtime (10 s when the runtime is
