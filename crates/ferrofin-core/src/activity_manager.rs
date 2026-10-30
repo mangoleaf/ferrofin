@@ -42,10 +42,19 @@ const EMPTY_GUID: &str = "00000000-0000-0000-0000-000000000000";
 /// The default page size when a query sets no `limit` (C# `query.Limit ?? 100`).
 const DEFAULT_LIMIT: i32 = 100;
 
+/// Capacity of the entry-created broadcast; a fixed constant, not a setting
+/// (owner decision). A subscriber that falls further behind sees `Lagged`,
+/// which still means "entries were created": the stream sends no entries,
+/// only a signal to refetch them, so a lag loses nothing.
+const ENTRY_CREATED_CAPACITY: usize = 64;
+
 /// The concrete activity-log manager over the `ActivityLogs` table.
 #[derive(Clone)]
 pub struct FerrofinActivityManager {
     db: Database,
+    /// The C# `EntryCreated` event
+    /// ([`ActivityManager::subscribe_entry_created`]); clones share it.
+    entry_created: tokio::sync::broadcast::Sender<()>,
 }
 
 impl std::fmt::Debug for FerrofinActivityManager {
@@ -59,7 +68,10 @@ impl FerrofinActivityManager {
     /// Creates an activity-log manager over the given database.
     #[must_use]
     pub fn new(db: Database) -> Self {
-        Self { db }
+        Self {
+            db,
+            entry_created: tokio::sync::broadcast::channel(ENTRY_CREATED_CAPACITY).0,
+        }
     }
 }
 
@@ -224,7 +236,14 @@ impl ActivityManager for FerrofinActivityManager {
         .execute(self.db.writer())
         .await
         .map_err(db_err)?;
+        // `CreateAsync` raises `EntryCreated` only once `SaveChangesAsync` has
+        // succeeded. Nobody subscribed is not an error.
+        let _ = self.entry_created.send(());
         Ok(())
+    }
+
+    fn subscribe_entry_created(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        Some(self.entry_created.subscribe())
     }
 
     async fn clean(&self, before: chrono::DateTime<Utc>) -> Result<u64, ServiceError> {
@@ -417,6 +436,32 @@ mod tests {
                 .expect("by item")
                 .total_record_count,
             1
+        );
+    }
+
+    /// `CreateAsync` raises `EntryCreated` once per saved entry, after the
+    /// save: an insert that fails (here, no `ActivityLogs` table) raises
+    /// nothing.
+    #[tokio::test]
+    async fn create_entry_raises_entry_created_only_once_saved() {
+        let entry = || ActivityLogCreate {
+            name: "n".to_owned(),
+            type_: "T".to_owned(),
+            ..Default::default()
+        };
+        let mgr = FerrofinActivityManager::new(memory_db().await);
+        let mut created = mgr.subscribe_entry_created().expect("raises events");
+        mgr.create_entry(entry()).await.expect("create");
+        assert_eq!(created.try_recv(), Ok(()));
+        assert!(created.try_recv().is_err(), "raised once");
+
+        let unmigrated = Database::connect_in_memory().await.expect("open db");
+        let mgr = FerrofinActivityManager::new(unmigrated);
+        let mut created = mgr.subscribe_entry_created().expect("raises events");
+        mgr.create_entry(entry()).await.unwrap_err();
+        assert!(
+            created.try_recv().is_err(),
+            "a failed insert raises nothing"
         );
     }
 

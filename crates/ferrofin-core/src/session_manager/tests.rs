@@ -1104,8 +1104,11 @@ fn raised(
 }
 
 /// The `ISessionManager` events `SessionInfoWebSocketListener` listens to are
-/// raised once per change: a new session starts one and a request on a known
-/// session none (`GetSessionInfo` → `OnSessionStarted` only on creation); each
+/// raised once per change: a new session raises `SessionStarted` and, its
+/// `LastActivityDate` being `DateTime.MinValue` upstream, also
+/// `SessionActivity`; a request on a session active within the last 10 s
+/// raises neither (`GetSessionInfo` → `OnSessionStarted` only on creation; see
+/// `session_activity_is_raised_only_past_ten_idle_seconds`); each
 /// playback report raises its own, with `IsAutomated` carried through
 /// (`SessionManager.cs:961`); and a session ends once, however it leaves the
 /// pool, while ending an unknown one raises nothing (`ReportSessionEnded`).
@@ -1130,7 +1133,10 @@ async fn each_session_change_raises_its_websocket_event_once() {
         .unwrap()
         .id
         .unwrap();
-    assert_eq!(raised(&mut events), [SessionEvent::SessionStarted]);
+    assert_eq!(
+        raised(&mut events),
+        [SessionEvent::SessionStarted, SessionEvent::SessionActivity]
+    );
     mgr.log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
         .unwrap();
@@ -1171,6 +1177,70 @@ async fn each_session_change_raises_its_websocket_event_once() {
     assert_eq!(raised(&mut events), [SessionEvent::SessionEnded]);
     mgr.report_session_ended(&session_id).await.unwrap();
     assert_eq!(raised(&mut events), [], "an unknown session ends nothing");
+}
+
+/// `LogSessionActivity` raises `SessionActivity` only when the session's
+/// previous activity is more than 10 s old (`SessionManager.cs:281-289`).
+/// The idle time is set on the session, not slept.
+#[tokio::test]
+async fn session_activity_is_raised_only_past_ten_idle_seconds() {
+    use ferrofin_traits::session::SessionEvent;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let session_id = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
+
+    for (idle_secs, expected) in [(5, vec![]), (11, vec![SessionEvent::SessionActivity])] {
+        active_at(
+            &mgr,
+            &session_id,
+            Utc::now() - chrono::Duration::seconds(idle_secs),
+        )
+        .await;
+        mgr.log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+            .await
+            .unwrap();
+        assert_eq!(raised(&mut events), expected, "idle {idle_secs} s");
+    }
+}
+
+/// `ReportCapabilities(…, saveCapabilities: true)` raises
+/// `CapabilitiesChanged` once (`SessionManager.cs:1901-1918`); an unknown
+/// session fails before anything is stored and raises nothing.
+#[tokio::test]
+async fn reporting_capabilities_raises_capabilities_changed_once() {
+    use ferrofin_traits::session::SessionEvent;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let session_id = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
+
+    mgr.report_capabilities(&session_id, &ClientCapabilities::default())
+        .await
+        .unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::CapabilitiesChanged]);
+    mgr.report_capabilities("unknown", &ClientCapabilities::default())
+        .await
+        .unwrap_err();
+    assert_eq!(raised(&mut events), []);
 }
 
 /// A logout ends the device's session through `ReportSessionEnded`, so the
@@ -2292,6 +2362,8 @@ async fn the_sessions_live_stream_follows_the_reports() {
 /// capabilities map is never evicted.
 #[tokio::test]
 async fn a_recreated_session_inherits_the_devices_capabilities() {
+    use ferrofin_traits::session::SessionEvent;
+
     let db = test_db().await;
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
@@ -2326,6 +2398,11 @@ async fn a_recreated_session_inherits_the_devices_capabilities() {
     );
 
     // The client's next request recreates it — same id, capabilities intact.
+    // Inheriting them is `ReportCapabilities(…, saveCapabilities: false)`,
+    // which raises no `CapabilitiesChanged`.
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
     let again = mgr
         .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
@@ -2334,6 +2411,10 @@ async fn a_recreated_session_inherits_the_devices_capabilities() {
     assert!(
         again.supports_media_control,
         "the recreated session inherits the device's reported capabilities"
+    );
+    assert_eq!(
+        raised(&mut events),
+        [SessionEvent::SessionStarted, SessionEvent::SessionActivity]
     );
 }
 
@@ -3773,6 +3854,16 @@ async fn checked_in_at(mgr: &FerrofinSessionManager, session_id: &str, at: DateT
         .find(|s| s.id == session_id)
         .expect("session");
     session.last_playback_check_in = at;
+}
+
+/// Moves a session's `LastActivityDate` back to `at`.
+async fn active_at(mgr: &FerrofinSessionManager, session_id: &str, at: DateTime<Utc>) {
+    let mut sessions = mgr.sessions.lock().await;
+    let session = sessions
+        .values_mut()
+        .find(|s| s.id == session_id)
+        .expect("session");
+    session.last_activity_date = at;
 }
 
 /// When the session last did something (`LastActivityDate`).

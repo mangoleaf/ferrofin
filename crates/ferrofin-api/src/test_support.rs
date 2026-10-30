@@ -2815,6 +2815,25 @@ pub fn fake_state_with_sessions(
     config: Arc<dyn ServerConfigurationManager>,
     sessions: Arc<dyn SessionManager>,
 ) -> AppState {
+    fake_state_with_streams(
+        auth,
+        config,
+        sessions,
+        Arc::new(FakeActivity),
+        Arc::new(FakeTasks),
+    )
+}
+
+/// [`fake_state_with_sessions`] over the given activity and task managers
+/// too: every manager a session socket's dashboard stream subscribes to.
+#[must_use]
+pub fn fake_state_with_streams(
+    auth: Arc<dyn AuthService>,
+    config: Arc<dyn ServerConfigurationManager>,
+    sessions: Arc<dyn SessionManager>,
+    activity: Arc<dyn ActivityManager>,
+    tasks: Arc<dyn TaskManager>,
+) -> AppState {
     AppState::new(
         Arc::new(FakeLibrary),
         Arc::new(FakeUsers),
@@ -2845,9 +2864,9 @@ pub fn fake_state_with_sessions(
         Arc::new(FakeApiKeys),
         Arc::new(FakeLocalization),
         Arc::new(FakeDisplayPreferences),
-        Arc::new(FakeActivity),
+        activity,
         Arc::new(FakeFileSystem),
-        Arc::new(FakeTasks),
+        tasks,
     )
 }
 

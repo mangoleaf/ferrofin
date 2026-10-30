@@ -132,6 +132,15 @@ pub trait ActivityManager: Send + Sync {
     /// current time. Best-effort callers may ignore the result.
     async fn create_entry(&self, entry: ActivityLogCreate) -> Result<(), ServiceError>;
 
+    /// Subscribes to entry creation: one `()` per entry
+    /// [`create_entry`](ActivityManager::create_entry) persisted, the port of
+    /// the C# `EntryCreated` event the WebSocket `ActivityLogEntry` stream
+    /// listens to. `None` (the default) means this manager raises nothing,
+    /// so that stream sends nothing.
+    fn subscribe_entry_created(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        None
+    }
+
     /// Deletes entries created before `before`, returning how many were removed
     /// (C# `CleanAsync` — the "Clean Activity Log" scheduled task's backend).
     async fn clean(&self, before: DateTime<Utc>) -> Result<u64, ServiceError>;
