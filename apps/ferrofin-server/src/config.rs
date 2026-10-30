@@ -19,6 +19,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use ferrofin_providers::rate_limit::RequestLimits;
 use serde::Deserialize;
 
 /// Default TCP port for the HTTP endpoint.
@@ -109,11 +110,31 @@ pub struct Cli {
     pub config_file: Option<PathBuf>,
 }
 
+/// The `FERROFIN_*` variables whose `config.toml` key is not their stem
+/// (lower-cased, prefix stripped), with that key. Every other variable's key
+/// is its stem, and `FERROFIN_CONFIG_FILE`, which names the file, has none.
+/// One spelling per setting: the stem is no alias for these, since a file
+/// holding both spellings would set one setting twice; it is an unknown key,
+/// whose warning names the key to use.
+const KEYS_NOT_NAMED_BY_STEM: &[(&str, &str)] = &[
+    ("FERROFIN_LOG", "log_level"),
+    ("FERROFIN_OMDB_KEY", "omdb_api_key"),
+    ("FERROFIN_TVDB_KEY", "tvdb_api_key"),
+    ("FERROFIN_TVDB_PIN", "tvdb_subscriber_pin"),
+    ("FERROFIN_FANART_KEY", "fanart_personal_api_key"),
+    ("FERROFIN_MUSICBRAINZ_URL", "musicbrainz_base_url"),
+    (
+        "FERROFIN_WS_MIN_STREAM_PERIOD_MS",
+        "websocket_min_stream_period_ms",
+    ),
+];
+
 /// The subset of [`Config`] fields that may appear in `config.toml`.
 ///
 /// All fields are optional: `config.toml` is a sparse override layer, and the
-/// whole file is optional. Field names match the `FERROFIN_*` env var stems
-/// (lower-cased, prefix stripped) so the two layers describe the same knobs.
+/// whole file is optional. Field names are the keys: the `FERROFIN_*` env var
+/// stems (lower-cased, prefix stripped), except those
+/// [`KEYS_NOT_NAMED_BY_STEM`] lists, so the two layers describe the same knobs.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct FileConfig {
@@ -140,12 +161,15 @@ struct FileConfig {
     tvdb_token_days: Option<String>,
     fanart_personal_api_key: Option<String>,
     musicbrainz_base_url: Option<String>,
+    provider_timeout_seconds: Option<u64>,
+    provider_max_wait_seconds: Option<u64>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     ffmpeg_img_extract_perf_tradeoff: Option<bool>,
     library_roots: Option<Vec<PathBuf>>,
     server_name: Option<String>,
     log_level: Option<String>,
+    log_format: Option<String>,
     admin_user: Option<String>,
     admin_password: Option<String>,
     db_pool: Option<DbPoolFileValue>,
@@ -263,6 +287,18 @@ impl ProviderEndpoints {
     }
 }
 
+/// How log lines are written to stdout. The log file is always plain text:
+/// `GET /System/Logs` shows it in the dashboard's log viewer as written.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LogFormat {
+    /// One JSON object per line, carrying the request span's `trace_id` (for a
+    /// log pipeline such as Alloy and Loki). The default.
+    #[default]
+    Json,
+    /// Human-readable lines, for running the server by hand.
+    Text,
+}
+
 /// The resolved bootstrap configuration, after layering CLI > env > file >
 /// defaults and deriving the sub-directories under `data_dir`.
 ///
@@ -295,7 +331,7 @@ pub struct Config {
     /// What loading noticed and set aside without failing, e.g. a key the
     /// file may not set. Loading runs before logging starts, so the server
     /// logs these once it has (at boot, and after each in-process restart),
-    /// each with [`config_file`](Self::config_file) as its `path`.
+    /// with [`config_file`](Self::config_file) as context.
     pub load_warnings: Vec<String>,
 
     /// Configuration directory holding `system.json` + `branding.json`.
@@ -393,6 +429,23 @@ pub struct Config {
     /// 1 req/sec limit).
     pub musicbrainz_base_url: String,
 
+    /// Default per-attempt timeout of a metadata-provider request, in seconds
+    /// (a request that sets its own keeps it). Resolved
+    /// `FERROFIN_PROVIDER_TIMEOUT_SECONDS` env > `provider_timeout_seconds` in
+    /// `config.toml` > 20, clamped to
+    /// [`RequestLimits::TIMEOUT_SECONDS`](ferrofin_providers::rate_limit::RequestLimits::TIMEOUT_SECONDS)
+    /// with a warning. The server hands it to every provider limiter for each
+    /// lifetime (`ferrofin_providers::rate_limit::set_request_limits`).
+    pub provider_timeout_seconds: u64,
+
+    /// Longest pending pacing or quota wait before a metadata lookup is
+    /// skipped, in seconds. Resolved `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` env >
+    /// `provider_max_wait_seconds` in `config.toml` > 60, clamped to
+    /// [`RequestLimits::MAX_WAIT_SECONDS`](ferrofin_providers::rate_limit::RequestLimits::MAX_WAIT_SECONDS)
+    /// with a warning; applied as
+    /// [`provider_timeout_seconds`](Self::provider_timeout_seconds) is.
+    pub provider_max_wait_seconds: u64,
+
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
     pub ffmpeg_path: Option<PathBuf>,
@@ -419,6 +472,11 @@ pub struct Config {
 
     /// Log filter in `EnvFilter` (RUST_LOG) syntax.
     pub log_level: String,
+
+    /// How stdout log lines are written. Resolved `FERROFIN_LOG_FORMAT` env >
+    /// `log_format` in `config.toml` (`json` or `text`, any case) > JSON; any
+    /// other value warns and is JSON. Logging is set up once per process.
+    pub log_format: LogFormat,
 
     /// Administrator username seeded on a fresh install.
     pub admin_user: String,
@@ -692,6 +750,10 @@ impl Config {
     // line per config field, so the length is inherent (cf. `build_app_state`).
     #[allow(clippy::too_many_lines)]
     fn load_from(cli: Cli, env: &dyn Env) -> anyhow::Result<Self> {
+        let env = &WarningEnv {
+            env,
+            warnings: std::cell::RefCell::default(),
+        };
         let mut load_warnings = Vec::new();
         let chosen_data_dir = cli
             .data_dir
@@ -707,7 +769,8 @@ impl Config {
         // named the file: one found in the data directory cannot move it.
         let (data_dir, config_file, file, config_file_found) = if let Some(config_file) = named_file
         {
-            let (file, found) = load_file_config(&config_file)?;
+            let (file, found, unknown) = load_file_config(&config_file)?;
+            load_warnings.extend(unknown);
             let data_dir = chosen_data_dir
                 .or_else(|| file.data_dir.clone())
                 .unwrap_or_else(|| default_data_dir(env));
@@ -715,7 +778,8 @@ impl Config {
         } else {
             let data_dir = chosen_data_dir.unwrap_or_else(|| default_data_dir(env));
             let config_file = data_dir.join(CONFIG_FILE_NAME);
-            let (file, found) = load_file_config(&config_file)?;
+            let (file, found, unknown) = load_file_config(&config_file)?;
+            load_warnings.extend(unknown);
             if let Some(ignored) = file.data_dir.as_ref().filter(|dir| **dir != data_dir) {
                 load_warnings.push(format!(
                     "data_dir `{}` in config.toml is ignored: a config.toml found in the data \
@@ -817,6 +881,23 @@ impl Config {
             .or(file.musicbrainz_base_url)
             .unwrap_or_default();
 
+        let provider_timeout_seconds = resolve_provider_seconds(
+            env,
+            "FERROFIN_PROVIDER_TIMEOUT_SECONDS",
+            "provider_timeout_seconds",
+            file.provider_timeout_seconds,
+            RequestLimits::DEFAULT_TIMEOUT_SECONDS,
+            RequestLimits::TIMEOUT_SECONDS,
+        );
+        let provider_max_wait_seconds = resolve_provider_seconds(
+            env,
+            "FERROFIN_PROVIDER_MAX_WAIT_SECONDS",
+            "provider_max_wait_seconds",
+            file.provider_max_wait_seconds,
+            RequestLimits::DEFAULT_MAX_WAIT_SECONDS,
+            RequestLimits::MAX_WAIT_SECONDS,
+        );
+
         let ffmpeg_path = cli
             .ffmpeg_path
             .or_else(|| env.var("FERROFIN_FFMPEG_PATH").map(PathBuf::from))
@@ -843,6 +924,8 @@ impl Config {
             .or(file.log_level)
             .unwrap_or_else(|| DEFAULT_LOG_LEVEL.to_owned());
 
+        let log_format = resolve_log_format(env, file.log_format);
+
         let admin_user = env
             .var("FERROFIN_ADMIN_USER")
             .or(file.admin_user)
@@ -855,11 +938,11 @@ impl Config {
 
         let db_pool = resolve_db_pool(env, file.db_pool)?;
 
-        Ok(Self {
+        let mut config = Self {
             data_dir,
             config_file,
             config_file_found,
-            load_warnings,
+            load_warnings: Vec::new(),
             config_dir,
             cache_dir,
             web_dir,
@@ -879,6 +962,8 @@ impl Config {
             tvdb_token_days,
             fanart_personal_api_key,
             musicbrainz_base_url,
+            provider_timeout_seconds,
+            provider_max_wait_seconds,
             ffmpeg_path,
             ffprobe_path,
             ffmpeg_img_extract_perf_tradeoff: parse_bool_var(
@@ -890,6 +975,7 @@ impl Config {
             library_roots,
             server_name,
             log_level,
+            log_format,
             admin_user,
             admin_password,
             db_pool,
@@ -966,7 +1052,11 @@ impl Config {
                 .or(file.playback_metrics_queue),
             quick_connect_pending_per_ip: parse_var(env, "FERROFIN_QUICK_CONNECT_PENDING_PER_IP")
                 .or(file.quick_connect_pending_per_ip),
-        })
+        };
+        // The file's warnings first, then the variables', in the order read.
+        load_warnings.extend(env.warnings.take());
+        config.load_warnings = load_warnings;
+        Ok(config)
     }
 
     /// The path to the SQLite database file.
@@ -1057,7 +1147,8 @@ impl Config {
     ///
     /// Held for the process's life: the data, configuration and cache
     /// directories (the database, configuration and caches never move under a
-    /// running process), the log filter (`init_tracing` installs it once), and
+    /// running process), the log filter and format (`init_tracing` installs
+    /// them once), and
     /// the scan-duration histogram buckets (the metrics pipeline installs them
     /// once; kept even before metrics were first enabled, so the setting
     /// always applies on a process restart). The test seams that are no
@@ -1076,6 +1167,12 @@ impl Config {
         );
         keep_running(&mut next.cache_dir, &self.cache_dir, "cache_dir", &mut kept);
         keep_running(&mut next.log_level, &self.log_level, "log_level", &mut kept);
+        keep_running(
+            &mut next.log_format,
+            &self.log_format,
+            "log_format",
+            &mut kept,
+        );
         // Compared bit for bit: an unparsable entry is NaN, which never equals
         // itself, and an unchanged list must not read as a change.
         let bits = |buckets: &Option<Vec<f64>>| {
@@ -1146,12 +1243,15 @@ impl Config {
             tvdb_token_days: None,
             fanart_personal_api_key: String::new(),
             musicbrainz_base_url: OFFLINE_PROVIDER_URL.to_owned(),
+            provider_timeout_seconds: RequestLimits::DEFAULT_TIMEOUT_SECONDS,
+            provider_max_wait_seconds: RequestLimits::DEFAULT_MAX_WAIT_SECONDS,
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_img_extract_perf_tradeoff: false,
             library_roots: Vec::new(),
             server_name: "ferrofin-test".to_owned(),
             log_level: "info".to_owned(),
+            log_format: LogFormat::Json,
             admin_user: "admin".to_owned(),
             admin_password: String::new(),
             db_pool: None,
@@ -1196,6 +1296,54 @@ fn keep_running<T: Clone + PartialEq>(
     if next != running {
         next.clone_from(running);
         kept.push(key);
+    }
+}
+
+/// Resolves a provider request limit in seconds: the `env_key` env var >
+/// `file_key` in `config.toml` > `default`, clamped to `range`. A value
+/// outside the range warns ([`Env::warn`]) and takes the nearest bound, as
+/// the limit always did; one that does not parse warns and is unset.
+fn resolve_provider_seconds(
+    env: &dyn Env,
+    env_key: &str,
+    file_key: &str,
+    file: Option<u64>,
+    default: u64,
+    range: std::ops::RangeInclusive<u64>,
+) -> u64 {
+    let seconds = parse_var(env, env_key).or(file).unwrap_or(default);
+    let clamped = seconds.clamp(*range.start(), *range.end());
+    if clamped != seconds {
+        env.warn(format!(
+            "{env_key} / {file_key} `{seconds}` is outside {} to {} seconds; using {clamped}",
+            range.start(),
+            range.end()
+        ));
+    }
+    clamped
+}
+
+/// Resolves the stdout log format: the `FERROFIN_LOG_FORMAT` env var when it
+/// is not blank, else `log_format` in `config.toml`, else JSON. `json` and
+/// `text` match in any case; anything else warns ([`Env::warn`]) and is JSON,
+/// as it always was.
+fn resolve_log_format(env: &dyn Env, file: Option<String>) -> LogFormat {
+    let Some(raw) = env
+        .var("FERROFIN_LOG_FORMAT")
+        .filter(|raw| !raw.trim().is_empty())
+        .or(file)
+    else {
+        return LogFormat::Json;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "json" => LogFormat::Json,
+        "text" => LogFormat::Text,
+        _ => {
+            env.warn(format!(
+                "FERROFIN_LOG_FORMAT / log_format `{raw}` is neither `json` nor `text`; using json"
+            ));
+            LogFormat::Json
+        }
     }
 }
 
@@ -1338,12 +1486,97 @@ fn resolve_trickplay_concurrency(
     }
 }
 
+/// The keys `config.toml` may hold: [`FileConfig`]'s field names, as its
+/// derived `Deserialize` hands them to the deserializer, so no list is kept
+/// by hand.
+fn file_config_keys() -> &'static [&'static str] {
+    use serde::de::{self, Visitor};
+
+    /// Carries the field names out of `deserialize_struct`.
+    #[derive(Debug)]
+    struct Fields(&'static [&'static str]);
+    impl std::fmt::Display for Fields {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("field names")
+        }
+    }
+    impl std::error::Error for Fields {}
+    impl de::Error for Fields {
+        fn custom<T: std::fmt::Display>(_: T) -> Self {
+            Fields(&[])
+        }
+    }
+
+    /// A deserializer that only records the struct's field names.
+    struct FieldNames;
+    impl<'de> de::Deserializer<'de> for FieldNames {
+        type Error = Fields;
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Fields> {
+            Err(Fields(&[]))
+        }
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Fields> {
+            Err(Fields(fields))
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+            identifier ignored_any
+        }
+    }
+
+    match FileConfig::deserialize(FieldNames) {
+        Err(Fields(fields)) => fields,
+        Ok(_) => &[],
+    }
+}
+
+/// Warnings for the keys of `table` that `config.toml` cannot hold, in key
+/// order: each names the key, and the key to use where it is a key in the
+/// wrong case (`Port`) or the stem of a variable whose key is spelled
+/// otherwise ([`KEYS_NOT_NAMED_BY_STEM`]); the file's keys are case-sensitive.
+fn unknown_key_warnings<'a>(table: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let known = file_config_keys();
+    let mut unknown: Vec<&String> = table
+        .into_iter()
+        .filter(|key| !known.contains(&key.as_str()))
+        .collect();
+    unknown.sort();
+    unknown
+        .into_iter()
+        .map(|key| {
+            let canonical = known
+                .iter()
+                .find(|known| known.eq_ignore_ascii_case(key))
+                .copied()
+                .or_else(|| {
+                    KEYS_NOT_NAMED_BY_STEM.iter().find_map(|(var, file_key)| {
+                        var.strip_prefix("FERROFIN_")
+                            .is_some_and(|stem| stem.eq_ignore_ascii_case(key))
+                            .then_some(*file_key)
+                    })
+                });
+            match canonical {
+                Some(file_key) => format!(
+                    "unknown key `{key}` in config.toml is ignored; did you mean `{file_key}`?"
+                ),
+                None => format!("unknown key `{key}` in config.toml is ignored"),
+            }
+        })
+        .collect()
+}
+
 /// Reads and parses the optional `config.toml` at `path` (chosen by
-/// [`Config::load_from`]), and says whether it existed. A missing file yields
-/// an empty (all-`None`) config — never an error.
-fn load_file_config(path: &Path) -> anyhow::Result<(FileConfig, bool)> {
+/// [`Config::load_from`]), says whether it existed, and warns about each key
+/// it holds that is not a setting ([`unknown_key_warnings`]). A missing file
+/// yields an empty (all-`None`) config — never an error.
+fn load_file_config(path: &Path) -> anyhow::Result<(FileConfig, bool, Vec<String>)> {
     if !path.exists() {
-        return Ok((FileConfig::default(), false));
+        return Ok((FileConfig::default(), false, Vec::new()));
     }
 
     let settings = config::Config::builder()
@@ -1356,10 +1589,17 @@ fn load_file_config(path: &Path) -> anyhow::Result<(FileConfig, bool)> {
                 without_source_lines(&e.to_string())
             )
         })?;
+    let warnings = unknown_key_warnings(
+        settings
+            .clone()
+            .try_deserialize::<std::collections::HashMap<String, config::Value>>()
+            .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))?
+            .keys(),
+    );
     let file = settings
         .try_deserialize()
         .map_err(|e| anyhow::anyhow!("failed to parse config file `{}`: {e}", path.display()))?;
-    Ok((file, true))
+    Ok((file, true, warnings))
 }
 
 /// A TOML parse error without the lines of the file it quotes: the line at
@@ -1425,12 +1665,46 @@ fn split_list(value: &str) -> Vec<PathBuf> {
 trait Env {
     /// Returns the value of `key`, or `None` if unset or non-UTF-8.
     fn var(&self, key: &str) -> Option<String>;
+
+    /// Records a value that is set but cannot be used. The process
+    /// environment and the test fakes drop it; [`Config::load_from`] reads
+    /// through a [`WarningEnv`], which keeps it for [`Config::load_warnings`].
+    fn warn(&self, _warning: String) {}
 }
 
-/// Reads `key` from `env` and parses it as `T`, yielding `None` when the var is
-/// unset or does not parse.
+/// An [`Env`] that keeps the warnings its values raise ([`Env::warn`]).
+struct WarningEnv<'a> {
+    env: &'a dyn Env,
+    warnings: std::cell::RefCell<Vec<String>>,
+}
+
+impl Env for WarningEnv<'_> {
+    fn var(&self, key: &str) -> Option<String> {
+        self.env.var(key)
+    }
+
+    fn warn(&self, warning: String) {
+        self.warnings.borrow_mut().push(warning);
+    }
+}
+
+/// Reads `key` from `env` and parses it as `T` (blanks around the value
+/// ignored), yielding `None` when the var is unset or blank, and when it does
+/// not parse, which also warns ([`Env::warn`]) so the operator learns the
+/// value did nothing.
 fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Option<T> {
-    env.var(key).and_then(|v| v.parse().ok())
+    let raw = env.var(key)?;
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let parsed = value.parse().ok();
+    if parsed.is_none() {
+        env.warn(format!(
+            "{key} `{raw}` is not a valid value and is ignored; config.toml or the default applies"
+        ));
+    }
+    parsed
 }
 
 /// A boolean env var, accepting the forms people actually write in a container
@@ -1440,12 +1714,21 @@ fn parse_var<T: std::str::FromStr>(env: &dyn Env, key: &str) -> Option<T> {
 /// silently discards `FERROFIN_ENABLE_METRICS=1`: it parses as `None`, falls
 /// through to the file/default, and the operator sees a knob that did nothing
 /// and said nothing. Accepted here, case-insensitively: `1`/`0`, `true`/`false`,
-/// `yes`/`no`, `on`/`off`. Anything else is `None`, same as before.
+/// `yes`/`no`, `on`/`off`. Blank is unset; anything else is `None` too, with a
+/// warning ([`Env::warn`]).
 fn parse_bool_var(env: &dyn Env, key: &str) -> Option<bool> {
-    match env.var(key)?.trim().to_ascii_lowercase().as_str() {
+    let raw = env.var(key)?;
+    match raw.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
+        "" => None,
+        _ => {
+            env.warn(format!(
+                "{key} `{raw}` is not on or off (1/0, true/false, yes/no, on/off) and is \
+                 ignored; config.toml or the default applies"
+            ));
+            None
+        }
     }
 }
 
@@ -1937,6 +2220,194 @@ mod tests {
         assert_eq!(cfg.admin_password, "123456");
         assert_eq!(cfg.tvdb_subscriber_pin, "4321");
         assert_eq!(cfg.omdb_api_key, "true");
+    }
+
+    /// A key `config.toml` cannot hold is a warning that names it, and the
+    /// variable's stem where the key is spelled otherwise names the key to
+    /// use; the file's other keys still apply, and the stem is no alias.
+    #[test]
+    fn an_unknown_key_is_a_warning_naming_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "tvdb_pin = \"1234\"\nbogus = 1\nport = 5000\nServer_Name = \"x\"\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.port, 5000);
+        assert_eq!(cfg.tvdb_subscriber_pin, "", "the stem is not an alias");
+        assert_eq!(cfg.load_warnings.len(), 3, "{:?}", cfg.load_warnings);
+        let about = |key: &str| {
+            cfg.load_warnings
+                .iter()
+                .find(|w| w.contains(&format!("`{key}`")))
+                .unwrap_or_else(|| panic!("no warning about {key}: {:?}", cfg.load_warnings))
+        };
+        assert!(
+            about("tvdb_pin").contains("`tvdb_subscriber_pin`"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert!(
+            !about("bogus").contains("did you mean"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert!(
+            about("Server_Name").contains("`server_name`"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert_ne!(cfg.server_name, "x", "keys are case-sensitive");
+    }
+
+    /// Every `FERROFIN_*` variable this module reads has a `config.toml`
+    /// key, its stem or the one [`KEYS_NOT_NAMED_BY_STEM`] gives it, and
+    /// every key has a variable; `docs/CONFIG.md` has a row for every
+    /// variable and lists every key that is not a stem. A new setting that
+    /// misses any of these fails here.
+    #[test]
+    fn every_variable_has_a_key_and_a_row_in_the_docs() {
+        let source = include_str!("config.rs");
+        let code = &source[..source.find("\nmod tests {").expect("the test module")];
+        let docs = include_str!("../../../docs/CONFIG.md");
+        let vars: std::collections::BTreeSet<String> = code
+            .match_indices("\"FERROFIN_")
+            .map(|(at, _)| {
+                code[at + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                    .collect::<String>()
+            })
+            .filter(|name| name.len() > "FERROFIN_".len())
+            .collect();
+        let key_of = |var: &str| {
+            KEYS_NOT_NAMED_BY_STEM
+                .iter()
+                .find(|(named, _)| *named == var)
+                .map_or_else(
+                    || var["FERROFIN_".len()..].to_ascii_lowercase(),
+                    |(_, key)| (*key).to_owned(),
+                )
+        };
+        let keys = file_config_keys();
+        let mut problems = Vec::new();
+        for var in &vars {
+            if !docs.contains(&format!("| `{var}` |")) {
+                problems.push(format!("{var}: no row in docs/CONFIG.md"));
+            }
+            let key = key_of(var);
+            if var != "FERROFIN_CONFIG_FILE" && !keys.contains(&key.as_str()) {
+                problems.push(format!("{var}: config.toml has no key `{key}`"));
+            }
+        }
+        for key in keys {
+            if !vars.iter().any(|var| key_of(var) == *key) {
+                problems.push(format!("`{key}`: no FERROFIN_* variable reads it"));
+            }
+        }
+        for (var, key) in KEYS_NOT_NAMED_BY_STEM {
+            if !docs.contains(&format!("| `{var}` | `{key}` |")) {
+                problems.push(format!(
+                    "{var} → {key}: missing from docs/CONFIG.md's key table"
+                ));
+            }
+        }
+        assert!(problems.is_empty(), "{problems:#?}");
+        assert!(
+            vars.len() > 40,
+            "the scan found too few variables: {vars:?}"
+        );
+    }
+
+    /// A variable that does not parse is a warning naming it, and
+    /// `config.toml` or the default applies as before; a blank one is unset.
+    #[test]
+    fn an_unparsable_variable_is_a_warning_naming_it() {
+        let env = FakeEnv::new()
+            .with("FERROFIN_PORT", "80g")
+            .with("FERROFIN_ENABLE_METRICS", "maybe")
+            .with("FERROFIN_HTTPS_PORT", "")
+            .with("FERROFIN_SHUTDOWN_TIMEOUT_SECS", " 45 ");
+        let cfg = Config::load_from(Cli::default(), &env).unwrap();
+        assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+        assert_eq!(cfg.enable_metrics, None);
+        assert_eq!(cfg.https_port, DEFAULT_HTTPS_PORT);
+        assert_eq!(
+            cfg.shutdown_timeout_secs, 45,
+            "surrounding blanks are not an error"
+        );
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("FERROFIN_PORT"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert!(
+            cfg.load_warnings[1].contains("FERROFIN_ENABLE_METRICS"),
+            "{:?}",
+            cfg.load_warnings
+        );
+    }
+
+    /// The provider request limits and the log format are settings of the
+    /// file too, not unknown keys.
+    #[test]
+    fn the_provider_limits_and_the_log_format_are_config_toml_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "provider_timeout_seconds = 30\nprovider_max_wait_seconds = 120\nlog_format = \"text\"\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(cfg.provider_timeout_seconds, 30);
+        assert_eq!(cfg.provider_max_wait_seconds, 120);
+        assert_eq!(cfg.log_format, LogFormat::Text);
+
+        // The variables win; out of range is clamped with a warning, an
+        // unknown format warns and is JSON.
+        let env = FakeEnv::new()
+            .with("FERROFIN_PROVIDER_TIMEOUT_SECONDS", "5")
+            .with("FERROFIN_PROVIDER_MAX_WAIT_SECONDS", "45")
+            .with("FERROFIN_LOG_FORMAT", "pretty");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(cfg.provider_timeout_seconds, 10);
+        assert_eq!(cfg.provider_max_wait_seconds, 45);
+        assert_eq!(cfg.log_format, LogFormat::Json);
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+        assert!(
+            cfg.load_warnings[0].contains("FERROFIN_PROVIDER_TIMEOUT_SECONDS"),
+            "{:?}",
+            cfg.load_warnings
+        );
+        assert!(
+            cfg.load_warnings[1].contains("`pretty`"),
+            "{:?}",
+            cfg.load_warnings
+        );
+
+        // Unset: the defaults, which the provider crate defines.
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            (cfg.provider_timeout_seconds, cfg.provider_max_wait_seconds),
+            (
+                RequestLimits::DEFAULT_TIMEOUT_SECONDS,
+                RequestLimits::DEFAULT_MAX_WAIT_SECONDS
+            )
+        );
+        assert_eq!(cfg.log_format, LogFormat::Json);
     }
 
     /// The config file is TOML: a file named for another format is refused,

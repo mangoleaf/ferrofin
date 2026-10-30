@@ -105,7 +105,7 @@ fn log_startup_banner(config: &Config) {
     tracing::info!(
         library_roots = config.library_roots.len(),
         admin_user = %config.admin_user,
-        admin_password_set = !config.admin_password.is_empty(),
+        admin_password_set = !config.admin_password.trim().is_empty(),
         "library & admin"
     );
 }
@@ -296,8 +296,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 /// line, so a changed `config.toml` applies on `POST /System/Restart`.
 ///
 /// What the process holds for its whole life (the directories, the log
-/// filter, the scan-duration histogram buckets) keeps its running value, with
-/// a warning naming each such setting that changed
+/// filter and format, the scan-duration histogram buckets) keeps its running
+/// value, with a warning naming each such setting that changed
 /// ([`Config::for_restart`]). A reload that fails (a `config.toml` that no
 /// longer parses or validates) is logged as an error naming the file, and the
 /// next lifetime runs on the configuration this one ran on: a server with no
@@ -395,9 +395,11 @@ fn next_lifetime_config(running: &Config, reloaded: anyhow::Result<Config>) -> C
 
 /// Logs what loading `config` set aside ([`Config::load_warnings`]): loading
 /// runs before tracing is installed, so its findings are logged here instead.
+/// Each names its key or variable; `config_file` is the file in use, as
+/// context (a warning about a variable is not about that file).
 fn log_load_warnings(config: &Config) {
     for warning in &config.load_warnings {
-        tracing::warn!(path = %config.config_file.display(), "{warning}");
+        tracing::warn!(config_file = %config.config_file.display(), "{warning}");
     }
 }
 

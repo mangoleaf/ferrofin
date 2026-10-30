@@ -963,11 +963,24 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   a file found in the data directory is ignored with a warning (see
   [docs/UPGRADING.md](docs/UPGRADING.md))
 - Dashboard → Restart loads `config.toml` again, so its changes apply without restarting the
-  process; the data, configuration and cache directories, `log_level` and
+  process; the data, configuration and cache directories, `log_level`, `log_format` and
   `metrics_scan_duration_buckets` keep their values until the process restarts (with a warning
   naming them), and a file that no longer loads is logged and leaves the previous
   configuration running. A `config.toml` parse error names the line and column but no longer
   quotes the line, which may hold a password
+- A `config.toml` key the server ignores, a misspelling or a variable's stem where the key is
+  spelled otherwise (`tvdb_pin` for `tvdb_subscriber_pin`), is a startup warning naming it and
+  the key to use, and so is a number or on/off variable that does not parse
+  (`FERROFIN_PORT=80g`); both used to be dropped without a word. `docs/CONFIG.md` lists the
+  seven keys that are not their variable's stem, and documents `FERROFIN_DISABLE_EXTENSIONS`
+  and `FERROFIN_MAX_PLUGIN_DOWNLOAD_MB`. The startup log's `admin_password_set` no longer
+  reports a blank password as set
+- The metadata-provider request limits and the stdout log format are `config.toml` settings
+  too (`provider_timeout_seconds`, `provider_max_wait_seconds`, `log_format`), beside
+  `FERROFIN_PROVIDER_TIMEOUT_SECONDS`, `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` and
+  `FERROFIN_LOG_FORMAT`, which keep working as before. The provider limits now apply on
+  Dashboard → Restart; a limit outside its range, or a log format other than `json` or `text`,
+  logs a warning. The `OTEL_*` variables are documented as environment only
 - `FERROFIN_LIBRARY_ROOTS` (`library_roots` in `config.toml`) does what it is documented to do:
   a fresh install starts with one library per listed folder, named after it, and scans them.
   Nothing read the setting before, so a headless install that set it started with no libraries.

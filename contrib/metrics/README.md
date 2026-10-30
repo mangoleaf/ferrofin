@@ -108,7 +108,8 @@ OTEL_TRACES_SAMPLER_ARG=0.25 \
 
 With export on, stdout is structured JSON by default and every log line emitted
 inside a **sampled** request carries the request's `trace_id` (unsampled requests
-carry none — no dead links). `FERROFIN_LOG_FORMAT=text` restores the legacy
+carry none — no dead links). `FERROFIN_LOG_FORMAT=text` (`log_format = "text"` in
+`config.toml`) restores the legacy
 human-readable stdout for interactive dev; the rotating log **file** is always
 plain text regardless (it feeds the `GET /System/Logs` dashboard viewer).
 

@@ -613,8 +613,9 @@ The tiered matrix with verification depth per area is
 Ferrofin is built to be run under a modern monitoring stack, not tailed in a terminal.
 
 - **Structured JSON logs** on stdout by default, one event per line with a level, target
-  and typed fields (`item_id`, `user_id`, `task`, …). Set `FERROFIN_LOG_FORMAT=text` for
-  the human-readable form when running interactively; `FERROFIN_LOG` takes the usual
+  and typed fields (`item_id`, `user_id`, `task`, …). Set `FERROFIN_LOG_FORMAT=text` (or
+  `log_format = "text"` in `config.toml`) for the human-readable form when running
+  interactively; `FERROFIN_LOG` takes the usual
   `RUST_LOG` filter syntax.
 - **Prometheus metrics** at `/metrics` when `FERROFIN_ENABLE_METRICS=true`, using
   Jellyfin's own metric names (`http_*`, `process_*`) so existing dashboards keep
