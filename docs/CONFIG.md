@@ -6,7 +6,7 @@ Ferrofin is configured three ways, **highest precedence first**:
 2. **`FERROFIN_*` environment variables** — the full surface, below.
 3. **`config.toml`** — an optional file at `{data_dir}/config.toml` (or `--config`/
    `FERROFIN_CONFIG_FILE`). Each key is its variable's stem, lower-cased and prefix-stripped
-   (`FERROFIN_BIND_ADDR` → `bind_addr`), except the seven in the table below. The whole file is
+   (`FERROFIN_BIND_ADDR` → `bind_addr`), except the six in the table below. The whole file is
    optional; a missing one is not an error. It is TOML and must be named `*.toml`: any other
    name (`config.json`, `config.yaml`, …) is refused.
 
@@ -18,9 +18,8 @@ Ferrofin is configured three ways, **highest precedence first**:
 | `FERROFIN_TVDB_PIN` | `tvdb_subscriber_pin` |
 | `FERROFIN_FANART_KEY` | `fanart_personal_api_key` |
 | `FERROFIN_MUSICBRAINZ_URL` | `musicbrainz_base_url` |
-| `FERROFIN_WS_MIN_STREAM_PERIOD_MS` | `websocket_min_stream_period_ms` |
 
-Each setting has exactly one key; the variable's stem is not accepted for these seven.
+Each setting has exactly one key; the variable's stem is not accepted for these six.
 `FERROFIN_CONFIG_FILE` has no key: it names the file. A key the file cannot hold is ignored with
 a warning at startup that names it, and a key spelled as its variable's stem (`tvdb_pin`) is
 told the key to use (`tvdb_subscriber_pin`). A number or on/off variable whose value does not
@@ -82,7 +81,6 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_PUBLISHED_URL` | auto-detect | Public base URL advertised to clients. |
 | `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. |
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
-| `FERROFIN_WS_MIN_STREAM_PERIOD_MS` | `100` | Smallest period, in milliseconds, between pushes of a dashboard WebSocket stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). A client names the period in its `*Start` subscription. Every stream is sent on events, as Jellyfin's are, and the period only spaces out low-priority updates (session activity, task progress); it is clamped up to this floor, which Jellyfin does not have. Well-behaved clients ask for 1500 ms and are unaffected. The `config.toml` key is `websocket_min_stream_period_ms`. |
 | `FERROFIN_LOG` | `info` | Log filter, `RUST_LOG`/`EnvFilter` syntax; `RUST_LOG` wins when set. The `config.toml` key is `log_level`. |
 | `FERROFIN_LOG_FORMAT` | `json` | Stdout log lines: `json` (one JSON object per line, with the request's `trace_id`, for a log pipeline) or `text` (human-readable, for running the server by hand). Any other value logs a warning and is `json`. The log file under `{data_dir}/log` is always plain text. The `config.toml` key is `log_format`. |
 | `FERROFIN_QUICK_CONNECT_PENDING_PER_IP` | `10` | How many unauthorized Quick Connect requests one client IP may hold at once. `POST /QuickConnect/Initiate` needs no sign-in, so past this cap the IP's oldest pending request is dropped and its code stops working. Jellyfin has no cap. Behind a reverse proxy that is not in **Known proxies**, every client shares the proxy's IP, so the cap then counts all clients together. The cap is per address, so an IPv6 client can spread requests across its prefix. `0` means the default. The `config.toml` key is `quick_connect_pending_per_ip`. |

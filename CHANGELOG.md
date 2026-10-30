@@ -140,6 +140,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   start and completion are still sent at once, and subscribing still sends the current task
   list once (Jellyfin sends nothing until a task event, but the dashboard's scan button needs
   it). An idle dashboard now costs no task-list reads
+- The WebSocket minimum stream period setting added in 1.4.0
+  (`FERROFIN_WS_MIN_STREAM_PERIOD_MS`, `websocket_min_stream_period_ms`) is gone. Every
+  dashboard stream is now sent on events, so a client's period only spaces out low-priority
+  updates and has no floor, as in Jellyfin; a period of 0 or below now sends every update,
+  where it used to fall back to 1500 ms. A `config.toml` that still sets the key loads, with a
+  warning that it is ignored
 - Report Jellyfin version 12.4.0 (was 12.2.0) in `/System/Info` and `/System/Info/Public`,
   built-in plugin versions and the plugin catalog's `targetAbi` filter: the newest Jellyfin
   release Ferrofin adopts
@@ -627,6 +633,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   folders view, a season's episodes): compute each child's sort key once instead of on
   every comparison. Sorting 2,000 children made 95,896 heap allocations and now makes
   6,004; the order is unchanged
+- A request on a session that already exists no longer reads the device's options row or
+  copies its stored capabilities; only the request that creates the session does. Every
+  playback start, progress and stop report ran one `DeviceOptions` statement before, and
+  now runs none. Those reports also take just the session id and the fields they use,
+  where they built the session's DTO and copied the whole session
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -1029,7 +1040,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   spelled otherwise (`tvdb_pin` for `tvdb_subscriber_pin`), is a startup warning naming it and
   the key to use, and so is a number or on/off variable that does not parse
   (`FERROFIN_PORT=80g`); both used to be dropped without a word. `docs/CONFIG.md` lists the
-  seven keys that are not their variable's stem, and documents `FERROFIN_DISABLE_EXTENSIONS`
+  six keys that are not their variable's stem, and documents `FERROFIN_DISABLE_EXTENSIONS`
   and `FERROFIN_MAX_PLUGIN_DOWNLOAD_MB`. The startup log's `admin_password_set` no longer
   reports a blank password as set
 - The metadata-provider request limits and the stdout log format are `config.toml` settings
@@ -1042,6 +1053,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   a fresh install starts with one library per listed folder, named after it, and scans them.
   Nothing read the setting before, so a headless install that set it started with no libraries.
   A later boot, or an adopted Jellyfin database, adds none
+- A scan finds a movie or series with no id on TheMovieDb and OMDb by its parsed name, as
+  Jellyfin does (`ParseName`): a `Split (2016)` folder searched TheMovieDb for `Split 2016` and
+  matched nothing, so a movie in the usual `Name (Year)` layout with no NFO or id tag got no
+  metadata. The year in the name is the search year when the item has none, and OMDb gets the
+  title with its punctuation
 
 ## [1.0.0] - 2026-09-05
 
