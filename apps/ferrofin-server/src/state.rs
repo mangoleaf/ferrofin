@@ -1692,15 +1692,17 @@ pub async fn build_app_state(
     // feed the plugin manager below (so they appear in `/Plugins`); their tasks
     // are registered once `media_segments` exists, and the `task_manager` is
     // wrapped into the `tasks` seam after that.
-    // Suppressed wholesale when `disable_extensions` is set: no descriptors in
+    // Suppressed when `disable_extensions` is set: no descriptors in
     // `/Plugins`, no scheduled tasks, no event hooks. A benchmark leg must
-    // compare like with like, and the Jellyfin leg runs with no plugins.
-    let extensions = if config.disable_extensions {
-        tracing::info!("extensions disabled by configuration");
-        Vec::new()
-    } else {
-        ferrofin_extensions::builtin_extensions()
-    };
+    // compare like with like, and the Jellyfin leg runs with no plugins. The
+    // Ferrofin settings extension stays (owner decision D4): it ports no
+    // plugin and has no tasks or hooks, only the server's own settings page.
+    if config.disable_extensions {
+        tracing::info!(
+            "extensions disabled by configuration; the Ferrofin settings extension stays"
+        );
+    }
+    let extensions = ferrofin_extensions::registered_extensions(config.disable_extensions);
     let media_sources: Arc<dyn ferrofin_traits::library::MediaSourceManager> = Arc::new(
         FerrofinMediaSourceManager::new(
             Arc::clone(&item_repository),
@@ -2723,6 +2725,16 @@ pub async fn build_app_state(
     // list and per-plugin configuration under `{config}/plugins/` and stages WASM
     // installs for the next start; `docs/EXTENSIONS.md` describes the two tiers.
     let state = state.with_plugins(Arc::clone(&plugins));
+
+    // ---- Ferrofin settings -----------------------------------------------
+    // `GET /Ferrofin/Settings`: the bootstrap configuration this lifetime runs
+    // with and where each value comes from, while the Ferrofin plugin is
+    // enabled in the plugin manager.
+    let state = state.with_server_settings(Arc::new(crate::settings::FerrofinServerSettings::new(
+        config.clone(),
+        Arc::clone(&lifecycle),
+        Arc::clone(&plugins),
+    )));
 
     // ---- SyncPlay ---------------------------------------------------------
     // The SyncPlay manager shares the session message bus (created with the

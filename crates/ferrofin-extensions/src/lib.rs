@@ -9,7 +9,8 @@
 //! [`builtin_extensions`] — but each is enable/disable-able at runtime; a task
 //! self-gates on its plugin's enabled flag, so toggling needs no restart.
 //!
-//! The composition root drives this: it builds [`RegisteredPlugin`]s from the
+//! The composition root drives this: it picks the extensions to register
+//! ([`registered_extensions`]), builds [`RegisteredPlugin`]s from their
 //! descriptors ([`registered_plugins`]) and registers each extension's tasks
 //! ([`register_tasks`]).
 
@@ -24,6 +25,7 @@ use uuid::Uuid;
 
 use crate::fingerprint::Fingerprinter;
 
+pub mod ferrofin_settings;
 pub mod ffmpeg;
 pub mod file_transformation;
 pub mod fingerprint;
@@ -101,7 +103,23 @@ pub fn builtin_extensions() -> Vec<Arc<dyn Extension>> {
         Arc::new(intro_skipper::IntroSkipperExtension::new()),
         Arc::new(file_transformation::FileTransformationExtension),
         Arc::new(merge_versions::MergeVersionsExtension),
+        Arc::new(ferrofin_settings::FerrofinSettingsExtension),
     ]
+}
+
+/// The extensions a server registers: every one of [`builtin_extensions`],
+/// or, with `disable_extensions` set (the benchmark's switch, so Ferrofin is
+/// measured against a Jellyfin with no plugins), only the Ferrofin settings
+/// extension. That one ports no plugin and has no tasks or hooks to fire
+/// inside a measurement: it is the server's own settings page.
+#[must_use]
+pub fn registered_extensions(disable_extensions: bool) -> Vec<Arc<dyn Extension>> {
+    builtin_extensions()
+        .into_iter()
+        .filter(|extension| {
+            !disable_extensions || extension.id() == ferrofin_settings::EXTENSION_ID
+        })
+        .collect()
 }
 
 /// Builds the [`RegisteredPlugin`]s the plugin manager needs, so every extension
@@ -208,7 +226,7 @@ mod tests {
     #[test]
     fn registered_plugins_carry_each_extensions_seed_config_and_pages() {
         let extensions = builtin_extensions();
-        assert_eq!(extensions.len(), 3);
+        assert_eq!(extensions.len(), 4);
         let plugins = registered_plugins(&extensions);
         assert_eq!(plugins.len(), extensions.len());
         for (plugin, ext) in plugins.iter().zip(&extensions) {
@@ -228,7 +246,25 @@ mod tests {
     fn extension_ids_are_unique() {
         let ids: std::collections::HashSet<Uuid> =
             builtin_extensions().iter().map(|e| e.id()).collect();
-        assert_eq!(ids.len(), 3, "plugin ids double as /Plugins keys");
+        assert_eq!(ids.len(), 4, "plugin ids double as /Plugins keys");
+    }
+
+    #[tokio::test]
+    async fn disable_extensions_keeps_only_the_ferrofin_settings() {
+        let ids = |extensions: Vec<Arc<dyn Extension>>| -> Vec<Uuid> {
+            extensions.iter().map(|e| e.id()).collect()
+        };
+        assert_eq!(
+            ids(registered_extensions(false)),
+            ids(builtin_extensions()),
+            "unset, every extension is registered"
+        );
+        let kept = registered_extensions(true);
+        assert_eq!(ids(kept.clone()), vec![ferrofin_settings::EXTENSION_ID]);
+        // Nothing of it can fire inside a measurement window.
+        let cx = context().await;
+        assert!(kept[0].tasks(&cx).is_empty());
+        assert!(kept[0].media_segment_providers(&cx).is_empty());
     }
 
     #[tokio::test]

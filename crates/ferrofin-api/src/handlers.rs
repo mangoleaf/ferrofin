@@ -154,6 +154,7 @@ pub mod dashboard;
 pub mod devices;
 pub mod display_preferences;
 pub mod environment;
+pub mod ferrofin_settings;
 pub mod filter;
 pub mod genres;
 pub mod hls;
@@ -2037,6 +2038,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = merge_versions::register(router);
     // Plugins Tier 1 — plugin-manager surface over the compile-time registry.
     let router = plugins::register(router);
+    // The Ferrofin plugin's settings page — not a contract operation, so in
+    // neither REAL_ROUTES nor EXTENSION_ROUTES.
+    let router = ferrofin_settings::register(router);
     // Live TV read surface — empty/disabled state so the web UI treats Live TV
     // as "not configured" instead of erroring on 501 (mutations stay stubbed).
     let router = live_tv::register(router);
