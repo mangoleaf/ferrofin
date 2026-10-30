@@ -30,6 +30,7 @@ pub mod ffmpeg;
 pub mod file_transformation;
 pub mod fingerprint;
 pub mod intro_skipper;
+mod library_pages;
 pub mod merge_versions;
 
 /// The collaborators an extension's tasks are allowed to touch (trait objects

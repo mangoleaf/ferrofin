@@ -69,8 +69,10 @@ const TICKS_PER_SECOND: i64 = 10_000_000;
 /// The upstream Library category display string (`TasksLibraryCategory`).
 const LIBRARY: &str = "Library";
 
-/// Items examined per page (the upstream `QueryPageLimit`).
-const PAGE_SIZE: i32 = 100;
+/// Items examined per page (the upstream `QueryPageLimit`). The extensions'
+/// library walks (Intro Skipper's queue, Merge Versions) read their rows in
+/// pages of the same size.
+pub const PAGE_SIZE: i32 = 100;
 
 /// An interval trigger firing every `hours` hours.
 fn interval_hours(hours: i64) -> TaskTriggerInfo {
