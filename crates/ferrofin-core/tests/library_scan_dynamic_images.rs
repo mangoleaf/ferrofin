@@ -188,7 +188,8 @@ fn png(colour: [u8; 3]) -> Vec<u8> {
 /// path, as `ImageSaver.SaveImage` saves it (`Genre.IsSaveLocalMetadataEnabled`
 /// is true), with the file's own modification time — so neither a rescan nor
 /// a full-refresh validation draws the collage over it. A row adopted from
-/// Jellyfin stores that path as `%MetadataPath%/Genre/…`, expanded first.
+/// Jellyfin stores that path as `%MetadataPath%/Genre/…`, which the item read
+/// expands (gl-848) and every save keeps as stored.
 #[rstest::rstest]
 #[case::ferrofin(false)]
 #[case::adopted(true)]
@@ -199,10 +200,23 @@ async fn an_uploaded_genre_primary_survives_rescans(#[case] adopted: bool) {
     write_movie_library(&media);
     let metadata = tmp.path().join("metadata");
     let meta_root = metadata.join("library");
+    // The server's directories, as the composition root wires them: the
+    // internal metadata directory is `{root}/metadata`.
+    let virtual_paths = ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(Arc::new(
+        ferrofin_core::FerrofinServerApplicationPaths::new(
+            tmp.path(),
+            tmp.path().join("log"),
+            tmp.path().join("config"),
+            tmp.path().join("cache"),
+            tmp.path().join("web"),
+        ),
+    ));
 
     let db = Database::connect_in_memory().await.expect("connect");
     db.run_migrations().await.expect("migrate");
-    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let persistence = Arc::new(
+        FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(virtual_paths.clone()),
+    );
     let vf: Arc<dyn VirtualFolderManager> = Arc::new(
         FerrofinVirtualFolderManager::new(tmp.path().join("views"))
             .with_item_store(persistence.clone()),
@@ -219,10 +233,10 @@ async fn an_uploaded_genre_primary_survives_rescans(#[case] adopted: bool) {
     )
     .await
     .expect("add library");
-    let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
-        db.clone(),
-        Arc::new(ItemTypeLookup::new()),
-    ));
+    let items: Arc<dyn ItemRepository> = Arc::new(
+        FerrofinItemRepository::new(db.clone(), Arc::new(ItemTypeLookup::new()))
+            .with_virtual_paths(virtual_paths),
+    );
     let processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
         ImageProcessor::new(Arc::new(ImageCrateEncoder::new()), tmp.path().join("cache")),
     );
@@ -300,6 +314,22 @@ async fn an_uploaded_genre_primary_survives_rescans(#[case] adopted: bool) {
         Path::new(&saved.path),
         genre_dir.join("folder.png"),
         "saved beside the genre, outside its internal metadata folder"
+    );
+    let stored: Option<String> =
+        sqlx::query_scalar(r#"SELECT "Path" FROM "BaseItems" WHERE "Id" = ?1"#)
+            .bind(guid_to_db(genre_id))
+            .fetch_one(db.pool())
+            .await
+            .expect("stored path");
+    let expected = if adopted {
+        "%MetadataPath%/Genre/Crime".to_owned()
+    } else {
+        genre_dir.to_string_lossy().into_owned()
+    };
+    assert_eq!(
+        stored.as_deref(),
+        Some(expected.as_str()),
+        "the saves keep the path as stored"
     );
 }
 

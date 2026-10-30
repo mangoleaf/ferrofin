@@ -8,7 +8,9 @@
 //! makes a Jellyfin database portable between data directories — and what
 //! makes an adopted one unreadable until the same expansion is applied on
 //! Ferrofin's side. Ferrofin writes resolved paths, so expanding on read is
-//! the identity for rows it wrote itself.
+//! the identity for rows it wrote itself; a save of an adopted item row keeps
+//! its stored token form while the path saved is that form's expansion
+//! (`FerrofinItemPersistenceService::upsert_item`).
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -64,6 +66,17 @@ impl VirtualPathExpander {
     #[must_use]
     pub fn expand_opt(&self, path: Option<&str>) -> Option<String> {
         path.map(|p| self.expand(p))
+    }
+
+    /// [`Self::expand`] on a row's stored path, in place: `BaseItemMapper.Map`'s
+    /// `dto.Path = appHost.ExpandVirtualPath(entity.Path)`. A path holding
+    /// neither token is left as it is, without a copy ([`Self::expand_cow`]).
+    pub fn expand_in_place(&self, path: &mut Option<String>) {
+        if let Some(stored) = path.as_deref()
+            && let Cow::Owned(expanded) = self.expand_cow(stored)
+        {
+            *path = Some(expanded);
+        }
     }
 
     /// [`Self::expand`] without a copy when there is nothing to expand: `path` itself, borrowed,
@@ -210,6 +223,48 @@ mod tests {
     fn identity_keeps_the_tokens() {
         let stored = "%MetadataPath%/library/x.jpg";
         assert_eq!(VirtualPathExpander::identity().expand(stored), stored);
+    }
+
+    #[test]
+    fn expand_in_place_rewrites_only_a_stored_token() {
+        let mut stored = Some("%MetadataPath%/Genre/Action".to_owned());
+        expander().expand_in_place(&mut stored);
+        assert_eq!(
+            stored.as_deref(),
+            Some("/var/lib/ferrofin/data/metadata/Genre/Action")
+        );
+        let mut media = Some("/srv/media/a.mkv".to_owned());
+        expander().expand_in_place(&mut media);
+        assert_eq!(media.as_deref(), Some("/srv/media/a.mkv"));
+        let mut none = None;
+        expander().expand_in_place(&mut none);
+        assert_eq!(none, None);
+        let mut kept = Some("%AppDataPath%/playlists".to_owned());
+        VirtualPathExpander::identity().expand_in_place(&mut kept);
+        assert_eq!(kept.as_deref(), Some("%AppDataPath%/playlists"));
+        let mut percent = Some("/media/100%/a.mkv".to_owned());
+        expander().expand_in_place(&mut percent);
+        assert_eq!(percent.as_deref(), Some("/media/100%/a.mkv"));
+    }
+
+    #[test]
+    fn expand_cow_borrows_for_the_identity_and_expands_a_by_name_path() {
+        assert!(matches!(
+            expander().expand_cow("/srv/media/a.mkv"),
+            Cow::Borrowed("/srv/media/a.mkv")
+        ));
+        assert!(matches!(
+            VirtualPathExpander::identity().expand_cow("%MetadataPath%/x"),
+            Cow::Borrowed("%MetadataPath%/x")
+        ));
+        assert_eq!(
+            expander().expand_cow("/media/100%/a.mkv"),
+            "/media/100%/a.mkv"
+        );
+        assert_eq!(
+            expander().expand_cow("%MetadataPath%/People/A/Amanda Adams"),
+            "/var/lib/ferrofin/data/metadata/People/A/Amanda Adams"
+        );
     }
 
     #[test]

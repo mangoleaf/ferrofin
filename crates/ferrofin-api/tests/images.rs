@@ -854,7 +854,7 @@ impl ferrofin_traits::drawing::ImageProcessor for RecordingProcessor {
     }
     async fn get_image_cache_tag(
         &self,
-        _item_id: Uuid,
+        _item_path: Option<&str>,
         _image: &ItemImageInfo,
     ) -> Result<Option<String>, ServiceError> {
         Ok(None)

@@ -1292,8 +1292,11 @@ impl FerrofinLiveTvManager {
                 continue;
             };
             // `GetImageTag` logs and answers null on a failure. Debug, not
-            // upstream's error: it would repeat on every guide page.
-            match images.processor.get_image_cache_tag(id, primary).await {
+            // upstream's error: it would repeat on every guide page. The tag
+            // hashes the channel item's path, and a channel item has none
+            // (`GuideManager.GetChannel` sets no `Path`; nor does
+            // `projection::channel_entity`), so its row is not read for it.
+            match images.processor.get_image_cache_tag(None, primary).await {
                 Ok(Some(tag)) => {
                     tags.insert(id, tag);
                 }
@@ -9092,10 +9095,13 @@ mod tests {
         }
         async fn get_image_cache_tag(
             &self,
-            _item_id: Uuid,
+            item_path: Option<&str>,
             image: &ferrofin_traits::options::ItemImageInfo,
         ) -> Result<Option<String>, ServiceError> {
-            Ok(Some(format!("tag:{}", image.path)))
+            Ok(Some(match item_path {
+                Some(owner) => format!("tag:{}@{owner}", image.path),
+                None => format!("tag:{}", image.path),
+            }))
         }
         async fn get_image_cache_tag_for_path(
             &self,
