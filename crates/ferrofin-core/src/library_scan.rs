@@ -1720,6 +1720,20 @@ impl<'a> ProbePipeline<'a> {
         self.current = None;
     }
 
+    /// Gives up plan index `index`, the current item, which will never be
+    /// [`take`](Self::take)n: a probe queued for it would hold the head of the
+    /// queue, and every later item would go unprobed.
+    fn discard(&mut self, index: usize) {
+        if self.inflight.front().is_some_and(|(i, _, _)| *i == index) {
+            if let Some((_, _, handle)) = self.inflight.pop_front() {
+                handle.abort();
+            }
+            self.dispatch_next();
+        } else if let Some(slot) = self.eligible.get_mut(index) {
+            *slot = None;
+        }
+    }
+
     /// The current item's own probe can use its foreground slot even at limit 1.
     fn begin_item(&mut self, index: usize) {
         self.current = Some(index);
@@ -2171,6 +2185,8 @@ struct SkippedItems {
     locks_unread: usize,
     /// How many items' parent chains could not be read.
     ratings_unread: usize,
+    /// How many failed items kept a refresh stamp that had to go.
+    stamps_kept: usize,
     /// The first item of any of these, and why.
     first: Option<(Uuid, String)>,
 }
@@ -2199,10 +2215,18 @@ impl SkippedItems {
         self.first.get_or_insert_with(|| (id, err.to_string()));
     }
 
+    /// Records that `id` failed after its save and its refresh stamp could
+    /// not be cleared over `err`, so the next scan may not retry it.
+    fn note_stamp_kept(&mut self, id: Uuid, err: &ServiceError) {
+        tracing::debug!(item_id = %id, %err, "refresh stamp not cleared");
+        self.stamps_kept += 1;
+        self.first.get_or_insert_with(|| (id, err.to_string()));
+    }
+
     /// One warning naming how many items `pass` skipped, refreshed without
-    /// their field locks or scored without their parent chain, and the
-    /// first, when there were any; the skipped ones are retried by the next
-    /// validation.
+    /// their field locks, scored without their parent chain or left stamped,
+    /// and the first, when there were any; the skipped ones are retried by
+    /// the next validation.
     fn report(&self, pass: &'static str) {
         if let Some((id, err)) = &self.first {
             tracing::warn!(
@@ -2210,6 +2234,7 @@ impl SkippedItems {
                 skipped = self.count,
                 locks_unread = self.locks_unread,
                 ratings_unread = self.ratings_unread,
+                stamps_kept = self.stamps_kept,
                 item_id = %id,
                 error = %err,
                 "scan pass could not read or write some items; the next scan retries the skipped ones"
@@ -2885,6 +2910,11 @@ struct ItemState<'s, 'a> {
     /// `renamedExtraIds`, the extras whose corrected name differs from the
     /// persisted one, whatever a local reader then makes of it.
     renamed_extra: bool,
+    /// Set by [`LibraryScanner::scan_item`] just before it saves the item's
+    /// row: from then on a failure may leave the row carrying this refresh's
+    /// stamp, even a failure of the save itself, which writes the row before
+    /// the names it pushes to its children.
+    save_attempted: bool,
 }
 
 /// Whether [`LibraryScanner::scan_item`] wrote the item.
@@ -3695,6 +3725,10 @@ pub struct ScanOutcome {
     pub unchanged: usize,
     /// Stored items the scan deleted because their files are gone.
     pub removed: usize,
+    /// Planned items the walk could not read or write, counted under no other
+    /// field. The next scan refreshes each; a stored one is not pruned, and a
+    /// new one exists only if its row was saved before the failure.
+    pub skipped: usize,
     /// The scan was cancelled and stopped before it finished: some items,
     /// the pruning or a closing pass were never run.
     pub stopped: bool,
@@ -3707,6 +3741,7 @@ impl std::ops::AddAssign for ScanOutcome {
         self.updated += other.updated;
         self.unchanged += other.unchanged;
         self.removed += other.removed;
+        self.skipped += other.skipped;
         self.stopped |= other.stopped;
     }
 }
@@ -4920,8 +4955,9 @@ impl LibraryScanner {
     /// [`scan_with`](Self::scan_with).
     ///
     /// # Errors
-    /// Propagates the item-store failure if listing libraries, saving an item,
-    /// or writing its ancestor closure fails.
+    /// Propagates the item-store failure if planning the scan or sweeping
+    /// user data fails. One item that cannot be read or written fails only
+    /// itself ([`ScanOutcome::skipped`]), unless an item refresh asked for it.
     pub async fn scan(&self, only: Option<Uuid>) -> Result<ScanOutcome, ServiceError> {
         self.scan_with(only, &MetadataRefreshOptions::default())
             .await
@@ -5270,9 +5306,15 @@ impl LibraryScanner {
         if let Ok(outcome) = &mut result {
             outcome.removed += orphaned.iter().map(|(_, ids)| ids.len()).sum::<usize>();
             // Each library this scan went over to its end now holds rows this
-            // scanner wrote: a delete may remove files there.
+            // scanner wrote: a delete may remove files there. A skipped item's
+            // row is one it did not write, so no library counts as gone over
+            // until a scan skips nothing.
             if !outcome.stopped && !run.cancel.is_cancelled() {
-                for library in folders.iter().filter_map(collection_folder_id) {
+                let libraries = folders
+                    .iter()
+                    .filter_map(collection_folder_id)
+                    .filter(|_| outcome.skipped == 0);
+                for library in libraries {
                     if let Err(err) = self
                         .persistence
                         .record_library_scanned(library, LIBRARY_LAYOUT_GENERATION)
@@ -6271,6 +6313,19 @@ impl LibraryScanner {
     /// chapters and images) or not at all, and a cancelled scan skips the
     /// pruning and the post-scan passes, as upstream's
     /// `ThrowIfCancellationRequested` between children does.
+    ///
+    /// One item's failure is that item's alone
+    /// (`LimitedConcurrencyLibraryScheduler.ProcessItem`, which logs what a
+    /// child threw and goes on): it is counted in [`ScanOutcome::skipped`],
+    /// stays out of the prune (it is planned), and the walk, the prune and
+    /// the closing passes run on. A row saved before the failure loses its
+    /// refresh stamp ([`ItemPersistenceService::clear_date_last_refreshed`]),
+    /// so the next scan refreshes it whatever its file did. A new item that
+    /// left no row takes what is planned below it along
+    /// (`Folder.RefreshChildMetadata` recurses only into a child that
+    /// refreshed): those would hang off nothing. An item's own refresh
+    /// (`RefreshSingleItem`, which `Folder.RunTasks` does not wrap) still
+    /// ends with its failure, so a caller awaiting it hears of it.
     // The scan loop reads best as one straight line; serving the priority
     // lane between items and choosing the closing passes tipped it over the
     // line count.
@@ -6493,6 +6548,14 @@ impl LibraryScanner {
         // The playlists whose local readers this walk runs, read once every
         // row is saved ([`playlists`]).
         let mut due_playlists: Vec<playlists::DuePlaylist> = Vec::new();
+        // The new items that failed and left no row.
+        let mut unwritten: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        // The first failure of an item an item refresh was asked for, a part
+        // or version it carries included: `RefreshedOwnedItems` is awaited
+        // with no catch of its own.
+        let mut target_failure: Option<ServiceError> = None;
+        let targeted =
+            |item: &Planned| scope.is_some_and(|scope| !scope.prune && scope.covers(item));
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
             probes.pause_foreground();
@@ -6539,6 +6602,21 @@ impl LibraryScanner {
             // refreshed (`superseded_copies`). Nothing is written for it.
             if refresh.superseded.contains(&scanned) {
                 outcome.unchanged += 1;
+                if let Some(tracking) = run.tracking
+                    && let Some(&library) = item.ancestors.first()
+                {
+                    tracking.advance(library);
+                }
+                continue;
+            }
+            if item.ancestors.iter().any(|id| unwritten.contains(id)) {
+                probes.discard(scanned);
+                let err = ServiceError::backend("a parent of the item failed to save");
+                art_cache.skipped.note(item.id, &err);
+                outcome.skipped += 1;
+                if targeted(item) {
+                    target_failure.get_or_insert(err);
+                }
                 if let Some(tracking) = run.tracking
                     && let Some(&library) = item.ancestors.first()
                 {
@@ -6621,15 +6699,66 @@ impl LibraryScanner {
                 folders: key_folders,
                 refresh: &refresh,
                 renamed_extra: false,
+                save_attempted: false,
             };
             // Boxed: the per-item pipeline is the deepest future the scan
             // holds, and inlining it puts the scan future over clippy's
             // `large_futures` ceiling.
-            let saved = Box::pin(self.scan_item(pass, &mut state)).await?;
+            let scanned_item = Box::pin(self.scan_item(pass, &mut state)).await;
             let extra_renamed = state.renamed_extra;
-            if undecodable {
+            let save_attempted = state.save_attempted;
+            if undecodable || scanned_item.is_err() {
                 self.keep_stored_series_key(item, &mut series_keys).await;
             }
+            let saved = match scanned_item {
+                Ok(saved) => saved,
+                Err(err) => {
+                    art_cache.skipped.note(item.id, &err);
+                    outcome.skipped += 1;
+                    // A failed clear leaves a new item's row unknown, so it
+                    // counts as unwritten: that store is failing anyway, and
+                    // the next scan refreshes it either way.
+                    let mut row_stands = false;
+                    if save_attempted {
+                        match self.persistence.clear_date_last_refreshed(item.id).await {
+                            Ok(found) => row_stands = found,
+                            Err(err) => art_cache.skipped.note_stamp_kept(item.id, &err),
+                        }
+                    }
+                    if row_stands {
+                        // What the rest of the walk records for a saved item
+                        // and the retry could not tell: the row now says
+                        // neither who owned it nor that it is new.
+                        if let Some(owner) = released_by {
+                            released.entry(owner).or_default().push(item.id);
+                        }
+                        owners.note_saved(item, is_new || moved_ids.contains(&item.id));
+                        if item.entity.extra_type.is_some() {
+                            owners.note_extra(
+                                item,
+                                extra_changed(stored, item, extra_renamed, request.options),
+                            );
+                        }
+                        if announce && !is_new {
+                            items_updated.push(item);
+                        }
+                    } else if is_new {
+                        unwritten.insert(item.id);
+                        if announce {
+                            items_added.pop();
+                        }
+                    }
+                    if let Some(tracking) = run.tracking
+                        && let Some(&library) = item.ancestors.first()
+                    {
+                        tracking.advance(library);
+                    }
+                    if targeted(item) {
+                        target_failure.get_or_insert(err);
+                    }
+                    continue;
+                }
+            };
             if scope.is_some() && !matches!(saved, ItemSaved::Cancelled) {
                 let reason = if refresh.is_context(item, !is_new) {
                     "context"
@@ -6769,18 +6898,7 @@ impl LibraryScanner {
             // its title metadata to its parts (`Video.RefreshedOwnedItems`,
             // `Video.cs:549-555`); that copy writes only a part that differs.
             if matches!(saved, ItemSaved::Saved) {
-                if crate::video_versions::owns_videos(item.entity.data.as_deref()) {
-                    owners.saved.push(item.id);
-                } else if (is_new || moved_ids.contains(&item.id))
-                    && item.entity.extra_type.is_none()
-                    && let Some(owner) = item
-                        .entity
-                        .owner_id
-                        .as_deref()
-                        .and_then(|o| Uuid::parse_str(o).ok())
-                {
-                    owners.saved.push(owner);
-                }
+                owners.note_saved(item, is_new || moved_ids.contains(&item.id));
             } else if matches!(saved, ItemSaved::Unchanged)
                 && crate::video_versions::additional_part_count(item.entity.data.as_deref()) > 0
             {
@@ -6790,21 +6908,11 @@ impl LibraryScanner {
             // extra this walk created, re-owned or renamed, or refreshes in
             // full, gives its owner's extras the owner's title metadata; any
             // other, the owner's dates.
-            if !matches!(saved, ItemSaved::Cancelled)
-                && item.entity.extra_type.is_some()
-                && let Some(owner) = item
-                    .entity
-                    .owner_id
-                    .as_deref()
-                    .and_then(|o| Uuid::parse_str(o).ok())
-            {
-                // A row not stored before (or not readable) is a new extra.
-                let changed = match stored {
-                    Stored::Existing(row) => row.owner_id != item.entity.owner_id || extra_renamed,
-                    _ => true,
-                } || request.options.replace_all_metadata
-                    || request.options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh;
-                owners.extras.push((owner, item.id, changed));
+            if !matches!(saved, ItemSaved::Cancelled) && item.entity.extra_type.is_some() {
+                owners.note_extra(
+                    item,
+                    extra_changed(stored, item, extra_renamed, request.options),
+                );
             }
             if let Some(owner) = released_by {
                 released.entry(owner).or_default().push(item.id);
@@ -6873,9 +6981,13 @@ impl LibraryScanner {
             }
         };
         outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
+        // A failed sweep still fails the scan, after what it saved is announced.
+        let mut recovered = Ok(());
         if !outcome.stopped {
-            self.recover_user_data(run.passes).await?;
-            run.report(100.0);
+            recovered = self.recover_user_data(run.passes).await;
+            if recovered.is_ok() {
+                run.report(100.0);
+            }
         }
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload. Clients must
@@ -6884,7 +6996,12 @@ impl LibraryScanner {
         // pruned rows and the rows a fold or move took away.
         moved_away.extend(removed);
         self.announce_changes(&items_added, &items_updated, &moved_away);
-        Ok(outcome)
+        recovered?;
+        // A stopped refresh answers as stopped, whatever it got through.
+        match target_failure {
+            Some(err) if !outcome.stopped => Err(err),
+            _ => Ok(outcome),
+        }
     }
 
     /// Each resolved primary's local alternate versions as ids
@@ -7339,6 +7456,7 @@ impl LibraryScanner {
             created = outcome.created,
             updated = outcome.updated,
             unchanged = outcome.unchanged,
+            skipped = outcome.skipped,
             "library scan cancelled"
         );
         probes.abort();
@@ -8178,6 +8296,7 @@ impl LibraryScanner {
         // re-dated file, or a date a reader supplied, writes its
         // `DateCreated` over the stored one, which the first-import guard
         // would otherwise keep.
+        state.save_attempted = true;
         if writes_date_created {
             self.persistence
                 .save_scanned_items_with_date_created(std::slice::from_ref(&entity))
@@ -10940,19 +11059,16 @@ impl LibraryScanner {
         }
     }
 
-    /// The children of a series the walk did not settle (its row is
-    /// undecodable, or its refresh failed) take the key stored for it, which
-    /// came from its provider ids, rather than the plan's. One column is read:
-    /// the row may not decode.
+    /// The children of a series whose row the walk did not write (it is
+    /// undecodable, or its refresh failed first) take the key stored on it,
+    /// which came from its provider ids, rather than the plan's or one the
+    /// row never got. One column is read: the row may not decode.
     async fn keep_stored_series_key(
         &self,
         item: &Planned,
         series_keys: &mut HashMap<Uuid, String>,
     ) {
-        if series_keys.contains_key(&item.id)
-            || item_type_lookup::kind_from_type_name(&item.entity.type_)
-                != Some(BaseItemKind::Series)
-        {
+        if item_type_lookup::kind_from_type_name(&item.entity.type_) != Some(BaseItemKind::Series) {
             return;
         }
         match self.persistence.presentation_unique_key(item.id).await {
@@ -21802,6 +21918,23 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
     }
 }
 
+/// Whether the walk created, re-owned or renamed the extra `item` or refreshed
+/// it in full. A row not stored before (or not readable) is a new extra.
+fn extra_changed(
+    stored: Stored<'_>,
+    item: &Planned,
+    renamed: bool,
+    options: &MetadataRefreshOptions,
+) -> bool {
+    let new_or_changed = match stored {
+        Stored::Existing(row) => row.owner_id != item.entity.owner_id || renamed,
+        _ => true,
+    };
+    new_or_changed
+        || options.replace_all_metadata
+        || options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh
+}
+
 /// The owners whose owned videos a walk copies metadata to
 /// ([`LibraryScanner::copy_to_owned_videos`]).
 #[derive(Debug, Default)]
@@ -21814,6 +21947,37 @@ struct OwnedCopies {
     /// Each extra the walk refreshed: its owner, its id, and whether the
     /// walk created, re-owned or renamed it or refreshed it in full.
     extras: Vec<(Uuid, Uuid, bool)>,
+}
+
+impl OwnedCopies {
+    /// The walk saved `item`, which is `created_or_moved` if so: an owner
+    /// copies to what it owns, and a part or version it did not have yet
+    /// makes its owner copy.
+    fn note_saved(&mut self, item: &Planned, created_or_moved: bool) {
+        if crate::video_versions::owns_videos(item.entity.data.as_deref()) {
+            self.saved.push(item.id);
+        } else if created_or_moved
+            && item.entity.extra_type.is_none()
+            && let Some(owner) = owner_of(item)
+        {
+            self.saved.push(owner);
+        }
+    }
+
+    /// The walk refreshed the extra `item`: it is listed under its owner.
+    fn note_extra(&mut self, item: &Planned, changed: bool) {
+        if let Some(owner) = owner_of(item) {
+            self.extras.push((owner, item.id, changed));
+        }
+    }
+}
+
+/// The id of `item`'s owner, when it has one.
+fn owner_of(item: &Planned) -> Option<Uuid> {
+    item.entity
+        .owner_id
+        .as_deref()
+        .and_then(|owner| Uuid::parse_str(owner).ok())
 }
 
 /// Whether `entity` is a stacked movie's additional part as the planner
@@ -36106,6 +36270,32 @@ mod tests {
         );
     }
 
+    /// An item the walk gives up leaves no probe at the head of the queue:
+    /// `take` only answers for the head, so every later item would go
+    /// unprobed.
+    #[tokio::test]
+    async fn a_discarded_item_leaves_the_next_probe_at_the_head() {
+        let track = |n: u128| super::Planned {
+            id: uuid::Uuid::from_u128(n),
+            entity: ferrofin_db::entities::base_items::BaseItemEntity {
+                media_type: Some("Audio".into()),
+                path: Some(format!("/music/{n}.mp3")),
+                ..Default::default()
+            },
+            ancestors: Vec::new(),
+            generated_names: Vec::new(),
+        };
+        let planned = vec![track(1), track(2), track(3), track(4)];
+        let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeProbe);
+        // A window of one: only the first is dispatched.
+        let mut probes = super::ProbePipeline::new(Some(encoder), None, &planned, 1);
+        probes.decide(0, [true, true, true, true]);
+        probes.discard(2); // not dispatched yet: it never will be
+        probes.discard(0);
+        probes.discard(1);
+        assert!(probes.take(3).await.info.is_some());
+    }
+
     struct AlbumCoverProbe {
         calls: std::sync::atomic::AtomicUsize,
     }
@@ -37960,6 +38150,7 @@ mod tests {
                 updated: 0,
                 unchanged: total - 1,
                 removed: 1,
+                skipped: 0,
                 stopped: false,
             }
         );

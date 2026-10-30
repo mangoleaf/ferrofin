@@ -977,10 +977,20 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         upstream_file: "MediaBrowser.Controller/Entities/TV/Episode.cs",
         upstream_method: "FindSeriesName",
         ferrofin: "What a child's refresh in the library scan does when its parent row cannot \
-                   be read. ferrofin-core library_scan.rs parent_row (a failed read counts as \
+                   be read, and what the walk does when an item fails. ferrofin-core \
+                   library_scan.rs run_scan (the item's error is counted in \
+                   ScanOutcome::skipped, the walk goes on, a saved row loses its \
+                   DateLastRefreshed, a new item with no row takes its descendants along, an \
+                   item refresh still ends with its item's failure) \
+                   ← parent_row (a failed read counts as \
                    no row, once per pass) ← sync_series_name (FindSeriesName), \
                    sync_season_name, remember_series_folder; apply_parental_rating_score and \
                    inherit_stored_rating; keep_stored_series_key. Compared with \
+                   MediaBrowser.Controller/LibraryTaskScheduler/\
+                   LimitedConcurrencyLibraryScheduler.cs (ProcessItem), \
+                   MediaBrowser.Controller/Entities/Folder.cs (RunTasks, \
+                   RefreshChildMetadata), \
+                   MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata), \
                    MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
                    MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
                    MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
@@ -991,6 +1001,18 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              its parent, and the children of an undecodable series keep the series key stored \
              on its row. Upstream has no such row to fall back from: the read would throw into \
              the per-child catch and the item would not refresh.",
+            "A stored item that fails after its row was saved has its DateLastRefreshed \
+             cleared, so the next scan retries it as a first refresh where upstream, which \
+             saves the row after the providers and the probe, retries it because the row kept \
+             its old DateModified; the rows a save hangs off it by foreign key are why \
+             Ferrofin saves first, and the retry is the same but runs every provider.",
+            "A new item that fails before its first save has no row until the next scan, \
+             where upstream's CreateItems and first-refresh save keep one, so a new folder \
+             that fails takes its descendants with it for this scan.",
+            "A stored folder that fails leaves its children to refresh, where \
+             RefreshChildMetadata does not recurse into a folder that threw, because the \
+             flat walk has already planned them and a persistent failure on a season must \
+             not hide its new episodes for good.",
             "An episode whose season row is absent or unreadable keeps the season name it has, \
              the planner's localized one, where FindSeasonName answers a literal \"Season N\" or \
              \"Season Unknown\". Fix path: port that branch to sync_season_name for a row that \

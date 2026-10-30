@@ -1698,6 +1698,22 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(0)
     }
 
+    /// Clears `item_id`'s `DateLastRefreshed`, so the next scan takes it as
+    /// never refreshed: its refresh failed after the row was saved, and the
+    /// saved row no longer shows what is left to do. Nothing else on the row
+    /// moves. Returns whether there is such a row.
+    ///
+    /// The default clears nothing and answers `false` (for stub/fake
+    /// services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn clear_date_last_refreshed(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let _ = item_id;
+        Ok(false)
+    }
+
     /// `item_id`'s stored `PresentationUniqueKey`, read as that one column so
     /// a row the decoder rejects still answers. `None` for no row or no key.
     ///

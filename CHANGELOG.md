@@ -805,6 +805,9 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
+- One item that cannot be read or written no longer ends a library scan: it is skipped, counted
+  in the scan's summary and refreshed again by the next scan, as Jellyfin does, while the rest of
+  the scan, the removal of deleted files, the closing passes and the client notification all run
 - A Series or Season row the database cannot decode no longer fails every later library scan at
   its first child: its children keep the names and the parental rating they have, and new
   episodes, later libraries and deleted files are all handled again

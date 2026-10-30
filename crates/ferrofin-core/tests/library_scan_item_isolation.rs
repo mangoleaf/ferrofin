@@ -1,23 +1,29 @@
-//! One bad row stays that row's problem. A Series or Season row the decoder
-//! rejects is read as a parent by each of its children, and that read fails on
-//! every scan, so the scan must not depend on it: a child keeps its own values
-//! (`FindSeriesName` for a parent that is not there), and the walk, the prune,
-//! the closing passes and the `LibraryChanged` push all still run.
+//! One item's failure stays that item's, as upstream's per-child `catch` in
+//! `LimitedConcurrencyLibraryScheduler.ProcessItem` keeps it: the rest of the
+//! walk, the prune, the closing passes and the `LibraryChanged` push still run.
+//!
+//! - a Series or Season row the decoder rejects: its children read it as their
+//!   parent, and the read fails on every scan, so the scan must not depend on
+//!   it: a child keeps its own values (`FindSeriesName` for a parent that is
+//!   not there);
+//! - a write that fails for one item, before or after its row is saved: the
+//!   item is skipped and the next scan refreshes it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ferrofin_core::event_manager::consumer_done;
 use ferrofin_core::file_system::FerrofinFileSystem;
-use ferrofin_core::item_type_lookup::ItemTypeLookup;
+use ferrofin_core::item_type_lookup::{ItemTypeLookup, derive_item_id};
 use ferrofin_core::item_visibility::ItemVisibility;
 use ferrofin_core::library_changed_notifier::LibraryChangedNotifier;
 use ferrofin_core::{
     FerrofinEventManager, FerrofinItemPersistenceService, FerrofinItemRepository,
-    FerrofinVirtualFolderManager, LibraryScanner, LocalizationManager,
+    FerrofinVirtualFolderManager, LibraryScanner, LocalizationManager, ScanOutcome,
 };
 use ferrofin_db::Database;
 use ferrofin_model::configuration::{LibraryOptions, MediaPathInfo};
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities::CollectionTypeOptions;
 use ferrofin_traits::events::EventManager;
 use ferrofin_traits::library::VirtualFolderManager;
@@ -171,6 +177,14 @@ impl Fixture {
         .await;
     }
 
+    async fn refreshed(&self, path: &Path) -> Option<String> {
+        sqlx::query_scalar(r#"SELECT "DateLastRefreshed" FROM "BaseItems" WHERE "Path" = ?1"#)
+            .bind(path.to_string_lossy().into_owned())
+            .fetch_one(self.db.pool())
+            .await
+            .expect("stamp")
+    }
+
     async fn rating_score(&self, path: &Path) -> Option<i64> {
         sqlx::query_scalar(
             r#"SELECT "InheritedParentalRatingValue" FROM "BaseItems" WHERE "Path" = ?1"#,
@@ -192,6 +206,13 @@ impl Fixture {
         .await
         .expect("names")
     }
+}
+
+fn movie_id(path: &Path) -> String {
+    derive_item_id(BaseItemKind::Movie, &path.to_string_lossy())
+        .expect("movie id")
+        .simple()
+        .to_string()
 }
 
 // A Series or Season row the decoder rejects, followed by a new episode under
@@ -220,6 +241,7 @@ async fn an_undecodable_parent_stops_nothing_else(#[case] kind: &str) {
 
     let rescan = fx.scanner.scan_all().await.expect("rescan");
 
+    assert_eq!(rescan.skipped, 0, "a child of the row is refreshed");
     assert_eq!(rescan.removed, 1, "the deleted movie is pruned");
     assert!(fx.names(&doomed).await.is_none());
     assert!(fx.names(&new_movie).await.is_some(), "the later library");
@@ -485,4 +507,316 @@ async fn an_undecodable_parent_is_asked_for_once_per_scan() {
         1,
         "{warned:?}"
     );
+}
+
+// A write that fails for one new item skips that item alone. It is neither
+// counted as created nor announced, it stays out of the prune, and the next
+// scan creates it.
+#[tokio::test]
+async fn a_failed_save_skips_only_that_item() {
+    let fx = Fixture::new().await;
+    let doomed = fx.movie("Doomed");
+    fx.scanner.scan_all().await.expect("first scan");
+    fx.added().await;
+    fx.run(
+        r#"CREATE TRIGGER "refuse_broken" BEFORE INSERT ON "BaseItems"
+           WHEN NEW."Name" = 'Broken'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+    )
+    .await;
+    let broken = fx.movie("Broken");
+    let later = fx.movie("Later");
+    std::fs::remove_file(&doomed).expect("delete");
+
+    let rescan = fx.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(
+        rescan,
+        ScanOutcome {
+            created: 1,
+            removed: 1,
+            skipped: 1,
+            ..ScanOutcome::default()
+        }
+    );
+    assert!(fx.names(&broken).await.is_none());
+    assert!(fx.names(&later).await.is_some(), "the item after it");
+    assert!(fx.names(&doomed).await.is_none(), "the prune ran");
+    assert_eq!(fx.added().await, vec![movie_id(&later)]);
+
+    fx.run(r#"DROP TRIGGER "refuse_broken""#).await;
+    let retry = fx.scanner.scan_all().await.expect("retry");
+    assert_eq!(retry.created, 1, "the next scan creates it");
+    assert_eq!(retry.skipped, 0);
+    assert_eq!(fx.added().await, vec![movie_id(&broken)]);
+}
+
+// A failure after the row was saved must not leave it stamped as refreshed: a
+// stamped row whose file did not change is not looked at again, so whatever
+// the failed step owed would stay lost. Here the ancestor closure, written
+// after the row: the stamp goes, and the next scan finishes the item. A row
+// that was saved exists, so a new one is still announced.
+#[rstest]
+#[case::new_item(true)]
+#[case::stored_item(false)]
+#[tokio::test]
+async fn a_failure_after_the_row_is_saved_leaves_the_item_to_retry(#[case] new: bool) {
+    let fx = Fixture::new().await;
+    let stored = fx.movie("Stored");
+    fx.scanner.scan_all().await.expect("first scan");
+    fx.added().await;
+    let failing = if new {
+        fx.movie("Fresh")
+    } else {
+        stored.clone()
+    };
+    if !new {
+        // A lost closure: the scan saves the row, then writes the closure.
+        fx.run(r#"DELETE FROM "AncestorIds" WHERE "ItemId" IN (SELECT "Id" FROM "BaseItems" WHERE "Name" = 'Stored')"#)
+            .await;
+        assert!(
+            fx.refreshed(&stored).await.is_some(),
+            "the row starts stamped"
+        );
+    }
+    fx.run(&format!(
+        r#"CREATE TRIGGER "refuse_closure" BEFORE INSERT ON "AncestorIds"
+           WHEN NEW."ItemId" = (SELECT "Id" FROM "BaseItems" WHERE "Path" = '{}')
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+        failing.to_string_lossy()
+    ))
+    .await;
+
+    let rescan = fx.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(rescan.skipped, 1);
+    assert_eq!(rescan.created, 0);
+    assert!(fx.names(&failing).await.is_some(), "the row was saved");
+    assert_eq!(fx.refreshed(&failing).await, None, "no stamp");
+    assert_eq!(
+        fx.added().await,
+        if new {
+            vec![movie_id(&failing)]
+        } else {
+            Vec::new()
+        }
+    );
+
+    fx.run(r#"DROP TRIGGER "refuse_closure""#).await;
+    let retry = fx.scanner.scan_all().await.expect("retry");
+    assert_eq!(retry.skipped, 0);
+    assert_eq!(retry.updated, 1, "the next scan finishes it");
+    assert!(fx.refreshed(&failing).await.is_some(), "stamped now");
+    let closure: i64 = sqlx::query_scalar(
+        r#"SELECT COUNT(*) FROM "AncestorIds" WHERE "ItemId" =
+           (SELECT "Id" FROM "BaseItems" WHERE "Path" = ?1)"#,
+    )
+    .bind(failing.to_string_lossy().into_owned())
+    .fetch_one(fx.db.pool())
+    .await
+    .expect("closure");
+    assert!(closure > 0, "and writes what it owed");
+}
+
+// A series whose save fails has settled on a key its row does not hold, so its
+// children stay on the key the row does hold.
+#[tokio::test]
+async fn children_of_a_series_that_failed_to_save_keep_its_stored_key() {
+    let fx = Fixture::new().await;
+    fx.episode("Show", 1);
+    fx.scanner.scan_all().await.expect("first scan");
+    fx.run(
+        r#"UPDATE "BaseItems" SET "PresentationUniqueKey" = 'settled-key',
+               "DateLastRefreshed" = NULL
+           WHERE "Type" LIKE '%.Series'"#,
+    )
+    .await;
+    fx.run(
+        r#"UPDATE "BaseItems" SET "SeriesPresentationUniqueKey" = 'settled-key'
+           WHERE "Type" LIKE '%.Season' OR "Type" LIKE '%.Episode'"#,
+    )
+    .await;
+    fx.run(
+        r#"CREATE TRIGGER "refuse_series" BEFORE UPDATE ON "BaseItems"
+           WHEN OLD."Type" LIKE '%.Series'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+    )
+    .await;
+    let new_episode = fx.episode("Show", 2);
+
+    let rescan = fx.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(rescan.skipped, 1);
+    let key: Option<String> = sqlx::query_scalar(
+        r#"SELECT "SeriesPresentationUniqueKey" FROM "BaseItems" WHERE "Path" = ?1"#,
+    )
+    .bind(new_episode.to_string_lossy().into_owned())
+    .fetch_one(fx.db.pool())
+    .await
+    .expect("key");
+    assert_eq!(key.as_deref(), Some("settled-key"));
+}
+
+// A series' save writes its row and then pushes its name to its children. When
+// the push fails the row already carries this refresh's stamp and file facts,
+// so the stamp goes even though the save itself reported the failure.
+#[tokio::test]
+async fn a_save_that_fails_after_writing_the_row_leaves_it_to_retry() {
+    let fx = Fixture::new().await;
+    fx.episode("Show", 1);
+    let series = fx.shows.join("Show");
+    fx.scanner.scan_all().await.expect("first scan");
+    fx.run(r#"UPDATE "BaseItems" SET "DateLastRefreshed" = NULL WHERE "Type" LIKE '%.Series'"#)
+        .await;
+    fx.run(r#"UPDATE "BaseItems" SET "SeriesName" = 'Stale' WHERE "Type" LIKE '%.Season'"#)
+        .await;
+    fx.run(
+        r#"CREATE TRIGGER "refuse_name" BEFORE UPDATE OF "SeriesName" ON "BaseItems"
+           WHEN OLD."Type" LIKE '%.Season'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+    )
+    .await;
+
+    let rescan = fx.scanner.scan_all().await.expect("rescan");
+
+    assert!(rescan.skipped > 0);
+    assert_eq!(fx.refreshed(&series).await, None, "no stamp");
+
+    fx.run(r#"DROP TRIGGER "refuse_name""#).await;
+    let retry = fx.scanner.scan_all().await.expect("retry");
+    assert_eq!(retry.skipped, 0);
+    assert!(fx.refreshed(&series).await.is_some(), "stamped now");
+}
+
+// A scan that skipped an item did not write its row, so no library counts as
+// gone over by this build, which is what lets a delete remove files there.
+#[tokio::test]
+async fn a_scan_that_skipped_an_item_does_not_record_the_library() {
+    let fx = Fixture::new().await;
+    fx.run(
+        r#"CREATE TRIGGER "refuse_broken" BEFORE INSERT ON "BaseItems"
+           WHEN NEW."Name" = 'Broken'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+    )
+    .await;
+    fx.movie("Broken");
+    let recorded = || async {
+        sqlx::query_scalar::<_, i64>(
+            r#"SELECT COUNT(*) FROM "FerrofinMeta" WHERE "Key" LIKE 'library_scanned_by:%'"#,
+        )
+        .fetch_one(fx.db.pool())
+        .await
+        .expect("recorded")
+    };
+
+    let scan = fx.scanner.scan_all().await.expect("scan");
+
+    assert_eq!(scan.skipped, 1);
+    assert_eq!(recorded().await, 0);
+
+    fx.run(r#"DROP TRIGGER "refuse_broken""#).await;
+    fx.scanner.scan_all().await.expect("retry");
+    assert_eq!(recorded().await, 2, "both libraries");
+}
+
+// A new series that cannot be saved leaves nothing for its seasons and episodes
+// to hang off: `RefreshChildMetadata` does not recurse into it, and a child's
+// ancestor closure would fail on its foreign key after the child's row was
+// saved. They wait for the next scan, with the rest of the walk going on.
+#[tokio::test]
+async fn a_new_series_that_fails_takes_its_children_along() {
+    let fx = Fixture::new().await;
+    fx.scanner.scan_all().await.expect("first scan");
+    fx.run(
+        r#"CREATE TRIGGER "refuse_broken" BEFORE INSERT ON "BaseItems"
+           WHEN NEW."Name" = 'Broken'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+    )
+    .await;
+    let child = fx.episode("Broken", 1);
+    let later = fx.episode("Later", 1);
+
+    let rescan = fx.scanner.scan_all().await.expect("rescan");
+
+    assert_eq!(rescan.skipped, 3, "the series, its season and its episode");
+    assert!(fx.names(&child).await.is_none(), "no orphan");
+    assert!(fx.names(&later).await.is_some(), "the walk went on");
+
+    fx.run(r#"DROP TRIGGER "refuse_broken""#).await;
+    let retry = fx.scanner.scan_all().await.expect("retry");
+    assert_eq!(retry.created, 3);
+    assert_eq!(retry.skipped, 0);
+    assert!(fx.names(&child).await.is_some());
+}
+
+// Identify's Apply awaits the refresh of one item, and upstream's
+// `item.RefreshMetadata` throws to it: only `Folder.RunTasks`' children are
+// caught. A refresh that applied nothing must not report success.
+#[tokio::test]
+async fn an_item_refresh_ends_with_its_items_failure() {
+    use ferrofin_core::{ScanCancel, ScanRun};
+    use ferrofin_traits::library::ScanTarget;
+    use ferrofin_traits::providers::{MetadataRefreshMode, MetadataRefreshOptions};
+    let fx = Fixture::new().await;
+    let movie = fx.movie("Stored");
+    fx.scanner.scan_all().await.expect("first scan");
+    let options = MetadataRefreshOptions {
+        replace_all_metadata: true,
+        metadata_refresh_mode: MetadataRefreshMode::FullRefresh,
+        ..MetadataRefreshOptions::default()
+    };
+    let none = MetadataRefreshOptions {
+        metadata_refresh_mode: MetadataRefreshMode::None,
+        image_refresh_mode: MetadataRefreshMode::None,
+        ..MetadataRefreshOptions::default()
+    };
+    fx.run(
+        r#"CREATE TRIGGER "refuse_stored" BEFORE UPDATE OF "Name" ON "BaseItems"
+           WHEN OLD."Name" = 'Stored'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+    )
+    .await;
+
+    let refreshed = fx
+        .scanner
+        .scan_target(
+            &ScanTarget::Items(vec![movie.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await;
+
+    assert!(refreshed.is_err(), "{refreshed:?}");
+
+    // A folder's refresh of the same item goes through `Folder.RunTasks`.
+    let folder = fx
+        .scanner
+        .scan_target(
+            &ScanTarget::Paths(vec![fx.movies.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await
+        .expect("folder refresh");
+    assert_eq!(folder.skipped, 1);
+
+    // The refresh of a new item whose new parent cannot be saved applied
+    // nothing either, though the item itself never ran.
+    fx.run(
+        r#"CREATE TRIGGER "refuse_series" BEFORE INSERT ON "BaseItems"
+           WHEN NEW."Type" LIKE '%.Series'
+           BEGIN SELECT RAISE(ABORT, 'refused'); END"#,
+    )
+    .await;
+    let episode = fx.episode("New", 1);
+    let refreshed = fx
+        .scanner
+        .scan_target(
+            &ScanTarget::Items(vec![episode.to_string_lossy().into_owned()]),
+            ScanRun::new(&options, &none, &ScanCancel::new())
+                .with_passes(ferrofin_core::ScanPasses::Touched),
+        )
+        .await;
+    assert!(refreshed.is_err(), "{refreshed:?}");
+    assert!(fx.names(&episode).await.is_none());
 }
