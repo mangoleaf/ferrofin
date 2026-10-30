@@ -5,9 +5,29 @@ Ferrofin is configured three ways, **highest precedence first**:
 1. **CLI flags** — `--data-dir`, `--bind`, `--port`, `--published-url`, `--ffmpeg`, `--config`.
 2. **`FERROFIN_*` environment variables** — the full surface, below.
 3. **`config.toml`** — an optional file at `{data_dir}/config.toml` (or `--config`/
-   `FERROFIN_CONFIG_FILE`). Keys are the env-var stems, lower-cased and prefix-stripped
-   (`FERROFIN_BIND_ADDR` → `bind_addr`). The whole file is optional; a missing one is not an
-   error. It is TOML and must be named `*.toml`: any other name (`config.json`, `config.yaml`, …) is refused.
+   `FERROFIN_CONFIG_FILE`). Each key is its variable's stem, lower-cased and prefix-stripped
+   (`FERROFIN_BIND_ADDR` → `bind_addr`), except the seven in the table below. The whole file is
+   optional; a missing one is not an error. It is TOML and must be named `*.toml`: any other
+   name (`config.json`, `config.yaml`, …) is refused.
+
+| Variable | `config.toml` key |
+|---|---|
+| `FERROFIN_LOG` | `log_level` |
+| `FERROFIN_OMDB_KEY` | `omdb_api_key` |
+| `FERROFIN_TVDB_KEY` | `tvdb_api_key` |
+| `FERROFIN_TVDB_PIN` | `tvdb_subscriber_pin` |
+| `FERROFIN_FANART_KEY` | `fanart_personal_api_key` |
+| `FERROFIN_MUSICBRAINZ_URL` | `musicbrainz_base_url` |
+| `FERROFIN_WS_MIN_STREAM_PERIOD_MS` | `websocket_min_stream_period_ms` |
+
+Each setting has exactly one key; the variable's stem is not accepted for these seven.
+`FERROFIN_CONFIG_FILE` has no key: it names the file. A key the file cannot hold is ignored with
+a warning at startup that names it, and a key spelled as its variable's stem (`tvdb_pin`) is
+told the key to use (`tvdb_subscriber_pin`). A number or on/off variable whose value does not
+parse (`FERROFIN_PORT=80g`) is ignored with a warning naming it, so the file's value or the
+default applies, and a blank one counts as unset; the rows that say so (`FERROFIN_DB_POOL`, the
+cache lifetimes, the directory-cache limits, `FERROFIN_TRICKPLAY_CONCURRENCY`) stop the server
+on a bad value instead.
 
 The file is `--config`, else `FERROFIN_CONFIG_FILE` (blank counts as unset), else `config.toml` in the data directory
 that `--data-dir`, `FERROFIN_DATA_DIR` or the default location names, in that order. A
@@ -63,7 +83,7 @@ Jellyfin `jellyfin.db` (root or `data/jellyfin.db`) found in the data dir — se
 | `FERROFIN_BASE_URL` | none | URL path prefix the server is mounted under. |
 | `FERROFIN_SERVER_NAME` | host name | Server name reported to clients. |
 | `FERROFIN_WS_MIN_STREAM_PERIOD_MS` | `100` | Smallest period, in milliseconds, between pushes of a dashboard WebSocket stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). A client names the period in its `*Start` subscription; Ferrofin drives these streams on a timer (each tick recomputes and resends the full snapshot), so the client's period is clamped up to this floor to stop a tiny period becoming back-to-back `get_sessions`/activity work. Well-behaved clients ask for 1500 ms and are unaffected. The `config.toml` key is `websocket_min_stream_period_ms`. |
-| `FERROFIN_LOG` | `info` | Log filter, `RUST_LOG`/`EnvFilter` syntax. |
+| `FERROFIN_LOG` | `info` | Log filter, `RUST_LOG`/`EnvFilter` syntax; `RUST_LOG` wins when set. The `config.toml` key is `log_level`. |
 | `FERROFIN_QUICK_CONNECT_PENDING_PER_IP` | `10` | How many unauthorized Quick Connect requests one client IP may hold at once. `POST /QuickConnect/Initiate` needs no sign-in, so past this cap the IP's oldest pending request is dropped and its code stops working. Jellyfin has no cap. Behind a reverse proxy that is not in **Known proxies**, every client shares the proxy's IP, so the cap then counts all clients together. The cap is per address, so an IPv6 client can spread requests across its prefix. `0` means the default. The `config.toml` key is `quick_connect_pending_per_ip`. |
 
 ### HTTPS
@@ -155,18 +175,25 @@ Jellyfin's shared keys. The settings below are optional overrides or additions.
 
 | Variable | Purpose |
 |---|---|
-| `FERROFIN_OMDB_KEY` | Optional OMDb API key override; unset or blank uses Jellyfin's shared key. |
-| `FERROFIN_TVDB_KEY` / `FERROFIN_TVDB_PIN` | Optional TheTVDB API key override and subscriber PIN. |
+| `FERROFIN_OMDB_KEY` | Optional OMDb API key override; unset or blank uses Jellyfin's shared key. The `config.toml` key is `omdb_api_key`. |
+| `FERROFIN_TVDB_KEY` | Optional TheTVDB API key override; unset or blank uses Jellyfin's shared key. The `config.toml` key is `tvdb_api_key`. |
+| `FERROFIN_TVDB_PIN` | Optional TheTVDB subscriber PIN, for a paid subscription. The `config.toml` key is `tvdb_subscriber_pin`. |
 | `FERROFIN_TVDB_CACHE_HOURS` | How long TheTVDB lookups are reused, in whole hours (default `1`, the TVDB plugin's `CacheDurationInHours`): an episode's TVDB id, and the season list of a series a season's TVDB id is read from. A longer duration saves requests when a library is refreshed again within that time. The `config.toml` key is `tvdb_cache_hours`. A value that is not a whole number above zero is refused with a warning at startup and the default is used. |
 | `FERROFIN_TVDB_TOKEN_DAYS` | How old TheTVDB's sign-in token may get before Ferrofin signs in again, in whole days (default `25`, the TVDB plugin's value). TheTVDB expires a token after a month, so the value must be from 1 to 29. The `config.toml` key is `tvdb_token_days`. Any other value is refused with a warning at startup and the default is used. |
-| `FERROFIN_FANART_KEY` | Optional fanart.tv personal key, sent alongside the shared project key. |
-| `FERROFIN_MUSICBRAINZ_URL` | MusicBrainz base URL override (self-hosted mirror). |
+| `FERROFIN_FANART_KEY` | Optional fanart.tv personal key, sent alongside the shared project key. The `config.toml` key is `fanart_personal_api_key`. |
+| `FERROFIN_MUSICBRAINZ_URL` | MusicBrainz base URL override (self-hosted mirror). The `config.toml` key is `musicbrainz_base_url`. |
 | `FERROFIN_STUDIOS_REPO_URL` | Studio-images repo URL override. |
 
 TMDB's `TmdbApiKey` plugin setting overrides its shared key. OpenSubtitles uses
 Jellyfin's shared application key with the username/password configured in its
 plugin settings; its `ApiKey` field is an optional override. The shared key does
 not replace the account needed for subtitle downloads.
+
+## Extensions
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FERROFIN_DISABLE_EXTENSIONS` | `false` | Register none of the compiled-in extensions (Intro Skipper, File Transformation, Merge Versions): their plugins, scheduled tasks and event hooks are gone. Meant for measurement, so a benchmark compares Ferrofin with a Jellyfin that has no plugins installed. Accepts `1`/`0`, `true`/`false`, `yes`/`no`, `on`/`off`. |
 
 ## WASM plugins (Tier 1b)
 
@@ -185,6 +212,7 @@ Limits for sandboxed WASM plugins loaded from `{data_dir}/plugins/*.wasm`
 | `FERROFIN_WASM_SUBTITLE_EXTRACT_MB` | Cap on one plugin-extracted subtitle track in MiB (default 10). Generous for SRT text. |
 | `FERROFIN_WASM_ANALYSIS_CONCURRENCY` | Concurrent media-decode budget shared by all analysis plugins (`extract-audio`/`extract-frames`). Default: a quarter of the visible cores, at least one — analysis must never starve transcodes; a small NAS may want `1`, a big host more. |
 | `FERROFIN_WASM_PRIVATE_HTTP_ALLOW` | Plugins allowed to `http-fetch` private/loopback/link-local destinations: comma-separated plugin UUIDs, or `*` for all. Default: denied for every plugin (public destinations are always allowed). Plugin UUIDs appear in `/Plugins` and the load log line. (Accepting plugin names here is a planned improvement.) |
+| `FERROFIN_MAX_PLUGIN_DOWNLOAD_MB` | Size cap, in MiB, on a plugin downloaded from a plugin repository during an install (default 128, sized for interpreter-language guests that bundle their runtime). An abuse guard, not a tuning knob: a larger download is refused. `0` means the default. |
 
 ## Build- and test-time only
 

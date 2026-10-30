@@ -65,6 +65,7 @@ work across subsystems:
 | `provider` | metadata provider name |
 | `job_id` | transcode/other job id |
 | `path` | filesystem path |
+| `config_file` | the bootstrap `config.toml` in use, as context (the startup banner, configuration warnings), when `path` would name the wrong subject |
 | `trigger` | `api` \| `schedule` \| `startup` \| `watcher` \| `webhook` (library scans: `ScanTrigger`) |
 | `trigger_trace_id` | originating sampled request's trace id (hex), when known |
 

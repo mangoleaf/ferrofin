@@ -959,6 +959,13 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   naming them), and a file that no longer loads is logged and leaves the previous
   configuration running. A `config.toml` parse error names the line and column but no longer
   quotes the line, which may hold a password
+- A `config.toml` key the server ignores, a misspelling or a variable's stem where the key is
+  spelled otherwise (`tvdb_pin` for `tvdb_subscriber_pin`), is a startup warning naming it and
+  the key to use, and so is a number or on/off variable that does not parse
+  (`FERROFIN_PORT=80g`); both used to be dropped without a word. `docs/CONFIG.md` lists the
+  seven keys that are not their variable's stem, and documents `FERROFIN_DISABLE_EXTENSIONS`
+  and `FERROFIN_MAX_PLUGIN_DOWNLOAD_MB`. The startup log's `admin_password_set` no longer
+  reports a blank password as set
 
 ## [1.0.0] - 2026-09-05
 

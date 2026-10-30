@@ -8,6 +8,15 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — `config.toml` warns about the keys it ignores
+
+Usually nothing to do. A key the server cannot use, a misspelling or a variable's stem written
+where the key is spelled otherwise (`tvdb_pin`, `omdb_key`, `log`, …), never applied; it is now
+a warning at startup that names it and, for a stem, the key to use. Rename such keys as the
+warning says (the seven keys that are not their variable's stem are listed in
+`docs/CONFIG.md`). A number or on/off variable that does not parse (`FERROFIN_PORT=80g`) is
+still ignored and now warns too; one with blanks around the value (`" 45 "`) is now read.
+
 ## Unreleased — `{data_dir}/config.toml` is read for every data directory, and a dashboard restart reloads it
 
 - **A `config.toml` in the data directory now applies however the data directory is named.**
