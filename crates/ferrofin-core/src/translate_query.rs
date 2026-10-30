@@ -1565,7 +1565,7 @@ fn append_name_predicates(
     if let Some(contains) = non_blank(filter.name_contains.as_ref()) {
         let clean = format!("%{}%", get_clean_value(contains).trim_matches('%'));
         qb.push(r#" AND (bi."CleanName" LIKE "#)
-            .push_bind(clean.clone())
+            .push_bind(clean)
             .push(r#" OR ferrofin_lower_invariant(bi."OriginalTitle") LIKE "#)
             .push_bind(format!("%{}%", lower_invariant(contains).trim_matches('%')))
             .push(")");

@@ -3462,7 +3462,7 @@ mod tests {
         // 5.1 → stereo downmix gets the default volume=2 boost (GetAudioFilterParam).
         let mut surround = audio_stream("ac3", 0);
         surround.channels = Some(6);
-        let mut state = job(&[surround.clone()]);
+        let mut state = job(&[surround]);
         state.output_audio_channels = Some(2);
         let opts = EncodingOptions::default();
         assert_eq!(

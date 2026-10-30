@@ -5032,10 +5032,7 @@ mod tests {
             request(paths(&["/m/z"]), MetadataRefreshOptions::default()),
             true,
         );
-        let late_l = queue.enqueue(
-            request(lib.clone(), MetadataRefreshOptions::default()),
-            true,
-        );
+        let late_l = queue.enqueue(request(lib, MetadataRefreshOptions::default()), true);
         assert_eq!(queue.pending.len(), 2);
         assert_eq!(
             queue.pending[1].waiters.tickets,

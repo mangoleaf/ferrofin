@@ -2209,7 +2209,7 @@ impl FerrofinLiveTvManager {
                     ProgramRow {
                         id: guid_to_db(id),
                         channel_id,
-                        external_id: external_id.clone(),
+                        external_id,
                         start: start.clone(),
                         end: end.clone(),
                         genres: genres.clone(),
@@ -4405,14 +4405,14 @@ impl FerrofinLiveTvManager {
         // C# `dto.IsNews |= program.IsNews` on a null `bool?`: a false flag
         // stays null and is never serialized, so only true flags appear.
         let flag = |on: bool| on.then_some(true);
-        dto.is_repeat = dto.is_repeat.or(flag(row.is_repeat));
-        dto.is_movie = dto.is_movie.or(flag(row.is_movie));
-        dto.is_series = dto.is_series.or(flag(row.is_series));
-        dto.is_sports = dto.is_sports.or(flag(row.is_sports));
-        dto.is_live = dto.is_live.or(flag(row.is_live));
-        dto.is_news = dto.is_news.or(flag(row.is_news));
-        dto.is_kids = dto.is_kids.or(flag(row.is_kids));
-        dto.is_premiere = dto.is_premiere.or(flag(row.is_premiere));
+        dto.is_repeat = dto.is_repeat.or_else(|| flag(row.is_repeat));
+        dto.is_movie = dto.is_movie.or_else(|| flag(row.is_movie));
+        dto.is_series = dto.is_series.or_else(|| flag(row.is_series));
+        dto.is_sports = dto.is_sports.or_else(|| flag(row.is_sports));
+        dto.is_live = dto.is_live.or_else(|| flag(row.is_live));
+        dto.is_news = dto.is_news.or_else(|| flag(row.is_news));
+        dto.is_kids = dto.is_kids.or_else(|| flag(row.is_kids));
+        dto.is_premiere = dto.is_premiere.or_else(|| flag(row.is_premiere));
         if has_channel_info || has_channel_image {
             dto.channel_name = Some(row.channel_name.clone());
             dto.media_type = if row.channel_media_kind == "Radio" {

@@ -2188,7 +2188,7 @@ async fn version_pairs(db: &Database) -> Result<Vec<OwnedPair>, ServiceError> {
     .await
     .map_err(db_err)?;
     for (id, type_, path, child_path) in linked {
-        primaries.entry(id.clone()).or_insert(GroupRow {
+        primaries.entry(id.clone()).or_insert_with(|| GroupRow {
             id: id.clone(),
             type_,
             path,

@@ -562,7 +562,7 @@ mod tests {
             ..PersonInfo::new("Carol")
         };
         actor.role = Some("Herself".to_owned());
-        add_person(&mut people, actor.clone());
+        add_person(&mut people, actor);
         // First Carol was Unknown, so the Actor is a distinct (Name,Type) entry.
         assert_eq!(people.len(), 2);
 

@@ -278,12 +278,10 @@ fn extension_name(locale: &Locale, original: &str) -> String {
     // CultureData.NormalizeCultureName retains the original extension span.
     // The scoped request catalog uses plain names; this branch matters for a
     // saved default that carries several ordered Unicode keywords.
-    lower
-        .find("-u-")
-        .or_else(|| lower.find("-t-"))
-        .map_or(base.clone(), |start| {
-            format!("{base}{}", &original[start..])
-        })
+    match lower.find("-u-").or_else(|| lower.find("-t-")) {
+        Some(start) => format!("{base}{}", &original[start..]),
+        None => base,
+    }
 }
 
 fn base_parent(locale: &Locale) -> Option<String> {

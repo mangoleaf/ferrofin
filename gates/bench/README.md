@@ -34,7 +34,7 @@ The owner withdrew the fixed 15% spread gate on 2026-09-04: tail variation was n
 reliable pass/fail test. Reports retain ranges for review instead.
 
 The benchmark reference is the Jellyfin release named by the C# source-parity pin
-(`UPSTREAM_TAG` in `handlers/mod.rs`), pinned by digest in `testdata/jellyfin-image.txt`.
+(`UPSTREAM_TAG` in `handlers.rs`), pinned by digest in `testdata/jellyfin-image.txt`.
 The pin is the latest Jellyfin release when a release branch is cut, and the branch keeps it:
 a release is measured against the Jellyfin release its branch pins, and the next release
 branch moves to the newest one (owner decision 2026-10-25). `oracle.py check` compares the tag
@@ -126,7 +126,7 @@ warm-up at the same rate (different picks) that is discarded, and a window in wh
   this branch pins; M counts rows in `VERIFIED_AGAINST_EARLIER_PIN`, compared against an
   earlier pin and owed a re-check) for behavioral equivalence, recorded as rows of
   `handlers::VERIFIED` in
-  `crates/ferrofin-api/src/handlers/mod.rs` and printed by
+  `crates/ferrofin-api/src/handlers.rs` and printed by
   `cargo test -p ferrofin-api --test contract_superset verified_rows -- --nocapture`.
   Runtime response comparison is supporting evidence for that work, never the number.
 

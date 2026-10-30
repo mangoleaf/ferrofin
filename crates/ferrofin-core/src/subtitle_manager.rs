@@ -185,8 +185,12 @@ impl FerrofinSubtitleManager {
                 // SubtitleManager.Normalize: namespace every candidate id with
                 // the MD5 id of the candidate's own provider name.
                 for result in &mut found {
-                    let namespace =
-                        provider_id(result.provider_name.as_deref().unwrap_or(provider.name()));
+                    let namespace = provider_id(
+                        result
+                            .provider_name
+                            .as_deref()
+                            .unwrap_or_else(|| provider.name()),
+                    );
                     result.id = Some(format!(
                         "{namespace}_{}",
                         result.id.as_deref().unwrap_or("")

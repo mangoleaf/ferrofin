@@ -68,7 +68,7 @@ from typing import NamedTuple
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-VERIFIED_SOURCE = "crates/ferrofin-api/src/handlers/mod.rs"
+VERIFIED_SOURCE = "crates/ferrofin-api/src/handlers.rs"
 #: The per-request timeout defaults to 30 s and may be set from 10 to 120 s (run.sh holds the same range).
 REQUEST_TIMEOUT_DEFAULT_S = 30
 REQUEST_TIMEOUT_RANGE_S = (10, 120)

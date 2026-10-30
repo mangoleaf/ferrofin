@@ -743,7 +743,7 @@ mod tests {
         genre.type_ = "MediaBrowser.Controller.Entities.Genre".to_owned();
         assert!(!LibraryChangedNotifier::filter_item(&genre));
 
-        let mut artist = genre.clone();
+        let mut artist = genre;
         artist.type_ = "MediaBrowser.Controller.Entities.Audio.MusicArtist".to_owned();
         assert!(
             LibraryChangedNotifier::filter_item(&artist),

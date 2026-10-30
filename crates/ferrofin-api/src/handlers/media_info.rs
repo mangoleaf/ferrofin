@@ -1436,8 +1436,11 @@ async fn post_playback_info(
         media_source_id: query
             .media_source_id
             .clone()
-            .or(body.media_source_id.take()),
-        live_stream_id: query.live_stream_id.clone().or(body.live_stream_id.take()),
+            .or_else(|| body.media_source_id.take()),
+        live_stream_id: query
+            .live_stream_id
+            .clone()
+            .or_else(|| body.live_stream_id.take()),
         auto_open_live_stream: query
             .auto_open_live_stream
             .or(body.auto_open_live_stream)

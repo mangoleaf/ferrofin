@@ -1267,7 +1267,7 @@ mod tests {
         // its first half.
         let double = BaseItemEntity {
             data: Some(r#"{"IndexNumberEnd":3,"Container":"mkv"}"#.to_owned()),
-            ..ep.clone()
+            ..ep
         };
         assert_eq!(episode_merge_key(&double, |_| None), "Show|number:1:2:3");
         let ep = episode("Show", "Season 1", "Pilot", None);

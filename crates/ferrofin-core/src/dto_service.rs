@@ -1160,7 +1160,7 @@ impl ImageParentGraph {
                 needs_folders,
             );
             if hop == 0 {
-                next = next.or(owner.filter(|o| self.rows.contains_key(o)));
+                next = next.or_else(|| owner.filter(|o| self.rows.contains_key(o)));
             }
             let Some(next) = next else { break };
             chain.push(next);
@@ -3737,7 +3737,7 @@ fn attach_order(
         people.iter().collect();
     ordered.sort_by_key(|person| {
         (
-            person.sort_order.unwrap_or(i64::from(i32::MAX)),
+            person.sort_order.unwrap_or_else(|| i64::from(i32::MAX)),
             kind_rank(person),
         )
     });
