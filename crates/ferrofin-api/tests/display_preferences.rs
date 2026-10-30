@@ -1118,6 +1118,62 @@ async fn display_preferences_refuse_a_blank_client(#[case] method: &str, #[case]
     assert!(prefs.asked_item.lock().unwrap().is_none());
 }
 
+/// gl-1028: `[FromRoute, Required] string displayPreferencesId` on both
+/// actions. ASP.NET's `SimpleTypeModelBinder` reads a route value of nothing
+/// but white space as null, `[Required]` fails, and model validation answers a
+/// `400` `ValidationProblemDetails` keyed `displayPreferencesId` before the
+/// action runs, so ahead of `GetUserId`'s `403` and before any row is read.
+/// Ferrofin hashed the blank id with MD5 and served it (`GET` 200, `POST` 204).
+#[rstest::rstest]
+#[case::get_space("GET", "%20", "")]
+#[case::get_tab("GET", "%09", "")]
+#[case::get_spaces("GET", "%20%20%20", "")]
+#[case::get_no_break_space("GET", "%C2%A0", "")]
+#[case::get_for_another_user("GET", "%20", "&userId=OTHER")]
+#[case::post_space("POST", "%20", "")]
+#[case::post_line_feed("POST", "%0A", "")]
+#[case::post_for_another_user("POST", "%20", "&userId=OTHER")]
+#[tokio::test]
+async fn display_preferences_refuse_a_blank_route_id(
+    #[case] method: &str,
+    #[case] id: &str,
+    #[case] user: &str,
+) {
+    let prefs = Arc::new(StubDisplayPreferences::default());
+    let app = state_with_display_prefs(prefs.clone());
+    let body = if method == "POST" {
+        Body::from(r#"{"CustomPrefs":{}}"#)
+    } else {
+        Body::empty()
+    };
+    let (status, body) = send(
+        app,
+        method,
+        &format!(
+            "/DisplayPreferences/{id}?client=web{}",
+            user.replace("OTHER", &OTHER_USER_ID.to_string())
+        ),
+        body,
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        problem,
+        serde_json::json!({
+            "type": "https://tools.ietf.org/html/rfc9110#section-15.5.1",
+            "title": "One or more validation errors occurred.",
+            "status": 400,
+            "errors": {
+                "displayPreferencesId": ["The displayPreferencesId field is required."],
+            },
+        })
+    );
+    assert!(prefs.asked_item.lock().unwrap().is_none());
+    assert!(prefs.row.lock().unwrap().is_none());
+}
+
 /// The other half of the rule: an **administrator** naming another user's id is
 /// still served. A gate that refuses everyone is not a port of `GetUserId`.
 #[tokio::test]
@@ -1204,6 +1260,9 @@ async fn display_preferences_self_as_non_admin_is_allowed() {
 )]
 #[case::urn("urn:uuid:01234567-89ab-cdef-0123-456789abcdef", None)]
 #[case::name("usersettings", None)]
+// The binder drops only an all-white-space id (gl-1028): a padded name is
+// hashed as sent.
+#[case::padded_name("%20usersettings%20", None)]
 #[tokio::test]
 async fn display_preferences_id_is_read_as_guid_try_parse_reads_it(
     #[case] raw: &str,

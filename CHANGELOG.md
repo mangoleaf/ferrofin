@@ -601,6 +601,17 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   no identity of its own online, so a lookup by its file name filled it with another title's
   overview, people or Primary image. Its local readers, embedded images and extracted frames
   still run. The item it belongs to is asked as before
+- A whitespace-only `lyricId` (`GET /Providers/Lyrics/{lyricId}`,
+  `POST /Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}`) or `displayPreferencesId`
+  (`GET` and `POST /DisplayPreferences/{displayPreferencesId}`) answers Jellyfin's `400`
+  validation problem ("The lyricId field is required."), after the permission check and before
+  the item or the preferences are read. The lyric routes answered `404`, and the display
+  preferences routes read and saved preferences under the blank id
+- A lyric upload whose file name's extension is padded or holds a line break
+  (`fileName=song.lrc%20`) answers `400` and saves nothing, as Jellyfin's lyric parsers refuse
+  it; it was trimmed and saved as `song.lrc`. A remote lyric's format is read as given too. An
+  upload past the 30 MB limit answers `404` for a missing item and `400` for a file name
+  without an extension, as Jellyfin checks both before it reads the body; both answered `413`
 
 ### Performance
 - A library scan keeps the remote answers it shares between items only as long as
