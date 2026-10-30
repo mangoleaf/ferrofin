@@ -1294,13 +1294,16 @@ mod tests {
                             routes
                                 .iter_mut()
                                 .find(|(route, _)| path.contains(route))
-                                .map_or((404, "{}".to_owned()), |(_, replies)| {
-                                    if replies.len() > 1 {
-                                        replies.pop_front().unwrap()
-                                    } else {
-                                        replies.front().cloned().unwrap()
-                                    }
-                                })
+                                .map_or_else(
+                                    || (404, "{}".to_owned()),
+                                    |(_, replies)| {
+                                        if replies.len() > 1 {
+                                            replies.pop_front().unwrap()
+                                        } else {
+                                            replies.front().cloned().unwrap()
+                                        }
+                                    },
+                                )
                         };
                         let response = format!(
                             "HTTP/1.1 {status} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",

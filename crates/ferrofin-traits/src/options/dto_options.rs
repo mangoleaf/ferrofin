@@ -214,7 +214,7 @@ mod tests {
         let opts = DtoOptions::default();
         assert_eq!(opts.image_limit(ImageType::Primary), i32::MAX);
 
-        let mut disabled = opts.clone();
+        let mut disabled = opts;
         disabled.enable_images = false;
         assert_eq!(disabled.image_limit(ImageType::Primary), 0);
 

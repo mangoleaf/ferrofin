@@ -9874,7 +9874,7 @@ mod tests {
         // A locked row keeps its user-owned columns, but not the file facts.
         let locked = ferrofin_db::entities::base_items::BaseItemEntity {
             is_locked: true,
-            ..stored.clone()
+            ..stored
         };
         assert!(!super::scan_save_changes_row(&renamed, &locked, false));
         assert!(super::scan_save_changes_row(&moved, &locked, false));

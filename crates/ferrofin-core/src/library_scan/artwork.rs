@@ -427,7 +427,7 @@ mod tests {
         let old = legacy.join("backdrop.jpg");
         std::fs::write(&new, b"new").unwrap();
         std::fs::write(&old, b"old").unwrap();
-        let folders = [own.clone(), legacy.clone()];
+        let folders = [own, legacy];
         prune_old_backdrops_in(&folders, &[]);
         assert!(
             old.exists() && new.exists(),

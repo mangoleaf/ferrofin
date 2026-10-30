@@ -1201,10 +1201,12 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
                         output_codec,
                         "h264",
                     );
-                let target_fps = req.max_framerate.or(probe_state
-                    .video_stream
-                    .as_ref()
-                    .and_then(|v| v.average_frame_rate.or(v.real_frame_rate)));
+                let target_fps = req.max_framerate.or_else(|| {
+                    probe_state
+                        .video_stream
+                        .as_ref()
+                        .and_then(|v| v.average_frame_rate.or(v.real_frame_rate))
+                });
                 let resolution = ferrofin_model::dlna::ResolutionNormalizer::normalize(
                     source_bitrate,
                     output_bitrate,
@@ -2269,7 +2271,7 @@ impl FerrofinStreamStatePlanner {
                 // the matrix did not claim the job, so the frames are in system
                 // memory and the software chain above has already set the
                 // format. The frame-rate cap is already in place.
-                main: with_frame_rate_cap(sw_filters.clone(), sw_fps.as_deref(), sw_deinterlace),
+                main: with_frame_rate_cap(sw_filters, sw_fps.as_deref(), sw_deinterlace),
                 // With no output size to fit to (a video stream without
                 // dimensions), `null` keeps the subtitle as authored.
                 sub: vec![if fit.is_empty() {
@@ -3702,7 +3704,7 @@ mod tests {
         third.is_default = false;
         // Out of index order, so only the sort makes stream 2 the first with
         // channels.
-        let streams = vec![video_stream("h264"), third, second.clone(), first];
+        let streams = vec![video_stream("h264"), third, second, first];
         // The requested index wins.
         assert_eq!(
             media_stream(&streams, Some(2), MediaStreamType::Audio).map(|s| s.index),

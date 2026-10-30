@@ -298,10 +298,12 @@ impl FerrofinServerApplicationHost {
             "http"
         });
         let is_https = scheme.eq_ignore_ascii_case("https");
-        let port = port.unwrap_or(if is_https {
-            self.https_port()
-        } else {
-            self.http_port()
+        let port = port.unwrap_or_else(|| {
+            if is_https {
+                self.https_port()
+            } else {
+                self.http_port()
+            }
         });
 
         // Omit the port when it is the scheme's default (80/443), matching the
@@ -454,10 +456,12 @@ impl ServerApplicationHost for FerrofinServerApplicationHost {
             let scheme = Self::request_scheme(request);
             // C# passes -1 when Host omits the port, so UriBuilder omits it
             // rather than substituting the server's internal listen port.
-            let port = Some(req_port.unwrap_or(if scheme.eq_ignore_ascii_case("https") {
-                443
-            } else {
-                80
+            let port = Some(req_port.unwrap_or_else(|| {
+                if scheme.eq_ignore_ascii_case("https") {
+                    443
+                } else {
+                    80
+                }
             }));
             return Ok(self.build_local_api_url(&host, Some(&scheme), port));
         }

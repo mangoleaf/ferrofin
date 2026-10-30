@@ -940,7 +940,7 @@ mod tests {
         );
         // Another timer already recording to it counts too; this timer's own
         // in-flight path does not.
-        let taken = ActiveRecording::new("t2".to_owned(), uuid::Uuid::nil(), path.clone());
+        let taken = ActiveRecording::new("t2".to_owned(), uuid::Uuid::nil(), path);
         let free = dir.path().join("Other.ts");
         assert_eq!(
             ensure_file_unique(

@@ -361,7 +361,7 @@ impl FerrofinVirtualFolderManager {
         let db = self.user_preferences.as_ref().map(|(db, _)| db);
         SnapshotInvalidation(
             &self.snapshot,
-            db.or(self.physical_root.as_ref().map(|(db, _)| db)),
+            db.or_else(|| self.physical_root.as_ref().map(|(db, _)| db)),
         )
     }
 

@@ -1792,14 +1792,8 @@ mod tests {
             .with_metadata_path(metadata)
             .with_id_derivation(mode);
 
-        let before: Vec<Option<String>> = manager
-            .get_user_views(user_id)
-            .await
-            .expect("views")
-            .into_iter()
-            .map(|v| v.name)
-            .collect();
-        assert_eq!(before.len(), 2, "the duplicate is what 12.0 left behind");
+        let before = manager.get_user_views(user_id).await.expect("views").len();
+        assert_eq!(before, 2, "the duplicate is what 12.0 left behind");
 
         assert_eq!(
             manager

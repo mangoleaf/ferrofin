@@ -471,7 +471,7 @@ impl<'a> BaseNfoParser<'a> {
                 if let Some(provider) = provider.filter(|p| !p.is_empty()) {
                     let normalized = self
                         .lookup_provider(&provider)
-                        .map_or(provider.clone(), ToOwned::to_owned);
+                        .map_or_else(|| provider.clone(), ToOwned::to_owned);
                     result.item.set_provider_id(&normalized, &provider_id);
                 }
             }
