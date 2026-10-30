@@ -613,6 +613,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   on its own rows instead of building the user's whole watch history first. On the
   benchmark corpus (release builds before and after, requests interleaved) a series' two
   counts went from 0.61 to 0.15 ms, and a 7,490-leaf folder's from 34 to 19 ms
+- Non-recursive folder listings sorted by `SortName` or `Name` (`/Items?parentId=…`, the
+  folders view, a season's episodes): compute each child's sort key once instead of on
+  every comparison. Sorting 2,000 children made 95,896 heap allocations and now makes
+  6,004; the order is unchanged
 - A request on a session that already exists no longer reads the device's options row or
   copies its stored capabilities; only the request that creates the session does. Every
   playback start, progress and stop report ran one `DeviceOptions` statement before, and
