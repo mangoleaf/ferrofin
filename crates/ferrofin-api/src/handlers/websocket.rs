@@ -376,32 +376,23 @@ fn parse_inbound(text: &str) -> Option<Inbound> {
 /// malformed — jellyfin-web subscribes with "0,1500".
 const DEFAULT_STREAM_MILLIS: u64 = 1500;
 
-/// Fallback minimum period between pushes of a dashboard stream, used when the
-/// composition root does not configure one (chiefly unit tests). The server
-/// injects the operator-configured floor
-/// (`FERROFIN_WS_MIN_STREAM_PERIOD_MS`, default 100 ms) via
-/// [`crate::AppState::with_websocket_min_stream_period`]; this constant only
-/// backs a bare [`crate::AppState::new`] so client-chosen periods are floored
-/// even then.
-///
-/// The floor dates from when the task and activity streams ran on a timer,
-/// where a 1 ms period meant back-to-back reads. Every stream is now
-/// event-driven, as upstream's `BasePeriodicWebSocketListener` is, and the
-/// period only spaces out low-priority updates (session activity, task
-/// progress); upstream has no floor. Removing it is TODO(gl-723).
-pub(crate) const DEFAULT_WS_MIN_STREAM_PERIOD: Duration = Duration::from_millis(100);
-
 /// Parses the `"initialDelayMs,periodMs"` subscription payload (the C#
 /// `BasePeriodicWebSocketListener` Data convention) into the stream period.
 /// It is upstream's throttle interval (`WebSocketListenerState.IntervalMs`)
 /// for every stream. The initial delay is ignored, as upstream stores
-/// `InitialDelayMs` and never reads it.
+/// `InitialDelayMs` and never uses it.
+///
+/// There is no floor, as upstream has none (`BasePeriodicWebSocketListener.cs:177`):
+/// 0 is kept, and a negative period, which upstream's `long.Parse` accepts and
+/// whose throttle passes every send, is 0. No timer runs on the period: every
+/// send is triggered by an event, forced ones coalesce to one frame per wake
+/// (`drain`), and throttled ones are also spaced by the period, so nothing
+/// loops whatever a client asks.
 fn subscription_period(data: Option<&str>) -> Duration {
     let millis = data
         .and_then(|d| d.split(',').nth(1))
-        .and_then(|p| p.trim().parse::<u64>().ok())
-        .filter(|&p| p > 0)
-        .unwrap_or(DEFAULT_STREAM_MILLIS);
+        .and_then(|p| p.trim().parse::<i64>().ok())
+        .map_or(DEFAULT_STREAM_MILLIS, |p| u64::try_from(p).unwrap_or(0));
     Duration::from_millis(millis)
 }
 
@@ -604,7 +595,7 @@ async fn handle_socket(
     // (each is `None` until subscribed). Only a socket with a session may
     // subscribe — the streams answer as the socket's user — and the activity
     // stream is an administrator's alone (`may_subscribe`).
-    let mut streams = Streams::new(state.websocket_min_stream_period);
+    let mut streams = Streams::default();
 
     if open {
         loop {
@@ -843,6 +834,7 @@ async fn keep_alive_watchdog(
 }
 
 /// The armed dashboard streams of one socket.
+#[derive(Default)]
 struct Streams {
     sessions: Option<EventStream<SessionEvent>>,
     /// One `()` per progress report of a running task.
@@ -851,24 +843,9 @@ struct Streams {
     task_updates: Option<TaskUpdateReceiver>,
     /// One `()` per created activity-log entry.
     activity: Option<EventStream<()>>,
-    /// The floor every armed stream's period is clamped up to (see
-    /// [`DEFAULT_WS_MIN_STREAM_PERIOD`]).
-    min_period: Duration,
 }
 
 impl Streams {
-    /// A fresh, unsubscribed stream set whose periods are floored at
-    /// `min_period` (the operator-configured minimum stream period).
-    fn new(min_period: Duration) -> Self {
-        Self {
-            sessions: None,
-            tasks: None,
-            task_updates: None,
-            activity: None,
-            min_period,
-        }
-    }
-
     /// Arms or cancels a stream for one subscription message; the task
     /// stream is [`update_task_subscription`]'s.
     fn apply(
@@ -879,11 +856,11 @@ impl Streams {
     ) {
         match inbound {
             Inbound::SessionsStart(p) => {
-                self.sessions = self.event_stream(sessions.subscribe_session_events(), p);
+                self.sessions = Self::event_stream(sessions.subscribe_session_events(), p);
             }
             Inbound::SessionsStop => self.sessions = None,
             Inbound::ActivityStart(p) => {
-                self.activity = self.event_stream(activity.subscribe_entry_created(), p);
+                self.activity = Self::event_stream(activity.subscribe_entry_created(), p);
             }
             Inbound::ActivityStop => self.activity = None,
             Inbound::TasksStart(_) | Inbound::TasksStop | Inbound::KeepAlive => {}
@@ -894,13 +871,12 @@ impl Streams {
     /// which replaces any earlier one. `None` (a manager that raises no
     /// events) leaves the stream unarmed, so it sends nothing.
     fn event_stream<E>(
-        &self,
         events: Option<tokio::sync::broadcast::Receiver<E>>,
         period: Duration,
     ) -> Option<EventStream<E>> {
         events.map(|events| EventStream {
             events,
-            period: period.max(self.min_period),
+            period,
             last_sent: None,
         })
     }
@@ -1173,7 +1149,7 @@ async fn update_task_subscription(
     match inbound {
         Inbound::TasksStart(period) => {
             let (message, progress) = subscribe_tasks(state, &mut streams.task_updates).await;
-            streams.tasks = streams.event_stream(progress, period);
+            streams.tasks = Streams::event_stream(progress, period);
             if message.is_some() {
                 mark_sent(&mut streams.tasks);
             }
@@ -1319,29 +1295,16 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
 
+    /// A subscription keeps the period the client asked for, however small:
+    /// upstream's `IntervalMs` has no floor (`event_stream`, which every
+    /// stream's subscription goes through).
     #[tokio::test]
-    async fn stream_period_is_floored_at_the_configured_minimum() {
-        // A hostile or misconfigured client asks for a 1 ms period; the
-        // subscription is clamped up to the floor (`event_stream`, which every
-        // stream's subscription goes through).
-        let floor = Duration::from_millis(100);
-        let mut streams = Streams::new(floor);
-        let (_events, receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
-        streams.sessions = streams.event_stream(Some(receiver), Duration::from_millis(1));
-        assert_eq!(streams.sessions.as_ref().unwrap().period, floor);
-    }
-
-    #[tokio::test]
-    async fn stream_period_above_the_floor_is_left_untouched() {
-        // jellyfin-web subscribes with 1500 ms, comfortably above the floor, so
-        // the floor must not slow a well-behaved client down.
-        let mut streams = Streams::new(Duration::from_millis(100));
-        let (_events, receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
-        streams.sessions = streams.event_stream(Some(receiver), Duration::from_millis(1500));
-        assert_eq!(
-            streams.sessions.as_ref().unwrap().period,
-            Duration::from_millis(1500)
-        );
+    async fn stream_period_has_no_floor() {
+        for period in [Duration::ZERO, Duration::from_millis(1)] {
+            let (_events, receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
+            let stream = Streams::event_stream(Some(receiver), period).unwrap();
+            assert_eq!(stream.period, period);
+        }
     }
 
     /// A second `SessionsStart` replaces the first: a new receiver, the new
@@ -1350,12 +1313,12 @@ mod tests {
     /// leaves the stream unarmed.
     #[tokio::test]
     async fn a_second_sessions_start_replaces_the_subscription() {
-        let mut streams = Streams::new(Duration::from_millis(100));
+        let mut streams = Streams::default();
         let (events, receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
-        streams.sessions = streams.event_stream(Some(receiver), Duration::from_millis(1500));
+        streams.sessions = Streams::event_stream(Some(receiver), Duration::from_millis(1500));
         streams.sessions.as_mut().unwrap().last_sent = Some(tokio::time::Instant::now());
 
-        streams.sessions = streams.event_stream(Some(events.subscribe()), Duration::from_secs(5));
+        streams.sessions = Streams::event_stream(Some(events.subscribe()), Duration::from_secs(5));
         let subscription = streams.sessions.as_ref().unwrap();
         assert_eq!(subscription.period, Duration::from_secs(5));
         assert_eq!(subscription.last_sent, None);
@@ -1476,11 +1439,11 @@ mod tests {
             Arc::new(ferrofin_traits::stubs::NoopLibraryMonitor),
             Arc::new(RecordingTasks::default()),
         );
-        let mut streams = Streams::new(Duration::ZERO);
+        let mut streams = Streams::default();
         let (transitions, receiver) = tokio::sync::broadcast::channel(4);
         let (progress, progress_receiver) = tokio::sync::broadcast::channel(4);
         streams.task_updates = Some(receiver);
-        streams.tasks = streams.event_stream(Some(progress_receiver), Duration::ZERO);
+        streams.tasks = Streams::event_stream(Some(progress_receiver), Duration::ZERO);
 
         transitions.send(Vec::new()).unwrap();
         progress.send(()).unwrap();
@@ -1669,6 +1632,32 @@ mod tests {
             parse_inbound(r#"{"MessageType":"ActivityLogEntryStart","Data":"0,1000"}"#),
             Some(Inbound::ActivityStart(Duration::from_secs(1)))
         );
+        // No floor: upstream's IntervalMs of 0, or below, throttles nothing.
+        for data in ["0,0", "0,-5"] {
+            assert_eq!(
+                parse_inbound(&format!(
+                    r#"{{"MessageType":"SessionsStart","Data":"{data}"}}"#
+                )),
+                Some(Inbound::SessionsStart(Duration::ZERO)),
+                "{data}"
+            );
+        }
+        // A period that does not parse falls back to the default; the initial
+        // delay is never read.
+        for (data, millis) in [
+            ("0,abc", DEFAULT_STREAM_MILLIS),
+            ("0,", DEFAULT_STREAM_MILLIS),
+            ("0,99999999999999999999", DEFAULT_STREAM_MILLIS),
+            ("abc,500", 500),
+        ] {
+            assert_eq!(
+                parse_inbound(&format!(
+                    r#"{{"MessageType":"SessionsStart","Data":"{data}"}}"#
+                )),
+                Some(Inbound::SessionsStart(Duration::from_millis(millis))),
+                "{data}"
+            );
+        }
         // Malformed or missing Data falls back to the default period.
         assert_eq!(
             parse_inbound(r#"{"MessageType":"SessionsStart"}"#),

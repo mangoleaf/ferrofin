@@ -61,17 +61,6 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 /// ASP.NET's `HostOptions.ShutdownTimeout` default, which Jellyfin runs with.
 const DEFAULT_SHUTDOWN_TIMEOUT_SECS: u32 = 30;
 
-/// Minimum period, in milliseconds, between pushes of a dashboard WebSocket
-/// stream (Sessions / ScheduledTasksInfo / ActivityLogEntry). The client names
-/// the period in its `*Start` subscription. Every stream is event-driven, as
-/// upstream's `BasePeriodicWebSocketListener` is, and the period only spaces
-/// out low-priority updates (session activity, task progress); the floor
-/// dates from when the task and activity streams ran on a timer, and upstream
-/// has none.
-/// 100 ms allows far faster updates than jellyfin-web's 1500 ms while bounding
-/// the worst case for a hostile client.
-const DEFAULT_WS_MIN_STREAM_PERIOD_MS: u32 = 100;
-
 /// Command-line arguments — the highest-precedence configuration layer.
 ///
 /// Only the knobs a operator commonly overrides on the command line are
@@ -123,10 +112,6 @@ const KEYS_NOT_NAMED_BY_STEM: &[(&str, &str)] = &[
     ("FERROFIN_TVDB_PIN", "tvdb_subscriber_pin"),
     ("FERROFIN_FANART_KEY", "fanart_personal_api_key"),
     ("FERROFIN_MUSICBRAINZ_URL", "musicbrainz_base_url"),
-    (
-        "FERROFIN_WS_MIN_STREAM_PERIOD_MS",
-        "websocket_min_stream_period_ms",
-    ),
 ];
 
 /// The subset of [`Config`] fields that may appear in `config.toml`.
@@ -178,7 +163,6 @@ struct FileConfig {
     metrics_sample_interval: Option<u32>,
     metrics_scan_duration_buckets: Option<Vec<f64>>,
     shutdown_timeout_secs: Option<u32>,
-    websocket_min_stream_period_ms: Option<u32>,
     scan_progress_every: Option<u32>,
     scan_probe_concurrency: Option<u32>,
     scan_directory_cache_records: Option<u32>,
@@ -546,13 +530,6 @@ pub struct Config {
     /// `FERROFIN_SHUTDOWN_TIMEOUT_SECS` env > `shutdown_timeout_secs` in
     /// `config.toml` > 30.
     pub shutdown_timeout_secs: u32,
-
-    /// Minimum period (milliseconds) between pushes of a dashboard WebSocket
-    /// stream; the client-chosen Sessions / ScheduledTasksInfo /
-    /// ActivityLogEntry period is clamped up to it. Resolved
-    /// `FERROFIN_WS_MIN_STREAM_PERIOD_MS` env > `websocket_min_stream_period_ms`
-    /// in `config.toml` > 100. See [`DEFAULT_WS_MIN_STREAM_PERIOD_MS`].
-    pub websocket_min_stream_period_ms: u32,
 
     /// Library-scan progress cadence: emit a progress `info!` every N items.
     /// `None` = the 100-item default; `0` disables progress logs. Resolved in
@@ -994,9 +971,6 @@ impl Config {
             shutdown_timeout_secs: parse_var(env, "FERROFIN_SHUTDOWN_TIMEOUT_SECS")
                 .or(file.shutdown_timeout_secs)
                 .unwrap_or(DEFAULT_SHUTDOWN_TIMEOUT_SECS),
-            websocket_min_stream_period_ms: parse_var(env, "FERROFIN_WS_MIN_STREAM_PERIOD_MS")
-                .or(file.websocket_min_stream_period_ms)
-                .unwrap_or(DEFAULT_WS_MIN_STREAM_PERIOD_MS),
             scan_progress_every: parse_var(env, "FERROFIN_SCAN_PROGRESS_EVERY")
                 .or(file.scan_progress_every),
             scan_probe_concurrency: parse_var(env, "FERROFIN_SCAN_PROBE_CONCURRENCY")
@@ -1262,7 +1236,6 @@ impl Config {
             metrics_sample_interval: None,
             metrics_scan_duration_buckets: None,
             shutdown_timeout_secs: DEFAULT_SHUTDOWN_TIMEOUT_SECS,
-            websocket_min_stream_period_ms: DEFAULT_WS_MIN_STREAM_PERIOD_MS,
             scan_progress_every: None,
             scan_probe_concurrency: None,
             scan_directory_cache_records: None,
@@ -1794,23 +1767,6 @@ mod tests {
         assert_eq!(cfg.base_url, "");
         assert!(cfg.library_roots.is_empty(), "{:?}", cfg.library_roots);
         assert!(cfg.ffmpeg_path.is_none());
-        assert_eq!(
-            cfg.websocket_min_stream_period_ms,
-            DEFAULT_WS_MIN_STREAM_PERIOD_MS
-        );
-    }
-
-    #[test]
-    fn websocket_min_stream_period_resolves_env_over_default() {
-        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
-        assert_eq!(
-            cfg.websocket_min_stream_period_ms,
-            DEFAULT_WS_MIN_STREAM_PERIOD_MS
-        );
-
-        let env = FakeEnv::new().with("FERROFIN_WS_MIN_STREAM_PERIOD_MS", "250");
-        let cfg = Config::load_from(Cli::default(), &env).unwrap();
-        assert_eq!(cfg.websocket_min_stream_period_ms, 250);
     }
 
     #[test]
@@ -2266,6 +2222,25 @@ mod tests {
             cfg.load_warnings
         );
         assert_ne!(cfg.server_name, "x", "keys are case-sensitive");
+    }
+
+    /// v1.5.0 removed the WebSocket minimum stream period: a `config.toml`
+    /// that still sets it loads, and the key is only warned about.
+    #[test]
+    fn a_leftover_websocket_min_stream_period_key_loads_with_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "websocket_min_stream_period_ms = 250\n").unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli, &FakeEnv::new()).unwrap();
+        assert_eq!(cfg.port, DEFAULT_HTTP_PORT);
+        assert_eq!(
+            cfg.load_warnings,
+            ["unknown key `websocket_min_stream_period_ms` in config.toml is ignored"]
+        );
     }
 
     /// Every `FERROFIN_*` variable this module reads has a `config.toml`

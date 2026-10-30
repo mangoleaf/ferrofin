@@ -11003,10 +11003,10 @@ impl LibraryScanner {
     /// A movie or series is fetched by the IMDb id in the lookup — an NFO's, a
     /// previous match's, or the one a provider that ran before it in this
     /// pass found — and only without one found by OMDb's exact-title
-    /// endpoint (`OmdbItemProvider.GetResult` → `GetImdbId`). An episode is
-    /// read out of its series' season listing, keyed by the series' IMDb id
-    /// recorded earlier in this scan. `None` when OMDb has nothing (or has no
-    /// key).
+    /// endpoint, by its parsed name (`OmdbItemProvider.GetResult` →
+    /// `GetImdbId`, [`video_resolver::parse_name`]). An episode is read out of
+    /// its series' season listing, keyed by the series' IMDb id recorded
+    /// earlier in this scan. `None` when OMDb has nothing (or has no key).
     ///
     /// `Rated` and `Genres` are only taken for an English library (OMDb has no
     /// localization — C# `IsConfiguredForEnglish`), and `Rated` additionally
@@ -11044,8 +11044,14 @@ impl LibraryScanner {
                 match (own_imdb.as_deref(), name) {
                     (Some(imdb), _) => omdb.item(imdb).await,
                     (None, Some(name)) => {
-                        let cleaned = ferrofin_providers::tmdb::clean_name(name);
-                        omdb.find_by_title(kind, &cleaned, year).await
+                        // `GetSearchResultsInternal` (`OmdbItemProvider.cs:106-125`):
+                        // the name is a file or folder name (`Movie (2016)`), so
+                        // `&t=` gets `ParseName`'s title, as it is (no TMDb
+                        // `CleanName`), and `&y=` the year in the name when the
+                        // item has none.
+                        let parsed = video_resolver::parse_name(name, &PATH_NAMING);
+                        omdb.find_by_title(kind, &parsed.name, year.or(parsed.year))
+                            .await
                     }
                     (None, None) => None,
                 }
@@ -11099,11 +11105,11 @@ impl LibraryScanner {
     ///
     /// The title is fetched by the `Tmdb` id in the lookup, else resolved
     /// through `/find` by its IMDb id (a series also by its TVDB id), and
-    /// searched by name only without any of them — so a `Tmdb` id a provider
-    /// that ran before it found (TVDB's remote ids) spares the search. Its
-    /// answer carries the title's IMDb id and, for a series, its TVDB id
-    /// (`TmdbSeriesProvider.cs:306-312`), which the providers after it resolve
-    /// by.
+    /// searched by its parsed name ([`video_resolver::parse_name`]) only
+    /// without any of them — so a `Tmdb` id a provider that ran before it found
+    /// (TVDB's remote ids) spares the search. Its answer carries the title's
+    /// IMDb id and, for a series, its TVDB id (`TmdbSeriesProvider.cs:306-312`),
+    /// which the providers after it resolve by.
     async fn fetch_tmdb_metadata(
         &self,
         row: &BaseItemEntity,
@@ -11126,7 +11132,6 @@ impl LibraryScanner {
             "Series" => TmdbKind::Series,
             _ => return None,
         };
-        let year = lookup.year(row);
         // C# `TmdbMovieProvider.GetMetadata` reads `info.GetProviderId(Tmdb)`
         // first and only searches by title when there is none, so a `<tmdbid>`
         // the user pinned in an NFO is honoured rather than re-guessed.
@@ -11143,12 +11148,18 @@ impl LibraryScanner {
         let tmdb_id = if let Some(id) = pinned {
             id
         } else {
-            let name = lookup.name(row)?;
-            let cleaned = ferrofin_providers::tmdb::clean_name(&name);
+            // "ParseName is required here" (`TmdbMovieProvider.cs:162-170`,
+            // `TmdbSeriesProvider.cs:201-208`): the name is a file or folder
+            // name (`Movie (2016)`), so the search and the match go by the
+            // parsed title, and by the year in the name when the item has none.
+            let parsed = video_resolver::parse_name(&lookup.name(row)?, &PATH_NAMING);
+            let year = lookup.year(row).or(parsed.year);
+            let cleaned = ferrofin_providers::tmdb::clean_name(&parsed.name);
             let results = tmdb
                 .search(kind, &cleaned, year, lookup.tmdb_language().as_deref())
                 .await;
-            ferrofin_providers::tmdb::find_best_match(&results, &name, year).map(|h| h.tmdb_id)?
+            ferrofin_providers::tmdb::find_best_match(&results, &parsed.name, year)
+                .map(|h| h.tmdb_id)?
         };
         // The seasons/episodes below this series key off the cached id.
         // Cached however the id was resolved — a pinned series id serves its
@@ -21128,7 +21139,8 @@ fn embedded_video_people(info: &MediaInfo) -> Vec<PeopleEntity> {
         .collect()
 }
 
-/// The naming rules [`before_metadata_refresh`] reads a path by.
+/// The naming rules [`before_metadata_refresh`] reads a path by, and the
+/// remote lookups parse a name by (`LibraryManager.ParseName`'s `_namingOptions`).
 static PATH_NAMING: std::sync::LazyLock<NamingOptions> =
     std::sync::LazyLock::new(NamingOptions::new);
 

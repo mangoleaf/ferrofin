@@ -52,13 +52,13 @@ pub mod guid {
         }
     }
 
-    /// Writes `ToString("N")`.
+    /// Writes `ToString("N")`, from a stack buffer: nothing is allocated.
     ///
     /// # Errors
     ///
     /// Propagates the serializer's error.
     pub fn serialize<S: Serializer>(value: &Uuid, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&value.simple().to_string())
+        serializer.serialize_str(value.simple().encode_lower(&mut Uuid::encode_buffer()))
     }
 
     /// Reads any guid spelling; `null` is `Guid.Empty`.
@@ -85,7 +85,7 @@ pub mod guid {
             serializer: S,
         ) -> Result<S::Ok, S::Error> {
             match value {
-                Some(id) if !id.is_nil() => serializer.serialize_str(&id.simple().to_string()),
+                Some(id) if !id.is_nil() => super::serialize(id, serializer),
                 _ => serializer.serialize_none(),
             }
         }
@@ -118,8 +118,9 @@ pub mod guid {
         /// Propagates the serializer's error.
         pub fn serialize<S: Serializer>(value: &[Uuid], serializer: S) -> Result<S::Ok, S::Error> {
             let mut seq = serializer.serialize_seq(Some(value.len()))?;
+            let mut text = Uuid::encode_buffer();
             for id in value {
-                seq.serialize_element(&id.simple().to_string())?;
+                seq.serialize_element(&*id.simple().encode_lower(&mut text))?;
             }
             seq.end()
         }
@@ -173,7 +174,9 @@ pub mod guid {
 
 /// `JsonDateTimeConverter` — `DateTime<Utc>` fields.
 pub mod datetime {
-    use chrono::{DateTime, NaiveDate, Utc};
+    use std::borrow::Cow;
+
+    use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
     use serde::{Deserialize, Deserializer, Serializer};
 
     /// C# `DateTime.MinValue` — `0001-01-01T00:00:00Z`, what an unassigned
@@ -199,19 +202,10 @@ pub mod datetime {
     /// trimmed (`Utf8JsonWriter`'s `FFFFFFF`).
     #[must_use]
     pub fn format(value: &DateTime<Utc>) -> String {
-        let ticks = value.timestamp_subsec_nanos() / 100;
-        let mut fraction = format!("{ticks:07}");
-        if ticks / 10_000 != 0 {
-            // Milliseconds present: STJ trims the trailing zeros of the 7-digit
-            // fraction (a millisecond is never all zeros here, so some digit stays).
-            while fraction.ends_with('0') {
-                fraction.pop();
-            }
-        }
-        format!("{}.{fraction}Z", value.format("%Y-%m-%dT%H:%M:%S"))
+        WireText::new(value).as_str().into_owned()
     }
 
-    /// Writes [`format`].
+    /// Writes [`format`]'s text, from a stack buffer: nothing is allocated.
     ///
     /// # Errors
     ///
@@ -220,7 +214,90 @@ pub mod datetime {
         value: &DateTime<Utc>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&format(value))
+        serializer.serialize_str(&WireText::new(value).as_str())
+    }
+
+    /// The longest [`format`] text: a signed six-digit year (chrono's widest,
+    /// `-262143`), `-MM-ddTHH:mm:ss.`, eight tick digits (a leap second's
+    /// fraction is 10^7 ticks or more) and `Z`.
+    const WIRE_TEXT_LEN: usize = 7 + 16 + 8 + 1;
+
+    /// [`format`]'s text, built on the stack: the bytes chrono's
+    /// `%Y-%m-%dT%H:%M:%S` and two `format!`s wrote before, without their
+    /// seven allocations per date.
+    struct WireText {
+        bytes: [u8; WIRE_TEXT_LEN],
+        len: usize,
+    }
+
+    impl WireText {
+        fn new(value: &DateTime<Utc>) -> Self {
+            let mut text = Self {
+                bytes: [0; WIRE_TEXT_LEN],
+                len: 0,
+            };
+            // chrono's `%Y`: four digits for the years 0..=9999, otherwise a sign
+            // and at least four digits.
+            let year = value.year();
+            if !(0..10_000).contains(&year) {
+                text.push(if year < 0 { b'-' } else { b'+' });
+            }
+            text.push_digits(year.unsigned_abs(), 4);
+            text.push(b'-');
+            text.push_digits(value.month(), 2);
+            text.push(b'-');
+            text.push_digits(value.day(), 2);
+            text.push(b'T');
+            text.push_digits(value.hour(), 2);
+            text.push(b':');
+            text.push_digits(value.minute(), 2);
+            text.push(b':');
+            // A leap second is second 59 with 10^9 ns or more, which `%S` writes
+            // as 60.
+            let nanos = value.timestamp_subsec_nanos();
+            text.push_digits(value.second() + nanos / 1_000_000_000, 2);
+            text.push(b'.');
+            let ticks = nanos / 100;
+            let fraction = text.len;
+            text.push_digits(ticks, 7);
+            if ticks / 10_000 != 0 {
+                // Milliseconds present: STJ trims the trailing zeros of the 7-digit
+                // fraction (a millisecond is never all zeros here, so some digit stays).
+                while text.len > fraction && text.bytes[text.len - 1] == b'0' {
+                    text.len -= 1;
+                }
+            }
+            text.push(b'Z');
+            text
+        }
+
+        fn push(&mut self, byte: u8) {
+            self.bytes[self.len] = byte;
+            self.len += 1;
+        }
+
+        /// `value` in decimal, zero-padded to at least `width` digits
+        /// (`{value:0width$}`).
+        fn push_digits(&mut self, value: u32, width: usize) {
+            let mut count = 1;
+            let mut rest = value / 10;
+            while rest != 0 {
+                count += 1;
+                rest /= 10;
+            }
+            let end = self.len + count.max(width);
+            let mut rest = value;
+            for slot in self.bytes[self.len..end].iter_mut().rev() {
+                *slot = b"0123456789"[(rest % 10) as usize];
+                rest /= 10;
+            }
+            self.len = end;
+        }
+
+        /// The text. Every byte is ASCII, so this always borrows.
+        fn as_str(&self) -> Cow<'_, str> {
+            String::from_utf8_lossy(&self.bytes[..self.len])
+        }
     }
 
     /// Parses stored and query-string dates, including surrounding whitespace.
@@ -276,7 +353,7 @@ pub mod datetime {
             serializer: S,
         ) -> Result<S::Ok, S::Error> {
             match value {
-                Some(dt) => serializer.serialize_str(&super::format(dt)),
+                Some(dt) => super::serialize(dt, serializer),
                 None => serializer.serialize_none(),
             }
         }
@@ -395,6 +472,147 @@ mod tests {
         let at = Utc.with_ymd_and_hms(2026, 8, 23, 5, 29, 37).unwrap()
             + chrono::Duration::nanoseconds(764_472_900);
         assert_eq!(super::datetime::format(&at), "2026-08-23T05:29:37.7644729Z");
+    }
+
+    /// `at` written through both date attributes.
+    fn both_fields(at: DateTime<Utc>) -> String {
+        serde_json::to_string(&Dates {
+            at,
+            maybe: Some(at),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn date_edge_values_keep_their_wire_text() {
+        let second = Utc.with_ymd_and_hms(2026, 8, 23, 16, 57, 22).unwrap();
+        let ns = chrono::Duration::nanoseconds;
+        for (at, text) in [
+            // `DateTime.MinValue` and `DateTime.MaxValue`.
+            (
+                super::datetime::dotnet_min(),
+                "0001-01-01T00:00:00.0000000Z",
+            ),
+            (
+                Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59).unwrap() + ns(999_999_900),
+                "9999-12-31T23:59:59.9999999Z",
+            ),
+            // The largest tick count below a millisecond keeps all seven digits …
+            (second + ns(999_900), "2026-08-23T16:57:22.0009999Z"),
+            (second + ns(100), "2026-08-23T16:57:22.0000001Z"),
+            // … and the first millisecond is trimmed.
+            (second + ns(1_000_000), "2026-08-23T16:57:22.001Z"),
+            (second + ns(123_456_700), "2026-08-23T16:57:22.1234567Z"),
+            (second + ns(500_000_000), "2026-08-23T16:57:22.5Z"),
+            // Nanoseconds below the 100 ns tick are dropped.
+            (second + ns(99), "2026-08-23T16:57:22.0000000Z"),
+        ] {
+            assert_eq!(super::datetime::format(&at), text);
+            assert_eq!(
+                both_fields(at),
+                format!(r#"{{"at":"{text}","maybe":"{text}"}}"#)
+            );
+        }
+    }
+
+    /// The text `datetime::format` wrote before it moved to a stack buffer:
+    /// chrono's `%Y-%m-%dT%H:%M:%S`, then the tick fraction.
+    fn chrono_format(value: &DateTime<Utc>) -> String {
+        let ticks = value.timestamp_subsec_nanos() / 100;
+        let mut fraction = format!("{ticks:07}");
+        if ticks / 10_000 != 0 {
+            while fraction.ends_with('0') {
+                fraction.pop();
+            }
+        }
+        format!("{}.{fraction}Z", value.format("%Y-%m-%dT%H:%M:%S"))
+    }
+
+    #[test]
+    fn dates_are_written_exactly_as_chrono_formats_them() {
+        let years = [
+            -262_143, -10_000, -9_999, -1, 0, 1, 9, 99, 999, 1_000, 1_970, 2_026, 9_999, 10_000,
+            262_142,
+        ];
+        let nanos = [
+            0,
+            99,
+            100,
+            900,
+            99_900,
+            999_999,
+            1_000_000,
+            1_000_100,
+            10_000_000,
+            120_000_000,
+            123_456_700,
+            479_586_000,
+            500_000_000,
+            764_472_999,
+            999_000_000,
+            999_999_900,
+            999_999_999,
+        ];
+        // A leap second is second 59 with 10^9 ns or more; `%S` writes it as 60.
+        let leap = [1_000_000_000, 1_000_000_100, 1_500_000_000, 1_999_999_999];
+        let mut checked = 0;
+        for year in years {
+            for (time, subsec) in nanos
+                .iter()
+                .map(|&n| ((1, 2, 3), n))
+                .chain(leap.iter().map(|&n| ((23, 59, 59), n)))
+            {
+                let date = chrono::NaiveDate::from_ymd_opt(year, 12, 31).unwrap();
+                let at = date
+                    .and_hms_nano_opt(time.0, time.1, time.2, subsec)
+                    .unwrap()
+                    .and_utc();
+                let text = chrono_format(&at);
+                assert_eq!(super::datetime::format(&at), text, "{at:?}");
+                assert_eq!(
+                    both_fields(at),
+                    format!(r#"{{"at":"{text}","maybe":"{text}"}}"#),
+                    "{at:?}"
+                );
+                checked += 1;
+            }
+        }
+        // chrono's extremes, whatever their year.
+        for at in [DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC] {
+            assert_eq!(super::datetime::format(&at), chrono_format(&at), "{at:?}");
+            checked += 1;
+        }
+        assert_eq!(checked, years.len() * (nanos.len() + leap.len()) + 2);
+    }
+
+    #[test]
+    fn guids_are_written_exactly_as_their_simple_display() {
+        for id in [
+            Uuid::nil(),
+            Uuid::max(),
+            ID,
+            Uuid::from_u128(1),
+            Uuid::from_u128(0xabcd_ef00_0000_0000_0000_0000_0000_0000),
+        ] {
+            let n = id.simple().to_string();
+            let nullable = if id.is_nil() {
+                "null".to_owned()
+            } else {
+                format!(r#""{n}""#)
+            };
+            assert_eq!(
+                serde_json::to_string(&Ids {
+                    id,
+                    parent: Some(id),
+                    children: vec![id, id],
+                    extra: Some(vec![id]),
+                })
+                .unwrap(),
+                format!(
+                    r#"{{"id":"{n}","parent":{nullable},"children":["{n}","{n}"],"extra":["{n}"]}}"#
+                )
+            );
+        }
     }
 
     #[test]
