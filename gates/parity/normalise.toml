@@ -27,7 +27,8 @@ reason = "Each server generates its own server id; the corpus copies do not shar
 [[rule]]
 paths = ["ImageBlurHashes.Primary", "ImageBlurHashes.Backdrop",
          "Items[].ImageBlurHashes.Primary", "Items[].ImageBlurHashes.Backdrop", "Items[].ImageBlurHashes.Logo", "Items[].ImageBlurHashes.Thumb",
-         "[].ImageBlurHashes.Primary", "[].ImageBlurHashes.Backdrop", "[].ImageBlurHashes.Logo", "[].ImageBlurHashes.Thumb"]
+         "[].ImageBlurHashes.Primary", "[].ImageBlurHashes.Backdrop", "[].ImageBlurHashes.Logo", "[].ImageBlurHashes.Thumb",
+         "[].NowPlayingItem.ImageBlurHashes.Primary", "[].NowPlayingItem.ImageBlurHashes.Backdrop"]
 kind = "opaque-keys"
 reason = "A blurhash map is keyed by the image tag, compared where the item lists its tags; the hashes are compared."
 
@@ -70,8 +71,16 @@ reason = "A user created by the test gets a new random id on each server."
 paths = ["LastActivityDate", "LastLoginDate", "[].LastActivityDate", "[].LastLoginDate", "SessionInfo.LastActivityDate",
          "User.LastActivityDate", "User.LastLoginDate", "DateLastActivity"]
 kind = "opaque"
-requests = ["GetCurrentUser", "GetUserById", "GetUsers", "AuthenticateUserByName", "GetDeviceInfo"]
+requests = ["GetCurrentUser", "GetUserById", "GetUsers", "AuthenticateUserByName", "GetDeviceInfo",
+            "GetSessions", "*/session", "screen-playback-start/sessions"]
 reason = "Each server stamps the time it handled the harness's sign-in and its requests."
+
+# A playback start stamps the session's check-in on both servers (before one, Ferrofin's differs: gl-837 in the ledger).
+[[rule]]
+paths = ["[].LastPlaybackCheckIn"]
+kind = "opaque"
+requests = ["screen-playback-start/sessions"]
+reason = "Each server stamps the time it handled the playback start the read-back follows."
 
 [[rule]]
 paths = ["Items[].DateLastActivity"]

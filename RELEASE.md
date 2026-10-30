@@ -59,6 +59,16 @@ from.
    the interleaved A/B gate in [`gates/bench/gate.py`](gates/bench/gate.py). The gate measures Ferrofin
    only; Jellyfin is not part of it.
 
+   `vPREV`, here and below, is **the latest release of the minor line before the release** (owner
+   decision 2026-10-29): v1.4.1 and v1.4.2 compare against the newest `v1.3.*` (v1.3.2), v1.5.0
+   against the newest `v1.4.*`, and a `vX.0.0` against the newest release of major X-1, never against
+   an earlier release of their own minor line. Every command below that takes it refuses any other
+   image before it starts and names the right one ([`gates/bench/baseline.py`](gates/bench/baseline.py),
+   from the checkout's tags: fetch them first). It knows the release from the `release/vX.Y.Z` branch;
+   for a patch cut from `main`, or a checkout of the release commit that is detached, add
+   `--release vX.Y.Z` to each `gate.py` command (`gates/run --release`, `make run-gates RELEASE=`):
+   without either, a command takes it for work in progress and checks nothing.
+
    ```bash
    export FERROFIN_GATES_DIR=/srv/gates                    # the gates' output root: the corpus and every session (gates/lib.sh)
    docker build -t ferrofin:vX.Y.Z-rc .                    # the frozen release commit
@@ -192,7 +202,10 @@ from.
    adoption status and parity overview, and its benchmark is the first Jellyfin comparison), then
    two more `make run-bench IMAGE=<candidate>` sessions for the second and third comparison. They
    are publication inputs only: their numbers never decide a release, and parity is not a gate
-   here. Keep the three session folders for step 6.
+   here. Keep the three session folders for step 6. Build `<candidate>` and run every one of these
+   sessions, and the A/B gate, from a checkout of the frozen head: a result records the commit
+   its harness checkout was at, not the image's, and step 6 publishes only results that
+   record the tag's commit.
    On a branch whose `UPSTREAM_TAG` moved since the corpus was last prepared, prepare it for
    the new oracle first: `docker pull "$(cat gates/bench/testdata/jellyfin-image.txt)"`, move
    `$FERROFIN_GATES_DIR/fixtures/bench-testdata/jellyfin/` aside, and run
@@ -234,15 +247,21 @@ from.
      AB=$FERROFIN_GATES_DIR/runs/bench-gate-ab-<date>-<time>
    ```
 
-   `AB` is step 2's A/B gate session (its verdict cells give the README's graph against the previous
-   release). It writes `docs/results/vX.Y.Z/summary.json`, the graphs beside it and the README's
-   Results block, and refuses runs of different commits, images, hosts or fixtures. Regenerate
+   `AB` is step 2's A/B gate session (its verdict cells give the release page's graph against the previous
+   release). It writes `docs/results/vX.Y.Z/summary.json`, the graphs and the release's page
+   (`README.md`) beside it and the README's Results block, and refuses runs of different commits, images, hosts or fixtures. Regenerate
    `docs/BENCHMARKS.md` from the same three runs: `python3 gates/bench/report.py <run> <run> <run>`
    prints the tables, which replace everything between the file's two rules; update the date,
    commit and run notes above the first rule to match. Commit all of it to the release PR
    (release branch → `main`), or to `main` for a patch release. CI's `benchmark-report` job fails
    when the block or the graphs differ from what the committed summary files give, so never edit
    them by hand.
+
+   `publish.py summarise` refuses results whose recorded commit is not the one the tag names,
+   and needs the tag in the local checkout (`git fetch github --tags`). When the release was
+   re-cut after step 2's publication inputs ran, run them again on the tag's commit before
+   publishing. Labelling the old commit's results with `MEASURED_BEFORE_TAG=1` is a last resort
+   the owner agrees to.
 
 The workflow needs the repository secret `RELEASE_TOKEN`: a fine-grained personal
 access token for this repository with **Contents: read and write**. Tags pushed with the

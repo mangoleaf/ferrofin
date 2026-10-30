@@ -63,6 +63,12 @@ ingress:
       hosts: [ferrofin.example.com]
 ```
 
+A fresh database's `admin` account has no password until the `/web` setup wizard sets one,
+so finish the wizard before you enable ingress. For a release named `ferrofin`, reach it with
+`kubectl -n ferrofin port-forward svc/ferrofin 8096` and open `http://localhost:8096/web`.
+Finish it before you enable an `httpRoute` too. Alternatively, seed the password from a Secret
+with a `FERROFIN_ADMIN_PASSWORD` key, through `ferrofin.envFrom`.
+
 Health probes target Ferrofin's real endpoints: `GET /health/live` is process-only, and
 `GET /health/ready` checks that the database answers. Jellyfin's own `/health` (plain-text
 `Healthy`, or `Unhealthy` with a 503) runs the same check, so healthchecks written for
