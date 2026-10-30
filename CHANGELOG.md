@@ -628,6 +628,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   playback start, progress and stop report ran one `DeviceOptions` statement before, and
   now runs none. Those reports also take just the session id and the fields they use,
   where they built the session's DTO and copied the whole session
+- The `UserDataChanged` push reads the user data of the items it lists together, where it
+  read each item on its own (four to six statements per item and per parent). Only a
+  folder's played counts are still read per folder. Marking a five-episode series played
+  now runs 14 statements for the push instead of 44; the message is unchanged
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
