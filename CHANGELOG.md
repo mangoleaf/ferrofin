@@ -607,6 +607,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Jellyfin answers `500`
 
 ### Performance
+- A JPEG's blur hash and its resized images decode at a reduced scale (1/8, 1/4 or 1/2 of
+  each side, by DCT scaling, as Jellyfin's blur hash decodes through Skia) instead of at full
+  size. A 24 MP baseline photo's blur hash peaks at about 2 MB of memory instead of 80 MB (a
+  progressive JPEG still holds its full-size DCT coefficients while it decodes); a resized
+  image decodes at the smallest scale still twice its size and stays close to the full
+  decode. Blur hashes computed from now on can differ from the full decode's by one
+  quantisation step, no closer to or further from Jellyfin's; this change recomputes no
+  stored hash. Other formats decode as before
 - A library scan keeps the remote answers it shares between items only as long as
   Jellyfin's provider clients keep theirs, instead of until the scan ends. A TheMovieDb
   season is kept for an hour after it was fetched, and the season cache holds at most
