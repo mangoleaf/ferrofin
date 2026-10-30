@@ -612,6 +612,8 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Jellyfin answers `500`
 
 ### Performance
+- `GET /Items` reads the caller's tag whitelist from the policy the request already holds instead
+  of cloning the whole cached user DTO for it
 - A request whose path needs no rewriting, which covers image, segment and `/web/*` fetches, costs
   no allocation for path-case routing, and the route is found by a binary search instead of a
   walk of the whole route table

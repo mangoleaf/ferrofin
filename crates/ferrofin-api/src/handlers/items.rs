@@ -713,20 +713,12 @@ async fn get_items(
     let mut options = query.dto_options();
     // `if (user.GetPreference(AllowedTags).Length != 0 && !fields.Contains(Tags))
     //  fields = [.. fields, Tags];` (v12 ItemsController.cs:276-281): a user
-    // whose policy whitelists tags always gets each row's `Tags`. The user
-    // DTO is served from the read-through cache, so this is no extra query
-    // on the common path.
-    if let Some(user) = internal.user.as_ref() {
-        let allowed_tags = state
-            .users
-            .get_user_dto(user, None)
-            .await?
-            .policy
-            .map(|p| p.allowed_tags)
-            .unwrap_or_default();
-        if !allowed_tags.is_empty() && !options.contains_field(ItemFields::Tags) {
-            options.fields.push(ItemFields::Tags);
-        }
+    // whose policy whitelists tags always gets each row's `Tags`.
+    if let Some(user) = internal.user.as_ref()
+        && whitelists_tags(&state, &auth, user).await?
+        && !options.contains_field(ItemFields::Tags)
+    {
+        options.fields.push(ItemFields::Tags);
     }
     // A playlist's or box set's own listing is its linked children
     // (`Folder.GetItemsInternal` → `GetChildren` → `GetLinkedChildren(user)`),
@@ -754,6 +746,32 @@ async fn get_items(
         Some(result.total_record_count),
         dtos,
     )))
+}
+
+/// Whether `user`'s policy names any `AllowedTags`.
+///
+/// The caller's own policy came with the request, so a browse needs no user
+/// DTO for it. `user` can be another account, one an administrator or an API
+/// key named with `userId`: its policy is read, never the caller's.
+async fn whitelists_tags(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    user: &UserEntity,
+) -> Result<bool, ApiError> {
+    if auth
+        .user
+        .as_ref()
+        .is_some_and(|caller| caller.id == user.id)
+        && let Some(policy) = &auth.user_policy
+    {
+        return Ok(!policy.allowed_tags.is_empty());
+    }
+    Ok(state
+        .users
+        .get_user_dto(user, None)
+        .await?
+        .policy
+        .is_some_and(|policy| !policy.allowed_tags.is_empty()))
 }
 
 /// `if (collectionType == CollectionType.playlists) { recursive = true;
@@ -2330,6 +2348,78 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    /// The whitelist that counts is the one of the account the query is for.
+    /// The request's policy is the caller's, so it answers only for the
+    /// caller: an administrator or an API key naming `userId` gets that
+    /// account's, in either direction.
+    #[tokio::test]
+    async fn the_tag_whitelist_comes_from_the_account_the_query_is_for() {
+        use crate::test_support::{authed_fake_state_with_policy, fake_user_entity};
+        use ferrofin_model::users::UserPolicy;
+
+        let whitelist = || UserPolicy {
+            allowed_tags: vec!["kids".to_owned()],
+            ..UserPolicy::default()
+        };
+        let caller = fake_user_entity(Uuid::from_u128(1), "caller");
+        let other = fake_user_entity(Uuid::from_u128(2), "other");
+        let auth = |policy: Option<UserPolicy>| AuthorizationInfo {
+            user: Some(caller.clone()),
+            user_policy: policy.map(std::sync::Arc::new),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        };
+        let answer = |stored: UserPolicy, auth: AuthorizationInfo, user: UserEntity| async move {
+            whitelists_tags(&authed_fake_state_with_policy(stored), &auth, &user)
+                .await
+                .expect("no lookup fails")
+        };
+
+        // The caller: the request's policy, whatever the store would say.
+        assert!(
+            answer(
+                UserPolicy::default(),
+                auth(Some(whitelist())),
+                caller.clone()
+            )
+            .await
+        );
+        assert!(
+            !answer(
+                whitelist(),
+                auth(Some(UserPolicy::default())),
+                caller.clone()
+            )
+            .await
+        );
+        // Another account: its stored policy, whatever the caller's says.
+        assert!(
+            !answer(
+                UserPolicy::default(),
+                auth(Some(whitelist())),
+                other.clone()
+            )
+            .await
+        );
+        assert!(
+            answer(
+                whitelist(),
+                auth(Some(UserPolicy::default())),
+                other.clone()
+            )
+            .await
+        );
+        // No policy on the request (an alternate auth service, an API key).
+        assert!(answer(whitelist(), auth(None), caller.clone()).await);
+        let api_key = AuthorizationInfo {
+            is_api_key: true,
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        };
+        assert!(answer(whitelist(), api_key.clone(), other.clone()).await);
+        assert!(!answer(UserPolicy::default(), api_key, other).await);
+    }
 
     /// A browse under either spelling of the playlists folder becomes a
     /// recursive `[Playlist]` listing from the user root (so it is
