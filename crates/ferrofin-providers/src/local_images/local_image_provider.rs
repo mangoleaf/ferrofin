@@ -78,7 +78,12 @@ impl LocalImageProvider {
         item: &ImageItem,
         directory_service: &D,
     ) -> Vec<LocalImageInfo> {
-        let files = Self::get_files(item, true, directory_service);
+        // A missing / non-file-protocol item yields no files.
+        let listing = item
+            .containing_folder_path
+            .as_deref()
+            .map(|path| directory_service.file_system_entries(path));
+        let files = Self::get_files(listing.as_deref().unwrap_or_default(), true);
         let mut list = Vec::new();
         Self::populate_images(item, &mut list, &files, true, directory_service);
         list
@@ -104,29 +109,25 @@ impl LocalImageProvider {
         files.sort_by_key(|f| {
             supported_image_extension_index(f.extension.as_deref().unwrap_or_default())
         });
+        let file_refs: Vec<&FileSystemMetadata> = files.iter().collect();
         let mut list = Vec::new();
-        Self::populate_images(item, &mut list, &files, false, directory_service);
+        Self::populate_images(item, &mut list, &file_refs, false, directory_service);
         list
     }
 
-    /// Lists the containing folder's entries, filtered to image files (and,
-    /// when `include_directories`, subdirectories) and ordered by
-    /// supported-extension index.
+    /// The containing folder's `entries`, filtered to image files (and, when
+    /// `include_directories`, subdirectories) and ordered by supported-extension
+    /// index.
     ///
-    /// Port of the private `GetFiles`. A missing / non-file-protocol item yields
-    /// no files.
-    fn get_files<D: DirectoryService>(
-        item: &ImageItem,
+    /// Port of the private `GetFiles`. Like upstream's LINQ over the cached
+    /// array, it picks entries out of the shared listing rather than copying
+    /// them.
+    fn get_files(
+        entries: &[FileSystemMetadata],
         include_directories: bool,
-        directory_service: &D,
-    ) -> Vec<FileSystemMetadata> {
-        let Some(path) = item.containing_folder_path.as_deref() else {
-            return Vec::new();
-        };
-
-        let mut files: Vec<FileSystemMetadata> = directory_service
-            .file_system_entries(path)
-            .into_iter()
+    ) -> Vec<&FileSystemMetadata> {
+        let mut files: Vec<&FileSystemMetadata> = entries
+            .iter()
             .filter(|i| {
                 (include_directories && i.is_directory)
                     || i.extension
@@ -147,7 +148,7 @@ impl LocalImageProvider {
     fn populate_images<D: DirectoryService>(
         item: &ImageItem,
         images: &mut Vec<LocalImageInfo>,
-        files: &[FileSystemMetadata],
+        files: &[&FileSystemMetadata],
         support_parent_series_files: bool,
         directory_service: &D,
     ) {
@@ -259,7 +260,7 @@ impl LocalImageProvider {
     fn populate_disc_images(
         item: &ImageItem,
         images: &mut Vec<LocalImageInfo>,
-        files: &[FileSystemMetadata],
+        files: &[&FileSystemMetadata],
         image_prefix: &str,
         is_in_mixed_folder: bool,
     ) {
@@ -291,7 +292,7 @@ impl LocalImageProvider {
     fn populate_primary_images(
         item: &ImageItem,
         images: &mut Vec<LocalImageInfo>,
-        files: &[FileSystemMetadata],
+        files: &[&FileSystemMetadata],
         image_prefix: &str,
         is_in_mixed_folder: bool,
     ) {
@@ -337,7 +338,7 @@ impl LocalImageProvider {
     fn populate_backdrops<D: DirectoryService>(
         item: &ImageItem,
         images: &mut Vec<LocalImageInfo>,
-        files: &[FileSystemMetadata],
+        files: &[&FileSystemMetadata],
         image_prefix: &str,
         is_in_mixed_folder: bool,
         directory_service: &D,
@@ -434,7 +435,7 @@ impl LocalImageProvider {
     /// Port of the six-argument private `PopulateBackdrops`.
     fn populate_backdrops_named(
         images: &mut Vec<LocalImageInfo>,
-        files: &[FileSystemMetadata],
+        files: &[&FileSystemMetadata],
         image_prefix: &str,
         first_file_name: &str,
         subsequent_file_name_prefix: &str,
@@ -491,10 +492,10 @@ impl LocalImageProvider {
             return;
         };
 
-        let series_files: Vec<FileSystemMetadata> = {
-            let mut f: Vec<FileSystemMetadata> = directory_service
-                .file_system_entries(series_folder)
-                .into_iter()
+        let series_listing = directory_service.file_system_entries(series_folder);
+        let series_files: Vec<&FileSystemMetadata> = {
+            let mut f: Vec<&FileSystemMetadata> = series_listing
+                .iter()
                 .filter(|i| {
                     !i.is_directory
                         && i.extension
@@ -560,7 +561,7 @@ impl LocalImageProvider {
     ///
     /// Port of the six-argument private `AddImage`.
     fn add_image_both(
-        files: &[FileSystemMetadata],
+        files: &[&FileSystemMetadata],
         images: &mut Vec<LocalImageInfo>,
         name: &str,
         image_prefix: &str,
@@ -579,7 +580,7 @@ impl LocalImageProvider {
     ///
     /// Port of the static `AddImage`. Returns whether a file was found.
     fn add_image(
-        files: &[FileSystemMetadata],
+        files: &[&FileSystemMetadata],
         images: &mut Vec<LocalImageInfo>,
         name: &str,
         type_: ImageType,
@@ -603,14 +604,14 @@ impl LocalImageProvider {
     /// Port of the static `GetImage`. The exact-length check prevents
     /// `poster.png` from matching a query for `post`, etc.
     fn get_image<'a>(
-        files: &'a [FileSystemMetadata],
+        files: &[&'a FileSystemMetadata],
         name: &str,
         prefix: Option<&str>,
     ) -> Option<&'a FileSystemMetadata> {
         let prefix = prefix.unwrap_or("");
         let file_name_length = name.chars().count() + prefix.chars().count();
 
-        files.iter().find(|file| {
+        files.iter().copied().find(|file| {
             if file.is_directory || file.length <= 0 {
                 return false;
             }
