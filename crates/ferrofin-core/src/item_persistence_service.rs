@@ -2264,21 +2264,12 @@ pub(crate) async fn move_user_data(
 }
 
 /// Person cleanup uses the same retention-aware deletion as media pruning.
-pub(crate) async fn remove_orphaned_person_items(db: &Database) -> Result<usize, ServiceError> {
-    let ids: Vec<String> = sqlx::query_scalar(
-        r#"SELECT "Id" FROM "BaseItems" WHERE "Type" = ?1
-           AND ("Name" IS NULL OR "Name" NOT IN (SELECT "Name" FROM "Peoples"))"#,
-    )
-    .bind(stored_type_name(BaseItemKind::Person).unwrap_or_default())
-    .fetch_all(db.pool())
-    .await
-    .map_err(db_err)?;
-    let ids = ids
-        .iter()
-        .map(|id| Uuid::parse_str(id).map_err(|e| ServiceError::Backend(e.to_string())))
-        .collect::<Result<Vec<_>, _>>()?;
+pub(crate) async fn remove_person_items(
+    db: &Database,
+    ids: &[Uuid],
+) -> Result<usize, ServiceError> {
     Ok(FerrofinItemPersistenceService::new(db.clone())
-        .delete_items(&ids)
+        .delete_items(ids)
         .await?
         .len())
 }
@@ -7898,7 +7889,7 @@ mod tests {
             .execute(db.writer())
             .await
             .unwrap();
-        assert_eq!(super::remove_orphaned_person_items(&db).await.unwrap(), 1);
+        assert_eq!(super::remove_person_items(&db, &[person]).await.unwrap(), 1);
         let (item, favorite): (String, bool) =
             sqlx::query_as(r#"SELECT "ItemId", "IsFavorite" FROM "UserData" WHERE "UserId" = ?1"#)
                 .bind(guid_to_db(user))

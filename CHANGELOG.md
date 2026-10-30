@@ -805,6 +805,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
+- **Refresh People** no longer deletes a locked person, or a person whose item a provider renamed
+  away from their credit: it decides by the id a credit derives, as Jellyfin 12 does, and a row
+  also stays while a credit carries its exact name or resolves to it by clean name, so it deletes
+  a subset of what it used to. It now creates the item a credit has none of and refreshes it.
+  Spellings sharing a clean name stay one person on one item
 - The web client's Next Up row loads again: jellyfin-web 12.x sends `nextUpDateCutoff` as a
   bare date, which Ferrofin answered with a `400`. Every `DateTime` query parameter now binds
   as Jellyfin's does: a date or an offset-less date-time is accepted and read as server

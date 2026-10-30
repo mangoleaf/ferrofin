@@ -8,6 +8,15 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — the first Refresh People may create people and look them up
+
+Nothing to do. The **Refresh People** task now creates the person item a credit has none of,
+as Jellyfin 12 does, and looks each new person up once with the metadata providers. A library
+scanned by Ferrofin or adopted from Jellyfin already has an item for nearly every credit, so
+few are new. A database with credits and no items behind them gets them all on the first run,
+which then takes as long as those lookups do. The task also stops deleting locked people and
+people a provider renamed, so such an item no longer disappears with its images and metadata.
+
 ## Unreleased — every image tag changes once; clients download artwork again once
 
 Nothing to do. An image's cache tag (`ImageTags`, `BackdropImageTags`, the blurhash keys and
