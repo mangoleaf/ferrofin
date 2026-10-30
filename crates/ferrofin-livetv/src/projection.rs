@@ -1156,7 +1156,7 @@ mod tests {
         // A renamed channel IS a write, and carries the edit through.
         let renamed = ChannelRow {
             name: "Parity One HD".to_owned(),
-            ..row.clone()
+            ..row
         };
         let fresh = channel_entity(&renamed, parse, Some(view));
         let updated = channel_item_update(&stored, &fresh).expect("the rename is a write");
@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(updated.date_created, stored.date_created);
 
         // A user-forced sort key is not a property the refresh owns.
-        let mut forced = stored.clone();
+        let mut forced = stored;
         forced.forced_sort_name = Some("zzz".to_owned());
         forced.sort_name = Some("zzz".to_owned());
         let updated = channel_item_update(&forced, &fresh).expect("the rename is still a write");

@@ -2833,9 +2833,7 @@ mod bus_fallback_tests {
         bus.register(
             session_id.to_owned(),
             Box::new(move |msg| {
-                log.lock()
-                    .expect("bus log mutex")
-                    .push((id.clone(), msg.clone()));
+                log.lock().expect("bus log mutex").push((id.clone(), msg));
             }),
         );
     }

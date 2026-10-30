@@ -435,7 +435,7 @@ pub struct ArtistNameMatch {
 /// serializes requests behind a ≥1s throttle.
 pub struct MusicBrainzClient {
     http: reqwest::Client,
-    /// The operator's explicit server override (`FERROFIN_MUSICBRAINZ_BASE_URL`
+    /// The operator's explicit server override (`FERROFIN_MUSICBRAINZ_URL`
     /// / config `musicbrainz_base_url`). `None` when the operator set nothing,
     /// which is when the dashboard's `Server` governs.
     configured_base_url: Option<String>,
@@ -487,7 +487,7 @@ impl MusicBrainzClient {
     /// `MusicBrainzArtistProvider.ReloadConfig` re-points the shared `Query`
     /// at `Configuration.Server` whenever the settings page is saved; reading
     /// per call is the same observable behaviour without an event bus. An
-    /// operator who set `FERROFIN_MUSICBRAINZ_BASE_URL` still wins over the
+    /// operator who set `FERROFIN_MUSICBRAINZ_URL` still wins over the
     /// dashboard (an explicit env/file setting is the more specific
     /// instruction, and that knob shipped before this plugin had an identity).
     pub(crate) async fn settings(&self) -> crate::plugin_config::MusicBrainzConfig {

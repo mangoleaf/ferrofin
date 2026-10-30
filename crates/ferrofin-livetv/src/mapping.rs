@@ -450,7 +450,7 @@ mod tests {
         // …and so does a mapping keyed on a non-ASCII tuner channel id.
         let mapped = TunerChannel {
             id: "Ö-1".to_owned(),
-            ..tuner.clone()
+            ..tuner
         };
         assert_eq!(
             epg_channel_for_tuner_channel(&[pair("ö-1", "örf.at")], &mapped, &epg)
@@ -608,7 +608,7 @@ mod tests {
         let bare = TunerChannel {
             number: String::new(),
             tuner_channel_id: "nope".into(),
-            ..tuner.clone()
+            ..tuner
         };
         let row = tuner_channel_mapping(&bare, &[], &EpgChannelData::default());
         assert_eq!(row.name.as_deref(), Some("Parity One"));

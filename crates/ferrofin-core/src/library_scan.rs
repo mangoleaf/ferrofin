@@ -1696,7 +1696,8 @@ impl<'a> ProbePipeline<'a> {
                 let external = self.externals.as_ref().map(|seam| {
                     let mut external = seam.for_item(self.planned[index].id);
                     // The sidecars sit beside the `.strm`, not its target.
-                    external.sidecar_path = shortcut.and(self.planned[index].entity.path.clone());
+                    external.sidecar_path =
+                        shortcut.and_then(|_| self.planned[index].entity.path.clone());
                     external
                 });
                 let is_audio = request.media_is_audio;
@@ -14645,11 +14646,10 @@ impl LibraryScanner {
                     // `list` applies the ignore rules here too; upstream's
                     // `GetFiles` of an extras folder applies none (gl-755,
                     // awaiting the owner: Jellyfin bug or behaviour to port).
-                    let files: Vec<_> = self
+                    let files = self
                         .list(&entry.path, ctx)
                         .into_iter()
-                        .filter(|file| file.type_ != FileSystemEntryType::Directory)
-                        .collect();
+                        .filter(|file| file.type_ != FileSystemEntryType::Directory);
                     let mixed = ctx
                         .direct_file_counts
                         .borrow()
@@ -14657,7 +14657,7 @@ impl LibraryScanner {
                         .copied()
                         .unwrap_or(0)
                         > 1;
-                    candidates.extend(files.into_iter().map(|file| (file.path, mixed)));
+                    candidates.extend(files.map(|file| (file.path, mixed)));
                 }
             } else {
                 candidates.push((entry.path.clone(), false));
@@ -15040,7 +15040,7 @@ impl LibraryScanner {
         };
         // The movie, or the lone video of a folder that is no photo album,
         // owns the folder's extras.
-        if let Some(owner) = movie.as_ref().or(lone.filter(|_| album.is_none())) {
+        if let Some(owner) = movie.as_ref().or_else(|| lone.filter(|_| album.is_none())) {
             self.register_extras_owner(dir, owner, kind, ctx, movies_by_dir);
         }
         let folder = MovieFolder {
@@ -28746,7 +28746,7 @@ mod tests {
             ..BaseItemEntity::default()
         };
         super::apply_audio_metadata(&mut row, &info, None);
-        assert_eq!(row.normalization_gain, expected.or(Some(-9.0)));
+        assert_eq!(row.normalization_gain, Some(expected.unwrap_or(-9.0)));
     }
 
     /// A rescan lays the probed gain over the stored row; a probe that read
@@ -29474,7 +29474,7 @@ mod tests {
         assert!(with_tvdb.wants_backfill(&series(Some("x"), None), policy));
         // TVDB arm (TVDB ranked first): overview only for the series; the
         // episode gate as is.
-        assert!(with_tvdb.wants_backfill(&series(None, trailers.clone()), tvdb_policy));
+        assert!(with_tvdb.wants_backfill(&series(None, trailers), tvdb_policy));
         assert!(
             !with_tvdb.wants_backfill(&series(Some("x"), None), tvdb_policy),
             "TVDB never supplies trailers, so their absence is no trigger"
@@ -39169,14 +39169,14 @@ mod tests {
             movies[0].path.as_deref(),
             Some(folder.join("La Chimera (2023).mkv").to_str().unwrap())
         );
-        let samples: Vec<_> = scanned_by_kind(&db, BaseItemKind::Video)
+        let samples = scanned_by_kind(&db, BaseItemKind::Video)
             .await
             .into_iter()
             .filter(|v| {
                 v.extra_type == Some(ferrofin_model::entities::ExtraType::Sample.json_value())
             })
-            .collect();
-        assert_eq!(samples.len(), 2, "both are the movie's Sample extras");
+            .count();
+        assert_eq!(samples, 2, "both are the movie's Sample extras");
     }
 
     /// `IgnorePatterns` reaches extras too: `FindExtras` resolves each
@@ -40660,7 +40660,7 @@ mod tests {
         };
         let movies = library("m", "/media/films/");
         let home = library("h", "/media");
-        let all = [movies.clone(), home.clone()];
+        let all = [movies, home.clone()];
         let clip = "/media/films/Day 1.mp4";
         assert!(super::held_by_unscanned(
             clip,

@@ -78,8 +78,9 @@ returns). A restart that loses the last spans is a bug.
 The sampled request span carries a `trace_id` field, and every `tracing` event
 inside the request inherits it — **never** stamp trace ids per-callsite by hand.
 
-- Stdout is structured **JSON by default**; `FERROFIN_LOG_FORMAT=text` restores the
-  legacy human-readable tee for interactive dev.
+- Stdout is structured **JSON by default**; `FERROFIN_LOG_FORMAT=text` (or
+  `log_format = "text"` in `config.toml`) restores the legacy human-readable tee for
+  interactive dev.
 - The rotating log **file** stays plain text always — `GET /System/Logs` feeds the
   Jellyfin dashboard log viewer, which renders raw lines (this IS a parity
   surface; JSON there would break it).

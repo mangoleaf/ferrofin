@@ -863,7 +863,7 @@ mod tests {
         assert!(!is_hw_tonemap_available(&ctx(&caps, &on, &sdr), ""));
 
         // An 8-bit source is not HDR in practice.
-        let mut eight = s.clone();
+        let mut eight = s;
         eight.pixel_format = Some("yuv420p".to_owned());
         assert!(!is_hw_tonemap_available(&ctx(&caps, &on, &eight), ""));
     }

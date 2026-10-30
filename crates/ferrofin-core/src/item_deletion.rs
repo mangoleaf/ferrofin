@@ -843,7 +843,7 @@ mod tests {
         assert_eq!(
             rows(&paths),
             vec![
-                (file.clone(), false),
+                (file, false),
                 (dir.join("Alien-poster.jpg"), false),
                 (dir.join("Alien.nfo"), false),
                 (dir.join("Aliens.nfo"), false),
@@ -874,7 +874,7 @@ mod tests {
             vec![(file.clone(), false)],
             "not in a mixed folder: no sidecars"
         );
-        let mut mixed = episode.clone();
+        let mut mixed = episode;
         mixed.is_in_mixed_folder = true;
         assert_eq!(
             delete_paths(

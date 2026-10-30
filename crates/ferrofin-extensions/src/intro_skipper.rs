@@ -264,7 +264,7 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
         IntroSkipperSettings {
             // A negative delay is no delay upstream's CSS can use: default.
             skip_button_hide_delay: u64::try_from(config.skipbutton_hide_delay)
-                .unwrap_or(IntroSkipperSettings::default().skip_button_hide_delay),
+                .unwrap_or_else(|_| IntroSkipperSettings::default().skip_button_hide_delay),
             update_media_segments: config.update_media_segments,
         }
     }

@@ -366,7 +366,10 @@ impl ImageFileSaver {
         let cleanup = cleanup.map(|error| {
             ServiceError::backend(format!(
                 "remove replaced artwork {}: {error}",
-                old_path.as_deref().unwrap_or(Path::new("")).display()
+                old_path
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(""))
+                    .display()
             ))
         });
         match copied {

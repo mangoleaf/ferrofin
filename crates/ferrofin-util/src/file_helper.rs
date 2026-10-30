@@ -48,7 +48,7 @@ fn atomic_replace_with_permissions(
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+        .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(".ferrofin-config-{}", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();

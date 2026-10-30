@@ -1398,7 +1398,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "AddListingProvider",
         ferrofin: "handlers/live_tv.rs add_listing_provider → ferrofin-livetv manager.rs \
                save_listing_provider (ListingsBackend::of, validate_xmltv, \
-               store_listing_provider) → schedules_direct/mod.rs SchedulesDirect::validate \
+               store_listing_provider) → schedules_direct.rs SchedulesDirect::validate \
                (ListingsManager.SaveListingProvider, XmlTvListingsProvider.Validate, \
                SchedulesDirect.Validate)",
         date: "2026-10-21",
@@ -1419,7 +1419,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "GetLineups",
         ferrofin: "handlers/live_tv.rs get_lineups → ferrofin-livetv manager.rs get_lineups \
-               (ListingsBackend::of, provider_channels) → schedules_direct/mod.rs \
+               (ListingsBackend::of, provider_channels) → schedules_direct.rs \
                SchedulesDirect::get_lineups (ListingsManager.GetLineups, \
                XmlTvListingsProvider.GetLineups, SchedulesDirect.GetHeadends)",
         date: "2026-10-28",

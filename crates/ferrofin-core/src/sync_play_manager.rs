@@ -854,7 +854,10 @@ impl Group {
             command,
             emitted_at: now,
         };
-        envelope(MSG_COMMAND, serde_json::to_value(cmd).unwrap_or(json!({})))
+        envelope(
+            MSG_COMMAND,
+            serde_json::to_value(cmd).unwrap_or_else(|_| json!({})),
+        )
     }
 
     fn state_update_env(&self, reason: PlaybackRequestType) -> String {
@@ -1763,7 +1766,7 @@ fn envelope(message_type: &str, data: serde_json::Value) -> String {
 fn render_update(update: GroupUpdate) -> String {
     envelope(
         MSG_GROUP_UPDATE,
-        serde_json::to_value(update).unwrap_or(json!({})),
+        serde_json::to_value(update).unwrap_or_else(|_| json!({})),
     )
 }
 
@@ -2309,7 +2312,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                     group_id: Uuid::nil(),
                     data: String::new(),
                 }))
-                .unwrap_or(json!({})),
+                .unwrap_or_else(|_| json!({})),
             );
             self.bus.send(&session.session_id, env);
         }
@@ -2433,7 +2436,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                         group_id: Uuid::nil(),
                         data: String::new(),
                     }))
-                    .unwrap_or(json!({})),
+                    .unwrap_or_else(|_| json!({})),
                 );
                 self.bus.send(&session.session_id, env);
                 return Ok(());

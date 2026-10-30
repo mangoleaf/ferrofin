@@ -528,7 +528,7 @@ mod tests {
             "120M ticks of served data ends at or before (320M - 200M)"
         );
 
-        let mut opts2 = options.clone();
+        let mut opts2 = options;
         opts2.enable_segment_deletion = false;
         assert_eq!(
             maximum_deleted_index(&opts2, Some(3_600_000_000), &served),

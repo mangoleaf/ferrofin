@@ -1599,7 +1599,7 @@ fn project_config(
         return serde_json::to_vec(body)
             .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")));
     }
-    let mut out = schema.clone();
+    let mut out = schema;
     for (key, value) in body {
         let Some(slot) = out.get_mut(key) else {
             continue; // unknown key: the deserializer drops it

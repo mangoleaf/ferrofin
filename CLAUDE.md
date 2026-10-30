@@ -179,7 +179,7 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
   (owner decisions 2026-10-16 and 2026-10-25), never a release candidate. The release branch
   keeps it until its release, and the next release branch moves to the newest release. If
   `git ls-remote --tags https://github.com/jellyfin/jellyfin` shows a newer release, say so: the
-  next release branch moves to it (see `UPSTREAM_TAG` in `handlers/mod.rs`).
+  next release branch moves to it (see `UPSTREAM_TAG` in `handlers.rs`).
   Where Jellyfin ships xUnit tests, transliterate the `[Theory]/[InlineData]` cases directly
   into `rstest` `#[case]` tests: the C# expected values are the oracle.
 - **Metrics** (`/metrics`, `ferrofin-metrics`): all metric work follows
@@ -400,7 +400,7 @@ which is a different pin from the C# release named below, deliberately. The cont
 API real clients speak, and Jellyfin 12's own surface is smaller (12.0-rc7 and 12.1.0: 364 operations to 10.11.8's 412 — it drops the
 DynamicHls family, `/MusicGenres`, `/CriticReviews` and more), so satisfying it would break
 clients. See `contracts/README.md`. The Jellyfin C# release each `VERIFIED` row was compared
-*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.4`, the release
+*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers.rs`, currently `v12.4`, the release
 this branch pins; rows compared against an earlier pin are listed in
 `VERIFIED_AGAINST_EARLIER_PIN` until they are re-checked.
 Owner's standing definition: **"deep verified" means the

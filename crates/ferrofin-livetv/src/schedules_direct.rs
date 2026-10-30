@@ -479,7 +479,7 @@ impl SchedulesDirect {
                             .as_deref()
                             .map(|uri| uri.rsplit('/').next().unwrap_or(uri).to_owned())
                     } else {
-                        lineup.lineup.clone()
+                        lineup.lineup
                     },
                 }
             })

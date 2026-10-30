@@ -6,7 +6,9 @@
 //! minimum interval. Only replayable GET requests are retried; other methods
 //! are sent once while sharing quota/cooldown tracking.
 
+use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -59,41 +61,71 @@ const fn backoff_skipped() -> bool {
     false
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Settings {
-    timeout: Duration,
-    max_wait: Duration,
+/// The default per-attempt timeout and the longest pending pacing or quota
+/// wait that every [`RateLimiter`] applies. The server sets them from its
+/// configuration ([`set_request_limits`]) for each of its lifetimes; until
+/// then, and in tests, the defaults apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestLimits {
+    /// Per-attempt HTTP timeout; a request that sets its own keeps it.
+    pub timeout: Duration,
+    /// Longest pending pacing or quota wait before a lookup is skipped.
+    pub max_wait: Duration,
 }
 
-impl Settings {
-    fn from_env() -> Self {
+impl RequestLimits {
+    /// The default timeout, in seconds.
+    pub const DEFAULT_TIMEOUT_SECONDS: u64 = 20;
+    /// The default maximum wait, in seconds.
+    pub const DEFAULT_MAX_WAIT_SECONDS: u64 = 60;
+    /// The seconds the timeout may take.
+    pub const TIMEOUT_SECONDS: RangeInclusive<u64> = 10..=60;
+    /// The seconds the maximum wait may take.
+    pub const MAX_WAIT_SECONDS: RangeInclusive<u64> = 30..=300;
+
+    /// A `timeout` and a `max_wait` of whole seconds, each clamped to its
+    /// range ([`Self::TIMEOUT_SECONDS`], [`Self::MAX_WAIT_SECONDS`]).
+    #[must_use]
+    pub fn from_seconds(timeout: u64, max_wait: u64) -> Self {
+        let clamp = |seconds: u64, range: RangeInclusive<u64>| {
+            Duration::from_secs(seconds.clamp(*range.start(), *range.end()))
+        };
         Self {
-            timeout: seconds_setting(
-                std::env::var("FERROFIN_PROVIDER_TIMEOUT_SECONDS")
-                    .ok()
-                    .as_deref(),
-                20,
-                10,
-                60,
-            ),
-            max_wait: seconds_setting(
-                std::env::var("FERROFIN_PROVIDER_MAX_WAIT_SECONDS")
-                    .ok()
-                    .as_deref(),
-                60,
-                30,
-                300,
-            ),
+            timeout: clamp(timeout, Self::TIMEOUT_SECONDS),
+            max_wait: clamp(max_wait, Self::MAX_WAIT_SECONDS),
         }
     }
 }
 
-fn seconds_setting(value: Option<&str>, default: u64, min: u64, max: u64) -> Duration {
-    Duration::from_secs(
-        value
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(default)
-            .clamp(min, max),
+impl Default for RequestLimits {
+    fn default() -> Self {
+        Self::from_seconds(
+            Self::DEFAULT_TIMEOUT_SECONDS,
+            Self::DEFAULT_MAX_WAIT_SECONDS,
+        )
+    }
+}
+
+/// [`RequestLimits::timeout`] in force, in seconds.
+static TIMEOUT_SECONDS: AtomicU64 = AtomicU64::new(RequestLimits::DEFAULT_TIMEOUT_SECONDS);
+/// [`RequestLimits::max_wait`] in force, in seconds.
+static MAX_WAIT_SECONDS: AtomicU64 = AtomicU64::new(RequestLimits::DEFAULT_MAX_WAIT_SECONDS);
+
+/// Sets the limits every limiter in the process applies from its next
+/// request on, limiters made earlier included (the image limiters live for
+/// the whole process). The server calls it once per lifetime, before any
+/// provider request, with its configuration's values.
+pub fn set_request_limits(limits: RequestLimits) {
+    TIMEOUT_SECONDS.store(limits.timeout.as_secs(), Ordering::Relaxed);
+    MAX_WAIT_SECONDS.store(limits.max_wait.as_secs(), Ordering::Relaxed);
+}
+
+/// The limits in force: the last [`set_request_limits`], else the defaults.
+#[must_use]
+pub fn request_limits() -> RequestLimits {
+    RequestLimits::from_seconds(
+        TIMEOUT_SECONDS.load(Ordering::Relaxed),
+        MAX_WAIT_SECONDS.load(Ordering::Relaxed),
     )
 }
 
@@ -127,7 +159,6 @@ pub struct RateLimiter {
     provider: Arc<str>,
     /// The `provider` label of this limiter's request metrics.
     metric_label: &'static str,
-    settings: Settings,
     state: Arc<Mutex<RequestRate>>,
 }
 
@@ -139,7 +170,6 @@ impl RateLimiter {
         Self {
             metric_label: crate::metrics::provider_label(&provider),
             provider,
-            settings: Settings::from_env(),
             state: Arc::default(),
         }
     }
@@ -188,8 +218,8 @@ impl RateLimiter {
     ///
     /// Returns `None` for permanent errors, exhausted retries,
     /// non-GET/non-replayable requests, an open circuit, or a pending cooldown
-    /// longer than the configured maximum wait. Long cooldowns are retained for later calls. Each HTTP attempt
-    /// has a 20-second default timeout; explicit request timeouts are preserved.
+    /// longer than the maximum wait ([`request_limits`]). Long cooldowns are retained for later calls. Each HTTP
+    /// attempt has the default timeout ([`request_limits`]); explicit request timeouts are preserved.
     /// The shared gate covers response headers as well as
     /// dispatch, so concurrent callers cannot miss a newly received cooldown.
     /// Cooldowns survive exhausted retries and cancelled callers.
@@ -268,12 +298,13 @@ impl RateLimiter {
         tracing::debug!(provider = %self.provider, %context, "metadata provider request");
         let mut original = Some(request);
         let interval = interval.min(Duration::from_secs(u64::from(u32::MAX)));
+        let limits = request_limits();
         for attempt in 1..=attempts {
             let mut rate = self.state.lock().await;
             // ponytail: serialize through response headers so quota updates cannot
             // race. This limits each provider/origin to one request in flight;
             // revisit with quota reservations if scans become concurrent.
-            rate.wait_ready(&self.provider, &context, self.settings.max_wait)
+            rate.wait_ready(&self.provider, &context, limits.max_wait)
                 .await?;
             // Reserve before awaiting I/O, including when this future is cancelled.
             rate.consume_quota();
@@ -286,9 +317,7 @@ impl RateLimiter {
                     .and_then(reqwest::Request::try_clone)
                     .ok_or(RequestError::NotReplayable)?
             };
-            attempt_request
-                .timeout_mut()
-                .get_or_insert(self.settings.timeout);
+            attempt_request.timeout_mut().get_or_insert(limits.timeout);
             if *sent > 0 {
                 crate::metrics::retried(self.metric_label);
             }
@@ -779,6 +808,19 @@ mod tests {
         Some(response["artists"][0]["id"].as_str()?.to_owned())
     }
 
+    /// Each limit is clamped to its range, and the defaults sit inside them.
+    #[test]
+    fn request_limits_are_clamped_to_their_ranges() {
+        let secs = |limits: RequestLimits| (limits.timeout.as_secs(), limits.max_wait.as_secs());
+        assert_eq!(secs(RequestLimits::default()), (20, 60));
+        assert_eq!(secs(RequestLimits::from_seconds(30, 120)), (30, 120));
+        assert_eq!(secs(RequestLimits::from_seconds(1, 1)), (10, 30));
+        assert_eq!(
+            secs(RequestLimits::from_seconds(u64::MAX, u64::MAX)),
+            (60, 300)
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn quota_budget_is_paced_and_retained_without_headers() {
         let mut rate = RequestRate::default();
@@ -1127,21 +1169,10 @@ mod tests {
         }
     }
 
+    // The limits' bounds: `request_limits_are_clamped_to_their_ranges`; their
+    // parsing is the server configuration's (`ferrofin-server`'s config tests).
     #[test]
-    fn settings_bounds_and_safe_request_identifiers() {
-        assert_eq!(seconds_setting(None, 20, 10, 60), Duration::from_secs(20));
-        assert_eq!(
-            seconds_setting(Some("bad"), 20, 10, 60),
-            Duration::from_secs(20)
-        );
-        assert_eq!(
-            seconds_setting(Some("0"), 20, 10, 60),
-            Duration::from_secs(10)
-        );
-        assert_eq!(
-            seconds_setting(Some("1000"), 20, 10, 60),
-            Duration::from_mins(1)
-        );
+    fn safe_request_identifiers() {
         let url =
             reqwest::Url::parse("https://example.org/private-key?apikey=secret&i=tt123").unwrap();
         assert_eq!(request_context("omdb", &url), "tt123");

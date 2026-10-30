@@ -552,11 +552,11 @@ mod tests {
         }
         // And the order really is different from registration order for at
         // least one kind, so the assertion above has something to catch.
-        let person: Vec<String> = external_id_infos(BaseItemKind::Person)
+        let person = external_id_infos(BaseItemKind::Person)
             .into_iter()
             .filter_map(|info| info.name)
-            .collect();
-        assert!(person.len() > 1, "Person should offer several ids");
+            .count();
+        assert!(person > 1, "Person should offer several ids");
     }
 
     fn ids(pairs: &[(&str, &str)]) -> HashMap<String, String> {
