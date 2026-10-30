@@ -55,6 +55,11 @@ doc_markdown = "allow"
 # modules with children are self-named `foo.rs` beside `foo/`, never `foo/mod.rs`
 # (integration-test helpers at `tests/<name>/mod.rs` are not flagged)
 mod_module_files = "warn"
+# nursery allocation lints (gl-1017): a clone whose original is never used again, a
+# collect only iterated, counted or searched once, an eagerly built `or`/`unwrap_or` default
+redundant_clone = "warn"
+needless_collect = "warn"
+or_fun_call = "warn"
 
 [workspace.dependencies]
 if-addrs = { version = "0.15.0", features = ["link-local"] }

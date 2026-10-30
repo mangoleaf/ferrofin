@@ -866,12 +866,11 @@ impl TvdbClient {
         language: &str,
         three_letter_names: &[String],
     ) -> Vec<TvdbSearchHit> {
-        let options = crate::provider_manager::naming_options();
-        let parsed = ferrofin_naming::video::video_resolver::clean_date_time(name, options);
-        let parsed_year = parsed.year;
-        let parsed_name =
-            ferrofin_naming::video::video_resolver::try_clean_string(Some(&parsed.name), options)
-                .unwrap_or(parsed.name);
+        let parsed = ferrofin_naming::video::video_resolver::parse_name(
+            name,
+            crate::provider_manager::naming_options(),
+        );
+        let (parsed_name, parsed_year) = (parsed.name, parsed.year);
         let comparable = comparable_name(&parsed_name);
         let query = vec![
             ("query", comparable.clone()),

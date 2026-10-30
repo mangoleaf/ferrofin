@@ -285,6 +285,41 @@ impl SessionInfo {
     }
 }
 
+/// What a playback report reads from its session: whose user data it saves,
+/// how its log line and event name the session, and the item it already
+/// plays. Copied out by [`FerrofinSessionManager::playback_session`] in place
+/// of a clone of the whole [`SessionInfo`] (capabilities with any device
+/// profile, transcoding info, connection handles), which a client reporting
+/// progress every few seconds would pay on each report.
+struct PlaybackSession {
+    id: String,
+    user_id: Uuid,
+    /// The session's additional users (C# `AdditionalUsers`), by id.
+    additional_user_ids: Vec<Uuid>,
+    user_name: Option<String>,
+    client: Option<String>,
+    device_id: String,
+    device_name: Option<String>,
+    application_version: Option<String>,
+    now_playing_item_id: Option<Uuid>,
+}
+
+impl PlaybackSession {
+    fn of(session: &SessionInfo) -> Self {
+        Self {
+            id: session.id.clone(),
+            user_id: session.user_id,
+            additional_user_ids: session.additional_users.iter().map(|u| u.user_id).collect(),
+            user_name: session.user_name.clone(),
+            client: session.client.clone(),
+            device_id: session.device_id.clone(),
+            device_name: session.device_name.clone(),
+            application_version: session.application_version.clone(),
+            now_playing_item_id: session.now_playing_item_id,
+        }
+    }
+}
+
 /// How long a playing session may go without a client check-in before it is
 /// stopped, and how often that is checked (`CheckForIdlePlayback`'s timer and
 /// `TotalMinutes > 5`).
@@ -685,13 +720,15 @@ impl FerrofinSessionManager {
     /// Records session activity, creating the session on first contact
     /// (C# `LogSessionActivity` → `GetSessionInfo`/`CreateSessionInfo`).
     ///
-    /// Returns the session's wire [`SessionInfoDto`] rather than a clone of the
-    /// in-memory [`SessionInfo`]: this runs on every authenticated request and
-    /// every websocket token resolve, and the DTO (plus, on first contact, the
-    /// `SessionStarted` payload) is all any caller wants — cloning the whole
-    /// session (additional users, capabilities, connection handles, ~8 options)
-    /// only to project it was pure per-request garbage.
-    async fn upsert_session(
+    /// Returns what `project` takes from the session, read while the session
+    /// lock is held, rather than a clone of the in-memory [`SessionInfo`]: this
+    /// runs on every authenticated request and every websocket token resolve.
+    /// [`Self::to_dto`] gives the wire [`SessionInfoDto`]; a caller that wants
+    /// only the session id projects just that, and builds no DTO.
+    ///
+    /// The device is read only when the request creates the session.
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_session<T>(
         &self,
         app_name: &str,
         app_version: &str,
@@ -699,7 +736,8 @@ impl FerrofinSessionManager {
         device_name: &str,
         remote_endpoint: &str,
         user: Option<&UserEntity>,
-    ) -> Result<SessionInfoDto, ServiceError> {
+        project: impl FnOnce(&Self, &SessionInfo) -> T + Send,
+    ) -> Result<T, ServiceError> {
         if device_id.is_empty() {
             return Err(ServiceError::invalid_input("deviceId is required"));
         }
@@ -711,97 +749,104 @@ impl FerrofinSessionManager {
             Some(u) => parse_user_id(&u.id)?,
         };
         let key = Self::session_key(app_name, device_id, user_id);
-        let user_name = user.map(|u| u.username.clone());
+        let user_name = || user.map(|u| u.username.clone());
+        let reported_device_name = if device_name.is_empty() {
+            DEFAULT_DEVICE_NAME
+        } else {
+            device_name
+        };
 
-        // The custom device name, if the device has one persisted.
-        let custom_name = self
-            .device_manager
-            .get_device_options(device_id)
-            .await?
-            .and_then(|o| o.custom_name);
-
-        // A newly created session inherits the device's last reported
-        // capabilities (C# `OnSessionStarted` -> `ReportCapabilities(info, caps,
-        // saveCapabilities: false)`). That is what makes the device manager's
-        // never-evicted capabilities map load-bearing: a session recreated after
-        // its socket closed still advertises `SupportsRemoteControl`, so the
-        // client does not vanish from the cast menu until it re-posts
-        // `/Sessions/Capabilities/Full`.
-        let device_capabilities = self
-            .device_manager
-            .get_capabilities(Some(device_id))
-            .await?;
+        // What every request updates on its session (C# `GetSessionInfo`'s
+        // tail), then the caller's projection, all under the guard.
+        let touch = |session: &mut SessionInfo, is_new: bool| {
+            // `LogSessionActivity` raises `SessionActivity` when the session had
+            // been idle past the interval. `CreateSessionInfo` leaves a new
+            // session's `LastActivityDate` at `DateTime.MinValue`, so a new one
+            // raises it too.
+            let was_idle = is_new || now - session.last_activity_date > SESSION_ACTIVITY_INTERVAL;
+            session.user_id = user_id;
+            session.user_name = user_name();
+            session.remote_end_point = Some(remote_endpoint.to_owned());
+            session.client = Some(app_name.to_owned());
+            session.application_version = Some(app_version.to_owned());
+            session.last_activity_date = now;
+            if !session.has_custom_device_name || session.device_name.is_none() {
+                session.device_name = Some(reported_device_name.to_owned());
+            }
+            if user.is_none() {
+                session.additional_users.clear();
+            }
+            let projected = project(self, session);
+            let started_payload = is_new.then(|| session_started_payload(session));
+            (projected, was_idle, started_payload)
+        };
 
         let mut sessions = self.sessions.lock().await;
-        let is_new = !sessions.contains_key(&key);
-        let session = sessions.entry(key.clone()).or_insert_with(|| {
-            let (device_name, has_custom) = match &custom_name {
-                Some(name) if !name.is_empty() => (name.clone(), true),
-                _ => (
-                    if device_name.is_empty() {
-                        DEFAULT_DEVICE_NAME.to_owned()
-                    } else {
-                        device_name.to_owned()
-                    },
-                    false,
-                ),
-            };
-            SessionInfo {
-                id: Self::session_id_for_key(&key),
-                user_id,
-                user_name: user_name.clone(),
-                client: Some(app_name.to_owned()),
-                device_id: device_id.to_owned(),
-                device_name: Some(device_name),
-                application_version: Some(app_version.to_owned()),
-                remote_end_point: Some(remote_endpoint.to_owned()),
-                server_id: Some(self.server_id.clone()),
-                has_custom_device_name: has_custom,
-                last_activity_date: now,
-                last_playback_check_in: now,
-                last_paused_date: None,
-                now_playing_item_id: None,
-                now_playing_position_ticks: None,
-                now_playing_is_paused: false,
-                now_playing_media_source_id: None,
-                now_playing_live_stream_id: None,
-                now_viewing_item_id: None,
-                additional_users: Vec::new(),
-                capabilities: device_capabilities,
-                transcoding_info: None,
-                is_playing: false,
-                connections: Vec::new(),
-            }
-        });
+        let (projected, was_idle, started_payload) = if let Some(session) = sessions.get_mut(&key) {
+            touch(session, false)
+        } else {
+            // First contact. The device is read only now, and without the
+            // guard, so a request on a known session reads nothing from it.
+            drop(sessions);
 
-        // `LogSessionActivity` raises `SessionActivity` when the session had
-        // been idle past the interval. `CreateSessionInfo` leaves a new
-        // session's `LastActivityDate` at `DateTime.MinValue`, so a new one
-        // raises it too.
-        let was_idle = is_new || now - session.last_activity_date > SESSION_ACTIVITY_INTERVAL;
+            // The custom device name, if the device has one persisted.
+            let custom_name = self
+                .device_manager
+                .get_device_options(device_id)
+                .await?
+                .and_then(|o| o.custom_name);
 
-        // Refresh the mutable per-activity fields (C# `GetSessionInfo` tail).
-        session.user_id = user_id;
-        session.user_name = user_name;
-        session.remote_end_point = Some(remote_endpoint.to_owned());
-        session.client = Some(app_name.to_owned());
-        session.application_version = Some(app_version.to_owned());
-        session.last_activity_date = now;
-        if !session.has_custom_device_name || session.device_name.is_none() {
-            session.device_name = Some(if device_name.is_empty() {
-                DEFAULT_DEVICE_NAME.to_owned()
-            } else {
-                device_name.to_owned()
+            // A newly created session inherits the device's last reported
+            // capabilities (C# `OnSessionStarted` -> `ReportCapabilities(info,
+            // caps, saveCapabilities: false)`). That is what makes the device
+            // manager's never-evicted capabilities map load-bearing: a session
+            // recreated after its socket closed still advertises
+            // `SupportsRemoteControl`, so the client does not vanish from the
+            // cast menu until it re-posts `/Sessions/Capabilities/Full`.
+            let device_capabilities = self
+                .device_manager
+                .get_capabilities(Some(device_id))
+                .await?;
+
+            // A concurrent first request may have created the session while
+            // the guard was released: the first insert wins, as with C#'s
+            // `GetOrAdd`, and only that request starts the session.
+            sessions = self.sessions.lock().await;
+            let is_new = !sessions.contains_key(&key);
+            let session = sessions.entry(key.clone()).or_insert_with(|| {
+                let (device_name, has_custom) = match custom_name {
+                    Some(name) if !name.is_empty() => (name, true),
+                    _ => (reported_device_name.to_owned(), false),
+                };
+                SessionInfo {
+                    id: Self::session_id_for_key(&key),
+                    user_id,
+                    user_name: user_name(),
+                    client: Some(app_name.to_owned()),
+                    device_id: device_id.to_owned(),
+                    device_name: Some(device_name),
+                    application_version: Some(app_version.to_owned()),
+                    remote_end_point: Some(remote_endpoint.to_owned()),
+                    server_id: Some(self.server_id.clone()),
+                    has_custom_device_name: has_custom,
+                    last_activity_date: now,
+                    last_playback_check_in: now,
+                    last_paused_date: None,
+                    now_playing_item_id: None,
+                    now_playing_position_ticks: None,
+                    now_playing_is_paused: false,
+                    now_playing_media_source_id: None,
+                    now_playing_live_stream_id: None,
+                    now_viewing_item_id: None,
+                    additional_users: Vec::new(),
+                    capabilities: device_capabilities,
+                    transcoding_info: None,
+                    is_playing: false,
+                    connections: Vec::new(),
+                }
             });
-        }
-        if user.is_none() {
-            session.additional_users.clear();
-        }
-
-        // Project everything the callers need while the guard is still held, so
-        // no clone of the session itself escapes.
-        let dto = self.to_dto(session);
-        let started_payload = is_new.then(|| session_started_payload(session));
+            touch(session, is_new)
+        };
         drop(sessions);
 
         if let Some(payload) = started_payload {
@@ -820,7 +865,7 @@ impl FerrofinSessionManager {
             self.raise(SessionEvent::SessionActivity);
         }
 
-        Ok(dto)
+        Ok(projected)
     }
 
     /// `LogSessionActivity`'s user stamp (`SessionManager.cs:262-275`): when
@@ -867,8 +912,19 @@ impl FerrofinSessionManager {
             .ok_or_else(|| ServiceError::not_found(format!("session {session_id}")))
     }
 
+    /// Looks up a live session by its **session id**, copying out what a
+    /// playback report reads ([`PlaybackSession`]). C# `GetSession(sessionId)`.
+    async fn playback_session(&self, session_id: &str) -> Result<PlaybackSession, ServiceError> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .values()
+            .find(|s| s.id == session_id)
+            .map(PlaybackSession::of)
+            .ok_or_else(|| ServiceError::not_found(format!("session {session_id}")))
+    }
+
     /// Resolves the primary + additional users of a session (C# `GetUsers`).
-    async fn users_for(&self, session: &SessionInfo) -> Result<Vec<UserEntity>, ServiceError> {
+    async fn users_for(&self, session: &PlaybackSession) -> Result<Vec<UserEntity>, ServiceError> {
         let mut users = Vec::new();
         if session.user_id.is_nil() {
             return Ok(users);
@@ -879,8 +935,8 @@ impl FerrofinSessionManager {
             .await?
             .ok_or_else(|| ServiceError::not_found("user not found"))?;
         users.push(primary);
-        for extra in &session.additional_users {
-            if let Some(u) = self.user_manager.get_user_by_id(extra.user_id).await? {
+        for &extra in &session.additional_user_ids {
+            if let Some(u) = self.user_manager.get_user_by_id(extra).await? {
                 users.push(u);
             }
         }
@@ -1010,7 +1066,7 @@ impl FerrofinSessionManager {
     /// user-data manager announces each save to the user's devices.
     async fn save_stopped_play_state(
         &self,
-        session: &SessionInfo,
+        session: &PlaybackSession,
         info: &PlaybackStopInfo,
     ) -> Result<(), ServiceError> {
         let progress_item = self
@@ -1509,6 +1565,28 @@ impl SessionManager for FerrofinSessionManager {
             device_name,
             remote_endpoint,
             user,
+            Self::to_dto,
+        )
+        .await
+    }
+
+    async fn log_session_activity_id(
+        &self,
+        app_name: &str,
+        app_version: &str,
+        device_id: &str,
+        device_name: &str,
+        remote_endpoint: &str,
+        user: Option<&UserEntity>,
+    ) -> Result<Option<String>, ServiceError> {
+        self.upsert_session(
+            app_name,
+            app_version,
+            device_id,
+            device_name,
+            remote_endpoint,
+            user,
+            |_, session| Some(session.id.clone()),
         )
         .await
     }
@@ -1532,7 +1610,7 @@ impl SessionManager for FerrofinSessionManager {
             .session_id
             .as_deref()
             .ok_or_else(|| ServiceError::invalid_input("sessionId is required"))?;
-        let session = self.get_session_snapshot(session_id).await?;
+        let session = self.playback_session(session_id).await?;
 
         // A live stream this playback holds is registered against both of the
         // ids the client may later report a stop under (C#
@@ -1617,7 +1695,7 @@ impl SessionManager for FerrofinSessionManager {
             .session_id
             .as_deref()
             .ok_or_else(|| ServiceError::invalid_input("sessionId is required"))?;
-        let session = self.get_session_snapshot(session_id).await?;
+        let session = self.playback_session(session_id).await?;
 
         // Progress re-registers the pairing: a client that starts reporting a
         // play session only after the first progress tick still gets paired.
@@ -1694,7 +1772,7 @@ impl SessionManager for FerrofinSessionManager {
             .session_id
             .as_deref()
             .ok_or_else(|| ServiceError::invalid_input("sessionId is required"))?;
-        let session = self.get_session_snapshot(session_id).await?;
+        let session = self.playback_session(session_id).await?;
 
         // C# `OnPlaybackStopped` refuses a negative position (stalled clients
         // report one), and releases the live stream first so that no tuner
@@ -2343,6 +2421,7 @@ impl SessionManager for FerrofinSessionManager {
             &device.device_name,
             remote_endpoint,
             user.as_ref(),
+            Self::to_dto,
         )
         .await
     }
@@ -2639,6 +2718,7 @@ impl FerrofinSessionManager {
                 device_name,
                 remote_endpoint,
                 Some(&user),
+                Self::to_dto,
             )
             .await?;
         dto.server_id = Some(self.server_id.clone());
@@ -2785,7 +2865,7 @@ const TICKS_PER_MILLISECOND: i64 = 10_000;
 /// ([`crate::playback_activity`]), and plugins receive all three, as
 /// upstream's event consumers do.
 fn playback_event_payload(
-    session: &SessionInfo,
+    session: &PlaybackSession,
     item_id: Uuid,
     position_ticks: Option<i64>,
 ) -> String {
