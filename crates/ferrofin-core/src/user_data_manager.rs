@@ -431,7 +431,7 @@ impl FerrofinUserDataManager {
         user_id: Uuid,
     ) -> Result<Option<UserDataEntity>, ServiceError> {
         let (rows, keys) = self.rows_and_keys(item_id, user_id).await?;
-        Ok(Self::preferred_row(&rows, &keys))
+        Ok(Self::preferred_row(rows, &keys))
     }
 
     /// The user's stored rows on the item, and the item's current keys.
@@ -462,7 +462,7 @@ impl FerrofinUserDataManager {
         user_id: Uuid,
     ) -> Result<UserDataEntity, ServiceError> {
         let (rows, keys) = self.rows_and_keys(item_id, user_id).await?;
-        Ok(Self::preferred_row(&rows, &keys).unwrap_or_else(|| {
+        Ok(Self::preferred_row(rows, &keys).unwrap_or_else(|| {
             let mut row = Self::empty_row(item_id, user_id);
             if let Some(first) = keys.into_iter().next() {
                 row.custom_data_key = first;
@@ -473,11 +473,13 @@ impl FerrofinUserDataManager {
 
     /// Pinned ResolveUserDataRow: exact current-key priority, then the first
     /// attached candidate when none matches. No own-GUID override is applied.
-    fn preferred_row(rows: &[UserDataEntity], keys: &[String]) -> Option<UserDataEntity> {
-        keys.iter()
-            .find_map(|key| rows.iter().find(|row| row.custom_data_key == *key))
-            .or_else(|| rows.first())
-            .cloned()
+    /// The chosen row is moved out of `rows`, which every caller owns.
+    fn preferred_row(mut rows: Vec<UserDataEntity>, keys: &[String]) -> Option<UserDataEntity> {
+        let index = keys
+            .iter()
+            .find_map(|key| rows.iter().position(|row| row.custom_data_key == *key))
+            .unwrap_or(0);
+        (index < rows.len()).then(|| rows.swap_remove(index))
     }
 
     /// The `CustomDataKey`s this item's rows are written under.
@@ -1050,7 +1052,7 @@ impl FerrofinUserDataManager {
             .get_user_data_dtos_for_rows(std::slice::from_ref(&container.root), user_id, true)
             .await?
             .remove(&container.id)
-            .unwrap_or_else(|| to_dto(&Self::empty_row(container.id, user_id), container.id));
+            .unwrap_or_else(|| to_dto(Self::empty_row(container.id, user_id), container.id));
         if let Some(members) = self.members.get()
             && kind_from_type_name(&container.root.type_).is_some_and(|kind| {
                 crate::kinds::supports_user_data_from_children(kind)
@@ -1357,7 +1359,7 @@ impl FerrofinUserDataManager {
         // `Video.MarkPlayed` → `PropagatePlayedState(user, true, resetPosition)`.
         self.propagate_played_state(user_id, item_id, true, true)
             .await?;
-        Ok(to_dto(&row, item_id))
+        Ok(to_dto(row, item_id))
     }
 
     /// Port of `BaseItem.MarkUnplayed` → `ResetPlayedState` for one item
@@ -1380,7 +1382,7 @@ impl FerrofinUserDataManager {
         // `Video.MarkUnplayed` → `PropagatePlayedState(user, false, true)`.
         self.propagate_played_state(user_id, item_id, false, true)
             .await?;
-        Ok(to_dto(&row, item_id))
+        Ok(to_dto(row, item_id))
     }
 }
 
@@ -1535,6 +1537,11 @@ fn row_data_keys(
     let own_providers = providers.get(&item_id).map_or(&[][..], Vec::as_slice);
     let source = key_source(item, item_id, kind, own_providers);
     let mut keys = user_data_keys(&source, None);
+    // Only a season or an episode is keyed through its series, so no other
+    // item formats its id to look one up.
+    if !matches!(kind, BaseItemKind::Season | BaseItemKind::Episode) {
+        return keys;
+    }
     let Some(series) = series_keys.get(&guid_to_db(item_id)) else {
         return keys;
     };
@@ -1613,8 +1620,9 @@ fn provider_value<'a>(providers: &'a [(String, String)], want: &str) -> Option<&
 /// Maps a [`UserDataEntity`] row to the presentation DTO (C#
 /// `GetUserItemDataDto`). Playback fields carry over verbatim; the
 /// item-dependent `PlayedPercentage`/`UnplayedItemCount` are left unset here
-/// (they are filled by the DTO service against the resolved item).
-fn to_dto(row: &UserDataEntity, item_id: Uuid) -> UserItemDataDto {
+/// (they are filled by the DTO service against the resolved item). The row's
+/// key moves into the DTO.
+fn to_dto(row: UserDataEntity, item_id: Uuid) -> UserItemDataDto {
     UserItemDataDto {
         rating: row.rating,
         played_percentage: None,
@@ -1625,7 +1633,26 @@ fn to_dto(row: &UserDataEntity, item_id: Uuid) -> UserItemDataDto {
         likes: row.rating.map(|rating| rating >= MIN_LIKE_VALUE),
         last_played_date: row.last_played_date,
         played: row.played,
-        key: row.custom_data_key.clone(),
+        key: row.custom_data_key,
+        item_id,
+    }
+}
+
+/// [`to_dto`] of the row `GetUserData` answers for an item the user never
+/// wrote ([`FerrofinUserDataManager::empty_row`]) keyed by `key`, without
+/// building that row: its ids are never read.
+fn unwritten_dto(item_id: Uuid, key: String) -> UserItemDataDto {
+    UserItemDataDto {
+        rating: None,
+        played_percentage: None,
+        unplayed_item_count: None,
+        playback_position_ticks: 0,
+        play_count: 0,
+        is_favorite: false,
+        likes: None,
+        last_played_date: None,
+        played: false,
+        key,
         item_id,
     }
 }
@@ -1729,7 +1756,7 @@ impl UserDataManager for FerrofinUserDataManager {
         user_id: Uuid,
     ) -> Result<Option<UserItemDataDto>, ServiceError> {
         let row = self.read_or_unwritten_row(item_id, user_id).await?;
-        let mut dto = to_dto(&row, item_id);
+        let mut dto = to_dto(row, item_id);
         self.fill_user_data_dto_values(&mut dto, item_id, user_id)
             .await?;
         Ok(Some(dto))
@@ -1755,7 +1782,7 @@ impl UserDataManager for FerrofinUserDataManager {
         };
         let mut map: HashMap<Uuid, UserItemDataDto> = Self::preferred_rows(rows, &keys)
             .into_iter()
-            .map(|(id, row)| (id, to_dto(&row, id)))
+            .map(|(id, row)| (id, to_dto(row, id)))
             .collect();
         for &item_id in item_ids {
             map.entry(item_id).or_insert_with(|| {
@@ -1763,7 +1790,7 @@ impl UserDataManager for FerrofinUserDataManager {
                 if let Some(first) = keys.get(&guid_to_db(item_id)).and_then(|keys| keys.first()) {
                     row.custom_data_key.clone_from(first);
                 }
-                to_dto(&row, item_id)
+                to_dto(row, item_id)
             });
         }
         Ok(map)
@@ -1816,14 +1843,21 @@ impl UserDataManager for FerrofinUserDataManager {
             let Ok(id) = Uuid::parse_str(&item.id) else {
                 continue;
             };
-            let current = row_data_keys(item, id, &providers, &series_keys);
             let candidates = stored.remove(&id).unwrap_or_default();
-            let row = Self::preferred_row(&candidates, &current).unwrap_or_else(|| {
-                let mut row = Self::empty_row(id, user_id);
-                row.custom_data_key = current.first().cloned().unwrap_or_default();
-                row
-            });
-            map.insert(id, to_dto(&row, id));
+            // `ResolveUserDataRow` answers with an only row whatever the
+            // item's keys are, so they are derived only to choose between
+            // rows, or to key the row of an item the user never wrote.
+            let dto = match <[UserDataEntity; 1]>::try_from(candidates) {
+                Ok([row]) => to_dto(row, id),
+                Err(candidates) => {
+                    let current = row_data_keys(item, id, &providers, &series_keys);
+                    match Self::preferred_row(candidates, &current) {
+                        Some(row) => to_dto(row, id),
+                        None => unwritten_dto(id, current.into_iter().next().unwrap_or_default()),
+                    }
+                }
+            };
+            map.insert(id, dto);
         }
         Ok(map)
     }
@@ -1855,7 +1889,7 @@ impl UserDataManager for FerrofinUserDataManager {
         self.upsert_row(&row).await?;
         self.notify_saved(user_id, item_id, UserDataSaveReason::UpdateUserRating)
             .await;
-        Ok(to_dto(&row, item_id))
+        Ok(to_dto(row, item_id))
     }
 
     async fn update_play_state(
@@ -2151,7 +2185,7 @@ impl FerrofinUserDataManager {
                 let current = keys
                     .get(&guid_to_db(id))
                     .map_or(own.as_slice(), Vec::as_slice);
-                Self::preferred_row(&candidates, current).map(|row| (id, row))
+                Self::preferred_row(candidates, current).map(|row| (id, row))
             })
             .collect()
     }
@@ -3334,6 +3368,19 @@ mod tests {
             .expect("some");
         assert!(!dto.is_favorite);
         assert_eq!(dto.play_count, 0);
+    }
+
+    /// A page builds an unwritten item's DTO without its empty row, so it
+    /// must be the DTO of that row under the same key.
+    #[test]
+    fn an_unwritten_dto_is_the_empty_rows_dto() {
+        let item = Uuid::from_u128(2);
+        let mut row = FerrofinUserDataManager::empty_row(item, Uuid::from_u128(1));
+        row.custom_data_key = "Year-2021".to_owned();
+        assert_eq!(
+            unwritten_dto(item, "Year-2021".to_owned()),
+            to_dto(row, item)
+        );
     }
 
     /// C# `GetUserData(User, BaseItem)` synthesizes the missing row with
