@@ -8456,12 +8456,9 @@ mod tests {
             (season_id, "/shows/Season 01"),
             (series_id, "%MetadataPath%/shows"),
         ] {
-            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
-                .bind(guid_to_db(id))
-                .bind(path)
-                .execute(db.writer())
-                .await
-                .expect("path");
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            save_item(&db, &row).await;
         }
         let episode_id = row_id(&episode);
         seed_images(
@@ -11989,12 +11986,9 @@ mod tests {
             (movie, "/media/M.mkv"),
             (person, "%MetadataPath%/People/L/Leonardo DiCaprio"),
         ] {
-            sqlx::query(r#"UPDATE "BaseItems" SET "Path" = ?2 WHERE "Id" = ?1"#)
-                .bind(guid_to_db(id))
-                .bind(path)
-                .execute(db.writer())
-                .await
-                .expect("path");
+            let mut row = fetch_item(&db, id).await;
+            row.path = Some(path.to_owned());
+            save_item(&db, &row).await;
         }
         let person_row = fetch_item(&db, person).await;
         let item = fetch_item(&db, movie).await;
