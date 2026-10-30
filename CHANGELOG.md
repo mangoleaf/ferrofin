@@ -662,6 +662,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   before it reads the next channel's. It used to hold every airing and every stored programme
   item of the whole guide at once. The guide rows are built as they are written instead of
   all first. What the refresh stores is unchanged; its memory was not measured
+- The `UserDataChanged` push reads the user data of the items it lists together, where it
+  read each item on its own (four to six statements per item and per parent). Only a
+  folder's played counts are still read per folder. Marking a five-episode series played
+  now runs 14 statements for the push instead of 44; the message is unchanged
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or

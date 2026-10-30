@@ -312,21 +312,33 @@ impl FerrofinUserDataManager {
 
     /// Sends each user one `UserDataChanged` listing their saved items and,
     /// one level up for the indicators, each item's owner or else its parent
-    /// (`GetOwner() ?? GetParent()`). Best-effort: a failed read sends what
-    /// it can.
+    /// (`GetOwner() ?? GetParent()`), each as `GetUserDataDto(item, user)`
+    /// answers it. The listed items are read together
+    /// ([`Self::user_data_dtos_for_items`]); an item whose row was not read
+    /// (it is gone, or the read failed) takes the single read, and so does
+    /// every item when the batch read fails. Best-effort: a failed read
+    /// sends what it can.
     async fn send_changes(&self, changes: HashMap<Uuid, Vec<Uuid>>) {
         use crate::video_versions::{DbVersionReader, VersionRowReader as _};
         let Some(sink) = self.changed.get() else {
             return;
         };
+        let reader = DbVersionReader(&self.db);
         for (user_id, items) in changes {
             if !sink.has_listener(user_id).await {
                 continue;
             }
-            let rows = DbVersionReader(&self.db)
-                .rows_by_id(&items)
-                .await
-                .unwrap_or_default();
+            let mut rows = match reader.rows_by_id(&items).await {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(
+                        %user_id,
+                        %error,
+                        "user-data push: reading the items failed; reading each item instead"
+                    );
+                    Vec::new()
+                }
+            };
             let up: HashMap<Uuid, Uuid> = rows
                 .iter()
                 .filter_map(|row| {
@@ -346,9 +358,54 @@ impl FerrofinUserDataManager {
                     }
                 }
             }
+            let mut read: HashSet<Uuid> = rows
+                .iter()
+                .filter_map(|row| Uuid::parse_str(&row.id).ok())
+                .collect();
+            let mut parents: Vec<Uuid> = up
+                .values()
+                .copied()
+                .filter(|id| !read.contains(id))
+                .collect();
+            parents.sort_unstable();
+            parents.dedup();
+            if !parents.is_empty() {
+                match reader.rows_by_id(&parents).await {
+                    Ok(found) => {
+                        read.extend(found.iter().filter_map(|row| Uuid::parse_str(&row.id).ok()));
+                        rows.extend(found);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            %user_id,
+                            %error,
+                            "user-data push: reading the parents failed; reading each instead"
+                        );
+                    }
+                }
+            }
+            let mut dtos = match self.user_data_dtos_for_items(&rows, user_id).await {
+                Ok(dtos) => dtos,
+                Err(error) => {
+                    tracing::warn!(
+                        %user_id,
+                        %error,
+                        "user-data push: the batch read failed; reading each item instead"
+                    );
+                    read.clear();
+                    HashMap::new()
+                }
+            };
             let mut user_data_list = Vec::with_capacity(listed.len());
             for id in listed {
-                if let Ok(Some(dto)) = self.get_user_data_dto(id, user_id).await {
+                // An item not in `read` takes the single read. An item in
+                // `read` with no answer had a fill read fail: leave it out,
+                // as the single read would.
+                if let Some(dto) = dtos.remove(&id) {
+                    user_data_list.push(dto);
+                } else if !read.contains(&id)
+                    && let Ok(Some(dto)) = self.get_user_data_dto(id, user_id).await
+                {
                     user_data_list.push(dto);
                 }
             }
@@ -1054,9 +1111,7 @@ impl FerrofinUserDataManager {
         user_id: Uuid,
     ) -> Result<(), ServiceError> {
         use crate::video_versions::{DbVersionReader, VersionRows, resume_user_data};
-        if item.primary_version_id.is_some()
-            || !kind_from_type_name(&item.type_).is_some_and(crate::kinds::is_video)
-        {
+        if !takes_version_resume(item) {
             return Ok(());
         }
         let has_versions: bool = sqlx::query_scalar(
@@ -1082,10 +1137,11 @@ impl FerrofinUserDataManager {
 
     /// `item.FillUserDataDtoValues(dto, userData, null, user, options)` as
     /// `GetUserDataDto(item, user)` runs it (v12.2 UserDataManager.cs:411-427),
-    /// chosen by class: a `Folder` (Folder.cs:2024-2081) takes its played
-    /// numbers from its leaves, any other item (BaseItem.cs:2746-2767) turns a
-    /// positive resume position over a known runtime into `PlayedPercentage`.
-    /// Unwired (unit tests), the stored row is the whole answer.
+    /// chosen by class ([`UserDataFill`]): a `Folder` (Folder.cs:2024-2081)
+    /// takes its played numbers from its leaves, any other item
+    /// (BaseItem.cs:2746-2767) turns a positive resume position over a known
+    /// runtime into `PlayedPercentage`. Unwired (unit tests), the stored row
+    /// is the whole answer.
     async fn fill_user_data_dto_values(
         &self,
         dto: &mut UserItemDataDto,
@@ -1101,33 +1157,175 @@ impl FerrofinUserDataManager {
         let Some(item) = library.get_item_by_id(item_id).await? else {
             return Ok(());
         };
-        let Some(kind) = kind_from_type_name(&item.type_) else {
-            return Ok(());
-        };
-        // Dispatched by class, as the C# virtual is, not by the stored
-        // `IsFolder`: a by-name row (a by-name artist, a genre) never passes
-        // the folder gates below, as `supports_played_status` excludes it.
-        if !crate::kinds::is_folder(kind) {
-            crate::dto_service::fill_leaf_played_percentage(dto, item.run_time_ticks);
-            // `GetResumeUserData(user, item)?.ApplyTo(dto)` (UserDataManager.cs:424).
-            return self
-                .apply_version_resume(dto, &item, item_id, user_id)
-                .await;
+        match UserDataFill::of(&item) {
+            UserDataFill::Stored => Ok(()),
+            UserDataFill::Leaf => {
+                crate::dto_service::fill_leaf_played_percentage(dto, item.run_time_ticks);
+                // `GetResumeUserData(user, item)?.ApplyTo(dto)` (UserDataManager.cs:424).
+                self.apply_version_resume(dto, &item, item_id, user_id)
+                    .await
+            }
+            UserDataFill::Counts => {
+                let Some(user) = crate::item_repository::query_user(&self.db, user_id).await?
+                else {
+                    return Ok(());
+                };
+                let counts = self
+                    .container_counts(item_id, &user, &members.counts)
+                    .await?;
+                crate::dto_service::fill_folder_played(dto, counts);
+                Ok(())
+            }
         }
-        // No item DTO, so only the `SupportsPlayedStatus` half applies.
-        if !(crate::kinds::supports_user_data_from_children(kind)
-            && supports_played_status(kind, parse_media_type(item.media_type.as_deref())))
-        {
-            return Ok(());
-        }
-        let Some(user) = crate::item_repository::query_user(&self.db, user_id).await? else {
-            return Ok(());
-        };
-        let counts = self
-            .container_counts(item_id, &user, &members.counts)
+    }
+
+    /// [`UserDataManager::get_user_data_dto`] for each of `items`, read
+    /// together for the `UserDataChanged` push: the rows and keys in one
+    /// batch ([`UserDataManager::get_user_data_dtos_for_rows`], provider ids
+    /// hydrated, as the single read loads its item by id), then each item's
+    /// [`UserDataFill`] from the row in hand — a leaf's `PlayedPercentage`,
+    /// the version resume of every video in one group read
+    /// ([`Self::version_resume_batch`]) and a folder's counts, the one read
+    /// left per item. An item whose fill read fails is left out, as the
+    /// single read fails it; the version read is shared, so its failure
+    /// leaves out every video that took part in it. Unwired (unit tests), the
+    /// stored rows are the whole answer.
+    ///
+    /// # Errors
+    /// [`ServiceError`] when the batch read fails.
+    async fn user_data_dtos_for_items(
+        &self,
+        items: &[BaseItemEntity],
+        user_id: Uuid,
+    ) -> Result<HashMap<Uuid, UserItemDataDto>, ServiceError> {
+        let mut dtos = self
+            .get_user_data_dtos_for_rows(items, user_id, true)
             .await?;
-        crate::dto_service::fill_folder_played(dto, counts);
-        Ok(())
+        let Some(members) = self
+            .members
+            .get()
+            .filter(|members| members.library.strong_count() > 0)
+        else {
+            return Ok(dtos);
+        };
+        let mut resumable = Vec::new();
+        let mut folders = Vec::new();
+        for item in items {
+            let Ok(id) = Uuid::parse_str(&item.id) else {
+                continue;
+            };
+            let Some(dto) = dtos.get_mut(&id) else {
+                continue;
+            };
+            match UserDataFill::of(item) {
+                UserDataFill::Stored => {}
+                UserDataFill::Leaf => {
+                    crate::dto_service::fill_leaf_played_percentage(dto, item.run_time_ticks);
+                    if takes_version_resume(item) {
+                        resumable.push(item);
+                    }
+                }
+                UserDataFill::Counts => folders.push(id),
+            }
+        }
+        match self.version_resume_batch(&resumable, user_id).await {
+            Ok(resumes) => {
+                for (id, resume) in resumes {
+                    if let Some(dto) = dtos.get_mut(&id) {
+                        resume.apply_to(dto);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %user_id,
+                    %error,
+                    "user-data push: reading the version resume failed; leaving the videos out"
+                );
+                for item in resumable {
+                    if let Ok(id) = Uuid::parse_str(&item.id) {
+                        dtos.remove(&id);
+                    }
+                }
+            }
+        }
+        if folders.is_empty() {
+            return Ok(dtos);
+        }
+        match crate::item_repository::query_user(&self.db, user_id).await {
+            Ok(Some(user)) => {
+                for id in folders {
+                    match self.container_counts(id, &user, &members.counts).await {
+                        Ok(counts) => {
+                            if let Some(dto) = dtos.get_mut(&id) {
+                                crate::dto_service::fill_folder_played(dto, counts);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                %user_id,
+                                item_id = %id,
+                                %error,
+                                "user-data push: counting the folder's leaves failed"
+                            );
+                            dtos.remove(&id);
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %user_id,
+                    %error,
+                    "user-data push: reading the user failed; leaving the folders out"
+                );
+                for id in folders {
+                    dtos.remove(&id);
+                }
+            }
+        }
+        Ok(dtos)
+    }
+
+    /// [`Self::apply_version_resume`] for many videos at once
+    /// (`GetResumeUserDataBatch`, v12.2 `UserDataManager.cs:263-357`): their
+    /// version groups in one [`crate::video_versions::VersionRows::load`],
+    /// the user data of every version in a group in one read, and each
+    /// video's version played last, by video id. A video with no other
+    /// version has none.
+    ///
+    /// # Errors
+    /// [`ServiceError`] when a read fails.
+    async fn version_resume_batch(
+        &self,
+        videos: &[&BaseItemEntity],
+        user_id: Uuid,
+    ) -> Result<HashMap<Uuid, crate::video_versions::VersionResumeData>, ServiceError> {
+        use crate::video_versions::{DbVersionReader, VersionRows, resume_user_data};
+        if videos.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let versions = VersionRows::load(&DbVersionReader(&self.db), videos).await?;
+        let mut wanted: Vec<Uuid> = videos
+            .iter()
+            .map(|video| versions.all_version_ids(video))
+            .filter(|group| group.len() > 1)
+            .flatten()
+            .collect();
+        if wanted.is_empty() {
+            return Ok(HashMap::new());
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        let data = self.get_user_data_dtos(&wanted, user_id).await?;
+        Ok(videos
+            .iter()
+            .filter_map(|video| {
+                let id = Uuid::parse_str(&video.id).ok()?;
+                resume_user_data(&versions, video, |id| data.get(&id)).map(|resume| (id, resume))
+            })
+            .collect())
     }
 
     /// Port of `BaseItem.MarkPlayed(user, datePlayed, resetPosition: true)`
@@ -1195,6 +1393,52 @@ struct Container {
     user: ferrofin_db::entities::users::UserEntity,
     /// The items the mark is written on, in the order they were found.
     leaves: Vec<Uuid>,
+}
+
+/// What `item.FillUserDataDtoValues(dto, userData, null, user, options)`
+/// adds to an item's stored user data in `GetUserDataDto(item, user)` (v12.2
+/// UserDataManager.cs:411-427), chosen by the item's class as the C# virtual
+/// is, not by the stored `IsFolder`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserDataFill {
+    /// Nothing: a type with no class, or a folder whose played state is not
+    /// its leaves' — with no item DTO, only `Folder`'s `SupportsPlayedStatus`
+    /// half applies, and a by-name row (a by-name artist, a genre) never
+    /// passes it.
+    Stored,
+    /// Any item but a folder (BaseItem.cs:2746-2767): a positive resume
+    /// position over a known runtime becomes `PlayedPercentage`, then a video
+    /// takes the completion of its version played last
+    /// ([`takes_version_resume`]).
+    Leaf,
+    /// A `Folder` (Folder.cs:2024-2081) whose played numbers come from its
+    /// leaves.
+    Counts,
+}
+
+impl UserDataFill {
+    fn of(item: &BaseItemEntity) -> Self {
+        let Some(kind) = kind_from_type_name(&item.type_) else {
+            return Self::Stored;
+        };
+        if !crate::kinds::is_folder(kind) {
+            return Self::Leaf;
+        }
+        if crate::kinds::supports_user_data_from_children(kind)
+            && supports_played_status(kind, parse_media_type(item.media_type.as_deref()))
+        {
+            Self::Counts
+        } else {
+            Self::Stored
+        }
+    }
+}
+
+/// Whether `GetResumeUserData(user, item)` can fold a version's completion
+/// into `item`'s user data: a video that is no version itself.
+fn takes_version_resume(item: &BaseItemEntity) -> bool {
+    item.primary_version_id.is_none()
+        && kind_from_type_name(&item.type_).is_some_and(crate::kinds::is_video)
 }
 
 /// Whether a played mark on this item goes to its members: a `Folder`
@@ -4970,6 +5214,163 @@ mod tests {
             season_data["UnplayedItemCount"], 1,
             "the season's count refreshed"
         );
+    }
+
+    /// A primary `Other.mkv` and its 4K copy, owned by and pointing at it: a
+    /// second group beside [`version_group`]'s.
+    async fn version_pair(db: &Database) -> (Uuid, Uuid) {
+        let (primary, copy) = (Uuid::from_u128(40), Uuid::from_u128(41));
+        for (id, path) in [
+            (primary, "/Movies/Other/Other.mkv"),
+            (copy, "/Movies/Other/Other - 4K.mkv"),
+        ] {
+            seed_item(db, id, BaseItemKind::Movie).await;
+            sqlx::query(
+                r#"UPDATE "BaseItems" SET "Path" = ?2, "RunTimeTicks" = ?3 WHERE "Id" = ?1"#,
+            )
+            .bind(guid_to_db(id))
+            .bind(path)
+            .bind(72_000_000_000_i64)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            r#"UPDATE "BaseItems" SET "OwnerId" = ?2, "PrimaryVersionId" = ?2 WHERE "Id" = ?1"#,
+        )
+        .bind(guid_to_db(copy))
+        .bind(guid_to_db(primary))
+        .execute(db.pool())
+        .await
+        .unwrap();
+        (primary, copy)
+    }
+
+    /// A box set linking `members`, in a library that holds them.
+    async fn box_set_of(db: &Database, members: &[Uuid]) -> Uuid {
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let boxset = Uuid::from_u128(0xB0);
+        crate::test_support::seed_folder_item(db, boxset, BaseItemKind::BoxSet, "Set", None).await;
+        crate::test_support::seed_library_over(db, members).await;
+        let links = crate::FerrofinLinkedChildrenService::new(db.clone());
+        // 0 = `LinkedChildType.Manual`.
+        for &member in members {
+            links.upsert_linked_child(boxset, member, 0).await.unwrap();
+        }
+        boxset
+    }
+
+    /// gl-1005: the push reads its items together, yet answers each one as
+    /// the single read (`get_user_data_dto`, upstream's per-item
+    /// `GetUserDataDto(item, user)` in `GetUserDataChangeInfo`) does: an
+    /// episode's resume `PlayedPercentage`, the first user-data key of a
+    /// never-written episode and movie, a season's, series' and box set's
+    /// counts, a primary's completion from the version finished last, and a
+    /// gone item's empty row keyed by its id.
+    #[tokio::test]
+    async fn the_batched_push_answers_each_item_as_the_single_read_does() {
+        let db = test_db().await;
+        let user = Uuid::from_u128(1);
+        crate::test_support::seed_user_with_defaults(&db, user).await;
+        let (series, season) = (Uuid::from_u128(0x5E0), Uuid::from_u128(0x5E1));
+        let (ep1, ep2, ep3) = (
+            Uuid::from_u128(0xE1),
+            Uuid::from_u128(0xE2),
+            Uuid::from_u128(0xE3),
+        );
+        seed_show(
+            &db,
+            series,
+            season,
+            &[(ep1, false, None), (ep2, false, None), (ep3, false, None)],
+        )
+        .await;
+        seed_provider_id(&db, series, "Tvdb", "73739").await;
+        sqlx::query(r#"UPDATE "BaseItems" SET "RunTimeTicks" = 1000 WHERE "Id" = ?1"#)
+            .bind(guid_to_db(ep2))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (primary, alt1, alt2) = version_group(&db).await;
+        // A second group, read in the same version batch.
+        let (other, other_4k) = version_pair(&db).await;
+        let fresh = Uuid::from_u128(30);
+        seed_item(&db, fresh, BaseItemKind::Movie).await;
+        seed_provider_id(&db, fresh, "Tmdb", "700391").await;
+        let boxset = box_set_of(&db, &[fresh, primary]).await;
+        let gone = Uuid::from_u128(0xD0);
+        let (mgr, _library) = container_manager(&db);
+        mgr.mark_item_played(user, ep1, None).await.unwrap();
+        resume_at(&mgr, ep2, user, 250).await;
+        mgr.save_user_data(user, series, &favorite_dto())
+            .await
+            .unwrap();
+        resume_at(&mgr, primary, user, 1000).await;
+        mgr.save_user_data(
+            user,
+            alt2,
+            &UpdateUserItemDataDto {
+                played: Some(true),
+                last_played_date: Some(chrono::Utc::now()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        mgr.save_user_data(
+            user,
+            other_4k,
+            &UpdateUserItemDataDto {
+                playback_position_ticks: Some(5_000),
+                last_played_date: Some(chrono::Utc::now()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // Set after the saves above, so only the batch below is announced.
+        let sink = Arc::new(RecordingSink::default());
+        mgr.set_user_data_changed_sink(sink.clone());
+        let saved = vec![
+            ep1, ep2, ep3, series, primary, alt1, other, other_4k, fresh, boxset, gone,
+        ];
+        // Each saved item followed, once, by its owner or parent: the
+        // episodes' season, and the primaries that own `alt1` and `other_4k`.
+        let listed = [
+            ep1, season, ep2, ep3, series, primary, alt1, other, other_4k, fresh, boxset, gone,
+        ];
+        let mut single = Vec::with_capacity(listed.len());
+        for id in listed {
+            single.push(serde_json::to_value(data(&mgr, id, user).await).unwrap());
+        }
+
+        mgr.send_changes(HashMap::from([(user, saved)])).await;
+
+        let sent = sink.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one message for the batch");
+        assert_eq!(
+            sent[0].1["UserDataList"],
+            serde_json::Value::Array(single.clone()),
+            "each item as the single read answers it, in the listed order"
+        );
+        // The fixture reaches every fill, so the two agree on more than the
+        // stored rows.
+        let of = |id: Uuid| &single[listed.iter().position(|&l| l == id).unwrap()];
+        assert_eq!(of(ep2)["PlayedPercentage"], 25.0);
+        assert_eq!(of(ep3)["Key"], "73739001003");
+        assert_eq!(of(season)["UnplayedItemCount"], 2);
+        assert_eq!(of(series)["UnplayedItemCount"], 2);
+        assert_eq!(of(series)["IsFavorite"], true);
+        assert_eq!(of(primary)["Played"], true, "finished on the 4K copy");
+        assert_eq!(of(primary)["PlaybackPositionTicks"], 0);
+        assert_eq!(
+            of(other)["LastPlayedDate"],
+            of(other_4k)["LastPlayedDate"],
+            "the second group's video takes its 4K copy's date"
+        );
+        assert_eq!(of(fresh)["Key"], "700391");
+        assert!(of(boxset)["UnplayedItemCount"].is_u64(), "{}", of(boxset));
+        assert_eq!(of(gone)["Key"], gone.to_string());
     }
 
     /// A user with no session that would hear the batch is sent nothing.
