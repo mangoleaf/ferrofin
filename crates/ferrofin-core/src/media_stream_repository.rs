@@ -41,10 +41,7 @@ use crate::db_error::{db_err, media_stream_type_disc};
 /// planner a leading-`ItemId` alternative that also covers the projection, and
 /// `subtitle_probe_uses_the_item_id_index` pins that it stays chosen.
 fn stream_type_probe_sql(ids: usize) -> String {
-    let ph = (2..=ids + 1)
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let ph = ferrofin_db::numbered_placeholders(2..=ids + 1);
     format!(
         r#"SELECT DISTINCT "ItemId" FROM "MediaStreamInfos"
                    WHERE "StreamType" = ?1 AND "ItemId" IN ({ph})"#
@@ -151,10 +148,7 @@ impl MediaStreamRepository for FerrofinMediaStreamRepository {
         }
         // One query for the whole page; rows arrive in per-item StreamIndex order.
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let ph = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let ph = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT * FROM "MediaStreamInfos" WHERE "ItemId" IN ({ph})
                    ORDER BY "ItemId", "StreamIndex""#,

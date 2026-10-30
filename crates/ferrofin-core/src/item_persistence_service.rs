@@ -2452,7 +2452,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         // re-sync: 12.0 keeps membership out of `Data` (`[JsonIgnore]`), and
         // the playlist keys it does hold are not changed by a delete.
         for chunk in closure.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let ids = numbered_placeholders(chunk.len());
+            let ids = ferrofin_db::numbered_placeholders(1..=chunk.len());
             for sql in [
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ParentId" IN ({ids})"#),
                 format!(r#"DELETE FROM "LinkedChildren" WHERE "ChildId" IN ({ids})"#),
@@ -2473,7 +2473,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         for chunk in closure.rchunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = format!(
                 r#"DELETE FROM "BaseItems" WHERE "Id" IN ({})"#,
-                numbered_placeholders(chunk.len())
+                ferrofin_db::numbered_placeholders(1..=chunk.len())
             );
             let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
@@ -2510,7 +2510,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         for chunk in closure.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
             let sql = format!(
                 r#"SELECT * FROM "BaseItems" WHERE "Id" IN ({})"#,
-                numbered_placeholders(chunk.len())
+                ferrofin_db::numbered_placeholders(1..=chunk.len())
             );
             let mut query = sqlx::query_as::<_, BaseItemEntity>(sqlx::AssertSqlSafe(sql.as_str()));
             for id in chunk {
@@ -3203,10 +3203,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         // Chunked to stay under SQLite's bound-parameter ceiling, the same
         // 500-wide shape every other batched id lookup here uses.
         for chunk in item_ids.chunks(500) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Path", "Width", "Height", "Blurhash", "DateModified"
                    FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})"#
@@ -3259,10 +3256,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let mut out: HashMap<Uuid, StoredItemLinks> = HashMap::with_capacity(item_ids.len());
         let key = |id: &str| Uuid::parse_str(id).ok();
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let images = format!(
                 r#"SELECT "ItemId", "ImageType", "Path", "Width", "Height", "Blurhash", "DateModified"
                    FROM "BaseItemImageInfos" WHERE "ItemId" IN ({placeholders})
@@ -4058,10 +4052,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let mut written = 0;
         let at = datetime_to_db(at);
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (2..=chunk.len() + 1)
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = ferrofin_db::numbered_placeholders(2..=chunk.len() + 1);
             let sql = format!(
                 r#"UPDATE "BaseItems" SET "DateLastRefreshed" = ?1, "DateLastSaved" = ?1
                    WHERE "Id" IN ({placeholders})"#
@@ -4085,10 +4076,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
     ) -> Result<HashMap<Uuid, Vec<ferrofin_model::entities::MetadataField>>, ServiceError> {
         let mut out: HashMap<Uuid, Vec<ferrofin_model::entities::MetadataField>> = HashMap::new();
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = ferrofin_db::numbered_placeholders(1..=chunk.len());
             // `IX_BaseItemMetadataFields_ItemId` serves the lookup; ordered by
             // field so the set reads back the same way every time.
             let sql = format!(
@@ -5167,7 +5155,7 @@ async fn links_under(
         let sql = format!(
             r#"SELECT "ParentId", "ChildId", "ChildType", "SortOrder" FROM "LinkedChildren"
                WHERE "ParentId" IN ({}) ORDER BY "ParentId", "SortOrder""#,
-            numbered_placeholders(chunk.len())
+            ferrofin_db::numbered_placeholders(1..=chunk.len())
         );
         let mut query = sqlx::query_as::<_, (String, String, i64, i64)>(sqlx::AssertSqlSafe(sql));
         for id in chunk {
@@ -5196,7 +5184,7 @@ async fn version_states(
         let sql = format!(
             r#"SELECT "Id", "OwnerId", "ExtraType", "PrimaryVersionId"
                FROM "BaseItems" WHERE "Id" IN ({})"#,
-            numbered_placeholders(chunk.len())
+            ferrofin_db::numbered_placeholders(1..=chunk.len())
         );
         let mut query = sqlx::query_as::<_, (String, Option<String>, Option<i32>, Option<String>)>(
             sqlx::AssertSqlSafe(sql),
@@ -6219,14 +6207,6 @@ fn incomplete_inputs(kind: BaseItemKind, item: &BaseItemEntity) -> bool {
     }
 }
 
-/// `?1, …, ?n`.
-fn numbered_placeholders(n: usize) -> String {
-    (1..=n)
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 /// One `(Id, Type, Path, ParentId, ExtraType)` row of the path-scoped reads.
 type PathRow = (String, String, Option<String>, Option<String>, Option<i32>);
 
@@ -6269,7 +6249,7 @@ pub(crate) fn pathless_seasons_sql(n: usize) -> String {
         r#"SELECT "Id", "ParentId", "IndexNumber", "Name" FROM "BaseItems"
            WHERE "ParentId" IN ({}) AND +"Type" = ?{} AND +"Path" IS NULL
            ORDER BY "Id""#,
-        numbered_placeholders(n),
+        ferrofin_db::numbered_placeholders(1..=n),
         n + 1
     )
 }
@@ -6280,7 +6260,7 @@ pub(crate) fn pathless_seasons_sql(n: usize) -> String {
 pub(crate) fn items_at_paths_sql(n: usize) -> String {
     format!(
         r#"SELECT "Id", "Type", "Path", "ParentId", "ExtraType" FROM "BaseItems" WHERE "Path" IN ({})"#,
-        numbered_placeholders(n)
+        ferrofin_db::numbered_placeholders(1..=n)
     )
 }
 
@@ -6298,7 +6278,7 @@ pub(crate) fn item_user_weights_sql(n: usize) -> String {
                                      WHERE f."ItemId" = i."Id"),
              EXISTS (SELECT 1 FROM "LinkedChildren" l WHERE l."ChildId" = i."Id")
            FROM "BaseItems" i WHERE i."Id" IN ({})"#,
-        numbered_placeholders(n)
+        ferrofin_db::numbered_placeholders(1..=n)
     )
 }
 
@@ -6326,7 +6306,7 @@ fn parse_stored_datetime(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// `TopParentId` term's column expression, which the caller pins (`+`) or
 /// not. The outer table is aliased `bi`.
 fn prune_candidate_terms(libraries: usize, top_parent: &str) -> String {
-    let tops = numbered_placeholders(libraries);
+    let tops = ferrofin_db::numbered_placeholders(1..=libraries);
     format!(
         r#"{top_parent} IN ({tops}) AND bi."Id" <> '{PLACEHOLDER_ID}'
             AND (+bi."OwnerId" IS NULL
@@ -6372,7 +6352,7 @@ pub(crate) fn items_under_roots_sql(libraries: usize, n: usize) -> String {
 /// seeks extras by Path and checks each owner by primary key, so a watcher
 /// event does not walk every owner in the library.
 fn owned_extra_items_sql(libraries: usize, roots: usize) -> String {
-    let tops = numbered_placeholders(libraries);
+    let tops = ferrofin_db::numbered_placeholders(1..=libraries);
     if roots > 0 {
         let paths = root_terms(libraries, roots).replace("\"Path\"", "e.\"Path\"");
         return format!(
@@ -6443,7 +6423,7 @@ pub(crate) fn pathless_children_sql(libraries: usize, n: usize) -> String {
 /// from there; the paths of all of them. Each step seeks by primary key or
 /// by `IX_BaseItems_OwnerId`; a `UNION` ends an ownership cycle.
 pub(crate) fn local_group_paths_sql(n: usize) -> String {
-    let paths = numbered_placeholders(n);
+    let paths = ferrofin_db::numbered_placeholders(1..=n);
     format!(
         r#"WITH RECURSIVE
              up("Id") AS (
@@ -6473,7 +6453,7 @@ type ChildLinkRow = (
 );
 
 pub(crate) fn child_links_sql(n: usize) -> String {
-    let ids = numbered_placeholders(n);
+    let ids = ferrofin_db::numbered_placeholders(1..=n);
     format!(
         r#"SELECT "Id", "ParentId", "SeasonId", "OwnerId", "Path", "ExtraType" FROM "BaseItems"
             WHERE "ParentId" IN ({ids}) OR "SeasonId" IN ({ids}) OR "OwnerId" IN ({ids})"#
@@ -6499,7 +6479,7 @@ async fn deletion_closure_rows(
     for chunk in given.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
         let sql = format!(
             r#"SELECT "Id" FROM "BaseItems" WHERE "Id" IN ({})"#,
-            numbered_placeholders(chunk.len())
+            ferrofin_db::numbered_placeholders(1..=chunk.len())
         );
         let mut query = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql.as_str()));
         for id in chunk {
@@ -6542,10 +6522,7 @@ async fn deletion_closure_rows(
 /// row in the database) and probe `AncestorIds` per row. `EXPLAIN QUERY
 /// PLAN` pinned by `folder_aggregates_seek_from_the_ancestor_closure`.
 pub(crate) fn folder_run_time_sums_sql(n: usize, kinds: usize) -> String {
-    let types = (n + 1..=n + kinds)
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let types = ferrofin_db::numbered_placeholders(n + 1..=n + kinds);
     format!(
         r#"SELECT f."Id", f."RunTimeTicks",
                   (SELECT COALESCE(SUM(c."RunTimeTicks"), 0)
@@ -6555,7 +6532,7 @@ pub(crate) fn folder_run_time_sums_sql(n: usize, kinds: usize) -> String {
                       AND c."Type" IN ({types}))
              FROM "BaseItems" AS f
             WHERE f."Id" IN ({})"#,
-        numbered_placeholders(n)
+        ferrofin_db::numbered_placeholders(1..=n)
     )
 }
 
@@ -6588,7 +6565,7 @@ pub(crate) fn folder_last_media_added_sql(n: usize) -> String {
                              AND p."TopParentId" IS c."TopParentId")))
              FROM "BaseItems" AS f
             WHERE f."Id" IN ({})"#,
-        numbered_placeholders(n)
+        ferrofin_db::numbered_placeholders(1..=n)
     )
 }
 
@@ -6822,10 +6799,7 @@ async fn provider_id_sets(
 ) -> Result<HashMap<Uuid, Vec<(String, String)>>, ServiceError> {
     let mut sets: HashMap<Uuid, Vec<(String, String)>> = HashMap::new();
     for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-        let marks = (1..=chunk.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = ferrofin_db::numbered_placeholders(1..=chunk.len());
         let sql = format!(
             r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
                WHERE "ItemId" IN ({marks})"#
@@ -6936,10 +6910,7 @@ async fn image_rows(
     use ferrofin_db::entities::base_items::BaseItemImageInfoEntity;
     let mut rows: HashMap<Uuid, Vec<BaseItemImageInfoEntity>> = HashMap::new();
     for chunk in ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-        let marks = (1..=chunk.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(",");
+        let marks = ferrofin_db::numbered_placeholders(1..=chunk.len());
         let mut query = sqlx::query_as::<_, BaseItemImageInfoEntity>(sqlx::AssertSqlSafe(
             crate::item_repository::images_of_items_sql(&marks),
         ));
