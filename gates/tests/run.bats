@@ -24,8 +24,8 @@ print('{"checked_cpus": [0]}' if sys.argv[1] == "--topology" else os.environ.get
 EOS
   # The real oracle check (gates/bench/oracle.py) on a pin of the copy's own, with a git whose ls-remote
   # lists $FAKE_LATEST_TAG as the latest Jellyfin release instead of asking the network.
-  mkdir -p repo/crates/ferrofin-api/src/handlers
-  echo 'pub const UPSTREAM_TAG: &str = "v12.2";' > repo/crates/ferrofin-api/src/handlers/mod.rs
+  mkdir -p repo/crates/ferrofin-api/src
+  echo 'pub const UPSTREAM_TAG: &str = "v12.2";' > repo/crates/ferrofin-api/src/handlers.rs
   cat > bin/git <<EOS
 #!/usr/bin/env bash
 if [ "\$1" = ls-remote ]; then
@@ -248,7 +248,7 @@ session() { # the one session directory made under the root
 }
 
 @test "gates/run: the release A/B gate's refusals stop the preflight: an unreadable pin, a missing previous image, --previous without bench" {
-  echo 'pub const UPSTREAM_TAG: &str = "v12.3-rc1";' > repo/crates/ferrofin-api/src/handlers/mod.rs
+  echo 'pub const UPSTREAM_TAG: &str = "v12.3-rc1";' > repo/crates/ferrofin-api/src/handlers.rs
   run repo/gates/run bench --image ferrofin:test --previous ferrofin:old --dry-run
   [ "$status" -eq 2 ]
   [[ "$output" == *"UPSTREAM_TAG v12.3-rc1"*"is not a Jellyfin release tag"* ]]

@@ -19,7 +19,7 @@ shared subsystem, which operation rows reference) beside `REAL_ROUTES`, validate
 `crates/ferrofin-api/tests/contract_superset.rs`, which prints the line above
 (`cargo test -p ferrofin-api --test contract_superset verified_rows -- --nocapture`). The
 release compared against is `UPSTREAM_TAG` / `UPSTREAM_COMMIT` in
-`crates/ferrofin-api/src/handlers/mod.rs`, the latest Jellyfin release when the release branch was
+`crates/ferrofin-api/src/handlers.rs`, the latest Jellyfin release when the release branch was
 cut (the branch keeps it until its release); rows compared
 against an earlier pin are listed in `VERIFIED_AGAINST_EARLIER_PIN` until re-checked.
 
