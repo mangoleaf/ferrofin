@@ -8,6 +8,11 @@
 //! fresh database, an upgraded install, an adopted 10.11.8 or 12.0 database —
 //! and are written so a database that is already in the 12.0 state is left
 //! alone (an adopted 12.0 database went through the real routines in Jellyfin).
+//!
+//! A repair runs while the previous version can still be writing: the chart's
+//! default rolling update keeps the old pod up until this boot is ready. A row
+//! saved after a repair ran stays as it was, so read "Migrations and one-shot
+//! repairs" in `CONTRIBUTING.md` before adding one.
 
 use std::path::Path;
 

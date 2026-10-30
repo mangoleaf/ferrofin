@@ -55,10 +55,18 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   on a retry instead of being replaced
 - Take the copies made before migrating or adopting with `VACUUM INTO` when another process
   is reading or writing the database, instead of a file copy that missed what was still in
-  the write-ahead log
+  the write-ahead log. A file copy that another process wrote through while it ran is taken
+  again the same way: its checkpoint could leave the copy corrupt with nothing to report it
 - On a database adopted from Jellyfin 10.11, remove once the items whose file or library is
   gone, as Jellyfin 12's `MigrateLinkedChildren` does, with its guards for unmounted media
   folders; play state moves to the placeholder item
+
+### Documentation
+- The Helm chart no longer calls a rolling update's overlap "safe": the old version keeps
+  writing through the new pod's migrations and one-shot repairs. It no longer endorses RWX
+  across nodes either, because SQLite's write-ahead log cannot be shared between hosts. The chart
+  README, `docs/UPGRADING.md` (stop the old pod first for heavy migrations) and `CONTRIBUTING.md`
+  (what a migration or repair must assume) say what happens and how to opt out
 
 ### Tooling
 - A release's A/B gate compares against the latest release of the minor line before it (v1.4.1
