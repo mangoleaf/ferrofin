@@ -997,6 +997,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   a fresh install starts with one library per listed folder, named after it, and scans them.
   Nothing read the setting before, so a headless install that set it started with no libraries.
   A later boot, or an adopted Jellyfin database, adds none
+- A scan finds a movie or series with no id on TheMovieDb and OMDb by its parsed name, as
+  Jellyfin does (`ParseName`): a `Split (2016)` folder searched TheMovieDb for `Split 2016` and
+  matched nothing, so a movie in the usual `Name (Year)` layout with no NFO or id tag got no
+  metadata. The year in the name is the search year when the item has none, and OMDb gets the
+  title with its punctuation
 
 ## [1.0.0] - 2026-09-05
 
