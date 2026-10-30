@@ -812,7 +812,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   (an admin search/replace whose replace text multiplies the file, or another plugin's
   transform) is skipped with one warning, leaving the file as it was before that step
 - Dependencies with published RustSec advisories are upgraded: wasmtime and wasmtime-wasi
-  49.0.0 → 49.0.4 (25 advisories against the WASM plugin host, among them a WASI symlink-rename
+  49.0.0 → 49.0.5 (29 advisories against the WASM plugin host, among them a WASI symlink-rename
   sandbox escape, an aarch64 Cranelift miscompile and fuel-limit bypasses), zip 8 → 9 (three
   extraction advisories), h2, tokio, ctutils, event-listener, webpki-root-certs (distrusted CA
   roots), and quinn-proto, which Cargo.lock records although nothing builds it
