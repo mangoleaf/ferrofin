@@ -1,8 +1,8 @@
 # Upgrading Ferrofin
 
 Operator-facing notes for upgrades that need a manual step or change behaviour in a
-way the release notes do not make obvious. Newest first. `CHANGELOG.md` lists *what*
-changed; this file says *what you have to do about it*.
+way the release notes do not make obvious. Newest first. The release notes on
+GitHub list *what* changed; this file says *what you have to do about it*.
 
 Ferrofin's own database upgrades in place: start the new version against the same
 data directory and its migrations run on boot. Back up the data directory before a
@@ -38,6 +38,22 @@ is marked failed while the migration goes on running. Do not use `--atomic` or
 database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
+
+## Unreleased — a mount that does not answer is left out of the drive list
+
+Nothing to do, unless your network storage is slow to answer. The library wizard's drive list
+(`GET /Environment/Drives`) now gives each mount 2 s and lists the ones that answered. A mount
+that hangs no longer freezes the server, and it returns to the list once it answers. A mount
+that regularly takes longer than 2 s, such as a NAS waking its disks, is missing from the list
+even though it is healthy: type its path into the folder picker instead.
+
+While a mount hangs, the folder picker, the log pages and the fallback fonts can stop until it
+answers, for local disks too, once 32 calls are stuck on it. Everything else keeps working.
+
+If a script calls these routes, some answers changed to match Jellyfin 12.4:
+`GET /Environment/DirectoryContents` is a `404` for a path that is no directory (it was an empty
+list), and `POST /Environment/ValidatePath` with `ValidateWritable` is a `500` for a read-only
+directory and a `404` when the path is a file (both were `400`).
 
 ## Unreleased — the Helm chart's notes on rolling updates and RWX volumes are corrected
 
