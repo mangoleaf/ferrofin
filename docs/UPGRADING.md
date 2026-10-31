@@ -8,13 +8,44 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Kubernetes: stop the old pod first for heavy migrations
+
+The Helm chart's default rolling update keeps the old pod serving and writing the database
+until the new one is ready, so the two versions overlap for the whole of the new pod's
+migrations and one-shot repairs. The
+[chart README](../charts/ferrofin/README.md#upgrades-and-the-database) lists what can happen in
+that window. Docker, the Debian package and a tarball install have no overlap: the old server
+stops before the new one starts.
+
+**Stop the old pod first** for an upgrade with heavy migrations: one whose notes in this file
+name a numbered migration or a one-time repair. Skipping releases adds up the notes of every
+release you skip. If in doubt and you can afford the stop, stop first. Add
+`--set strategy.type=Recreate` to that one `helm upgrade`:
+
+```bash
+helm upgrade ferrofin oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin --version <new> \
+  -n ferrofin -f my-values.yaml --set strategy.type=Recreate
+```
+
+Kubernetes then stops the old pod before it starts the new one, so playback stops for the whole
+boot and only one version ever touches the database. Your next `helm upgrade` without the `--set`
+is a rolling update again, unless it uses `--reuse-values`. If your values live in Git (Argo CD, Flux), set
+`strategy.type: Recreate` for that sync.
+
+If you pass `--wait`, give it a `--timeout` longer than the migrations: past it the Helm release
+is marked failed while the migration goes on running. Do not use `--atomic` or
+`--rollback-on-failure` for such an upgrade. They roll back to a version that cannot open a
+database the new one has already migrated.
+
+Back up the data directory first, as for any major upgrade.
+
 ## Unreleased — the Collections library becomes a real library
 
 Usually nothing to do. A server that has made a collection stored its Collections library as a
 bare database row at `{data}/collections`, which the dashboard did not list and which had no
-settings. The first boot on this release replaces it with a library like Jellyfin's:
-`root/default/Collections` with a shortcut to `{data}/collections`, listed under Dashboard →
-Libraries, with box sets under a plain folder for that directory.
+settings. A one-time repair at the first boot on this release replaces it with a library like
+Jellyfin's: `root/default/Collections` with a shortcut to `{data}/collections`, listed under
+Dashboard → Libraries, with box sets under a plain folder for that directory.
 
 - The library's id changes, and with it the `ParentId` of every box set. Users keep their access:
   a user's enabled and blocked libraries and their other library lists move to the new id, and
@@ -34,6 +65,45 @@ Libraries, with box sets under a plain folder for that directory.
 - If the library cannot be made (the `root` directory is read-only, for one) or the copy cannot be
   written, the log says so with a warning, the server starts and works as it did, and the next boot
   tries again.
+- On a Kubernetes rolling update the old pod is still serving while this runs. A box set it creates
+  lands in the new folder. A user's library access saved through it in that moment can name the old
+  id, which nothing moves afterwards, so check such a user or
+  [stop the old pod first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
+
+## Unreleased — the Helm chart's notes on rolling updates and RWX volumes are corrected
+
+Nothing changes in the chart's behaviour, and the default stays `RollingUpdate`, but what it told
+you was wrong in two ways. If you run the chart, read this once.
+
+- **Concurrent access during a rolling update is not simply "safe".** SQLite's locks keep the
+  file intact on one node, but the old and new versions overlap, as described under
+  [Kubernetes](#kubernetes-stop-the-old-pod-first-for-heavy-migrations) above.
+- **RWX across nodes was never safe.** The chart used to accept RWX as a way to mount the volume
+  twice. SQLite's write-ahead log cannot be shared between hosts, so a surge pod on a second node
+  over NFS or CephFS can corrupt the database. If that describes your release, set
+  `strategy.type: Recreate`, or keep both pods on one node as the
+  [chart README](../charts/ferrofin/README.md#storage-one-node-at-a-time) shows, before your next
+  upgrade.
+
+## Unreleased — the first Refresh People may create people and look them up
+
+Nothing to do. The **Refresh People** task now creates the person item a credit has none of,
+as Jellyfin 12 does, and looks each new person up once with the metadata providers. A library
+scanned by Ferrofin or adopted from Jellyfin already has an item for nearly every credit, so
+few are new. A database with credits and no items behind them gets them all on the first run,
+which then takes as long as those lookups do. The task also stops deleting locked people and
+people a provider renamed, so such an item no longer disappears with its images and metadata.
+
+## Unreleased — idle connections are closed after 130 s
+
+Usually nothing to do. A connection with no request under way is now closed after 130 s, and a
+request whose headers have not all arrived 30 s after its first byte is answered `408` and closed.
+These are the limits of Jellyfin's web server (Kestrel's `KeepAliveTimeout` and
+`RequestHeadersTimeout`), and clients reconnect on their own, as they do with Jellyfin. They do not
+apply while a request runs or to a WebSocket. A reverse proxy that keeps idle upstream connections
+open for longer than 130 s (nginx `keepalive_timeout` under `upstream`, Traefik's or HAProxy's idle
+timeouts) may reuse one just as Ferrofin closes it. Keep that timeout below 130 s, as you would for
+Jellyfin.
 
 ## Unreleased — every image tag changes once; clients download artwork again once
 
@@ -158,7 +228,9 @@ upgrade.
   update), the write-ahead log cannot be folded into the file first. After waiting up to 30
   seconds, Ferrofin then takes the copy with SQLite's `VACUUM INTO`, which still holds every
   committed change, and logs a warning that names the cause. Before, such a copy missed what
-  was still in the write-ahead log, and could be unreadable. Stop the other program before
+  was still in the write-ahead log, and could be unreadable. If the other program writes while
+  an ordinary copy is being made, Ferrofin takes the copy again the same way, because it could
+  hold half of a checkpoint. Stop the other program before
   you upgrade anyway, and always before you adopt: the migrations run with it attached, and
   adopting a database Jellyfin is still using is not safe even with a good copy.
 

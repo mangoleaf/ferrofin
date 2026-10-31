@@ -81,6 +81,36 @@ restart logs an error naming the file and comes back on the configuration it was
 process start the same file stops the server. Environment variables and flags are read from the
 process, so a change to one applies only when the process restarts.
 
+### Saving from the web
+
+`POST /Ferrofin/Settings` (administrators only) saves changes to `config.toml`. The body is
+`{"Changes": {"scan_probe_concurrency": 4, "log_level": null}}`: a value sets the key, and `null`
+removes it, so the setting goes back to its default. The save is all or nothing, and it only
+touches what it names: comments, layout and every other key stay as they were. A removed key's
+line goes, with the comment at its end; the comment lines above it stay. An existing file keeps
+its mode and, where the server may set them, its owner and group; a new one is created `0600` (it
+may hold provider keys); and a linked file stays a link.
+
+Every change is checked before anything is written, and a refused one answers `400` naming the
+key: an unknown key, a setting that may not be changed here (with the reason
+[the report](#seeing-what-is-set) gives, so a value a flag or a variable sets is refused, as one
+saved underneath it would not apply), or an invalid value. The result is then loaded the way a
+start loads it, under the server's environment and flags, before it replaces `config.toml`. Rules
+that only warn at a start (`tvdb_cache_hours`, `tvdb_token_days`, `log_level`, `log_format`,
+`metrics_scan_duration_buckets`, the provider time limits) refuse the value here instead, so a
+value the server would ignore is never saved. A URL setting must be an `http` or `https` URL, or
+blank for its default, and is saved trimmed.
+
+A file or directory that cannot be written answers `409` naming the path, and nothing changes.
+That includes a read-only `config.toml` (`chmod a-w`), even where the directory would allow the
+rename: the file is yours to lock. It also includes a `config.toml` that is itself a mount (one
+file bound into a container), which cannot be renamed over: mount its directory instead. The
+answer lists the keys saved (`Changed`), whether a restart
+is needed (`RestartRequired`) and which of them need the server process itself restarted
+([above](#when-a-change-applies), `ProcessRestartRequired`), and `GET /System/Info` reports
+`HasPendingRestart: true` until the restart. The log names the keys, never their values. Like
+the report, the route answers `404` while the **Ferrofin** plugin is disabled.
+
 ## Paths
 
 | Variable | Default | Purpose |

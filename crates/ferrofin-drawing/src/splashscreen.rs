@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::hash::{BuildHasher, RandomState};
+use std::rc::Rc;
 
 use ferrofin_traits::error::ServiceError;
 use image::{Rgba, RgbaImage, imageops};
@@ -54,8 +55,8 @@ fn generate_collage(posters: &[String], backdrops: &[String]) -> Result<RgbaImag
     let row_height = WALL_HEIGHT / ROWS;
     // Each path is decoded and scaled once, where upstream decodes it for every
     // tile it fills; the wall comes out the same.
-    let mut scaled: HashMap<String, Option<RgbaImage>> = HashMap::new();
-    let mut load = |path: &str| -> Option<RgbaImage> {
+    let mut scaled: HashMap<String, Option<Rc<RgbaImage>>> = HashMap::new();
+    let mut load = |path: &str| -> Option<Rc<RgbaImage>> {
         scaled
             .entry(path.to_owned())
             .or_insert_with(|| {
@@ -63,7 +64,7 @@ fn generate_collage(posters: &[String], backdrops: &[String]) -> Result<RgbaImag
                 let height = image.height().max(1);
                 let width = (u64::from(row_height) * u64::from(image.width()) / u64::from(height))
                     .clamp(1, u64::from(WALL_WIDTH));
-                Some(
+                Some(Rc::new(
                     image
                         .resize_exact(
                             u32::try_from(width).unwrap_or(WALL_WIDTH),
@@ -71,7 +72,7 @@ fn generate_collage(posters: &[String], backdrops: &[String]) -> Result<RgbaImag
                             imageops::FilterType::Lanczos3,
                         )
                         .to_rgba8(),
-                )
+                ))
             })
             .clone()
     };
@@ -93,7 +94,7 @@ fn generate_collage(posters: &[String], backdrops: &[String]) -> Result<RgbaImag
                 ));
             };
             *index = next;
-            imageops::overlay(&mut wall, &image, i64::from(x), i64::from(y));
+            imageops::overlay(&mut wall, &*image, i64::from(x), i64::from(y));
             x += image.width() + SPACING;
             counter = if counter >= 4 { 0 } else { counter + 1 };
         }

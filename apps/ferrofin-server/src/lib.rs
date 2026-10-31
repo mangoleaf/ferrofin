@@ -22,6 +22,7 @@
 mod base_url;
 pub mod bootstrap;
 pub mod config;
+mod connection_limits;
 mod encoding_options;
 mod existing_database;
 pub mod listen;
@@ -903,6 +904,7 @@ fn lifetime_app(
 struct Serving {
     servers: tokio::task::JoinSet<std::io::Result<()>>,
     stop: tokio::sync::watch::Sender<bool>,
+    limits: connection_limits::ConnectionLimits,
 }
 
 impl Serving {
@@ -911,10 +913,20 @@ impl Serving {
         listeners: impl IntoIterator<Item = listen::ServedListener>,
         app: &axum::Router,
     ) -> Self {
+        Self::start_with_limits(listeners, app, connection_limits::KESTREL_LIMITS)
+    }
+
+    /// Starts serving `app` on every listener, under `limits`.
+    fn start_with_limits(
+        listeners: impl IntoIterator<Item = listen::ServedListener>,
+        app: &axum::Router,
+        limits: connection_limits::ConnectionLimits,
+    ) -> Self {
         let (stop, _) = tokio::sync::watch::channel(false);
         let mut serving = Self {
             servers: tokio::task::JoinSet::new(),
             stop,
+            limits,
         };
         serving.serve(listeners, app);
         serving
@@ -929,15 +941,20 @@ impl Serving {
         for listener in listeners {
             let mut stop = self.stop.subscribe();
             let app = app.clone();
+            let listener = connection_limits::LimitedListener::new(listener, self.limits);
             self.servers.spawn(async move {
                 // Each connection's peer (`ConnectInfo`, which handlers read, e.g.
                 // `GET /System/Endpoint`) and the address it was accepted on, which
                 // the IP gate compares with it (C# `IsLocal()`).
                 let make_service = tower::service_fn(
-                    move |stream: axum::serve::IncomingStream<'_, listen::ServedListener>| {
+                    move |stream: axum::serve::IncomingStream<
+                        '_,
+                        connection_limits::LimitedListener<listen::ServedListener>,
+                    >| {
                         let peer = *stream.remote_addr();
-                        let local = stream.io().local_addr().ok();
-                        let transport = stream.io().transport();
+                        let local = stream.io().inner().local_addr().ok();
+                        let transport = stream.io().inner().transport();
+                        let requests = stream.io().requests();
                         let app = app.clone();
                         async move {
                             let service = tower::ServiceBuilder::new()
@@ -953,7 +970,9 @@ impl Serving {
                                     request
                                 })
                                 .service(app);
-                            Ok::<_, std::convert::Infallible>(service)
+                            Ok::<_, std::convert::Infallible>(connection_limits::track_requests(
+                                requests, service,
+                            ))
                         }
                     },
                 );
@@ -977,7 +996,9 @@ impl Serving {
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
         timeout_secs: u32,
     ) -> anyhow::Result<()> {
-        let Self { mut servers, stop } = self;
+        let Self {
+            mut servers, stop, ..
+        } = self;
         let (drain_started_tx, drain_started_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             shutdown.await;
@@ -1186,6 +1207,25 @@ impl Signals {
     }
 }
 
+/// Sets the socket options of an accepted connection.
+pub(crate) fn configure_accepted(stream: &mut tokio::net::TcpStream) {
+    disable_nagle(stream);
+    enable_keepalive(stream);
+}
+
+/// Turns TCP keep-alive on (`SO_KEEPALIVE`), so the kernel ends a connection
+/// whose peer vanished without a FIN or RST. Nothing else would end one that is
+/// running a request with no data to send, such as a stalled upload. Probe
+/// timing stays the host's (`net.ipv4.tcp_keepalive_*`).
+///
+/// Kestrel sets no such option. A failure is logged and ignored, as
+/// [`disable_nagle`]'s is.
+fn enable_keepalive(stream: &tokio::net::TcpStream) {
+    if let Err(error) = socket2::SockRef::from(stream).set_keepalive(true) {
+        tracing::debug!(%error, "failed to set SO_KEEPALIVE on an accepted connection");
+    }
+}
+
 /// Turns Nagle's algorithm off on every accepted connection (`TCP_NODELAY`).
 ///
 /// Kestrel — the server Jellyfin runs on — sets `NoDelay` on accepted sockets by
@@ -1205,7 +1245,7 @@ impl Signals {
 /// A failure to set the option is logged and ignored: it is an optimisation, not
 /// a correctness requirement, and a connection that cannot take the sockopt must
 /// still be served.
-pub(crate) fn disable_nagle(stream: &mut tokio::net::TcpStream) {
+fn disable_nagle(stream: &tokio::net::TcpStream) {
     if let Err(error) = stream.set_nodelay(true) {
         tracing::debug!(%error, "failed to set TCP_NODELAY on an accepted connection");
     }
@@ -1965,7 +2005,7 @@ mod tests {
     /// Discriminating: a plain `TcpListener` accepts with `TCP_NODELAY` **off**
     /// (asserted first, so the test fails loudly if the platform ever changes
     /// that premise and makes the assertion below vacuous), and `axum::serve`
-    /// adds nothing of its own. Drop the `.tap_io(disable_nagle)` from
+    /// adds nothing of its own. Drop the `.tap_io(configure_accepted)` from
     /// [`listen::bind`] — or stub `disable_nagle` out — and the second
     /// assertion fails.
     #[tokio::test]
@@ -1996,6 +2036,39 @@ mod tests {
         assert!(
             served.nodelay().expect("nodelay"),
             "accepted connections must have TCP_NODELAY set"
+        );
+        drop((served, client));
+    }
+
+    /// The listener `run` binds turns TCP keep-alive on, which a raw accepted
+    /// socket has off.
+    #[tokio::test]
+    async fn accepted_connections_have_tcp_keepalive_enabled() {
+        use axum::serve::Listener as _;
+
+        let plain = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let client = tokio::net::TcpStream::connect(plain.local_addr().expect("addr"))
+            .await
+            .expect("connect");
+        let (raw, _) = plain.accept().await.expect("accept");
+        assert!(
+            !socket2::SockRef::from(&raw).keepalive().expect("keepalive"),
+            "a raw accepted socket is expected to have SO_KEEPALIVE off; if it is on by \
+             default this test can no longer discriminate"
+        );
+        drop((raw, client, plain));
+
+        let mut listener = super::listen::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (served, _) = listener.accept().await;
+        assert!(
+            socket2::SockRef::from(&served)
+                .keepalive()
+                .expect("keepalive"),
+            "accepted connections must have SO_KEEPALIVE set"
         );
         drop((served, client));
     }

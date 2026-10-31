@@ -88,7 +88,7 @@ use ferrofin_traits::library::{
 use ferrofin_traits::net::WebSocketConnection;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery};
 use ferrofin_traits::session::{
-    AuthenticationRequest, AuthenticationResultData, SessionEvent, SessionManager,
+    AuthenticationRequest, AuthenticationResultData, SessionEvent, SessionManager, SessionSummary,
 };
 use ferrofin_traits::session_bus::SessionMessageBus;
 
@@ -163,8 +163,8 @@ static ITEM_INFO_DTO_OPTIONS: LazyLock<DtoOptions> = LazyLock::new(|| {
     options
 });
 
-/// What a session's reports say is playing, copied out under the sessions
-/// lock so that the `NowPlayingItem` can be built after the lock is released.
+/// What a start or progress report says is playing, from which the session's
+/// `NowPlayingItem` is built.
 #[allow(clippy::struct_field_names)] // the report's `ItemId`, `MediaSourceId`, `LiveStreamId`
 struct NowPlaying {
     item_id: Uuid,
@@ -172,6 +172,17 @@ struct NowPlaying {
     media_source_id: Option<String>,
     /// The reported `LiveStreamId`, as stored.
     live_stream_id: Option<String>,
+}
+
+impl NowPlaying {
+    /// What a start or progress report says is playing.
+    fn of(report: &PlaybackProgressInfo) -> Self {
+        Self {
+            item_id: report.item_id,
+            media_source_id: report.media_source_id.clone(),
+            live_stream_id: report.live_stream_id.clone(),
+        }
+    }
 }
 
 /// The in-memory session-state object the C# `SessionInfo` domain class becomes.
@@ -197,6 +208,12 @@ struct SessionInfo {
     last_playback_check_in: DateTime<Utc>,
     last_paused_date: Option<DateTime<Utc>>,
     now_playing_item_id: Option<Uuid>,
+    /// The item the session shows as playing (C# `SessionInfo.NowPlayingItem`),
+    /// built by [`FerrofinSessionManager::now_playing_item`] on the report that
+    /// first names the item and kept while reports name it again
+    /// (`UpdateNowPlayingItem`). Cleared on stop (`RemoveNowPlayingItem`).
+    /// `None` while nothing plays or when the item could not be built.
+    now_playing_item: Option<Arc<BaseItemDto>>,
     /// The current playback position + paused flag reported for the now-playing item,
     /// surfaced as the session's `PlayState` (C# `Session.PlayState`). Cleared on stop.
     now_playing_position_ticks: Option<i64>,
@@ -227,17 +244,18 @@ impl SessionInfo {
     /// `SessionManager.UpdateNowPlayingItem`, which both `OnPlaybackStart` and
     /// `OnPlaybackProgress` call). A session recreated mid-playback gets its
     /// now-playing item back from the first progress report, since clients
-    /// never resend the start. `now_playing` is the reported item when the
-    /// library knows it, else `None` (C# leaves `NowPlayingItem` null for an
-    /// item it cannot resolve). `media_source_id` and `live_stream_id` are
-    /// stored as reported (C# `PlayState.MediaSourceId = info.MediaSourceId`
-    /// and `PlayState.LiveStreamId = info.LiveStreamId`), so a report without
-    /// a live stream clears it. A report without a media source leaves `None`
+    /// never resend the start. `now_playing` is the reported item's id when the
+    /// library knows it, with the `NowPlayingItem` to show for it, else `None`
+    /// (C# leaves `NowPlayingItem` null for an item it cannot resolve).
+    /// `media_source_id` and `live_stream_id` are stored as reported (C#
+    /// `PlayState.MediaSourceId = info.MediaSourceId` and
+    /// `PlayState.LiveStreamId = info.LiveStreamId`), so a report without a
+    /// live stream clears it. A report without a media source leaves `None`
     /// where C# first fills in the item id; the idle stop's save
     /// (`progress_item`) reads both as the item itself.
     fn update_now_playing(
         &mut self,
-        now_playing: Option<Uuid>,
+        now_playing: Option<(Uuid, Option<Arc<BaseItemDto>>)>,
         position_ticks: Option<i64>,
         is_paused: bool,
         media_source_id: Option<&str>,
@@ -245,7 +263,9 @@ impl SessionInfo {
         update_check_in: bool,
     ) {
         let now = Utc::now();
-        self.now_playing_item_id = now_playing;
+        let (item_id, item) = now_playing.unzip();
+        self.now_playing_item_id = item_id;
+        self.now_playing_item = item.flatten();
         self.last_activity_date = now;
         if update_check_in {
             self.last_playback_check_in = now;
@@ -301,10 +321,21 @@ struct PlaybackSession {
     device_id: String,
     device_name: Option<String>,
     application_version: Option<String>,
-    now_playing_item_id: Option<Uuid>,
+    /// The item the session shows as playing, shared with the session.
+    now_playing_item: Option<Arc<BaseItemDto>>,
 }
 
 impl PlaybackSession {
+    /// The item the session already shows, when a report names it again: C#
+    /// `UpdateNowPlayingItem` keeps it (`info.Item = current`) and builds
+    /// nothing.
+    fn kept_now_playing_item(&self, item_id: Uuid) -> Option<Arc<BaseItemDto>> {
+        self.now_playing_item
+            .as_ref()
+            .filter(|item| item.id == item_id)
+            .cloned()
+    }
+
     fn of(session: &SessionInfo) -> Self {
         Self {
             id: session.id.clone(),
@@ -315,7 +346,7 @@ impl PlaybackSession {
             device_id: session.device_id.clone(),
             device_name: session.device_name.clone(),
             application_version: session.application_version.clone(),
-            now_playing_item_id: session.now_playing_item_id,
+            now_playing_item: session.now_playing_item.clone(),
         }
     }
 }
@@ -833,6 +864,7 @@ impl FerrofinSessionManager {
                     last_playback_check_in: now,
                     last_paused_date: None,
                     now_playing_item_id: None,
+                    now_playing_item: None,
                     now_playing_position_ticks: None,
                     now_playing_is_paused: false,
                     now_playing_media_source_id: None,
@@ -1417,16 +1449,19 @@ impl FerrofinSessionManager {
 
     /// A playing session's `NowPlayingItem`: the part of C#
     /// `UpdateNowPlayingItem` that builds it. An `IHasMediaSources` item looks
-    /// up the media source the reports name through `GetMediaSource`. An empty
+    /// up the media source the report names through `GetMediaSource`. An empty
     /// `MediaSourceId` means the item's own id, as upstream fills it in first.
     /// [`Self::get_item_info`] builds the trimmed item with that source's
     /// streams. `RunTimeTicks` is the source's runtime when a source was found,
     /// else the item's.
     ///
-    /// Upstream builds this once per item on the playback report and keeps it.
-    /// It is rebuilt here on each read, from the latest report (TODO(gl-1000)).
-    /// A lookup that fails costs the item its streams, and a failed build the
-    /// whole item. Upstream fails the report, which no `GET /Sessions` can.
+    /// As upstream, it runs on the start or progress report that first names
+    /// the item, and the session keeps the result
+    /// ([`SessionInfo::now_playing_item`]) while later reports name the item
+    /// again. A lookup that fails costs the item its streams, and a failed
+    /// build the whole item, and the report still succeeds, so the user's
+    /// progress is saved. The next report naming the item builds it again.
+    /// Upstream fails the report.
     async fn now_playing_item(
         &self,
         item: &BaseItemEntity,
@@ -1504,7 +1539,7 @@ impl FerrofinSessionManager {
     async fn retain_accessible_session_devices(
         &self,
         user: &UserEntity,
-        result: &mut Vec<(SessionInfoDto, Option<NowPlaying>)>,
+        result: &mut Vec<(SessionInfoDto, Option<Arc<BaseItemDto>>)>,
     ) -> Result<(), ServiceError> {
         let ids: Vec<&str> = result
             .iter()
@@ -1631,13 +1666,26 @@ impl SessionManager for FerrofinSessionManager {
         } else {
             self.library_manager.get_item_by_id(info.item_id).await?
         };
+        let now_playing = match &item {
+            Some(row) => {
+                let shown = match session.kept_now_playing_item(info.item_id) {
+                    Some(kept) => Some(kept),
+                    None => self
+                        .now_playing_item(row, &NowPlaying::of(info))
+                        .await
+                        .map(Arc::new),
+                };
+                Some((info.item_id, shown))
+            }
+            None => None,
+        };
 
         // Record the now-playing item + mark automatic progress started.
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
                 s.update_now_playing(
-                    item.as_ref().map(|_| info.item_id),
+                    now_playing,
                     info.position_ticks,
                     info.is_paused,
                     info.media_source_id.as_deref(),
@@ -1708,18 +1756,26 @@ impl SessionManager for FerrofinSessionManager {
             .await;
         }
 
-        // C# `GetNowPlayingItem`: the item the session already plays is not
-        // looked up again, so a steady stream of reports costs no query.
+        // C# `GetNowPlayingItem` and `info.Item = current`: the item the
+        // session already shows is neither looked up nor built again, so a
+        // steady stream of reports costs no query.
         let now_playing = if info.item_id.is_nil() {
             None
-        } else if session.now_playing_item_id == Some(info.item_id) {
-            Some(info.item_id)
+        } else if let Some(kept) = session.kept_now_playing_item(info.item_id) {
+            Some((info.item_id, Some(kept)))
         } else {
-            self.library_manager
-                .get_item_by_id(info.item_id)
-                .await?
-                .map(|_| info.item_id)
+            match self.library_manager.get_item_by_id(info.item_id).await? {
+                Some(row) => {
+                    let shown = self
+                        .now_playing_item(&row, &NowPlaying::of(info))
+                        .await
+                        .map(Arc::new);
+                    Some((info.item_id, shown))
+                }
+                None => None,
+            }
         };
+        let is_library_item = now_playing.is_some();
         {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
@@ -1740,7 +1796,7 @@ impl SessionManager for FerrofinSessionManager {
         // user's "Remember audio/subtitle selections" say). A progress save is
         // not announced (`UserDataChangeNotifier`). Only for a library item:
         // C# `if (libraryItem is not null …)`.
-        if now_playing.is_some() {
+        if is_library_item {
             let progress_item = self
                 .progress_item(info.item_id, info.media_source_id.as_deref())
                 .await?;
@@ -1809,6 +1865,7 @@ impl SessionManager for FerrofinSessionManager {
             let mut sessions = self.sessions.lock().await;
             if let Some(s) = sessions.values_mut().find(|s| s.id == session_id) {
                 s.now_playing_item_id = None;
+                s.now_playing_item = None;
                 s.now_playing_position_ticks = None;
                 s.now_playing_is_paused = false;
                 s.now_playing_media_source_id = None;
@@ -2347,14 +2404,9 @@ impl SessionManager for FerrofinSessionManager {
                 info.hardware_acceleration_type =
                     Some(ferrofin_model::entities::HardwareAccelerationType::none);
             }
-            let now_playing = session.now_playing_item_id.map(|item_id| NowPlaying {
-                item_id,
-                media_source_id: session.now_playing_media_source_id.clone(),
-                live_stream_id: session.now_playing_live_stream_id.clone(),
-            });
-            result.push((dto, now_playing));
+            result.push((dto, session.now_playing_item.clone()));
         }
-        drop(sessions); // release before the async NowPlayingItem enrichment below
+        drop(sessions); // the device reads and the item copies run unlocked
 
         if controllable_user_to_check.is_some() && !is_api_key {
             let Some(user) = &caller else {
@@ -2364,24 +2416,34 @@ impl SessionManager for FerrofinSessionManager {
                 .await?;
         }
 
-        // Enrich NowPlayingItem: C# `UpdateNowPlayingItem` builds a BaseItemDto for the
-        // session's current item. Done after dropping the sessions lock (async DTO build).
-        let mut dtos = Vec::with_capacity(result.len());
-        for (mut dto, now_playing) in result {
-            if let Some(now_playing) = now_playing
-                && let Some(item) = self
-                    .library_manager
-                    .get_item_by_id(now_playing.item_id)
-                    .await?
-            {
-                dto.now_playing_item = self.now_playing_item(&item, &now_playing).await;
-            }
-            dtos.push(dto);
-        }
+        // C# `ToSessionInfoDto`: `NowPlayingItem = sessionInfo.NowPlayingItem`,
+        // the item the playback reports built and the session keeps.
+        let mut dtos: Vec<SessionInfoDto> = result
+            .into_iter()
+            .map(|(mut dto, item)| {
+                dto.now_playing_item = item.as_deref().cloned();
+                dto
+            })
+            .collect();
 
         // Newest activity first (C# `OrderByDescending(LastActivityDate)`).
         dtos.sort_by_key(|s| std::cmp::Reverse(s.last_activity_date));
         Ok(dtos)
+    }
+
+    async fn get_session_summaries(&self) -> Result<Vec<SessionSummary>, ServiceError> {
+        let sessions = self.sessions.lock().await;
+        Ok(sessions
+            .values()
+            .map(|session| SessionSummary {
+                user_id: session.user_id,
+                now_playing_item_id: session.now_playing_item.as_ref().map(|item| item.id),
+                // `None` until the session stores the reported PlayMethod
+                // (TODO(gl-119)), as the session DTO's PlayState is.
+                play_method: player_state(session).play_method,
+                is_transcoding: session.transcoding_info.is_some(),
+            })
+            .collect())
     }
 
     async fn get_session_by_authentication_token(
@@ -2817,15 +2879,21 @@ fn session_info_to_dto(session: &SessionInfo) -> SessionInfoDto {
         capabilities: Some(crate::device_manager::client_capabilities_to_dto(
             &session.capabilities,
         )),
-        play_state: Some(ferrofin_model::session::PlayerStateInfo {
-            position_ticks: session.now_playing_position_ticks,
-            is_paused: session.now_playing_is_paused,
-            can_seek: session.now_playing_item_id.is_some(),
-            ..Default::default()
-        }),
+        play_state: Some(player_state(session)),
         now_playing_queue: Some(Vec::new()),
         now_playing_queue_full_items: Some(Vec::new()),
         ..SessionInfoDto::default()
+    }
+}
+
+/// The session's `PlayState` (C# `SessionInfo.PlayState`), which the session
+/// DTO and its [`SessionSummary`] both read.
+fn player_state(session: &SessionInfo) -> ferrofin_model::session::PlayerStateInfo {
+    ferrofin_model::session::PlayerStateInfo {
+        position_ticks: session.now_playing_position_ticks,
+        is_paused: session.now_playing_is_paused,
+        can_seek: session.now_playing_item_id.is_some(),
+        ..Default::default()
     }
 }
 

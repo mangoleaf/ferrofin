@@ -8,6 +8,11 @@
 //! fresh database, an upgraded install, an adopted 10.11.8 or 12.0 database —
 //! and are written so a database that is already in the 12.0 state is left
 //! alone (an adopted 12.0 database went through the real routines in Jellyfin).
+//!
+//! A repair runs while the previous version can still be writing: the chart's
+//! default rolling update keeps the old pod up until this boot is ready. A row
+//! saved after a repair ran stays as it was, so read "Migrations and one-shot
+//! repairs" in `CONTRIBUTING.md` before adding one.
 
 use std::path::Path;
 
@@ -3088,7 +3093,7 @@ const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
 /// and `run_rekey_virtual_seasons`, called from
 /// `apps/ferrofin-server/src/state.rs`, which fold through [`rekey_rows`]).
 /// Every save brings them back into agreement, as upstream's
-/// `SaveUserData` does (`FerrofinUserDataManager::upsert_row`); keeping a fold itself
+/// `SaveUserData` does (`FerrofinUserDataManager::mutate_row`); keeping a fold itself
 /// in agreement is open work item gl-714.
 ///
 /// Returns the number of rows updated, and logs one summary when it

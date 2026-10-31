@@ -1,7 +1,7 @@
 # Feature status
 
-**Parity: 13 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
-22 compared against v12.2 and owed a re-check, 0 subsystem rows (as of 2026-10-29; the
+**Parity: 14 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+22 compared against v12.2 and owed a re-check, 2 subsystem rows (as of 2026-10-30; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
 Ferrofin answers the way Jellyfin does (identical, in another order, a known difference, filed, new), is in
@@ -345,7 +345,7 @@ the season's folder change asks the season providers.
   refreshing (no `DateLastRefreshed`), which is refreshed in full, probe and providers
   included. Later scans of an unchanged library save nothing. See the same section.
 - With metrics on (`FERROFIN_ENABLE_METRICS=true`), `ferrofin_library_scan_items_total`
-  counts each scan's items by outcome (`created`, `updated`, `unchanged`, `removed`),
+  counts each scan's items by outcome (`created`, `updated`, `unchanged`, `removed`, `skipped`),
   `ferrofin_media_probe_total` its ffprobe runs and
   `ferrofin_metadata_provider_requests_total` its provider requests; the
   [Library scans dashboard](../contrib/metrics/README.md#library-scans-dashboard) plots them.

@@ -15,6 +15,7 @@ pub mod entities;
 pub mod enums;
 pub mod error;
 pub mod normalized_usernames;
+mod placeholders;
 pub mod presentation_key;
 pub mod row_cache;
 mod sqlite_casing;
@@ -35,3 +36,4 @@ pub const BATCH_BIND_CHUNK: usize = 500;
 /// in its stored GUID form; every real query excludes it.
 pub const PLACEHOLDER_ITEM_ID: &str = "00000000-0000-0000-0000-000000000001";
 pub use error::{DbError, Result};
+pub use placeholders::numbered_placeholders;
