@@ -1,5 +1,6 @@
 # git-cliff configuration — changelog generated from Conventional Commits.
-# https://git-cliff.org  ·  used by CI (release-notes job) and locally: `git-cliff -o CHANGELOG.md`
+# https://git-cliff.org  ·  renders the placeholder notes of the draft GitHub Release (release.yml) and the
+# .deb changelog (contrib/debian/gen-docs.sh); the published notes come from the github-release-notes skill.
 
 [changelog]
 header = """
@@ -36,6 +37,9 @@ filter_unconventional = false
 split_commits = false
 # Map commit prefixes to changelog sections.
 commit_parsers = [
+  { message = "^Merge", skip = true },
+  { message = "^[Ww]ip", skip = true },
+  { message = "^style", skip = true },
   { message = "^feat", group = "Features" },
   { message = "^fix", group = "Bug Fixes" },
   { message = "^perf", group = "Performance" },
@@ -48,8 +52,8 @@ commit_parsers = [
   { message = "^chore", group = "Miscellaneous" },
   { body = ".*security", group = "Security" },
 ]
-# Only tags shaped like a version release; ignore chart-only tags in the app changelog.
-tag_pattern = "v[0-9]*"
+# Only final vX.Y.Z tags count. An unanchored "v[0-9]*" also matched chart-v* and -rc.N tags.
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
 filter_commits = false
 topo_order = false
 sort_commits = "oldest"

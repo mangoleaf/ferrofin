@@ -376,7 +376,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # ── GitHub Release with git-cliff notes + the binaries (final versions only) ──
+  # ── GitHub Release, created as a draft, with git-cliff placeholder notes + the binaries (final versions only) ──
+  #   It stays a draft until the github-release-notes skill writes the real notes and publishes it.
   github-release:
     if: >-
       !cancelled() && github.event_name == 'push' && startsWith(github.ref_name, 'v') &&
@@ -402,11 +403,11 @@ jobs:
           pattern: ferrofin-*
           path: dist
           merge-multiple: true
-      - name: create the GitHub Release
+      - name: create the GitHub Release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --verify-tag \
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
             --title "Ferrofin $GITHUB_REF_NAME" --notes-file release_notes.md dist/*
 
   # ── Helm chart as an OCI artifact on GHCR ──
