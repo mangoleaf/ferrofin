@@ -63,6 +63,9 @@ work across subsystems:
 | `library` | library name/id |
 | `task` | scheduled-task key |
 | `provider` | metadata provider name |
+| `tuner` | Live TV tuner host id |
+| `listings_provider` | Live TV listings provider id |
+| `channel` | Live TV channel name |
 | `job_id` | transcode/other job id |
 | `path` | filesystem path |
 | `config_file` | the bootstrap `config.toml` in use, as context (the startup banner, configuration warnings), when `path` would name the wrong subject |
@@ -88,6 +91,13 @@ header contents stay out — spans and events alike. Secret hygiene
 (`ferrofin-model/src/secret.rs`, `secrecy`-backed) is load-bearing; keep it. Raw
 filesystem paths and entity IDs **are** fine in logs (unlike metric labels — different
 rules; cardinality doesn't bind logs).
+
+A URL an operator configured is not fine. An IPTV tuner or guide URL can carry the account
+in its userinfo, its query or its path, and no rule tells a credential in a path from an
+ordinary one, so log the id of what it belongs to and only its scheme and host
+(`ferrofin_util::source_url::redact_url`). The same goes for error text, which ends up in
+a log or a `4xx` body: `reqwest::Error` prints the URL in its `Display` and `Debug`, so
+take it off with `without_url()`.
 
 ## 6. The sinks are fixed
 

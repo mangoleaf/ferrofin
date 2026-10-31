@@ -240,7 +240,9 @@ async fn serve_remote_static(
         })?
         .map_err(|error| {
             ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
-                "remote stream request failed: {error}"
+                "remote stream request to {} failed: {}",
+                ferrofin_util::source_url::redact_url(url),
+                error.without_url()
             )))
         })?;
     let status =
@@ -573,6 +575,26 @@ mod remote_static_tests {
             error.status(),
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// A pass-through channel's URL can carry the provider's account, and a
+    /// `5xx`'s text is logged at the boundary.
+    #[tokio::test]
+    async fn a_failed_relay_names_only_the_origins_host() {
+        let error = serve_remote_static(
+            "http://acct-user:info-secret@127.0.0.1:0/path-secret/1.ts?password=query-secret",
+            None,
+            Request::new(Body::empty()),
+            SHORT_TIMEOUT,
+        )
+        .await
+        .expect_err("nothing listens there");
+
+        let text = error.to_string();
+        assert!(text.contains("http://127.0.0.1:0"), "{text}");
+        for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
+            assert!(!text.contains(secret), "{text}");
+        }
     }
 
     /// The timeout stops at the headers (`ResponseHeadersRead`): a body that

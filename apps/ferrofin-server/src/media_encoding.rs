@@ -383,6 +383,21 @@ pub fn build_media_encoding(
     (hls, attachments, subtitles)
 }
 
+/// `GET url`, its body or what went wrong, which names only the URL's host.
+async fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let source = ferrofin_util::source_url::redact_url(url);
+    let resp = reqwest::get(url)
+        .await
+        .map_err(|e| format!("GET {source}: {}", e.without_url()))?;
+    if !resp.status().is_success() {
+        return Err(format!("GET {source}: HTTP {}", resp.status()));
+    }
+    resp.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("GET {source} body: {}", e.without_url()))
+}
+
 /// The real ffmpeg + filesystem [`SubtitleIo`] for the subtitle encoder.
 ///
 /// Mirrors [`FfmpegAttachmentIo`]: cache paths come from the [`PathManager`],
@@ -406,16 +421,7 @@ impl SubtitleIo for FfmpegSubtitleIo {
     }
 
     async fn http_get(&self, url: &str) -> Result<Vec<u8>, String> {
-        let resp = reqwest::get(url)
-            .await
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("GET {url}: HTTP {}", resp.status()));
-        }
-        resp.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| format!("GET {url} body: {e}"))
+        http_get_bytes(url).await
     }
 
     fn path_protocol(&self, path: &str) -> MediaProtocol {
@@ -728,6 +734,18 @@ mod tests {
     use ferrofin_model::entities::MediaStreamType;
     use ferrofin_model::entities_media::MediaAttachment;
     use ferrofin_model::media_info::LiveStreamRequest;
+
+    /// The text ends up in a log, and the URL can carry an account.
+    #[tokio::test]
+    async fn a_failed_remote_subtitle_names_only_the_host() {
+        let error = http_get_bytes(
+            "http://acct-user:info-secret@127.0.0.1:0/path-secret/en.srt?token=query-secret",
+        )
+        .await
+        .expect_err("nothing listens there");
+
+        assert_eq!(error, "GET http://127.0.0.1:0: error sending request");
+    }
 
     /// A fake [`MediaSourceManager`] returning fixed sources + attachments.
     struct FakeSources {

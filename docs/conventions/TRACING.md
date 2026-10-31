@@ -55,8 +55,9 @@ hardcode `1.0` in a deploy config without a reason.
 - Always `skip_all`; name 1–3 meaningful fields explicitly.
 - `tracing::field::Empty` + `span.record()` for values born inside the function.
 - `tracing::field::display()` for `Uuid`s.
-- **Never** record tokens, passwords, API keys, or `Authorization` header
-  contents — anywhere, in spans or events.
+- **Never** record tokens, passwords, API keys, `Authorization` header contents
+  or a URL an operator configured (LOGGING.md, rule 5) — anywhere, in spans or
+  events.
 - Span names are static strings; dynamic values go in fields.
 
 ## 5. Span granularity

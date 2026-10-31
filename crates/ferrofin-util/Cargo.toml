@@ -18,6 +18,8 @@ thiserror.workspace = true
 rand.workspace = true
 unicode-normalization.workspace = true
 regex.workspace = true
+# `source_url`: splitting a URL the way `reqwest` does.
+url.workspace = true
 icu_casemap.workspace = true
 icu_collator.workspace = true
 icu_locale_core.workspace = true

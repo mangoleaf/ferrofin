@@ -282,7 +282,8 @@ impl M3uTunerHost {
             })?;
         if !opened.is_success() {
             return Err(ServiceError::backend(format!(
-                "fetch {url} answered {}",
+                "fetch {} answered {}",
+                crate::fetch::redact_url(url),
                 opened.status
             )));
         }
@@ -525,7 +526,7 @@ mod tests {
             .expect_err("a 404 is no playlist");
         assert!(
             matches!(&err, ServiceError::Backend(why)
-                if why == "fetch http://iptv.example/list.m3u answered 404"),
+                if why == "fetch http://iptv.example answered 404"),
             "{err:?}"
         );
     }

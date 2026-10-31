@@ -1954,8 +1954,8 @@ impl FerrofinLiveTvManager {
         // Upstream's `GetChannels` throws on a bad document, so the mapping
         // dialog shows an error instead of "no channels".
         if let Some(e) = guide.error {
-            let path = info.path.as_deref().unwrap_or_default();
-            return Err(ServiceError::Backend(format!("{path}: {e}")));
+            let source = crate::fetch::redact_url(info.path.as_deref().unwrap_or_default());
+            return Err(ServiceError::Backend(format!("{source}: {e}")));
         }
         Ok(guide
             .channels
@@ -1986,7 +1986,8 @@ impl FerrofinLiveTvManager {
                 .is_ok_and(|meta| meta.is_file())
         {
             return Err(ServiceError::not_found(format!(
-                "Could not find the XmlTv file specified: {path}"
+                "Could not find the XmlTv file specified: {}",
+                crate::fetch::redact_url(path)
             )));
         }
         Ok(())
@@ -2429,7 +2430,12 @@ impl FerrofinLiveTvManager {
                 let (document, probe) =
                     parse_guide(document, self.guide_language(provider), |_| false).await?;
                 if let Some(e) = &probe.error {
-                    tracing::warn!(%path, error = %e, "live tv: guide document unreadable; keeping the stored guide");
+                    tracing::warn!(
+                        listings_provider = provider.id.as_deref().unwrap_or_default(),
+                        path = %crate::fetch::redact_url(path),
+                        error = %e,
+                        "live tv: guide document unreadable; keeping the stored guide"
+                    );
                     Ok((None, false))
                 } else {
                     Ok((
@@ -2442,7 +2448,12 @@ impl FerrofinLiveTvManager {
                 }
             }
             Err(e) => {
-                tracing::warn!(%path, error = %e, "live tv: guide fetch failed");
+                tracing::warn!(
+                    listings_provider = provider.id.as_deref().unwrap_or_default(),
+                    path = %crate::fetch::redact_url(path),
+                    error = %e,
+                    "live tv: guide fetch failed"
+                );
                 Ok((None, false))
             }
         }
@@ -2817,7 +2828,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
                         }
                         tracing::info!(
                             host = host.name(),
-                            url = device.url.as_deref().unwrap_or_default(),
+                            url = %crate::fetch::redact_url(device.url.as_deref().unwrap_or_default()),
                             "live tv: discovered a tuner device"
                         );
                         found.push(device);
@@ -3367,9 +3378,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
                     // channel cache rather than failing the whole refresh, so
                     // one unreachable tuner must not lose the others' guide.
                     clean_database = false;
+                    // No URL field: the error names the host it asked, and
+                    // an HDHomeRun `Url` with no scheme reads as a path here.
                     tracing::warn!(
                         tuner = %id,
-                        url = tuner.url.as_deref().unwrap_or_default(),
                         error = %e,
                         "live tv: tuner lineup fetch failed"
                     );
@@ -13147,14 +13159,28 @@ mod tests {
             )
         }
 
+        /// Everything captured so far.
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+
         /// The captured lines logged at `level` (`"WARN"`, `"DEBUG"`, …) that
         /// mention `needle`.
         fn lines_at(&self, level: &str, needle: &str) -> Vec<String> {
-            let text = String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned();
-            text.lines()
+            self.text()
+                .lines()
                 .filter(|line| line.contains(&format!(" {level} ")) && line.contains(needle))
                 .map(str::to_owned)
                 .collect()
+        }
+
+        /// No captured line shows any of [`SOURCE_ACCOUNT`].
+        #[track_caller]
+        fn assert_no_source_account(&self) {
+            let text = self.text();
+            for secret in SOURCE_ACCOUNT {
+                assert!(!text.contains(secret), "{secret} logged:\n{text}");
+            }
         }
     }
 
@@ -13174,6 +13200,295 @@ mod tests {
 
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
+        }
+    }
+
+    /// What [`credentialed_source`] puts in a URL. No log line shows any of it.
+    const SOURCE_ACCOUNT: [&str; 4] = ["acct-user", "info-secret", "path-secret", "query-secret"];
+
+    /// Where [`credentialed_source`] points: port 0 refuses every connection.
+    const SOURCE_HOST: &str = "http://127.0.0.1:0";
+
+    /// A source at [`SOURCE_HOST`] with the account in its userinfo, path and
+    /// query.
+    fn credentialed_source() -> String {
+        "http://acct-user:info-secret@127.0.0.1:0/live/acct-user/path-secret/source\
+         ?username=acct-user&password=query-secret"
+            .to_owned()
+    }
+
+    /// Answers `body` until `down` is set, then fails as the real fetcher does.
+    #[derive(Default)]
+    struct SourceGoesDown {
+        body: String,
+        down: std::sync::atomic::AtomicBool,
+        real: crate::fetch::ReqwestFetcher,
+    }
+
+    impl SourceGoesDown {
+        fn answering(body: &str) -> Arc<Self> {
+            Arc::new(Self {
+                body: body.to_owned(),
+                ..Self::default()
+            })
+        }
+
+        fn go_down(&self) {
+            self.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SourceFetcher for SourceGoesDown {
+        async fn fetch(&self, url: &str) -> Result<String, ServiceError> {
+            if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                self.real.fetch(url).await
+            } else {
+                Ok(self.body.clone())
+            }
+        }
+    }
+
+    /// A manager over `fetcher` with `url` saved as an XMLTV provider.
+    async fn manager_with_guide_source(
+        fetcher: &Arc<SourceGoesDown>,
+        url: &str,
+    ) -> (FerrofinLiveTvManager, ListingsProviderInfo) {
+        let mgr = manager_with_fetcher(Arc::clone(fetcher) as Arc<dyn SourceFetcher>).await;
+        let provider = mgr
+            .save_listing_provider(
+                as_xmltv(ListingsProviderInfo {
+                    path: Some(url.to_owned()),
+                    ..ListingsProviderInfo::default()
+                }),
+                false,
+                false,
+            )
+            .await
+            .expect("provider");
+        (mgr, provider)
+    }
+
+    /// A failed tuner and a failed guide name themselves by id and host, and
+    /// neither the fields nor the error text show the account in the URL.
+    #[tokio::test]
+    async fn a_failed_refresh_logs_the_sources_by_id_and_host_without_their_account() {
+        let url = credentialed_source();
+        let fetcher = SourceGoesDown::answering("#EXTM3U\n");
+        let (mgr, provider) = manager_with_guide_source(&fetcher, &url).await;
+        let tuner = mgr
+            .save_tuner_host(TunerHostInfo {
+                type_: Some("m3u".to_owned()),
+                url: Some(url.clone()),
+                ..TunerHostInfo::default()
+            })
+            .await
+            .expect("tuner");
+        fetcher.go_down();
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.refresh_guide().await.expect("refresh");
+        }
+
+        logs.assert_no_source_account();
+        let failed = logs.lines_at("WARN", "tuner lineup fetch failed");
+        assert_eq!(failed.len(), 1, "{}", logs.text());
+        assert!(
+            failed[0].contains(tuner.id.as_deref().expect("id")) && failed[0].contains(SOURCE_HOST),
+            "{failed:?}"
+        );
+        let failed = logs.lines_at("WARN", "guide fetch failed");
+        assert_eq!(failed.len(), 1, "{}", logs.text());
+        assert!(
+            failed[0].contains(provider.id.as_deref().expect("id"))
+                && failed[0].contains(SOURCE_HOST),
+            "{failed:?}"
+        );
+    }
+
+    /// `GetApiUrl` adds the scheme an HDHomeRun tuner's `Url` leaves out, so
+    /// the stored value is a URL however it reads. The row is stored directly:
+    /// saving it would leave the device's answer cached, and this refresh
+    /// starts cold, as after a restart, so it asks the device.
+    #[tokio::test]
+    async fn a_failed_hdhomerun_tuner_with_no_scheme_logs_only_its_host() {
+        let mgr = manager_with_fetcher(Arc::new(crate::fetch::ReqwestFetcher::new())).await;
+        let id = Uuid::new_v4().simple().to_string();
+        let url = "acct-user:info-secret@127.0.0.1:0/path-secret";
+        let tuner = TunerHostInfo {
+            id: Some(id.clone()),
+            type_: Some("hdhomerun".to_owned()),
+            url: Some(url.to_owned()),
+            ..TunerHostInfo::default()
+        };
+        let data = serde_json::to_string(&tuner).expect("json");
+        crate::guide_repository::store_tuner_host(&mgr.db, None, &id, url, "hdhomerun", &data)
+            .await
+            .expect("store");
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.refresh_guide().await.expect("refresh");
+        }
+
+        logs.assert_no_source_account();
+        let failed = logs.lines_at("WARN", "tuner lineup fetch failed");
+        assert_eq!(failed.len(), 1, "{}", logs.text());
+        assert!(
+            failed[0].contains(&id) && failed[0].contains(SOURCE_HOST),
+            "{failed:?}"
+        );
+    }
+
+    /// A download that fails with a cached copy to fall back to warns and goes on.
+    #[tokio::test]
+    async fn a_guide_falling_back_to_its_cached_copy_logs_no_account() {
+        let url = credentialed_source();
+        let fetcher = SourceGoesDown::answering(XMLTV);
+        let (mgr, provider) = manager_with_guide_source(&fetcher, &url).await;
+        mgr.xmltv.get_xml(&provider).await.expect("first download");
+        let cache_file = mgr
+            .xmltv
+            .cache_file_for_test(provider.id.as_deref().expect("id"));
+        std::fs::File::options()
+            .write(true)
+            .open(&cache_file)
+            .expect("cache file")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_hours(2))
+            .expect("age");
+        fetcher.go_down();
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.xmltv.get_xml(&provider).await.expect("fallback");
+        }
+
+        logs.assert_no_source_account();
+        let warned = logs.lines_at("WARN", "using the previously downloaded file");
+        assert_eq!(warned.len(), 1, "{}", logs.text());
+        assert!(warned[0].contains(SOURCE_HOST), "{warned:?}");
+    }
+
+    /// An unreadable guide is a listings error in both its readers: the refresh
+    /// logs it and the mapping dialog answers it.
+    #[tokio::test]
+    async fn an_unreadable_guide_is_reported_without_its_account() {
+        let url = credentialed_source();
+        let fetcher = SourceGoesDown::answering("<tv><channel id=\"one\"");
+        let (mgr, provider) = manager_with_guide_source(&fetcher, &url).await;
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.refresh_guide().await.expect("refresh");
+        }
+
+        logs.assert_no_source_account();
+        let warned = logs.lines_at("WARN", "guide document unreadable");
+        assert_eq!(warned.len(), 1, "{}", logs.text());
+        assert!(
+            warned[0].contains(provider.id.as_deref().expect("id"))
+                && warned[0].contains(SOURCE_HOST),
+            "{warned:?}"
+        );
+        let error = mgr
+            .provider_channels(&provider)
+            .await
+            .expect_err("unreadable");
+        let text = error.to_string();
+        assert!(text.contains(SOURCE_HOST), "{text}");
+        for secret in SOURCE_ACCOUNT {
+            assert!(!text.contains(secret), "{text}");
+        }
+    }
+
+    /// A rejected M3U line is the playlist's own text: `/live/<user>/<pass>/1.ts`
+    /// is shaped like a path and is not one, so the channel's name stands for it.
+    #[tokio::test]
+    async fn a_rejected_m3u_line_is_logged_by_its_channel_name() {
+        let fetcher = SourceGoesDown::answering(
+            "#EXTM3U\n#EXTINF:-1,Rejected\n/live/acct-user/path-secret/1.ts\n",
+        );
+        let mgr = manager_with_fetcher(Arc::clone(&fetcher) as Arc<dyn SourceFetcher>).await;
+        mgr.save_tuner_host(TunerHostInfo {
+            type_: Some("m3u".to_owned()),
+            url: Some("http://tuner/playlist.m3u".to_owned()),
+            ..TunerHostInfo::default()
+        })
+        .await
+        .expect("tuner");
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.refresh_guide().await.expect("refresh");
+        }
+
+        logs.assert_no_source_account();
+        assert_eq!(
+            logs.lines_at("DEBUG", "\"Rejected\"").len(),
+            1,
+            "{}",
+            logs.text()
+        );
+    }
+
+    /// Discovery logs what a device said about itself, which it can say anything in.
+    #[tokio::test]
+    async fn a_discovered_device_is_logged_by_its_host() {
+        let mgr = manager_with(FakeFetcher(HashMap::new()))
+            .await
+            .with_tuner_hosts(vec![Arc::new(DiscoveringHost(vec![TunerHostInfo {
+                type_: Some("discovering".to_owned()),
+                url: Some(credentialed_source()),
+                ..TunerHostInfo::default()
+            }]))]);
+
+        let logs = CapturedLogs::default();
+        {
+            let _guard = logs.install();
+            mgr.discover_tuners(0, false).await.expect("discover");
+        }
+
+        logs.assert_no_source_account();
+        assert_eq!(
+            logs.lines_at("INFO", "discovered a tuner device").len(),
+            1,
+            "{}",
+            logs.text()
+        );
+    }
+
+    /// A `404` body is surfaced to the caller, and a `Path` with a scheme
+    /// `is_http` does not know is judged a missing file.
+    #[tokio::test]
+    async fn a_guide_path_that_is_no_file_is_refused_without_its_account() {
+        let mgr = manager_with(FakeFetcher(HashMap::new())).await;
+
+        let error = mgr
+            .save_listing_provider(
+                as_xmltv(ListingsProviderInfo {
+                    path: Some(
+                        "rtsp://acct-user:info-secret@guide.example/path-secret/guide.xml"
+                            .to_owned(),
+                    ),
+                    ..ListingsProviderInfo::default()
+                }),
+                false,
+                false,
+            )
+            .await
+            .expect_err("no such file");
+
+        assert!(matches!(error, ServiceError::NotFound(_)), "{error:?}");
+        let text = error.to_string();
+        assert!(text.contains("rtsp://guide.example"), "{text}");
+        for secret in SOURCE_ACCOUNT {
+            assert!(!text.contains(secret), "{text}");
         }
     }
 
