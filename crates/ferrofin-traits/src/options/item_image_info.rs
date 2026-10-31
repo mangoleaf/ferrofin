@@ -34,6 +34,22 @@ pub struct ItemImageInfo {
     pub blur_hash: Option<String>,
 }
 
+/// An item's image rows with what their owner decides about serving them, read
+/// together so that serving an image costs one query.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ItemImagesToServe {
+    /// The image rows, in stored order.
+    pub images: Vec<ItemImageInfo>,
+
+    /// `ImageProcessor.ProcessImage`'s `autoOrient`: true for a `Photo` whose
+    /// stored orientation is unknown or not `TopLeft`.
+    pub auto_orient: bool,
+
+    /// Whether the owner is a Live TV channel or programme, whose rows hold
+    /// what a tuner or a guide supplied rather than what a scan found.
+    pub live_tv: bool,
+}
+
 impl ItemImageInfo {
     /// Returns `true` when [`path`](Self::path) is a local file rather than a
     /// remote `http(s)` URL.
