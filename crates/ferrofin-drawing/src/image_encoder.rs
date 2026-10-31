@@ -23,7 +23,7 @@
 //! - `GetImageSize` returns [`ImageDimensions::default`] (`0×0`) on a zero-byte or
 //!   undecodable file, exactly like the Skia `return default;` fallbacks.
 //! - `CreateSplashscreen` builds `{DataPath}/splashscreen.png` (see
-//!   [`crate::splashscreen`]). `GetImageBlurHash` is implemented (decode → 128x128 downscale → BlurHash-encode);
+//!   [`crate::splashscreen`]). `GetImageBlurHash` is implemented (decode → 128x128 resize → BlurHash-encode);
 //!   its output is valid but not byte-identical to Skia's (see the method doc).
 //! - A JPEG headed for a blur hash or a smaller `EncodeImage` output is decoded
 //!   at the smallest DCT scale (1/8, 1/4, 1/2) that still covers the target
@@ -458,7 +458,7 @@ impl ImageCrateEncoder {
     }
 
     /// The synchronous body of [`ImageEncoder::get_image_blur_hash`]: decode,
-    /// downscale to fit 128×128, then BlurHash-encode. CPU-bound (plus the
+    /// resize to fit 128×128, then BlurHash-encode. CPU-bound (plus the
     /// decode's file read), so it runs on the blocking pool, never inline.
     fn blur_hash_blocking(x_comp: i32, y_comp: i32, path: &str) -> Result<String, ServiceError> {
         let small = Self::blur_hash_pixels(path)?;
@@ -470,7 +470,13 @@ impl ImageCrateEncoder {
 
     /// The pixels a blur hash is computed from: the image as stored (no EXIF
     /// orientation, like upstream's codec decode) fitted inside
-    /// [`BLUR_HASH_MAX_SIDE`] squared with a Triangle filter.
+    /// [`BLUR_HASH_MAX_SIDE`] squared with a Triangle filter, in one resize.
+    ///
+    /// An image inside the limit is enlarged to that fit, where upstream hashes
+    /// it as it is. The encoder samples each cosine from a pixel's edge, so a
+    /// few pixels read as detail the image does not have: hashed as it is, a
+    /// solid 16×16 renders about 7 levels off on average and a solid 1×1 about
+    /// 85, against about 1 once enlarged (gl-1058).
     ///
     /// A JPEG is decoded at the smallest DCT scale that still covers the fitted
     /// size, as Skia's codec decodes it for upstream (BlurHashSharp asks it for
@@ -859,7 +865,7 @@ impl ImageEncoder for ImageCrateEncoder {
             .map_err(|e| ServiceError::backend(format!("image probe task failed: {e}")))?
     }
 
-    /// Port of `SkiaEncoder.GetImageBlurHash`: decode, downscale to fit 128x128
+    /// Port of `SkiaEncoder.GetImageBlurHash`: decode, resize to fit 128x128
     /// ("larger is too slow, no visible difference"), then BlurHash-encode with the
     /// caller's component counts. A JPEG decodes at the smallest DCT scale that
     /// still covers the 128x128 fit, as upstream's BlurHashSharp has Skia's codec
@@ -867,9 +873,10 @@ impl ImageEncoder for ImageCrateEncoder {
     ///
     /// The hash is functionally valid but **not byte-identical** to Jellyfin's — its
     /// pixels come from Skia's decode+resample, which the `image` crate can't reproduce
-    /// exactly. Upstream also resizes the DCT-scaled bitmap by the original-relative
-    /// factor a second time, so a large JPEG is hashed from a ~16 px image; whether to
-    /// reproduce that is gl-1058.
+    /// exactly. Upstream also shrinks a bitmap its codec has already scaled (JPEG, WebP)
+    /// by the original-relative factor a second time, so it hashes a large image from
+    /// about 16 px and throws on a wide WebP logo (jellyfin#12106). That bug is not ported
+    /// (gl-1058): every format here is hashed from the one 128x128 fit.
     async fn get_image_blur_hash(
         &self,
         x_comp: i32,
@@ -1812,6 +1819,66 @@ mod tests {
             diff < 1.0,
             "{scaled} vs {full}: mean difference {diff} levels"
         );
+    }
+
+    /// gl-1058: a blur hash comes from one resize of the image to fit 128×128,
+    /// whether or not the format's codec scales while decoding. Upstream's JPEG
+    /// and WebP shrink a second time (jellyfin#12106); the large sizes are those
+    /// of BlurHashSharp PR 164, its proposed fix.
+    #[rstest]
+    #[case::wide_logo(4319, 481, 128, 14)]
+    #[case::tall_logo(481, 4319, 14, 128)]
+    #[case::height_rounds_to_zero(10000, 1, 128, 1)]
+    #[case::width_rounds_to_zero(1, 10000, 1, 128)]
+    #[case::one_side_at_the_limit(128, 200, 82, 128)]
+    #[case::at_the_limit(128, 128, 128, 128)]
+    #[case::inside_the_limit(100, 50, 128, 64)]
+    #[case::one_pixel(1, 1, 128, 128)]
+    fn a_blur_hash_comes_from_one_fit_of_its_image(
+        #[values(("jpg", CrateFormat::Jpeg), ("webp", CrateFormat::WebP), ("png", CrateFormat::Png))]
+        format: (&str, CrateFormat),
+        #[case] width: u32,
+        #[case] height: u32,
+        #[case] expected_width: u32,
+        #[case] expected_height: u32,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let path = out_path(&dir, &format!("logo.{}", format.0));
+        let image = DynamicImage::ImageRgb8(smooth_photo(width, height));
+        ImageCrateEncoder::write(&image, &path, format.1, 90).expect("fixture");
+
+        let pixels = ImageCrateEncoder::blur_hash_pixels(&path).expect("pixels");
+        assert_eq!(pixels.dimensions(), (expected_width, expected_height));
+        // Well-formed length: 6 + (xComp*yComp - 1)*2 base83 chars.
+        let hash = ImageCrateEncoder::blur_hash_blocking(4, 3, &path).expect("hash");
+        assert_eq!(
+            hash.len(),
+            6 + (4 * 3 - 1) * 2,
+            "unexpected blur hash: {hash}"
+        );
+    }
+
+    /// gl-1058: an image inside the limit is enlarged to the fit before it is
+    /// hashed, so a solid one stays flat. Upstream hashes it as it is, and the
+    /// encoder then reads its few pixels as detail the image does not have: a
+    /// solid 1×1 renders about 85 levels off and a solid 16×16 about 7.
+    #[rstest]
+    #[case(1)]
+    #[case(8)]
+    #[case(16)]
+    #[tokio::test]
+    async fn a_small_solid_image_keeps_a_flat_blur_hash(#[case] side: u32) {
+        let dir = TempDir::new().expect("tempdir");
+        let input = fixture(&dir, "solid.png", side, side);
+        let hash = ImageCrateEncoder::new()
+            .get_image_blur_hash(5, 5, &input)
+            .await
+            .expect("blur hash");
+        let rendered = blurhash::decode(&hash, 32, 32, 1.0).expect("decodes");
+        let solid = [0x30, 0x60, 0x90, 0xFF].repeat(32 * 32);
+        // Alpha counts here too: enlarged is about 0.7 off, as it is at least 5.
+        let diff = mean_abs_diff(&rendered, &solid);
+        assert!(diff < 2.0, "{hash}: mean difference {diff} levels");
     }
 
     /// Transliterated from upstream `ImageHelperTests` (jellyfin#17056): an
