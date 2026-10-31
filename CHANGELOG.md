@@ -917,6 +917,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - A resized image is written beside its cache path and renamed into place, so a request that
   races its encode, or follows an encode that failed part-way, never serves (and pins for a
   year, under the immutable cache header) a truncated image
+- The Merge Versions plugin's daily episode merge keeps episodes named by air date apart
+  (`Show - 2023-12-16 - Guest.ts`). With no provider id and no episode number its key fell
+  back to (season, name, year), which every airing of such a show shares, so a season of
+  weekly or daily recordings was hidden behind one episode as its "versions". The key now
+  carries the air date too, and the next run releases the links the old key made
 - The Merge Versions plugin's bulk merges and splits run one at a time, whether a route or a
   daily task starts them: a merge and a split started together interleaved their version-link
   writes
