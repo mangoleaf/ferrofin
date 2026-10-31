@@ -317,7 +317,12 @@ pub(crate) async fn merge_into_location(
 ) -> Result<u64, ServiceError> {
     let old_db = guid_to_db(old);
     let (folder, library) = (guid_to_db(target.folder), guid_to_db(target.library));
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // A boot repair: the previous version may be writing (CONTRIBUTING.md).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     for ancestor in [target.folder, target.aggregate, target.library] {
         sqlx::query(
             r#"INSERT OR IGNORE INTO "AncestorIds" ("ItemId", "ParentItemId")
