@@ -29,6 +29,7 @@ mod log_lines;
 pub mod media_encoding;
 pub mod metrics_wiring;
 pub mod planner;
+mod recording_library;
 pub mod seed;
 pub mod settings;
 mod startup;

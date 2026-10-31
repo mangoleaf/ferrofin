@@ -1355,6 +1355,16 @@ pub async fn build_app_state(
     .with_metadata_savers(Arc::clone(&providers))
     .with_image_saver(image_saver)
     .with_self_writes(Arc::clone(&self_writes_guard))
+    // A file being recorded is left alone until its capture ends.
+    .with_recording_paths({
+        let live_tv = Arc::downgrade(&live_tv);
+        Arc::new(move || {
+            live_tv
+                .upgrade()
+                .map(|live_tv| live_tv.paths_being_recorded())
+                .unwrap_or_default()
+        })
+    })
     .with_trickplay(Arc::clone(&trickplay), {
         let config_mgr = Arc::clone(&config_mgr);
         move || config_mgr.snapshot_shared().trickplay_options.scan_behavior
@@ -1637,6 +1647,17 @@ pub async fn build_app_state(
     // From here the writers' bracketed writes reach the monitor.
     self_writes.set(library_monitor_impl.clone());
     let library_monitor: Arc<dyn ferrofin_traits::library::LibraryMonitor> = library_monitor_impl;
+    // Close the Live TV <-> library cycle: the recording folders become
+    // libraries through this, on the lock a `livetv` save over the API holds.
+    let configuration_write_lock = Arc::new(tokio::sync::Mutex::new(()));
+    live_tv_impl.set_recording_library(
+        Arc::new(crate::recording_library::ServerRecordingLibrary {
+            virtual_folders: Arc::clone(&virtual_folders),
+            library: Arc::clone(&library),
+            monitor: Arc::clone(&library_monitor),
+        }),
+        Arc::clone(&configuration_write_lock),
+    );
     let mut background = Vec::new();
     if let Some(mut rx) = fs_events {
         let monitor = Arc::clone(&library_monitor);
@@ -2217,6 +2238,13 @@ pub async fn build_app_state(
     if let Err(err) = live_tv.start_dvr().await {
         tracing::warn!(%err, "could not restart the Live TV recording timers");
     }
+    // `RecordingsHost.StartAsync`'s other half. A folder it adds restarts the
+    // library monitor, which is a filesystem walk, so boot does not wait on it.
+    let recordings = Arc::clone(&live_tv);
+    background.push(tokio::spawn(tracing::Instrument::instrument(
+        async move { recordings.create_recording_folders().await },
+        tracing::info_span!(parent: None, "recording_folders", trigger = "startup"),
+    )));
 
     // ---- sessions + tv_series (consume dto) -------------------------------
     // The session message bus is created here (not with SyncPlay below) because
@@ -2718,6 +2746,7 @@ pub async fn build_app_state(
     // built above, so `POST /Library/*/{Added,Updated}` actually refreshes.
     let state = state
         .with_library_monitor(library_monitor)
+        .with_configuration_write_lock(configuration_write_lock)
         .with_intro_skipper_store(intro_skipper)
         .with_intro_skipper_analysis(intro_skipper_analysis);
 

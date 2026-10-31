@@ -2553,6 +2553,43 @@ pub trait LibraryMonitor: Send + Sync {
 
 fn _assert_object_safe_library_monitor(_: &dyn LibraryMonitor) {}
 
+/// What Live TV's recordings need of the library: the part of
+/// `ILibraryManager` that `RecordingsManager` calls.
+///
+/// Ferrofin's own seam rather than the managers themselves, because a
+/// structure change here also has to restart the library monitor and queue the
+/// scan, which upstream's `AddVirtualFolder(.., refreshLibrary: true)` does
+/// inside the library manager. The composition root implements it over
+/// [`VirtualFolderManager`], [`LibraryManager`] and [`LibraryMonitor`].
+#[async_trait]
+pub trait RecordingLibrary: Send + Sync {
+    /// `ILibraryManager.GetVirtualFolders`.
+    async fn virtual_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError>;
+
+    /// `ILibraryManager.AddVirtualFolder(name, type, options, refreshLibrary: true)`.
+    async fn add_virtual_folder(
+        &self,
+        name: &str,
+        collection_type: Option<CollectionTypeOptions>,
+        options: &LibraryOptions,
+    ) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.RemoveVirtualFolder(name, refreshLibrary: true)`.
+    async fn remove_virtual_folder(&self, name: &str) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.RemoveMediaPath(name, path)`.
+    async fn remove_media_path(&self, name: &str, path: &str) -> Result<(), ServiceError>;
+
+    /// `ILibraryManager.QueueLibraryScan`.
+    async fn queue_library_scan(&self) -> Result<(), ServiceError>;
+
+    /// `RecordingsManager.TriggerRefresh(path)`: queues the refresh of the item
+    /// nearest `path`, which also drops the item of a file that has gone.
+    async fn refresh_path(&self, path: &str) -> Result<(), ServiceError>;
+}
+
+fn _assert_object_safe_recording_library(_: &dyn RecordingLibrary) {}
+
 /// The server's own file writes, which the library monitor must not take for
 /// a change to rescan: `ILibraryMonitor.ReportFileSystemChangeBeginning` and
 /// `ReportFileSystemChangeComplete` as upstream's writers call them around a

@@ -101,8 +101,9 @@ pub(crate) fn parse_forwarded_entry(entry: &str) -> Option<std::net::IpAddr> {
 /// object so the concrete type is chosen at the composition root, not baked into
 /// this crate.
 pub struct Inner {
-    /// Serializes named saves through validation, persistence and live updates.
-    pub configuration_write_lock: tokio::sync::Mutex<()>,
+    /// Serializes named saves through validation, persistence and live updates,
+    /// and with the Live TV manager's own write of `livetv`.
+    pub configuration_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes issuing and consuming recovery files through password updates.
     pub password_reset_lock: tokio::sync::Mutex<()>,
     /// Store validators registered by the composition root, keyed case-insensitively.
@@ -385,7 +386,7 @@ impl AppState {
         tasks: Arc<dyn TaskManager>,
     ) -> Self {
         Self::from_inner(Inner {
-            configuration_write_lock: tokio::sync::Mutex::new(()),
+            configuration_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             password_reset_lock: tokio::sync::Mutex::new(()),
             configuration_validators: std::collections::HashMap::new(),
             committed_configuration_checks: Vec::new(),
@@ -594,6 +595,20 @@ impl AppState {
         let inner = Arc::get_mut(&mut self.inner)
             .expect("with_library_monitor must be called before the state is shared");
         inner.library_monitor = library_monitor;
+        self
+    }
+
+    /// Shares the named-configuration save lock with whoever else writes those
+    /// files. Called once by the composition root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the state has already been shared.
+    #[must_use]
+    pub fn with_configuration_write_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        let inner = Arc::get_mut(&mut self.inner)
+            .expect("with_configuration_write_lock must be called before the state is shared");
+        inner.configuration_write_lock = lock;
         self
     }
 

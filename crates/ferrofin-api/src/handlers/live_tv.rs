@@ -46,7 +46,7 @@ use ferrofin_traits::stubs::LiveTvChannelQuery;
 use crate::auth::{RequireAdmin, RequireLiveTvAccess, RequireLiveTvManagement};
 use crate::error::ApiError;
 use crate::extract::{JsonBody, Query};
-use crate::handlers::items::{effective_user_id, require_visible_item, resolve_user_opt};
+use crate::handlers::items::{require_visible_item, resolve_user_opt};
 use crate::handlers::query_parse::{
     de_comma_delimited, de_comma_delimited_guids, de_pipe_delimited, parse_csv_enums_lenient,
     parse_csv_uuids, parse_pipe_strings,
@@ -1142,19 +1142,72 @@ async fn delete_recording(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// `GET /LiveTv/Recordings/Folders` — recording folders (not modelled → empty).
+/// `GET /LiveTv/Recordings/Folders` — the libraries recordings go to.
 ///
-/// Empty either way, but both gates still run: the route is
-/// `[Authorize(Policy = Policies.LiveTvAccess)]`, and upstream then applies
-/// `RequestHelpers.GetUserId` before it asks the manager for folders — so an
-/// unentitled caller gets a `403` rather than an empty `200`.
+/// Port of `LiveTvController.GetRecordingFolders` and
+/// `LiveTvManager.GetRecordingFoldersAsync`: each recording folder's location
+/// (`FindByPath`), kept when the user may see a library holding it, at or
+/// above that location (`IsVisibleStandalone`), becomes every such library
+/// (`GetCollectionFolders`), once each, by `SortName`.
 async fn get_recording_folders(
     State(state): State<AppState>,
     RequireLiveTvAccess(auth): RequireLiveTvAccess,
     Query(query): Query<LiveTvUserQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
-    effective_user_id(&state, &auth, query.user_id).await?;
-    Ok(Json(QueryResult::default()))
+    let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    let (Some(m), Some(user)) = (state.live_tv.as_ref(), user) else {
+        return Ok(Json(QueryResult::default()));
+    };
+    let mut locations: Vec<String> = Vec::new();
+    for location in m
+        .get_recording_folders()
+        .await?
+        .into_iter()
+        .flat_map(|folder| folder.locations)
+    {
+        if !locations.contains(&location) {
+            locations.push(location);
+        }
+    }
+    let libraries = state.virtual_folders.library_folders().await?;
+    let mut folders = Vec::new();
+    for location in &locations {
+        let mut holders = Vec::new();
+        for library in libraries
+            .iter()
+            .filter(|library| library.holds_path(location))
+        {
+            let id = library
+                .item_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok());
+            if let Some(id) = id
+                && let Some(item) = state.library.get_item_by_id(id).await?
+            {
+                holders.push(item);
+            }
+        }
+        let mut visible = false;
+        for item in &holders {
+            visible = visible
+                || state
+                    .library
+                    .is_item_visible_standalone(item, &user)
+                    .await?;
+        }
+        if visible {
+            folders.extend(holders);
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    folders.retain(|folder| seen.insert(folder.id.clone()));
+    folders.sort_by(|a, b| a.sort_name.cmp(&b.sort_name));
+    let items = state
+        .dto
+        .get_base_item_dtos(&folders, &DtoOptions::default(), Some(&user), None, false)
+        .await?;
+    let total = i32::try_from(items.len()).unwrap_or(i32::MAX);
+    Ok(Json(QueryResult::new(Some(0), Some(total), items)))
 }
 
 /// `GET /LiveTv/Recordings/Groups` — recording groups (deprecated; empty).

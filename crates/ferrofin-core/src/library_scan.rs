@@ -3965,6 +3965,8 @@ pub struct LibraryScanner {
     /// materialized itself — Jellyfin's carry one and the DTO emits it
     /// unconditionally. Absent → those rows keep a `NULL` `Path`.
     by_name: Option<crate::by_name_store::ByNameStore>,
+    /// The files being recorded ([`with_recording_paths`](Self::with_recording_paths)).
+    recording_paths: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
     /// Brackets the files the scan writes beside the media (embedded lyrics
     /// saved as `.lrc`), as upstream's `LyricManager` does. `None` in unit
     /// tests.
@@ -4231,6 +4233,7 @@ impl LibraryScanner {
             item_repository: None,
             years: None,
             by_name: None,
+            recording_paths: None,
             self_writes: None,
             studios_client: None,
             metadata_dir: None,
@@ -4492,6 +4495,26 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_years(mut self, years: crate::years::YearStore) -> Self {
         self.years = Some(years);
+        self
+    }
+
+    /// Reads the files Live TV is recording to right now, which the walk leaves
+    /// out until the capture's own refresh finds them.
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-1077):
+    /// upstream gives such a file an item from `OnStarted`, which
+    /// `Video.SourceType` (`LiveTV`), `IsCompleteMedia` and `DtoService`'s
+    /// `Type: Recording` keep away from everything a finished video reaches.
+    /// None of that is ported, so an item here would be a partial file posing
+    /// as a finished one. Un-defer path: port those, then remove this.
+    ///
+    /// Called once by the composition root.
+    #[must_use]
+    pub fn with_recording_paths(
+        mut self,
+        read: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.recording_paths = Some(read);
         self
     }
 
@@ -14437,12 +14460,17 @@ impl LibraryScanner {
                 // `DotIgnoreIgnoreRule` (`.ignore` files). Every listing of the
                 // walk comes through here, `FindExtras`' own filter included.
                 let mut dot_ignore = ctx.dot_ignore.borrow_mut();
+                // Read after the listing: a capture registers before it
+                // creates its file, so a file listed here is never missed.
+                let recording = self.recording_paths.as_ref().map(|read| read());
+                let recording = recording.as_deref().unwrap_or_default();
                 entries
                     .into_iter()
                     .filter(|entry| {
                         let is_dir = entry.type_ == FileSystemEntryType::Directory;
                         if crate::resolvers::should_ignore_path(&entry.path)
                             || dot_ignore.should_ignore(&entry.path, is_dir)
+                            || recording.contains(&entry.path)
                         {
                             ctx.excluded.borrow_mut().push(entry.path.clone());
                             false

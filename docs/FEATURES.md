@@ -107,7 +107,9 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     the command line. Ferrofin quotes such a path; an ordinary one (`/dev/dri/renderD128`)
     is passed exactly as Jellyfin passes it.
 - **Live TV** — M3U **and HDHomeRun** tuners + XMLTV **and Schedules Direct** guides,
-  channels/programs, DB-backed DVR timers & recordings. The Schedules Direct provider is a
+  channels/programs, DB-backed DVR timers & recordings, with each recording folder a library of
+  its own, so a finished recording is scanned like any other media. A recording in progress is
+  listed by `/LiveTv/Recordings` and joins its library when it ends. The Schedules Direct provider is a
   port of Jellyfin 12.2's `SchedulesDirect` (login, lineups, the station map, schedules,
   program details and artwork, SD's error codes and daily limits); it is verified against
   Jellyfin's own JSON fixtures and a fake SD API, and **has not been run against a real

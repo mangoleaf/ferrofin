@@ -23,6 +23,11 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   setting by group, with its value, default, source badge, variable and flag, and a lock with the
   reason on each one the page may not change; secrets are marked as secrets. The page holds no
   setting itself (it is served anonymously) and disappears with the plugin when it is disabled
+- Recordings are library items: each recording folder whose directory exists becomes a library
+  (`Recordings`, `Recorded Movies`, `Recorded Shows`) at startup, on a guide refresh, when a
+  recording starts and when the Live TV settings are saved, unless a library already holds it. A
+  recording joins the library when it ends, and `GET /LiveTv/Recordings/Folders` answers those
+  libraries. See [docs/UPGRADING.md](docs/UPGRADING.md)
 
 ### Database
 - Adopt Jellyfin 12.3 and 12.4 databases in place: neither release adds a migration, so each
