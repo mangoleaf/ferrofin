@@ -380,13 +380,8 @@ impl HlsRequestContext {
             // absent only in tests.
             is_in_local_network: extensions
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .is_some_and(|ci| {
-                    let client = state.client_address_for(
-                        crate::state::normalize_ip(ci.0.ip()),
-                        &crate::state::forwarded_for(headers),
-                    );
-                    state.is_in_local_network(client)
-                }),
+                .is_some()
+                && state.is_in_local_network(state.client_address_of(extensions, headers)),
             subtitles_in_manifest_default,
             user_agent: None,
         }
