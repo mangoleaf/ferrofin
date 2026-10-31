@@ -1785,6 +1785,37 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "post",
+        path: "/Collections",
+        upstream_file: "Jellyfin.Api/Controllers/CollectionController.cs",
+        upstream_method: "CreateCollection",
+        ferrofin: "handlers/collection.rs create_collection (parse_csv_uuids for the \
+               CommaDelimitedCollectionModelBinder ids; parentId bound and unused, as \
+               upstream) → ferrofin-core collection_manager.rs create_collection \
+               (CollectionManager.CreateCollectionAsync: new_box_set_folder_and_id for the \
+               [boxset] folder and AddChild's path-derived id, AddToCollectionAsync's refusal \
+               of an id naming no item after the box set is stored) and \
+               ensure_collections_folder → collections_library.rs (EnsureLibraryFolder: \
+               physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
+               LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
+               makes)",
+        date: "2026-10-30",
+        divergences: &[
+            "A missing name makes a box set with an empty name, where upstream's \
+         GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",
+            "A malformed id is a 400 before anything is written, and a whitespace-only entry \
+         in ids is dropped. Upstream's new Guid(x) throws a FormatException on either once \
+         the box set is stored, which answers 500 and leaves it behind. Jellyfin bug not \
+         ported.",
+            "A second box set of one name gets a folder of its own (<name>1 [boxset]). \
+         Upstream reuses the folder, so the path-derived id is the first box set's and \
+         AddChild overwrites it. Jellyfin bug not ported.",
+            "The 400 bodies (a malformed id, an id naming no item) are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "get",
         path: "/Library/VirtualFolders",
         upstream_file: "Jellyfin.Api/Controllers/LibraryStructureController.cs",

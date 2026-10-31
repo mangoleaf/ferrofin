@@ -544,6 +544,24 @@ impl FerrofinVirtualFolderManager {
         }))
     }
 
+    /// Moves every user's library preferences from the row `old_id`, which held
+    /// a `boxsets` library, to the `boxsets` library `new_id`: the same rewrite a
+    /// rename makes, for a library whose row is being replaced.
+    pub(crate) async fn move_boxsets_preferences(
+        &self,
+        (old_id, old_name): (uuid::Uuid, &str),
+        (new_id, new_name): (uuid::Uuid, &str),
+    ) -> Result<(), ServiceError> {
+        self.remap_user_preferences(&LibraryRename {
+            old_id,
+            new_id,
+            old_name: old_name.to_owned(),
+            new_name: new_name.to_owned(),
+            view_type: Self::collection_type_marker(CollectionTypeOptions::boxsets),
+        })
+        .await
+    }
+
     /// Rewrites every user's library preferences from the renamed library's old
     /// ids to its new ones. Port of C# `ReplaceLibraryIdInUserPreferencesAsync`:
     /// seven list preferences map the library id; `MyMediaExcludes` and
@@ -841,9 +859,8 @@ impl FerrofinVirtualFolderManager {
     /// and shows up as a phantom library in `/UserViews` and `/Items`.
     ///
     /// The `Directory.Exists` test is the whole guard, exactly as upstream: a
-    /// `CollectionFolder` whose directory is still there is never touched — which
-    /// is what keeps the manual-collections folder (whose directory lives outside
-    /// the user-views root) safe. Two extra safety stances, neither of which
+    /// `CollectionFolder` whose directory is still there is never touched. Two
+    /// extra safety stances, neither of which
     /// upstream needs because it holds the folders in memory:
     /// - a row with no `Path` at all is left alone (upstream cannot have one), and
     /// - if the user-views root itself is unreadable the pass is skipped entirely,

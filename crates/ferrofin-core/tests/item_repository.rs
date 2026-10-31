@@ -1791,8 +1791,10 @@ async fn a_created_collection_survives_an_unscoped_user_query() {
         .await
         .expect("save");
 
-    // …and a collection made through the real manager.
-    let collections = collection_manager_over(&db);
+    // …and a collection made through the real manager, with a real
+    // Collections library to make.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let collections = collection_manager_over(&db, tmp.path()).await;
     collections
         .create_collection(&CollectionCreationOptions {
             name: "My Collection".to_owned(),
@@ -1839,7 +1841,7 @@ async fn a_created_collection_survives_an_unscoped_user_query() {
             .fetch_one(db.pool())
             .await
             .expect("container row");
-    assert_eq!(container.0.as_deref(), Some("Collections"));
+    assert_eq!(container.0.as_deref(), Some("collections"));
     assert!(
         container.1.is_some_and(|p| p.ends_with("/collections")),
         "the container is the folder under the data directory"
@@ -1889,29 +1891,49 @@ async fn seed_user_who_sees_everything(
 }
 
 /// The real collection manager over `db`, with throwaway application paths.
-fn collection_manager_over(db: &ferrofin_db::Database) -> ferrofin_core::FerrofinCollectionManager {
+async fn collection_manager_over(
+    db: &ferrofin_db::Database,
+    dir: &std::path::Path,
+) -> ferrofin_core::FerrofinCollectionManager {
+    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
+        dir,
+        dir.join("log"),
+        dir.join("config"),
+        dir.join("cache"),
+        dir.join("web"),
+    ));
+    let mode = ferrofin_core::item_type_lookup::IdDerivation::from_meta(
+        None,
+        Some(dir.to_string_lossy().into_owned()),
+    );
+    ferrofin_core::AggregateFolderStore::new(
+        db.clone(),
+        mode.clone(),
+        dir.join("root"),
+        dir.join("data"),
+    )
+    .ensure()
+    .await
+    .expect("roots");
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
     ferrofin_core::FerrofinCollectionManager::new(
         db.clone(),
-        std::sync::Arc::new(ferrofin_core::FerrofinLibraryManager::new(
-            std::sync::Arc::new(ferrofin_core::FerrofinItemRepository::new(
-                db.clone(),
-                std::sync::Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new()),
-            )),
-            std::sync::Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
-            std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-            std::sync::Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+        Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+            Arc::new(repo(db)),
+            Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+            persistence.clone(),
+            Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
         )),
-        std::sync::Arc::new(ferrofin_core::FerrofinLinkedChildrenService::new(
+        Arc::new(ferrofin_core::FerrofinLinkedChildrenService::new(
             db.clone(),
         )),
-        std::sync::Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
-            "/tmp/ferrofin-test",
-            "/tmp/ferrofin-test/log",
-            "/tmp/ferrofin-test/config",
-            "/tmp/ferrofin-test/cache",
-            "/tmp/ferrofin-test/web",
-        )),
+        paths,
     )
+    .with_virtual_folders(Arc::new(
+        ferrofin_core::FerrofinVirtualFolderManager::new(dir.join("root/default"))
+            .with_item_store(persistence)
+            .with_id_derivation(mode),
+    ))
 }
 
 /// v12.2 `BuildMaxParentalRatingFilter` (45d7760a14): a container is only as
