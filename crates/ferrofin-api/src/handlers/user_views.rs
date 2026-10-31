@@ -170,10 +170,9 @@ async fn get_grouping_options(
     Query(query): Query<UserViewsQuery>,
 ) -> Result<Json<Vec<SpecialViewOptionDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let user_id = user_uuid(&user)?;
-    // Grouping options come from root libraries, independently of which home
-    // views the user hid (`MyMediaExcludes`).
-    let folders = state.user_views.get_media_folders(user_id).await?;
+    // Grouping options come from the root libraries the user can open,
+    // independently of which home views they hid (`MyMediaExcludes`).
+    let folders = state.user_views.get_user_root_children(&user).await?;
     let by_id = collection_types_by_id(&state).await?;
     let mut options: Vec<SpecialViewOptionDto> = folders
         .into_iter()
@@ -187,7 +186,18 @@ async fn get_grouping_options(
             })
         })
         .collect();
-    options.sort_by(|a, b| a.name.cmp(&b.name));
+    // `OrderBy(i => i.Name)`: `string.CompareTo`, in the request's culture.
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    options.sort_by(|a, b| {
+        let (a, b) = (
+            a.name.as_deref().unwrap_or_default(),
+            b.name.as_deref().unwrap_or_default(),
+        );
+        comparer
+            .as_ref()
+            .map_or_else(|| a.cmp(b), |comparer| comparer.compare(a, b))
+    });
     Ok(Json(options))
 }
 

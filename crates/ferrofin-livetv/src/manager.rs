@@ -8374,9 +8374,12 @@ mod tests {
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             Ok(Vec::new())
         }
-        async fn get_media_folders(
+        async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+            Ok(Vec::new())
+        }
+        async fn get_user_root_children(
             &self,
-            _user_id: Uuid,
+            _user: &ferrofin_db::entities::users::UserEntity,
         ) -> Result<Vec<BaseItemEntity>, ServiceError> {
             Ok(Vec::new())
         }

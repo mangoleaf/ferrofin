@@ -1122,7 +1122,13 @@ impl UserViewManager for FakeUserViews {
     async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
-    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("fake")
+    }
+    async fn get_user_root_children(
+        &self,
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("fake")
     }
     async fn get_latest_items(
