@@ -7,20 +7,21 @@
 //! root; the [`RequireAuth`] extractor enforces authentication here.
 
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::http::request::Parts;
-use axum::http::{HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_model::net::EndPointInfo;
 use ferrofin_model::system::{LogFile, PublicSystemInfo, SystemInfo};
 use ferrofin_model::system_info_dtos::SystemStorageDto;
-use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::net::RequestContext;
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 
 use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth, RequireLocalAccessOrAdmin};
 use crate::error::ApiError;
 use crate::extract::Query;
+use crate::handlers::streaming::opened_file_response;
 use crate::state::AppState;
 
 /// Builds a [`RequestContext`] from an axum request's [`Parts`] (headers +
@@ -167,10 +168,9 @@ async fn get_server_logs(
     _auth: RequireAdmin,
 ) -> Result<Json<Vec<LogFile>>, ApiError> {
     let dir = state.config.application_paths().log_directory_path();
-    let file_system = std::sync::Arc::clone(&state.file_system);
-    let files = tokio::task::spawn_blocking(move || file_system.get_files(&dir, &[".txt", ".log"]))
-        .await
-        .map_err(|error| ServiceError::backend(format!("log directory listing: {error}")))?;
+    let files = state
+        .blocking_file_system(move |file_system| file_system.get_files(&dir, &[".txt", ".log"]))
+        .await?;
     let mut logs: Vec<LogFile> = files
         .into_iter()
         .map(|f| LogFile {
@@ -180,11 +180,17 @@ async fn get_server_logs(
             name: f.name,
         })
         .collect();
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
     logs.sort_by(|a, b| {
         b.date_modified
             .cmp(&a.date_modified)
             .then_with(|| b.date_created.cmp(&a.date_created))
-            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| {
+                comparer
+                    .as_ref()
+                    .map_or_else(|| a.name.cmp(&b.name), |c| c.compare(&a.name, &b.name))
+            })
     });
     Ok(Json(logs))
 }
@@ -201,9 +207,9 @@ struct LogFileQuery {
 /// `GET /System/Logs/Log` — the contents of one log file.
 ///
 /// Port of `SystemController.GetLogFile`: finds the file by (case-insensitive)
-/// name in the log directory (`404` if absent) and returns it as UTF-8 text.
-/// Upstream streams the file; this reads it whole, on the blocking pool,
-/// through the [`FileSystem`](ferrofin_traits::filesystem::FileSystem) seam.
+/// name in the log directory (`404` if absent) and streams it as UTF-8 text, as
+/// upstream's `FileStream` does: a debug server log or a long encode's ffmpeg
+/// log runs to hundreds of megabytes. No ranges, no validators.
 #[utoipa::path(
     get,
     path = "/System/Logs/Log",
@@ -221,28 +227,20 @@ async fn get_log_file(
 ) -> Result<Response, ApiError> {
     let name = query
         .name
-        .filter(|n| !n.is_empty())
+        .filter(|n| !n.trim().is_empty())
         .ok_or_else(|| ApiError::BadRequest("missing required 'name'".to_owned()))?;
     let dir = state.config.application_paths().log_directory_path();
-    // The listing and the read on the blocking pool: a debug server log or a
-    // long encode's ffmpeg log runs to hundreds of megabytes.
-    let file_system = std::sync::Arc::clone(&state.file_system);
-    let bytes = tokio::task::spawn_blocking(move || {
-        let file = file_system
-            .get_files(&dir, &[])
-            .into_iter()
-            .find(|f| f.name.eq_ignore_ascii_case(&name))
-            .ok_or_else(|| ApiError::NotFound("Log file not found.".to_owned()))?;
-        Ok::<_, ApiError>(file_system.read_file(&file.full_name)?)
-    })
-    .await
-    .map_err(|error| ServiceError::backend(format!("log file read: {error}")))??;
-    let mut response = bytes.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; charset=utf-8"),
-    );
-    Ok(response)
+    let file = state
+        .blocking_file_system(move |file_system| {
+            let file = file_system
+                .get_files(&dir, &[])
+                .into_iter()
+                .find(|f| equals_ordinal_ignore_case(&f.name, &name))
+                .ok_or_else(|| ApiError::NotFound("Log file not found.".to_owned()))?;
+            Ok::<_, ApiError>(file_system.open_file(&file.full_name)?)
+        })
+        .await??;
+    opened_file_response(file, "text/plain; charset=utf-8")
 }
 
 /// `GET /System/Endpoint` — information about the request's network endpoint.

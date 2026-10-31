@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use ferrofin_model::io::{FileSystemEntryInfo, FileSystemEntryType};
 use ferrofin_providers::FileSystemMetadata;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::filesystem::{FileMetadata, FileSystem};
+use ferrofin_traits::filesystem::{FileMetadata, FileSystem, OpenedFile};
 
 /// The bounds of a [`DirectoryCache`] (`DirectoryService`'s
 /// `MaxCachedRecords` and `IdleTimeoutMs`).
@@ -274,6 +274,10 @@ impl FileSystem for DirectoryCache {
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, ServiceError> {
         self.file_system.read_file(path)
+    }
+
+    fn open_file(&self, path: &str) -> Result<OpenedFile, ServiceError> {
+        self.file_system.open_file(path)
     }
 }
 
