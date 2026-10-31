@@ -868,6 +868,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
+- A hung network mount can no longer freeze the server through the directory browser, the log
+  routes or the fallback fonts: every `FileSystem` call from a handler runs on the blocking pool,
+  at most 32 at a time, so calls hung on a dead mount can stop those routes until it answers but
+  nothing else. `GET /Environment/Drives` leaves out a mount that does not answer within 2 s,
+  keeping to one probe thread per mount however often it is called. The log and font routes
+  stream the file instead of reading it into memory, and a log that grows while it is read no
+  longer overruns its `Content-Length`. A monitor scan's stats and sidecar listing leave the
+  runtime worker too
 - One item that cannot be read or written no longer ends a library scan: it is skipped, counted
   in the scan's summary and refreshed again by the next scan, as Jellyfin does, while the rest of
   the scan, the removal of deleted files, the closing passes and the client notification all run
