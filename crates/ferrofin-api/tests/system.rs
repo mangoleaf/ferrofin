@@ -5,6 +5,7 @@
 //! stub `ferrofin-traits` impls that authenticate and return canned data. Managers
 //! a given handler never touches reuse the `test_support` panic fakes.
 
+use std::io::Read as _;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -30,7 +31,7 @@ use ferrofin_model::system::{FolderStorageInfo, PublicSystemInfo, SystemInfo, Sy
 use ferrofin_traits::activity::{ActivityLogQuery, ActivityManager};
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::filesystem::{FileMetadata, FileSystem};
+use ferrofin_traits::filesystem::{FileMetadata, FileSystem, OpenedFile};
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::AuthorizationInfo;
 use ferrofin_traits::system::{ServerApplicationPaths, SystemManager};
@@ -388,6 +389,11 @@ fn elevated_full_state() -> AppState {
 /// Builds an [`AppState`] whose system/filesystem/config/activity managers are
 /// stubs and the rest are panic fakes.
 fn full_state_with(elevated: bool) -> AppState {
+    state_with_file_system(elevated, Arc::new(StubFileSystem))
+}
+
+/// [`full_state_with`] over another filesystem.
+fn state_with_file_system(elevated: bool, file_system: Arc<dyn FileSystem>) -> AppState {
     let auth = Arc::new(OkAuth { elevated });
     AppState::new(
         Arc::new(FakeLibrary),
@@ -420,7 +426,7 @@ fn full_state_with(elevated: bool) -> AppState {
         Arc::new(FakeLocalization),
         Arc::new(FakeDisplayPreferences),
         Arc::new(StubActivity::default()),
-        Arc::new(StubFileSystem),
+        file_system,
         Arc::new(FakeTasks),
     )
 }
@@ -609,6 +615,212 @@ async fn system_logs_list_and_fetch() {
 
     let (missing_status, _) = get(elevated_full_state(), "/System/Logs/Log?name=absent.log").await;
     assert_eq!(missing_status, StatusCode::NOT_FOUND);
+}
+
+/// A log folder of one file, `big.log`, whose open the test scripts.
+struct OneLog(fn() -> Result<OpenedFile, ServiceError>);
+
+impl FileSystem for OneLog {
+    fn get_file_system_entries(&self, _path: &str) -> Vec<FileSystemEntryInfo> {
+        unimplemented!("unused")
+    }
+    fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
+        unimplemented!("unused")
+    }
+    fn file_exists(&self, _path: &str) -> bool {
+        unimplemented!("unused")
+    }
+    fn directory_exists(&self, _path: &str) -> bool {
+        unimplemented!("unused")
+    }
+    fn validate_writable(&self, _path: &str) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    fn get_files(&self, _path: &str, _extensions: &[&str]) -> Vec<FileMetadata> {
+        vec![FileMetadata {
+            name: "big.log".to_owned(),
+            full_name: "/logs/big.log".to_owned(),
+            length: 0,
+            date_created: chrono::DateTime::UNIX_EPOCH,
+            date_modified: chrono::DateTime::UNIX_EPOCH,
+        }]
+    }
+    fn read_file(&self, _path: &str) -> Result<Vec<u8>, ServiceError> {
+        unimplemented!("a response streams")
+    }
+    fn open_file(&self, _path: &str) -> Result<OpenedFile, ServiceError> {
+        (self.0)()
+    }
+}
+
+/// `bytes` zeros for a log `length` long; the reader outrunning the length
+/// is a log still being written.
+fn opened(length: u64, bytes: u64) -> OpenedFile {
+    OpenedFile {
+        path: "/logs/big.log".to_owned(),
+        length,
+        reader: Box::new(std::io::repeat(b'x').take(bytes)),
+    }
+}
+
+async fn get_log(file_system: OneLog, headers: &[(&str, &str)]) -> axum::response::Response {
+    let mut request = Request::builder()
+        .uri("/System/Logs/Log?name=BIG.LOG")
+        .header("X-Emby-Token", "tok");
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    create_router(state_with_file_system(true, Arc::new(file_system)))
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+async fn body_of(response: axum::response::Response) -> Vec<u8> {
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+/// Oracle: Jellyfin 12.4 on a 5000-byte log. `File(stream, type)` sends the
+/// length and takes no notice of `Range` or `If-Modified-Since`.
+#[tokio::test]
+async fn a_log_answers_as_upstreams_file_stream() {
+    let response = get_log(
+        OneLog(|| Ok(opened(5000, 5000))),
+        &[
+            ("Range", "bytes=0-9"),
+            ("If-Modified-Since", "Fri, 01 Jan 2100 00:00:00 GMT"),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(headers["content-type"], "text/plain; charset=utf-8");
+    assert_eq!(headers["content-length"], "5000");
+    assert!(!headers.contains_key("accept-ranges"));
+    assert!(!headers.contains_key("last-modified"));
+    assert_eq!(body_of(response).await, vec![b'x'; 5000]);
+}
+
+/// An empty log is a 200 with a length of zero and an empty body.
+#[tokio::test]
+async fn an_empty_log_declares_a_length_of_zero() {
+    let response = get_log(OneLog(|| Ok(opened(0, 0))), &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-length"], "0");
+    assert_eq!(body_of(response).await, [] as [u8; 0]);
+}
+
+/// The compression layer sizes a response by its `Content-Length`, so streaming
+/// the log leaves it as it was: a small one plain, a large one encoded.
+#[tokio::test]
+async fn a_streamed_log_compresses_as_the_whole_one_did() {
+    let gzip = [("Accept-Encoding", "gzip")];
+    let large = get_log(OneLog(|| Ok(opened(5000, 5000))), &gzip).await;
+    assert_eq!(large.headers()["content-encoding"], "gzip");
+    assert!(!large.headers().contains_key("content-length"));
+    let small = get_log(OneLog(|| Ok(opened(100, 100))), &gzip).await;
+    assert!(!small.headers().contains_key("content-encoding"));
+    assert_eq!(small.headers()["content-length"], "100");
+    assert_eq!(body_of(small).await.len(), 100);
+}
+
+/// Today's log grows while it is read. The body stops at the length the headers
+/// declared: going past it would abort the response.
+#[tokio::test]
+async fn a_log_growing_under_the_reader_stops_at_the_declared_length() {
+    let response = get_log(OneLog(|| Ok(opened(300_000, 900_000))), &[]).await;
+    assert_eq!(response.headers()["content-length"], "300000");
+    assert_eq!(body_of(response).await.len(), 300_000);
+}
+
+/// A log is read as the client takes it, whatever its size: only the chunks
+/// asked for leave the disk. A log has no size cap.
+#[tokio::test]
+async fn a_log_is_read_as_the_client_takes_it_not_whole() {
+    use axum::body::HttpBody as _;
+
+    static READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    struct Counting;
+    impl std::io::Read for Counting {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            READ.fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            Ok(buffer.len())
+        }
+    }
+
+    const HUGE: u64 = 1 << 40;
+    let response = get_log(
+        OneLog(|| {
+            Ok(OpenedFile {
+                path: "/logs/big.log".to_owned(),
+                length: HUGE,
+                reader: Box::new(Counting),
+            })
+        }),
+        &[],
+    )
+    .await;
+    assert_eq!(response.headers()["content-length"], HUGE.to_string());
+    let mut body = response.into_body();
+    let first = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
+        .await
+        .expect("a frame")
+        .expect("no error");
+    assert!(first.is_data());
+    assert!(
+        READ.load(std::sync::atomic::Ordering::SeqCst) < 1 << 24,
+        "read {} bytes for one frame",
+        READ.load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+/// A read that fails mid-file ends the body with an error, so the response is
+/// aborted rather than passed off as complete.
+#[tokio::test]
+async fn a_failed_read_aborts_the_body() {
+    struct Failing;
+    impl std::io::Read for Failing {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("input/output error"))
+        }
+    }
+    let response = get_log(
+        OneLog(|| {
+            Ok(OpenedFile {
+                path: "/logs/big.log".to_owned(),
+                length: 10,
+                reader: Box::new(Failing),
+            })
+        }),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .is_err()
+    );
+}
+
+/// Oracle: Jellyfin 12.4. A log gone since the listing is a 404, and one that
+/// cannot be opened a 500.
+#[tokio::test]
+async fn a_log_that_cannot_be_opened_answers_as_upstream_does() {
+    let gone = get_log(OneLog(|| Err(ServiceError::not_found("gone"))), &[]).await;
+    assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    let refused = get_log(OneLog(|| Err(ServiceError::backend("denied"))), &[]).await;
+    assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// `[FromQuery, Required] string name`: a blank value is no value.
+#[tokio::test]
+async fn a_blank_log_name_is_a_bad_request() {
+    let (status, _) = get(elevated_full_state(), "/System/Logs/Log?name=%20").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 /// Listing the log directory and reading a log file run on the blocking pool,

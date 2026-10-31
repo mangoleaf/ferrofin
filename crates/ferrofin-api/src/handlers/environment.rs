@@ -11,19 +11,26 @@
 //! - `GET /Environment/NetworkShares` — always the empty array (deprecated).
 //!
 //! Filesystem access goes through the injected
-//! [`FileSystem`](ferrofin_traits::filesystem::FileSystem) trait.
+//! [`FileSystem`](ferrofin_traits::filesystem::FileSystem) trait, on the
+//! blocking pool: a path on a hung network mount must cost a thread of its
+//! own, not a runtime worker.
 
 use std::path::Path as StdPath;
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use ferrofin_model::environment_dtos::{DefaultDirectoryBrowserInfoDto, ValidatePathDto};
-use ferrofin_model::io::FileSystemEntryInfo;
+use ferrofin_model::io::{FileSystemEntryInfo, FileSystemEntryType};
+use ferrofin_traits::error::ServiceError;
+use ferrofin_traits::filesystem::FileSystem;
+use ferrofin_util::current_culture;
+use ferrofin_util::path_helper::get_full_path;
 
 use crate::auth::FirstTimeSetupOrElevated;
-use crate::error::ApiError;
+use crate::error::{ApiError, ProblemStatus};
 use crate::extract::{JsonBody, Query};
 use crate::state::AppState;
 
@@ -49,9 +56,12 @@ struct DirectoryContentsQuery {
 
 /// `GET /Environment/DirectoryContents` — a directory's entries.
 ///
-/// Port of `EnvironmentController.GetDirectoryContents`: enumerates the path,
-/// keeps files/directories per the flags, and orders by full path. A malformed
-/// UNC root (`\\x`) returns an empty list, matching the C# guard.
+/// Port of `EnvironmentController.GetDirectoryContents`: enumerates the path
+/// (`DirectoryInfo` resolves it to a full path first), keeps files/directories
+/// per the flags, and orders by full path in the request's culture. A malformed
+/// UNC root (`\\x`) returns an empty list, matching the C# guard. A path that is
+/// no directory is a 404, and one the server may not read lists empty
+/// (`IgnoreInaccessible`).
 #[utoipa::path(
     get,
     path = "/Environment/DirectoryContents",
@@ -70,7 +80,7 @@ async fn get_directory_contents(
 ) -> Result<Json<Vec<FileSystemEntryInfo>>, ApiError> {
     let path = query
         .path
-        .filter(|p| !p.is_empty())
+        .filter(|p| !p.trim().is_empty())
         .ok_or_else(|| ApiError::BadRequest("missing required 'path'".to_owned()))?;
 
     // Guard against a bare UNC-root path (`\\x`) as the C# does.
@@ -78,20 +88,53 @@ async fn get_directory_contents(
         return Ok(Json(Vec::new()));
     }
 
-    let mut entries: Vec<FileSystemEntryInfo> = state
-        .file_system
-        .get_file_system_entries(&path)
-        .into_iter()
-        .filter(|entry| {
-            let is_dir = matches!(
-                entry.type_,
-                ferrofin_model::io::FileSystemEntryType::Directory
-            );
-            (is_dir && query.include_directories) || (!is_dir && query.include_files)
+    let (include_files, include_directories) = (query.include_files, query.include_directories);
+    let culture = current_culture::capture();
+    let entries = state
+        .blocking_file_system(move |file_system| {
+            let mut entries: Vec<FileSystemEntryInfo> =
+                list_directory(file_system, &full_path(&path))?
+                    .into_iter()
+                    .filter(|entry| {
+                        let is_dir = entry.type_ == FileSystemEntryType::Directory;
+                        (is_dir && include_directories) || (!is_dir && include_files)
+                    })
+                    .collect();
+            let comparer = current_culture::comparer(&culture).ok();
+            entries.sort_by(|a, b| {
+                comparer.as_ref().map_or_else(
+                    || a.path.cmp(&b.path),
+                    |comparer| comparer.compare(&a.path, &b.path),
+                )
+            });
+            Ok::<_, ApiError>(entries)
         })
-        .collect();
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
+        .await??;
     Ok(Json(entries))
+}
+
+/// `Path.GetFullPath`, as `new DirectoryInfo(path)` resolves its argument: every
+/// entry's path is listed from this, so a relative path answers with absolute
+/// ones and a `..` is gone.
+fn full_path(path: &str) -> String {
+    let absolute = std::path::absolute(path).map_or_else(
+        |_| path.to_owned(),
+        |absolute| absolute.to_string_lossy().into_owned(),
+    );
+    get_full_path(&absolute).to_string_lossy().into_owned()
+}
+
+/// `path`'s entries for the browser. A directory the server may not read is
+/// empty (`EnumerationOptions.IgnoreInaccessible`); any other failure is the
+/// response's.
+fn list_directory(
+    file_system: &dyn FileSystem,
+    path: &str,
+) -> Result<Vec<FileSystemEntryInfo>, ServiceError> {
+    match file_system.try_get_file_system_entries(path) {
+        Err(ServiceError::Forbidden(_)) => Ok(Vec::new()),
+        listed => listed,
+    }
 }
 
 /// `POST /Environment/ValidatePath` — validate a path exists (and is writable).
@@ -116,32 +159,31 @@ async fn validate_path(
     JsonBody(dto): JsonBody<ValidatePathDto>,
 ) -> Result<StatusCode, ApiError> {
     let path = dto.path.unwrap_or_default();
-    match dto.is_file {
-        Some(true) => {
-            if !state.file_system.file_exists(&path) {
-                return Err(ApiError::NotFound(format!("file {path}")));
+    let (is_file, validate_writable) = (dto.is_file, dto.validate_writable);
+    state
+        .blocking_file_system(move |file_system| {
+            let exists = match is_file {
+                Some(true) => file_system.file_exists(&path),
+                Some(false) => file_system.directory_exists(&path),
+                None => file_system.file_exists(&path) || file_system.directory_exists(&path),
+            };
+            if !exists {
+                return Err(ApiError::Problem(ProblemStatus::NotFound));
             }
-        }
-        Some(false) => {
-            if !state.file_system.directory_exists(&path) {
-                return Err(ApiError::NotFound(format!("directory {path}")));
+            if is_file.is_none() && validate_writable {
+                file_system.validate_writable(&path)?;
             }
-        }
-        None => {
-            if !state.file_system.file_exists(&path) && !state.file_system.directory_exists(&path) {
-                return Err(ApiError::NotFound(format!("path {path}")));
-            }
-            if dto.validate_writable {
-                state.file_system.validate_writable(&path)?;
-            }
-        }
-    }
-    Ok(StatusCode::NO_CONTENT)
+            Ok(StatusCode::NO_CONTENT)
+        })
+        .await?
 }
 
 /// `GET /Environment/Drives` — the available drives / root mounts.
 ///
-/// Port of `EnvironmentController.GetDrives`.
+/// Port of `EnvironmentController.GetDrives`. `get_drives` returns in bounded
+/// time, leaving out a mount that does not answer, so it needs no slot of
+/// [`AppState::blocking_file_system`]: the library wizard's drive list still
+/// opens with every slot held by calls hung on that mount.
 #[utoipa::path(
     get,
     path = "/Environment/Drives",
@@ -151,8 +193,12 @@ async fn validate_path(
 async fn get_drives(
     State(state): State<AppState>,
     _auth: FirstTimeSetupOrElevated,
-) -> Json<Vec<FileSystemEntryInfo>> {
-    Json(state.file_system.get_drives())
+) -> Result<Json<Vec<FileSystemEntryInfo>>, ApiError> {
+    let file_system = Arc::clone(&state.file_system);
+    let drives = tokio::task::spawn_blocking(move || file_system.get_drives())
+        .await
+        .map_err(|error| ServiceError::backend(format!("listing the drives: {error}")))?;
+    Ok(Json(drives))
 }
 
 /// `GET /Environment/NetworkShares` — network paths (always empty; deprecated).

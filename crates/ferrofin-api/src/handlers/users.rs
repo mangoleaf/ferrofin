@@ -382,14 +382,18 @@ struct AuthenticateByIdQuery {
 ///
 /// Port of the obsolete `UserController.AuthenticateUser`
 /// (`[ApiExplorerSettings(IgnoreApi = true)]`, so absent from the OpenAPI
-/// contract, but still served upstream and anonymous): 404 "User not found",
-/// else exactly `AuthenticateUserByName` with that user's name.
+/// contract, but still served upstream and anonymous): 400 for a nil id, 404
+/// "User not found", else exactly `AuthenticateUserByName` with that user's name.
 async fn authenticate_by_id(
     State(state): State<AppState>,
     Path(user_id): Path<Uuid>,
     Query(query): Query<AuthenticateByIdQuery>,
     parts: Parts,
 ) -> Result<Json<AuthenticationResult>, ApiError> {
+    // `GetUserById(Guid.Empty)` throws `ArgumentException`: a `400`.
+    if user_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     let Some(user) = state.users.get_user_by_id(user_id).await? else {
         return Err(ApiError::NotFound("User not found".to_owned()));
     };
@@ -621,13 +625,15 @@ async fn filtered_user_dtos(
 
 /// `GET /Users/{userId}` — a single user by id.
 ///
-/// Port of `UserController.GetUserById`: a missing user is a `404`.
+/// Port of `UserController.GetUserById`: a nil id is a `400`, a missing user
+/// a `404`.
 #[utoipa::path(
     get,
     path = "/Users/{userId}",
     params(("userId" = String, Path, description = "The user id")),
     responses(
         (status = 200, description = "User returned", body = UserDto),
+        (status = 400, description = "A nil user id"),
         (status = 404, description = "User not found")
     ),
     tag = "ferrofin"
@@ -660,6 +666,7 @@ async fn get_user_by_id(
     params(("userId" = String, Path, description = "The user id")),
     responses(
         (status = 204, description = "User deleted"),
+        (status = 400, description = "A nil user id"),
         (status = 404, description = "User not found")
     ),
     tag = "ferrofin"
@@ -774,7 +781,7 @@ async fn create_user_by_name(
     params(("userId" = Option<String>, Query, description = "The user id (defaults to caller)")),
     responses(
         (status = 204, description = "User updated"),
-        (status = 400, description = "Invalid name, or an incomplete policy"),
+        (status = 400, description = "Invalid name, an incomplete policy, or a nil user id"),
         (status = 403, description = "Update not allowed"),
         (status = 404, description = "User not found")
     ),
@@ -892,7 +899,7 @@ async fn update_device_access(state: &AppState, user: &UserEntity) -> Result<(),
     params(("userId" = String, Path, description = "The user id")),
     responses(
         (status = 204, description = "Policy updated"),
-        (status = 400, description = "A required provider id is missing or blank"),
+        (status = 400, description = "A required provider id is missing or blank, or a nil user id"),
         (status = 403, description = "Policy update forbidden"),
         (status = 404, description = "User not found")
     ),
@@ -966,6 +973,7 @@ fn policy_validation(policy: &UserPolicy, prefix: &str) -> Option<ProblemDetails
     params(("userId" = Option<String>, Query, description = "The user id (defaults to caller)")),
     responses(
         (status = 204, description = "Configuration updated"),
+        (status = 400, description = "A nil user id"),
         (status = 403, description = "Update not allowed"),
         (status = 404, description = "User not found")
     ),
@@ -997,6 +1005,7 @@ async fn update_user_configuration(
     params(("userId" = Option<String>, Query, description = "The user id (defaults to caller)")),
     responses(
         (status = 204, description = "Password updated"),
+        (status = 400, description = "A nil user id"),
         (status = 403, description = "Update not allowed or invalid credentials"),
         (status = 404, description = "User not found")
     ),
@@ -1173,8 +1182,13 @@ async fn get_current_user(
     Ok(Json(state.users.get_user_dto(user, None).await?))
 }
 
-/// Loads a user by id, mapping the absent case to a `404`.
+/// Loads a user by id, mapping the absent case to a `404`. A nil id is a `400`,
+/// as `UserManager.GetUserById(Guid.Empty)` throws `ArgumentException`; an API
+/// key's `userId ?? User.GetUserId()` is that empty id.
 async fn load_user(state: &AppState, user_id: Uuid) -> Result<UserEntity, ApiError> {
+    if user_id.is_nil() {
+        return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
+    }
     state
         .users
         .get_user_by_id(user_id)

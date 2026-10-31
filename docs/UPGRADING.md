@@ -70,6 +70,22 @@ Dashboard → Libraries, with box sets under a plain folder for that directory.
   id, which nothing moves afterwards, so check such a user or
   [stop the old pod first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
 
+## Unreleased — a mount that does not answer is left out of the drive list
+
+Nothing to do, unless your network storage is slow to answer. The library wizard's drive list
+(`GET /Environment/Drives`) now gives each mount 2 s and lists the ones that answered. A mount
+that hangs no longer freezes the server, and it returns to the list once it answers. A mount
+that regularly takes longer than 2 s, such as a NAS waking its disks, is missing from the list
+even though it is healthy: type its path into the folder picker instead.
+
+While a mount hangs, the folder picker, the log pages and the fallback fonts can stop until it
+answers, for local disks too, once 32 calls are stuck on it. Everything else keeps working.
+
+If a script calls these routes, some answers changed to match Jellyfin 12.4:
+`GET /Environment/DirectoryContents` is a `404` for a path that is no directory (it was an empty
+list), and `POST /Environment/ValidatePath` with `ValidateWritable` is a `500` for a read-only
+directory and a `404` when the path is a file (both were `400`).
+
 ## Unreleased — the Helm chart's notes on rolling updates and RWX volumes are corrected
 
 Nothing changes in the chart's behaviour, and the default stays `RollingUpdate`, but what it told
@@ -277,6 +293,13 @@ way cannot have their profile or policy saved from the dashboard until both are 
 a sign-in restores `AuthenticationProviderId`; set `PasswordResetProviderId` (normally
 `Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider`) with a
 `POST /Users/{userId}/Policy` that carries the user's full policy.
+
+A policy body that leaves other members out now saves Jellyfin's default for each one
+(`new UserPolicy()`: media playback, all libraries, all devices and remote access allowed, no
+login lockout, among others), where an earlier Ferrofin saved `false` or `0`. A script that
+relied on an omitted member being `false` must now send it. A user an earlier Ferrofin saved
+from such a body keeps that stripped policy until it is saved again in full, from the
+dashboard or with the user's complete policy.
 
 ## Unreleased — library tiles are drawn as Jellyfin 12.2 draws them
 
