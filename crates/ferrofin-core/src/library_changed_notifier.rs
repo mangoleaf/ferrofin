@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ferrofin_db::entities::base_items::BaseItemEntity;
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::entities_media::LibraryUpdateInfo;
 use ferrofin_traits::configuration::ServerConfigurationManager;
 use ferrofin_traits::events::{EventManager, LibraryChangeAudience};
@@ -196,16 +197,49 @@ impl LibraryChangedNotifier {
     /// A non-folder with no path has no `HasPathProtocol` and is skipped; a
     /// by-name item (genre, studio, person, year) is skipped unless it is a
     /// `MusicArtist`, which Jellyfin exempts because artists are browsable
-    /// library content rather than a facet.
+    /// library content rather than a facet; and so is anything whose
+    /// `SourceType` is not `Library`.
     fn filter_item(item: &BaseItemEntity) -> bool {
         if !item.is_folder && item.path.as_deref().unwrap_or_default().is_empty() {
             return false;
         }
-        let Some(kind) = crate::item_type_lookup::kind_from_type_name(&item.type_) else {
-            return true;
-        };
-        !crate::kinds::is_item_by_name(kind)
-            || kind == ferrofin_model::data::BaseItemKind::MusicArtist
+        let kind = crate::item_type_lookup::kind_from_type_name(&item.type_);
+        if kind.is_some_and(|kind| {
+            crate::kinds::is_item_by_name(kind) && kind != BaseItemKind::MusicArtist
+        }) {
+            return false;
+        }
+        Self::source_type_is_library(item, kind)
+    }
+
+    /// `BaseItem.SourceType == SourceType.Library`, which no row stores: Live TV
+    /// channels and programmes are `LiveTV`, and a channel and anything with a
+    /// `ChannelId` are `Channel`.
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-1077):
+    /// `Video.SourceType` is also `LiveTV` while its file is being recorded.
+    /// No check is needed yet: a scan leaves such a file out
+    /// ([`LibraryScanner::with_recording_paths`]), so no scan makes a row to
+    /// announce until the capture ends. Un-defer path: when a recording gets
+    /// its item as it starts, this check has to come with it.
+    ///
+    /// [`LibraryScanner::with_recording_paths`]: crate::library_scan::LibraryScanner::with_recording_paths
+    fn source_type_is_library(item: &BaseItemEntity, kind: Option<BaseItemKind>) -> bool {
+        let live_tv_or_channel = matches!(
+            kind,
+            Some(
+                BaseItemKind::Channel
+                    | BaseItemKind::LiveTvChannel
+                    | BaseItemKind::TvChannel
+                    | BaseItemKind::LiveTvProgram
+                    | BaseItemKind::TvProgram
+            )
+        );
+        let in_a_channel = item
+            .channel_id
+            .as_deref()
+            .is_some_and(|id| Uuid::parse_str(id).is_ok_and(|id| !id.is_nil()));
+        !live_tv_or_channel && !in_a_channel
     }
 
     fn changed_of(item: &BaseItemEntity) -> Option<Changed> {
@@ -749,6 +783,37 @@ mod tests {
             LibraryChangedNotifier::filter_item(&artist),
             "C# exempts MusicArtist from the IItemByName skip"
         );
+    }
+
+    /// `return item.SourceType == SourceType.Library;`, for rows a path or a
+    /// folder flag would otherwise let through.
+    #[rstest::rstest]
+    #[case::live_tv_channel("MediaBrowser.Controller.LiveTv.LiveTvChannel")]
+    #[case::live_tv_program("MediaBrowser.Controller.LiveTv.LiveTvProgram")]
+    #[case::channel("MediaBrowser.Controller.Channels.Channel")]
+    fn a_kind_outside_the_library_is_not_announced(#[case] type_name: &str) {
+        let mut item = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        item.type_ = type_name.to_owned();
+        assert!(!LibraryChangedNotifier::filter_item(&item));
+    }
+
+    #[test]
+    fn only_a_real_channel_id_puts_an_item_in_a_channel() {
+        let mut item = movie(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        item.channel_id = Some(Uuid::new_v4().to_string());
+        assert!(!LibraryChangedNotifier::filter_item(&item));
+        let mut unknown = item.clone();
+        unknown.type_ = "Not.A.Known.Type".to_owned();
+        assert!(!LibraryChangedNotifier::filter_item(&unknown));
+
+        for empty in [
+            Uuid::nil().to_string(),
+            String::new(),
+            "not-a-guid".to_owned(),
+        ] {
+            item.channel_id = Some(empty);
+            assert!(LibraryChangedNotifier::filter_item(&item));
+        }
     }
 
     /// Jellyfin 12's window (jellyfin/jellyfin#17762): it runs from the first
