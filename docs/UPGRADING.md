@@ -1,12 +1,179 @@
 # Upgrading Ferrofin
 
 Operator-facing notes for upgrades that need a manual step or change behaviour in a
-way the release notes do not make obvious. Newest first. `CHANGELOG.md` lists *what*
-changed; this file says *what you have to do about it*.
+way the release notes do not make obvious. Newest first. The release notes on
+GitHub list *what* changed; this file says *what you have to do about it*.
 
 Ferrofin's own database upgrades in place: start the new version against the same
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
+
+## Kubernetes: stop the old pod first for heavy migrations
+
+The Helm chart's default rolling update keeps the old pod serving and writing the database
+until the new one is ready, so the two versions overlap for the whole of the new pod's
+migrations and one-shot repairs. The
+[chart README](../charts/ferrofin/README.md#upgrades-and-the-database) lists what can happen in
+that window. Docker, the Debian package and a tarball install have no overlap: the old server
+stops before the new one starts.
+
+**Stop the old pod first** for an upgrade with heavy migrations: one whose notes in this file
+name a numbered migration or a one-time repair. Skipping releases adds up the notes of every
+release you skip. If in doubt and you can afford the stop, stop first. Add
+`--set strategy.type=Recreate` to that one `helm upgrade`:
+
+```bash
+helm upgrade ferrofin oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin --version <new> \
+  -n ferrofin -f my-values.yaml --set strategy.type=Recreate
+```
+
+Kubernetes then stops the old pod before it starts the new one, so playback stops for the whole
+boot and only one version ever touches the database. Your next `helm upgrade` without the `--set`
+is a rolling update again, unless it uses `--reuse-values`. If your values live in Git (Argo CD, Flux), set
+`strategy.type: Recreate` for that sync.
+
+If you pass `--wait`, give it a `--timeout` longer than the migrations: past it the Helm release
+is marked failed while the migration goes on running. Do not use `--atomic` or
+`--rollback-on-failure` for such an upgrade. They roll back to a version that cannot open a
+database the new one has already migrated.
+
+Back up the data directory first, as for any major upgrade.
+
+## Unreleased — the Collections library becomes a real library
+
+Usually nothing to do. A server that has made a collection stored its Collections library as a
+bare database row at `{data}/collections`, which the dashboard did not list and which had no
+settings. A one-time repair at the first boot on this release replaces it with a library like
+Jellyfin's: `root/default/Collections` with a shortcut to `{data}/collections`, listed under
+Dashboard → Libraries, with box sets under a plain folder for that directory.
+
+- The library's id changes, and with it the `ParentId` of every box set. Users keep their access:
+  a user's enabled and blocked libraries and their other library lists move to the new id, and
+  so do the old row's user data and image.
+- A library that already lists `{data}/collections`, such as one adopted from Jellyfin, is kept
+  under its own name, and the box sets of both rows end up together in it. Otherwise the new
+  library takes the old row's name. If a library of yours with other locations already has that
+  name, it is left alone and the new one is numbered (`Collections2`), as Jellyfin numbers it.
+- Removing the Collections library from the dashboard now removes its box sets from the
+  database at the next scan, as it does on Jellyfin. Unlike Jellyfin, Ferrofin does not read
+  them back from `{data}/collections` when the library is made again (gl-1072), so do not remove
+  it to rename or reset it. Their folders on disk stay.
+- Before it changes anything, the boot copies the database beside itself as
+  `<database>.pre-collections-library` (`ferrofin.db.pre-collections-library` on most servers). It
+  is safe to delete once the server has run well on this release. It is not a way back to Jellyfin:
+  that is `jellyfin.db.pre-ferrofin`.
+- If the library cannot be made (the `root` directory is read-only, for one) or the copy cannot be
+  written, the log says so with a warning, the server starts and works as it did, and the next boot
+  tries again.
+- On a Kubernetes rolling update the old pod is still serving while this runs. A box set it creates
+  lands in the new folder. A user's library access saved through it in that moment can name the old
+  id, which nothing moves afterwards, so check such a user or
+  [stop the old pod first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
+
+## Unreleased — a mount that does not answer is left out of the drive list
+
+Nothing to do, unless your network storage is slow to answer. The library wizard's drive list
+(`GET /Environment/Drives`) now gives each mount 2 s and lists the ones that answered. A mount
+that hangs no longer freezes the server, and it returns to the list once it answers. A mount
+that regularly takes longer than 2 s, such as a NAS waking its disks, is missing from the list
+even though it is healthy: type its path into the folder picker instead.
+
+While a mount hangs, the folder picker, the log pages and the fallback fonts can stop until it
+answers, for local disks too, once 32 calls are stuck on it. Everything else keeps working.
+
+If a script calls these routes, some answers changed to match Jellyfin 12.4:
+`GET /Environment/DirectoryContents` is a `404` for a path that is no directory (it was an empty
+list), and `POST /Environment/ValidatePath` with `ValidateWritable` is a `500` for a read-only
+directory and a `404` when the path is a file (both were `400`).
+
+## Unreleased — the Helm chart's notes on rolling updates and RWX volumes are corrected
+
+Nothing changes in the chart's behaviour, and the default stays `RollingUpdate`, but what it told
+you was wrong in two ways. If you run the chart, read this once.
+
+- **Concurrent access during a rolling update is not simply "safe".** SQLite's locks keep the
+  file intact on one node, but the old and new versions overlap, as described under
+  [Kubernetes](#kubernetes-stop-the-old-pod-first-for-heavy-migrations) above.
+- **RWX across nodes was never safe.** The chart used to accept RWX as a way to mount the volume
+  twice. SQLite's write-ahead log cannot be shared between hosts, so a surge pod on a second node
+  over NFS or CephFS can corrupt the database. If that describes your release, set
+  `strategy.type: Recreate`, or keep both pods on one node as the
+  [chart README](../charts/ferrofin/README.md#storage-one-node-at-a-time) shows, before your next
+  upgrade.
+
+## Unreleased — the first Refresh People may create people and look them up
+
+Nothing to do. The **Refresh People** task now creates the person item a credit has none of,
+as Jellyfin 12 does, and looks each new person up once with the metadata providers. A library
+scanned by Ferrofin or adopted from Jellyfin already has an item for nearly every credit, so
+few are new. A database with credits and no items behind them gets them all on the first run,
+which then takes as long as those lookups do. The task also stops deleting locked people and
+people a provider renamed, so such an item no longer disappears with its images and metadata.
+
+## Unreleased — idle connections are closed after 130 s
+
+Usually nothing to do. A connection with no request under way is now closed after 130 s, and a
+request whose headers have not all arrived 30 s after its first byte is answered `408` and closed.
+These are the limits of Jellyfin's web server (Kestrel's `KeepAliveTimeout` and
+`RequestHeadersTimeout`), and clients reconnect on their own, as they do with Jellyfin. They do not
+apply while a request runs or to a WebSocket. A reverse proxy that keeps idle upstream connections
+open for longer than 130 s (nginx `keepalive_timeout` under `upstream`, Traefik's or HAProxy's idle
+timeouts) may reuse one just as Ferrofin closes it. Keep that timeout below 130 s, as you would for
+Jellyfin.
+
+## Unreleased — every image tag changes once; clients download artwork again once
+
+Nothing to do. An image's cache tag (`ImageTags`, `BackdropImageTags`, the blurhash keys and
+every other `*ImageTag`) now hashes the path of the item that owns the image, as Jellyfin's
+does, where it hashed the image file's path. Every tag therefore changes once after the
+upgrade, and clients, which cache artwork by tag, fetch each image again the first time they
+show it. The tags are then the ones Jellyfin serves for the same database, so a client that
+talks to both servers, or one carried over from Jellyfin by adopting its database, shares
+cached artwork with it. The server's own resized-image cache is keyed on the image file, not on
+the tag, and is kept. A user's profile image keeps its tag (Jellyfin hashes the image's own path
+there too).
+
+## Unreleased — the WebSocket minimum stream period setting is gone
+
+Usually nothing to do. `FERROFIN_WS_MIN_STREAM_PERIOD_MS` (`websocket_min_stream_period_ms` in
+`config.toml`), added in 1.4.0, floored the period a dashboard WebSocket stream was pushed at.
+Every stream is now sent when something happens, as Jellyfin's are, and a client's period only
+spaces out low-priority updates (session activity, task progress), so there is nothing left to
+floor. Remove the variable and the key: the variable is no longer read, and the key is ignored
+with a startup warning.
+
+## Unreleased — `config.toml` warns about the keys it ignores
+
+Usually nothing to do. A key the server cannot use, a misspelling or a variable's stem written
+where the key is spelled otherwise (`tvdb_pin`, `omdb_key`, `log`, …), never applied; it is now
+a warning at startup that names it and, for a stem, the key to use. Rename such keys as the
+warning says (the six keys that are not their variable's stem are listed in
+`docs/CONFIG.md`). A number or on/off variable that does not parse (`FERROFIN_PORT=80g`) is
+still ignored and now warns too; one with blanks around the value (`" 45 "`) is now read.
+
+## Unreleased — `{data_dir}/config.toml` is read for every data directory, and a dashboard restart reloads it
+
+- **A `config.toml` in the data directory now applies however the data directory is named.**
+  It used to be read only when `FERROFIN_DATA_DIR` named the data directory: a server started
+  with `--data-dir`, or on the default data directory (`$XDG_DATA_HOME/ferrofin`,
+  `~/.local/share/ferrofin`, `/var/lib/ferrofin`), ignored it. If such a file was left there
+  and forgotten, its settings (the port, the bind address, `base_url` and the rest) take
+  effect at the next start: check `{data_dir}/config.toml` before upgrading. The startup log
+  now names the file it read (`config_file`, `config_file_found`). With both `--data-dir`
+  and `FERROFIN_DATA_DIR`, the file is read from the flag's directory, as the data is.
+  The Docker image (it sets `FERROFIN_DATA_DIR`) and the Debian package (its unit passes
+  `--config`) are unaffected.
+- **A blank `FERROFIN_CONFIG_FILE` counts as unset.** It used to name an empty path, so no
+  file was read at all; now `{data_dir}/config.toml` is read, as when the variable is unset.
+- **A `data_dir` key in a `config.toml` found in the data directory is ignored**, with a
+  warning in the log: the file cannot move the directory it was found in. It still applies
+  in a file named by `--config` or `FERROFIN_CONFIG_FILE`.
+- **Dashboard → Restart applies `config.toml`.** The in-process restart used to come back
+  on the configuration the process started with; it now loads `config.toml` again, so an
+  edit made and forgotten applies at the next dashboard restart. The data, configuration and
+  cache directories, `log_level`, `log_format` and `metrics_scan_duration_buckets` still need a
+  restart of the process (the log names any that changed). A `config.toml` that no longer loads is logged as an error
+  and the server comes back on its previous configuration.
 
 ## Unreleased — Live TV sources and guides follow Jellyfin more closely
 
@@ -60,7 +227,8 @@ upgrade.
   `0007`, `0032` and `0044`, and the adoption copy `jellyfin.db.pre-ferrofin`, still stop
   the boot when they cannot be written.
 - **No cut-short copies.** Every copy (`jellyfin.db.pre-ferrofin`, `.pre-NNNN`, and the boot
-  repairs' `.pre-rehome`, `.pre-season-ids`, `.pre-playlist-folders` and `.pre-harmonize`)
+  repairs' `.pre-rehome`, `.pre-season-ids`, `.pre-playlist-folders`, `.pre-collections-library`
+  and `.pre-harmonize`)
   is written to `<name>.partial`, flushed to disk and only then renamed. A full disk or a
   killed server therefore never leaves a partial file under the real name. The next attempt
   at that copy deletes a leftover `.partial`; you can also delete one yourself while the
@@ -76,7 +244,9 @@ upgrade.
   update), the write-ahead log cannot be folded into the file first. After waiting up to 30
   seconds, Ferrofin then takes the copy with SQLite's `VACUUM INTO`, which still holds every
   committed change, and logs a warning that names the cause. Before, such a copy missed what
-  was still in the write-ahead log, and could be unreadable. Stop the other program before
+  was still in the write-ahead log, and could be unreadable. If the other program writes while
+  an ordinary copy is being made, Ferrofin takes the copy again the same way, because it could
+  hold half of a checkpoint. Stop the other program before
   you upgrade anyway, and always before you adopt: the migrations run with it attached, and
   adopting a database Jellyfin is still using is not safe even with a good copy.
 

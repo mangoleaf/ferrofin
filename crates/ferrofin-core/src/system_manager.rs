@@ -712,7 +712,7 @@ mod tests {
         let storage = mgr.get_system_storage_info().await.unwrap();
         assert_eq!(storage.program_data_folder.free_space, 100);
         assert_eq!(storage.cache_folder.used_space, 50);
-        assert!(storage.libraries.is_empty());
+        assert!(storage.libraries.is_empty(), "{:?}", storage.libraries);
         assert!(storage.transcoding_temp_folder.path.ends_with("transcodes"));
     }
 

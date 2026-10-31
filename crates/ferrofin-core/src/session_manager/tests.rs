@@ -12,6 +12,7 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_db::enums::PermissionKind;
 use ferrofin_db::store::guid_to_db;
 use ferrofin_model::configuration::ServerConfiguration;
+use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::dto::{BaseItemDto, SessionInfoDto};
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::{ClientCapabilities, MessageCommand, SessionMessageType};
@@ -73,8 +74,9 @@ impl ServerConfigurationManager for FixedConfig {
     }
 }
 
-/// A DTO service that is never invoked by the tested paths (the manager holds it
-/// only for the deferred now-playing-item enrichment).
+/// A DTO service for the tests that do not look at a `NowPlayingItem`: a
+/// playback report naming a library item still builds one, which is the bare
+/// item (its id and name). [`RecordingDtoService`] serves the tests that look.
 struct UnusedDtoService;
 
 #[async_trait]
@@ -96,13 +98,20 @@ impl DtoService for UnusedDtoService {
     }
     async fn get_base_item_dtos(
         &self,
-        _items: &[BaseItemEntity],
+        items: &[BaseItemEntity],
         _options: &DtoOptions,
         _user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        unreachable!("dto service is not exercised by these tests")
+        Ok(items
+            .iter()
+            .map(|row| BaseItemDto {
+                id: Uuid::parse_str(&row.id).expect("item id"),
+                name: row.name.clone(),
+                ..BaseItemDto::default()
+            })
+            .collect())
     }
     async fn get_item_by_name_dto(
         &self,
@@ -459,7 +468,8 @@ async fn additional_users_add_and_remove() {
         .iter()
         .find(|s| s.id.as_deref() == Some(&session_id))
         .unwrap();
-    assert!(s.additional_users.as_ref().unwrap().is_empty());
+    let additional_users = s.additional_users.as_ref().unwrap();
+    assert!(additional_users.is_empty(), "{additional_users:?}");
 }
 
 #[tokio::test]
@@ -543,7 +553,7 @@ async fn bus_connected_session_is_controllable_and_receives_play() {
         .get_sessions(user_id, None, None, Some(user_id), false)
         .await
         .unwrap();
-    assert!(listed.is_empty());
+    assert!(listed.is_empty(), "{listed:?}");
 
     // The `/socket` handler registers a sink on the bus for this session.
     let received = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -630,7 +640,7 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
             .fetch_one(db.pool())
             .await
             .unwrap();
-    assert!(!persisted.is_empty());
+    assert_ne!(persisted, "");
     assert_eq!(
         result.access_token.expose(),
         persisted.as_str(),
@@ -1092,7 +1102,195 @@ async fn report_session_ended_removes_the_session() {
         .get_sessions(Uuid::nil(), None, None, None, true)
         .await
         .unwrap();
-    assert!(sessions.is_empty());
+    assert!(sessions.is_empty(), "{sessions:?}");
+}
+
+/// Every session event raised since the last call.
+fn raised(
+    events: &mut tokio::sync::broadcast::Receiver<ferrofin_traits::session::SessionEvent>,
+) -> Vec<ferrofin_traits::session::SessionEvent> {
+    std::iter::from_fn(|| events.try_recv().ok()).collect()
+}
+
+/// The `ISessionManager` events `SessionInfoWebSocketListener` listens to are
+/// raised once per change: a new session raises `SessionStarted` and, its
+/// `LastActivityDate` being `DateTime.MinValue` upstream, also
+/// `SessionActivity`; a request on a session active within the last 10 s
+/// raises neither (`GetSessionInfo` → `OnSessionStarted` only on creation; see
+/// `session_activity_is_raised_only_past_ten_idle_seconds`); each
+/// playback report raises its own, with `IsAutomated` carried through
+/// (`SessionManager.cs:961`); and a session ends once, however it leaves the
+/// pool, while ending an unknown one raises nothing (`ReportSessionEnded`).
+#[tokio::test]
+async fn each_session_change_raises_its_websocket_event_once() {
+    use ferrofin_model::data::BaseItemKind;
+    use ferrofin_model::session::{PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo};
+    use ferrofin_traits::session::SessionEvent;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let item_id = Uuid::new_v4();
+    crate::test_support::seed_item(&db, item_id, BaseItemKind::Movie).await;
+
+    let session_id = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    assert_eq!(
+        raised(&mut events),
+        [SessionEvent::SessionStarted, SessionEvent::SessionActivity]
+    );
+    mgr.log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    assert_eq!(raised(&mut events), [], "a known session starts nothing");
+
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: Some(session_id.clone()),
+        item_id,
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::PlaybackStart]);
+    for is_automated in [false, true] {
+        let progress = PlaybackProgressInfo {
+            session_id: Some(session_id.clone()),
+            item_id,
+            ..PlaybackProgressInfo::default()
+        };
+        mgr.on_playback_progress(&progress, is_automated)
+            .await
+            .unwrap();
+        assert_eq!(
+            raised(&mut events),
+            [SessionEvent::PlaybackProgress { is_automated }]
+        );
+    }
+    mgr.on_playback_stopped(&PlaybackStopInfo {
+        session_id: Some(session_id.clone()),
+        item_id,
+        ..PlaybackStopInfo::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::PlaybackStopped]);
+
+    mgr.close_if_needed(&session_id).await.unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::SessionEnded]);
+    mgr.report_session_ended(&session_id).await.unwrap();
+    assert_eq!(raised(&mut events), [], "an unknown session ends nothing");
+}
+
+/// `LogSessionActivity` raises `SessionActivity` only when the session's
+/// previous activity is more than 10 s old (`SessionManager.cs:281-289`).
+/// The idle time is set on the session, not slept.
+#[tokio::test]
+async fn session_activity_is_raised_only_past_ten_idle_seconds() {
+    use ferrofin_traits::session::SessionEvent;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let session_id = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
+
+    for (idle_secs, expected) in [(5, vec![]), (11, vec![SessionEvent::SessionActivity])] {
+        active_at(
+            &mgr,
+            &session_id,
+            Utc::now() - chrono::Duration::seconds(idle_secs),
+        )
+        .await;
+        mgr.log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+            .await
+            .unwrap();
+        assert_eq!(raised(&mut events), expected, "idle {idle_secs} s");
+    }
+}
+
+/// `ReportCapabilities(…, saveCapabilities: true)` raises
+/// `CapabilitiesChanged` once (`SessionManager.cs:1901-1918`); an unknown
+/// session fails before anything is stored and raises nothing.
+#[tokio::test]
+async fn reporting_capabilities_raises_capabilities_changed_once() {
+    use ferrofin_traits::session::SessionEvent;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
+    let session_id = mgr
+        .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
+        .await
+        .unwrap()
+        .id
+        .unwrap();
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
+
+    mgr.report_capabilities(&session_id, &ClientCapabilities::default())
+        .await
+        .unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::CapabilitiesChanged]);
+    mgr.report_capabilities("unknown", &ClientCapabilities::default())
+        .await
+        .unwrap_err();
+    assert_eq!(raised(&mut events), []);
+}
+
+/// A logout ends the device's session through `ReportSessionEnded`, so the
+/// `Sessions` stream hears of it like any other end.
+#[tokio::test]
+async fn a_logout_raises_session_ended() {
+    use ferrofin_traits::session::SessionEvent;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "alice").await;
+    set_permission(&db, &user.id, PermissionKind::EnableAllDevices, true)
+        .await
+        .unwrap();
+    let token = sign_in(&mgr, user_id, "dev-1").await;
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
+
+    mgr.logout(&token).await.unwrap();
+    assert_eq!(raised(&mut events), [SessionEvent::SessionEnded]);
+}
+
+/// The idle check stops a silent playback through `OnPlaybackStopped`, so the
+/// `Sessions` stream hears `PlaybackStopped` as for a client's own stop.
+#[tokio::test]
+async fn an_idle_playback_stop_raises_playback_stopped() {
+    use ferrofin_traits::session::SessionEvent;
+
+    let db = test_db().await;
+    let mgr = manager(&db);
+    let (session_id, _, _) = playing_session(&db, &mgr, "dev-idle", Some(1), false).await;
+    let now = Utc::now();
+    checked_in_at(&mgr, &session_id, now - chrono::Duration::seconds(301)).await;
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
+
+    mgr.check_for_idle_playback(now).await;
+    assert_eq!(raised(&mut events), [SessionEvent::PlaybackStopped]);
 }
 
 /// A [`UserDataManager`](ferrofin_traits::library::UserDataManager) decorator
@@ -1375,8 +1573,9 @@ async fn progress_remembers_the_reported_audio_and_subtitle_tracks() {
     );
 }
 
-/// A media-source manager that records every `close_live_stream` id. Only the
-/// live-stream half of the trait is reachable from the session manager.
+/// A media-source manager that records every `close_live_stream` id. A
+/// playback report's `NowPlayingItem` build also looks up its media source,
+/// which finds none here.
 struct RecordingMediaSources {
     closed: Mutex<Vec<String>>,
 }
@@ -1410,7 +1609,7 @@ impl ferrofin_traits::library::MediaSourceManager for RecordingMediaSources {
         _enable_path_substitution: bool,
         _user_id: Option<Uuid>,
     ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
-        unreachable!("not reached from the session manager")
+        Ok(Vec::new())
     }
     async fn open_live_stream(
         &self,
@@ -1420,9 +1619,9 @@ impl ferrofin_traits::library::MediaSourceManager for RecordingMediaSources {
     }
     async fn get_live_stream(
         &self,
-        _id: &str,
+        id: &str,
     ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
-        unreachable!("not reached from the session manager")
+        Err(ServiceError::NotFound(format!("live stream {id}")))
     }
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError> {
         self.closed
@@ -2173,6 +2372,8 @@ async fn the_sessions_live_stream_follows_the_reports() {
 /// capabilities map is never evicted.
 #[tokio::test]
 async fn a_recreated_session_inherits_the_devices_capabilities() {
+    use ferrofin_traits::session::SessionEvent;
+
     let db = test_db().await;
     let mgr = manager(&db);
     let user = seed_named_user(&db, Uuid::new_v4(), "alice").await;
@@ -2207,6 +2408,11 @@ async fn a_recreated_session_inherits_the_devices_capabilities() {
     );
 
     // The client's next request recreates it — same id, capabilities intact.
+    // Inheriting them is `ReportCapabilities(…, saveCapabilities: false)`,
+    // which raises no `CapabilitiesChanged`.
+    let mut events = mgr
+        .subscribe_session_events()
+        .expect("the session manager raises events");
     let again = mgr
         .log_session_activity("Web", "1.0", "dev-1", "TV", "e", Some(&user))
         .await
@@ -2215,6 +2421,10 @@ async fn a_recreated_session_inherits_the_devices_capabilities() {
     assert!(
         again.supports_media_control,
         "the recreated session inherits the device's reported capabilities"
+    );
+    assert_eq!(
+        raised(&mut events),
+        [SessionEvent::SessionStarted, SessionEvent::SessionActivity]
     );
 }
 
@@ -2748,7 +2958,8 @@ async fn casting_a_nonexistent_id_contributes_nothing() {
         .unwrap();
 
     // C# logs and drops the id rather than failing the whole command.
-    assert!(pushed_item_ids(&only_pushed_data(&received)).is_empty());
+    let found = pushed_item_ids(&only_pushed_data(&received));
+    assert!(found.is_empty(), "{found:?}");
 }
 
 #[tokio::test]
@@ -3228,7 +3439,7 @@ async fn remote_control_permission_gates_delivery_and_saved_changes() {
     mgr.remove_additional_user(&target, alice_id).await.unwrap();
     mgr.assert_can_control("", &target).await.unwrap();
     let public = mgr
-        .upsert_session("Public", "1", "shared", "Shared", "e", None)
+        .log_session_activity("Public", "1", "shared", "Shared", "e", None)
         .await
         .unwrap()
         .id
@@ -3261,7 +3472,7 @@ async fn shared_device_filter_uses_the_requested_user_and_device_access() {
     .await
     .unwrap();
     let public = mgr
-        .upsert_session("Public", "1", "shared", "Shared", "e", None)
+        .log_session_activity("Public", "1", "shared", "Shared", "e", None)
         .await
         .unwrap()
         .id
@@ -3304,27 +3515,24 @@ async fn shared_device_filter_uses_the_requested_user_and_device_access() {
             "API key filters by the named user's sharing preference"
         );
     }
-    assert!(
-        mgr.get_sessions(id, None, None, Some(Uuid::new_v4()), false)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let sessions = mgr
+        .get_sessions(id, None, None, Some(Uuid::new_v4()), false)
+        .await
+        .unwrap();
+    assert!(sessions.is_empty(), "{sessions:?}");
     set_permission(&db, &alice.id, PermissionKind::EnableAllDevices, false)
         .await
         .unwrap();
-    assert!(
-        mgr.get_sessions(id, None, None, Some(id), false)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        !mgr.get_sessions(Uuid::nil(), None, None, Some(id), true)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let sessions = mgr
+        .get_sessions(id, None, None, Some(id), false)
+        .await
+        .unwrap();
+    assert!(sessions.is_empty(), "{sessions:?}");
+    let sessions = mgr
+        .get_sessions(Uuid::nil(), None, None, Some(id), true)
+        .await
+        .unwrap();
+    assert!(!sessions.is_empty(), "{sessions:?}");
 }
 
 /// `SessionManager.GetProgressItem` (`SessionManager.cs:742-756`): playing a
@@ -3658,6 +3866,16 @@ async fn checked_in_at(mgr: &FerrofinSessionManager, session_id: &str, at: DateT
     session.last_playback_check_in = at;
 }
 
+/// Moves a session's `LastActivityDate` back to `at`.
+async fn active_at(mgr: &FerrofinSessionManager, session_id: &str, at: DateTime<Utc>) {
+    let mut sessions = mgr.sessions.lock().await;
+    let session = sessions
+        .values_mut()
+        .find(|s| s.id == session_id)
+        .expect("session");
+    session.last_activity_date = at;
+}
+
 /// When the session last did something (`LastActivityDate`).
 async fn activity_of(mgr: &FerrofinSessionManager, session_id: &str) -> DateTime<Utc> {
     mgr.sessions
@@ -3892,7 +4110,8 @@ async fn a_session_paused_past_the_threshold_is_told_to_stop() {
     // Paused nine minutes against a ten-minute threshold: nothing.
     paused_since(&mgr, &session_id, now - chrono::Duration::minutes(9)).await;
     mgr.check_for_inactive_streams(10, now).await;
-    assert!(playstates(&connection).is_empty());
+    let found = playstates(&connection);
+    assert!(found.is_empty(), "{found:?}");
 
     // Past it: one `Stop`, at the paused position, from the session's user.
     paused_since(&mgr, &session_id, now - chrono::Duration::minutes(11)).await;
@@ -3916,3 +4135,366 @@ fn the_idle_check_runs_every_fifth_minute() {
         .collect();
     assert_eq!(due, [5, 10]);
 }
+
+/// A DTO service that records the options and user of each build and answers
+/// with the bare item (id, name, runtime). It sets `MediaStreams` to an empty
+/// list only when the options ask for it, so a test can tell the DTO's own
+/// streams from those the session manager puts on.
+#[derive(Default)]
+struct RecordingDtoService {
+    builds: Mutex<Vec<(DtoOptions, bool)>>,
+}
+
+impl RecordingDtoService {
+    /// The options of every build so far.
+    fn options(&self) -> Vec<DtoOptions> {
+        self.builds
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(options, _)| options.clone())
+            .collect()
+    }
+}
+
+#[async_trait]
+impl DtoService for RecordingDtoService {
+    async fn get_primary_image_aspect_ratio(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Option<f64>, ServiceError> {
+        unreachable!("not reached from a NowPlayingItem build")
+    }
+    async fn get_base_item_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        unreachable!("not reached from a NowPlayingItem build")
+    }
+    async fn get_base_item_dtos(
+        &self,
+        items: &[BaseItemEntity],
+        options: &DtoOptions,
+        user: Option<&UserEntity>,
+        _owner_id: Option<Uuid>,
+        _skip_visibility_check: bool,
+    ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        self.builds
+            .lock()
+            .unwrap()
+            .push((options.clone(), user.is_some()));
+        Ok(items
+            .iter()
+            .map(|row| BaseItemDto {
+                id: Uuid::parse_str(&row.id).expect("item id"),
+                name: row.name.clone(),
+                run_time_ticks: row.run_time_ticks,
+                media_streams: options
+                    .contains_field(ferrofin_model::querying::ItemFields::MediaStreams)
+                    .then(Vec::new),
+                ..BaseItemDto::default()
+            })
+            .collect())
+    }
+    async fn get_item_by_name_dto(
+        &self,
+        _item: &BaseItemEntity,
+        _options: &DtoOptions,
+        _tagged_item_ids: Option<&[Uuid]>,
+        _user: Option<&UserEntity>,
+    ) -> Result<BaseItemDto, ServiceError> {
+        unreachable!("not reached from a NowPlayingItem build")
+    }
+}
+
+/// A media-source manager over canned sources: the item's static sources and
+/// the open live streams. It counts the static lookups, so a test can tell
+/// that none was made.
+struct CannedSources {
+    static_sources: Vec<ferrofin_model::dto::MediaSourceInfo>,
+    live_streams: Vec<ferrofin_model::dto::MediaSourceInfo>,
+    static_lookups: Mutex<usize>,
+}
+
+#[async_trait]
+impl ferrofin_traits::library::MediaSourceManager for CannedSources {
+    async fn get_media_streams(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::entities_media::MediaStream>, ServiceError> {
+        unreachable!("not reached from a NowPlayingItem build")
+    }
+    async fn get_media_attachments(
+        &self,
+        _item_id: Uuid,
+    ) -> Result<Vec<ferrofin_model::entities_media::MediaAttachment>, ServiceError> {
+        unreachable!("not reached from a NowPlayingItem build")
+    }
+    async fn get_playback_media_sources(
+        &self,
+        _item_id: Uuid,
+        _user_id: Uuid,
+        _allow_media_probe: bool,
+        _enable_path_substitution: bool,
+    ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
+        unreachable!("not reached from a NowPlayingItem build")
+    }
+    async fn get_static_media_sources(
+        &self,
+        _item_id: Uuid,
+        enable_path_substitution: bool,
+        user_id: Option<Uuid>,
+    ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
+        // C# `GetMediaSource(…, enablePathSubstitution: false)` with no user.
+        assert!(!enable_path_substitution);
+        assert_eq!(user_id, None);
+        *self.static_lookups.lock().unwrap() += 1;
+        Ok(self.static_sources.clone())
+    }
+    async fn open_live_stream(
+        &self,
+        _request: &ferrofin_model::media_info::LiveStreamRequest,
+    ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
+        unreachable!("not reached from a NowPlayingItem build")
+    }
+    async fn get_live_stream(
+        &self,
+        id: &str,
+    ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
+        self.live_streams
+            .iter()
+            .find(|s| s.live_stream_id.as_deref() == Some(id))
+            .cloned()
+            .ok_or_else(|| ServiceError::NotFound(format!("live stream {id}")))
+    }
+    async fn close_live_stream(&self, _id: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+}
+
+/// A source with one stream of `index` and the runtime `ticks`.
+fn canned_source(
+    id: &str,
+    live_stream_id: Option<&str>,
+    index: i32,
+    ticks: Option<i64>,
+) -> ferrofin_model::dto::MediaSourceInfo {
+    ferrofin_model::dto::MediaSourceInfo {
+        id: Some(id.to_owned()),
+        live_stream_id: live_stream_id.map(str::to_owned),
+        run_time_ticks: ticks,
+        media_streams: vec![ferrofin_model::entities_media::MediaStream {
+            index,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// The runtime the seeded item itself carries, which no canned source has.
+const ITEM_TICKS: i64 = 1_000;
+
+/// What a session playing an item of `kind` shows as its `NowPlayingItem`
+/// after a start report naming `media_source_id` and `live_stream_id`, and the
+/// options of every DTO build. `wired` attaches the media-source manager. The
+/// item's own source has stream 0 and 100 ticks, another version's has
+/// stream 1 and 200 ticks, and the open live stream `live-1` has stream 2 and
+/// no runtime.
+async fn now_playing_after(
+    kind: BaseItemKind,
+    media_source_id: Option<&str>,
+    live_stream_id: Option<&str>,
+    wired: bool,
+) -> (Option<BaseItemDto>, Vec<DtoOptions>, usize) {
+    use ferrofin_model::session::PlaybackStartInfo;
+
+    let db = test_db().await;
+    let config: Arc<dyn ServerConfigurationManager> = Arc::new(FixedConfig {
+        config: default_server_configuration(),
+    });
+    let dtos = Arc::new(RecordingDtoService::default());
+    let item_id = Uuid::new_v4();
+    let sources = Arc::new(CannedSources {
+        static_sources: vec![
+            canned_source(&item_id.simple().to_string(), None, 0, Some(100)),
+            canned_source("5d2c5a3e9b8f4c1aa0e1d2c3b4a59687", None, 1, Some(200)),
+        ],
+        live_streams: vec![canned_source("live-source", Some("live-1"), 2, None)],
+        static_lookups: Mutex::new(0),
+    });
+    let mut mgr = FerrofinSessionManager::new(
+        Arc::new(FerrofinUserManager::new(db.clone())),
+        Arc::new(FerrofinDeviceManager::new(db.clone())),
+        Arc::new(FerrofinUserDataManager::new(db.clone(), config)),
+        library_manager(&db),
+        Arc::clone(&dtos) as Arc<dyn DtoService>,
+        Arc::new(FerrofinEventManager::new()) as Arc<dyn ferrofin_traits::events::EventManager>,
+        db.clone(),
+        "server-1".to_owned(),
+    );
+    if wired {
+        mgr = mgr.with_media_sources(
+            Arc::clone(&sources) as Arc<dyn ferrofin_traits::library::MediaSourceManager>
+        );
+    }
+
+    crate::test_support::seed_item(&db, item_id, kind).await;
+    let mut row = crate::test_support::fetch_item(&db, item_id).await;
+    row.run_time_ticks = Some(ITEM_TICKS);
+    crate::test_support::save_item(&db, &row).await;
+    let user = seed_named_user(&db, Uuid::new_v4(), "watcher").await;
+    let session = mgr
+        .log_session_activity("Web", "1.0", "dev-now-playing", "TV", "e", Some(&user))
+        .await
+        .unwrap();
+    mgr.on_playback_start(&PlaybackStartInfo {
+        session_id: session.id.clone(),
+        item_id,
+        media_source_id: media_source_id.map(str::to_owned),
+        live_stream_id: live_stream_id.map(str::to_owned),
+        ..PlaybackStartInfo::default()
+    })
+    .await
+    .unwrap();
+
+    let listed = mgr
+        .get_sessions(Uuid::nil(), None, None, None, true)
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    let item = listed.into_iter().next().unwrap().now_playing_item;
+    if let Some(item) = &item {
+        assert_eq!(item.id, item_id);
+    }
+    let lookups = *sources.static_lookups.lock().unwrap();
+    let built_for_user = dtos.builds.lock().unwrap().iter().any(|(_, user)| *user);
+    assert!(!built_for_user, "C# GetItemInfo builds with no user");
+    (item, dtos.options(), lookups)
+}
+
+/// The indices of the streams a `NowPlayingItem` carries, `None` when it has
+/// no `MediaStreams` at all.
+fn stream_indices(item: &BaseItemDto) -> Option<Vec<i32>> {
+    item.media_streams
+        .as_ref()
+        .map(|streams| streams.iter().map(|s| s.index).collect())
+}
+
+/// C# `SessionManager.GetItemInfo` builds a session's `NowPlayingItem` from
+/// every field but this list, with no program recording info, then puts the
+/// reported media source's streams on it. `UpdateNowPlayingItem` gives it
+/// that source's runtime.
+#[tokio::test]
+async fn the_now_playing_item_is_upstreams_trimmed_item_info() {
+    use ferrofin_model::querying::ItemFields;
+
+    let (item, options, _) = now_playing_after(
+        BaseItemKind::Movie,
+        Some("5D2C5A3E-9B8F-4C1A-A0E1-D2C3B4A59687"),
+        None,
+        true,
+    )
+    .await;
+    let item = item.expect("a NowPlayingItem");
+
+    // `GetItemInfo`'s removals, verbatim (`People` is removed twice upstream).
+    let removed = [
+        ItemFields::CanDelete,
+        ItemFields::CanDownload,
+        ItemFields::ChildCount,
+        ItemFields::CustomRating,
+        ItemFields::DateLastMediaAdded,
+        ItemFields::DateLastRefreshed,
+        ItemFields::DateLastSaved,
+        ItemFields::DisplayPreferencesId,
+        ItemFields::Etag,
+        ItemFields::ItemCounts,
+        ItemFields::MediaSourceCount,
+        ItemFields::MediaStreams,
+        ItemFields::MediaSources,
+        ItemFields::People,
+        ItemFields::PlayAccess,
+        ItemFields::People,
+        ItemFields::ProductionLocations,
+        ItemFields::RecursiveItemCount,
+        ItemFields::RemoteTrailers,
+        ItemFields::SeasonUserData,
+        ItemFields::Settings,
+        ItemFields::SortName,
+        ItemFields::Tags,
+    ];
+    let expected: Vec<ItemFields> = DtoOptions::all_fields()
+        .into_iter()
+        .filter(|field| !removed.contains(field))
+        .collect();
+    assert_eq!(options.len(), 1, "one build per playing session");
+    assert_eq!(options[0].fields, expected);
+    assert!(!options[0].add_program_recording_info);
+    let defaults = DtoOptions::default();
+    assert_eq!(options[0].image_types, defaults.image_types);
+    assert_eq!(options[0].image_type_limit, defaults.image_type_limit);
+    assert!(options[0].enable_images && options[0].enable_user_data);
+
+    // The named version, matched in any spelling of its guid.
+    assert_eq!(stream_indices(&item), Some(vec![1]));
+    assert_eq!(item.run_time_ticks, Some(200));
+}
+
+/// Which media source the item shows (C# `MediaSourceManager.GetMediaSource`
+/// from `UpdateNowPlayingItem`): an open live stream wins; an empty
+/// `MediaSourceId` is the item's own id; an id naming no source, an item that
+/// is not `IHasMediaSources` (a book) and a manager without media sources
+/// show none, and keep the item's own runtime.
+#[rstest::rstest]
+#[case::named(BaseItemKind::Movie, Some("5d2c5a3e9b8f4c1aa0e1d2c3b4a59687"), None, true, Some(vec![1]), Some(200), 1)]
+#[case::none_named(BaseItemKind::Movie, None, None, true, Some(vec![0]), Some(100), 1)]
+#[case::empty_named(BaseItemKind::Episode, Some(""), None, true, Some(vec![0]), Some(100), 1)]
+#[case::unknown(
+    BaseItemKind::Movie,
+    Some("no-such-source"),
+    None,
+    true,
+    None,
+    Some(ITEM_TICKS),
+    1
+)]
+#[case::live_stream(BaseItemKind::Movie, Some("ignored"), Some("live-1"), true, Some(vec![2]), None, 0)]
+#[case::closed_live_stream(
+    BaseItemKind::Movie,
+    None,
+    Some("live-9"),
+    true,
+    None,
+    Some(ITEM_TICKS),
+    0
+)]
+#[case::audio(BaseItemKind::Audio, None, None, true, Some(vec![0]), Some(100), 1)]
+#[case::book(BaseItemKind::Book, None, None, true, None, Some(ITEM_TICKS), 0)]
+#[case::not_wired(BaseItemKind::Movie, None, None, false, None, Some(ITEM_TICKS), 0)]
+#[tokio::test]
+async fn the_now_playing_item_shows_the_reported_media_source(
+    #[case] kind: BaseItemKind,
+    #[case] media_source_id: Option<&str>,
+    #[case] live_stream_id: Option<&str>,
+    #[case] wired: bool,
+    #[case] streams: Option<Vec<i32>>,
+    #[case] ticks: Option<i64>,
+    #[case] static_lookups: usize,
+) {
+    let (item, _, lookups) = now_playing_after(kind, media_source_id, live_stream_id, wired).await;
+    let item = item.expect("a NowPlayingItem");
+    assert_eq!(stream_indices(&item), streams);
+    assert_eq!(item.run_time_ticks, ticks);
+    assert_eq!(lookups, static_lookups);
+}
+
+/// What a session request reads from its device: only the request that
+/// creates the session reads it.
+mod device_reads;
+
+/// The session's `NowPlayingItem`, built once per item on the report that
+/// names it, and the session summaries that read it.
+mod now_playing_item;

@@ -39,6 +39,11 @@ use crate::options::AuthorizationInfo;
 pub struct RequestContext {
     /// The request headers as `(name, value)` pairs. Header names are compared
     /// case-insensitively by the authorization logic, matching HTTP semantics.
+    ///
+    /// The HTTP layer gives [`AuthorizationContext`] and [`AuthService`] only
+    /// the headers they read (`Authorization`, `X-Emby-Authorization`,
+    /// `X-Emby-Token` and `X-MediaBrowser-Token`), and every header to the
+    /// other readers, such as the `Host` a system address is built from.
     pub headers: Vec<(String, String)>,
 
     /// The raw query string (without the leading `?`), if any. Jellyfin also
@@ -207,7 +212,7 @@ mod tests {
     #[test]
     fn default_request_context_is_empty() {
         let ctx = RequestContext::default();
-        assert!(ctx.headers.is_empty());
+        assert!(ctx.headers.is_empty(), "{:?}", ctx.headers);
         assert_eq!(ctx.query_string, None);
         assert_eq!(ctx.remote_endpoint, None);
     }

@@ -1,5 +1,5 @@
 """The messy-row shapes on a scratch SQLite database: each seeder, the end-state reader, and the
-comparison against Jellyfin 12.2's record and the written divergences (no docker, no fixtures)."""
+comparison against the oracle release's record and the written divergences (no docker, no fixtures)."""
 
 import contextlib
 from contextlib import closing
@@ -493,7 +493,7 @@ class Comparison(unittest.TestCase):
         failures = messy.compare(bad, self.ENTRY, oracle, "10.11")
         self.assertEqual(len(failures), 1)
         self.assertIn("deleted_user", failures[0])
-        self.assertIn("Jellyfin 12.2", failures[0])
+        self.assertIn("Jellyfin 12.4", failures[0])
 
     def test_a_written_divergence_replaces_the_oracle_for_that_shape_and_lineage_only(self):
         oracle = self.oracle(deleted_user=self.booted("deleted_user", self.KEPT),
@@ -501,7 +501,7 @@ class Comparison(unittest.TestCase):
         ferrofin = {"deleted_user": self.GONE, "duplicate_paths": {"original": True, "duplicate": True}}
         with mock.patch.dict(messy.DIVERGENCES, {("deleted_user", "10.11"): (self.GONE, "0044 deletes it")}):
             self.assertEqual(messy.compare(ferrofin, self.ENTRY, oracle, "10.11"), [])
-            # the other lineage has no divergence written: Jellyfin 12.2's kept rows are the expectation
+            # the other lineage has no divergence written: Jellyfin 12.4's kept rows are the expectation
             self.assertTrue(messy.compare(ferrofin, self.ENTRY, oracle, "12.x"))
             # a divergence names the state Ferrofin must reach: anything else still fails
             changed = {**ferrofin, "deleted_user": {**self.GONE, "Devices": 1}}
@@ -549,7 +549,7 @@ class Comparison(unittest.TestCase):
                 with mock.patch.object(messy, "SHAPES", ("duplicate_paths",)):
                     results, failures = messy.shape_results(db, fixture)
                 self.assertEqual(results, [{"shape": "duplicate_paths", "got": {"original": False, "duplicate": False},
-                                            "want": {"original": kept, "duplicate": False}, "source": "Jellyfin 12.2", "verdict": verdict}])
+                                            "want": {"original": kept, "duplicate": False}, "source": "Jellyfin 12.4", "verdict": verdict}])
                 self.assertEqual(len(failures), 0 if verdict == "PASS" else 1)   # the same judgement as check
                 with mock.patch.object(messy, "SHAPES", ("duplicate_paths",)):
                     self.assertEqual(messy.check(db, fixture), failures)
@@ -655,7 +655,7 @@ class RecordAndBuild(unittest.TestCase):
         for template in ("movies/a/a.mkv", "movies/p/p.mkv", "movies/a/extras/x.mkv", "shows/Show/Season 01/e1.mkv"):
             (self.root / "media" / template).parent.mkdir(parents=True, exist_ok=True)
             (self.root / "media" / template).write_bytes(b"synthetic media " + template.encode())
-        for name in ("jellyfin-10.11.11", "jellyfin-12.2-from-121"):
+        for name in ("jellyfin-10.11.11", "jellyfin-12.4-from-123"):
             source = self.root / name
             (source / "data").mkdir(parents=True)
             populate(source / "data/jellyfin.db")
@@ -736,9 +736,9 @@ class RecordAndBuild(unittest.TestCase):
             self.assertEqual(recorded.call_count, 2)
             messy.build(self.root, 18130)
             self.assertEqual(recorded.call_count, 2)
-        derived = json.loads((self.root / "jellyfin-12.2-messy/messy.json").read_text())
+        derived = json.loads((self.root / "jellyfin-12.4-messy/messy.json").read_text())
         self.assertEqual((derived["lineage"], derived["source"], set(derived["shapes"])),
-                         ("12.x", "jellyfin-12.2-from-121", set(messy.SHAPES)))
+                         ("12.x", "jellyfin-12.4-from-123", set(messy.SHAPES)))
 
     def test_a_built_fixture_with_other_shapes_is_refused_not_reused(self):
         record = {"shapes": {shape: {"outcome": "booted"} for shape in messy.SHAPES}}
@@ -849,6 +849,11 @@ class Helpers(unittest.TestCase):
     def test_each_derived_fixture_copies_a_fixture_the_builder_makes_and_a_run_row_adopts(self):
         from synthetic import VERSIONS
         built = {name for name, _, _ in VERSIONS}
+        # the latest 12.x fixture, and the oracle is the latest release, which built it
+        self.assertEqual(dict((name, source) for name, source, _ in messy.DERIVED)["jellyfin-12.4-messy"],
+                         "jellyfin-12.4-from-123")
+        self.assertEqual(messy.ORACLE_IMAGE, "jellyfin/jellyfin:12.4")
+        self.assertIn(("jellyfin-12.4-from-123", messy.ORACLE_RELEASE, "jellyfin-12.3-from-122"), VERSIONS)
         run_sh = (Path(__file__).parents[1] / "run.sh").read_text()
         for name, source, _ in messy.DERIVED:
             with self.subTest(name):

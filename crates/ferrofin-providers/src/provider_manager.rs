@@ -582,14 +582,9 @@ impl RemoteSearchProvider for OmdbSearchProvider {
         // supply one. Skipped on the id branch, exactly as in C#, where the
         // whole block sits under `if (string.IsNullOrWhiteSpace(imdbId))`.
         let (name, year) = if known.imdb_id.is_none() && !raw_name.trim().is_empty() {
-            let options = naming_options();
-            let parsed = ferrofin_naming::video::video_resolver::clean_date_time(raw_name, options);
-            let cleaned = ferrofin_naming::video::video_resolver::try_clean_string(
-                Some(&parsed.name),
-                options,
-            )
-            .unwrap_or(parsed.name);
-            (cleaned, search_info.year.or(parsed.year))
+            let parsed =
+                ferrofin_naming::video::video_resolver::parse_name(raw_name, naming_options());
+            (parsed.name, search_info.year.or(parsed.year))
         } else {
             (raw_name.to_owned(), search_info.year)
         };
@@ -619,7 +614,8 @@ impl RemoteSearchProvider for OmdbSearchProvider {
     }
 }
 
-/// The shared naming options backing the OMDb provider's `ParseName` port.
+/// The shared naming options the providers' `ParseName` runs by (the OMDb
+/// Identify search, the TVDB search).
 ///
 /// [`NamingOptions::new`] compiles the whole clean-name regex table, so it is
 /// built once for the process rather than per search request.
@@ -2516,6 +2512,29 @@ impl LocalProviderManager {
         // item with no file has no file change, probe or local reader to
         // monitor.
         let library = self.library_options_for(&stored).await;
+        // `ValidateImages` (`MetadataService.cs:121-143`) runs first, whatever
+        // the lock or the fetcher checkboxes: the local image providers. With
+        // "Save artwork into media folders" and "Replace existing images"
+        // upstream registers no new local file
+        // (`IsSaveLocalMetadataEnabled() && ReplaceAllImages`).
+        let saves_local_and_replaces = options.replace_all_images
+            && library
+                .as_ref()
+                .is_some_and(|library| library.save_local_metadata);
+        // A failed validation is logged and the refresh goes on without the
+        // remote image providers, unstamped (`localImagesFailed`,
+        // `MetadataService.cs:127-143,195-198`).
+        let (local_images, local_images_failed) = if saves_local_and_replaces {
+            (false, false)
+        } else {
+            match self.validate_virtual_season_images(item_id, &stored).await {
+                Ok(saved) => (saved, false),
+                Err(err) => {
+                    tracing::warn!(%item_id, %err, "could not validate the item's local images");
+                    (false, true)
+                }
+            }
+        };
         let request = RefreshRequest {
             options,
             force_save: options.force_save,
@@ -2542,7 +2561,9 @@ impl LocalProviderManager {
         let gated = self.gated_options(&stored, options).await;
         let fetch = Fetch {
             metadata: plan.remote_metadata && wants_fetch(gated.metadata_refresh_mode),
-            images: plan.remote_images != ImageFetch::None && wants_fetch(gated.image_refresh_mode),
+            images: !local_images_failed
+                && plan.remote_images != ImageFetch::None
+                && wants_fetch(gated.image_refresh_mode),
         };
         let chosen_name = options
             .search_result
@@ -2653,6 +2674,7 @@ impl LocalProviderManager {
             },
             None => (None, 0),
         };
+        failures += u32::from(local_images_failed);
         let fetched = fetched.unwrap_or_default();
         // A box set or playlist (`EnableUpdatingOfficialRatingFromChildren`)
         // scores ratings against its `GetPreferredMetadataCountryCode()`.
@@ -2815,7 +2837,11 @@ impl LocalProviderManager {
             plan,
             &request,
             PassOutcome {
-                changed: metadata_changed || ids_changed || image_saved || generated,
+                changed: metadata_changed
+                    || ids_changed
+                    || image_saved
+                    || generated
+                    || local_images,
                 failed: failures > 0,
             },
         );
@@ -2894,7 +2920,7 @@ impl LocalProviderManager {
             || request.options.replace_all_metadata
         {
             ItemUpdateType::MetadataDownload
-        } else if image_saved || generated {
+        } else if image_saved || generated || local_images {
             ItemUpdateType::ImageUpdate
         } else {
             ItemUpdateType::None
@@ -2903,6 +2929,68 @@ impl LocalProviderManager {
             self.save_metadata(item_id, update).await?;
         }
         Ok(update)
+    }
+
+    /// `ImageProvider.ValidateImages` for a season with no folder of its own:
+    /// `LocalImageProvider` reads its images from its series' folder (the
+    /// `LocationType.Virtual` branch of `Supports`,
+    /// `PopulateSeasonImagesFromSeriesFolder`). What it finds merges onto the
+    /// stored images by `MergeImages`' rule, as the library scan merges a
+    /// season's. `CanRefreshImages` enables every `ILocalImageProvider` before
+    /// the lock and the fetcher checkboxes, so neither gates it. Returns
+    /// whether the images were saved.
+    async fn validate_virtual_season_images(
+        &self,
+        item_id: Uuid,
+        row: &BaseItemEntity,
+    ) -> Result<bool, ServiceError> {
+        use crate::local_images::{
+            FsDirectoryService, ImageItem, LocalImageProvider, local_image_infos,
+            merge_local_images,
+        };
+        if BaseItemKind::from_stored_type_name(&row.type_) != Some(BaseItemKind::Season)
+            || row.path.as_deref().is_some_and(|path| !path.is_empty())
+        {
+            return Ok(false);
+        }
+        let (Some(items), Some(store)) = (&self.items, &self.image_store) else {
+            return Ok(false);
+        };
+        let Some(series_id) = row
+            .series_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok())
+        else {
+            return Ok(false);
+        };
+        let series_folder = items
+            .retrieve_item(series_id)
+            .await?
+            .and_then(|series| series.path)
+            .filter(|path| !path.is_empty());
+        let season = ImageItem {
+            name: row.name.clone().unwrap_or_default(),
+            ..ImageItem::default()
+        }
+        .with_season(row.index_number, series_folder);
+        if !LocalImageProvider::supports(&season) {
+            return Ok(false);
+        }
+        let found = local_image_infos(LocalImageProvider::get_images(
+            &season,
+            &FsDirectoryService::new(),
+        ));
+        if found.is_empty() {
+            return Ok(false);
+        }
+        let Some(mut images) = self.stored_images(item_id).await else {
+            return Ok(false);
+        };
+        if !merge_local_images(&mut images, &found) {
+            return Ok(false);
+        }
+        store.save_item_images(item_id, &images).await?;
+        Ok(true)
     }
 
     /// Remote and dynamic image providers share one ordered acquisition pass.
@@ -5404,7 +5492,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name.as_deref(), Some("Exact"));
         assert_eq!(results[0].production_year, Some(2001));
-        assert!(results[0].artists.is_empty());
+        assert!(results[0].artists.is_empty(), "{:?}", results[0].artists);
         assert!(results[0].album_artist.is_none());
         assert_eq!(
             results[0].provider_ids.as_ref().expect("ids")["MusicBrainzAlbum"],
@@ -5528,7 +5616,7 @@ mod tests {
             .get_search_results(&named_request(BaseItemKind::MusicArtist, "Nobody"))
             .await
             .expect("results");
-        assert!(results.is_empty());
+        assert!(results.is_empty(), "{results:?}");
     }
 
     #[tokio::test]
@@ -5570,20 +5658,16 @@ mod tests {
         assert!(album.supports(BaseItemKind::MusicAlbum));
         assert!(!album.supports(BaseItemKind::MusicArtist));
         assert!(artist.supports(BaseItemKind::MusicArtist));
-        assert!(
-            album
-                .get_search_results(&named_request(BaseItemKind::MusicAlbum, "Kind of Blue"))
-                .await
-                .expect("ok")
-                .is_empty()
-        );
-        assert!(
-            artist
-                .get_search_results(&named_request(BaseItemKind::MusicArtist, "Miles Davis"))
-                .await
-                .expect("ok")
-                .is_empty()
-        );
+        let search_results = album
+            .get_search_results(&named_request(BaseItemKind::MusicAlbum, "Kind of Blue"))
+            .await
+            .expect("ok");
+        assert!(search_results.is_empty(), "{search_results:?}");
+        let search_results = artist
+            .get_search_results(&named_request(BaseItemKind::MusicArtist, "Miles Davis"))
+            .await
+            .expect("ok");
+        assert!(search_results.is_empty(), "{search_results:?}");
     }
 
     #[tokio::test]
@@ -5642,13 +5726,11 @@ mod tests {
         assert_eq!(ids["Imdb"], "nm0000093");
 
         // No name and no id → nothing to search.
-        assert!(
-            provider
-                .get_search_results(&request(BaseItemKind::Person))
-                .await
-                .expect("ok")
-                .is_empty()
-        );
+        let search_results = provider
+            .get_search_results(&request(BaseItemKind::Person))
+            .await
+            .expect("ok");
+        assert!(search_results.is_empty(), "{search_results:?}");
     }
 
     #[tokio::test]
@@ -6489,7 +6571,8 @@ mod tests {
         let mut locked_rows = HashMap::new();
         locked_rows.insert(artist_id, entity);
         let locked = manager(vec!["MusicBrainz".to_owned()], locked_rows);
-        assert!(locked.remote_search(&scoped).await.unwrap().is_empty());
+        let results = locked.remote_search(&scoped).await.unwrap();
+        assert!(results.is_empty(), "{results:?}");
     }
 
     #[tokio::test]
@@ -6541,7 +6624,7 @@ mod tests {
             .remote_search(&request(BaseItemKind::Movie))
             .await
             .unwrap();
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[tokio::test]
@@ -6560,7 +6643,8 @@ mod tests {
         assert_eq!(mgr.remote_search(&req).await.unwrap().len(), 1);
 
         req.search_provider_name = Some("NoSuchProvider".to_owned());
-        assert!(mgr.remote_search(&req).await.unwrap().is_empty());
+        let results = mgr.remote_search(&req).await.unwrap();
+        assert!(results.is_empty(), "{results:?}");
     }
 
     #[tokio::test]
@@ -6630,7 +6714,8 @@ mod tests {
         assert_eq!(results[0].name.as_deref(), Some("Matched"));
         assert_eq!(results[0].provider_ids.as_ref().unwrap()["Tvdb"], "42");
         req.search_info.provider_ids = Some(HashMap::from([("Tmdb".into(), "404".into())]));
-        assert!(provider.get_search_results(&req).await.unwrap().is_empty());
+        let search_results = provider.get_search_results(&req).await.unwrap();
+        assert!(search_results.is_empty(), "{search_results:?}");
     }
 
     #[tokio::test]
@@ -6645,7 +6730,7 @@ mod tests {
             .get_search_results(&request(BaseItemKind::Series))
             .await
             .expect("empty");
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[tokio::test]
@@ -6701,7 +6786,7 @@ mod tests {
             .get_external_id_infos(Uuid::nil())
             .await
             .expect("descriptor query succeeds");
-        assert!(infos.is_empty());
+        assert!(infos.is_empty(), "{infos:?}");
     }
 
     /// An [`ItemTypeLookup`] over the two names the descriptor tests need.
@@ -6872,22 +6957,22 @@ mod tests {
         let id = Uuid::new_v4();
         let query = RemoteImageQuery::new("Tmdb".into());
 
+        let available_remote_images = mgr.get_available_remote_images(id, &query).await.unwrap();
         assert!(
-            mgr.get_available_remote_images(id, &query)
-                .await
-                .unwrap()
-                .is_empty()
+            available_remote_images.is_empty(),
+            "{available_remote_images:?}"
         );
+        let remote_image_provider_info = mgr.get_remote_image_provider_info(id).await.unwrap();
         assert!(
-            mgr.get_remote_image_provider_info(id)
-                .await
-                .unwrap()
-                .is_empty()
+            remote_image_provider_info.is_empty(),
+            "{remote_image_provider_info:?}"
         );
         // The metadata-plugin registry projects the compiled-in providers, so it
         // is non-empty (covered in detail by `library_options` tests).
-        assert!(!mgr.get_all_metadata_plugins().await.unwrap().is_empty());
-        assert!(mgr.get_refresh_queue().await.unwrap().is_empty());
+        let all_metadata_plugins = mgr.get_all_metadata_plugins().await.unwrap();
+        assert!(!all_metadata_plugins.is_empty(), "{all_metadata_plugins:?}");
+        let refresh_queue = mgr.get_refresh_queue().await.unwrap();
+        assert!(refresh_queue.is_empty(), "{refresh_queue:?}");
 
         // With no config reader and no item store, `GetMetadataOptions` has
         // nothing to look up and takes the `?? new MetadataOptions()` arm.
@@ -7224,7 +7309,7 @@ mod tests {
             .get_available_remote_images(item_id, &RemoteImageQuery::default())
             .await
             .expect("images");
-        assert!(images.is_empty());
+        assert!(images.is_empty(), "{images:?}");
     }
 
     /// A stored `(provider key, value)` id list.
@@ -7257,6 +7342,8 @@ mod tests {
         copied: std::sync::Mutex<Vec<(Vec<Uuid>, bool, bool)>>,
         /// Each refresh `copy_owner_metadata_to_extras` was asked for.
         extras_copied: std::sync::Mutex<Vec<OwnerExtrasRefresh>>,
+        /// Refuses every `save_item_images`, as a store that cannot write.
+        fail_image_saves: bool,
     }
 
     #[async_trait]
@@ -7266,6 +7353,9 @@ mod tests {
             item_id: Uuid,
             images: &[ItemImageInfo],
         ) -> Result<(), ServiceError> {
+            if self.fail_image_saves {
+                return Err(ServiceError::backend("the image store refuses writes"));
+            }
             let mut stored = self.images.lock().unwrap();
             stored.retain(|(id, _)| *id != item_id);
             stored.extend(images.iter().cloned().map(|image| (item_id, image)));
@@ -8402,11 +8492,13 @@ mod tests {
         assert_eq!(banners.len(), 1);
         assert_eq!(banners[0].url.as_deref(), Some("https://f/banner.jpg"));
         // An unknown provider name yields nothing.
+        let available_remote_images = mgr
+            .get_available_remote_images(item_id, &RemoteImageQuery::new("Nope".to_owned()))
+            .await
+            .unwrap();
         assert!(
-            mgr.get_available_remote_images(item_id, &RemoteImageQuery::new("Nope".to_owned()))
-                .await
-                .unwrap()
-                .is_empty()
+            available_remote_images.is_empty(),
+            "{available_remote_images:?}"
         );
     }
 
@@ -8473,11 +8565,13 @@ mod tests {
                 .len(),
             2
         );
+        let available_remote_images = bare
+            .get_available_remote_images(bare_id, &RemoteImageQuery::default())
+            .await
+            .unwrap();
         assert!(
-            bare.get_available_remote_images(bare_id, &RemoteImageQuery::default())
-                .await
-                .unwrap()
-                .is_empty()
+            available_remote_images.is_empty(),
+            "{available_remote_images:?}"
         );
     }
 
@@ -8767,7 +8861,8 @@ mod tests {
             }
         }
         assert_eq!(order, [high, normal, low_a, low_b]);
-        assert!(mgr.get_refresh_queue().await.unwrap().is_empty());
+        let refresh_queue = mgr.get_refresh_queue().await.unwrap();
+        assert!(refresh_queue.is_empty(), "{refresh_queue:?}");
     }
 
     #[tokio::test]
@@ -9327,7 +9422,8 @@ mod tests {
         // answer with the MusicBrainz hit.
         let mut req = request(BaseItemKind::MusicAlbum);
         req.item_id = item_id;
-        assert!(mgr.remote_search(&req).await.expect("search").is_empty());
+        let results = mgr.remote_search(&req).await.expect("search");
+        assert!(results.is_empty(), "{results:?}");
 
         // `IncludeDisabledProviders` short-circuits the whole gate
         // (`CanRefreshMetadata`'s `if (includeDisabled) return true`) — this is
@@ -9360,7 +9456,8 @@ mod tests {
         );
         let mut req = request(BaseItemKind::MusicAlbum);
         req.item_id = item_id;
-        assert!(mgr.remote_search(&req).await.expect("search").is_empty());
+        let results = mgr.remote_search(&req).await.expect("search");
+        assert!(results.is_empty(), "{results:?}");
 
         // …unless the caller explicitly asked for disabled providers.
         req.include_disabled_providers = true;
@@ -11066,6 +11163,224 @@ mod tests {
         assert_eq!(row.overview.as_deref(), Some("Stored."));
         assert!(row.date_last_refreshed.is_some(), "no provider failed");
         assert!(season.people.written.lock().expect("lock").is_empty());
+    }
+
+    /// A season with no folder of its own, under a series whose folder holds
+    /// `season01-poster.jpg`, `season01-fanart.jpg`, another season's poster
+    /// and the series' own poster, stored with a downloaded Primary, in a
+    /// library saved with `options`; refreshed before, so a Default refresh
+    /// runs no remote provider, and with its sort key settled, so a refresh
+    /// changes nothing but its images.
+    struct SeriesArtSeason {
+        show: tempfile::TempDir,
+        season_id: Uuid,
+        /// The season's stored `DateLastRefreshed`.
+        refreshed: chrono::DateTime<chrono::Utc>,
+        store: Arc<RecordingStore>,
+        mgr: LocalProviderManager,
+    }
+
+    impl SeriesArtSeason {
+        fn new(options: ferrofin_model::configuration::LibraryOptions) -> Self {
+            Self::with_store(options, RecordingStore::default())
+        }
+
+        fn with_store(
+            options: ferrofin_model::configuration::LibraryOptions,
+            store: RecordingStore,
+        ) -> Self {
+            let show = tempfile::tempdir().expect("tmp");
+            for file in [
+                "season01-poster.jpg",
+                "season01-fanart.jpg",
+                "season02-poster.jpg",
+                "poster.jpg",
+            ] {
+                std::fs::write(show.path().join(file), b"jpeg").expect("art");
+            }
+            let library_id = Uuid::new_v4();
+            let series_id = Uuid::new_v4();
+            let mut series = row("TV.Series", "Show");
+            series.id = series_id.to_string();
+            series.path = Some(show.path().to_string_lossy().into_owned());
+            let season_id = Uuid::new_v4();
+            let mut season = row("TV.Season", "Season 1");
+            season.id = season_id.to_string();
+            season.series_id = Some(series_id.to_string());
+            season.top_parent_id = Some(library_id.to_string());
+            season.index_number = Some(1);
+            let refreshed = chrono::Utc::now() - chrono::Duration::days(1);
+            season.date_last_refreshed = Some(refreshed);
+            crate::metadata_merge::settle_sort_name(&mut season);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let items = Arc::new(FakeItems {
+                rows: HashMap::from([(series_id, series), (season_id, season)]),
+                seen: tx,
+            });
+            let store = Arc::new(store);
+            store.images.lock().expect("lock").push((
+                season_id,
+                ItemImageInfo {
+                    path: "/metadata/library/ab/primary.jpg".to_owned(),
+                    image_type: ImageType::Primary,
+                    ..ItemImageInfo::default()
+                },
+            ));
+            let mgr = LocalProviderManager::default()
+                .with_remote_images(
+                    Arc::new(crate::tmdb::TmdbClient::new().with_base_url("http://127.0.0.1:9")),
+                    items,
+                )
+                .with_image_store(Arc::clone(&store) as Arc<_>, std::env::temp_dir())
+                .with_virtual_folders(Arc::new(FakeLibraries {
+                    item_id: library_id,
+                    options,
+                }));
+            Self {
+                show,
+                season_id,
+                refreshed,
+                store,
+                mgr,
+            }
+        }
+
+        /// The path of `file` in the series folder.
+        fn art(&self, file: &str) -> String {
+            self.show.path().join(file).to_string_lossy().into_owned()
+        }
+
+        /// The season's stored images.
+        fn images(&self) -> Vec<(String, ImageType)> {
+            self.store
+                .images
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(id, _)| *id == self.season_id)
+                .map(|(_, image)| (image.path.clone(), image.image_type))
+                .collect()
+        }
+    }
+
+    /// A season with no folder of its own takes its series folder's
+    /// `season01-*` files on a refresh through this route, with no remote
+    /// provider running: `ValidateImages` runs the local image providers
+    /// first, and `LocalImageProvider` supports a virtual season whose series
+    /// is on the file system. The downloaded Primary gives way to the local
+    /// poster (`MergeImages`); another season's files and the series' own
+    /// poster are not the season's. A second refresh finds nothing new.
+    #[tokio::test]
+    async fn a_virtual_seasons_refresh_takes_its_series_folder_artwork() {
+        let season = SeriesArtSeason::new(ferrofin_model::configuration::LibraryOptions::default());
+        let update = season
+            .mgr
+            .refresh_single_item(season.season_id, &Opts::default())
+            .await
+            .expect("refresh");
+        assert_eq!(update, ItemUpdateType::ImageUpdate);
+        assert_eq!(
+            season.images(),
+            [
+                (season.art("season01-poster.jpg"), ImageType::Primary),
+                (season.art("season01-fanart.jpg"), ImageType::Backdrop),
+            ]
+        );
+        assert_eq!(
+            season.store.saved.lock().expect("lock").len(),
+            1,
+            "the item is saved"
+        );
+
+        let update = season
+            .mgr
+            .refresh_single_item(season.season_id, &Opts::default())
+            .await
+            .expect("second refresh");
+        assert_eq!(update, ItemUpdateType::None);
+        assert_eq!(season.store.saved.lock().expect("lock").len(), 1);
+    }
+
+    /// A local image validation that fails (here the image store refuses the
+    /// write) does not fail the refresh: upstream logs it and goes on
+    /// without the remote image providers, and the item is saved unstamped
+    /// (`localImagesFailed`, `MetadataService.cs:127-143,195-198`). The same
+    /// forced save with a store that writes stamps the refresh.
+    #[rstest::rstest]
+    #[case::store_refuses_writes(true)]
+    #[case::store_writes(false)]
+    #[tokio::test]
+    async fn a_failed_local_image_validation_leaves_the_refresh_unstamped(
+        #[case] fail_image_saves: bool,
+    ) {
+        let season = SeriesArtSeason::with_store(
+            ferrofin_model::configuration::LibraryOptions::default(),
+            RecordingStore {
+                fail_image_saves,
+                ..RecordingStore::default()
+            },
+        );
+        let stored = season.images();
+        let forced = Opts {
+            force_save: true,
+            ..Opts::default()
+        };
+        season
+            .mgr
+            .refresh_single_item(season.season_id, &forced)
+            .await
+            .expect("the refresh goes on");
+        let saved = season
+            .store
+            .saved
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .expect("a forced save");
+        if fail_image_saves {
+            assert_eq!(season.images(), stored);
+            assert_eq!(saved.date_last_refreshed, Some(season.refreshed));
+        } else {
+            assert_ne!(season.images(), stored);
+            assert!(saved.date_last_refreshed > Some(season.refreshed));
+        }
+    }
+
+    /// "Replace existing images" in a library that saves artwork into its
+    /// media folders registers no local file: upstream only validates the
+    /// stored images then (`IsSaveLocalMetadataEnabled() &&
+    /// ReplaceAllImages`, `MetadataService.cs:121-125`). The same refresh in a
+    /// library that does not save artwork beside the media registers them.
+    #[rstest::rstest]
+    #[case::saves_artwork_beside_the_media(true, false)]
+    #[case::keeps_artwork_in_the_metadata_folder(false, true)]
+    #[tokio::test]
+    async fn replacing_all_images_registers_local_files_unless_the_library_saves_them(
+        #[case] save_local_metadata: bool,
+        #[case] registered: bool,
+    ) {
+        let season = SeriesArtSeason::new(ferrofin_model::configuration::LibraryOptions {
+            save_local_metadata,
+            ..Default::default()
+        });
+        let replace_images = Opts {
+            image_refresh_mode: Mode::FullRefresh,
+            replace_all_images: true,
+            ..Opts::default()
+        };
+        season
+            .mgr
+            .refresh_single_item(season.season_id, &replace_images)
+            .await
+            .expect("refresh");
+        let poster = (season.art("season01-poster.jpg"), ImageType::Primary);
+        assert_eq!(
+            season.images().contains(&poster),
+            registered,
+            "{:?}",
+            season.images()
+        );
     }
 
     /// Both season providers failing under "Replace all metadata" (which

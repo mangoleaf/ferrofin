@@ -1821,6 +1821,73 @@ async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
     assert_eq!(json["Items"][0]["Tags"], serde_json::json!([]));
 }
 
+/// The caller's policy rides on the request, so a browse reads its whitelist
+/// from there rather than rebuilding the caller's user DTO. [`OkUsers`] reports
+/// no whitelist, so `Tags` here can only have come from the request's policy.
+#[tokio::test]
+async fn items_reads_the_callers_tag_whitelist_from_the_request_policy() {
+    struct WhitelistedAuth;
+    impl WhitelistedAuth {
+        fn info() -> AuthorizationInfo {
+            AuthorizationInfo {
+                user: Some(user_entity(USER_ID, "alice")),
+                user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                    allowed_tags: vec!["kids".to_owned()],
+                    ..ferrofin_model::users::UserPolicy::default()
+                })),
+                is_authenticated: true,
+                ..AuthorizationInfo::default()
+            }
+        }
+    }
+    #[async_trait]
+    impl AuthService for WhitelistedAuth {
+        async fn authenticate(
+            &self,
+            _request: &RequestContext,
+        ) -> Result<AuthorizationInfo, ServiceError> {
+            Ok(Self::info())
+        }
+    }
+    #[async_trait]
+    impl AuthorizationContext for WhitelistedAuth {
+        async fn get_authorization_info(
+            &self,
+            _request: &RequestContext,
+        ) -> Result<AuthorizationInfo, ServiceError> {
+            Ok(Self::info())
+        }
+    }
+
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0xABCD),
+        adopted_tree: false,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
+        ..Default::default()
+    };
+    let state = ok_state_full(
+        library,
+        Arc::new(OkUsers),
+        Arc::new(OkDto),
+        (Arc::new(WhitelistedAuth), Arc::new(WhitelistedAuth)),
+    );
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/Items?recursive=true")
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert_eq!(json["Items"][0]["Tags"], serde_json::json!([]), "{json}");
+}
+
 #[tokio::test]
 async fn item_by_id_returns_base_item_dto() {
     let item_id = Uuid::from_u128(0xABCD);
@@ -2091,7 +2158,7 @@ async fn get_items_resolves_the_artist_album_and_studio_names() {
     )
     .await;
     assert_eq!(blank.studio_ids, [kept]);
-    assert!(blank.artist_ids.is_empty());
+    assert!(blank.artist_ids.is_empty(), "{:?}", blank.artist_ids);
 }
 
 /// An artist's albums asked for with no `sortBy` come newest first, then by
@@ -2598,8 +2665,16 @@ async fn get_items_forwards_the_stream_language_filters_but_the_user_route_drops
     assert!(query.include_owned_items);
 
     let query = run(format!("/Users/{USER_ID}/Items?{filters}")).await;
-    assert!(query.audio_languages.is_empty());
-    assert!(query.subtitle_languages.is_empty());
+    assert!(
+        query.audio_languages.is_empty(),
+        "{:?}",
+        query.audio_languages
+    );
+    assert!(
+        query.subtitle_languages.is_empty(),
+        "{:?}",
+        query.subtitle_languages
+    );
     assert_eq!(query.has_subtitles, Some(true));
     // `hasSubtitles` alone still reads media streams.
     assert!(query.include_owned_items);
@@ -2891,7 +2966,7 @@ async fn intros_are_empty() {
     let (status, body) = send("GET", &format!("/Items/{ITEM_ID}/Intros"), Body::empty()).await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
-    assert!(result.items.is_empty());
+    assert!(result.items.is_empty(), "{:?}", result.items);
 }
 
 #[tokio::test]
@@ -2904,7 +2979,7 @@ async fn critic_reviews_are_empty() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let result: QueryResult<BaseItemDto> = serde_json::from_slice(&body).expect("result");
-    assert!(result.items.is_empty());
+    assert!(result.items.is_empty(), "{:?}", result.items);
 }
 
 #[tokio::test]
@@ -2960,7 +3035,11 @@ async fn theme_media_combines_songs_and_videos() {
     let result: AllThemeMediaResult = serde_json::from_slice(&body).expect("all theme media");
     assert_eq!(result.theme_songs_result.result.items[0].id, SONG_ID);
     assert_eq!(result.theme_videos_result.result.items[0].id, VIDEO_ID);
-    assert!(result.soundtrack_songs_result.result.items.is_empty());
+    assert!(
+        result.soundtrack_songs_result.result.items.is_empty(),
+        "{:?}",
+        result.soundtrack_songs_result.result.items
+    );
 }
 
 #[tokio::test]

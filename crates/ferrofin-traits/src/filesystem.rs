@@ -6,9 +6,15 @@
 //! `IFileSystem` (stream helpers, shortcut handling, metadata) is server-side
 //! plumbing and stays out of the trait surface.
 //!
-//! Methods are synchronous (the controller calls into a blocking filesystem)
-//! and the trait is object-safe.
+//! **Every method blocks.** The trait is synchronous and object-safe, and a
+//! call goes to the disk or the network: on a hard-mounted NFS or CIFS export
+//! whose server is gone, it sleeps uninterruptibly until the server returns.
+//! A call made inline on a runtime worker takes that worker with it. A handler
+//! goes through `AppState::blocking_file_system`, the blocking pool with a cap
+//! on the threads a hung mount can hold; the library scan hands the worker's
+//! other tasks on first, with `off_runtime`.
 
+use std::io::Read;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -38,14 +44,44 @@ pub struct FileMetadata {
     pub date_modified: DateTime<Utc>,
 }
 
+/// A file opened for reading, for a response that streams it.
+pub struct OpenedFile {
+    /// The path it was opened from, for the log if a read fails.
+    pub path: String,
+
+    /// The file's length when it was opened. Stop reading here: a log still
+    /// being written is longer by the time the reader gets to its end, and a
+    /// response that declared this length cannot carry more.
+    pub length: u64,
+
+    /// The file's contents, from the start. Each read blocks, as the methods
+    /// of [`FileSystem`] do.
+    pub reader: Box<dyn Read + Send>,
+}
+
+impl std::fmt::Debug for OpenedFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenedFile")
+            .field("path", &self.path)
+            .field("length", &self.length)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Browses the server's local filesystem.
 ///
 /// Port of the `EnvironmentController`-facing members of `IFileSystem`.
+///
+/// **Every method blocks**, for as long as the disk or the network mount
+/// behind the path takes, which is forever on a hung mount. See the
+/// [module docs](self) for where a call may run.
 pub trait FileSystem: Send + Sync {
     /// Lists the direct children (files and directories) of a path
-    /// (C# `IFileSystem.GetFileSystemEntries`). Returns an empty list — not an
-    /// error — when the path cannot be read, matching the controller's
-    /// swallow-and-return behaviour.
+    /// (C# `IFileSystem.GetFileSystemEntries`). Returns an empty list when the
+    /// path cannot be read, for a reader to whom that makes no difference;
+    /// [`try_get_file_system_entries`](Self::try_get_file_system_entries) tells
+    /// them apart.
     fn get_file_system_entries(&self, path: &str) -> Vec<FileSystemEntryInfo>;
 
     /// [`get_file_system_entries`](Self::get_file_system_entries), telling a
@@ -59,8 +95,13 @@ pub trait FileSystem: Send + Sync {
     ///
     /// # Errors
     ///
-    /// [`ServiceError::Backend`] when the directory could not be listed
-    /// completely.
+    /// - [`ServiceError::NotFound`] when `path` is no directory, as
+    ///   `DirectoryInfo.EnumerateFileSystemInfos` throws
+    ///   `DirectoryNotFoundException`.
+    /// - [`ServiceError::Forbidden`] when the server may not read it, which
+    ///   upstream's `IgnoreInaccessible` reads as an empty directory.
+    /// - [`ServiceError::Backend`] when the directory could not be listed
+    ///   completely for any other reason.
     fn try_get_file_system_entries(
         &self,
         path: &str,
@@ -77,6 +118,9 @@ pub trait FileSystem: Send + Sync {
     }
 
     /// Lists the available drives / root mounts (C# `IFileSystem.GetDrives`).
+    ///
+    /// Unlike every other method, this one returns in bounded time on a real
+    /// filesystem: a mount that does not answer is left out of the list.
     fn get_drives(&self) -> Vec<FileSystemEntryInfo>;
 
     /// Whether a file or a directory exists at `path`. The default asks
@@ -106,7 +150,9 @@ pub trait FileSystem: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceError`] if the throwaway file cannot be created (i.e. the
+    /// [`ServiceError::NotFound`] if `path` is no directory (C#
+    /// `DirectoryNotFoundException`), or [`ServiceError::Backend`] if the
+    /// throwaway file cannot be created there for any other reason (i.e. the
     /// directory is not writable).
     fn validate_writable(&self, path: &str) -> Result<(), ServiceError>;
 
@@ -116,14 +162,33 @@ pub trait FileSystem: Send + Sync {
     /// cannot be read.
     fn get_files(&self, path: &str, extensions: &[&str]) -> Vec<FileMetadata>;
 
-    /// Reads a file's full contents (C# `SystemController.GetLogFile` file
-    /// stream). `404`-worthy absence surfaces as [`ServiceError::not_found`].
+    /// Reads a file's full contents into memory. A response never does this:
+    /// a log has no size cap, so it goes through
+    /// [`open_file`](Self::open_file). `404`-worthy absence surfaces as
+    /// [`ServiceError::not_found`].
     ///
     /// # Errors
     ///
     /// Returns [`ServiceError::not_found`] if the file does not exist, or a
     /// backend [`ServiceError`] for any other read failure.
     fn read_file(&self, path: &str) -> Result<Vec<u8>, ServiceError>;
+
+    /// Opens a file to stream it (C# `SystemController.GetLogFile`'s
+    /// `FileStream`, `SubtitleController.GetFallbackFont`'s `PhysicalFile`).
+    /// The default serves [`read_file`](Self::read_file)'s bytes; a real
+    /// filesystem reads no more than the caller asks for.
+    ///
+    /// # Errors
+    ///
+    /// As [`read_file`](Self::read_file).
+    fn open_file(&self, path: &str) -> Result<OpenedFile, ServiceError> {
+        let bytes = self.read_file(path)?;
+        Ok(OpenedFile {
+            path: path.to_owned(),
+            length: bytes.len() as u64,
+            reader: Box::new(std::io::Cursor::new(bytes)),
+        })
+    }
 }
 
 fn _assert_object_safe_file_system(_: &dyn FileSystem) {}

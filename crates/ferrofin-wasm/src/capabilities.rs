@@ -152,7 +152,7 @@ pub fn is_private_address(addr: std::net::IpAddr) -> bool {
             // `to_ipv4` is the mapped and the compatible form; `::1` and `::`
             // are caught above, since the compatible form reads them as
             // `0.0.0.1` and `0.0.0.0`.
-            let embedded = v6.to_ipv4().or(match segments {
+            let embedded = v6.to_ipv4().or_else(|| match segments {
                 [0x64, 0xff9b, 0, 0, 0, 0, hi, lo] | [0x2002, hi, lo, ..] => {
                     Some(from_segments(hi, lo))
                 }

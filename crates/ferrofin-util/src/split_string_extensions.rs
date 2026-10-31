@@ -57,7 +57,7 @@ mod tests {
     #[test]
     fn empty_yields_nothing() {
         let parts: Vec<&str> = span_split("", ',').collect();
-        assert!(parts.is_empty());
+        assert!(parts.is_empty(), "{parts:?}");
     }
 
     #[test]

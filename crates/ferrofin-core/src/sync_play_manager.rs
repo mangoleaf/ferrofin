@@ -854,7 +854,10 @@ impl Group {
             command,
             emitted_at: now,
         };
-        envelope(MSG_COMMAND, serde_json::to_value(cmd).unwrap_or(json!({})))
+        envelope(
+            MSG_COMMAND,
+            serde_json::to_value(cmd).unwrap_or_else(|_| json!({})),
+        )
     }
 
     fn state_update_env(&self, reason: PlaybackRequestType) -> String {
@@ -1763,7 +1766,7 @@ fn envelope(message_type: &str, data: serde_json::Value) -> String {
 fn render_update(update: GroupUpdate) -> String {
     envelope(
         MSG_GROUP_UPDATE,
-        serde_json::to_value(update).unwrap_or(json!({})),
+        serde_json::to_value(update).unwrap_or_else(|_| json!({})),
     )
 }
 
@@ -2309,7 +2312,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                     group_id: Uuid::nil(),
                     data: String::new(),
                 }))
-                .unwrap_or(json!({})),
+                .unwrap_or_else(|_| json!({})),
             );
             self.bus.send(&session.session_id, env);
         }
@@ -2433,7 +2436,7 @@ impl SyncPlayManager for FerrofinSyncPlayManager {
                         group_id: Uuid::nil(),
                         data: String::new(),
                     }))
-                    .unwrap_or(json!({})),
+                    .unwrap_or_else(|_| json!({})),
                 );
                 self.bus.send(&session.session_id, env);
                 return Ok(());
@@ -3038,7 +3041,8 @@ mod tests {
         let s = session("s1", "alice");
         m.join_group(&s, Uuid::new_v4()).await.unwrap();
         assert!(bus.bodies()[0].contains("GroupDoesNotExist"));
-        assert!(m.list_groups(&s).await.unwrap().is_empty());
+        let groups = m.list_groups(&s).await.unwrap();
+        assert!(groups.is_empty(), "{groups:?}");
     }
 
     #[tokio::test]
@@ -3047,7 +3051,8 @@ mod tests {
         let s = session("s1", "alice");
         let info = m.new_group(&s, "g", None).await.unwrap();
         m.leave_group(&s).await.unwrap();
-        assert!(m.list_groups(&s).await.unwrap().is_empty());
+        let groups = m.list_groups(&s).await.unwrap();
+        assert!(groups.is_empty(), "{groups:?}");
         assert!(!m.is_user_active(s.user_id).await.unwrap());
         assert!(m.get_group(&s, info.group_id).await.is_err());
     }
@@ -4094,7 +4099,8 @@ mod tests {
         let ids: Vec<Uuid> = q.playlist().iter().map(|i| i.playlist_item_id).collect();
 
         assert!(q.remove(&ids));
-        assert!(q.playlist().is_empty());
+        let playlist = q.playlist();
+        assert!(playlist.is_empty(), "{playlist:?}");
         assert!(!q.is_item_playing());
         assert_eq!(q.playing_item_id(), Uuid::nil());
     }
@@ -5354,16 +5360,15 @@ mod tests {
                 .unwrap(),
             vec![movie_id]
         );
-        assert!(
-            library
-                .get_visible_item_ids(&vec![movie_id; 1200], &guest_user)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let visible_item_ids = library
+            .get_visible_item_ids(&vec![movie_id; 1200], &guest_user)
+            .await
+            .unwrap();
+        assert!(visible_item_ids.is_empty(), "{visible_item_ids:?}");
         let group = m.new_group(&owner, "movie night", None).await.unwrap();
         set_queue(&m, &owner, vec![movie_id]).await;
-        assert!(m.list_groups(&guest).await.unwrap().is_empty());
+        let groups = m.list_groups(&guest).await.unwrap();
+        assert!(groups.is_empty(), "{groups:?}");
         m.join_group(&guest, group.group_id).await.unwrap();
         assert_eq!(update_types(&bus, "s2"), vec!["LibraryAccessDenied"]);
         users
@@ -5397,7 +5402,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(m.list_groups(&guest).await.unwrap().is_empty());
+        let groups = m.list_groups(&guest).await.unwrap();
+        assert!(groups.is_empty(), "{groups:?}");
         bus.sent.lock().unwrap().clear();
         set_queue(&m, &owner, vec![movie_id]).await;
         assert!(

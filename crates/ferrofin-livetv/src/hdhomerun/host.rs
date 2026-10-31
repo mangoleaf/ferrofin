@@ -955,7 +955,7 @@ mod tests {
             lineup: "null".to_owned(),
         }));
         let lineup = host.get_lineup(&tuner("10.0.0.5")).await.expect("lineup");
-        assert!(lineup.is_empty());
+        assert!(lineup.is_empty(), "{lineup:?}");
     }
 
     #[tokio::test]

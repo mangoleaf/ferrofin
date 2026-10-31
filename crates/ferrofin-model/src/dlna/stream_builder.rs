@@ -587,7 +587,7 @@ impl<'a> StreamBuilder<'a> {
                     playlist_item.sub_protocol = MediaStreamProtocol::http;
                     let audio_stream_index = direct_play_info
                         .audio_stream_index
-                        .or(audio_stream.as_ref().map(|a| a.index));
+                        .or_else(|| audio_stream.as_ref().map(|a| a.index));
                     if let Some(asi) = audio_stream_index {
                         playlist_item.audio_stream_index = Some(asi);
                         let audio_codec = item
@@ -672,7 +672,7 @@ impl<'a> StreamBuilder<'a> {
                     options,
                     &item,
                     video_stream.as_ref(),
-                    audio_stream.clone(),
+                    audio_stream,
                     &candidate_audio_streams,
                     Some(transcoding_profile.container.as_str()),
                     Some(transcoding_profile.video_codec.as_str()),
@@ -942,7 +942,7 @@ impl<'a> StreamBuilder<'a> {
                 .contains(TranscodeReasons::CONTAINER_BITRATE_EXCEEDS_LIMIT);
 
         let direct_audio_stream = if direct_audio_stream_satisfied {
-            audio_stream_with_supported_codec.clone()
+            audio_stream_with_supported_codec
         } else {
             None
         };
@@ -2394,7 +2394,7 @@ fn apply_transcoding_conditions(
                         ProfileConditionType::LessThanEqual => {
                             let existing = item
                                 .get_target_video_level(qualifier)
-                                .unwrap_or(f64::from(num));
+                                .unwrap_or_else(|| f64::from(num));
                             let min = f64::from(num).min(existing);
                             item.set_option_qualified(qualifier, "level", format_level(min));
                         }

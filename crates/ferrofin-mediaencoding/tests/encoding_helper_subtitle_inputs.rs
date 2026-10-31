@@ -335,10 +335,8 @@ fn other_external_subtitles_add_no_input(
 ) {
     let sub = external_subtitle(2, codec, "/media/movie.en.sub");
     let state = build_state(Some(sub), Some(method), None);
-    assert!(
-        external_stream_input_arguments(&state, Some("10"), Some(FfmpegVersion::new(7, 0)))
-            .is_empty()
-    );
+    let found = external_stream_input_arguments(&state, Some("10"), Some(FfmpegVersion::new(7, 0)));
+    assert!(found.is_empty(), "{found:?}");
 }
 
 /// Without `-copyts` every input's timeline starts at its own first packet,

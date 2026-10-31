@@ -1658,7 +1658,11 @@ mod tests {
                 .iter()
                 .any(|o| o.name.as_deref() == Some("Intro Skipper"))
         );
-        assert!(!movie.supported_image_types.is_empty());
+        assert!(
+            !movie.supported_image_types.is_empty(),
+            "{:?}",
+            movie.supported_image_types
+        );
     }
 
     #[test]
@@ -1812,8 +1816,10 @@ mod tests {
             vec![(ImageType::Backdrop, 0, 1280), (ImageType::Primary, 1, 0),]
         );
         // Not in the C# dictionary => `defaultImageOptions ?? Array.Empty<…>()`.
-        assert!(opts("Person").is_empty());
-        assert!(opts("Photo").is_empty());
+        let found = opts("Person");
+        assert!(found.is_empty(), "{found:?}");
+        let found = opts("Photo");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// The per-type `MetadataOptions` the C# `ServerConfiguration`
@@ -2140,7 +2146,8 @@ mod tests {
         );
         assert_eq!(super::tvdb_images("Season"), [Primary, Banner, Backdrop]);
         assert_eq!(super::tvdb_images("Episode"), [Primary]);
-        assert!(super::tvdb_images("Movie").is_empty());
+        let found = super::tvdb_images("Movie");
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(
             super::fanart_images("Season"),
             [Backdrop, Thumb, Banner, Primary]

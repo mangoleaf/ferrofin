@@ -573,7 +573,8 @@ async fn adding_containers_expands_them_and_drops_what_cannot_be_added() {
         )
         .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
-    assert!(fx.entries(&id).await.is_empty());
+    let entries = fx.entries(&id).await;
+    assert!(entries.is_empty(), "{entries:?}");
     assert_eq!(fx.media_added(&id).await, replaced);
 }
 

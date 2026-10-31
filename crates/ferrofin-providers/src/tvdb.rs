@@ -765,6 +765,14 @@ impl TvdbClient {
         self
     }
 
+    /// How long this client reuses what it resolved: the plugin's
+    /// `CacheDurationInHours`, the one duration its `TvdbClientManager`
+    /// keeps every response for.
+    #[must_use]
+    pub fn cache_duration(&self) -> std::time::Duration {
+        self.cache_duration
+    }
+
     /// Sets how old the bearer token may get before the client logs in again
     /// ([`DEFAULT_TOKEN_MAX_AGE`] unless set).
     #[must_use]
@@ -866,12 +874,11 @@ impl TvdbClient {
         language: &str,
         three_letter_names: &[String],
     ) -> Vec<TvdbSearchHit> {
-        let options = crate::provider_manager::naming_options();
-        let parsed = ferrofin_naming::video::video_resolver::clean_date_time(name, options);
-        let parsed_year = parsed.year;
-        let parsed_name =
-            ferrofin_naming::video::video_resolver::try_clean_string(Some(&parsed.name), options)
-                .unwrap_or(parsed.name);
+        let parsed = ferrofin_naming::video::video_resolver::parse_name(
+            name,
+            crate::provider_manager::naming_options(),
+        );
+        let (parsed_name, parsed_year) = (parsed.name, parsed.year);
         let comparable = comparable_name(&parsed_name);
         let query = vec![
             ("query", comparable.clone()),
@@ -1894,7 +1901,8 @@ mod tests {
         // No /login route → token() fails → every call returns None/empty.
         let server = MockServer::start(vec![("/search", "{}".to_owned())]).await;
         let c = TvdbClient::new().with_base_url(&server.base_url);
-        assert!(c.search("x", None, "en", &[]).await.is_empty());
+        let results = c.search("x", None, "en", &[]).await;
+        assert!(results.is_empty(), "{results:?}");
         assert!(c.series_details(1, "usa").await.is_none());
     }
 
@@ -2111,6 +2119,7 @@ mod tests {
             assert_eq!((images[0].width, images[0].height), (Some(800), Some(0)));
         }
         assert!(client.artwork_types.lock().unwrap().is_some());
-        assert!(client.season_images(5, "official", 99).await.is_empty());
+        let season_images = client.season_images(5, "official", 99).await;
+        assert!(season_images.is_empty(), "{season_images:?}");
     }
 }

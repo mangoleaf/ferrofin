@@ -73,7 +73,8 @@ async fn home_sections_are_replaced_wholesale_per_display_preferences_row() {
     let db = memory_db().await;
     let mine = display_preferences_row(&db, 1, "00000000-0000-0000-0000-0000000000A1").await;
     let theirs = display_preferences_row(&db, 2, "00000000-0000-0000-0000-0000000000A2").await;
-    assert!(db.home_sections(mine).await.expect("empty").is_empty());
+    let home_sections = db.home_sections(mine).await.expect("empty");
+    assert!(home_sections.is_empty(), "{home_sections:?}");
 
     // Written out of order; read back by `Order`.
     db.replace_home_sections(mine, &[(2, 6), (0, 1), (1, 4)])
@@ -112,7 +113,8 @@ async fn home_sections_are_replaced_wholesale_per_display_preferences_row() {
 
     // Replacing with nothing leaves the row sectionless.
     db.replace_home_sections(mine, &[]).await.expect("clear");
-    assert!(db.home_sections(mine).await.expect("cleared").is_empty());
+    let home_sections = db.home_sections(mine).await.expect("cleared");
+    assert!(home_sections.is_empty(), "{home_sections:?}");
 }
 
 /// A Jellyfin database keeps every save's `HomeSection` rows (its controller

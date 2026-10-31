@@ -2084,7 +2084,7 @@ async fn refresh_nested_folder_scans_only_its_subtree() {
             }
         )]
     );
-    assert!(queued.is_empty());
+    assert!(queued.is_empty(), "{queued:?}");
 }
 
 /// A virtual season (episodes straight in the series folder) has no folder
@@ -2406,7 +2406,7 @@ async fn refresh_an_item_with_no_file_refreshes_through_the_provider_queue() {
     for row in [person, streamed] {
         let id = Uuid::parse_str(&row.id).expect("id");
         let (scans, queued, options) = refresh_row(row, REPLACE_ALL).await;
-        assert!(scans.is_empty());
+        assert!(scans.is_empty(), "{scans:?}");
         assert_eq!(queued, vec![id]);
         assert_eq!(options, vec![controller_options(REPLACE_ALL)]);
         assert!(options[0].force_save && options[0].remove_old_metadata);

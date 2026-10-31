@@ -80,8 +80,12 @@ mod tests {
         let q = InternalPeopleQuery::default();
         assert_eq!(q.limit, 0);
         assert_eq!(q.item_id, Uuid::nil());
-        assert!(q.person_types.is_empty());
-        assert!(q.exclude_person_types.is_empty());
+        assert!(q.person_types.is_empty(), "{:?}", q.person_types);
+        assert!(
+            q.exclude_person_types.is_empty(),
+            "{:?}",
+            q.exclude_person_types
+        );
         assert!(q.user_id.is_none());
         assert!(q.is_favorite.is_none());
         assert!(!q.must_have_item);

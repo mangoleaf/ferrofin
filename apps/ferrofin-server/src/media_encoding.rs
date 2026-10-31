@@ -1569,7 +1569,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(alt.media_attachments.is_empty());
+        assert!(
+            alt.media_attachments.is_empty(),
+            "{:?}",
+            alt.media_attachments
+        );
     }
 
     #[tokio::test]

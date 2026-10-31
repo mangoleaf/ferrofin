@@ -12,6 +12,10 @@
 //!   locations.
 //! - [`InternalMetadataFolderImageProvider`] — scans the internal metadata path.
 //!
+//! What they find becomes image rows ([`local_image_infos`]) merged onto an
+//! item's stored images by upstream's rule ([`merge_local_images`],
+//! [`first_of_each_singular_type`]).
+//!
 //! All filesystem access goes through the [`DirectoryService`] seam so the unit
 //! tests drive a temp-dir / in-memory fake and the un-mockable I/O
 //! ([`FsDirectoryService`]) stays out of the coverage numbers.
@@ -20,6 +24,7 @@ pub mod directory_service;
 pub mod episode_image_provider;
 pub mod item;
 pub mod local_image_provider;
+pub mod merge;
 pub mod other_providers;
 
 pub use directory_service::{
@@ -29,6 +34,9 @@ pub use directory_service::{
 pub use episode_image_provider::EpisodeLocalImageProvider;
 pub use item::{ImageItem, ImageItemKind};
 pub use local_image_provider::LocalImageProvider;
+pub use merge::{
+    file_date_modified, first_of_each_singular_type, local_image_infos, merge_local_images,
+};
 pub use other_providers::{
     CollectionFolderLocalImageProvider, InternalMetadataFolderImageProvider,
 };

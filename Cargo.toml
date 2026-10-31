@@ -52,6 +52,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 pedantic = { level = "warn", priority = -1 }
 # product names in docs (SQLite, ffmpeg, DLNA, …) trip doc_markdown — allow it
 doc_markdown = "allow"
+# modules with children are self-named `foo.rs` beside `foo/`, never `foo/mod.rs`
+# (integration-test helpers at `tests/<name>/mod.rs` are not flagged)
+mod_module_files = "warn"
+# nursery allocation lints (gl-1017): a clone whose original is never used again, a
+# collect only iterated, counted or searched once, an eagerly built `or`/`unwrap_or` default
+redundant_clone = "warn"
+needless_collect = "warn"
+or_fun_call = "warn"
 
 [workspace.dependencies]
 if-addrs = { version = "0.15.0", features = ["link-local"] }
@@ -81,6 +89,7 @@ ferrofin-api = { path = "crates/ferrofin-api" }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.7.1", features = ["fs", "trace", "cors", "compression-gzip", "compression-br"] }
+httpdate = "1.0.3"
 # Decoders for the response-compression tests only (the server never decodes a
 # response it just encoded). Streaming readers validate the wire response.
 flate2 = "1.1.10"
@@ -90,6 +99,7 @@ sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip
 brotli = "9.0.0"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.6"
+http-body = "1.0"
 # The `Stream` trait `axum::body::Body::from_stream` takes — the progressive
 # (tail-following) response bodies the Live TV live-stream/recording routes serve.
 futures-core = "0.3.34"
@@ -111,6 +121,9 @@ libsqlite3-sys = "0.37.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
+# Edits config.toml in place, keeping its comments and layout: the settings
+# page's save (ferrofin-server `settings::save`).
+toml_edit = { version = "0.25.17", default-features = false, features = ["parse", "display"] }
 # The `$.Field[0]` path in a body-binder rejection: serde's own error names the
 # type, not the member that failed, and ASP.NET's ValidationProblemDetails keys
 # its `errors` dictionary by path. ferrofin-api's JsonBody extractor only.
@@ -200,6 +213,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 kamadak-exif = "0.6"                                        # photo EXIF (ferrofin-drawing PhotoProvider)
 webp = { version = "0.3", default-features = false }  # LOSSY WebP encode via libwebp (BSD-3) — image-webp is lossless-only; Skia parity needs Google's encoder
 jpeg-encoder = "0.7"     # JPEG encode with 4:2:0 chroma subsampling — the `image` crate's encoder is hardcoded 4:4:4; Skia's SkJpegEncoder defaults to 4:2:0
+jpeg-decoder = { version = "0.3.2", default-features = false }  # DCT-scaled JPEG decode (1/2, 1/4, 1/8) for blur hashes and thumbnails, like Skia's GetScaledDimensions; zune-jpeg (the `image` crate's decoder) cannot scale. In maintenance mode upstream. No rayon: without it a decode wider than 128 px runs one short-lived thread per colour component, inside the encode permits that bound concurrent decodes to the cores (a failed spawn falls back to the full decode)
 blurhash = "0.2"         # ImageBlurHashes — functionally-valid hashes (not byte-identical to Jellyfin's Skia)
 config = { version = "0.15.26", default-features = false, features = ["toml"] }   # config.toml is TOML only
 clap = { version = "4.6.7", features = ["derive"] }

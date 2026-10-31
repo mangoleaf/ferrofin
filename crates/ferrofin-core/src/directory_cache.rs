@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use ferrofin_model::io::{FileSystemEntryInfo, FileSystemEntryType};
 use ferrofin_providers::FileSystemMetadata;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::filesystem::{FileMetadata, FileSystem};
+use ferrofin_traits::filesystem::{FileMetadata, FileSystem, OpenedFile};
 
 /// The bounds of a [`DirectoryCache`] (`DirectoryService`'s
 /// `MaxCachedRecords` and `IdleTimeoutMs`).
@@ -275,6 +275,10 @@ impl FileSystem for DirectoryCache {
     fn read_file(&self, path: &str) -> Result<Vec<u8>, ServiceError> {
         self.file_system.read_file(path)
     }
+
+    fn open_file(&self, path: &str) -> Result<OpenedFile, ServiceError> {
+        self.file_system.open_file(path)
+    }
 }
 
 /// The local image providers' view of the same listings.
@@ -284,13 +288,13 @@ impl FileSystem for DirectoryCache {
 /// only image files are stat'ed; every other entry reports length `0`. A
 /// link counts as what it points to, as the listing classifies it.
 impl ferrofin_providers::DirectoryService for DirectoryCache {
-    fn file_system_entries(&self, path: &str) -> Vec<FileSystemMetadata> {
+    fn file_system_entries(&self, path: &str) -> Arc<[FileSystemMetadata]> {
         let (hit, generation) = {
             let state = self.state();
             (state.metadata.get(path).map(Arc::clone), state.generation)
         };
         if let Some(hit) = hit {
-            return hit.to_vec();
+            return hit;
         }
         let entries: Arc<[FileSystemMetadata]> = self
             .shared_file_system_entries(path)
@@ -305,7 +309,7 @@ impl ferrofin_providers::DirectoryService for DirectoryCache {
             state.records += entries.len() + 1;
         }
         drop(state);
-        entries.to_vec()
+        entries
     }
 }
 
@@ -428,7 +432,8 @@ mod tests {
         let (tmp, _, fs, cache) = cache();
         let missing = tmp.path().join("later").to_string_lossy().into_owned();
         assert!(cache.try_get_file_system_entries(&missing).is_err());
-        assert!(cache.get_file_system_entries(&missing).is_empty());
+        let file_system_entries = cache.get_file_system_entries(&missing);
+        assert!(file_system_entries.is_empty(), "{file_system_entries:?}");
         std::fs::create_dir(&missing).unwrap();
         assert!(cache.try_get_file_system_entries(&missing).is_ok());
         assert_eq!(fs.listings(), 3);
@@ -458,7 +463,7 @@ mod tests {
         std::fs::write(tmp.path().join("poster.jpg"), b"jpeg").unwrap();
         std::fs::write(tmp.path().join("fanart.png"), b"").unwrap();
         std::fs::create_dir(tmp.path().join("extrafanart")).unwrap();
-        let mut entries = cache.file_system_entries(&dir);
+        let mut entries = cache.file_system_entries(&dir).to_vec();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let lengths: Vec<_> = entries
             .iter()
@@ -476,6 +481,18 @@ mod tests {
         assert_eq!(entries[3].extension.as_deref(), Some(".jpg"));
         cache.file_system_entries(&dir);
         cache.get_file_system_entries(&dir);
+        assert_eq!(fs.listings(), 1);
+    }
+
+    #[test]
+    fn image_entries_are_shared_not_copied() {
+        let (_tmp, dir, fs, cache) = cache();
+        let first = cache.file_system_entries(&dir);
+        let second = cache.file_system_entries(&dir);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a cached listing is handed out as the one shared copy"
+        );
         assert_eq!(fs.listings(), 1);
     }
 

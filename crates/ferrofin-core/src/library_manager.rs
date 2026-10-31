@@ -1022,8 +1022,13 @@ impl ScanWorker {
             self.progress.send_modify(|n| *n = n.wrapping_add(1));
         }
         let elapsed_ms = started.elapsed().as_millis();
-        let (created, updated, unchanged, removed) =
-            (total.created, total.updated, total.unchanged, total.removed);
+        let (created, updated, unchanged, removed, skipped) = (
+            total.created,
+            total.updated,
+            total.unchanged,
+            total.removed,
+            total.skipped,
+        );
         // A drain that included a stopped pass did not complete.
         if total.stopped {
             tracing::info!(
@@ -1031,6 +1036,7 @@ impl ScanWorker {
                 updated,
                 unchanged,
                 removed,
+                skipped,
                 elapsed_ms,
                 "library scan stopped"
             );
@@ -1040,6 +1046,7 @@ impl ScanWorker {
                 updated,
                 unchanged,
                 removed,
+                skipped,
                 elapsed_ms,
                 "library scan complete"
             );
@@ -1098,6 +1105,7 @@ impl ScanWorker {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "library scan stopped before it finished"
                 );
                 (ScanResult::Stopped, Some(pass))
@@ -1112,6 +1120,7 @@ impl ScanWorker {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "library scan pass complete"
                 );
                 (ScanResult::Completed, Some(pass))
@@ -1189,6 +1198,7 @@ impl PriorityLane for QueueLane {
                     updated = pass.updated,
                     unchanged = pass.unchanged,
                     removed = pass.removed,
+                    skipped = pass.skipped,
                     "item refresh served inside the running scan"
                 );
                 ScanResult::Completed
@@ -5049,10 +5059,7 @@ mod tests {
             request(paths(&["/m/z"]), MetadataRefreshOptions::default()),
             true,
         );
-        let late_l = queue.enqueue(
-            request(lib.clone(), MetadataRefreshOptions::default()),
-            true,
-        );
+        let late_l = queue.enqueue(request(lib, MetadataRefreshOptions::default()), true);
         assert_eq!(queue.pending.len(), 2);
         assert_eq!(
             queue.pending[1].waiters.tickets,
@@ -5915,12 +5922,8 @@ mod tests {
                 .expect("missing")
                 .is_none()
         );
-        assert!(
-            mgr.get_visible_item_ids(&[], &user)
-                .await
-                .expect("empty")
-                .is_empty()
-        );
+        let visible_item_ids = mgr.get_visible_item_ids(&[], &user).await.expect("empty");
+        assert!(visible_item_ids.is_empty(), "{visible_item_ids:?}");
         assert!(mgr.get_visible_item_ids(&[id], &user).await.is_err());
     }
 
@@ -5968,12 +5971,13 @@ mod tests {
                 .unwrap(),
             [shown]
         );
+        let parentally_allowed_item_ids = library
+            .get_parentally_allowed_item_ids(&[], &user, true)
+            .await
+            .unwrap();
         assert!(
-            library
-                .get_parentally_allowed_item_ids(&[], &user, true)
-                .await
-                .unwrap()
-                .is_empty()
+            parentally_allowed_item_ids.is_empty(),
+            "{parentally_allowed_item_ids:?}"
         );
     }
 
@@ -6280,12 +6284,11 @@ mod tests {
         );
 
         // Empty input yields an empty result without a query.
-        assert!(
-            mgr.get_named_items(BaseItemKind::Genre, &[])
-                .await
-                .expect("empty")
-                .is_empty()
-        );
+        let named_items = mgr
+            .get_named_items(BaseItemKind::Genre, &[])
+            .await
+            .expect("empty");
+        assert!(named_items.is_empty(), "{named_items:?}");
     }
 
     /// Two rows of the SAME kind sharing a `CleanName` must resolve to the same
@@ -6386,12 +6389,11 @@ mod tests {
 
         // Empty input yields an empty result without a query; a blank name is a
         // slot that resolves to nothing rather than a dropped slot.
-        assert!(
-            mgr.get_named_item_ids(BaseItemKind::Genre, &[])
-                .await
-                .expect("empty")
-                .is_empty()
-        );
+        let named_item_ids = mgr
+            .get_named_item_ids(BaseItemKind::Genre, &[])
+            .await
+            .expect("empty");
+        assert!(named_item_ids.is_empty(), "{named_item_ids:?}");
         assert_eq!(
             mgr.get_named_item_ids(BaseItemKind::Genre, &[String::new(), " ".to_owned()])
                 .await
@@ -6439,7 +6441,7 @@ mod tests {
             .await
             .expect("ancestors")
             .expect("item exists");
-        assert!(roots.is_empty());
+        assert!(roots.is_empty(), "{roots:?}");
 
         // A missing item yields None so the API maps it to 404.
         assert!(
@@ -7399,7 +7401,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert!(orphan_result.items.is_empty());
+            assert!(orphan_result.items.is_empty(), "{:?}", orphan_result.items);
             for recursive in [false, true] {
                 let direct = library
                     .query_items(&InternalItemsQuery {
@@ -8216,17 +8218,15 @@ mod tests {
             .unwrap();
         assert_eq!(adjacent.total_record_count, 2);
         assert_eq!(names(adjacent), ["Charlie video", "Zulu movie collection"]);
-        assert!(
-            library
-                .query_items(&InternalItemsQuery {
-                    adjacent_to: Some(Uuid::new_v4()),
-                    ..plain.clone()
-                })
-                .await
-                .unwrap()
-                .items
-                .is_empty()
-        );
+        let items = library
+            .query_items(&InternalItemsQuery {
+                adjacent_to: Some(Uuid::new_v4()),
+                ..plain.clone()
+            })
+            .await
+            .unwrap()
+            .items;
+        assert!(items.is_empty(), "{items:?}");
 
         assert_eq!(
             names(library.query_items(&plain).await.unwrap()),
@@ -8256,7 +8256,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outside.total_record_count, 3);
-        assert!(outside.items.is_empty());
+        assert!(outside.items.is_empty(), "{:?}", outside.items);
         assert!(
             library
                 .query_items(&InternalItemsQuery {

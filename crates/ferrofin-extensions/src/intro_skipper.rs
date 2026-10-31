@@ -264,7 +264,7 @@ impl IntroSkipperAnalysis for DetectSegmentsTask {
         IntroSkipperSettings {
             // A negative delay is no delay upstream's CSS can use: default.
             skip_button_hide_delay: u64::try_from(config.skipbutton_hide_delay)
-                .unwrap_or(IntroSkipperSettings::default().skip_button_hide_delay),
+                .unwrap_or_else(|_| IntroSkipperSettings::default().skip_button_hide_delay),
             update_media_segments: config.update_media_segments,
         }
     }
@@ -2074,7 +2074,7 @@ mod tests {
         let scan = scan_task(&h);
         assert_eq!(scan.key(), "TaskExtractMediaSegments");
         assert_eq!(scan.name(), "Media Segment Scan");
-        assert!(!scan.description().is_empty());
+        assert_ne!(scan.description(), "");
         assert_eq!(scan.category(), "Library");
         let triggers = scan.default_triggers();
         assert_eq!(triggers.len(), 1);
@@ -2318,6 +2318,106 @@ mod tests {
         assert!(strict.iter().all(|(k, _)| *k != id(0x55)));
     }
 
+    /// gl-1013: the queue reads the library a page at a time and keeps the
+    /// order of the whole-list walk: each item under the first enabled
+    /// library one of whose locations holds its file (a disabled library
+    /// nested in an enabled one included), libraries in order, and the
+    /// query's order within each.
+    #[tokio::test]
+    async fn the_queue_reads_the_library_a_page_at_a_time() {
+        let h = harness(&[], true, "{}", true).await;
+        let db = ferrofin_db::Database::connect_in_memory()
+            .await
+            .expect("connect");
+        db.run_migrations().await.expect("migrations");
+        let persistence = ferrofin_core::FerrofinItemPersistenceService::new(db.clone());
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new());
+        let items: Arc<dyn ferrofin_traits::persistence::ItemRepository> =
+            Arc::new(crate::library_pages::tests::OnePageAtATime(Arc::new(
+                ferrofin_core::FerrofinItemRepository::new(db.clone(), lookup),
+            )));
+        let library = ferrofin_core::FerrofinLibraryManager::new(
+            items,
+            Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+            Arc::new(ferrofin_core::FerrofinItemPersistenceService::new(
+                db.clone(),
+            )),
+            Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+        );
+        // More episodes than a page, one per series. The series take the
+        // three roots in turn, so the query's order interleaves the libraries.
+        let roots = ["/lib/kids", "/lib/main", "/lib/old"];
+        let count = crate::library_pages::PAGE + 37;
+        let season = |n: usize| Uuid::from_u128(0x2000 + u128::try_from(n).expect("n"));
+        let episode_type =
+            ferrofin_core::item_type_lookup::stored_type_name(BaseItemKind::Episode).expect("type");
+        let mut rows: Vec<BaseItemEntity> = (0..count)
+            .map(|n| {
+                let n128 = u128::try_from(n).expect("n");
+                BaseItemEntity {
+                    id: guid_to_db(Uuid::from_u128(0x1000 + n128)),
+                    type_: episode_type.to_owned(),
+                    path: Some(format!("{}/show {n:03}/s01e01.mkv", roots[n % 3])),
+                    run_time_ticks: Some(1_800 * 10_000_000),
+                    season_id: Some(guid_to_db(season(n))),
+                    series_id: Some(guid_to_db(Uuid::from_u128(0x3000 + n128))),
+                    series_name: Some(format!("Show {n:03}")),
+                    parent_index_number: Some(1),
+                    index_number: Some(1),
+                    ..BaseItemEntity::default()
+                }
+            })
+            .collect();
+        // A file under no library's location is never queued.
+        rows.push(BaseItemEntity {
+            id: guid_to_db(Uuid::from_u128(0x1fff)),
+            type_: episode_type.to_owned(),
+            path: Some("/elsewhere/show 000/s01e01.mkv".to_owned()),
+            season_id: Some(guid_to_db(Uuid::from_u128(0x2fff))),
+            series_name: Some("Show 000".to_owned()),
+            parent_index_number: Some(1),
+            index_number: Some(1),
+            ..BaseItemEntity::default()
+        });
+        persistence.save_items(&rows).await.expect("seed");
+        let folder =
+            |location: &str, enabled: bool| ferrofin_model::entities_media::VirtualFolderInfo {
+                locations: vec![location.to_owned()],
+                library_options: (!enabled).then(|| LibraryOptions {
+                    disabled_media_segment_providers: vec!["Intro Skipper".to_owned()],
+                    ..LibraryOptions::default()
+                }),
+                ..Default::default()
+            };
+        // `/lib/old` disables the plugin but lies inside the enabled `/lib`,
+        // so its files are queued under `/lib`, after the kids' library.
+        let folders = vec![
+            folder("/lib/kids", true),
+            folder("/lib/old", false),
+            folder("/lib", true),
+        ];
+
+        let queue = queue::build(
+            &library,
+            h.task.ffmpeg.as_ref(),
+            &folders,
+            &IntroSkipperConfig::default(),
+            true,
+        )
+        .await
+        .expect("queue");
+
+        let kids = (0..count).filter(|n| n % 3 == 0);
+        let rest = (0..count).filter(|n| n % 3 != 0);
+        let expected: Vec<Uuid> = kids.chain(rest).map(season).collect();
+        let seasons: Vec<Uuid> = queue.iter().map(|(season, _)| *season).collect();
+        assert_eq!(seasons, expected);
+        // One entry per file: the kids' files, which `/lib` holds too, are
+        // queued once.
+        assert!(queue.iter().all(|(_, entries)| entries.len() == 1));
+    }
+
     /// `ClearExcludedTimestampsAsync`: the items the exclusion policy now
     /// matches lose their stored segments and cache, and are republished.
     #[tokio::test]
@@ -2343,7 +2443,8 @@ mod tests {
             usize::try_from(cleared.removed_cache_entries).unwrap(),
             cache
         );
-        assert!(h.actions.stored_item_ids().await.expect("ids").is_empty());
+        let stored_item_ids = h.actions.stored_item_ids().await.expect("ids");
+        assert!(stored_item_ids.is_empty(), "{stored_item_ids:?}");
         assert!(
             intros_of(&h.segments, EP_A).await.is_empty(),
             "republished as empty"
@@ -3049,7 +3150,8 @@ mod tests {
             .execute(&TaskProgress::default())
             .await
             .expect("failing pass");
-        assert!(h.actions.segments(EP_A).await.expect("tier").is_empty());
+        let segments = h.actions.segments(EP_A).await.expect("tier");
+        assert!(segments.is_empty(), "{segments:?}");
         assert!(intro_state(&h).await.episode_ids.is_empty());
 
         h.actions.set_read_only(false);
@@ -3070,7 +3172,8 @@ mod tests {
         // The fixture's shared region is ~49.5 s.
         let task = configured(&h, r#"{"MaximumIntroDuration":30}"#);
         task.execute(&TaskProgress::default()).await.expect("run");
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        let found = intros_of(&h.segments, EP_A).await;
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(intro_state(&h).await.episode_ids.len(), 2);
         let calls = h.calls.load(Ordering::SeqCst);
         task.execute(&TaskProgress::default()).await.expect("rerun");
@@ -3089,7 +3192,8 @@ mod tests {
         std::fs::remove_file(h.cache.path().join("media/s01e02.mkv")).expect("remove");
         h.task.execute(&TaskProgress::default()).await.expect("run");
         assert_eq!(h.calls.load(Ordering::SeqCst), 0);
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        let found = intros_of(&h.segments, EP_A).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// The only episode still needing analysis is compared with its analysed
@@ -3206,7 +3310,8 @@ mod tests {
     ) {
         let h = harness(episodes, enabled, "{}", with_fingerprinter).await;
         h.task.execute(&TaskProgress::default()).await.expect("run");
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        let found = intros_of(&h.segments, EP_A).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// A scheduled pass waits its turn behind one in flight (a rescan, say),
@@ -3237,7 +3342,8 @@ mod tests {
         .await;
         h.task.execute(&TaskProgress::default()).await.expect("run");
         assert_eq!(h.calls.load(Ordering::SeqCst), 0);
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        let found = intros_of(&h.segments, EP_A).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[tokio::test]
@@ -3271,7 +3377,8 @@ mod tests {
             ..h
         };
         h.task.execute(&TaskProgress::default()).await.expect("run");
-        assert!(intros_of(&h.segments, EP_A).await.is_empty());
+        let found = intros_of(&h.segments, EP_A).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// The support bundle's analysis half: the last queue's counts, the
@@ -3446,13 +3553,15 @@ mod tests {
                 "Intro Skipper"
             )
         );
-        assert!(clean.default_triggers().is_empty());
+        let default_triggers = clean.default_triggers();
+        assert!(default_triggers.is_empty(), "{default_triggers:?}");
         clean
             .execute(&TaskProgress::default())
             .await
             .expect("clean");
 
-        assert!(h.actions.segments(gone).await.expect("tier").is_empty());
+        let segments = h.actions.segments(gone).await.expect("tier");
+        assert!(segments.is_empty(), "{segments:?}");
         assert!(
             !h.actions
                 .stored_item_ids()
@@ -3613,13 +3722,8 @@ mod tests {
             .set_excluded(SEASON, EP_A, true)
             .await
             .expect("exclude");
-        assert!(
-            provider
-                .get_segments(&request(EP_A))
-                .await
-                .expect("get")
-                .is_empty()
-        );
+        let segments = provider.get_segments(&request(EP_A)).await.expect("get");
+        assert!(segments.is_empty(), "{segments:?}");
 
         let disabled = harness(&TWO_EPISODES, false, "{}", true).await;
         let provider = SegmentProvider {

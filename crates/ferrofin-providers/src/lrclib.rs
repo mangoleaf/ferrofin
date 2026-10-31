@@ -465,7 +465,8 @@ mod tests {
 
         let empty: LrcLibItem =
             serde_json::from_str(r#"{"id": 8, "instrumental": true}"#).expect("parses");
-        assert!(map_item(&empty).is_empty());
+        let found = map_item(&empty);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -570,13 +571,8 @@ mod tests {
         // covered in `rate_limit`'s own suite. Only the wait is skipped.
         provider.limiter = provider.limiter.without_backoff();
         let started = std::time::Instant::now();
-        assert!(
-            provider
-                .search(&request())
-                .await
-                .expect("search")
-                .is_empty()
-        );
+        let results = provider.search(&request()).await.expect("search");
+        assert!(results.is_empty(), "{results:?}");
         // The limiter's first failure backoff is 2 s.
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
@@ -587,13 +583,8 @@ mod tests {
         let mut incomplete = request();
         incomplete.duration = None;
         let provider = LrcLibProvider::new().with_base_url("http://127.0.0.1:1");
-        assert!(
-            provider
-                .search(&incomplete)
-                .await
-                .expect("search")
-                .is_empty()
-        );
+        let results = provider.search(&incomplete).await.expect("search");
+        assert!(results.is_empty(), "{results:?}");
     }
 
     #[tokio::test]

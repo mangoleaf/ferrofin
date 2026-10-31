@@ -264,7 +264,7 @@ async fn get_universal_audio_stream(
                 .collect()
         })
         .unwrap_or_default();
-    let profile = universal_device_profile(&query, &containers);
+    let profile = std::sync::Arc::new(universal_device_profile(&query, &containers));
     let negotiated = universal_audio_source(
         &state,
         &auth,
@@ -437,7 +437,8 @@ mod tests {
         assert_eq!(transcoding.context, EncodingContext::Streaming);
         assert_eq!(transcoding.max_audio_channels.as_deref(), Some("2"));
         assert!(p.codec_profiles.is_empty(), "no caps, no codec profile");
-        assert!(profile("").direct_play_profiles.is_empty());
+        let direct_play_profiles = profile("").direct_play_profiles;
+        assert!(direct_play_profiles.is_empty(), "{direct_play_profiles:?}");
 
         let p = profile(
             "container=flac,mp3&maxAudioSampleRate=48000&maxAudioChannels=2\

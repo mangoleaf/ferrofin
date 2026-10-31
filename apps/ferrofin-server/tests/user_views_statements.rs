@@ -288,20 +288,16 @@ async fn a_warm_views_request_reads_no_library_row_again() {
             .any(|s| s.contains(r#"SELECT bi."ParentId", COUNT(*)"#)),
         "the views' child count is recorded:\n{listing}"
     );
-    let library_reads: Vec<&String> = statements
-        .iter()
-        .filter(|s| s.contains(r#"WHERE "Data" IS NOT NULL AND +"Type" ="#))
-        .collect();
     assert!(
-        library_reads.is_empty(),
+        !statements
+            .iter()
+            .any(|s| s.contains(r#"WHERE "Data" IS NOT NULL AND +"Type" ="#)),
         "the libraries' physical folders come from the cached library set:\n{listing}"
     );
-    let live_tv_lookups: Vec<&String> = statements
-        .iter()
-        .filter(|s| s.contains(r#"WHERE "Type" = ?1 AND ("Path" LIKE"#))
-        .collect();
     assert!(
-        live_tv_lookups.is_empty(),
+        !statements
+            .iter()
+            .any(|s| s.contains(r#"WHERE "Type" = ?1 AND ("Path" LIKE"#)),
         "the Live TV view is found among the rows the scope read:\n{listing}"
     );
     assert!(

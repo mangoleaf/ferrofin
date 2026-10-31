@@ -154,6 +154,7 @@ pub mod dashboard;
 pub mod devices;
 pub mod display_preferences;
 pub mod environment;
+pub mod ferrofin_settings;
 pub mod filter;
 pub mod genres;
 pub mod hls;
@@ -859,21 +860,65 @@ pub const EXTENSION_ROUTES: &[(&str, &str, &str)] = &[
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`]) under the old tag.
 /// The vendored OpenAPI contract stays 10.11.8: that is the API clients speak,
 /// even though Jellyfin 12 dropped operations from it.
-pub const UPSTREAM_TAG: &str = "v12.2";
+pub const UPSTREAM_TAG: &str = "v12.4";
 /// The commit `UPSTREAM_TAG` resolves to in `github.com/jellyfin/jellyfin`.
-pub const UPSTREAM_COMMIT: &str = "ca0f16eb7c";
+pub const UPSTREAM_COMMIT: &str = "83d0d0e7f7";
 /// The day [`UPSTREAM_TAG`] became the pin, `YYYY-MM-DD`; move it with the tag.
 /// A row dated on or after it was compared against [`UPSTREAM_TAG`], so it can
 /// never be listed in [`VERIFIED_AGAINST_EARLIER_PIN`] or
-/// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`].
-pub const UPSTREAM_PIN_DATE: &str = "2026-10-16";
+/// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`]; a row dated before it was
+/// compared against an earlier release, so it must be listed there.
+pub const UPSTREAM_PIN_DATE: &str = "2026-10-28";
 
 /// [`VERIFIED`] rows last compared against an earlier pin, as
 /// `(method, path, tag compared against)`. They are completed verification work,
 /// but not against [`UPSTREAM_TAG`], and the parity line counts them apart.
 /// Re-compare the row against [`UPSTREAM_TAG`], update its `date`, and remove it
-/// from this list. `v12.0-rc7` is commit `4910aafa1a`.
-pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[];
+/// from this list. `v12.2` is commit `ca0f16eb7c`.
+pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
+    // The v12.4 re-check found a gap that v12.2 has too (the C# under these
+    // rows is unchanged); each leaves the list with its fix.
+    // gl-1034: a nil parentId is an empty page, not GetItemById's 400.
+    ("get", "/Shows/NextUp", "v12.2"),
+    // gl-1037: a malformed minCommunityRating is ignored, not a 400; gl-884: a
+    // malformed genreIds/studioIds token is a 400, not dropped; gl-1038: a
+    // padded parentId/userId is a 400, not trimmed.
+    ("get", "/Artists", "v12.2"),
+    ("get", "/Artists/AlbumArtists", "v12.2"),
+    // gl-408: parameters these actions do not declare are bound (a 400 on a
+    // bad value); gl-1038: a padded parentId/userId is a 400, not trimmed.
+    ("get", "/Genres", "v12.2"),
+    ("get", "/MusicGenres", "v12.2"),
+    ("get", "/Studios", "v12.2"),
+    // gl-1034: a nil item id is a 404, not GetItemById's 400.
+    ("get", "/Audio/{itemId}/Lyrics", "v12.2"),
+    ("delete", "/Audio/{itemId}/Lyrics", "v12.2"),
+    ("get", "/Audio/{itemId}/RemoteSearch/Lyrics", "v12.2"),
+    ("post", "/Items/{itemId}/ContentType", "v12.2"),
+    // gl-1031: a malformed unrelated query parameter is a 400.
+    ("post", "/UserImage", "v12.2"),
+    ("delete", "/UserImage", "v12.2"),
+    // gl-1027: a padded lyric extension is trimmed and saved.
+    ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
+    // gl-1028: a whitespace-only route id is not the validation 400.
+    (
+        "post",
+        "/Audio/{itemId}/RemoteSearch/Lyrics/{lyricId}",
+        "v12.2",
+    ),
+    ("get", "/Providers/Lyrics/{lyricId}", "v12.2"),
+    ("get", "/DisplayPreferences/{displayPreferencesId}", "v12.2"),
+    (
+        "post",
+        "/DisplayPreferences/{displayPreferencesId}",
+        "v12.2",
+    ),
+    // gl-1059: "EnabledTuners": null or "ChannelMappings": null is a 400, not
+    // bound.
+    ("post", "/LiveTv/ListingProviders", "v12.2"),
+    // gl-762: livetv lists tuners and listing providers by id, not as added.
+    ("get", "/System/Configuration/{key}", "v12.2"),
+];
 
 /// [`VERIFIED_SUBSYSTEMS`] rows last compared against an earlier pin, as
 /// `(key, tag compared against)` — the same rules as
@@ -882,7 +927,10 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 
 /// The subsystems a [`VERIFIED_SUBSYSTEMS`] row may cover, by key. Every
 /// operation crosses several of them, so one row states their divergences once
-/// and operation rows name it in [`Verified::refs`].
+/// and operation rows name it in [`Verified::refs`]. `websocket-streams` is
+/// the `/socket` dashboard streams, which no contract operation describes;
+/// `scan-failure-isolation` is what the library scan does about a row or a
+/// write that fails, which no operation's response shows.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -890,6 +938,8 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "access-filtering",
     "images",
     "paging-sort",
+    "websocket-streams",
+    "scan-failure-isolation",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -916,7 +966,165 @@ pub struct VerifiedSubsystem {
 /// compared against the upstream C# at [`UPSTREAM_TAG`] (or the earlier tag
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
-pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[];
+pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "scan-failure-isolation",
+        upstream_file: "MediaBrowser.Controller/Entities/TV/Episode.cs",
+        upstream_method: "FindSeriesName",
+        ferrofin: "What a child's refresh in the library scan does when its parent row cannot \
+                   be read, and what the walk does when an item fails. ferrofin-core \
+                   library_scan.rs run_scan (the item's error is counted in \
+                   ScanOutcome::skipped, the walk goes on, a saved row loses its \
+                   DateLastRefreshed, a new item with no row takes its descendants along, a \
+                   refresh of an item or folder ends with that item's own failure) \
+                   ← parent_row (a failed read counts as \
+                   no row, once per pass) ← sync_series_name (FindSeriesName), \
+                   sync_season_name, remember_series_folder; apply_parental_rating_score and \
+                   inherit_stored_rating; keep_stored_series_key. Compared with \
+                   MediaBrowser.Controller/LibraryTaskScheduler/\
+                   LimitedConcurrencyLibraryScheduler.cs (ProcessItem), \
+                   MediaBrowser.Controller/Entities/Folder.cs (RunTasks, \
+                   RefreshChildMetadata), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (RefreshMetadata), \
+                   MediaBrowser.Providers/Manager/ProviderManager.cs (RefreshItem), \
+                   MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata), \
+                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
+                   MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
+        date: "2026-10-30",
+        divergences: &[
+            "An item whose parent chain cannot be read is scored from its own rating and \
+             country, an ancestor's custom rating not counting, else takes the score stored on \
+             its parent, and the children of an undecodable series keep the series key stored \
+             on its row. Upstream has no such row to fall back from: the read would throw into \
+             the per-child catch and the item would not refresh.",
+            "A stored item that fails after its row was saved has its DateLastRefreshed \
+             cleared, so the next scan retries it as a first refresh where upstream, which \
+             saves the row after the providers and the probe, retries it because the row kept \
+             its old DateModified; the rows a save hangs off it by foreign key are why \
+             Ferrofin saves first, and the retry is the same but runs every provider.",
+            "A new item that fails before its first save has no row until the next scan, \
+             where upstream's CreateItems and first-refresh save keep one, so a new folder \
+             that fails takes its descendants with it for this scan.",
+            "A stored folder that fails leaves its children to refresh, where \
+             RefreshChildMetadata does not recurse into a folder that threw, because the \
+             flat walk has already planned them and a persistent failure on a season must \
+             not hide its new episodes for good.",
+            "An episode whose season row is absent or unreadable keeps the season name it has, \
+             the planner's localized one, where FindSeasonName answers a literal \"Season N\" or \
+             \"Season Unknown\". Fix path: port that branch to sync_season_name for a row that \
+             is truly absent, leaving a row that fails to read out of it.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "websocket-streams",
+        upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",
+        upstream_method: "HandleMessages",
+        ferrofin: "handlers/websocket.rs handle_socket → Streams::apply, event_stream, wake_due \
+                   (drain, should_send); sessions_wake (session_event_forces), sessions_message → \
+                   ferrofin-core session_manager.rs SessionEvent raises, with upsert_session's \
+                   SessionActivity past SESSION_ACTIVITY_INTERVAL (LogSessionActivity, a new \
+                   session included) and report_capabilities' CapabilitiesChanged \
+                   (ReportCapabilities); activity_wake → ferrofin-core activity_manager.rs \
+                   create_entry's entry-created raise (ActivityManager.CreateAsync EntryCreated); \
+                   update_task_subscription, subscribe_tasks, task_transition_message, \
+                   task_progress_wake → ferrofin-core scheduled_tasks.rs subscribe_task_updates, \
+                   publish_snapshot from claim (TaskExecuting), record_result and stop_run \
+                   (TaskCompleted), and \
+                   TaskProgress::report's progress raise \
+                   (ScheduledTaskWorker.OnProgressChanged TaskProgress). Compared with the \
+                   Sessions listener \
+                   (Jellyfin.Api/WebSocketListeners/SessionInfoWebSocketListener.cs), the \
+                   ActivityLog listener \
+                   (Jellyfin.Api/WebSocketListeners/ActivityLogWebSocketListener.cs) and the \
+                   ScheduledTasks listener \
+                   (Jellyfin.Api/WebSocketListeners/ScheduledTasksWebSocketListener.cs)",
+        date: "2026-10-29",
+        divergences: &[
+            "Events already queued for a socket are drained and answered with one Sessions or \
+             ActivityLogEntry frame, where upstream sends one per forced event: a burst yields \
+             fewer frames with the same final state.",
+            "A non-administrator's Sessions frames carry the hardware accelerator blanked, as \
+             GET /Sessions does; upstream's stream sends it as is.",
+            "A second SessionsStart, ActivityLogEntryStart or ScheduledTasksInfoStart on a \
+             socket replaces its subscription; upstream adds a second one and sends each frame \
+             twice.",
+            "ScheduledTasksInfoStart sends the current task list at once, where upstream's Start \
+             sends nothing until a task event, because jellyfin-web's scan button has no HTTP \
+             fallback; it costs one registry snapshot per subscribe and none per period, and counts \
+             as the stream's last send, so progress inside the first period is held back.",
+            "A task start or completion is sent with the task list captured at the transition, \
+             where upstream reads the list when it sends; a progress frame due while one is still \
+             queued is dropped, so a short run never shows out of order, and a later report sends \
+             once the period has passed.",
+            "A session list that cannot be built is logged and skipped and the subscription stays; \
+             upstream logs it and drops the connection's subscription.",
+            "A *Start whose Data is missing, has no second field or holds a field that does not \
+             parse as a whole number still subscribes, at jellyfin-web's 1500 ms when the period \
+             is at fault, where upstream's Start throws and makes no subscription.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "images",
+        upstream_file: "src/Jellyfin.Drawing/ImageProcessor.cs",
+        upstream_method: "GetImageCacheTag",
+        ferrofin: "The image cache tags (ImageTags, BackdropImageTags, the Parent*, Series*, \
+                   Album* and People[] tags, ImageBlurHashes' keys, Chapters[].ImageTag, \
+                   search hints, GET /Items/{itemId}/Images, ChannelPrimaryImageTag, a user's \
+                   PrimaryImageTag); image serving and processing are compared per \
+                   operation. ferrofin-drawing processor.rs get_image_cache_tag (the owning \
+                   item's path, null as empty) and get_image_cache_tag_for_path (md5 of the \
+                   UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
+                   dto_service.rs image_tag, tag_and_fill_blur_hash (attach_images, \
+                   add_inherited_images, parent_primary_tag, attach_people with \
+                   person_paths), the chapter tags (the stored item path, \
+                   virtual_paths reverse); search_manager.rs fill_artwork; \
+                   handlers/images.rs image_info_dto; ferrofin-livetv manager.rs \
+                   channel_image_tags (a channel has no path); user_manager.rs get_user_dto \
+                   (the profile image's own path). Item paths as item_repository.rs mapped \
+                   reads them (BaseItemMapper.Map's ExpandVirtualPath). Compared with \
+                   Emby.Server.Implementations/Dto/DtoService.cs (GetImageCacheTag, \
+                   GetTagAndFillBlurhash, AddInheritedImages, AttachPeople), \
+                   Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
+                   Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
+                   Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
+                   src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag) and \
+                   Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto)",
+        date: "2026-10-30",
+        divergences: &[
+            "Timers, series timers and the new-timer defaults carry no image tags: \
+             LiveTvDtoService.FillImages (the program's and the library series' Primary, Thumb \
+             and Backdrop tags) is not ported. Fix path: gl-853.",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "user-data",
+        upstream_file: "Emby.Server.Implementations/Library/UserDataManager.cs",
+        upstream_method: "SaveUserData",
+        ferrofin: "The write path only. ferrofin-core user_data_manager.rs mutate_row \
+                   (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
+                   save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
+                   save_play_state and apply_play_report (UpdatePlayState), \
+                   reset_playback_stream_selections (ResetPlaybackStreamSelections), \
+                   record_playback_start, set_likes, mark_item_played, mark_item_unplayed, \
+                   clear_own_play_state and propagate_played_state. Compared with \
+                   Emby.Server.Implementations/Session/SessionManager.cs (OnPlaybackStart, \
+                   OnPlaybackProgress, UpdatePlaybackSettings, OnPlaybackStopped), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
+                   MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
+                   Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
+                   UpdateUserItemRatingInternal)",
+        date: "2026-10-30",
+        divergences: &[
+            "Each change reads the row inside its write transaction, so two overlapping saves of \
+             one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
+             writes every column back, so there the later save undoes the earlier one.",
+            "Marking a container unplayed also clears the play state on the container's own rows, \
+             which earlier Ferrofin builds wrote; upstream's MarkUnplayed leaves them, so a Played \
+             set on a container through the UserData API survives it there. Fix path: gl-1064.",
+        ],
+    },
+];
 
 /// One contract operation whose Ferrofin implementation was compared against
 /// the upstream Jellyfin C# for behavioral equivalence — see [`VERIFIED`].
@@ -965,6 +1173,7 @@ pub struct Verified {
 ///   operation with a well-formed `upstream_file`/`upstream_method`/`date`,
 ///   checks every [`VERIFIED_AGAINST_EARLIER_PIN`] entry is a distinct row with
 ///   a tag other than [`UPSTREAM_TAG`] dated before [`UPSTREAM_PIN_DATE`],
+///   checks every row dated before [`UPSTREAM_PIN_DATE`] is listed there,
 ///   checks every `refs` key names a [`VERIFIED_SUBSYSTEMS`] row (which obey
 ///   the same rules), and — with `FERROFIN_UPSTREAM_DIR` naming a Jellyfin
 ///   checkout at [`UPSTREAM_COMMIT`] — checks each row's `upstream_file`
@@ -981,7 +1190,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetNextUp",
         ferrofin: "handlers/tv_shows.rs get_next_up → ferrofin-core tv_series_manager.rs \
                (TVSeriesManager) → next_up_service.rs (NextUpService)",
-        date: "2026-10-28",
+        date: "2026-10-19",
         divergences: &[
             "TVSeriesManager.GetPreferredVersion (continue in the alternate version the user \
          has been watching, matched by media-source name) is not ported: the pick is always \
@@ -992,8 +1201,11 @@ pub const VERIFIED: &[Verified] = &[
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
+            "The 400 (an API key with no userId, or a value the query binder cannot convert), \
+         403 (another user's id without the administrator role) and 404 (a userId naming no \
+         account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1006,7 +1218,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts, item_counts_by_clean_name)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1018,7 +1230,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_album_artists (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1031,7 +1243,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1043,7 +1255,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_music_genres (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
@@ -1055,18 +1267,35 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &[],
+        refs: &["images"],
     },
     Verified {
         method: "get",
         path: "/UserItems/Resume",
         upstream_file: "Jellyfin.Api/Controllers/ItemsController.cs",
         upstream_method: "GetResumeItems",
-        ferrofin: "handlers/items.rs get_resume_items → ferrofin-core item_repository.rs \
-               get_items → translate_query.rs (push_resumable_predicate, \
+        ferrofin: "handlers/items.rs get_resume_items (active_session_item_ids → \
+               ferrofin-core session_manager.rs get_session_summaries) → ferrofin-core \
+               item_repository.rs get_items → translate_query.rs (push_resumable_predicate, \
                push_order_expression DatePlayed)",
-        date: "2026-10-19",
+        date: "2026-10-30",
         divergences: RESUME_DIVERGENCES,
+        refs: &["images"],
+    },
+    Verified {
+        method: "get",
+        path: "/Sessions",
+        upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
+        upstream_method: "GetSessions",
+        ferrofin: "handlers/session.rs get_sessions (items.rs effective_user_id) → \
+               ferrofin-core session_manager.rs get_sessions (shared_device_control_for, \
+               retain_accessible_session_devices, to_dto → session_info_to_dto) \
+               (SessionManager.GetSessions, ToSessionInfoDto); the NowPlayingItem it copies \
+               is built by on_playback_start and on_playback_progress \
+               (kept_now_playing_item, now_playing_item → get_item_info; UpdateNowPlayingItem, \
+               GetItemInfo) and cleared by on_playback_stopped (RemoveNowPlayingItem)",
+        date: "2026-10-30",
+        divergences: SESSIONS_DIVERGENCES,
         refs: &[],
     },
     Verified {
@@ -1122,10 +1351,13 @@ pub const VERIFIED: &[Verified] = &[
                get_lyrics (the item's Lyric streams, LrcLyricParser then TxtLyricParser)",
         date: "2026-10-19",
         divergences: &[
-            "A Lyric stream whose file is gone (removed outside the server, before the next \
-         refresh) is skipped and the next stream read; upstream's File.ReadAllTextAsync \
-         throws and the request is a 500. Jellyfin bug not ported. The sidecar read is a \
-         blocking std::fs read on the runtime (gl-144).",
+            "A Lyric stream whose file cannot be read (removed outside the server before the next \
+         refresh, or unreadable) is skipped and the next stream read; upstream's \
+         File.ReadAllTextAsync throws on the first such stream, a plain-text 404 when the \
+         file or its folder is gone and a 500 otherwise, so a later stream's lyric is never \
+         served. Jellyfin bug not ported.",
+            "The 404 (no such item, one the caller may not see, or no lyrics) body is Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1157,7 +1389,10 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/lyrics.rs delete_lyrics (run_item_refresh) → ferrofin-core \
                lyric_manager.rs delete_lyrics",
         date: "2026-10-19",
-        divergences: &[],
+        divergences: &[
+            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
         refs: &[],
     },
     Verified {
@@ -1168,7 +1403,10 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/lyrics.rs search_remote_lyrics → ferrofin-core lyric_manager.rs \
                search_lyrics (search_request_for, search_request, search_provider)",
         date: "2026-10-19",
-        divergences: &[],
+        divergences: &[
+            "The 404 (no such item, or one the caller may not see) body is Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
         refs: &[],
     },
     Verified {
@@ -1203,8 +1441,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LocalizationController.cs",
         upstream_method: "GetCountries",
         ferrofin: "handlers/localization.rs get_countries → ferrofin-core localization_manager.rs \
-               get_countries (COUNTRIES, data/countries.json byte-equal to v12.2)",
-        date: "2026-10-20",
+               get_countries (COUNTRIES, data/countries.json byte-equal to UPSTREAM_TAG's)",
+        date: "2026-10-28",
         divergences: &[],
         refs: &[],
     },
@@ -1216,7 +1454,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/branding.rs upload_splashscreen → handlers/image_upload.rs \
                (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
                to_extension, decode_base64)",
-        date: "2026-10-24",
+        date: "2026-10-28",
         divergences: &[
             "The body is decoded in full before anything is written, and the location is \
          recorded only after the file is: a body the decoder rejects is a 400 that changes \
@@ -1236,6 +1474,8 @@ pub const VERIFIED: &[Verified] = &[
          cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
          Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
          Jellyfin bug not ported.",
+            "The 400 (a Content-Type that is not an image type) body is Ferrofin's error shape, \
+         not upstream's JSON string. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1247,7 +1487,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/users.rs authenticate_with_quick_connect, authentication_result → \
                ferrofin-core quick_connect_manager.rs get_authorized_request (the result \
                authorize_request stored)",
-        date: "2026-10-20",
+        date: "2026-10-28",
         divergences: &[
             "The User member is built at the exchange, from the user as it is then, where \
          upstream returns the UserDto it snapshotted when the code was authorized, up to \
@@ -1266,7 +1506,7 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "InitiateQuickConnect",
         ferrofin: "handlers/quick_connect.rs initiate → ferrofin-core quick_connect_manager.rs \
                try_connect (make_room, draw_free_code)",
-        date: "2026-10-20",
+        date: "2026-10-28",
         divergences: &[
             "A drawn code that a pending request already holds is drawn again; upstream \
          TryConnect's `_currentRequests[code] = result` overwrites the other device's \
@@ -1277,6 +1517,8 @@ pub const VERIFIED: &[Verified] = &[
          poll then gets 404 as an expired one does; authorized requests are exempt. \
          Upstream has no cap, so the anonymous endpoint can grow the map toward the whole \
          code space.",
+            "The 400 (a missing DeviceId, Device, Client or Version) and 401 (Quick Connect \
+         disabled) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1287,18 +1529,26 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "AddListingProvider",
         ferrofin: "handlers/live_tv.rs add_listing_provider → ferrofin-livetv manager.rs \
                save_listing_provider (ListingsBackend::of, validate_xmltv, \
-               store_listing_provider) → schedules_direct/mod.rs SchedulesDirect::validate \
+               store_listing_provider) → schedules_direct.rs SchedulesDirect::validate \
                (ListingsManager.SaveListingProvider, XmlTvListingsProvider.Validate, \
                SchedulesDirect.Validate)",
         date: "2026-10-21",
         divergences: &[
-            "An XMLTV provider without a Path is a 400; upstream's Validate dereferences \
-         the null path and answers a NullReferenceException 500. Jellyfin bug not ported.",
+            "An XMLTV provider with no Path, or a null one, is a 400; upstream's Validate \
+         dereferences the null path and answers a NullReferenceException 500 (an empty or \
+         blank Path is the FileNotFoundException 404 on both). Jellyfin bug not ported.",
             "Schedules Direct's /token body is serialized, so a username with a quote or a \
          backslash stays valid JSON; upstream concatenates it into the body raw. Jellyfin \
          bug not ported.",
             "SchedulesDirect.GetTokenInternal logs the session token at info; Ferrofin never \
          logs the password, its hash or the token. Jellyfin bug not ported.",
+            "A body with \"EnabledTuners\": null or \"ChannelMappings\": null is a 400; \
+         upstream binds the null and saves the provider (200). Fix path: gl-1059.",
+            "The 400 (an XMLTV provider with no Path, a Schedules Direct save missing its \
+         Username, Password or ListingsId, or a query value the binder cannot convert), 401 \
+         (Schedules Direct refuses the login) and 404 (an unknown or missing Type, or an \
+         XMLTV file that is not there) bodies are Ferrofin's error shape, not upstream's. \
+         Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1308,10 +1558,10 @@ pub const VERIFIED: &[Verified] = &[
         upstream_file: "Jellyfin.Api/Controllers/LiveTvController.cs",
         upstream_method: "GetLineups",
         ferrofin: "handlers/live_tv.rs get_lineups → ferrofin-livetv manager.rs get_lineups \
-               (ListingsBackend::of, provider_channels) → schedules_direct/mod.rs \
+               (ListingsBackend::of, provider_channels) → schedules_direct.rs \
                SchedulesDirect::get_lineups (ListingsManager.GetLineups, \
                XmlTvListingsProvider.GetLineups, SchedulesDirect.GetHeadends)",
-        date: "2026-10-24",
+        date: "2026-10-28",
         divergences: &[
             "An XMLTV guide declaring an encoding name the WHATWG labels know but .NET's \
          encoding table does not (iso8859-9, iso88599, x-cp1254, …) is decoded by the \
@@ -1329,6 +1579,8 @@ pub const VERIFIED: &[Verified] = &[
             "The country and postal code are percent-encoded into Schedules Direct's \
          headends query; upstream concatenates them raw, so a value holding `&` or `#` \
          changes the query. Jellyfin bug not ported.",
+            "The 404 (a blank id, or no such provider) body is Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1342,11 +1594,13 @@ pub const VERIFIED: &[Verified] = &[
                TunerHost::validate, guide_repository::store_tuner_host), then \
                queue_guide_refresh (TunerHostManager.SaveTunerHost, M3UTunerHost.Validate, \
                HdHomerunHost.Validate)",
-        date: "2026-10-24",
+        date: "2026-10-28",
         divergences: &[
             "An M3U tuner without a Url, or with a null one, is a 400; upstream's \
          M3uParser.GetListingsStream dereferences the null Url and answers a \
          NullReferenceException 500. Jellyfin bug not ported.",
+            "The 404 (an unknown or missing tuner Type, or an M3U playlist file that is not \
+         there) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1358,7 +1612,7 @@ pub const VERIFIED: &[Verified] = &[
         ferrofin: "handlers/live_tv.rs delete_tuner_host → ferrofin-livetv manager.rs \
                delete_tuner_host, then queue_guide_refresh → refresh_guide's clean_database \
                prune (TunerHostManager.DeleteTunerHost, GuideManager.CleanDatabase)",
-        date: "2026-10-24",
+        date: "2026-10-28",
         divergences: &[],
         refs: &[],
     },
@@ -1503,12 +1757,14 @@ pub const VERIFIED: &[Verified] = &[
                (scope_to_user_libraries, the LibraryManager.AddUserToQuery port; \
                ItemCountService.GetItemCounts as QueryShape::TypeCounts and \
                counts_from_type_map)",
-        date: "2026-10-24",
+        date: "2026-10-28",
         divergences: &[
             "isFavorite with no user (an API key without userId, or a userId naming no \
          account) is ignored and the totals are unfiltered (200); upstream's TranslateQuery \
          dereferences the null User for the favourites subquery and fails (500). Jellyfin bug \
          not ported.",
+            "The 403 (a userId other than the caller's, from a caller who is not an \
+         administrator) body is Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1521,10 +1777,41 @@ pub const VERIFIED: &[Verified] = &[
                ferrofin-core api_key_manager.rs get_api_keys and to_authentication_info \
                (AuthenticationManager.GetApiKeys) → ferrofin-model security.rs \
                AuthenticationInfo, querying QueryResult::from_items",
-        date: "2026-10-24",
+        date: "2026-10-28",
         divergences: &[
             "The 401 (no or bad token) and 403 (not an administrator) bodies are Ferrofin's \
          error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Collections",
+        upstream_file: "Jellyfin.Api/Controllers/CollectionController.cs",
+        upstream_method: "CreateCollection",
+        ferrofin: "handlers/collection.rs create_collection (parse_csv_uuids for the \
+               CommaDelimitedCollectionModelBinder ids; parentId bound and unused, as \
+               upstream) → ferrofin-core collection_manager.rs create_collection \
+               (CollectionManager.CreateCollectionAsync: new_box_set_folder_and_id for the \
+               [boxset] folder and AddChild's path-derived id, AddToCollectionAsync's refusal \
+               of an id naming no item after the box set is stored) and \
+               ensure_collections_folder → collections_library.rs (EnsureLibraryFolder: \
+               physical_folder for FindFolders, ensure_library for AddVirtualFolder with its \
+               LibraryOptions, ensure_folder for the Folder row ValidateTopLibraryFolders \
+               makes)",
+        date: "2026-10-30",
+        divergences: &[
+            "A missing name makes a box set with an empty name, where upstream's \
+         GetValidFilename dereferences the null and answers 500. Jellyfin bug not ported.",
+            "A malformed id is a 400 before anything is written, and a whitespace-only entry \
+         in ids is dropped. Upstream's new Guid(x) throws a FormatException on either once \
+         the box set is stored, which answers 500 and leaves it behind. Jellyfin bug not \
+         ported.",
+            "A second box set of one name gets a folder of its own (<name>1 [boxset]). \
+         Upstream reuses the folder, so the path-derived id is the first box set's and \
+         AddChild overwrites it. Jellyfin bug not ported.",
+            "The 400 bodies (a malformed id, an id naming no item) are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1543,7 +1830,7 @@ pub const VERIFIED: &[Verified] = &[
                RefreshProgress and RefreshStatus) → ferrofin-model entities_media.rs \
                VirtualFolderInfo, configuration.rs LibraryOptions, TypeOptions, \
                ImageOption, MediaPathInfo",
-        date: "2026-10-24",
+        date: "2026-10-28",
         divergences: &[
             "An unreadable shortcut is logged at error the first time a listing meets it and \
          at debug while it stays unreadable; upstream logs it at error on every listing. \
@@ -1645,7 +1932,7 @@ pub const VERIFIED: &[Verified] = &[
                new_playlist_folder_and_id, then report_item_added for AddChild's \
                ItemAdded; playlist_items for AddToPlaylistInternal and \
                Playlist.GetPlaylistItems)",
-        date: "2026-10-25",
+        date: "2026-10-28",
         divergences: &[
             "A request with neither a body nor a name query is a 400; upstream's \
          GetValidFilename(null) throws a NullReferenceException (500). Jellyfin bug not \
@@ -1700,8 +1987,12 @@ pub const VERIFIED: &[Verified] = &[
                FerrofinPlaylistManager::update_playlist (PlaylistManager.UpdatePlaylist: \
                playlist_items for the Ids' AddToPlaylistInternal, rename_named_item_in, \
                OpenAccess, share_playlist_in, sync_container_data_in, queue_refresh)",
-        date: "2026-10-25",
+        date: "2026-10-28",
         divergences: &[
+            "An empty-GUID id in Ids (`\"Ids\":[null]` or all zeros) is dropped and the other \
+         ids replace the entries (204); upstream's UpdatePlaylist clears the entries and \
+         saves, then GetItemById throws ArgumentException inside AddToPlaylistInternal, so \
+         it answers 400 and leaves the playlist empty. Jellyfin bug not ported.",
             "Ids, Name, Users and IsPublic are saved in one transaction with the Data sync; \
          upstream saves the cleared entries before it adds the new ones and then saves the \
          rest, so a failure part way leaves a partial update. Jellyfin bug not ported.",
@@ -1728,6 +2019,121 @@ pub const VERIFIED: &[Verified] = &[
             "The 404 (no playlist the caller can see) and 403 (no editing share) bodies are \
          Ferrofin's error shape, not upstream's (a \"Playlist not found\" string and an \
          empty Forbid). Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Environment/DirectoryContents",
+        upstream_file: "Jellyfin.Api/Controllers/EnvironmentController.cs",
+        upstream_method: "GetDirectoryContents",
+        ferrofin: "handlers/environment.rs get_directory_contents → ferrofin-core file_system.rs \
+               try_get_file_system_entries",
+        date: "2026-10-30",
+        divergences: &[
+            "The 400 (no path, or a flag that is no boolean), 404 (the path is no directory) and \
+         500 (the listing failed) bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/Environment/ValidatePath",
+        upstream_file: "Jellyfin.Api/Controllers/EnvironmentController.cs",
+        upstream_method: "ValidatePath",
+        ferrofin: "handlers/environment.rs validate_path → ferrofin-core file_system.rs \
+               file_exists, directory_exists, validate_writable",
+        date: "2026-10-30",
+        divergences: &[
+            "The 400 (no body) and the writable check's 404 and 500 bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Environment/Drives",
+        upstream_file: "Jellyfin.Api/Controllers/EnvironmentController.cs",
+        upstream_method: "GetDrives",
+        ferrofin: "handlers/environment.rs get_drives → ferrofin-core file_system.rs get_drives, \
+               drive_probe.rs, mount_table.rs",
+        date: "2026-10-30",
+        divergences: &[
+            "A mount that does not answer in time (drive_probe.rs DRIVE_PROBE_TIMEOUT) is left \
+         out of that listing, a hung one and one merely that slow, where upstream's request \
+         waits for it for as long as the mount takes. Deliberate (gl-26): upstream's thread \
+         pool grows, and a hung statvfs cannot be cancelled.",
+            "With no readable mount table, or no mount that qualifies, the list is `/`; \
+         upstream's is empty.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/System/Logs",
+        upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
+        upstream_method: "GetServerLogs",
+        ferrofin: "handlers/system.rs get_server_logs → ferrofin-core file_system.rs get_files",
+        date: "2026-10-30",
+        divergences: &[],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/System/Logs/Log",
+        upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
+        upstream_method: "GetLogFile",
+        ferrofin: "handlers/system.rs get_log_file → ferrofin-core file_system.rs get_files, \
+               open_file → handlers/streaming.rs opened_file_response",
+        date: "2026-10-30",
+        divergences: &[
+            "A log that grows while it is read stops at the length the headers declared; \
+         upstream copies to the end of the stream, past that length, which Kestrel aborts. \
+         Jellyfin bug not ported.",
+            "The 400 (no name), 404 (no such log, or one gone before it was opened) and 500 (one \
+         that cannot be opened) bodies are Ferrofin's error shape, not upstream's (a \
+         \"Log file not found.\" string for the first 404). Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/FallbackFont/Fonts",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "GetFallbackFontList",
+        ferrofin: "handlers/subtitles.rs get_fallback_font_list → ferrofin-core file_system.rs \
+               get_files",
+        date: "2026-10-30",
+        divergences: &[
+            "With no FallbackFontPath, upstream also sets EnableFallbackFont to false on the \
+         cached EncodingOptions object, unsaved, so that a later read of the configuration \
+         reports false until the next restart. Jellyfin bug not ported: a GET does not \
+         change the configuration here.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/FallbackFont/Fonts/{name}",
+        upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",
+        upstream_method: "GetFallbackFont",
+        ferrofin: "handlers/subtitles.rs get_fallback_font → ferrofin-core file_system.rs \
+               get_files, open_file → handlers/streaming.rs opened_file_response, \
+               physical_file_precondition",
+        date: "2026-10-30",
+        divergences: &[
+            "A precondition date outside HTTP's three formats or before 1970 is ignored; \
+         ASP.NET's date parser takes both (a numeric offset, for one). No client sends one, \
+         short of echoing the Last-Modified of a font dated before 1970, which then gets a \
+         200 where upstream sends a 304.",
+            "The MIME type comes from mime_types.rs plus the font rows of the MimeTypes \
+         package; a font under an extension that package knows and this list does not is \
+         application/octet-stream. The list route serves four extensions, all covered.",
+            "The EnableFallbackFont side effect of a missing FallbackFontPath is not ported, as \
+         on GET /FallbackFont/Fonts.",
+            "The 400 (no name) and the 404 and 500 of a font that cannot be opened have \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1787,6 +2193,32 @@ const NO_USER_USER_DATA_FILTER_DIVERGENCE: &str = "A user-data filter (`isFavori
      unfiltered (200); upstream's TranslateQuery dereferences the null User for the user-data \
      subqueries and fails (500). Jellyfin bug not ported.";
 
+/// The accepted divergences of `GET /Sessions`.
+const SESSIONS_DIVERGENCES: &[&str] = &[
+    "PlayState carries only PositionTicks, IsPaused and a CanSeek derived from the \
+     now-playing item, NowPlayingQueue is always empty, TranscodingInfo is never cleared, \
+     and PlaylistItemId, NowViewingItem and UserPrimaryImageTag are never filled, where \
+     upstream's UpdateNowPlayingItem, RemoveNowPlayingItem and LogSessionActivity keep them. \
+     Fix path: gl-119.",
+    "LastPlaybackCheckIn starts at the session's creation, where upstream's is \
+     0001-01-01 until a playback report; NowPlayingQueueFullItems is sent as [], a member \
+     v12.4's SessionInfoDto no longer has. Fix path: gl-837.",
+    "A playback report's own Item is ignored and the NowPlayingItem is always built from the \
+     library item; upstream shows a reported Item as sent. Fix path: gl-1062.",
+    "A NowPlayingItem whose media source lookup fails is shown without its streams, and one \
+     whose build fails is not shown, while the report itself succeeds and saves the user's \
+     progress; the next report naming the item builds it again. Upstream fails the report, \
+     which keeps the session's previous NowPlayingItem.",
+    "A non-administrator's response carries the hardware accelerator blanked, and only that \
+     response; upstream blanks it on the stored session's TranscodingInfo, so every later \
+     reader, an administrator included, sees it blanked until the next transcoding report \
+     replaces it (the websocket-streams row records the Sessions stream's side). Jellyfin \
+     bug not ported.",
+    "The 403 (controllableByUserId naming another user without the administrator role) and \
+     400 (a value the query binder cannot convert) bodies are Ferrofin's error shape, not \
+     upstream's. Fix path: gl-666.",
+];
+
 /// What `/UserItems/Resume` — and its legacy twin `/Users/{userId}/Items/Resume`,
 /// the same handler with the user from the route, which is hidden from the
 /// contract (`[ApiExplorerSettings(IgnoreApi = true)]`) and so has no row —
@@ -1797,12 +2229,19 @@ const RESUME_DIVERGENCES: &[&str] = &[
      the resumable rule applies to are Series and Season (_resumableFolderKinds), which \
      never have linked children, so the arm can never match.",
     "A resumable Series or Season row's UnplayedItemCount / PlayedPercentage / Played \
-     count each leaf's own played row; v12.2's ItemCountService counts a leaf played \
+     count each leaf's own played row; v12.4's ItemCountService counts a leaf played \
      through an alternate version (DescendantQueryHelper.IsPlayedBy). Fix path: the \
      alternate-version arm in item_count_service's played statements (gl-441).",
     "Resume positions that Ferrofin builds before gl-46 saved for songs and for Sample, \
      ThemeVideo and Trailer extras (kinds v12 never lets resume) keep those items listed \
      until they are played again; new plays no longer save one. Fix path: gl-717.",
+    "`searchTerm`'s OriginalTitle arm lower-cases both sides (Unicode); v12.4 \
+     TranslateQuery matches the raw term with SQLite LIKE, which folds ASCII case only, so \
+     an OriginalTitle whose non-ASCII letters differ in case from the term matches here and \
+     not upstream. Fix path: gl-957.",
+    "The 400 (an API key with no userId, or a value the query binder cannot convert), \
+     403 (another user's id without the administrator role) and 404 (a userId naming no \
+     account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
 ];
 
 /// Compile-time `str` equality (`==` on `&str` isn't const).
@@ -1922,6 +2361,9 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
     let router = merge_versions::register(router);
     // Plugins Tier 1 — plugin-manager surface over the compile-time registry.
     let router = plugins::register(router);
+    // The Ferrofin plugin's settings page — not a contract operation, so in
+    // neither REAL_ROUTES nor EXTENSION_ROUTES.
+    let router = ferrofin_settings::register(router);
     // Live TV read surface — empty/disabled state so the web UI treats Live TV
     // as "not configured" instead of erroring on 501 (mutations stay stubbed).
     let router = live_tv::register(router);

@@ -1356,10 +1356,14 @@ impl UserManager for FerrofinUserManager {
 
         let policy = build_user_policy(pool, user, user_uuid, &perms, &prefs).await?;
 
+        // `GetImageCacheTag(User)`: the profile image's OWN path with its
+        // `LastModified`, the one tag upstream does not take from an item.
         let primary_image_tag = if let Some(processor) = &self.image_processor
             && let Some(image) = self.get_profile_image(user_uuid).await?
         {
-            processor.get_image_cache_tag(user_uuid, &image).await?
+            processor
+                .get_image_cache_tag_for_path(&image.path, image.date_modified)
+                .await?
         } else {
             None
         };
@@ -1873,7 +1877,7 @@ mod tests {
         let source = Arc::clone(&current);
         let mgr = FerrofinUserManager::new(db)
             .with_profile_image_dir(DirectoryPath::live(move || source.read().unwrap().clone()))
-            .with_image_processor(processor);
+            .with_image_processor(Arc::clone(&processor) as _);
         let user = mgr.create_user("synthetic-avatar").await.unwrap();
         assert!(
             mgr.get_user_dto(&user, None)
@@ -1921,6 +1925,18 @@ mod tests {
         assert_eq!(
             std::path::Path::new(&info.path),
             replacement.join("synthetic-avatar").join("profile.jpg")
+        );
+        // `GetImageCacheTag(User)`: the profile image's own path and its
+        // `LastModified`, unlike an item image's tag (gl-849).
+        assert_eq!(
+            Some(second.clone()),
+            ferrofin_traits::drawing::ImageProcessor::get_image_cache_tag_for_path(
+                &*processor,
+                &info.path,
+                info.date_modified,
+            )
+            .await
+            .unwrap()
         );
         assert!(std::path::Path::new(&info.path).is_file());
         assert!(
@@ -2267,7 +2283,11 @@ mod tests {
             .expect("dto")
             .policy
             .expect("policy");
-        assert!(read.access_schedules.is_empty());
+        assert!(
+            read.access_schedules.is_empty(),
+            "{:?}",
+            read.access_schedules
+        );
         assert_eq!(read.enabled_folders, vec![Uuid::from_u128(0xF3)]);
         assert!(read.enable_all_folders);
     }

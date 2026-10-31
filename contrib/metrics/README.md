@@ -108,7 +108,8 @@ OTEL_TRACES_SAMPLER_ARG=0.25 \
 
 With export on, stdout is structured JSON by default and every log line emitted
 inside a **sampled** request carries the request's `trace_id` (unsampled requests
-carry none — no dead links). `FERROFIN_LOG_FORMAT=text` restores the legacy
+carry none — no dead links). `FERROFIN_LOG_FORMAT=text` (`log_format = "text"` in
+`config.toml`) restores the legacy
 human-readable stdout for interactive dev; the rotating log **file** is always
 plain text regardless (it feeds the `GET /System/Logs` dashboard viewer).
 
@@ -189,7 +190,7 @@ used — a metrics setting never stops the server. Like the sampler interval it 
 | Metric | Type | Labels | What it counts |
 |---|---|---|---|
 | `ferrofin_library_scans_total` | counter | `trigger`, `result` (`completed`/`stopped`/`failed`) | Scan passes the scan queue ran. A pass is one queued request: a full or library scan, a folder or item refresh, a watcher/webhook batch. `stopped` = cancelled (shutdown, a replacing scan). |
-| `ferrofin_library_scan_items_total` | counter | `trigger`, `outcome` (`created`/`updated`/`unchanged`/`removed`) | The items each pass processed (a stopped pass's partial counts included), plus those of item refreshes served inside a running scan. `unchanged` = a stored item the scan left untouched. |
+| `ferrofin_library_scan_items_total` | counter | `trigger`, `outcome` (`created`/`updated`/`unchanged`/`removed`/`skipped`) | The items each pass processed (a stopped pass's partial counts included), plus those of item refreshes served inside a running scan. `unchanged` = a stored item the scan left untouched; `skipped` = an item it could not read or write, which the next scan retries. |
 | `ferrofin_library_scan_duration_seconds` | histogram | `trigger` | Duration of **completed** passes. Default buckets: 1–2.5–5 per decade, 0.001 … 5000 s (21 buckets; configurable, above): a watcher scan is 20–60 ms, an unchanged 20k-item rescan ~2 s, a first scan of a big library tens of minutes. |
 | `ferrofin_library_scan_in_progress` | gauge | — | 1 while the scan queue is running a scan. |
 | `ferrofin_library_scan_last_completed_timestamp_seconds` | gauge | `trigger` | Unix time the last pass of that trigger completed (absent until one has). |

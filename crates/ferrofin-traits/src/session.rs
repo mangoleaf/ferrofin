@@ -15,8 +15,12 @@
 //!   assembled at the API layer from this data. The `ToSessionInfoDto` /
 //!   `OnSessionControllerConnected` mapping helpers that take the un-ported
 //!   `SessionInfo` are dropped.
-//! - .NET `event`s (`PlaybackStart`, `SessionStarted`, …) are dropped; event
-//!   wiring lives in `ferrofin-core`.
+//! - The .NET `event`s `SessionInfoWebSocketListener` subscribes to
+//!   (`SessionStarted`, `PlaybackStart`, …) become one [`SessionEvent`]
+//!   broadcast, [`SessionManager::subscribe_session_events`]. Their payloads
+//!   are dropped: the listener only asks "send now, or throttled?", and the
+//!   domain [`EventManager`](crate::events::EventManager) still carries the
+//!   payloads for its own consumers.
 //! - Generic overloads (`SendSyncPlayGroupUpdate<T>`,
 //!   `SendMessageToUserSessions<T>`, `SendMessageToAdminSessions<T>`) collapse to
 //!   a single method taking a pre-serialized JSON payload (a `&str`), which keeps
@@ -32,8 +36,9 @@ use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::SessionInfoDto;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::session::{
-    ClientCapabilities, GeneralCommand, MessageCommand, PlayRequest, PlaybackProgressInfo,
-    PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest, SessionMessageType, TranscodingInfo,
+    ClientCapabilities, GeneralCommand, MessageCommand, PlayMethod, PlayRequest,
+    PlaybackProgressInfo, PlaybackStartInfo, PlaybackStopInfo, PlaystateRequest,
+    SessionMessageType, TranscodingInfo,
 };
 use uuid::Uuid;
 
@@ -88,6 +93,66 @@ pub struct AuthenticationRequest {
     pub remote_endpoint: Option<String>,
 }
 
+/// A change the WebSocket `Sessions` stream reacts to: one of the
+/// `ISessionManager` events `SessionInfoWebSocketListener` subscribes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// A session was created (`SessionStarted`).
+    SessionStarted,
+    /// A session left the pool: ended, closed or logged out (`SessionEnded`).
+    SessionEnded,
+    /// A client reported the start of playback (`PlaybackStart`).
+    PlaybackStart,
+    /// A client reported the end of playback, or the idle check stopped it
+    /// (`PlaybackStopped`).
+    PlaybackStopped,
+    /// Playback progress (`PlaybackProgress`); `is_automated` is upstream's
+    /// `PlaybackProgressEventArgs.IsAutomated`: the server's own one-second
+    /// estimate rather than a client check-in.
+    PlaybackProgress {
+        /// The server estimated this progress rather than a client reporting it.
+        is_automated: bool,
+    },
+    /// A client reported its capabilities (`CapabilitiesChanged`).
+    CapabilitiesChanged,
+    /// A request arrived on a session that had been idle for a while, or
+    /// created it (`SessionActivity`).
+    SessionActivity,
+}
+
+/// One session, as a caller that only reads ids or counts from
+/// `_sessionManager.Sessions` sees it (the `excludeActiveSessions` filter of
+/// `GetResumeItems`, the library-change audience, the metrics gauges):
+/// [`SessionManager::get_session_summaries`] lists these where
+/// [`SessionManager::get_sessions`] copies out each full [`SessionInfoDto`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSummary {
+    /// The session's user (`SessionInfo.UserId`), nil for a session with no
+    /// user. Additional users are not listed.
+    pub user_id: Uuid,
+    /// The id of the item the session shows as playing (`NowPlayingItem.Id`),
+    /// `None` while its `NowPlayingItem` is null.
+    pub now_playing_item_id: Option<Uuid>,
+    /// The session's `PlayState.PlayMethod`, as the session's DTO reports it.
+    pub play_method: Option<PlayMethod>,
+    /// Whether the session carries `TranscodingInfo`.
+    pub is_transcoding: bool,
+}
+
+impl From<&SessionInfoDto> for SessionSummary {
+    fn from(session: &SessionInfoDto) -> Self {
+        Self {
+            user_id: session.user_id,
+            now_playing_item_id: session.now_playing_item.as_ref().map(|item| item.id),
+            play_method: session
+                .play_state
+                .as_ref()
+                .and_then(|state| state.play_method),
+            is_transcoding: session.transcoding_info.is_some(),
+        }
+    }
+}
+
 /// Orchestrates client sessions: activity, playback reporting, and remote
 /// commands.
 ///
@@ -110,6 +175,36 @@ pub trait SessionManager: Send + Sync {
         remote_endpoint: &str,
         user: Option<&UserEntity>,
     ) -> Result<SessionInfoDto, ServiceError>;
+
+    /// Records session activity exactly as
+    /// [`log_session_activity`](Self::log_session_activity) does, returning
+    /// only the session id (C# `RequestHelpers.GetSessionId`): what the
+    /// playstate and session handlers want on every report, without building
+    /// the session DTO. `None` when the session has no id.
+    ///
+    /// The default reads the id off `log_session_activity`'s DTO; the concrete
+    /// session manager overrides it to skip that DTO.
+    async fn log_session_activity_id(
+        &self,
+        app_name: &str,
+        app_version: &str,
+        device_id: &str,
+        device_name: &str,
+        remote_endpoint: &str,
+        user: Option<&UserEntity>,
+    ) -> Result<Option<String>, ServiceError> {
+        Ok(self
+            .log_session_activity(
+                app_name,
+                app_version,
+                device_id,
+                device_name,
+                remote_endpoint,
+                user,
+            )
+            .await?
+            .id)
+    }
 
     /// Updates the reported device name of a session.
     async fn update_device_name(
@@ -307,6 +402,22 @@ pub trait SessionManager: Send + Sync {
         is_api_key: bool,
     ) -> Result<Vec<SessionInfoDto>, ServiceError>;
 
+    /// Every session, unfiltered (C# `ISessionManager.Sessions`), as a
+    /// [`SessionSummary`], in no particular order. It is for callers that
+    /// read only ids or counts, and it copies no session DTO or
+    /// `NowPlayingItem`.
+    ///
+    /// The default reduces the elevated [`Self::get_sessions`] view (a nil
+    /// user with the API-key flag) to these summaries, so test fakes need no
+    /// change. The concrete manager overrides it to read its session table
+    /// directly.
+    async fn get_session_summaries(&self) -> Result<Vec<SessionSummary>, ServiceError> {
+        let sessions = self
+            .get_sessions(Uuid::nil(), None, None, None, true)
+            .await?;
+        Ok(sessions.iter().map(SessionSummary::from).collect())
+    }
+
     /// Resolves a session from its access token, returning the session DTO.
     async fn get_session_by_authentication_token(
         &self,
@@ -360,6 +471,17 @@ pub trait SessionManager: Send + Sync {
     async fn has_active_playback(&self) -> Result<bool, ServiceError> {
         Ok(false)
     }
+
+    /// Subscribes to the session events the WebSocket `Sessions` stream sends
+    /// on (the C# `event` fields `SessionInfoWebSocketListener` attaches to).
+    /// Only events raised after the call are received.
+    ///
+    /// `None`, the default kept for test fakes, means this manager raises no
+    /// events, so a `Sessions` subscriber is sent nothing. It is not a polling
+    /// fallback.
+    fn subscribe_session_events(&self) -> Option<tokio::sync::broadcast::Receiver<SessionEvent>> {
+        None
+    }
 }
 
 fn _assert_object_safe_session_manager(_: &dyn SessionManager) {}
@@ -389,5 +511,48 @@ mod tests {
         };
         assert_eq!(req.username.as_deref(), Some("alice"));
         assert_eq!(req.user_id, Some(id));
+    }
+
+    /// A summary keeps the user, the shown item's id, the play method and
+    /// whether the session transcodes, and nothing else.
+    #[test]
+    fn a_session_summary_reduces_the_session_dto() {
+        use super::SessionSummary;
+        use ferrofin_model::dto::{BaseItemDto, SessionInfoDto};
+        use ferrofin_model::session::{PlayMethod, PlayerStateInfo, TranscodingInfo};
+
+        let user_id = Uuid::from_u128(1);
+        let item_id = Uuid::from_u128(2);
+        let playing = SessionInfoDto {
+            user_id,
+            now_playing_item: Some(BaseItemDto {
+                id: item_id,
+                ..BaseItemDto::default()
+            }),
+            play_state: Some(PlayerStateInfo {
+                play_method: Some(PlayMethod::DirectStream),
+                ..PlayerStateInfo::default()
+            }),
+            transcoding_info: Some(TranscodingInfo::default()),
+            ..SessionInfoDto::default()
+        };
+        assert_eq!(
+            SessionSummary::from(&playing),
+            SessionSummary {
+                user_id,
+                now_playing_item_id: Some(item_id),
+                play_method: Some(PlayMethod::DirectStream),
+                is_transcoding: true,
+            }
+        );
+        assert_eq!(
+            SessionSummary::from(&SessionInfoDto::default()),
+            SessionSummary {
+                user_id: Uuid::nil(),
+                now_playing_item_id: None,
+                play_method: None,
+                is_transcoding: false,
+            }
+        );
     }
 }

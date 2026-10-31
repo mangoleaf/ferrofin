@@ -1317,8 +1317,10 @@ mod tests {
         assert_eq!(file, expected);
         let record: SerializablePasswordReset =
             serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        assert!(redeem_reset_pins(dir.path(), "wrong").unwrap().is_empty());
-        assert!(redeem_reset_pins(dir.path(), "").unwrap().is_empty());
+        let found = redeem_reset_pins(dir.path(), "wrong").unwrap();
+        assert!(found.is_empty(), "{found:?}");
+        let found = redeem_reset_pins(dir.path(), "").unwrap();
+        assert!(found.is_empty(), "{found:?}");
         assert_eq!(
             redeem_reset_pins(dir.path(), &record.pin.replace('-', "")).unwrap(),
             vec![("alice".to_owned(), file.clone())]
@@ -1355,11 +1357,8 @@ mod tests {
         std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
 
         // Even with the correct pin, an expired record yields no match and is purged.
-        assert!(
-            redeem_reset_pins(dir.path(), "AA-BB-CC-DD")
-                .unwrap()
-                .is_empty()
-        );
+        let found = redeem_reset_pins(dir.path(), "AA-BB-CC-DD").unwrap();
+        assert!(found.is_empty(), "{found:?}");
         assert!(!file.exists());
     }
 
@@ -1367,10 +1366,7 @@ mod tests {
     fn redeem_on_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
-        assert!(
-            redeem_reset_pins(&missing, "AA-BB-CC-DD")
-                .unwrap()
-                .is_empty()
-        );
+        let found = redeem_reset_pins(&missing, "AA-BB-CC-DD").unwrap();
+        assert!(found.is_empty(), "{found:?}");
     }
 }

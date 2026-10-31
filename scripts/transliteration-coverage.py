@@ -11,7 +11,7 @@ test class (`LocalizationManagerTests`) or `[Fact]`/`[Theory]` method
 snake_case. A comment over a group of tests counts only for the test it is attached to.
 
 Skips with a message, exit 0, when FERROFIN_UPSTREAM_DIR is unset or the checkout is not at
-UPSTREAM_COMMIT (crates/ferrofin-api/src/handlers/mod.rs), as contract_superset does.
+UPSTREAM_COMMIT (crates/ferrofin-api/src/handlers.rs), as contract_superset does.
 """
 from collections import Counter
 from pathlib import Path
@@ -102,10 +102,10 @@ def report(inline, counts):
 
 def upstream_commit():
     """UPSTREAM_COMMIT from the Rust source."""
-    src = (REPO / "crates/ferrofin-api/src/handlers/mod.rs").read_text(encoding="utf-8")
+    src = (REPO / "crates/ferrofin-api/src/handlers.rs").read_text(encoding="utf-8")
     m = re.search(r'pub const UPSTREAM_COMMIT: &str = "([0-9a-f]+)";', src)
     if not m:
-        sys.exit("UPSTREAM_COMMIT not found in crates/ferrofin-api/src/handlers/mod.rs")
+        sys.exit("UPSTREAM_COMMIT not found in crates/ferrofin-api/src/handlers.rs")
     return m.group(1)
 
 

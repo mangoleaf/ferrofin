@@ -203,10 +203,10 @@ mod tests {
     #[test]
     fn with_all_fields_false_is_empty() {
         let opts = DtoOptions::with_all_fields(false);
-        assert!(opts.fields.is_empty());
+        assert!(opts.fields.is_empty(), "{:?}", opts.fields);
         assert!(!opts.contains_field(ItemFields::Overview));
         // Image types are still fully populated regardless of the field toggle.
-        assert!(!opts.image_types.is_empty());
+        assert!(!opts.image_types.is_empty(), "{:?}", opts.image_types);
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
         let opts = DtoOptions::default();
         assert_eq!(opts.image_limit(ImageType::Primary), i32::MAX);
 
-        let mut disabled = opts.clone();
+        let mut disabled = opts;
         disabled.enable_images = false;
         assert_eq!(disabled.image_limit(ImageType::Primary), 0);
 

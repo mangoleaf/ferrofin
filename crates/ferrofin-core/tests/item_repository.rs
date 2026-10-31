@@ -660,13 +660,8 @@ async fn locked_item_ids_is_empty_when_nothing_is_locked() {
         .await
         .expect("save");
 
-    assert!(
-        repository
-            .locked_item_ids()
-            .await
-            .expect("locked ids")
-            .is_empty()
-    );
+    let locked_item_ids = repository.locked_item_ids().await.expect("locked ids");
+    assert!(locked_item_ids.is_empty(), "{locked_item_ids:?}");
 }
 
 #[tokio::test]
@@ -740,20 +735,13 @@ async fn retrieve_items_reads_across_chunks_and_skips_missing_ids() {
     assert!(seventh.is_locked);
 
     // Nothing asked, nothing read; only missing ids, nothing returned.
-    assert!(
-        repository
-            .retrieve_items(&[])
-            .await
-            .expect("empty")
-            .is_empty()
-    );
-    assert!(
-        repository
-            .retrieve_items(&[Uuid::from_u128(0xDEAD)])
-            .await
-            .expect("missing")
-            .is_empty()
-    );
+    let items = repository.retrieve_items(&[]).await.expect("empty");
+    assert!(items.is_empty(), "{items:?}");
+    let items = repository
+        .retrieve_items(&[Uuid::from_u128(0xDEAD)])
+        .await
+        .expect("missing");
+    assert!(items.is_empty(), "{items:?}");
 }
 
 #[tokio::test]
@@ -1803,8 +1791,10 @@ async fn a_created_collection_survives_an_unscoped_user_query() {
         .await
         .expect("save");
 
-    // …and a collection made through the real manager.
-    let collections = collection_manager_over(&db);
+    // …and a collection made through the real manager, with a real
+    // Collections library to make.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let collections = collection_manager_over(&db, tmp.path()).await;
     collections
         .create_collection(&CollectionCreationOptions {
             name: "My Collection".to_owned(),
@@ -1851,7 +1841,7 @@ async fn a_created_collection_survives_an_unscoped_user_query() {
             .fetch_one(db.pool())
             .await
             .expect("container row");
-    assert_eq!(container.0.as_deref(), Some("Collections"));
+    assert_eq!(container.0.as_deref(), Some("collections"));
     assert!(
         container.1.is_some_and(|p| p.ends_with("/collections")),
         "the container is the folder under the data directory"
@@ -1901,29 +1891,49 @@ async fn seed_user_who_sees_everything(
 }
 
 /// The real collection manager over `db`, with throwaway application paths.
-fn collection_manager_over(db: &ferrofin_db::Database) -> ferrofin_core::FerrofinCollectionManager {
+async fn collection_manager_over(
+    db: &ferrofin_db::Database,
+    dir: &std::path::Path,
+) -> ferrofin_core::FerrofinCollectionManager {
+    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
+        dir,
+        dir.join("log"),
+        dir.join("config"),
+        dir.join("cache"),
+        dir.join("web"),
+    ));
+    let mode = ferrofin_core::item_type_lookup::IdDerivation::from_meta(
+        None,
+        Some(dir.to_string_lossy().into_owned()),
+    );
+    ferrofin_core::AggregateFolderStore::new(
+        db.clone(),
+        mode.clone(),
+        dir.join("root"),
+        dir.join("data"),
+    )
+    .ensure()
+    .await
+    .expect("roots");
+    let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
     ferrofin_core::FerrofinCollectionManager::new(
         db.clone(),
-        std::sync::Arc::new(ferrofin_core::FerrofinLibraryManager::new(
-            std::sync::Arc::new(ferrofin_core::FerrofinItemRepository::new(
-                db.clone(),
-                std::sync::Arc::new(ferrofin_core::item_type_lookup::ItemTypeLookup::new()),
-            )),
-            std::sync::Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
-            std::sync::Arc::new(FerrofinItemPersistenceService::new(db.clone())),
-            std::sync::Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+        Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+            Arc::new(repo(db)),
+            Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+            persistence.clone(),
+            Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
         )),
-        std::sync::Arc::new(ferrofin_core::FerrofinLinkedChildrenService::new(
+        Arc::new(ferrofin_core::FerrofinLinkedChildrenService::new(
             db.clone(),
         )),
-        std::sync::Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
-            "/tmp/ferrofin-test",
-            "/tmp/ferrofin-test/log",
-            "/tmp/ferrofin-test/config",
-            "/tmp/ferrofin-test/cache",
-            "/tmp/ferrofin-test/web",
-        )),
+        paths,
     )
+    .with_virtual_folders(Arc::new(
+        ferrofin_core::FerrofinVirtualFolderManager::new(dir.join("root/default"))
+            .with_item_store(persistence)
+            .with_id_derivation(mode),
+    ))
 }
 
 /// v12.2 `BuildMaxParentalRatingFilter` (45d7760a14): a container is only as
@@ -1962,7 +1972,8 @@ async fn maximum_rating_gates_every_container_on_its_members() {
         ..Default::default()
     };
     // Every member over the limit hides the rated container as well.
-    assert!(repo(&db).get_item_list(&query).await.unwrap().is_empty());
+    let item_list = repo(&db).get_item_list(&query).await.unwrap();
+    assert!(item_list.is_empty(), "{item_list:?}");
     // A member within the limit admits both.
     let mut child = item(Uuid::from_u128(0x990), BaseItemKind::Movie, "child");
     child.inherited_parental_rating_value = Some(12);
@@ -2459,20 +2470,16 @@ async fn album_and_artist_filters_and_the_unresolved_name_id() {
             .unwrap(),
         [in_first]
     );
-    assert!(
-        repository
-            .get_item_ids(&tracks(vec![Uuid::nil()], Vec::new()))
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        repository
-            .get_item_ids(&tracks(Vec::new(), vec![Uuid::nil()]))
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let item_ids = repository
+        .get_item_ids(&tracks(vec![Uuid::nil()], Vec::new()))
+        .await
+        .unwrap();
+    assert!(item_ids.is_empty(), "{item_ids:?}");
+    let item_ids = repository
+        .get_item_ids(&tracks(Vec::new(), vec![Uuid::nil()]))
+        .await
+        .unwrap();
+    assert!(item_ids.is_empty(), "{item_ids:?}");
     let artist = repository
         .get_item_ids(&InternalItemsQuery {
             include_item_types: vec![BaseItemKind::MusicArtist],

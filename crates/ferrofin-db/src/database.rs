@@ -13,6 +13,10 @@ use crate::error::Result;
 ///
 /// `sqlx::migrate!()` reads the directory at **compile time**, so building
 /// this crate needs no live database or `DATABASE_URL`.
+///
+/// A migration runs while the previous version can still be writing the same
+/// database: read "Migrations and one-shot repairs" in `CONTRIBUTING.md` before
+/// adding one.
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// The version of the last migration in this build's chain: a database
@@ -52,10 +56,13 @@ pub struct ImageParentRow {
     pub album_artists: Option<String>,
     /// The on-disk path (`Path`), if any.
     pub path: Option<String>,
-    /// The integrated loudness in LUFS (`LUFS`), if measured.
-    #[sqlx(rename = "LUFS")]
+    /// The integrated loudness in LUFS (`LUFS`), if measured (a non-finite
+    /// value reads as `None`).
+    #[sqlx(rename = "LUFS", try_from = "crate::entities::finite_real::FiniteReal")]
     pub lufs: Option<f64>,
-    /// The stored normalization gain (`NormalizationGain`), if any.
+    /// The stored normalization gain (`NormalizationGain`), if any (a
+    /// non-finite one reads as `None`).
+    #[sqlx(try_from = "crate::entities::finite_real::FiniteReal")]
     pub normalization_gain: Option<f64>,
 }
 
@@ -633,10 +640,7 @@ impl Database {
     ) -> Result<Vec<(String, String, String)>> {
         let mut out = Vec::new();
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "ItemId", "ProviderId", "ProviderValue" FROM "BaseItemProviders"
                    WHERE "ItemId" IN ({placeholders})"#,
@@ -663,10 +667,7 @@ impl Database {
     pub async fn item_data_blobs(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Data" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Data" IS NOT NULL"#,
@@ -694,10 +695,7 @@ impl Database {
     pub async fn item_studios(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Studios" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "Studios" IS NOT NULL AND "Studios" <> ''"#,
@@ -725,10 +723,7 @@ impl Database {
     pub async fn item_original_languages(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "OriginalLanguage" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders}) AND "OriginalLanguage" IS NOT NULL"#,
@@ -760,10 +755,7 @@ impl Database {
     ) -> Result<Vec<(String, i64)>> {
         let mut out = Vec::new();
         for chunk in primary_ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             // The seeded placeholder row is excluded exactly as the full-row
             // read (`get_items_by_primary_version_batch`) excludes it.
             let sql = format!(
@@ -795,10 +787,7 @@ impl Database {
     pub async fn image_parent_rows(&self, ids: &[String]) -> Result<Vec<ImageParentRow>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Type", "ParentId", "OwnerId", "SeriesId", "SeasonId",
                           "AlbumArtists", "Path", "LUFS", "NormalizationGain"
@@ -853,10 +842,7 @@ impl Database {
     pub async fn photo_album_names(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "Id", "Name" FROM "BaseItems"
                    WHERE "Id" IN ({placeholders})
@@ -883,10 +869,7 @@ impl Database {
     pub async fn playlist_owners(&self, ids: &[String]) -> Result<Vec<(String, String)>> {
         let mut out = Vec::with_capacity(ids.len());
         for chunk in ids.chunks(crate::BATCH_BIND_CHUNK) {
-            let placeholders = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let placeholders = crate::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT "PlaylistId", "OwnerUserId" FROM "FerrofinPlaylists"
                    WHERE "PlaylistId" IN ({placeholders}) AND "OwnerUserId" IS NOT NULL"#,
@@ -1420,7 +1403,8 @@ pub struct JellyfinGeneration {
 /// on every path, as must the Ferrofin-own `0035`–`0038`. A 12.x generation
 /// matches both an upgraded install and a fresh one (see
 /// [`JellyfinGeneration::optional_ids`]); `0041` gives a fresh install the one
-/// index it lacks.
+/// index it lacks. Releases that share a set share the name: 10.11.9 logs
+/// `10.11.8`, and 12.3 and 12.4, which add no migration, log `12.2.0`.
 pub const JELLYFIN_GENERATIONS: [JellyfinGeneration; 5] = [
     JellyfinGeneration {
         name: "10.11.8",
@@ -1786,10 +1770,32 @@ fn discard_snapshot(snapshot: &std::path::Path) {
 /// consistent view, log included, and waits for no other process; a warning
 /// says why. Refusing the boot instead could leave a rolling update waiting
 /// forever on a pod that never becomes ready (owner decision, 2026-10-25).
+///
+/// A finished checkpoint does not hold that process back. It can commit while
+/// the file is being copied, and its automatic checkpoint then writes into the
+/// file under the copy, which ends up with some pages from before and some from
+/// after: a corrupt database that nothing reports. Every commit puts frames in
+/// the log the checkpoint just emptied, so a log that is not empty when the copy
+/// ends means the copy cannot be trusted, and it is taken again the same way.
+/// (Only a `TRUNCATE` checkpoint of its own would empty the log again, which a
+/// running server takes at the end of its database optimization task.)
 async fn copy_database_file(
     conn: &mut sqlx::SqliteConnection,
     path: &std::path::Path,
     backup: &std::path::Path,
+) -> Result<()> {
+    copy_database_file_with(conn, path, backup, async |from, to| {
+        std::fs::copy(from, to).map(drop)
+    })
+    .await
+}
+
+/// [`copy_database_file`], with the byte-for-byte file copy passed in.
+async fn copy_database_file_with(
+    conn: &mut sqlx::SqliteConnection,
+    path: &std::path::Path,
+    backup: &std::path::Path,
+    copy_file: impl AsyncFnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
 ) -> Result<()> {
     let partial = start_snapshot(backup)?;
     let written = async {
@@ -1799,19 +1805,32 @@ async fn copy_database_file(
             sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
                 .fetch_one(&mut *conn)
                 .await?;
-        if busy == 0 && log == checkpointed {
-            std::fs::copy(path, &partial).map_err(|source| crate::DbError::Backup {
-                path: backup.display().to_string(),
-                source,
-            })?;
+        let distrusted = if busy == 0 && log == checkpointed {
+            copy_file(path, &partial)
+                .await
+                .map_err(|source| crate::DbError::Backup {
+                    path: backup.display().to_string(),
+                    source,
+                })?;
+            (!log_is_empty(path)).then_some(
+                "another process wrote to the database during the copy, which may hold half of a checkpoint",
+            )
         } else {
+            Some(
+                "another process has the database open, so its write-ahead log could not be folded in",
+            )
+        };
+        if let Some(cause) = distrusted {
             tracing::warn!(
                 database = %path.display(),
                 backup = %backup.display(),
                 log_frames = log,
                 checkpointed_frames = checkpointed,
-                "another process has the database open, so its write-ahead log could not be folded in: copying it with VACUUM INTO instead"
+                cause,
+                "copying the database with VACUUM INTO instead of the file"
             );
+            // `VACUUM INTO` refuses a file that is already there.
+            start_snapshot(backup)?;
             sqlx::query(sqlx::AssertSqlSafe(vacuum_into(&partial)))
                 .execute(&mut *conn)
                 .await?;
@@ -1820,6 +1839,18 @@ async fn copy_database_file(
     }
     .await;
     abandon_on_error(&partial, written)
+}
+
+/// Whether the write-ahead log of the database at `path` holds nothing, as a
+/// finished `wal_checkpoint(TRUNCATE)` leaves it. A log that cannot be looked at
+/// counts as holding something: the caller then takes the safe way.
+fn log_is_empty(path: &std::path::Path) -> bool {
+    let mut log = path.as_os_str().to_owned();
+    log.push("-wal");
+    match std::fs::metadata(log) {
+        Ok(metadata) => metadata.len() == 0,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// The temporary name a snapshot is written under until it is complete
@@ -2416,6 +2447,104 @@ mod tests {
             .expect("count");
         assert_eq!(rows, 2, "the copy must hold the commit still in the WAL");
         assert!(!dir.path().join("jellyfin.db.pre-0007.partial").exists());
+    }
+
+    /// Another process that commits while the file is being copied can
+    /// checkpoint into it (its automatic checkpoint runs every 1000 pages):
+    /// the copy then holds the first half of the file from before that
+    /// checkpoint and the second half from after it. Nothing reports that, so
+    /// the log is looked at once the copy is done, and a copy it cannot vouch
+    /// for is taken again with `VACUUM INTO`.
+    #[tokio::test]
+    async fn a_copy_another_process_wrote_through_is_taken_again() {
+        use sqlx::ConnectOptions as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        let mut conn = options.clone().connect().await.expect("connect");
+        sqlx::raw_sql(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             CREATE INDEX t_v ON t (v);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 5000)
+             INSERT INTO t SELECT i, printf('%0100d', i) FROM n;",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed");
+        let mut other = options.connect().await.expect("the other process");
+
+        let backup = dir.path().join("jellyfin.db.pre-0044");
+        copy_database_file_with(&mut conn, &path, &backup, async |from, to| {
+            let before = std::fs::read(from)?;
+            sqlx::raw_sql(
+                "UPDATE t SET v = printf('%0100d', 9999 - id);
+                 PRAGMA wal_checkpoint(PASSIVE);",
+            )
+            .execute(&mut other)
+            .await
+            .expect("a commit and a checkpoint during the copy");
+            let after = std::fs::read(from)?;
+            let middle = before.len() / 2;
+            std::fs::write(to, [&before[..middle], &after[middle..]].concat())
+        })
+        .await
+        .expect("copy");
+
+        let mut copy = SqliteConnectOptions::new()
+            .filename(&backup)
+            .read_only(true)
+            .connect()
+            .await
+            .expect("open the copy");
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check(1)")
+            .fetch_one(&mut copy)
+            .await
+            .expect("integrity check");
+        assert_eq!(integrity, "ok", "the copy must not be torn");
+        let first: String = sqlx::query_scalar("SELECT v FROM t WHERE id = 1")
+            .fetch_one(&mut copy)
+            .await
+            .expect("read the copy");
+        assert_eq!(
+            first,
+            format!("{:0100}", 9998),
+            "the copy is taken again, so it holds the commit made during the first one"
+        );
+    }
+
+    /// With nothing else on the database the copy is the file itself, not a
+    /// `VACUUM INTO` of it: a rewritten copy is not the file the operator had.
+    #[tokio::test]
+    async fn a_copy_nothing_wrote_through_is_the_file_itself() {
+        use sqlx::ConnectOptions as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("jellyfin.db");
+        let mut conn = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .connect()
+            .await
+            .expect("connect");
+        sqlx::raw_sql("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .execute(&mut conn)
+            .await
+            .expect("seed");
+
+        let backup = dir.path().join("jellyfin.db.pre-0044");
+        copy_database_file_with(&mut conn, &path, &backup, async |_, to| {
+            std::fs::write(to, "what the file copy wrote")
+        })
+        .await
+        .expect("copy");
+
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("read the copy"),
+            "what the file copy wrote"
+        );
     }
 
     /// Seeds a database file with every migration up to `last` applied and
@@ -4080,11 +4209,22 @@ mod tests {
     /// `20260910…` (108), and 12.1-from-12.0 → 12.2 keeps both (109). All four
     /// are the 12.2 generation, and `0040` is baselined: the database already has
     /// the partial `OwnerId` pair.
+    ///
+    /// Jellyfin 12.3 and 12.4 add no EF migration and no code routine (`v12.2`
+    /// to `v12.4` changes no `Migrations/` file), so a database they upgrade
+    /// keeps the set of the route it came by: 12.3 on the 12.1-from-12.0 → 12.2
+    /// database and 12.4 on that 12.3 one keep 109 ids, and either release
+    /// straight from 10.11 keeps 107, as the adoption fixtures record. Releases
+    /// sharing a set share the logged generation, so each adopts as `12.2.0`.
     #[rstest::rstest]
     #[case::from_10_11(false, false, 107)]
     #[case::from_12_0(true, false, 108)]
     #[case::from_12_1_of_10_11(false, true, 108)]
     #[case::from_12_1_of_12_0(true, true, 109)]
+    #[case::jellyfin_12_3_from_12_2(true, true, 109)]
+    #[case::jellyfin_12_3_from_10_11(false, false, 107)]
+    #[case::jellyfin_12_4_from_12_3(true, true, 109)]
+    #[case::jellyfin_12_4_from_10_11(false, false, 107)]
     #[tokio::test]
     async fn adopts_a_jellyfin_12_2_database_on_every_upgrade_route(
         #[case] passed_through_12_0: bool,
@@ -4506,11 +4646,15 @@ mod tests {
     /// A fresh 12.x install records only the routines its code base still has, so
     /// it lacks the retired 10.11-era ids every upgraded database carries, and its
     /// schema lacks `IX_CustomItemDisplayPreferences_UserId`. It is still its own
-    /// generation, and `0041` gives it the index.
+    /// generation, and `0041` gives it the index. A fresh 12.3 or 12.4 install
+    /// records 12.2's fresh set and schema (neither release adds a migration), so
+    /// it adopts as `12.2.0`.
     #[rstest::rstest]
     #[case::fresh_12_0("12.0.0", SCHEMA_12_0, &FRESH_12_0)]
     #[case::fresh_12_1("12.1.0", SCHEMA_12_0, &FRESH_12_1)]
     #[case::fresh_12_2("12.2.0", SCHEMA_12_2, &FRESH_12_2)]
+    #[case::fresh_12_3("12.2.0", SCHEMA_12_2, &FRESH_12_2)]
+    #[case::fresh_12_4("12.2.0", SCHEMA_12_2, &FRESH_12_2)]
     #[tokio::test]
     async fn adopts_a_fresh_jellyfin_12_x_install(
         #[case] generation: &str,

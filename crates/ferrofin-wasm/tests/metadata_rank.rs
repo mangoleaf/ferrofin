@@ -91,7 +91,7 @@ impl Tmdb {
                     None
                 };
                 let (status, payload) =
-                    body.map_or(("404 Not Found", "{}".to_owned()), |b| ("200 OK", b));
+                    body.map_or_else(|| ("404 Not Found", "{}".to_owned()), |b| ("200 OK", b));
                 let _ = write!(
                     s,
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",

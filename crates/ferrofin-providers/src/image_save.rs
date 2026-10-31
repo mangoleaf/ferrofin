@@ -10,8 +10,6 @@ use ferrofin_traits::library::{SelfWrite, SelfWriteGuard, VirtualFolderManager};
 use ferrofin_traits::options::ItemImageInfo;
 use ferrofin_traits::persistence::ItemRepository;
 use ferrofin_util::directory_path::DirectoryPath;
-use ferrofin_util::string_extensions::replace_ignore_ascii_case;
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -107,7 +105,6 @@ impl ImageFileSaver {
         index: usize,
         current: &[ItemImageInfo],
     ) -> Result<SavedImage, ServiceError> {
-        let item = &self.expand_path(item);
         let Some(settings) = self.settings(item).await? else {
             return Ok(SavedImage::clean(image));
         };
@@ -135,7 +132,6 @@ impl ImageFileSaver {
         images: &mut [ItemImageInfo],
         previous: &[ItemImageInfo],
     ) -> Result<(), ServiceError> {
-        let item = &self.expand_path(item);
         let Some(settings) = self.settings(item).await? else {
             return Ok(());
         };
@@ -174,23 +170,6 @@ impl ImageFileSaver {
             current.push(image.clone());
         }
         failure.map_or(Ok(()), Err)
-    }
-
-    /// `ExpandVirtualPath` on the item's own path (`BaseItemRepository.Map`):
-    /// an adopted genre or playlist stores `%MetadataPath%/Genre/…` or
-    /// `%AppDataPath%/playlists/…`, and the item read leaves it as stored.
-    fn expand_path<'a>(&self, item: &'a BaseItemEntity) -> Cow<'a, BaseItemEntity> {
-        let Some(path) = item.path.as_deref().filter(|path| path.contains('%')) else {
-            return Cow::Borrowed(item);
-        };
-        let paths = self.configuration.application_paths();
-        let path = replace_ignore_ascii_case(path, "%AppDataPath%", &paths.data_path());
-        let path =
-            replace_ignore_ascii_case(&path, "%MetadataPath%", &paths.internal_metadata_path());
-        Cow::Owned(BaseItemEntity {
-            path: Some(path),
-            ..item.clone()
-        })
     }
 
     /// Whether the item's own path lies in one of the server's own
@@ -366,7 +345,10 @@ impl ImageFileSaver {
         let cleanup = cleanup.map(|error| {
             ServiceError::backend(format!(
                 "remove replaced artwork {}: {error}",
-                old_path.as_deref().unwrap_or(Path::new("")).display()
+                old_path
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(""))
+                    .display()
             ))
         });
         match copied {

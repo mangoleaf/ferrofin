@@ -648,7 +648,7 @@ mod tests {
             500,
             false,
         );
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "{out:?}");
         // Season "all" kept only when allow_season_all.
         let mut out = Vec::new();
         populate(
@@ -658,7 +658,7 @@ mod tests {
             1920,
             false,
         );
-        assert!(out.is_empty());
+        assert!(out.is_empty(), "{out:?}");
         let mut out = Vec::new();
         populate(
             &mut out,
@@ -809,7 +809,8 @@ mod tests {
             "{season:?}"
         );
         assert_eq!(season[1].url, "https://x/sp2.jpg");
-        assert!(c.season_images("121361", 9).await.is_empty());
+        let season_images = c.season_images("121361", 9).await;
+        assert!(season_images.is_empty(), "{season_images:?}");
 
         let artist = c.artist_images("mbid").await;
         assert!(artist.iter().any(|i| i.image_type == ImageType::Primary));
@@ -820,7 +821,8 @@ mod tests {
         assert!(album.iter().any(|i| i.image_type == ImageType::Primary));
         assert!(album.iter().any(|i| i.image_type == ImageType::Disc));
         // A non-matching release group → nothing.
-        assert!(c.album_images("mbid", "nope").await.is_empty());
+        let album_images = c.album_images("mbid", "nope").await;
+        assert!(album_images.is_empty(), "{album_images:?}");
     }
 
     #[tokio::test]

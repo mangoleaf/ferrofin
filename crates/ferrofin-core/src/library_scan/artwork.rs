@@ -287,7 +287,7 @@ mod tests {
             false,
         )
         .await;
-        assert!(more.is_empty());
+        assert!(more.is_empty(), "{more:?}");
         assert_eq!(requests.lock().unwrap().len(), 3);
     }
 
@@ -345,7 +345,7 @@ mod tests {
             true,
         )
         .await;
-        assert!(images.is_empty());
+        assert!(images.is_empty(), "{images:?}");
         assert!(
             !requests
                 .lock()
@@ -427,7 +427,7 @@ mod tests {
         let old = legacy.join("backdrop.jpg");
         std::fs::write(&new, b"new").unwrap();
         std::fs::write(&old, b"old").unwrap();
-        let folders = [own.clone(), legacy.clone()];
+        let folders = [own, legacy];
         prune_old_backdrops_in(&folders, &[]);
         assert!(
             old.exists() && new.exists(),

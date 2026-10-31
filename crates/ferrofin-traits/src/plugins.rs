@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn descriptor_default_is_empty_and_disabled() {
         let d = PluginDescriptor::default();
-        assert!(d.name.is_empty());
+        assert_eq!(d.name, "");
         assert!(!d.enabled);
         assert!(!d.can_uninstall);
         assert!(d.id.is_nil());
@@ -454,10 +454,13 @@ mod tests {
     #[tokio::test]
     async fn disabled_manager_has_no_plugins() {
         let mgr = DisabledPluginManager;
-        assert!(mgr.list_plugins().await.expect("list").is_empty());
+        let plugins = mgr.list_plugins().await.expect("list");
+        assert!(plugins.is_empty(), "{plugins:?}");
         assert!(mgr.get_plugin(Uuid::new_v4()).await.expect("get").is_none());
-        assert!(mgr.get_repositories().await.expect("repos").is_empty());
-        assert!(mgr.list_packages().await.expect("pkgs").is_empty());
+        let repositories = mgr.get_repositories().await.expect("repos");
+        assert!(repositories.is_empty(), "{repositories:?}");
+        let packages = mgr.list_packages().await.expect("pkgs");
+        assert!(packages.is_empty(), "{packages:?}");
         assert!(mgr.enable_plugin(Uuid::new_v4()).await.is_err());
         assert!(mgr.set_repositories(Vec::new()).await.is_err());
     }

@@ -318,7 +318,8 @@ async fn an_administrator_setting_the_password_signs_out_every_device_of_the_use
         StatusCode::OK,
         "the administrator's own token is untouched"
     );
-    assert!(device_ids_of(&s).await.is_empty());
+    let found = device_ids_of(&s).await;
+    assert!(found.is_empty(), "{found:?}");
 }
 
 /// `UserController.DeleteUser` → `RevokeUserTokens(user.Id, null)`: every device
@@ -371,7 +372,8 @@ async fn disabling_a_user_revokes_their_tokens_for_good() {
 
     policy["IsDisabled"] = serde_json::Value::Bool(true);
     save_policy(&s, policy.clone()).await;
-    assert!(device_ids_of(&s).await.is_empty());
+    let found = device_ids_of(&s).await;
+    assert!(found.is_empty(), "{found:?}");
 
     policy["IsDisabled"] = serde_json::Value::Bool(false);
     save_policy(&s, policy).await;

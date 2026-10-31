@@ -46,7 +46,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         # Same master-commit pin as binaries (see the note there).
         with:
-          toolchain: 1.98.1 # = rust-toolchain.toml
+          toolchain: 1.99.1 # = rust-toolchain.toml
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-deny@0.20.2
@@ -244,10 +244,10 @@ jobs:
           fetch-depth: 0 # the .deb's changelog is rendered from history + tags
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
         # A master commit, deliberately without a ref comment: dtolnay rebuilds
-        # the 1.98.1 branch on every master merge (orphaning its SHAs) and moves
+        # the 1.99.1 branch on every master merge (orphaning its SHAs) and moves
         # master and v1, so any ref named here goes stale. The input picks Rust.
         with:
-          toolchain: 1.98.1 # = rust-toolchain.toml
+          toolchain: 1.99.1 # = rust-toolchain.toml
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -376,7 +376,8 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # ── GitHub Release with git-cliff notes + the binaries (final versions only) ──
+  # ── GitHub Release, created as a draft, with git-cliff placeholder notes + the binaries (final versions only) ──
+  #   It stays a draft until the github-release-notes skill writes the real notes and publishes it.
   github-release:
     if: >-
       !cancelled() && github.event_name == 'push' && startsWith(github.ref_name, 'v') &&
@@ -402,11 +403,11 @@ jobs:
           pattern: ferrofin-*
           path: dist
           merge-multiple: true
-      - name: create the GitHub Release
+      - name: create the GitHub Release as a draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --verify-tag \
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
             --title "Ferrofin $GITHUB_REF_NAME" --notes-file release_notes.md dist/*
 
   # ── Helm chart as an OCI artifact on GHCR ──

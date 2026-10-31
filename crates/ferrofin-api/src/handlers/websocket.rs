@@ -34,7 +34,9 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use ferrofin_traits::activity::ActivityManager;
 use ferrofin_traits::options::AuthorizationInfo;
+use ferrofin_traits::session::{SessionEvent, SessionManager};
 use tokio::sync::mpsc;
 
 use crate::auth::AuthenticatedIdentity;
@@ -308,15 +310,18 @@ enum Action {
 enum Inbound {
     /// `KeepAlive` — the client's periodic ping; answered with a `KeepAlive` ack.
     KeepAlive,
-    /// `SessionsStart` — stream the session list every `period`.
+    /// `SessionsStart` — send the session list on each session event, at most
+    /// one non-forced send per `period`.
     SessionsStart(Duration),
     /// `SessionsStop` — stop the session stream.
     SessionsStop,
-    /// `ScheduledTasksInfoStart` — stream the task list every `period`.
+    /// `ScheduledTasksInfoStart` — send the task list now, on each task start
+    /// and completion, and on progress at most once per `period`.
     TasksStart(Duration),
     /// `ScheduledTasksInfoStop` — stop the task stream.
     TasksStop,
-    /// `ActivityLogEntryStart` — stream new activity entries every `period`.
+    /// `ActivityLogEntryStart` — send an empty `ActivityLogEntry` frame on
+    /// each created entry, a signal to refetch the entries.
     ActivityStart(Duration),
     /// `ActivityLogEntryStop` — stop the activity stream.
     ActivityStop,
@@ -371,31 +376,23 @@ fn parse_inbound(text: &str) -> Option<Inbound> {
 /// malformed — jellyfin-web subscribes with "0,1500".
 const DEFAULT_STREAM_MILLIS: u64 = 1500;
 
-/// Fallback minimum period between pushes of a dashboard stream, used when the
-/// composition root does not configure one (chiefly unit tests). The server
-/// injects the operator-configured floor
-/// (`FERROFIN_WS_MIN_STREAM_PERIOD_MS`, default 100 ms) via
-/// [`crate::AppState::with_websocket_min_stream_period`]; this constant only
-/// backs a bare [`crate::AppState::new`] so client-chosen periods are floored
-/// even then.
-///
-/// The floor exists because Ferrofin drives these streams on a timer — each
-/// tick recomputes and sends the full snapshot — whereas upstream's
-/// `BasePeriodicWebSocketListener` is event-driven and sends only when a
-/// session/playback event fires (the client period is a debounce ceiling
-/// there, never a poll clock). Without a floor a client could ask for a 1 ms
-/// period and turn each tick into back-to-back `get_sessions`/activity work.
-pub(crate) const DEFAULT_WS_MIN_STREAM_PERIOD: Duration = Duration::from_millis(100);
-
 /// Parses the `"initialDelayMs,periodMs"` subscription payload (the C#
 /// `BasePeriodicWebSocketListener` Data convention) into the stream period.
-/// The initial delay is folded into the period (first send after one period).
+/// It is upstream's throttle interval (`WebSocketListenerState.IntervalMs`)
+/// for every stream. The initial delay is ignored, as upstream stores
+/// `InitialDelayMs` and never uses it.
+///
+/// There is no floor, as upstream has none (`BasePeriodicWebSocketListener.cs:177`):
+/// 0 is kept, and a negative period, which upstream's `long.Parse` accepts and
+/// whose throttle passes every send, is 0. No timer runs on the period: every
+/// send is triggered by an event, forced ones coalesce to one frame per wake
+/// (`drain`), and throttled ones are also spaced by the period, so nothing
+/// loops whatever a client asks.
 fn subscription_period(data: Option<&str>) -> Duration {
     let millis = data
         .and_then(|d| d.split(',').nth(1))
-        .and_then(|p| p.trim().parse::<u64>().ok())
-        .filter(|&p| p > 0)
-        .unwrap_or(DEFAULT_STREAM_MILLIS);
+        .and_then(|p| p.trim().parse::<i64>().ok())
+        .map_or(DEFAULT_STREAM_MILLIS, |p| u64::try_from(p).unwrap_or(0));
     Duration::from_millis(millis)
 }
 
@@ -594,12 +591,11 @@ async fn handle_socket(
     // is sent must still fall through to the teardown below.
     let open = greet_with_keep_alive(&mut socket, &overflowed, caller.is_some()).await;
 
-    // The dashboard's periodic streams, armed by *Start subscription messages
+    // The dashboard's streams, armed by *Start subscription messages
     // (each is `None` until subscribed). Only a socket with a session may
     // subscribe — the streams answer as the socket's user — and the activity
     // stream is an administrator's alone (`may_subscribe`).
-    let mut streams = Streams::new(state.websocket_min_stream_period);
-    let mut task_updates = None;
+    let mut streams = Streams::default();
 
     if open {
         loop {
@@ -625,11 +621,11 @@ async fn handle_socket(
                     Action::Inbound(inbound) => {
                         log_task_subscription(inbound, caller.is_some());
                         if caller.as_ref().is_some_and(|c| may_subscribe(c, inbound)) {
-                            let message = update_task_subscription(&state, inbound, &mut task_updates).await;
+                            let message = update_task_subscription(&state, inbound, &mut streams).await;
                             if !send_optional(&mut socket, message, &overflowed).await {
                                 break;
                             }
-                            streams.apply(inbound);
+                            streams.apply(inbound, state.sessions.as_ref(), state.activity.as_ref());
                         }
                     }
                 },
@@ -654,28 +650,27 @@ async fn handle_socket(
                         break;
                     }
                 }
-                () = tick(&mut streams.sessions) => {
-                    if let Some(c) = caller.as_ref()
-                        && let Some(msg) = sessions_message(&state, c.user_id, c.is_api_key).await
-                        && !send_frame(&mut socket, Message::Text(msg.into()), &overflowed).await
-                    {
-                        break;
-                    }
-                }
-                update = next_task_update(&mut task_updates) => {
-                    let msg = task_transition_message(&state, update, &mut task_updates).await;
-                    if !send_optional(&mut socket, msg, &overflowed).await {
-                        break;
-                    }
-                }
-                () = tick(&mut streams.tasks) => {
-                    let message = periodic_tasks_message(&state, task_updates.as_ref()).await;
+                first = next_event(&mut streams.sessions) => {
+                    let message =
+                        sessions_wake(&state, caller.as_ref(), &mut streams.sessions, first).await;
                     if !send_optional(&mut socket, message, &overflowed).await {
                         break;
                     }
                 }
-                () = tick(&mut streams.activity) => {
-                    let message = activity_message(&state, &mut streams.activity_since).await;
+                update = next_task_update(&mut streams.task_updates) => {
+                    let msg = task_transition_message(&state, update, &mut streams).await;
+                    if !send_optional(&mut socket, msg, &overflowed).await {
+                        break;
+                    }
+                }
+                first = next_event(&mut streams.tasks) => {
+                    let message = task_progress_wake(&state, &mut streams, first).await;
+                    if !send_optional(&mut socket, message, &overflowed).await {
+                        break;
+                    }
+                }
+                first = next_event(&mut streams.activity) => {
+                    let message = activity_wake(&mut streams.activity, first);
                     if !send_optional(&mut socket, message, &overflowed).await {
                         break;
                     }
@@ -838,96 +833,294 @@ async fn keep_alive_watchdog(
     }
 }
 
-/// The armed periodic streams of one socket.
+/// The armed dashboard streams of one socket.
+#[derive(Default)]
 struct Streams {
-    sessions: Option<tokio::time::Interval>,
-    tasks: Option<tokio::time::Interval>,
-    activity: Option<tokio::time::Interval>,
-    /// Only activity entries created after this instant are streamed (advanced
-    /// on every send, so each entry is delivered once).
-    activity_since: chrono::DateTime<chrono::Utc>,
-    /// The floor every armed stream's period is clamped up to (see
-    /// [`DEFAULT_WS_MIN_STREAM_PERIOD`]).
-    min_period: Duration,
+    sessions: Option<EventStream<SessionEvent>>,
+    /// One `()` per progress report of a running task.
+    tasks: Option<EventStream<()>>,
+    /// The task starts and completions captured since the subscribe snapshot.
+    task_updates: Option<TaskUpdateReceiver>,
+    /// One `()` per created activity-log entry.
+    activity: Option<EventStream<()>>,
 }
 
 impl Streams {
-    /// A fresh, unsubscribed stream set whose periods are floored at
-    /// `min_period` (the operator-configured minimum stream period).
-    fn new(min_period: Duration) -> Self {
-        Self {
-            sessions: None,
-            tasks: None,
-            activity: None,
-            activity_since: chrono::Utc::now(),
-            min_period,
+    /// Arms or cancels a stream for one subscription message; the task
+    /// stream is [`update_task_subscription`]'s.
+    fn apply(
+        &mut self,
+        inbound: Inbound,
+        sessions: &dyn SessionManager,
+        activity: &dyn ActivityManager,
+    ) {
+        match inbound {
+            Inbound::SessionsStart(p) => {
+                self.sessions = Self::event_stream(sessions.subscribe_session_events(), p);
+            }
+            Inbound::SessionsStop => self.sessions = None,
+            Inbound::ActivityStart(p) => {
+                self.activity = Self::event_stream(activity.subscribe_entry_created(), p);
+            }
+            Inbound::ActivityStop => self.activity = None,
+            Inbound::TasksStart(_) | Inbound::TasksStop | Inbound::KeepAlive => {}
         }
     }
 
-    /// Arms or cancels a stream for one subscription message.
-    fn apply(&mut self, inbound: Inbound) {
-        // Floor the client-chosen period: a tiny period would otherwise make
-        // each tick recompute and resend the full snapshot back to back.
-        let min_period = self.min_period;
-        let arm = |period: Duration| {
-            let mut interval = tokio::time::interval(period.max(min_period));
-            // First send one period from now, not immediately.
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            interval.reset();
-            Some(interval)
-        };
-        match inbound {
-            Inbound::SessionsStart(p) => self.sessions = arm(p),
-            Inbound::SessionsStop => self.sessions = None,
-            Inbound::TasksStart(p) => self.tasks = arm(p),
-            Inbound::TasksStop => self.tasks = None,
-            Inbound::ActivityStart(p) => {
-                self.activity_since = chrono::Utc::now();
-                self.activity = arm(p);
-            }
-            Inbound::ActivityStop => self.activity = None,
-            Inbound::KeepAlive => {}
-        }
+    /// A `*Start`'s subscription to `events` with a fresh throttle state,
+    /// which replaces any earlier one. `None` (a manager that raises no
+    /// events) leaves the stream unarmed, so it sends nothing.
+    fn event_stream<E>(
+        events: Option<tokio::sync::broadcast::Receiver<E>>,
+        period: Duration,
+    ) -> Option<EventStream<E>> {
+        events.map(|events| EventStream {
+            events,
+            period,
+            last_sent: None,
+        })
     }
 }
 
-/// Awaits the next tick of an armed stream; pends forever when unarmed (so the
-/// select branch never fires for a stream the client hasn't subscribed to).
-async fn tick(stream: &mut Option<tokio::time::Interval>) {
-    match stream {
-        Some(interval) => {
-            interval.tick().await;
+/// One socket's subscription to an event-driven stream: the port of the
+/// `(Connection, CancellationTokenSource, WebSocketListenerState)` entry
+/// `BasePeriodicWebSocketListener.Start` adds for the connection. Dropping it
+/// (`*Stop`, another `*Start`, the socket closing) drops the receiver, which
+/// unsubscribes, as `Stop` → `DisposeConnection` removes the entry.
+struct EventStream<E> {
+    events: tokio::sync::broadcast::Receiver<E>,
+    /// `WebSocketListenerState.IntervalMs`: the least time between two sends
+    /// of a non-forced change.
+    period: Duration,
+    /// `DateLastSendUtc`. `None` before the first send (upstream's
+    /// `DateTime.MinValue`), so the first non-forced change sends.
+    last_sent: Option<tokio::time::Instant>,
+}
+
+/// Upstream's force flag for one session event
+/// (`SessionInfoWebSocketListener.cs:111-144`): `SessionActivity` is
+/// `SendData(false)`, progress is `SendData(!e.IsAutomated)`, and the other
+/// five are `SendData(true)`.
+fn session_event_forces(event: SessionEvent) -> bool {
+    !matches!(
+        event,
+        SessionEvent::SessionActivity | SessionEvent::PlaybackProgress { is_automated: true }
+    )
+}
+
+/// What one wake of an event stream found, once its queue is drained.
+#[derive(Debug, PartialEq, Eq)]
+struct Wake {
+    /// `Some(force)` when an event or a lag arrived: whether any of them
+    /// forces a send. One snapshot answers them all, where upstream sends one
+    /// per forced event; a burst yields fewer frames with the same final
+    /// state (an accepted divergence).
+    pending: Option<bool>,
+    /// The manager dropped its sender, so nothing can arrive any more.
+    closed: bool,
+}
+
+/// Drains the events queued behind `first` without waiting and ORs their
+/// force flags (`forces`). A lag counts as forced, since the missed events
+/// may have been: it costs one extra snapshot and loses nothing, because the
+/// snapshot is rebuilt from the manager's state, never from the events.
+fn drain<E: Clone>(
+    first: Result<E, tokio::sync::broadcast::error::RecvError>,
+    events: &mut tokio::sync::broadcast::Receiver<E>,
+    forces: impl Fn(E) -> bool,
+) -> Wake {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    let mut wake = Wake {
+        pending: None,
+        closed: false,
+    };
+    let mut next = Some(first);
+    while let Some(received) = next {
+        match received {
+            Ok(event) => wake.pending = Some(wake.pending == Some(true) || forces(event)),
+            Err(RecvError::Lagged(_)) => wake.pending = Some(true),
+            Err(RecvError::Closed) => {
+                wake.closed = true;
+                break;
+            }
         }
+        next = match events.try_recv() {
+            Ok(event) => Some(Ok(event)),
+            Err(TryRecvError::Lagged(missed)) => Some(Err(RecvError::Lagged(missed))),
+            Err(TryRecvError::Closed) => Some(Err(RecvError::Closed)),
+            Err(TryRecvError::Empty) => None,
+        };
+    }
+    wake
+}
+
+/// Upstream's send-or-drop rule (`BasePeriodicWebSocketListener.cs:177`): a
+/// forced change always sends; any other only when at least `period` has
+/// passed since this socket's last send, and is otherwise dropped, with no
+/// trailing send.
+fn should_send(
+    force: bool,
+    last_sent: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    period: Duration,
+) -> bool {
+    force || last_sent.is_none_or(|sent| now.duration_since(sent) >= period)
+}
+
+/// Awaits the next event of an armed stream; pends forever when unarmed (so
+/// the select branch never fires for a stream the client hasn't subscribed
+/// to). `recv` is cancel-safe, so losing a `select!` race loses no event.
+async fn next_event<E: Clone>(
+    stream: &mut Option<EventStream<E>>,
+) -> Result<E, tokio::sync::broadcast::error::RecvError> {
+    match stream {
+        Some(stream) => stream.events.recv().await,
         None => std::future::pending().await,
     }
 }
 
-/// One outbound envelope: `{MessageType, MessageId, Data}` with the required
-/// `MessageId` (strict Kotlin-SDK clients crash without it), spelled as every
-/// Jellyfin guid is (`JsonGuidConverter`: 32 hex digits).
-fn envelope(message_type: &str, data: &serde_json::Value) -> String {
-    serde_json::json!({
-        "MessageType": message_type,
-        "MessageId": uuid::Uuid::new_v4().simple().to_string(),
-        "Data": data,
-    })
-    .to_string()
+/// One wake of an armed event stream, the port of `HandleMessages` for one
+/// connection: drains the queue and applies the throttle, returning whether
+/// a frame is due. A stream whose sender is gone is unarmed; a frame already
+/// due is still sent.
+fn wake_due<E: Clone>(
+    stream: &mut Option<EventStream<E>>,
+    first: Result<E, tokio::sync::broadcast::error::RecvError>,
+    forces: impl Fn(E) -> bool,
+) -> bool {
+    let Some(subscription) = stream.as_mut() else {
+        return false;
+    };
+    let wake = drain(first, &mut subscription.events, forces);
+    let now = tokio::time::Instant::now();
+    let due = wake
+        .pending
+        .is_some_and(|force| should_send(force, subscription.last_sent, now, subscription.period));
+    if wake.closed {
+        *stream = None;
+    }
+    due
 }
 
-/// The `Sessions` stream payload: the session list as the subscribing user
-/// sees it (the session manager applies the caller's visibility; an API key
-/// sees every session).
-async fn sessions_message(
+/// Stamps an armed stream's `DateLastSendUtc` for a frame just built, as
+/// upstream does for every send, forced or not. It is stamped just before the
+/// frame is written; upstream stamps it after the write completes. A failed
+/// write here ends the socket, so only the start of the throttle window moves,
+/// by the time one write takes.
+fn mark_sent<E>(stream: &mut Option<EventStream<E>>) {
+    if let Some(subscription) = stream {
+        subscription.last_sent = Some(tokio::time::Instant::now());
+    }
+}
+
+/// One wake of the `Sessions` stream: the snapshot to send, if any.
+async fn sessions_wake(
     state: &AppState,
-    user_id: uuid::Uuid,
-    is_api_key: bool,
+    caller: Option<&SocketCaller>,
+    stream: &mut Option<EventStream<SessionEvent>>,
+    first: Result<SessionEvent, tokio::sync::broadcast::error::RecvError>,
 ) -> Option<String> {
-    let sessions = state
+    if !wake_due(stream, first, session_event_forces) {
+        return None;
+    }
+    let message = sessions_message(state, caller?).await;
+    if message.is_some() {
+        mark_sent(stream);
+    }
+    message
+}
+
+/// One wake of the `ActivityLogEntry` stream, the port of
+/// `ActivityLogWebSocketListener`: `OnEntryCreated` forces a send
+/// (`SendData(true)`), and `GetDataToSend` is always an empty array, a signal
+/// to refetch the entries over `GET /System/ActivityLog/Entries`. Entries
+/// queued together are answered with one frame.
+fn activity_wake(
+    stream: &mut Option<EventStream<()>>,
+    first: Result<(), tokio::sync::broadcast::error::RecvError>,
+) -> Option<String> {
+    if !wake_due(stream, first, |()| true) {
+        return None;
+    }
+    mark_sent(stream);
+    activity_log_message()
+}
+
+/// The `ActivityLogEntry` frame: always an empty array.
+fn activity_log_message() -> Option<String> {
+    envelope("ActivityLogEntry", &serde_json::json!([]))
+}
+
+/// One outbound envelope: `{MessageType, MessageId, Data}` with the required
+/// `MessageId` (strict Kotlin-SDK clients crash without it), spelled as every
+/// Jellyfin guid is (`JsonGuidConverter`: 32 hex digits). `data` is written
+/// where it stands, with no second tree built around it. It stays a `Value`
+/// because that is what sorts the keys inside it: `serde_json::Map` is a
+/// `BTreeMap` here, and the envelope's own fields are declared in that order.
+fn envelope(message_type: &str, data: &serde_json::Value) -> Option<String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Envelope<'a> {
+        data: &'a serde_json::Value,
+        message_id: uuid::fmt::Simple,
+        message_type: &'a str,
+    }
+    serde_json::to_string(&Envelope {
+        data,
+        message_id: uuid::Uuid::new_v4().simple(),
+        message_type,
+    })
+    .ok()
+}
+
+/// The `Sessions` stream payload, the port of
+/// `SessionInfoWebSocketListener.GetDataToSendForConnection`: an
+/// administrator or API key sees every session, anyone else only the
+/// sessions they are the user or an additional user of, so a session with no
+/// user is not theirs. The list comes from `get_sessions`, which also blanks
+/// the hardware accelerator for a non-administrator, an accepted divergence:
+/// upstream's stream sends it, while its `GET /Sessions` blanks it.
+///
+/// A list that cannot be built is logged and skipped, and the subscription
+/// stays, so the next event tries again; upstream logs it and drops the
+/// connection's subscription.
+async fn sessions_message(state: &AppState, caller: &SocketCaller) -> Option<String> {
+    let mut sessions = match state
         .sessions
-        .get_sessions(user_id, None, None, None, is_api_key)
+        .get_sessions(caller.user_id, None, None, None, caller.is_api_key)
         .await
-        .ok()?;
-    Some(envelope("Sessions", &serde_json::to_value(sessions).ok()?))
+    {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(%error, "websocket Sessions snapshot could not be built");
+            return None;
+        }
+    };
+    if !caller.is_admin && !caller.is_api_key {
+        sessions.retain(|session| is_session_member(session, caller.user_id));
+    }
+    sessions_snapshot_message(sessions)
+}
+
+/// The `Sessions` frame for `sessions`.
+fn sessions_snapshot_message(sessions: Vec<ferrofin_model::dto::SessionInfoDto>) -> Option<String> {
+    match serde_json::to_value(sessions) {
+        Ok(data) => envelope("Sessions", &data),
+        Err(error) => {
+            tracing::warn!(%error, "websocket Sessions snapshot could not be serialized");
+            None
+        }
+    }
+}
+
+/// Upstream's `s.UserId.Equals(userId) || s.ContainsUser(userId)`.
+fn is_session_member(session: &ferrofin_model::dto::SessionInfoDto, user_id: uuid::Uuid) -> bool {
+    session.user_id == user_id
+        || session
+            .additional_users
+            .iter()
+            .flatten()
+            .any(|user| user.user_id == user_id)
 }
 
 /// The `ScheduledTasksInfo` stream payload: the current task list.
@@ -955,66 +1148,116 @@ fn task_snapshot_message(tasks: Vec<ferrofin_model::tasks::TaskInfo>) -> Option<
             );
         }
     }
-    Some(envelope(
+    envelope(
         "ScheduledTasksInfo",
         &serde_json::to_value(visible_tasks(tasks)).ok()?,
-    ))
+    )
 }
 
 type TaskUpdateReceiver = tokio::sync::broadcast::Receiver<Vec<ferrofin_model::tasks::TaskInfo>>;
 
-/// An initial snapshot and its subscription are acquired atomically by the registry.
+/// `ScheduledTasksInfoStart` and `ScheduledTasksInfoStop` for the task
+/// stream, the port of `ScheduledTasksWebSocketListener`. A start subscribes
+/// to the registry's transitions and progress and sends the current task
+/// list at once, an accepted divergence: upstream's `Start` sends nothing
+/// until a task event, but jellyfin-web's scan button has no HTTP fallback.
 async fn update_task_subscription(
     state: &AppState,
     inbound: Inbound,
-    receiver: &mut Option<TaskUpdateReceiver>,
+    streams: &mut Streams,
 ) -> Option<String> {
     match inbound {
-        Inbound::TasksStart(_) => match state.tasks.subscribe_task_updates() {
-            Some(subscription) => {
-                *receiver = Some(subscription.updates);
-                task_snapshot_message(subscription.snapshot)
+        Inbound::TasksStart(period) => {
+            let (message, progress) = subscribe_tasks(state, &mut streams.task_updates).await;
+            streams.tasks = Streams::event_stream(progress, period);
+            if message.is_some() {
+                mark_sent(&mut streams.tasks);
             }
-            None => tasks_message(state).await,
-        },
+            message
+        }
         Inbound::TasksStop => {
-            *receiver = None;
+            streams.task_updates = None;
+            streams.tasks = None;
             None
         }
         _ => None,
     }
 }
 
-async fn task_transition_message(
+/// Subscribes to the task registry, which takes the snapshot and the
+/// subscription atomically, so a short run cannot slip between them. Returns
+/// the snapshot frame and the progress signal. A registry that raises no
+/// events is read instead, and leaves both streams unarmed.
+async fn subscribe_tasks(
     state: &AppState,
-    update: Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError>,
-    receiver: &mut Option<TaskUpdateReceiver>,
-) -> Option<String> {
-    match update {
-        Ok(tasks) => task_snapshot_message(tasks),
-        // Resubscribe atomically after lag, dropping obsolete queued snapshots.
-        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-            update_task_subscription(state, Inbound::TasksStart(Duration::ZERO), receiver).await
+    updates: &mut Option<TaskUpdateReceiver>,
+) -> (Option<String>, Option<tokio::sync::broadcast::Receiver<()>>) {
+    match state.tasks.subscribe_task_updates() {
+        Some(subscription) => {
+            *updates = Some(subscription.updates);
+            (
+                task_snapshot_message(subscription.snapshot),
+                Some(subscription.progress),
+            )
         }
-        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-            *receiver = None;
-            None
-        }
+        None => (tasks_message(state).await, None),
     }
 }
 
-async fn periodic_tasks_message(
+/// A captured task start or completion (`TaskExecuting`, `TaskCompleted`):
+/// `SendData(true)`, so it sends at once, with the snapshot captured at the
+/// transition.
+async fn task_transition_message(
     state: &AppState,
-    receiver: Option<&TaskUpdateReceiver>,
+    update: Result<Vec<ferrofin_model::tasks::TaskInfo>, tokio::sync::broadcast::error::RecvError>,
+    streams: &mut Streams,
 ) -> Option<String> {
-    let message = tasks_message(state).await;
-    // A transition may race the read. Drain captured transitions before sending
-    // any newer periodic snapshot, otherwise a short run can appear out of order.
-    if receiver.is_some_and(|updates| !updates.is_empty()) {
-        None
-    } else {
-        message
+    let message = match update {
+        Ok(tasks) => task_snapshot_message(tasks),
+        // Resubscribe atomically after lag, dropping obsolete queued
+        // snapshots; the progress subscription stays as it is.
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            subscribe_tasks(state, &mut streams.task_updates).await.0
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            streams.task_updates = None;
+            None
+        }
+    };
+    if message.is_some() {
+        mark_sent(&mut streams.tasks);
     }
+    message
+}
+
+/// One wake of the task stream's progress (`OnTaskProgress`,
+/// `SendData(false)`): throttled by the period, and the task list is read
+/// only for a frame that is due. A captured transition still queued goes
+/// first and the progress frame is dropped, checked before the read and again
+/// after it: a transition may race the read, and a newer snapshot sent ahead
+/// of it would show a short run out of order.
+async fn task_progress_wake(
+    state: &AppState,
+    streams: &mut Streams,
+    first: Result<(), tokio::sync::broadcast::error::RecvError>,
+) -> Option<String> {
+    let transitions_queued = |streams: &Streams| {
+        streams
+            .task_updates
+            .as_ref()
+            .is_some_and(|updates| !updates.is_empty())
+    };
+    if !wake_due(&mut streams.tasks, first, |()| false) || transitions_queued(streams) {
+        return None;
+    }
+    let message = tasks_message(state).await;
+    if transitions_queued(streams) {
+        return None;
+    }
+    if message.is_some() {
+        mark_sent(&mut streams.tasks);
+    }
+    message
 }
 
 async fn next_task_update(
@@ -1036,31 +1279,6 @@ fn visible_tasks(
 ) -> Vec<ferrofin_model::tasks::TaskInfo> {
     tasks.retain(|task| !task.is_hidden);
     tasks
-}
-
-/// The `ActivityLogEntry` stream payload: entries created since the last send,
-/// or `None` when nothing new happened (no empty pushes).
-async fn activity_message(
-    state: &AppState,
-    since: &mut chrono::DateTime<chrono::Utc>,
-) -> Option<String> {
-    let query = ferrofin_traits::activity::ActivityLogQuery {
-        min_date: Some(*since),
-        ..Default::default()
-    };
-    let page = state.activity.get_paged_result(&query).await.ok()?;
-    if page.items.is_empty() {
-        return None;
-    }
-    if let Some(latest) = page.items.iter().map(|e| e.date).max() {
-        // The min_date filter is inclusive (`>=`), so step past the newest
-        // delivered entry or it would be re-sent on every tick.
-        *since = latest + chrono::Duration::milliseconds(1);
-    }
-    Some(envelope(
-        "ActivityLogEntry",
-        &serde_json::to_value(page.items).ok()?,
-    ))
 }
 
 /// The `KeepAlive` ack sent in reply to a client keep-alive ping.
@@ -1088,43 +1306,150 @@ fn force_keep_alive_message() -> String {
 mod tests {
     use super::{
         Action, DEFAULT_STREAM_MILLIS, Inbound, KEEPALIVE_FORCE_AFTER_SECS, KEEPALIVE_LOST_SECS,
-        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, SocketCaller, Streams, action_for,
-        force_keep_alive_message, keep_alive_ack, keep_alive_action, may_subscribe, parse_inbound,
-        push_sink, visible_tasks,
+        KEEPALIVE_SECS, KeepAlive, PUSH_QUEUE_DEPTH, SessionEvent, SocketCaller, Streams, Wake,
+        action_for, drain, force_keep_alive_message, keep_alive_ack, keep_alive_action,
+        may_subscribe, parse_inbound, push_sink, session_event_forces, should_send, visible_tasks,
     };
+    use crate::test_support::{FakeActivity, FakeSessions};
     use axum::extract::ws::Message;
     use std::time::Duration;
     use tokio::sync::mpsc;
 
+    /// A subscription keeps the period the client asked for, however small:
+    /// upstream's `IntervalMs` has no floor (`event_stream`, which every
+    /// stream's subscription goes through).
     #[tokio::test]
-    async fn stream_period_is_floored_at_the_configured_minimum() {
-        // A hostile or misconfigured client asks for a 1 ms period on every
-        // stream; each must be clamped up to the floor so a tick cannot become
-        // back-to-back `get_sessions`/activity work.
-        let floor = Duration::from_millis(100);
-        let mut streams = Streams::new(floor);
-        streams.apply(Inbound::SessionsStart(Duration::from_millis(1)));
-        streams.apply(Inbound::TasksStart(Duration::from_millis(1)));
-        streams.apply(Inbound::ActivityStart(Duration::from_millis(1)));
-        assert_eq!(streams.sessions.as_ref().unwrap().period(), floor);
-        assert_eq!(streams.tasks.as_ref().unwrap().period(), floor);
-        assert_eq!(streams.activity.as_ref().unwrap().period(), floor);
+    async fn stream_period_has_no_floor() {
+        for period in [Duration::ZERO, Duration::from_millis(1)] {
+            let (_events, receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
+            let stream = Streams::event_stream(Some(receiver), period).unwrap();
+            assert_eq!(stream.period, period);
+        }
     }
 
+    /// A second `SessionsStart` replaces the first: a new receiver, the new
+    /// period and a fresh throttle, so its first non-forced change sends.
+    /// `SessionsStop` drops the receiver. A manager that raises no events
+    /// leaves the stream unarmed.
     #[tokio::test]
-    async fn stream_period_above_the_floor_is_left_untouched() {
-        // jellyfin-web subscribes with 1500 ms, comfortably above the floor, so
-        // the floor must not slow a well-behaved client down.
-        let mut streams = Streams::new(Duration::from_millis(100));
-        streams.apply(Inbound::SessionsStart(Duration::from_millis(1500)));
+    async fn a_second_sessions_start_replaces_the_subscription() {
+        let mut streams = Streams::default();
+        let (events, receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
+        streams.sessions = Streams::event_stream(Some(receiver), Duration::from_millis(1500));
+        streams.sessions.as_mut().unwrap().last_sent = Some(tokio::time::Instant::now());
+
+        streams.sessions = Streams::event_stream(Some(events.subscribe()), Duration::from_secs(5));
+        let subscription = streams.sessions.as_ref().unwrap();
+        assert_eq!(subscription.period, Duration::from_secs(5));
+        assert_eq!(subscription.last_sent, None);
+        assert_eq!(events.receiver_count(), 1, "the first receiver is gone");
+
+        streams.apply(Inbound::SessionsStop, &FakeSessions, &FakeActivity);
+        assert!(streams.sessions.is_none());
+        assert_eq!(events.receiver_count(), 0);
+
+        streams.apply(
+            Inbound::SessionsStart(Duration::from_secs(1)),
+            &FakeSessions,
+            &FakeActivity,
+        );
+        assert!(streams.sessions.is_none(), "FakeSessions raises no events");
+    }
+
+    /// `SessionInfoWebSocketListener.cs:111-144`: only `SessionActivity` and
+    /// automated progress are throttled; every other event forces a send.
+    #[test]
+    fn only_session_activity_and_automated_progress_are_throttled() {
+        for (event, forced) in [
+            (SessionEvent::SessionStarted, true),
+            (SessionEvent::SessionEnded, true),
+            (SessionEvent::PlaybackStart, true),
+            (SessionEvent::PlaybackStopped, true),
+            (
+                SessionEvent::PlaybackProgress {
+                    is_automated: false,
+                },
+                true,
+            ),
+            (SessionEvent::PlaybackProgress { is_automated: true }, false),
+            (SessionEvent::CapabilitiesChanged, true),
+            (SessionEvent::SessionActivity, false),
+        ] {
+            assert_eq!(session_event_forces(event), forced, "{event:?}");
+        }
+    }
+
+    /// `BasePeriodicWebSocketListener.cs:177`: `force || (now -
+    /// DateLastSendUtc) >= IntervalMs`, with `DateLastSendUtc` unset before the
+    /// first send.
+    #[test]
+    fn a_throttled_change_sends_only_once_the_period_has_passed() {
+        let period = Duration::from_millis(1500);
+        let sent = tokio::time::Instant::now();
+        assert!(should_send(false, None, sent, period), "nothing sent yet");
+        assert!(should_send(true, Some(sent), sent, period), "forced");
+        assert!(!should_send(
+            false,
+            Some(sent),
+            sent + Duration::from_millis(1499),
+            period
+        ));
+        assert!(should_send(false, Some(sent), sent + period, period));
+    }
+
+    /// One wake drains everything queued and ORs the force flags; a lag is
+    /// forced; a closed channel says so once the queue is empty.
+    #[tokio::test]
+    async fn a_wake_drains_the_queue_into_one_decision() {
+        use tokio::sync::broadcast::error::RecvError;
+        let throttled = SessionEvent::SessionActivity;
+        let (events, mut receiver) = tokio::sync::broadcast::channel(2);
+
+        events.send(throttled).unwrap();
+        let first = receiver.recv().await;
+        let wake = drain(first, &mut receiver, session_event_forces);
         assert_eq!(
-            streams.sessions.as_ref().unwrap().period(),
-            Duration::from_millis(1500)
+            wake,
+            Wake {
+                pending: Some(false),
+                closed: false
+            }
+        );
+
+        events.send(throttled).unwrap();
+        events.send(SessionEvent::PlaybackStart).unwrap();
+        let first = receiver.recv().await;
+        let wake = drain(first, &mut receiver, session_event_forces);
+        assert_eq!(wake.pending, Some(true), "a queued forced event forces");
+        assert!(receiver.is_empty(), "the queue is drained");
+
+        for _ in 0..3 {
+            events.send(throttled).unwrap();
+        }
+        let first = receiver.recv().await;
+        assert!(matches!(first, Err(RecvError::Lagged(1))), "{first:?}");
+        let wake = drain(first, &mut receiver, session_event_forces);
+        assert_eq!(wake.pending, Some(true), "a lag is forced");
+
+        events.send(throttled).unwrap();
+        drop(events);
+        let first = receiver.recv().await;
+        let wake = drain(first, &mut receiver, session_event_forces);
+        assert_eq!(
+            wake,
+            Wake {
+                pending: Some(false),
+                closed: true
+            }
         );
     }
 
+    /// A progress frame is dropped while a captured transition is queued, so
+    /// a short run never shows out of order; once the transition is sent,
+    /// progress sends again. `ScheduledTasksInfoStop` drops both receivers.
+    /// The period is zero, so the throttle never holds a frame back here.
     #[tokio::test]
-    async fn captured_transitions_precede_periodic_snapshots_and_stop_unsubscribes() {
+    async fn captured_transitions_precede_progress_snapshots_and_stop_unsubscribes() {
         use crate::test_support::{
             FakeLibrary, RecordingTasks, elevated_state_with_library_monitor_and_tasks,
         };
@@ -1134,28 +1459,39 @@ mod tests {
             Arc::new(ferrofin_traits::stubs::NoopLibraryMonitor),
             Arc::new(RecordingTasks::default()),
         );
-        let (sender, receiver) = tokio::sync::broadcast::channel(4);
-        let mut receiver = Some(receiver);
-        sender.send(Vec::new()).unwrap();
+        let mut streams = Streams::default();
+        let (transitions, receiver) = tokio::sync::broadcast::channel(4);
+        let (progress, progress_receiver) = tokio::sync::broadcast::channel(4);
+        streams.task_updates = Some(receiver);
+        streams.tasks = Streams::event_stream(Some(progress_receiver), Duration::ZERO);
+
+        transitions.send(Vec::new()).unwrap();
+        progress.send(()).unwrap();
+        let first = super::next_event(&mut streams.tasks).await;
         assert!(
-            super::periodic_tasks_message(&state, receiver.as_ref())
+            super::task_progress_wake(&state, &mut streams, first)
                 .await
-                .is_none()
+                .is_none(),
+            "the queued transition goes first"
         );
-        let update = super::next_task_update(&mut receiver).await;
+        let update = super::next_task_update(&mut streams.task_updates).await;
         assert!(
-            super::task_transition_message(&state, update, &mut receiver)
+            super::task_transition_message(&state, update, &mut streams)
                 .await
                 .is_some()
         );
+        progress.send(()).unwrap();
+        let first = super::next_event(&mut streams.tasks).await;
         assert!(
-            super::periodic_tasks_message(&state, receiver.as_ref())
+            super::task_progress_wake(&state, &mut streams, first)
                 .await
                 .is_some()
         );
-        super::update_task_subscription(&state, Inbound::TasksStop, &mut receiver).await;
-        assert!(receiver.is_none());
-        assert_eq!(sender.receiver_count(), 0);
+
+        super::update_task_subscription(&state, Inbound::TasksStop, &mut streams).await;
+        assert!(streams.task_updates.is_none() && streams.tasks.is_none());
+        assert_eq!(transitions.receiver_count(), 0);
+        assert_eq!(progress.receiver_count(), 0);
     }
 
     /// A client that stops reading must not make the server buffer without
@@ -1316,6 +1652,32 @@ mod tests {
             parse_inbound(r#"{"MessageType":"ActivityLogEntryStart","Data":"0,1000"}"#),
             Some(Inbound::ActivityStart(Duration::from_secs(1)))
         );
+        // No floor: upstream's IntervalMs of 0, or below, throttles nothing.
+        for data in ["0,0", "0,-5"] {
+            assert_eq!(
+                parse_inbound(&format!(
+                    r#"{{"MessageType":"SessionsStart","Data":"{data}"}}"#
+                )),
+                Some(Inbound::SessionsStart(Duration::ZERO)),
+                "{data}"
+            );
+        }
+        // A period that does not parse falls back to the default; the initial
+        // delay is never read.
+        for (data, millis) in [
+            ("0,abc", DEFAULT_STREAM_MILLIS),
+            ("0,", DEFAULT_STREAM_MILLIS),
+            ("0,99999999999999999999", DEFAULT_STREAM_MILLIS),
+            ("abc,500", 500),
+        ] {
+            assert_eq!(
+                parse_inbound(&format!(
+                    r#"{{"MessageType":"SessionsStart","Data":"{data}"}}"#
+                )),
+                Some(Inbound::SessionsStart(Duration::from_millis(millis))),
+                "{data}"
+            );
+        }
         // Malformed or missing Data falls back to the default period.
         assert_eq!(
             parse_inbound(r#"{"MessageType":"SessionsStart"}"#),
@@ -1498,6 +1860,69 @@ mod tests {
                 .filter_map(|t| t.name.as_deref())
                 .collect::<Vec<_>>(),
             vec!["Clean Activity Log", "Scan Media Library"]
+        );
+    }
+
+    /// A frame with its random `MessageId` taken out, after checking that it is
+    /// the 32 hex digits every Jellyfin guid is written in.
+    fn without_message_id(frame: &str) -> String {
+        let (head, rest) = frame
+            .split_once(r#""MessageId":""#)
+            .expect("a frame carries a MessageId");
+        let (id, tail) = rest.split_once('"').expect("the id is a string");
+        assert_eq!(id.len(), 32, "{frame}");
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{frame}");
+        format!("{head}\"MessageId\":\"\"{tail}")
+    }
+
+    /// The exact bytes the three streams send: keys sorted at every level,
+    /// `Data` first, as `serde_json::Map` has always ordered them here.
+    #[test]
+    fn the_stream_frames_keep_their_bytes() {
+        let session = ferrofin_model::dto::SessionInfoDto {
+            id: Some("session-1".to_owned()),
+            user_name: Some("Zoë \"Z\"".to_owned()),
+            play_state: Some(ferrofin_model::session::PlayerStateInfo {
+                position_ticks: Some(5),
+                can_seek: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            without_message_id(&super::sessions_snapshot_message(vec![session]).expect("a frame")),
+            concat!(
+                r#"{"Data":[{"HasCustomDeviceName":false,"Id":"session-1","IsActive":false,"#,
+                r#""LastActivityDate":"1970-01-01T00:00:00.0000000Z","#,
+                r#""LastPlaybackCheckIn":"1970-01-01T00:00:00.0000000Z","#,
+                r#""PlayState":{"CanSeek":true,"IsMuted":false,"IsPaused":false,"#,
+                r#""PlaybackOrder":"Default","PositionTicks":5,"RepeatMode":"RepeatNone"},"#,
+                r#""PlayableMediaTypes":[],"SupportedCommands":[],"#,
+                r#""SupportsMediaControl":false,"SupportsRemoteControl":false,"#,
+                r#""UserId":"00000000000000000000000000000000","UserName":"Zoë \"Z\""}],"#,
+                r#""MessageId":"","MessageType":"Sessions"}"#,
+            )
+        );
+
+        let task = ferrofin_model::tasks::TaskInfo {
+            name: Some("Scan Media Library".to_owned()),
+            key: Some("RefreshLibrary".to_owned()),
+            id: Some("task-1".to_owned()),
+            current_progress_percentage: Some(12.5),
+            ..Default::default()
+        };
+        assert_eq!(
+            without_message_id(&super::task_snapshot_message(vec![task]).expect("a frame")),
+            concat!(
+                r#"{"Data":[{"CurrentProgressPercentage":12.5,"Id":"task-1","IsHidden":false,"#,
+                r#""Key":"RefreshLibrary","Name":"Scan Media Library","State":"Idle","#,
+                r#""Triggers":[]}],"MessageId":"","MessageType":"ScheduledTasksInfo"}"#,
+            )
+        );
+
+        assert_eq!(
+            without_message_id(&super::activity_log_message().expect("a frame")),
+            r#"{"Data":[],"MessageId":"","MessageType":"ActivityLogEntry"}"#
         );
     }
 

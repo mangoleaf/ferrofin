@@ -535,8 +535,10 @@ mod tests {
 
     #[test]
     fn empty_input_yields_no_channels() {
-        assert!(parse_m3u("").is_empty());
-        assert!(parse_m3u("#EXTM3U\n").is_empty());
+        let found = parse_m3u("");
+        assert!(found.is_empty(), "{found:?}");
+        let found = parse_m3u("#EXTM3U\n");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `ReadLineAsync` ends a line at a lone `\r` too, and `StreamReader`

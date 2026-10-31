@@ -110,10 +110,7 @@ impl ChapterRepository for FerrofinChapterRepository {
             return Ok(map);
         }
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let ph = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let ph = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT * FROM "Chapters" WHERE "ItemId" IN ({ph})
                    ORDER BY "ItemId", "StartPositionTicks""#,
@@ -209,6 +206,7 @@ mod tests {
         assert!(repo.get_chapter(item, 9).await.expect("miss").is_none());
 
         repo.delete_chapters(item).await.expect("delete");
-        assert!(repo.get_chapters(item).await.expect("get").is_empty());
+        let chapters = repo.get_chapters(item).await.expect("get");
+        assert!(chapters.is_empty(), "{chapters:?}");
     }
 }

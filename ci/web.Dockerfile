@@ -6,7 +6,7 @@
 #
 # The final image is FROM scratch and carries only /dist (the built static
 # client), so it's a tiny COPY source (~tens of MB, no node/toolchain).
-ARG JELLYFIN_WEB_VERSION=12.2
+ARG JELLYFIN_WEB_VERSION=12.4
 FROM node:24-trixie AS build
 ARG JELLYFIN_WEB_VERSION
 # webpack's production build is memory-hungry; give Node headroom so CI doesn't OOM.

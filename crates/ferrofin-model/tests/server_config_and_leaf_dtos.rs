@@ -244,9 +244,21 @@ fn absent_sort_lists_keep_jellyfins_defaults() {
         "SortReplaceCharacters": []
     }))
     .expect("deserialize");
-    assert!(emptied.sort_remove_words.is_empty());
-    assert!(emptied.sort_remove_characters.is_empty());
-    assert!(emptied.sort_replace_characters.is_empty());
+    assert!(
+        emptied.sort_remove_words.is_empty(),
+        "{:?}",
+        emptied.sort_remove_words
+    );
+    assert!(
+        emptied.sort_remove_characters.is_empty(),
+        "{:?}",
+        emptied.sort_remove_characters
+    );
+    assert!(
+        emptied.sort_replace_characters.is_empty(),
+        "{:?}",
+        emptied.sort_replace_characters
+    );
 }
 
 #[test]

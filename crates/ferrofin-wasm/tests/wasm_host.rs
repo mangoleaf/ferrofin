@@ -380,7 +380,11 @@ fn colliding_provider_names_are_refused_at_load() {
         .as_ref()
         .expect("the surviving plugin is the named provider");
     assert_eq!(info.name, "AcmeDb");
-    assert!(info.supported_kinds.is_empty());
+    assert!(
+        info.supported_kinds.is_empty(),
+        "{:?}",
+        info.supported_kinds
+    );
 }
 
 #[test]
@@ -757,10 +761,10 @@ async fn metadata_lookup_flows_through_the_adapter_and_caches_the_gate() {
     // slot is filled, but the call proves the full adapter → guest path.
     let wanted = [ferrofin_model::entities::ImageType::Primary];
     let contributed = providers[0].images(&lookup, &wanted).await.unwrap();
-    assert!(contributed.is_empty());
+    assert!(contributed.is_empty(), "{contributed:?}");
     // An empty wanted list short-circuits without a guest call.
     let contributed = providers[0].images(&lookup, &[]).await.unwrap();
-    assert!(contributed.is_empty());
+    assert!(contributed.is_empty(), "{contributed:?}");
 }
 
 #[test]
@@ -1820,13 +1824,15 @@ async fn analyzer_retains_a_host_skipped_write_even_when_library_is_reenabled_be
         host.plugins()[0].descriptor.id
     ));
     task.execute(&progress).await.unwrap();
+    let virtual_folders = inner.get_virtual_folders().await.unwrap();
+    let disabled_media_segment_providers = &virtual_folders[0]
+        .library_options
+        .as_ref()
+        .unwrap()
+        .disabled_media_segment_providers;
     assert!(
-        inner.get_virtual_folders().await.unwrap()[0]
-            .library_options
-            .as_ref()
-            .unwrap()
-            .disabled_media_segment_providers
-            .is_empty()
+        disabled_media_segment_providers.is_empty(),
+        "{disabled_media_segment_providers:?}"
     );
     let retained: Vec<ferrofin_model::media_segments::MediaSegmentDto> =
         serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
@@ -1849,7 +1855,7 @@ async fn analyzer_retains_a_host_skipped_write_even_when_library_is_reenabled_be
     task.execute(&progress).await.unwrap();
     let replaced: Vec<ferrofin_model::media_segments::MediaSegmentDto> =
         serde_json::from_slice(&std::fs::read(&snapshot).unwrap()).unwrap();
-    assert!(replaced.is_empty());
+    assert!(replaced.is_empty(), "{replaced:?}");
     assert!(
         ferrofin_wasm::capabilities::get_state(Some(&state), "host:segment-policy-pending")
             .is_none()
@@ -1930,7 +1936,11 @@ async fn state_only_analyzer_is_not_advertised_or_blocked_as_a_segment_producer(
                 .unwrap()
         );
     }
-    assert!(manager.registered_segment_providers().is_empty());
+    let registered_segment_providers = manager.registered_segment_providers();
+    assert!(
+        registered_segment_providers.is_empty(),
+        "{registered_segment_providers:?}"
+    );
     host.set_runtime_collaborators(ferrofin_wasm::capabilities::Collaborators {
         handle: tokio::runtime::Handle::current(),
         library,
@@ -1963,5 +1973,9 @@ async fn state_only_analyzer_is_not_advertised_or_blocked_as_a_segment_producer(
         .await
         .unwrap_err();
     assert!(count.contains('1'), "{count}");
-    assert!(manager.registered_segment_providers().is_empty());
+    let registered_segment_providers = manager.registered_segment_providers();
+    assert!(
+        registered_segment_providers.is_empty(),
+        "{registered_segment_providers:?}"
+    );
 }

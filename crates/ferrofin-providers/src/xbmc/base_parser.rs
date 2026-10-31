@@ -15,6 +15,7 @@
 use chrono::Datelike;
 use ferrofin_model::data::PersonKind;
 use ferrofin_model::entities::MetadataField;
+use ferrofin_util::finite::finite_or_none;
 
 use crate::container_types::{FileSystemMetadata, LocalImageInfo, MetadataResult, PersonInfo};
 
@@ -293,7 +294,9 @@ impl<'a> BaseNfoParser<'a> {
             "criticrating" => {
                 let text = reader.read_element_content_as_string();
                 if let Ok(value) = text.trim().parse::<f32>() {
-                    result.item.critic_rating = Some(value);
+                    // The `BaseItem` setters' `FiniteOrNull`: a parsed NaN or
+                    // infinity is assigned as no value.
+                    result.item.critic_rating = finite_or_none(Some(value));
                 }
             }
             "sorttitle" => result.item.forced_sort_name = Some(read_normalized_string(reader)),
@@ -416,7 +419,7 @@ impl<'a> BaseNfoParser<'a> {
             "rating" => {
                 let rating = reader.read_element_content_as_string().replace(',', ".");
                 if let Ok(value) = rating.trim().parse::<f32>() {
-                    result.item.community_rating = Some(value);
+                    result.item.community_rating = finite_or_none(Some(value));
                 }
             }
             "ratings" => Self::fetch_from_ratings_node(reader, &mut result.item),
@@ -471,7 +474,7 @@ impl<'a> BaseNfoParser<'a> {
                 if let Some(provider) = provider.filter(|p| !p.is_empty()) {
                     let normalized = self
                         .lookup_provider(&provider)
-                        .map_or(provider.clone(), ToOwned::to_owned);
+                        .map_or_else(|| provider.clone(), ToOwned::to_owned);
                     result.item.set_provider_id(&normalized, &provider_id);
                 }
             }
@@ -693,6 +696,7 @@ impl<'a> BaseNfoParser<'a> {
                     "value" => {
                         let val = reader.read_element_content_as_string();
                         if let Ok(rating) = val.trim().parse::<f32>() {
+                            let rating = finite_or_none(Some(rating));
                             let is_tomato = rating_name.is_some_and(|n| {
                                 n.to_ascii_lowercase().contains("tomato")
                                     && !n.to_ascii_lowercase().contains("audience")
@@ -701,10 +705,10 @@ impl<'a> BaseNfoParser<'a> {
                                 if !rating_name
                                     .is_some_and(|n| n.to_ascii_lowercase().contains("avg"))
                                 {
-                                    item.critic_rating = Some(rating);
+                                    item.critic_rating = rating;
                                 }
                             } else {
-                                item.community_rating = Some(rating);
+                                item.community_rating = rating;
                             }
                         }
                     }

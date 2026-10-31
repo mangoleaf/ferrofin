@@ -736,7 +736,7 @@ async fn plan_paths_walks_only_the_path_to_the_item() {
         vec![
             format!("{tv_root}/Show 7"),
             format!("{tv_root}/Show 7/Season 2"),
-            episode.clone(),
+            episode,
         ],
     );
     assert_eq!(

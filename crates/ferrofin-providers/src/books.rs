@@ -2371,13 +2371,9 @@ mod tests {
 
     /// `text` in UTF-16 or UTF-32, little- or big-endian, with an optional BOM.
     fn wide(text: &str, width: usize, little_endian: bool, bom: bool) -> Vec<u8> {
-        let units: Vec<u32> = bom
-            .then_some(0xFEFF)
+        bom.then_some(0xFEFF)
             .into_iter()
             .chain(text.chars().map(u32::from))
-            .collect();
-        units
-            .into_iter()
             .flat_map(|unit| {
                 let bytes = if little_endian {
                     unit.to_le_bytes().to_vec()

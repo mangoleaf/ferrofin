@@ -873,12 +873,10 @@ mod tests {
             store.excluded_episodes(season).await.unwrap(),
             HashSet::from([item])
         );
+        let segments_unless_excluded = store.segments_unless_excluded(item).await.unwrap();
         assert!(
-            store
-                .segments_unless_excluded(item)
-                .await
-                .unwrap()
-                .is_empty()
+            segments_unless_excluded.is_empty(),
+            "{segments_unless_excluded:?}"
         );
         store.retain_seasons(&[]).await.unwrap();
         assert_eq!(store.segments_unless_excluded(item).await.unwrap().len(), 4);
@@ -901,7 +899,8 @@ mod tests {
         assert_eq!(store.delete_mode(Credits).await.unwrap(), 1);
         assert_eq!(store.stored_item_ids().await.unwrap(), [item]);
         assert_eq!(store.delete_items(&[item]).await.unwrap(), 2);
-        assert!(store.segments(item).await.unwrap().is_empty());
+        let segments = store.segments(item).await.unwrap();
+        assert!(segments.is_empty(), "{segments:?}");
     }
 
     #[tokio::test]
@@ -991,7 +990,8 @@ mod tests {
             .reset_season(season, &[b, c], &[Credits])
             .await
             .unwrap();
-        assert!(store.segments(c).await.unwrap().is_empty());
+        let segments = store.segments(c).await.unwrap();
+        assert!(segments.is_empty(), "{segments:?}");
         assert_eq!(
             store.segments(b).await.unwrap().len(),
             1,
@@ -1175,7 +1175,8 @@ mod tests {
         assert_eq!(done.len(), 1);
         foreign_keys_whole(&db).await;
 
-        assert!(store.segments(episode).await.unwrap().is_empty());
+        let segments = store.segments(episode).await.unwrap();
+        assert!(segments.is_empty(), "{segments:?}");
         let mut moved = store.segments(to).await.unwrap();
         moved.sort_by_key(|s| s.mode.value());
         assert_eq!(
@@ -1304,7 +1305,8 @@ mod tests {
         assert_eq!(done.len(), 2);
         foreign_keys_whole(&db).await;
 
-        assert!(store.segments(loser).await.unwrap().is_empty());
+        let found = store.segments(loser).await.unwrap();
+        assert!(found.is_empty(), "{found:?}");
         let mut segments = store.segments(kept).await.unwrap();
         segments.sort_by_key(|s| s.mode.value());
         assert_eq!(
@@ -1457,7 +1459,8 @@ mod tests {
             assert_eq!(starts, expected);
         }
         for gone in [ids[1], ids[3]] {
-            assert!(store.segments(gone).await.unwrap().is_empty());
+            let segments = store.segments(gone).await.unwrap();
+            assert!(segments.is_empty(), "{segments:?}");
         }
     }
 

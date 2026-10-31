@@ -1,7 +1,7 @@
 # Feature status
 
-**Parity: 7 / 412 operations deep-verified against Jellyfin v12.2** (`ca0f16eb7c`), none
-owed a re-check against an earlier release, 0 subsystem rows (as of 2026-10-19; the
+**Parity: 25 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+19 compared against v12.2 and owed a re-check, 4 subsystem rows (as of 2026-10-30; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
 Ferrofin answers the way Jellyfin does (identical, in another order, a known difference, filed, new), is in
@@ -19,7 +19,7 @@ shared subsystem, which operation rows reference) beside `REAL_ROUTES`, validate
 `crates/ferrofin-api/tests/contract_superset.rs`, which prints the line above
 (`cargo test -p ferrofin-api --test contract_superset verified_rows -- --nocapture`). The
 release compared against is `UPSTREAM_TAG` / `UPSTREAM_COMMIT` in
-`crates/ferrofin-api/src/handlers/mod.rs`, the latest Jellyfin release when the release branch was
+`crates/ferrofin-api/src/handlers.rs`, the latest Jellyfin release when the release branch was
 cut (the branch keeps it until its release); rows compared
 against an earlier pin are listed in `VERIFIED_AGAINST_EARLIER_PIN` until re-checked.
 
@@ -33,8 +33,8 @@ with `FERROFIN_UPSTREAM_DIR` naming a Jellyfin checkout at `UPSTREAM_COMMIT`, pr
 upstream test project the Ferrofin rstest cases that cite an upstream test next to that
 project's `[InlineData]` count (1,833 cases against 2,677 at v12.2, as of 2026-10-19).
 
-Separately, [`gates/bench/`](../gates/bench/README.md) compares response *shapes* against Jellyfin
-12.0-rc7 each run, on a generated library scanned by a real Jellyfin. That is supporting
+Separately, [`gates/bench/`](../gates/bench/README.md) compares response *shapes* against the Jellyfin
+release `UPSTREAM_TAG` names each run, on a generated library scanned by a real Jellyfin. That is supporting
 evidence, not the parity number — it covers 28 requests and only the fields those requests
 happen to exercise.
 
@@ -89,6 +89,11 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     the last user or administrator, and can hand a playlist to a deleted user.
 - **Playback delivery** — direct play, and **live HLS transcode** including subtitle burn-in
   and fMP4 HEVC/AV1.
+  - **Accepted divergence (a fix, not a gap):** when a *half top-and-bottom* 3D source is
+    transcoded to a requested width, Jellyfin's software scaler carries an unbalanced
+    bracket (`scale=(iw*2):ih)`), which ffmpeg's expression parser rejects, so the
+    transcode never starts. Ferrofin emits the balanced form, which Jellyfin's own image
+    extraction has used since 12.3.
 - **Hardware transcoding** — **NVENC, VAAPI and QSV**. Decode, scale, deinterlace, rotate,
   HDR→SDR tonemap and subtitle compositing all run on the GPU where the driver supports
   it, with the pipeline chosen from a runtime probe of the device rather than from
@@ -129,11 +134,6 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   off. Off by default, as in Jellyfin.
 - **Observability** — Prometheus `/metrics` (Jellyfin-parity names), OTLP traces (opt-in).
 - **Media detail** — trickplay, chapters, lyrics, media segments.
-  - **Accepted divergence (a fix, not a gap):** Jellyfin's scaler for *half
-    top-and-bottom* 3D sources carries an unbalanced bracket (`scale=(iw*2):ih)`), which
-    ffmpeg's expression parser rejects outright — so chapter and thumbnail images cannot
-    be extracted for that layout there at all. Ferrofin emits the balanced form, the same
-    shape Jellyfin's own half-side-by-side case already has.
   - **Accepted divergence (a fix, not a gap):** Jellyfin passes every 3D scaler unquoted
     (`-vf {3}`), and those graphs contain spaces, so the command line is split apart and
     no 3D layout gets chapter or thumbnail images. Ferrofin quotes the filter graph.
@@ -150,6 +150,14 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
 
 Wired and working, with a documented limitation or lighter verification:
 
+- **Ferrofin settings page** — Ferrofin's own, with no Jellyfin counterpart, so checked in
+  jellyfin-web only. Dashboard → Plugins → **Ferrofin** → Settings, or the dashboard menu's
+  Ferrofin entry, lists every Ferrofin setting in groups with the value in use, its default, where
+  it comes from (default, `config.toml`, environment variable or flag), its variable and flag,
+  and, for each one the page may not change, why and where it is changed instead. Secrets are
+  shown to administrators, marked as secrets. Read-only so far: settings change in `config.toml`,
+  the environment or the command line ([`CONFIG.md`](CONFIG.md#seeing-what-is-set)). Disabling the
+  Ferrofin plugin hides the page.
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote
@@ -337,7 +345,7 @@ the season's folder change asks the season providers.
   refreshing (no `DateLastRefreshed`), which is refreshed in full, probe and providers
   included. Later scans of an unchanged library save nothing. See the same section.
 - With metrics on (`FERROFIN_ENABLE_METRICS=true`), `ferrofin_library_scan_items_total`
-  counts each scan's items by outcome (`created`, `updated`, `unchanged`, `removed`),
+  counts each scan's items by outcome (`created`, `updated`, `unchanged`, `removed`, `skipped`),
   `ferrofin_media_probe_total` its ffprobe runs and
   `ferrofin_metadata_provider_requests_total` its provider requests; the
   [Library scans dashboard](../contrib/metrics/README.md#library-scans-dashboard) plots them.

@@ -320,9 +320,12 @@ impl FerrofinUserViewManager {
         if let Some(row) = &mut previous
             && let Some(path) = &row.path
         {
-            // BaseItemRepository.Map expands virtual paths upstream. This row
-            // seam otherwise returns adopted token paths verbatim; compare the
-            // resolved path so a warm adopted view does not get saved every read.
+            // BaseItemRepository.Map expands virtual paths upstream, and so
+            // does the item repository the composition root wires (its rows
+            // come back expanded, so this is the identity there). A
+            // repository built without the server's paths returns the token
+            // verbatim; compare the resolved path either way, so a warm
+            // adopted view does not get saved every read.
             let path = crate::virtual_paths::replace_ignore_ascii_case(
                 path,
                 "%MetadataPath%",
@@ -1792,14 +1795,8 @@ mod tests {
             .with_metadata_path(metadata)
             .with_id_derivation(mode);
 
-        let before: Vec<Option<String>> = manager
-            .get_user_views(user_id)
-            .await
-            .expect("views")
-            .into_iter()
-            .map(|v| v.name)
-            .collect();
-        assert_eq!(before.len(), 2, "the duplicate is what 12.0 left behind");
+        let before = manager.get_user_views(user_id).await.expect("views").len();
+        assert_eq!(before, 2, "the duplicate is what 12.0 left behind");
 
         assert_eq!(
             manager
@@ -3443,12 +3440,8 @@ mod tests {
         )
         .await
         .expect("hide home tile");
-        assert!(
-            mgr.get_user_views(user_id)
-                .await
-                .expect("home views")
-                .is_empty()
-        );
+        let user_views = mgr.get_user_views(user_id).await.expect("home views");
+        assert!(user_views.is_empty(), "{user_views:?}");
         assert_eq!(
             mgr.get_media_folders(user_id)
                 .await
@@ -3669,8 +3662,10 @@ mod tests {
             exclude_item_types_for(&[], &[]),
             LATEST_EXCLUDED_BY_NAME_KINDS.to_vec()
         );
-        assert!(exclude_item_types_for(&[BaseItemKind::Movie], &[]).is_empty());
-        assert!(exclude_item_types_for(&[], &[MediaType::Video]).is_empty());
+        let found = exclude_item_types_for(&[BaseItemKind::Movie], &[]);
+        assert!(found.is_empty(), "{found:?}");
+        let found = exclude_item_types_for(&[], &[MediaType::Video]);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[tokio::test]

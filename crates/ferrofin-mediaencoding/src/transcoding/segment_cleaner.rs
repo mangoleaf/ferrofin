@@ -528,7 +528,7 @@ mod tests {
             "120M ticks of served data ends at or before (320M - 200M)"
         );
 
-        let mut opts2 = options.clone();
+        let mut opts2 = options;
         opts2.enable_segment_deletion = false;
         assert_eq!(
             maximum_deleted_index(&opts2, Some(3_600_000_000), &served),
@@ -644,7 +644,8 @@ mod tests {
     fn native_rate_sources_sync_their_input_timestamps() {
         let mut state = state();
         // Nothing to sync for an ordinary file.
-        assert!(input_sync_arguments(&state, None).is_empty());
+        let found = input_sync_arguments(&state, None);
+        assert!(found.is_empty(), "{found:?}");
 
         state.media_source.read_at_native_framerate = true;
         state.run_time_ticks = Some(600 * 10_000_000);
@@ -660,7 +661,8 @@ mod tests {
         // A segmented live stream (HLS, no runtime) is excluded.
         state.transcoding_type = TranscodingJobType::Hls;
         state.run_time_ticks = None;
-        assert!(input_sync_arguments(&state, None).is_empty());
+        let found = input_sync_arguments(&state, None);
+        assert!(found.is_empty(), "{found:?}");
 
         // A local wtv recording syncs whatever its rate flag.
         state.media_source.read_at_native_framerate = false;
@@ -668,7 +670,8 @@ mod tests {
         state.media_source.container = Some("WTV".to_owned());
         assert_eq!(input_sync_arguments(&state, None), ["-async", "1"]);
         state.media_source.protocol = MediaProtocol::Http;
-        assert!(input_sync_arguments(&state, None).is_empty());
+        let found = input_sync_arguments(&state, None);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `IgnoreInputDts` → `-fflags +igndts`; `RequiresLooping` → the loop and
@@ -676,7 +679,8 @@ mod tests {
     #[test]
     fn ignore_dts_and_stream_looping_reach_the_input_options() {
         let mut state = state();
-        assert!(input_source_arguments(&state).is_empty());
+        let found = input_source_arguments(&state);
+        assert!(found.is_empty(), "{found:?}");
         state.media_source.ignore_dts = true;
         assert_eq!(input_source_arguments(&state), ["-fflags", "+igndts"]);
         state.media_source.requires_looping = true;
@@ -737,17 +741,21 @@ mod tests {
             ["-readrate", "10", "-readrate_catchup", "1000"]
         );
         options.enable_segment_deletion = false;
-        assert!(input_rate_arguments(&state, &options, Some(FfmpegVersion::new(8, 0))).is_empty());
+        let found = input_rate_arguments(&state, &options, Some(FfmpegVersion::new(8, 0)));
+        assert!(found.is_empty(), "{found:?}");
         state.media_source.read_at_native_framerate = false;
         options.enable_segment_deletion = true;
         state.output_video_codec = Some("libx264".to_owned());
-        assert!(input_rate_arguments(&state, &options, Some(FfmpegVersion::new(8, 0))).is_empty());
+        let found = input_rate_arguments(&state, &options, Some(FfmpegVersion::new(8, 0)));
+        assert!(found.is_empty(), "{found:?}");
         state.output_video_codec = Some("copy".to_owned());
         state.video_stream = None;
-        assert!(input_rate_arguments(&state, &options, Some(FfmpegVersion::new(8, 0))).is_empty());
+        let found = input_rate_arguments(&state, &options, Some(FfmpegVersion::new(8, 0)));
+        assert!(found.is_empty(), "{found:?}");
         state.video_stream = Some(ferrofin_model::entities_media::MediaStream::default());
         state.transcoding_type = TranscodingJobType::Progressive;
-        assert!(input_rate_arguments(&state, &options, Some(FfmpegVersion::new(8, 0))).is_empty());
+        let found = input_rate_arguments(&state, &options, Some(FfmpegVersion::new(8, 0)));
+        assert!(found.is_empty(), "{found:?}");
         state.media_source.protocol = MediaProtocol::File;
         state.media_source.read_at_native_framerate = true;
         options.enable_segment_deletion = false;

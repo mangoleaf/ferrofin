@@ -889,14 +889,19 @@ async fn get_item_image_infos(
     RequireAuth(auth): RequireAuth,
     Path(item_id): Path<Uuid>,
 ) -> Result<axum::Json<Vec<ImageInfo>>, ApiError> {
-    state
+    let item = state
         .library
         .get_item_by_id_for_user(item_id, auth.user.as_ref())
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let images = state.library.get_item_images(item_id).await?;
     Ok(axum::Json(
-        project_image_infos(&images, state.image_processor.as_deref(), item_id).await,
+        project_image_infos(
+            &images,
+            state.image_processor.as_deref(),
+            item.path.as_deref(),
+        )
+        .await,
     ))
 }
 
@@ -905,16 +910,17 @@ async fn get_item_image_infos(
 /// Single-instance types (everything except Backdrop/Chapter) get a `None`
 /// index; multi-instance types are numbered from `0` in stored order, matching
 /// Jellyfin's `GetItemImageInfos` two-pass grouping. Width/height of `0` (the
-/// "unknown" sentinel) are nulled out, as in `GetImageInfo`.
+/// "unknown" sentinel) are nulled out, as in `GetImageInfo`. `item_path` is
+/// the item's path as the library read it (expanded), which every tag hashes.
 async fn project_image_infos(
     images: &[ItemImageInfo],
     processor: Option<&dyn ferrofin_traits::drawing::ImageProcessor>,
-    item_id: Uuid,
+    item_path: Option<&str>,
 ) -> Vec<ImageInfo> {
     let mut list = Vec::with_capacity(images.len());
     for image in images {
         if !allows_multiple_images(image.image_type) {
-            list.push(image_info_dto(image, None, processor, item_id).await);
+            list.push(image_info_dto(image, None, processor, item_path).await);
         }
     }
     for multi_type in [ImageType::Backdrop, ImageType::Chapter] {
@@ -928,7 +934,7 @@ async fn project_image_infos(
                     image,
                     Some(i32::try_from(index).unwrap_or(0)),
                     processor,
-                    item_id,
+                    item_path,
                 )
                 .await,
             );
@@ -948,14 +954,15 @@ fn allows_multiple_images(image_type: ImageType) -> bool {
 /// Builds one [`ImageInfo`] DTO from an image row and its optional index.
 ///
 /// When an [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) is present
-/// the cache tag (md5 of path + mtime ticks) is computed exactly as
-/// `DtoService` does for `ImageTags`; processor failures are tolerated
-/// (logged-and-skipped in C#) and a `None` tag is emitted.
+/// the cache tag (`GetImageCacheTag(item, info)`: md5 of the ITEM's path +
+/// the image's mtime ticks) is computed exactly as `DtoService` does for
+/// `ImageTags`; processor failures are tolerated (logged-and-skipped in C#)
+/// and a `None` tag is emitted.
 async fn image_info_dto(
     image: &ItemImageInfo,
     image_index: Option<i32>,
     processor: Option<&dyn ferrofin_traits::drawing::ImageProcessor>,
-    item_id: Uuid,
+    item_path: Option<&str>,
 ) -> ImageInfo {
     let (width, height) = if image.width > 0 && image.height > 0 {
         (Some(image.width), Some(image.height))
@@ -979,7 +986,7 @@ async fn image_info_dto(
     };
     let image_tag = match processor {
         Some(processor) => processor
-            .get_image_cache_tag(item_id, image)
+            .get_image_cache_tag(item_path, image)
             .await
             .ok()
             .flatten(),
@@ -1923,7 +1930,7 @@ mod tests {
 
         async fn get_image_cache_tag(
             &self,
-            _item_id: Uuid,
+            item_path: Option<&str>,
             image: &ItemImageInfo,
         ) -> Result<Option<String>, ferrofin_traits::error::ServiceError> {
             // .NET ticks: 100-ns intervals since 0001-01-01, offset from the Unix epoch.
@@ -1931,7 +1938,7 @@ mod tests {
             let ticks = UNIX_EPOCH_TICKS
                 + image.date_modified.timestamp() * 10_000_000
                 + i64::from(image.date_modified.timestamp_subsec_nanos()) / 100;
-            let key = format!("{}{ticks}", image.path);
+            let key = format!("{}{ticks}", item_path.unwrap_or_default());
             Ok(Some(
                 ferrofin_common::extensions::get_md5(&key)
                     .simple()
@@ -1986,7 +1993,7 @@ mod tests {
             &img("/media/movie/poster.jpg".into()),
             None,
             Some(&processor),
-            Uuid::nil(),
+            Some("/media/movie/movie.mkv"),
         )
         .await;
         let tag = dto.image_tag.expect("processor must produce a tag");
@@ -2000,13 +2007,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_info_tag_is_none_without_processor() {
-        let dto = image_info_dto(
-            &img("/media/movie/poster.jpg".into()),
-            None,
-            None,
-            Uuid::nil(),
-        )
-        .await;
+        let dto = image_info_dto(&img("/media/movie/poster.jpg".into()), None, None, None).await;
         assert!(dto.image_tag.is_none());
     }
 
@@ -2017,13 +2018,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("poster.jpg");
         std::fs::write(&file, b"0123456789").unwrap(); // 10 bytes
-        let dto = image_info_dto(
-            &img(file.to_string_lossy().into_owned()),
-            None,
-            None,
-            Uuid::nil(),
-        )
-        .await;
+        let dto = image_info_dto(&img(file.to_string_lossy().into_owned()), None, None, None).await;
         assert_eq!(dto.size, 10);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2031,13 +2026,13 @@ mod tests {
     #[tokio::test]
     async fn image_info_size_is_zero_for_remote_or_missing() {
         assert_eq!(
-            image_info_dto(&img("https://x/y.jpg".into()), None, None, Uuid::nil())
+            image_info_dto(&img("https://x/y.jpg".into()), None, None, None)
                 .await
                 .size,
             0
         );
         assert_eq!(
-            image_info_dto(&img("/no/such/file.jpg".into()), None, None, Uuid::nil())
+            image_info_dto(&img("/no/such/file.jpg".into()), None, None, None)
                 .await
                 .size,
             0
@@ -2089,7 +2084,7 @@ mod tests {
 
             let starved = tokio::time::timeout(
                 STARVED_WAIT,
-                image_info_dto(&img(path.clone()), None, None, Uuid::nil()),
+                image_info_dto(&img(path.clone()), None, None, None),
             )
             .await;
             assert!(
@@ -2101,7 +2096,7 @@ mod tests {
             // Free the pool and confirm the same call still reports the real length.
             release_tx.send(()).unwrap();
             hog.await.unwrap();
-            let dto = image_info_dto(&img(path), None, None, Uuid::nil()).await;
+            let dto = image_info_dto(&img(path), None, None, None).await;
             assert_eq!(dto.size, 10);
         });
 

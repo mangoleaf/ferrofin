@@ -713,20 +713,12 @@ async fn get_items(
     let mut options = query.dto_options();
     // `if (user.GetPreference(AllowedTags).Length != 0 && !fields.Contains(Tags))
     //  fields = [.. fields, Tags];` (v12 ItemsController.cs:276-281): a user
-    // whose policy whitelists tags always gets each row's `Tags`. The user
-    // DTO is served from the read-through cache, so this is no extra query
-    // on the common path.
-    if let Some(user) = internal.user.as_ref() {
-        let allowed_tags = state
-            .users
-            .get_user_dto(user, None)
-            .await?
-            .policy
-            .map(|p| p.allowed_tags)
-            .unwrap_or_default();
-        if !allowed_tags.is_empty() && !options.contains_field(ItemFields::Tags) {
-            options.fields.push(ItemFields::Tags);
-        }
+    // whose policy whitelists tags always gets each row's `Tags`.
+    if let Some(user) = internal.user.as_ref()
+        && whitelists_tags(&state, &auth, user).await?
+        && !options.contains_field(ItemFields::Tags)
+    {
+        options.fields.push(ItemFields::Tags);
     }
     // A playlist's or box set's own listing is its linked children
     // (`Folder.GetItemsInternal` → `GetChildren` → `GetLinkedChildren(user)`),
@@ -754,6 +746,32 @@ async fn get_items(
         Some(result.total_record_count),
         dtos,
     )))
+}
+
+/// Whether `user`'s policy names any `AllowedTags`.
+///
+/// The caller's own policy came with the request, so a browse needs no user
+/// DTO for it. `user` can be another account, one an administrator or an API
+/// key named with `userId`: its policy is read, never the caller's.
+async fn whitelists_tags(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    user: &UserEntity,
+) -> Result<bool, ApiError> {
+    if auth
+        .user
+        .as_ref()
+        .is_some_and(|caller| caller.id == user.id)
+        && let Some(policy) = &auth.user_policy
+    {
+        return Ok(!policy.allowed_tags.is_empty());
+    }
+    Ok(state
+        .users
+        .get_user_dto(user, None)
+        .await?
+        .policy
+        .is_some_and(|policy| !policy.allowed_tags.is_empty()))
 }
 
 /// `if (collectionType == CollectionType.playlists) { recursive = true;
@@ -1682,19 +1700,15 @@ impl ResumeQuery {
 /// first lifted to its group's primary, and the group is the primaries plus
 /// every alternate under them.
 async fn active_session_item_ids(state: &AppState, user_id: Uuid) -> Result<Vec<Uuid>, ApiError> {
-    // `is_api_key: true` is the elevated view: C# reads the raw
-    // `_sessionManager.Sessions` list, so the caller-visibility gate and the
-    // two permission reads `GetSessions` would otherwise run are skipped, and
-    // the `s.UserId.Equals(requestUserId)` filter below is the controller's own.
-    let sessions = state
-        .sessions
-        .get_sessions(user_id, None, None, None, true)
-        .await?;
+    // C# reads the raw `_sessionManager.Sessions` list, which the summaries
+    // are: no caller-visibility gate, no permission reads and no session DTO,
+    // and the `s.UserId.Equals(requestUserId)` filter below is the
+    // controller's own.
+    let sessions = state.sessions.get_session_summaries().await?;
     let mut playing: Vec<Uuid> = sessions
         .iter()
         .filter(|s| s.user_id == user_id)
-        .filter_map(|s| s.now_playing_item.as_ref())
-        .map(|item| item.id)
+        .filter_map(|s| s.now_playing_item_id)
         .collect();
     playing.sort_unstable();
     playing.dedup();
@@ -2331,6 +2345,78 @@ mod tests {
 
     use super::*;
 
+    /// The whitelist that counts is the one of the account the query is for.
+    /// The request's policy is the caller's, so it answers only for the
+    /// caller: an administrator or an API key naming `userId` gets that
+    /// account's, in either direction.
+    #[tokio::test]
+    async fn the_tag_whitelist_comes_from_the_account_the_query_is_for() {
+        use crate::test_support::{authed_fake_state_with_policy, fake_user_entity};
+        use ferrofin_model::users::UserPolicy;
+
+        let whitelist = || UserPolicy {
+            allowed_tags: vec!["kids".to_owned()],
+            ..UserPolicy::default()
+        };
+        let caller = fake_user_entity(Uuid::from_u128(1), "caller");
+        let other = fake_user_entity(Uuid::from_u128(2), "other");
+        let auth = |policy: Option<UserPolicy>| AuthorizationInfo {
+            user: Some(caller.clone()),
+            user_policy: policy.map(std::sync::Arc::new),
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        };
+        let answer = |stored: UserPolicy, auth: AuthorizationInfo, user: UserEntity| async move {
+            whitelists_tags(&authed_fake_state_with_policy(stored), &auth, &user)
+                .await
+                .expect("no lookup fails")
+        };
+
+        // The caller: the request's policy, whatever the store would say.
+        assert!(
+            answer(
+                UserPolicy::default(),
+                auth(Some(whitelist())),
+                caller.clone()
+            )
+            .await
+        );
+        assert!(
+            !answer(
+                whitelist(),
+                auth(Some(UserPolicy::default())),
+                caller.clone()
+            )
+            .await
+        );
+        // Another account: its stored policy, whatever the caller's says.
+        assert!(
+            !answer(
+                UserPolicy::default(),
+                auth(Some(whitelist())),
+                other.clone()
+            )
+            .await
+        );
+        assert!(
+            answer(
+                whitelist(),
+                auth(Some(UserPolicy::default())),
+                other.clone()
+            )
+            .await
+        );
+        // No policy on the request (an alternate auth service, an API key).
+        assert!(answer(whitelist(), auth(None), caller.clone()).await);
+        let api_key = AuthorizationInfo {
+            is_api_key: true,
+            is_authenticated: true,
+            ..AuthorizationInfo::default()
+        };
+        assert!(answer(whitelist(), api_key.clone(), other.clone()).await);
+        assert!(!answer(UserPolicy::default(), api_key, other).await);
+    }
+
     /// A browse under either spelling of the playlists folder becomes a
     /// recursive `[Playlist]` listing from the user root (so it is
     /// post-filtered per user); any other parent is left as asked.
@@ -2494,7 +2580,11 @@ mod tests {
         assert_eq!(internal.subtitle_languages, ["fre"]);
         let internal = bind("audioLanguages=eng&AudioLanguages=ger");
         assert_eq!(internal.audio_languages, ["eng", "ger"]);
-        assert!(internal.subtitle_languages.is_empty());
+        assert!(
+            internal.subtitle_languages.is_empty(),
+            "{:?}",
+            internal.subtitle_languages
+        );
     }
 
     /// The filters `TranslateQuery` already applies reach it from the URL
@@ -2585,7 +2675,11 @@ mod tests {
         };
         apply_media_stream_filter_rules(&mut contradicting);
         assert_eq!(contradicting.has_subtitles, Some(false));
-        assert!(contradicting.subtitle_languages.is_empty());
+        assert!(
+            contradicting.subtitle_languages.is_empty(),
+            "{:?}",
+            contradicting.subtitle_languages
+        );
         assert!(contradicting.include_owned_items);
     }
 

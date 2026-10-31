@@ -361,11 +361,13 @@ mod tests {
             .expect("reroute");
         assert_eq!(affected.len(), 2);
         // The old child now has no manual parents; the new child has both.
+        let manual_linked_parent_ids = svc
+            .get_manual_linked_parent_ids(from_child, None)
+            .await
+            .expect("old");
         assert!(
-            svc.get_manual_linked_parent_ids(from_child, None)
-                .await
-                .expect("old")
-                .is_empty()
+            manual_linked_parent_ids.is_empty(),
+            "{manual_linked_parent_ids:?}"
         );
         assert_eq!(
             svc.get_manual_linked_parent_ids(to_child, None)

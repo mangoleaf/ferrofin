@@ -386,7 +386,7 @@ where
         map.retain(|k, (_, last)| k == key || last.elapsed() < RESTART_FAILURE_COOLDOWN);
         let entry = map
             .entry(key.to_owned())
-            .or_insert((0, std::time::Instant::now()));
+            .or_insert_with(|| (0, std::time::Instant::now()));
         entry.0 += 1;
         entry.1 = std::time::Instant::now();
         if entry.0 == RESTART_FAILURE_LIMIT {

@@ -25,18 +25,26 @@
 //! - `CreateSplashscreen` builds `{DataPath}/splashscreen.png` (see
 //!   [`crate::splashscreen`]). `GetImageBlurHash` is implemented (decode → 128x128 downscale → BlurHash-encode);
 //!   its output is valid but not byte-identical to Skia's (see the method doc).
+//! - A JPEG headed for a blur hash or a smaller `EncodeImage` output is decoded
+//!   at the smallest DCT scale (1/8, 1/4, 1/2) that still covers the target
+//!   (twice the target for `EncodeImage`, `THUMBNAIL_DECODE_FACTOR`), as
+//!   Skia's codec decodes it for upstream's blur hash, so its full-size bitmap
+//!   is never built (see `scaled_jpeg`). Other formats, and targets no reduced
+//!   scale covers, decode in full.
 //! - The overlay work Skia does inside `EncodeImage` (background colour, blur,
 //!   foreground layer: gl-805; unplayed/percent-played indicators: gl-806) is
 //!   **not** ported yet — this encoder does auto-orientation, resize and
 //!   format-convert only, so `has_default_options` and `auto_orient` already
 //!   decide whether re-encoding is needed.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use tokio::sync::Semaphore;
 
 use crate::error::DrawingError;
+use crate::scaled_jpeg::{ScalableJpeg, swaps_axes};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ferrofin_model::drawing::drawing_utils::{resize, resize_fill, scale_down_to_fit};
@@ -44,7 +52,8 @@ use ferrofin_model::drawing::{ImageDimensions, ImageFormat, ImageOrientation};
 use ferrofin_traits::drawing::ImageEncoder;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{ImageCollageOptions, ImageProcessingOptions};
-use image::{DynamicImage, ImageFormat as CrateFormat, ImageReader, RgbaImage, imageops};
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageFormat as CrateFormat, ImageReader, RgbImage, RgbaImage, imageops};
 use jpeg_encoder::{
     ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor,
 };
@@ -317,7 +326,10 @@ impl ImageCrateEncoder {
         // Truncation is safe: quality is clamped to 0..=100.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let quality = quality as u8;
-        let rgb = image.to_rgb8();
+        let rgb = match image {
+            DynamicImage::ImageRgb8(rgb) => Cow::Borrowed(rgb),
+            other => Cow::Owned(other.to_rgb8()),
+        };
         // JPEG's frame header stores the dimensions in 16 bits, so anything wider
         // or taller than 65535 cannot be written; Skia fails the same encode.
         let (Ok(width), Ok(height)) = (u16::try_from(rgb.width()), u16::try_from(rgb.height()))
@@ -412,15 +424,10 @@ impl ImageCrateEncoder {
             return Ok(input_path.to_owned());
         }
 
-        let image = if auto_orient {
-            Self::decode_oriented(input_path)?
-        } else {
-            Self::decode(input_path)?
-        };
-        let original = ImageDimensions::new(
-            i32::try_from(image.width()).unwrap_or(i32::MAX),
-            i32::try_from(image.height()).unwrap_or(i32::MAX),
-        );
+        // A JPEG is only opened here: its header gives the size, and the
+        // decode waits for the target so it can run at a reduced scale.
+        let source = EncodeSource::open(input_path, auto_orient)?;
+        let original = source.dimensions();
 
         // "Just spit out the original file if all the options are default."
         if options.has_default_options(input_path, Some(original)) && !auto_orient {
@@ -429,7 +436,18 @@ impl ImageCrateEncoder {
 
         let new_size = get_new_image_size(options, original);
 
-        let resized = Self::resize_exact(&image, new_size)?;
+        let decoded = source.decode_covering(input_path, new_size)?;
+        // A full decode measures the upright image itself. When it differs
+        // from what the header read planned with (an EXIF orientation stored
+        // after the frame header, which the header read cannot see), plan from
+        // the decoded image, as this path always did.
+        let upright = image_dimensions(&decoded.image);
+        let new_size = if decoded.full_size && upright != original {
+            get_new_image_size(options, upright)
+        } else {
+            new_size
+        };
+        let resized = Self::resize_exact(&decoded.image, new_size)?;
         Self::write(
             &resized,
             output_path,
@@ -443,14 +461,35 @@ impl ImageCrateEncoder {
     /// downscale to fit 128×128, then BlurHash-encode. CPU-bound (plus the
     /// decode's file read), so it runs on the blocking pool, never inline.
     fn blur_hash_blocking(x_comp: i32, y_comp: i32, path: &str) -> Result<String, ServiceError> {
-        let decoded = Self::decode(path)?;
-        let small = decoded
-            .resize(128, 128, image::imageops::FilterType::Triangle)
-            .to_rgba8();
+        let small = Self::blur_hash_pixels(path)?;
         let x = u32::try_from(x_comp.clamp(1, 9)).unwrap_or(1);
         let y = u32::try_from(y_comp.clamp(1, 9)).unwrap_or(1);
         blurhash::encode(x, y, small.width(), small.height(), small.as_raw())
             .map_err(|e| ServiceError::backend(e.to_string()))
+    }
+
+    /// The pixels a blur hash is computed from: the image as stored (no EXIF
+    /// orientation, like upstream's codec decode) fitted inside
+    /// [`BLUR_HASH_MAX_SIDE`] squared with a Triangle filter.
+    ///
+    /// A JPEG is decoded at the smallest DCT scale that still covers the fitted
+    /// size, as Skia's codec decodes it for upstream (BlurHashSharp asks it for
+    /// `GetScaledDimensions`), so a photo never builds its full-size bitmap. Any
+    /// other input, or a JPEG too small to reduce, decodes in full as before.
+    fn blur_hash_pixels(path: &str) -> Result<RgbaImage, ServiceError> {
+        let filter = imageops::FilterType::Triangle;
+        if let Some(jpeg) = ScalableJpeg::open(path) {
+            let (width, height) = jpeg.dimensions();
+            let (fit_width, fit_height) = fit_within(width, height, BLUR_HASH_MAX_SIDE);
+            if let Some(scaled) = jpeg.decode_at_least(fit_width, fit_height, None) {
+                return Ok(scaled
+                    .resize_exact(fit_width, fit_height, filter)
+                    .to_rgba8());
+            }
+        }
+        Ok(Self::decode(path)?
+            .resize(BLUR_HASH_MAX_SIDE, BLUR_HASH_MAX_SIDE, filter)
+            .to_rgba8())
     }
 
     /// The build + write body of [`ImageEncoder::create_image_collage`]: several
@@ -474,7 +513,7 @@ impl ImageCrateEncoder {
         )
     }
 
-    /// The decode + overlay + JPEG-encode body of
+    /// The decode + copy + JPEG-encode body of
     /// [`ImageEncoder::create_trickplay_tile`]: up to `tile_width`×`tile_height`
     /// (default 100) JPEG decodes packed into one large grid. CPU- and
     /// file-I/O-bound with no yield points, so it runs on the blocking pool.
@@ -505,7 +544,7 @@ impl ImageCrateEncoder {
             _ => i32::try_from(first.height()).unwrap_or(i32::MAX),
         };
 
-        // Checked: a wrapped i32 product would ask RgbaImage::new for a huge buffer.
+        // Checked: a wrapped i32 product would ask RgbImage::new for a huge buffer.
         let (Some(grid_w), Some(grid_h)) = (
             img_width
                 .checked_mul(tile_width)
@@ -518,8 +557,11 @@ impl ImageCrateEncoder {
                 "A {tile_width}x{tile_height} grid of {img_width}x{img_height} images is too large.",
             )));
         };
-        let mut grid = RgbaImage::new(grid_w, grid_h);
+        // RGB, as the JPEG it becomes: the frames are JPEGs with no alpha to
+        // composite, and an empty cell stays black.
+        let mut grid = RgbImage::new(grid_w, grid_h);
 
+        let mut first = Some(first);
         let mut img_index = 0usize;
         'outer: for y in 0..tile_height {
             for x in 0..tile_width {
@@ -527,10 +569,9 @@ impl ImageCrateEncoder {
                     break 'outer;
                 }
 
-                let img = if img_index == 0 {
-                    first.clone()
-                } else {
-                    Self::decode(&paths[img_index])?
+                let img = match first.take() {
+                    Some(first) => first,
+                    None => Self::decode(&paths[img_index])?,
                 };
                 img_index += 1;
 
@@ -547,12 +588,12 @@ impl ImageCrateEncoder {
 
                 let px = u32::try_from(x * img_width).unwrap_or(0);
                 let py = u32::try_from(y * img_height).unwrap_or(0);
-                imageops::overlay(&mut grid, &img.to_rgba8(), i64::from(px), i64::from(py));
+                imageops::replace(&mut grid, &img.into_rgb8(), i64::from(px), i64::from(py));
             }
         }
 
         Self::write(
-            &DynamicImage::ImageRgba8(grid),
+            &DynamicImage::ImageRgb8(grid),
             &options.output_path,
             CrateFormat::Jpeg,
             quality,
@@ -560,6 +601,172 @@ impl ImageCrateEncoder {
 
         Ok(img_height)
     }
+}
+
+/// The input of [`ImageCrateEncoder::encode_image_blocking`]: a JPEG whose
+/// header alone has been read, so it can still decode at a reduced scale once
+/// the target size is known, or an image already decoded in full.
+enum EncodeSource {
+    /// A JPEG `jpeg-decoder` handles (boxed: its decoder state is large).
+    /// `orientation` is the EXIF orientation to apply, `None` when the caller
+    /// did not ask for auto-orientation.
+    Jpeg {
+        jpeg: Box<ScalableJpeg>,
+        orientation: Option<Orientation>,
+    },
+    /// Any other input, decoded (and oriented, when asked) in full.
+    Decoded(DynamicImage),
+}
+
+impl EncodeSource {
+    /// Opens `path`: reads a JPEG's header only, decodes anything else.
+    fn open(path: &str, auto_orient: bool) -> Result<Self, ServiceError> {
+        if let Some(jpeg) = ScalableJpeg::open(path) {
+            let orientation = auto_orient.then(|| jpeg.orientation());
+            return Ok(Self::Jpeg {
+                jpeg: Box::new(jpeg),
+                orientation,
+            });
+        }
+        Ok(Self::Decoded(full_decode(path, auto_orient)?))
+    }
+
+    /// The size of the image as it will be drawn (after any orientation).
+    fn dimensions(&self) -> ImageDimensions {
+        let (width, height) = match self {
+            Self::Jpeg { jpeg, orientation } => {
+                let (width, height) = jpeg.dimensions();
+                if orientation.is_some_and(swaps_axes) {
+                    (height, width)
+                } else {
+                    (width, height)
+                }
+            }
+            Self::Decoded(image) => return image_dimensions(image),
+        };
+        ImageDimensions::new(
+            i32::try_from(width).unwrap_or(i32::MAX),
+            i32::try_from(height).unwrap_or(i32::MAX),
+        )
+    }
+
+    /// The upright image, decoded at the smallest DCT scale that still covers
+    /// [`THUMBNAIL_DECODE_FACTOR`] times `target` on both axes, so the Lanczos3
+    /// resize after it always shrinks by at least that much. A JPEG that no
+    /// reduced scale covers, or that the scaled decoder fails on, decodes in
+    /// full through the `image` crate as before.
+    fn decode_covering(
+        self,
+        path: &str,
+        target: ImageDimensions,
+    ) -> Result<CoveringImage, ServiceError> {
+        let full_size = |image| CoveringImage {
+            image,
+            full_size: true,
+        };
+        let (jpeg, orientation) = match self {
+            Self::Decoded(image) => return Ok(full_size(image)),
+            Self::Jpeg { jpeg, orientation } => (jpeg, orientation),
+        };
+        if let Some((min_width, min_height)) = thumbnail_decode_minimum(target, orientation)
+            && let Some(mut image) = jpeg.decode_at_least(min_width, min_height, orientation)
+        {
+            if let Some(orientation) = orientation {
+                image.apply_orientation(orientation);
+            }
+            return Ok(CoveringImage {
+                image,
+                full_size: false,
+            });
+        }
+        full_decode(path, orientation.is_some()).map(full_size)
+    }
+}
+
+/// An image [`EncodeSource::decode_covering`] produced.
+struct CoveringImage {
+    /// The upright pixels.
+    image: DynamicImage,
+    /// Whether `image` is the full-size decode, whose own size is the image's
+    /// upright size; a reduced-scale decode is smaller by design.
+    full_size: bool,
+}
+
+/// The smallest stored-orientation size a JPEG thumbnail of `target` (upright)
+/// may be decoded at: [`THUMBNAIL_DECODE_FACTOR`] times the target, with the
+/// sides swapped when `orientation` turns the image a quarter turn. `None` for
+/// an empty target, which the resize rejects anyway.
+fn thumbnail_decode_minimum(
+    target: ImageDimensions,
+    orientation: Option<Orientation>,
+) -> Option<(u32, u32)> {
+    let (Ok(width @ 1..), Ok(height @ 1..)) =
+        (u32::try_from(target.width), u32::try_from(target.height))
+    else {
+        return None;
+    };
+    let (width, height) = if orientation.is_some_and(swaps_axes) {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    Some((
+        width.saturating_mul(THUMBNAIL_DECODE_FACTOR),
+        height.saturating_mul(THUMBNAIL_DECODE_FACTOR),
+    ))
+}
+
+/// The size of a decoded image, as the encoder's dimension type.
+fn image_dimensions(image: &DynamicImage) -> ImageDimensions {
+    ImageDimensions::new(
+        i32::try_from(image.width()).unwrap_or(i32::MAX),
+        i32::try_from(image.height()).unwrap_or(i32::MAX),
+    )
+}
+
+/// The full-size decode through the `image` crate, oriented when asked.
+fn full_decode(path: &str, auto_orient: bool) -> Result<DynamicImage, ServiceError> {
+    if auto_orient {
+        ImageCrateEncoder::decode_oriented(path)
+    } else {
+        ImageCrateEncoder::decode(path)
+    }
+}
+
+/// How many times the target size a JPEG thumbnail is decoded at, at least,
+/// before its Lanczos3 resize: the smallest DCT scale (1/8, 1/4, 1/2) whose
+/// output still covers this multiple is chosen.
+///
+/// It trades thumbnail sharpness against decode memory. A 1/8 decode averages
+/// each 8x8 block, so decoding at just the target size (a factor of 1) and
+/// then resizing almost 1:1 comes out visibly softer than a Lanczos3 shrink of
+/// the full image: about 15 dB further from a full-resolution Lanczos
+/// reference on lossless PNG output, measured on 41 photos and artworks. At 2
+/// the resize always shrinks at least twofold and the JPEG and WebP outputs
+/// match the full decode's closeness to that reference (median within 0.1 dB),
+/// while the decode still holds a quarter or less of the full bitmap's pixels
+/// for any thumbnail at most a quarter of the source's width and height.
+/// Lossless PNG output stays softer than the full decode's, about 9 dB further
+/// from that reference (median), where 1 cost about 15 dB.
+///
+/// Not a setting (owner decision): the blur hash, whose 128 px input is
+/// blurred anyway, decodes at a factor of 1.
+const THUMBNAIL_DECODE_FACTOR: u32 = 2;
+
+/// The longest side of the image a blur hash is computed from. Upstream's:
+/// `SkiaEncoder.GetImageBlurHash` passes 128×128 ("Any larger than 128x128 is
+/// too slow and there's no visually discernible difference").
+const BLUR_HASH_MAX_SIDE: u32 = 128;
+
+/// The size `width`×`height` takes when fitted inside `side`×`side` with its
+/// aspect ratio kept, rounded as the `image` crate's `DynamicImage::resize`
+/// rounds it (each side `round(len * ratio)`, at least 1).
+fn fit_within(width: u32, height: u32, side: u32) -> (u32, u32) {
+    let ratio = (f64::from(side) / f64::from(width)).min(f64::from(side) / f64::from(height));
+    // Both results are at most `side`, so the cast cannot truncate.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let fit = |len: u32| ((f64::from(len) * ratio).round() as u32).max(1);
+    (fit(width), fit(height))
 }
 
 /// Port of `ImageHelper.GetNewImageSize`: `DrawingUtils.Resize`, then
@@ -654,11 +861,15 @@ impl ImageEncoder for ImageCrateEncoder {
 
     /// Port of `SkiaEncoder.GetImageBlurHash`: decode, downscale to fit 128x128
     /// ("larger is too slow, no visible difference"), then BlurHash-encode with the
-    /// caller's component counts.
+    /// caller's component counts. A JPEG decodes at the smallest DCT scale that
+    /// still covers the 128x128 fit, as upstream's BlurHashSharp has Skia's codec
+    /// decode it (`GetScaledDimensions`).
     ///
     /// The hash is functionally valid but **not byte-identical** to Jellyfin's — its
     /// pixels come from Skia's decode+resample, which the `image` crate can't reproduce
-    /// exactly (documented divergence; `ImageBlurHashes` is denylisted in the parity test).
+    /// exactly. Upstream also resizes the DCT-scaled bitmap by the original-relative
+    /// factor a second time, so a large JPEG is hashed from a ~16 px image; whether to
+    /// reproduce that is gl-1058.
     async fn get_image_blur_hash(
         &self,
         x_comp: i32,
@@ -668,10 +879,11 @@ impl ImageEncoder for ImageCrateEncoder {
         if path.is_empty() {
             return Err(ServiceError::invalid_input("path is empty"));
         }
-        // A full decode (4K backdrops included) plus a Triangle resize is
-        // CPU-bound synchronous work, and the decode's file read can be a cold
-        // NFS/SMB read; offload it to the blocking pool under the shared encode
-        // permit so it never pins an async worker (see `encode_image`).
+        // A decode (a JPEG at a reduced DCT scale, anything else in full) plus
+        // a Triangle resize is CPU-bound synchronous work, and the decode's
+        // file read can be a cold NFS/SMB read; offload it to the blocking
+        // pool under the shared encode permit so it never pins an async worker
+        // (see `encode_image`).
         let _permit = encode_permits()
             .acquire()
             .await
@@ -683,7 +895,8 @@ impl ImageEncoder for ImageCrateEncoder {
     }
 
     /// Port of `EncodeImage`. Rejects unsupported inputs (returns `input_path`
-    /// untouched), decodes, short-circuits to the original file when
+    /// untouched), reads the image's size (a JPEG's from its header, anything
+    /// else by decoding it), short-circuits to the original file when
     /// [`ImageProcessingOptions::has_default_options`] holds and no
     /// auto-orientation is requested, otherwise resizes to
     /// `ImageHelper.GetNewImageSize` and writes `output_format` at `quality`.
@@ -693,6 +906,12 @@ impl ImageEncoder for ImageCrateEncoder {
     /// upright size. `orientation` is unused: Skia falls back to it only when
     /// the codec cannot open the file, and then has no bitmap to draw either.
     /// The played/unplayed/blur overlays are not drawn.
+    ///
+    /// A JPEG is sized from its header and decoded only once the target is
+    /// known, at the smallest DCT scale still covering twice it
+    /// ([`THUMBNAIL_DECODE_FACTOR`]); the resize after it is the same Lanczos3
+    /// shrink. Upstream decodes in full here
+    /// (`SkiaEncoder.Decode`); the output size is the same either way.
     async fn encode_image(
         &self,
         input_path: &str,
@@ -1171,11 +1390,11 @@ mod tests {
             enc.get_image_size(&input).await.expect("probe in"),
             ImageDimensions::new(200, 100)
         );
-        assert!(
-            !enc.get_image_blur_hash(4, 3, &input)
+        assert_ne!(
+            enc.get_image_blur_hash(4, 3, &input)
                 .await
-                .expect("blurhash")
-                .is_empty()
+                .expect("blurhash"),
+            ""
         );
         let options = ImageProcessingOptions {
             max_width: Some(100),
@@ -1267,6 +1486,332 @@ mod tests {
                 "auto_orient {auto_orient}"
             );
         }
+    }
+
+    /// Writes `pixels` to `dir/name` as a quality-95 JPEG, with `exif` when
+    /// given, and returns its path.
+    fn jpeg_fixture(
+        dir: &TempDir,
+        name: &str,
+        pixels: &image::RgbImage,
+        exif: Option<&[u8]>,
+    ) -> String {
+        use image::ImageEncoder as _;
+        let path = out_path(dir, name);
+        let file = std::fs::File::create(&path).expect("fixture");
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(file, 95);
+        if let Some(exif) = exif {
+            encoder.set_exif_metadata(exif.to_vec()).expect("exif");
+        }
+        encoder
+            .write_image(
+                pixels,
+                pixels.width(),
+                pixels.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .expect("write fixture");
+        path
+    }
+
+    /// A smooth photo-like `width`×`height` image: two gradients and a soft
+    /// diagonal ripple, nothing finer than the 1/8 scale can carry.
+    fn smooth_photo(width: u32, height: u32) -> image::RgbImage {
+        image::RgbImage::from_fn(width, height, |x, y| {
+            let (fx, fy) = (
+                f64::from(x) / f64::from(width),
+                f64::from(y) / f64::from(height),
+            );
+            let ripple = ((fx + fy) * 12.0).sin() * 40.0;
+            // The values are clamped to 0..=255 before the cast.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let channel = |v: f64| v.clamp(0.0, 255.0) as u8;
+            image::Rgb([
+                channel(40.0 + fx * 180.0 + ripple),
+                channel(200.0 - fy * 150.0),
+                channel(90.0 + ripple),
+            ])
+        })
+    }
+
+    /// The mean absolute difference between two same-sized images, per
+    /// channel, in 0-255 levels.
+    fn mean_abs_diff(a: &[u8], b: &[u8]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let total: u64 = a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| u64::from(x.abs_diff(*y)))
+            .sum();
+        // Pixel buffers stay far below 2^52 bytes.
+        #[allow(clippy::cast_precision_loss)]
+        let mean = total as f64 / a.len() as f64;
+        mean
+    }
+
+    /// gl-1015: a JPEG thumbnail decodes at a reduced DCT scale that still
+    /// covers twice the target (here 1/4, 400x300 for a 200x150 thumbnail)
+    /// and comes out the size and look of a full decode.
+    #[tokio::test]
+    async fn a_scaled_jpeg_thumbnail_matches_the_full_decode() {
+        let dir = TempDir::new().expect("tempdir");
+        let input = jpeg_fixture(&dir, "photo.jpg", &smooth_photo(1600, 1200), None);
+        let output = out_path(&dir, "thumb.png");
+        let options = ImageProcessingOptions {
+            max_width: Some(200),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let written = ImageCrateEncoder::new()
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                false,
+                None,
+                90,
+                &options,
+                ImageFormat::Png,
+            )
+            .await
+            .expect("encode");
+        assert_eq!(written, output);
+        let thumb = image::open(&output).expect("decodes").to_rgb8();
+        let full = image::open(&input)
+            .expect("decodes")
+            .resize_exact(200, 150, imageops::FilterType::Lanczos3)
+            .to_rgb8();
+        assert_eq!(thumb.dimensions(), (200, 150));
+        let diff = mean_abs_diff(thumb.as_raw(), full.as_raw());
+        assert!(
+            diff < 2.0,
+            "mean difference {diff} levels from the full decode"
+        );
+    }
+
+    /// gl-1015: the scaled decode plans its size in stored orientation and
+    /// draws the result upright: a landscape-stored portrait (EXIF 6, red on
+    /// the left, blue on the right) comes out red on top.
+    #[tokio::test]
+    async fn auto_orient_applies_to_a_scaled_jpeg_decode() {
+        let dir = TempDir::new().expect("tempdir");
+        let stored = image::RgbImage::from_fn(800, 400, |x, _| {
+            if x < 400 {
+                image::Rgb([220, 20, 20])
+            } else {
+                image::Rgb([20, 20, 220])
+            }
+        });
+        let input = jpeg_fixture(&dir, "phone.jpg", &stored, Some(&ORIENTATION_6_EXIF));
+        let output = out_path(&dir, "upright.png");
+        let options = ImageProcessingOptions {
+            max_height: Some(100),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        ImageCrateEncoder::new()
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                true,
+                None,
+                90,
+                &options,
+                ImageFormat::Png,
+            )
+            .await
+            .expect("encode");
+        let upright = image::open(&output).expect("decodes").to_rgb8();
+        assert_eq!(upright.dimensions(), (50, 100));
+        let [top_red, _, top_blue] = upright.get_pixel(25, 10).0;
+        let [bottom_red, _, bottom_blue] = upright.get_pixel(25, 90).0;
+        assert!(top_red > 180 && top_blue < 60, "top {top_red}/{top_blue}");
+        assert!(
+            bottom_blue > 180 && bottom_red < 60,
+            "bottom {bottom_red}/{bottom_blue}"
+        );
+    }
+
+    /// gl-1015: a thumbnail decodes at no less than twice its size, in the
+    /// orientation the file is stored in (owner decision: the factor is 2).
+    #[rstest]
+    #[case::landscape(200, 150, None, Some((400, 300)))]
+    #[case::quarter_turn_swaps(200, 150, Some(Orientation::Rotate90), Some((300, 400)))]
+    #[case::half_turn_keeps(200, 150, Some(Orientation::Rotate180), Some((400, 300)))]
+    #[case::empty_width(0, 150, None, None)]
+    #[case::negative_height(200, -1, None, None)]
+    fn a_thumbnail_decodes_at_twice_its_size(
+        #[case] width: i32,
+        #[case] height: i32,
+        #[case] orientation: Option<Orientation>,
+        #[case] expected: Option<(u32, u32)>,
+    ) {
+        assert_eq!(
+            thumbnail_decode_minimum(ImageDimensions::new(width, height), orientation),
+            expected
+        );
+    }
+
+    /// The blur hash's input size is what `DynamicImage::resize` would give,
+    /// so the hash keeps its input dimensions with the scaled decode.
+    #[rstest]
+    #[case(1999, 1333)]
+    #[case(1333, 1999)]
+    #[case(1001, 7)]
+    #[case(7, 1001)]
+    #[case(129, 128)]
+    #[case(300, 200)]
+    #[case(2000, 123)]
+    fn fit_within_rounds_as_the_image_crate_resizes(#[case] width: u32, #[case] height: u32) {
+        let resized = DynamicImage::new_rgb8(width, height).resize(
+            BLUR_HASH_MAX_SIDE,
+            BLUR_HASH_MAX_SIDE,
+            imageops::FilterType::Nearest,
+        );
+        assert_eq!(
+            fit_within(width, height, BLUR_HASH_MAX_SIDE),
+            (resized.width(), resized.height())
+        );
+    }
+
+    /// `jpeg_bytes` with an APP1 EXIF segment holding `exif` inserted right
+    /// after the frame header (SOF0), where the header read cannot see it.
+    fn with_exif_after_frame_header(jpeg_bytes: &[u8], exif: &[u8]) -> Vec<u8> {
+        let mut at = 2; // past SOI
+        loop {
+            assert_eq!(jpeg_bytes[at], 0xFF, "a marker at {at}");
+            let marker = jpeg_bytes[at + 1];
+            let length = usize::from(u16::from_be_bytes([jpeg_bytes[at + 2], jpeg_bytes[at + 3]]));
+            at += 2 + length;
+            if marker == 0xC0 {
+                break;
+            }
+        }
+        let segment_length = u16::try_from(2 + 6 + exif.len()).expect("small segment");
+        let mut out = jpeg_bytes[..at].to_vec();
+        out.extend([0xFF, 0xE1]);
+        out.extend(segment_length.to_be_bytes());
+        out.extend(b"Exif\0\0");
+        out.extend(exif);
+        out.extend(&jpeg_bytes[at..]);
+        out
+    }
+
+    /// gl-1015: an EXIF orientation stored after the frame header is missed by
+    /// the header read, so the scaled decode is discarded; the full decode then
+    /// sizes the thumbnail from the upright image, as it always did, instead of
+    /// stretching it to the size planned for the stored one.
+    #[tokio::test]
+    async fn an_orientation_after_the_frame_header_still_sizes_the_upright_image() {
+        let dir = TempDir::new().expect("tempdir");
+        let stored = image::RgbImage::from_fn(800, 400, |x, _| {
+            if x < 400 {
+                image::Rgb([220, 20, 20])
+            } else {
+                image::Rgb([20, 20, 220])
+            }
+        });
+        let plain = jpeg_fixture(&dir, "plain.jpg", &stored, None);
+        let input = out_path(&dir, "late-exif.jpg");
+        std::fs::write(
+            &input,
+            with_exif_after_frame_header(
+                &std::fs::read(&plain).expect("read"),
+                &ORIENTATION_6_EXIF,
+            ),
+        )
+        .expect("write fixture");
+        let output = out_path(&dir, "upright.png");
+        let options = ImageProcessingOptions {
+            max_height: Some(100),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        ImageCrateEncoder::new()
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                true,
+                None,
+                90,
+                &options,
+                ImageFormat::Png,
+            )
+            .await
+            .expect("encode");
+        let upright = image::open(&output).expect("decodes").to_rgb8();
+        assert_eq!(upright.dimensions(), (50, 100));
+        let [top_red, _, top_blue] = upright.get_pixel(25, 10).0;
+        assert!(top_red > 180 && top_blue < 60, "top {top_red}/{top_blue}");
+    }
+
+    /// gl-1015: a JPEG whose header reads but whose data is cut short ends as
+    /// the full decode ends it: the scaled decode's failure falls back to the
+    /// `image` crate, so the outcome is the one this path always had.
+    #[tokio::test]
+    async fn a_truncated_jpeg_ends_as_the_full_decode_ends_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let whole = jpeg_fixture(&dir, "whole.jpg", &smooth_photo(1600, 1200), None);
+        let bytes = std::fs::read(&whole).expect("read");
+        let input = out_path(&dir, "cut.jpg");
+        std::fs::write(&input, &bytes[..bytes.len() / 2]).expect("write fixture");
+        let output = out_path(&dir, "thumb.png");
+        let options = ImageProcessingOptions {
+            max_width: Some(200),
+            supported_output_formats: vec![ImageFormat::Png],
+            ..Default::default()
+        };
+        let encoded = ImageCrateEncoder::new()
+            .encode_image(
+                &input,
+                Utc::now(),
+                &output,
+                false,
+                None,
+                90,
+                &options,
+                ImageFormat::Png,
+            )
+            .await;
+        match image::open(&input) {
+            Ok(_) => {
+                assert_eq!(encoded.expect("the full decode reads it"), output);
+                let thumb = image::open(&output).expect("decodes");
+                assert_eq!((thumb.width(), thumb.height()), (200, 150));
+            }
+            Err(error) => assert!(encoded.is_err(), "the full decode fails ({error})"),
+        }
+    }
+
+    /// gl-1015: a JPEG's blur hash comes from a reduced DCT scale, as Skia's
+    /// codec decodes it for upstream. Its colours stay those of the hash a full
+    /// decode gives: both hashes rendered back differ by under a level.
+    #[tokio::test]
+    async fn a_scaled_jpeg_blur_hash_matches_the_full_decode() {
+        let dir = TempDir::new().expect("tempdir");
+        let input = jpeg_fixture(&dir, "photo.jpg", &smooth_photo(2400, 1600), None);
+        let scaled = ImageCrateEncoder::new()
+            .get_image_blur_hash(5, 4, &input)
+            .await
+            .expect("blur hash");
+        let small = image::open(&input)
+            .expect("decodes")
+            .resize(
+                BLUR_HASH_MAX_SIDE,
+                BLUR_HASH_MAX_SIDE,
+                imageops::FilterType::Triangle,
+            )
+            .to_rgba8();
+        let full =
+            blurhash::encode(5, 4, small.width(), small.height(), small.as_raw()).expect("encode");
+        let render = |hash: &str| blurhash::decode(hash, 32, 32, 1.0).expect("decodes");
+        let diff = mean_abs_diff(&render(&scaled), &render(&full));
+        assert!(
+            diff < 1.0,
+            "{scaled} vs {full}: mean difference {diff} levels"
+        );
     }
 
     /// Transliterated from upstream `ImageHelperTests` (jellyfin#17056): an
@@ -1771,6 +2316,58 @@ mod tests {
         // Grid is imgW*tileW x imgH*tileH = 640 x 360.
         let dims = enc.get_image_size(&output).await.expect("probe tile");
         assert_eq!(dims, ImageDimensions::new(640, 360));
+    }
+
+    /// A tile is its frames in reading order on black, with the bytes an RGBA
+    /// canvas flattened for JPEG gives, whichever format a frame decodes to.
+    #[tokio::test]
+    async fn a_trickplay_tile_is_its_frames_on_black() {
+        let dir = TempDir::new().expect("tempdir");
+        let (width, height) = (32_u32, 18_u32);
+        let colour = image::RgbImage::from_fn(width, height, |x, y| {
+            // Truncation is the point: wrap coordinates into channel space.
+            #[allow(clippy::cast_possible_truncation)]
+            image::Rgb([(x * 7) as u8, (y * 13) as u8, ((x + y) * 3) as u8])
+        });
+        let gray = DynamicImage::ImageRgb8(colour.clone()).to_luma8();
+        let frames = ["colour.jpg", "gray.jpg", "rgba.png"].map(|name| out_path(&dir, name));
+        DynamicImage::ImageRgb8(colour.clone())
+            .save(&frames[0])
+            .expect("write the colour frame");
+        DynamicImage::ImageLuma8(gray)
+            .save(&frames[1])
+            .expect("write the gray frame");
+        DynamicImage::ImageRgb8(colour)
+            .to_rgba8()
+            .save(&frames[2])
+            .expect("write the RGBA frame");
+        let output = out_path(&dir, "tile.jpg");
+
+        let options = ImageCollageOptions {
+            input_paths: frames.to_vec(),
+            output_path: output.clone(),
+            width: 2,
+            height: 2,
+        };
+        ImageCrateEncoder::new()
+            .create_trickplay_tile(&options, 90, 32, None)
+            .await
+            .expect("trickplay");
+
+        let mut canvas = RgbaImage::new(width * 2, height * 2);
+        for (index, cell) in [(0, 0), (1, 0), (0, 1)].into_iter().enumerate() {
+            let frame = ImageCrateEncoder::decode(&frames[index]).expect("decodes");
+            let (x, y) = (i64::from(cell.0 * width), i64::from(cell.1 * height));
+            imageops::overlay(&mut canvas, &frame.to_rgba8(), x, y);
+        }
+        let expected = ImageCrateEncoder::encode(
+            &DynamicImage::ImageRgba8(canvas),
+            &output,
+            CrateFormat::Jpeg,
+            90,
+        )
+        .expect("encodes");
+        assert_eq!(std::fs::read(&output).expect("reads the tile"), expected);
     }
 
     #[tokio::test]

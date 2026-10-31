@@ -11,8 +11,8 @@
 Ferrofin logs through `tracing` to two sinks: **structured JSON on stdout** (default;
 Alloy → Loki) and a **plain-text daily-rotating file** under `{data_dir}/log`
 (always text — `GET /System/Logs` renders it in the dashboard, a parity surface).
-`FERROFIN_LOG_FORMAT=text` switches stdout to the human-readable tee for interactive
-dev. Neither of these may change.
+`FERROFIN_LOG_FORMAT=text` (`log_format = "text"` in `config.toml`) switches stdout to the
+human-readable tee for interactive dev. Neither of these may change.
 
 ## 1. Levels mean things
 
@@ -65,6 +65,7 @@ work across subsystems:
 | `provider` | metadata provider name |
 | `job_id` | transcode/other job id |
 | `path` | filesystem path |
+| `config_file` | the bootstrap `config.toml` in use, as context (the startup banner, configuration warnings), when `path` would name the wrong subject |
 | `trigger` | `api` \| `schedule` \| `startup` \| `watcher` \| `webhook` (library scans: `ScanTrigger`) |
 | `trigger_trace_id` | originating sampled request's trace id (hex), when known |
 

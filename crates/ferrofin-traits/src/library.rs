@@ -2415,6 +2415,43 @@ pub trait MediaSourceManager: Send + Sync {
         chosen.ok_or_else(|| ServiceError::NotFound(format!("no media source for item {item_id}")))
     }
 
+    /// The media source a playback report names: the open live stream
+    /// `live_stream_id` names when it is non-empty, else the item's source
+    /// whose id is `media_source_id`, or `None` when no source has that id.
+    ///
+    /// Port of `MediaSourceManager.GetMediaSource(item, mediaSourceId,
+    /// liveStreamId, enablePathSubstitution)`. Unlike
+    /// [`Self::get_stream_media_source`], an id that names no source is no
+    /// source, never the first one. Upstream searches
+    /// `GetPlaybackMediaSources(item, null, false, …)`. With no user and no
+    /// probe, that is the static and channel sources, sorted. This searches
+    /// the userless [`Self::get_static_media_sources`], which holds the same
+    /// sources. Only the order differs, and a search by id does not depend on
+    /// it. The id is compared with [`MediaSourceInfo::id_matches`], so a guid
+    /// in any spelling matches, where upstream compares the strings ignoring
+    /// case.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::NotFound`] for a live stream that is not open, which
+    /// upstream's `GetLiveStream` throws too, and a storage failure.
+    async fn get_media_source(
+        &self,
+        item_id: Uuid,
+        media_source_id: &str,
+        live_stream_id: Option<&str>,
+        enable_path_substitution: bool,
+    ) -> Result<Option<MediaSourceInfo>, ServiceError> {
+        if let Some(live_stream_id) = live_stream_id.filter(|id| !id.is_empty()) {
+            return self.get_live_stream(live_stream_id).await.map(Some);
+        }
+        Ok(self
+            .get_static_media_sources(item_id, enable_path_substitution, None)
+            .await?
+            .into_iter()
+            .find(|source| source.id_matches(media_source_id)))
+    }
+
     /// Closes an open live stream.
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError>;
 }
@@ -3161,7 +3198,7 @@ mod tests {
             items: Vec::new(),
         };
         assert_eq!(rec.baseline_item_name, "Because you watched");
-        assert!(rec.items.is_empty());
+        assert!(rec.items.is_empty(), "{:?}", rec.items);
     }
 
     /// The server a guard case runs against: `administrators` administrators

@@ -191,7 +191,7 @@ mod tests {
             ),
             "the separate D2 backfill heuristic is not a source remote change-monitor signal"
         );
-        let mut audio = row.clone();
+        let mut audio = row;
         audio.type_ = "MediaBrowser.Controller.Entities.Audio.Audio".to_owned();
         assert!(!selected(
             &audio,

@@ -214,9 +214,10 @@ fn score_year(year: i32, result_year: Option<i32>) -> i32 {
     if year <= 0 {
         return 0;
     }
+    // Regional and festival release dates routinely straddle a new year, so a
+    // year off by one is as good as an exact one (jellyfin/jellyfin#18343).
     match result_year {
-        Some(ry) if (ry - year).abs() == 0 => 2, // YearExactScore
-        Some(ry) if (ry - year).abs() == 1 => 1, // YearAdjacentScore
+        Some(ry) if (ry - year).abs() <= 1 => 2, // YearScore
         _ => 0,
     }
 }
@@ -3246,7 +3247,8 @@ mod tests {
             Some("https://image.tmdb.org/t/p/original/bp.jpg")
         );
         assert!(hits[1].profile_url.is_none());
-        assert!(client.search_person("  ").await.is_empty());
+        let people = client.search_person("  ").await;
+        assert!(people.is_empty(), "{people:?}");
 
         let person = client.person_lookup(287, None).await.expect("lookup");
         assert_eq!(person.name.as_deref(), Some("Brad Pitt"));
@@ -3567,8 +3569,10 @@ mod tests {
 
     #[test]
     fn map_cast_no_cast_yields_nothing() {
-        assert!(map_aggregate_cast(Vec::new(), &cast_config(10)).is_empty());
-        assert!(map_cast(Vec::new(), &cast_config(10)).is_empty());
+        let found = map_aggregate_cast(Vec::new(), &cast_config(10));
+        assert!(found.is_empty(), "{found:?}");
+        let found = map_cast(Vec::new(), &cast_config(10));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `TmdbSeriesProvider.GetPersons` (v12.2): the whole run's cast from
@@ -3918,5 +3922,48 @@ mod tests {
     #[test]
     fn find_best_match_empty_returns_none() {
         assert!(super::find_best_match(&[], "Show", Some(2026)).is_none());
+    }
+
+    /// Upstream's `Movie(id, title, originalTitle, year)` test helper.
+    fn movie(tmdb_id: i64, title: &str, original_title: &str, year: i32) -> TmdbSearchHit {
+        TmdbSearchHit {
+            tmdb_id,
+            name: Some(title.to_owned()),
+            original_name: Some(original_title.to_owned()),
+            year: Some(year),
+            premiere_date: None,
+            poster_url: None,
+            overview: None,
+        }
+    }
+
+    // Rows of `TmdbUtilsTests.FindBestMatch_Movies_TestData` (Jellyfin v12.4),
+    // added by jellyfin/jellyfin#18343 in v12.3.
+    #[rstest::rstest]
+    // M. Night Shyamalan's Split premiered at a festival in 2016 and was
+    // released in 2017, so the obscure 2016 film of the same name must not
+    // outrank it. Years one apart tie and TMDb's own ordering decides.
+    #[case::split_2016(
+        "Split",
+        2016,
+        &[movie(381_288, "Split", "Split", 2017), movie(358_364, "Split", "Split", 2016)],
+        381_288
+    )]
+    // Two years apart is a different film, so the tie only covers a year off
+    // by one.
+    #[case::two_years_apart(
+        "Some Movie",
+        2016,
+        &[movie(1, "Some Movie", "Some Movie", 2018), movie(2, "Some Movie", "Some Movie", 2016)],
+        2
+    )]
+    fn find_best_match_movies(
+        #[case] name: &str,
+        #[case] year: i32,
+        #[case] results: &[TmdbSearchHit],
+        #[case] expected: i64,
+    ) {
+        let best = super::find_best_match(results, name, Some(year)).map(|hit| hit.tmdb_id);
+        assert_eq!(best, Some(expected));
     }
 }

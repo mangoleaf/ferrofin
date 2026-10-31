@@ -103,6 +103,9 @@ pub struct TaskProgress {
     /// Why the run started (`api`, `schedule`, `startup`); empty for a
     /// foreground [`run_now`](FerrofinTaskManager::run_now).
     trigger: &'static str,
+    /// The registry's progress signal, raised by [`report`](Self::report)
+    /// (upstream's `TaskProgress` event); `None` outside a registry run.
+    progressed: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
 impl TaskProgress {
@@ -127,10 +130,17 @@ impl TaskProgress {
         self.stopped.load(Ordering::Relaxed)
     }
 
-    /// Reports the task's completion percentage (clamped to `0.0..=100.0`).
+    /// Reports the task's completion percentage (clamped to `0.0..=100.0`)
+    /// and raises the registry's progress signal, as upstream's
+    /// `ScheduledTaskWorker.OnProgressChanged` raises `TaskProgress` on every
+    /// report.
     pub fn report(&self, percent: f64) {
         self.percent
             .store(percent.clamp(0.0, 100.0).to_bits(), Ordering::Relaxed);
+        if let Some(progressed) = &self.progressed {
+            // Nobody subscribed is not an error.
+            let _ = progressed.send(());
+        }
     }
 
     /// Reads the last reported percentage.
@@ -366,11 +376,31 @@ pub struct FerrofinTaskManager {
     activity: Arc<Mutex<Option<Arc<dyn ferrofin_traits::activity::ActivityManager>>>>,
 }
 
-struct TaskUpdates(tokio::sync::broadcast::Sender<Vec<TaskInfo>>);
+/// Capacity of the [`TaskUpdates`] transitions broadcast; a fixed constant,
+/// not a setting (owner decision). A subscriber further behind sees `Lagged`
+/// and resubscribes for a fresh snapshot, so no state is lost.
+const TASK_TRANSITIONS_CAPACITY: usize = 64;
+
+/// Capacity of the [`TaskUpdates`] progress broadcast; a fixed constant, not
+/// a setting (owner decision). A subscriber further behind sees `Lagged`,
+/// which it counts as a forced send: one extra read, and no state lost.
+const TASK_PROGRESS_CAPACITY: usize = 64;
+
+/// The registry's broadcasts to the WebSocket `ScheduledTasksInfo` stream.
+struct TaskUpdates {
+    /// Snapshots captured at each run's start and end (`TaskExecuting`,
+    /// `TaskCompleted`).
+    transitions: tokio::sync::broadcast::Sender<Vec<TaskInfo>>,
+    /// One `()` per progress report of a running task (`TaskProgress`).
+    progress: tokio::sync::broadcast::Sender<()>,
+}
 
 impl Default for TaskUpdates {
     fn default() -> Self {
-        Self(tokio::sync::broadcast::channel(64).0)
+        Self {
+            transitions: tokio::sync::broadcast::channel(TASK_TRANSITIONS_CAPACITY).0,
+            progress: tokio::sync::broadcast::channel(TASK_PROGRESS_CAPACITY).0,
+        }
     }
 }
 
@@ -499,12 +529,12 @@ impl FerrofinTaskManager {
     /// Captures transitions while holding the registry lock. A short task's
     /// start must survive even when it finishes before the socket reads it.
     fn publish_snapshot(&self, tasks: &HashMap<String, Registration>) {
-        if self.updates.0.receiver_count() == 0 {
+        if self.updates.transitions.receiver_count() == 0 {
             return;
         }
         let mut snapshot: Vec<_> = tasks.values().map(Registration::to_info).collect();
         snapshot.sort_by(|a, b| a.name.cmp(&b.name));
-        let _ = self.updates.0.send(snapshot);
+        let _ = self.updates.transitions.send(snapshot);
     }
 
     /// Creates an empty task registry.
@@ -999,7 +1029,10 @@ impl FerrofinTaskManager {
             )));
         }
         reg.state = TaskState::Running;
-        reg.progress = TaskProgress::default();
+        reg.progress = TaskProgress {
+            progressed: Some(self.updates.progress.clone()),
+            ..TaskProgress::default()
+        };
         reg.started_at = Some(Utc::now());
         reg.run_max_ticks = max_runtime_ticks;
         let claimed = (Arc::clone(&reg.task), reg.progress.clone());
@@ -1541,10 +1574,15 @@ impl ScheduledTask for RefreshLibraryTask {
 impl ferrofin_traits::tasks::TaskManager for FerrofinTaskManager {
     fn subscribe_task_updates(&self) -> Option<ferrofin_traits::tasks::TaskSubscription> {
         let guard = lock(&self.tasks);
-        let updates = self.updates.0.subscribe();
+        let updates = self.updates.transitions.subscribe();
+        let progress = self.updates.progress.subscribe();
         let mut snapshot: Vec<_> = guard.values().map(Registration::to_info).collect();
         snapshot.sort_by(|a, b| a.name.cmp(&b.name));
-        Some(ferrofin_traits::tasks::TaskSubscription { snapshot, updates })
+        Some(ferrofin_traits::tasks::TaskSubscription {
+            snapshot,
+            updates,
+            progress,
+        })
     }
 
     async fn get_tasks(&self) -> Result<Vec<TaskInfo>, ServiceError> {
@@ -1639,7 +1677,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_transitions_capture_short_runs_and_failures_before_the_next_tick() {
+    async fn task_transitions_capture_short_runs_and_failures() {
         use ferrofin_traits::tasks::TaskManager as _;
         for fail in [false, true] {
             let mgr = FerrofinTaskManager::new();
@@ -1668,6 +1706,42 @@ mod tests {
             );
             assert!(subscription.updates.try_recv().is_err());
         }
+    }
+
+    /// `ScheduledTaskWorker.OnProgressChanged` raises `TaskProgress` on every
+    /// report of a running task: one report, one progress signal, and none
+    /// before the run. Both run paths raise it: `run_now`, and `queue` (the
+    /// dashboard's and the scheduler's), whose spawned run rebuilds the handle
+    /// with its trigger tag.
+    #[tokio::test]
+    async fn a_running_tasks_progress_report_raises_the_progress_signal() {
+        use ferrofin_traits::tasks::TaskManager as _;
+        let mgr = FerrofinTaskManager::new();
+        mgr.register(Arc::new(CountingTask {
+            runs: Arc::new(AtomicU32::new(0)),
+            fail: false,
+            hidden: false,
+        }));
+        let mut subscription = mgr.subscribe_task_updates().unwrap();
+        assert!(subscription.progress.try_recv().is_err(), "nothing ran yet");
+        mgr.run_now("counting").await.unwrap();
+        assert_eq!(subscription.progress.try_recv(), Ok(()));
+        assert!(subscription.progress.try_recv().is_err(), "one report");
+
+        while subscription.updates.try_recv().is_ok() {}
+        mgr.queue("counting").unwrap();
+        // The run's start and end transitions; the end follows its report.
+        for _ in 0..2 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                subscription.updates.recv(),
+            )
+            .await
+            .expect("the queued run in time")
+            .unwrap();
+        }
+        assert_eq!(subscription.progress.try_recv(), Ok(()));
+        assert!(subscription.progress.try_recv().is_err(), "one report");
     }
 
     /// A task recording the trigger each of its runs saw.
@@ -2530,7 +2604,8 @@ mod tests {
             error.to_string().contains("could not save the triggers"),
             "{error}"
         );
-        assert!(mgr.get("counting").expect("info").triggers.is_empty());
+        let triggers = mgr.get("counting").expect("info").triggers;
+        assert!(triggers.is_empty(), "{triggers:?}");
         assert!(super::lock(&mgr.stored_overrides).is_empty());
     }
 
@@ -2583,7 +2658,8 @@ mod tests {
         }));
 
         // Defaults are empty (CountingTask uses the trait default).
-        assert!(mgr.get("counting").expect("info").triggers.is_empty());
+        let found = mgr.get("counting").expect("info").triggers;
+        assert!(found.is_empty(), "{found:?}");
 
         let triggers = vec![TaskTriggerInfo {
             type_: TaskTriggerInfoType::IntervalTrigger,

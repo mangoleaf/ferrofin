@@ -24,7 +24,9 @@
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ferrofin_core::file_system::FerrofinFileSystem;
@@ -227,6 +229,18 @@ fn series_requests(lines: &[String]) -> Vec<&String> {
 #[derive(Default)]
 struct CountingFs {
     listed: Mutex<Vec<String>>,
+    stall: Mutex<Option<Stall>>,
+}
+
+/// The next listing of `dir` sleeps until the runtime has run a task, as a
+/// listing on a slow mount does. A listing made inline on the only worker
+/// holds that task off until `patience` runs out.
+struct Stall {
+    dir: String,
+    listing: Arc<tokio::sync::Notify>,
+    ran: std::sync::mpsc::Receiver<()>,
+    patience: Duration,
+    starved: Arc<AtomicBool>,
 }
 
 impl CountingFs {
@@ -244,6 +258,13 @@ impl FileSystem for CountingFs {
         path: &str,
     ) -> Result<Vec<FileSystemEntryInfo>, ServiceError> {
         self.listed.lock().expect("lock").push(path.to_owned());
+        let stall = self.stall.lock().expect("lock").take_if(|s| s.dir == path);
+        if let Some(stall) = stall {
+            stall.listing.notify_one();
+            if stall.ran.recv_timeout(stall.patience).is_err() {
+                stall.starved.store(true, Ordering::SeqCst);
+            }
+        }
         FerrofinFileSystem::new().try_get_file_system_entries(path)
     }
     fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
@@ -531,7 +552,9 @@ async fn a_removed_episode_prunes_exactly_its_rows() {
             .await
             .expect("count");
     assert_eq!(streams, 0, "its streams went with it");
-    assert!(series_requests(&fx.tmdb.take()).is_empty());
+    let requests = fx.tmdb.take();
+    let found = series_requests(&requests);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 /// A removed season folder prunes its whole subtree — the season and its
@@ -615,7 +638,9 @@ async fn a_new_season_folder_creates_the_season_and_its_episodes() {
         after[&series_id].4, before[&series_id].4,
         "the series is not refreshed"
     );
-    assert!(series_requests(&fx.tmdb.take()).is_empty());
+    let requests = fx.tmdb.take();
+    let found = series_requests(&requests);
+    assert!(found.is_empty(), "{found:?}");
 
     // Another new season, with the series' folder mtime moved: still not
     // refreshed.
@@ -626,7 +651,9 @@ async fn a_new_season_folder_creates_the_season_and_its_episodes() {
     assert_eq!(outcome.created, 2, "{outcome:?}");
     assert_eq!(outcome.updated, 0, "{outcome:?}");
     assert_eq!(fx.rows().await[&series_id].4, after[&series_id].4);
-    assert!(series_requests(&fx.tmdb.take()).is_empty());
+    let requests = fx.tmdb.take();
+    let found = series_requests(&requests);
+    assert!(found.is_empty(), "{found:?}");
 }
 
 /// A provider names the series (TMDb answers "Show" for the folder "Flat"):
@@ -1131,6 +1158,52 @@ async fn a_sidecar_beside_a_movie_in_the_library_root_refreshes_that_movie() {
     assert_eq!(outcome.updated, 1, "{outcome:?}");
 }
 
+/// A changed path's stats and a sidecar's listing go through `off_runtime`, so
+/// a monitor scan on a slow mount never holds a runtime worker: on a runtime
+/// with one worker, a task still runs while the sidecar's folder is listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_changed_paths_listing_leaves_the_runtime_worker_free() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let media = tmp.path().join("media");
+    std::fs::create_dir_all(&media).expect("media");
+    std::fs::write(media.join("Heat (1995).mkv"), b"x").expect("video");
+    let fx = Fixture::new(tmp.path(), &media, CollectionTypeOptions::movies)
+        .await
+        .scanned()
+        .await;
+
+    let (ran, stalled_for) = std::sync::mpsc::channel();
+    let listing = Arc::new(tokio::sync::Notify::new());
+    let starved = Arc::new(AtomicBool::new(false));
+    *fx.fs.stall.lock().expect("lock") = Some(Stall {
+        dir: media.to_string_lossy().into_owned(),
+        listing: Arc::clone(&listing),
+        ran: stalled_for,
+        patience: Duration::from_secs(2),
+        starved: Arc::clone(&starved),
+    });
+    let task = tokio::spawn(async move {
+        listing.notified().await;
+        ran.send(()).ok();
+    });
+
+    let sidecar = media.join("Heat (1995).eng.srt");
+    std::fs::write(&sidecar, b"1\n").expect("srt");
+    // On the worker: the test's own future runs on the thread that started it.
+    tokio::spawn(async move { fx.report(&[&sidecar]).await })
+        .await
+        .expect("the scan finished");
+
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("the sidecar's folder was never listed")
+        .expect("the task ran");
+    assert!(
+        !starved.load(Ordering::SeqCst),
+        "the listing held the only worker"
+    );
+}
+
 /// A library location that is still there but lists empty — an NFS mount
 /// that dropped, leaving its empty mountpoint — is inaccessible, not
 /// emptied (`Folder.IsLibraryFolderAccessible`, `Folder.cs:400-415`): a
@@ -1377,7 +1450,7 @@ async fn retention_move_back_preserves_the_latest_state(#[case] destination_firs
     .fetch_all(fx.db.pool())
     .await
     .unwrap();
-    assert!(!rows.is_empty());
+    assert!(!rows.is_empty(), "{rows:?}");
     assert!(rows.iter().all(|row| *row == (false, true, None)));
     let retained: i64 =
         sqlx::query_scalar(r#"SELECT COUNT(*) FROM "FerrofinUserDataRetentionSnapshots""#)

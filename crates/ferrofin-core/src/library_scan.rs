@@ -45,6 +45,9 @@ use ferrofin_naming::common::NamingOptions;
 use ferrofin_naming::tv::{EpisodeResolver, season_path_parser, series_resolver};
 use ferrofin_naming::video::video_resolver;
 use ferrofin_providers::library_options::fetcher_names;
+use ferrofin_providers::local_images::{
+    file_date_modified, first_of_each_singular_type, local_image_infos, merge_local_images,
+};
 #[cfg(test)]
 use ferrofin_providers::metadata_merge::audio_sort_name;
 use ferrofin_providers::metadata_merge::{
@@ -81,6 +84,7 @@ use crate::refresh_plan::{
 };
 use crate::shortcut;
 use music::{MusicKind, MusicRefresh};
+use provider_cache::ProviderCache;
 
 /// Per-scan artwork lookup state, so a series is matched against TMDB once and
 /// its seasons/episodes reuse that match (and its per-season episode stills).
@@ -102,8 +106,17 @@ struct ArtworkCache {
     /// Final series names for season and episode `BeforeSaveInternal`, read
     /// once per pass.
     series_names: HashMap<String, Option<String>>,
+    /// Series item id → its folder (`None` when it has no path), which its
+    /// seasons' local images are read from besides their own folder
+    /// ([`LibraryScanner::remember_series_folder`]).
+    series_folders: HashMap<String, Option<String>>,
     /// Parent metadata overrides read once per scan, without retaining rows.
     locale_parents: HashMap<String, LocaleParent>,
+    /// The parents whose rows failed to read this pass: asked for once, then
+    /// taken as not found ([`LibraryScanner::parent_row`]).
+    unread_parents: std::collections::HashSet<String>,
+    /// What the walk could not read or write, reported once per pass.
+    skipped: SkippedItems,
     /// The libraries and their options the parental-score resolver reads,
     /// once per scan rather than once per scanned item.
     rating_libraries: Option<crate::item_visibility::RatingLibraries>,
@@ -121,20 +134,25 @@ struct ArtworkCache {
     /// Series item id → matched TMDB series id.
     series_tmdb: std::collections::HashMap<String, i64>,
     /// (series item id, season number, language) → TMDB details, fetched
-    /// once per scan and locale. `/tv/{id}/season/{n}` carries the season poster, every
-    /// episode's still URL, AND every episode's name/overview, so the metadata
-    /// pass and the image pass share this one response instead of each paying
-    /// for it. A miss — and a failed request — is recorded too, so neither is
-    /// re-requested once per episode.
-    season_details: std::collections::HashMap<(String, i32, Option<String>), SeasonLookup>,
+    /// once per locale for as long as `TmdbClientManager` would keep the
+    /// response ([`tmdb_season_cache`]). `/tv/{id}/season/{n}` carries the
+    /// season poster, every episode's still URL, AND every episode's
+    /// name/overview, so the metadata pass and the image pass share this one
+    /// response instead of each paying for it. A miss — and a failed
+    /// request — is recorded too, so neither is re-requested once per
+    /// episode.
+    season_details: ProviderCache<SeasonKey, SeasonLookup>,
     /// Series item id → the matched TVDB series details (when the TVDB
-    /// provider answered for the series). Its `tvdb_id` lets episodes
+    /// provider answered for the series), kept for the TVDB plugin's
+    /// `CacheDurationInHours` ([`tvdb_cache`]). Its `tvdb_id` lets episodes
     /// resolve, and its artwork is reused by the image pass instead of
     /// re-fetching.
-    series_tvdb: std::collections::HashMap<String, ferrofin_providers::TvdbSeriesDetails>,
+    series_tvdb: ProviderCache<String, ferrofin_providers::TvdbSeriesDetails>,
     /// Episode item id → its TVDB still URL, cached during the metadata pass so
-    /// the image pass downloads it without a second episode fetch.
-    episode_tvdb_still: std::collections::HashMap<String, String>,
+    /// the image pass downloads it without a second episode fetch; kept as
+    /// long as the plugin keeps the episode record it came from
+    /// ([`tvdb_cache`]).
+    episode_tvdb_still: ProviderCache<String, String>,
     /// Item id → the external ids the metadata match yielded, so the image pass
     /// can key fanart off them (movies: `Tmdb`/`Imdb`) within the same scan.
     item_provider_ids: std::collections::HashMap<String, Vec<(String, String)>>,
@@ -145,17 +163,24 @@ struct ArtworkCache {
     /// (dimensions, blurhash, and the mtime they were computed from), read
     /// once for the whole scan. Keyed by PATH rather than by item because
     /// dimensions and a blurhash are functions of the file alone, so two rows
-    /// sharing one `folder.jpg` share the answer.
-    stored_images: std::collections::HashMap<String, StoredImageMetadata>,
+    /// sharing one `folder.jpg` share the answer. Only a complete probe is
+    /// kept ([`remember_probed_image`]): no other can be adopted.
+    stored_images: ProbedImages,
 }
 
 impl ArtworkCache {
     /// [`discover_local_images`] over the run's listings, or over listings
-    /// of its own when the run has none.
+    /// of its own when the run has none, with a season's series folder from
+    /// [`series_folders`](Self::series_folders).
     fn discover_local_images(&self, entity: &BaseItemEntity) -> Vec<ItemImageInfo> {
+        let series_folder = entity
+            .series_id
+            .as_ref()
+            .and_then(|id| self.series_folders.get(id))
+            .and_then(Option::as_deref);
         match &self.dirs {
-            Some(dirs) => discover_local_images(entity, dirs.as_ref()),
-            None => discover_local_images(entity, &FsDirectoryService::new()),
+            Some(dirs) => discover_local_images(entity, series_folder, dirs.as_ref()),
+            None => discover_local_images(entity, series_folder, &FsDirectoryService::new()),
         }
     }
 }
@@ -176,6 +201,87 @@ enum SeasonLookup {
     /// The request failed. Every item that reads this entry counts the
     /// failure again, so none of them is stamped as a completed refresh.
     Failed,
+}
+
+/// The key [`ArtworkCache::season_details`] keeps a season under: the series
+/// item id, the season number and the TMDB language.
+type SeasonKey = (String, i32, Option<String>);
+
+/// How long a TMDB response is kept after it was fetched:
+/// `TmdbClientManager.CacheDurationInHours` (`TmdbClientManager.cs:26`), the
+/// absolute expiration it caches every response under (`:771-780`).
+const TMDB_CACHE_DURATION: std::time::Duration = std::time::Duration::from_hours(1);
+
+/// The weight of TMDB responses kept at most:
+/// `TmdbClientManager.CacheSizeLimit` (`TmdbClientManager.cs:28-30,48`),
+/// counted in TMDB records ([`SeasonLookup::estimate_size`]) rather than in
+/// responses.
+const TMDB_CACHE_SIZE_LIMIT: u64 = 100_000;
+
+impl SeasonLookup {
+    /// `EstimateSize`'s `TvSeason` arm (`TmdbClientManager.cs:800-818`): one
+    /// for the season, plus its credited people and its episodes. The people
+    /// counted are the ones the scan keeps, after the TMDb settings' cast cap
+    /// and crew filter. A miss or a failure, which upstream does not cache,
+    /// weighs one, as `EstimateSize`'s fallback arm does.
+    fn estimate_size(&self) -> u64 {
+        match self {
+            Self::Found(details) => {
+                u64::try_from(1 + details.people.len() + details.episodes.len()).unwrap_or(u64::MAX)
+            }
+            Self::Missing | Self::Failed => 1,
+        }
+    }
+
+    /// A failed request counted into the reading item's own refresh (the
+    /// scope the original request ran in is the first reader's only).
+    fn count_failure(&self) {
+        if matches!(self, Self::Failed) {
+            ferrofin_providers::rate_limit::note_request_failure();
+        }
+    }
+}
+
+/// TMDB season responses, kept by `TmdbClientManager`'s rules: for
+/// [`TMDB_CACHE_DURATION`], and at most [`TMDB_CACHE_SIZE_LIMIT`] records.
+/// Upstream's one cache holds every TMDB response (series, movies, people,
+/// searches) within that limit; the scan keeps only seasons, so they have
+/// the whole of it.
+fn tmdb_season_cache() -> ProviderCache<SeasonKey, SeasonLookup> {
+    ProviderCache::bounded(
+        TMDB_CACHE_DURATION,
+        TMDB_CACHE_SIZE_LIMIT,
+        SeasonLookup::estimate_size,
+    )
+}
+
+/// TheTVDB responses, kept by the plugin's `TvdbClientManager` rules: for
+/// its `CacheDurationInHours` (`duration`, the client's
+/// [`cache_duration`](ferrofin_providers::TvdbClient::cache_duration)),
+/// with no size limit (`TvdbClientManager.cs:50,61`).
+fn tvdb_cache<V>(duration: std::time::Duration) -> ProviderCache<String, V> {
+    ProviderCache::new(duration)
+}
+
+impl Default for ProviderCache<SeasonKey, SeasonLookup> {
+    fn default() -> Self {
+        tmdb_season_cache()
+    }
+}
+
+impl Default for ProviderCache<String, ferrofin_providers::TvdbSeriesDetails> {
+    /// At the plugin's default duration; a scan keeps its client's.
+    fn default() -> Self {
+        tvdb_cache(ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION)
+    }
+}
+
+impl Default for ProviderCache<String, String> {
+    /// TheTVDB's episode stills ([`ArtworkCache::episode_tvdb_still`]), at
+    /// the plugin's default duration; a scan keeps its client's.
+    fn default() -> Self {
+        tvdb_cache(ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION)
+    }
 }
 
 /// What a remote metadata fetch yields for one item: the cast/crew to persist
@@ -596,21 +702,6 @@ fn episode_in_season(
     number: i32,
 ) -> Option<&ferrofin_providers::tmdb::EpisodeDetails> {
     details.episodes.iter().find(|e| e.episode_number == number)
-}
-
-/// The image file's mtime as UTC, falling back to [`Utc::now`] when the stat
-/// fails. Port of Jellyfin's `IFileSystem.GetLastWriteTimeUtc`, which stamps
-/// `ItemImageInfo.DateModified`.
-///
-/// This MUST be the file's mtime, not the scan time: `date_modified` feeds both
-/// the client-facing `ImageTags` (`md5(path + ticks)`) and the resized-image
-/// cache key. A rescan of an unchanged file has to reproduce the same timestamp,
-/// or every scan changes every poster URL (busting the clients' year-long
-/// immutable image caches) and invalidates the entire server-side resize cache.
-fn file_date_modified(path: &Path) -> DateTime<Utc> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
 }
 
 /// Downloads each [`RemoteImage`] into `item_dir` (as `{type}.jpg`) and returns
@@ -1629,6 +1720,20 @@ impl<'a> ProbePipeline<'a> {
         self.current = None;
     }
 
+    /// Gives up plan index `index`, the current item, which will never be
+    /// [`take`](Self::take)n: a probe queued for it would hold the head of the
+    /// queue, and every later item would go unprobed.
+    fn discard(&mut self, index: usize) {
+        if self.inflight.front().is_some_and(|(i, _, _)| *i == index) {
+            if let Some((_, _, handle)) = self.inflight.pop_front() {
+                handle.abort();
+            }
+            self.dispatch_next();
+        } else if let Some(slot) = self.eligible.get_mut(index) {
+            *slot = None;
+        }
+    }
+
     /// The current item's own probe can use its foreground slot even at limit 1.
     fn begin_item(&mut self, index: usize) {
         self.current = Some(index);
@@ -1696,7 +1801,8 @@ impl<'a> ProbePipeline<'a> {
                 let external = self.externals.as_ref().map(|seam| {
                     let mut external = seam.for_item(self.planned[index].id);
                     // The sidecars sit beside the `.strm`, not its target.
-                    external.sidecar_path = shortcut.and(self.planned[index].entity.path.clone());
+                    external.sidecar_path =
+                        shortcut.and_then(|_| self.planned[index].entity.path.clone());
                     external
                 });
                 let is_audio = request.media_is_audio;
@@ -1846,7 +1952,8 @@ fn dynamic_answer(
     let item = &mut answer.item;
     item.overview = text(result.overview);
     item.production_year = result.production_year.map(i64::from);
-    item.community_rating = result.community_rating;
+    // The fresh item's `CommunityRating` setter runs `FiniteOrNull`.
+    item.community_rating = ferrofin_util::finite::finite_or_none(result.community_rating);
     item.genres = list(&result.genres);
     item.tagline = text(result.tagline);
     item.studios = list(&result.studios);
@@ -2064,26 +2171,30 @@ fn note_served(served: &mut Served, touched: &[(Uuid, RefreshReach)]) {
     }
 }
 
-/// The items a closing pass skipped because reading or writing one of them
+/// The items a scan pass skipped because reading or writing one of them
 /// failed — so one unreadable row never stops the pass for every item after
-/// it — and those it refreshed treating every field as locked because their
-/// field locks could not be read. Reported once per pass
-/// ([`report`](Self::report)): the per-item detail is `debug!`, as its
-/// volume scales with the library.
+/// it — those it refreshed treating every field as locked because their
+/// field locks could not be read, and those it scored without their parent
+/// chain. Reported once per pass ([`report`](Self::report)): the per-item
+/// detail is `debug!`, as its volume scales with the library.
 #[derive(Debug, Default)]
 struct SkippedItems {
     /// How many items were skipped.
     count: usize,
     /// How many items' field locks could not be read.
     locks_unread: usize,
-    /// The first item of either, and why.
+    /// How many items' parent chains could not be read.
+    ratings_unread: usize,
+    /// How many failed items kept a refresh stamp that had to go.
+    stamps_kept: usize,
+    /// The first item of any of these, and why.
     first: Option<(Uuid, String)>,
 }
 
 impl SkippedItems {
     /// Records that `id` was skipped over `err`.
     fn note(&mut self, id: Uuid, err: &ServiceError) {
-        tracing::debug!(item_id = %id, %err, "closing pass skipped an item");
+        tracing::debug!(item_id = %id, %err, "scan pass skipped an item");
         self.count += 1;
         self.first.get_or_insert_with(|| (id, err.to_string()));
     }
@@ -2096,18 +2207,37 @@ impl SkippedItems {
         self.first.get_or_insert_with(|| (id, err.to_string()));
     }
 
-    /// One warning naming how many items `pass` skipped or refreshed without
-    /// their field locks, and the first, when there were any; the skipped
-    /// ones are retried by the next validation.
+    /// Records that `id`'s parent chain could not be read over `err`, so its
+    /// parental rating was scored from the item alone.
+    fn note_rating_unread(&mut self, id: Uuid, err: &ServiceError) {
+        tracing::debug!(item_id = %id, %err, "parent chain unreadable; rating scored alone");
+        self.ratings_unread += 1;
+        self.first.get_or_insert_with(|| (id, err.to_string()));
+    }
+
+    /// Records that `id` failed after its save and its refresh stamp could
+    /// not be cleared over `err`, so the next scan may not retry it.
+    fn note_stamp_kept(&mut self, id: Uuid, err: &ServiceError) {
+        tracing::debug!(item_id = %id, %err, "refresh stamp not cleared");
+        self.stamps_kept += 1;
+        self.first.get_or_insert_with(|| (id, err.to_string()));
+    }
+
+    /// One warning naming how many items `pass` skipped, refreshed without
+    /// their field locks, scored without their parent chain or left stamped,
+    /// and the first, when there were any; the skipped ones are retried by
+    /// the next validation.
     fn report(&self, pass: &'static str) {
         if let Some((id, err)) = &self.first {
             tracing::warn!(
                 pass,
                 skipped = self.count,
                 locks_unread = self.locks_unread,
+                ratings_unread = self.ratings_unread,
+                stamps_kept = self.stamps_kept,
                 item_id = %id,
                 error = %err,
-                "closing pass could not read or write some items; the next scan retries the skipped ones"
+                "scan pass could not read or write some items; the next scan retries the skipped ones"
             );
         }
     }
@@ -2275,12 +2405,24 @@ fn log_scoped_item(item: &Planned, reason: &'static str, saved: bool) {
 }
 
 /// The `pruned` lines of a path-scoped scan ([`log_scoped_item`]'s), one per
-/// removed row.
-fn log_pruned(removed: &[(Uuid, Option<String>)]) {
-    for (id, path) in removed {
+/// removed row. The paths come from the `rows` the prune read, then the
+/// `children` it found under the stale ones.
+fn log_pruned(
+    removed: &[Uuid],
+    rows: &[ItemPathRow],
+    children: &[ferrofin_traits::persistence::ItemChildLink],
+) {
+    let mut paths: HashMap<Uuid, Option<&str>> = rows
+        .iter()
+        .map(|row| (row.id, row.path.as_deref()))
+        .collect();
+    for child in children {
+        paths.entry(child.id).or_insert(child.path.as_deref());
+    }
+    for id in removed {
         tracing::debug!(
             item_id = %id,
-            path = path.as_deref().unwrap_or_default(),
+            path = paths.get(id).copied().flatten().unwrap_or_default(),
             reason = "pruned",
             saved = false,
             "path-scoped scan item"
@@ -2474,6 +2616,10 @@ struct PathScope<'a> {
     /// carries it for context only (the owner of a new extra). `None` before
     /// the moves are made.
     moved: Option<&'a std::collections::HashSet<Uuid>>,
+    /// Whether the items at the roots are what a refresh was asked for, whose
+    /// failure the scan ends with: an item's or a folder's own refresh, not
+    /// the library monitor's roots.
+    roots_requested: bool,
 }
 
 impl<'a> PathScope<'a> {
@@ -2488,7 +2634,31 @@ impl<'a> PathScope<'a> {
             carried: None,
             regrouped: None,
             moved: None,
+            roots_requested: false,
         }
+    }
+
+    /// This scope with its roots being what a refresh was asked for.
+    fn requested(self) -> Self {
+        Self {
+            roots_requested: true,
+            ..self
+        }
+    }
+
+    /// Whether `item` is an item a refresh was asked for: it stands at a
+    /// root. `ProviderManager.RefreshItem` awaits that item's `RefreshMetadata`
+    /// with no catch, while `LimitedConcurrencyLibraryScheduler.ProcessItem`
+    /// catches what the folder validates below it (`Folder.RunTasks`) and
+    /// `BaseItem.RefreshMetadata` what `RefreshedOwnedItems` throws.
+    fn is_requested(&self, item: &Planned) -> bool {
+        self.roots_requested
+            && item.entity.path.as_deref().is_some_and(|path| {
+                let path = path.trim_end_matches('/');
+                self.roots
+                    .iter()
+                    .any(|root| root.trim_end_matches('/') == path)
+            })
     }
 
     /// Whether `item` is a member of a covered video's local group that the
@@ -2780,6 +2950,11 @@ struct ItemState<'s, 'a> {
     /// `renamedExtraIds`, the extras whose corrected name differs from the
     /// persisted one, whatever a local reader then makes of it.
     renamed_extra: bool,
+    /// Set by [`LibraryScanner::scan_item`] just before it saves the item's
+    /// row: from then on a failure may leave the row carrying this refresh's
+    /// stamp, even a failure of the save itself, which writes the row before
+    /// the names it pushes to its children.
+    save_attempted: bool,
 }
 
 /// Whether [`LibraryScanner::scan_item`] wrote the item.
@@ -3590,6 +3765,10 @@ pub struct ScanOutcome {
     pub unchanged: usize,
     /// Stored items the scan deleted because their files are gone.
     pub removed: usize,
+    /// Planned items the walk could not read or write, counted under no other
+    /// field. The next scan refreshes each; a stored one is not pruned, and a
+    /// new one exists only if its row was saved before the failure.
+    pub skipped: usize,
     /// The scan was cancelled and stopped before it finished: some items,
     /// the pruning or a closing pass were never run.
     pub stopped: bool,
@@ -3602,6 +3781,7 @@ impl std::ops::AddAssign for ScanOutcome {
         self.updated += other.updated;
         self.unchanged += other.unchanged;
         self.removed += other.removed;
+        self.skipped += other.skipped;
         self.stopped |= other.stopped;
     }
 }
@@ -4495,11 +4675,17 @@ impl LibraryScanner {
     /// Stamps the numeric parental score derived from `OfficialRating` — what
     /// the Parental Rating sort and the max-rating filters read (upstream
     /// `BaseItem.OnMetadataChanged` → `GetParentalRatingScore`).
+    ///
+    /// A parent chain that cannot be read scores an item with a rating of its
+    /// own from that rating and its own country. One without takes the score
+    /// stored on its parent, which is what it inherited, so it never loses a
+    /// restriction to a bad row: only the chain's read failed, and the column
+    /// still answers.
     async fn apply_parental_rating_score(
         &self,
         entity: &mut BaseItemEntity,
         cache: &mut ArtworkCache,
-    ) -> Result<(), ServiceError> {
+    ) {
         let kind = crate::item_type_lookup::kind_from_type_name(&entity.type_)
             .unwrap_or(BaseItemKind::Folder);
         let channel = entity
@@ -4514,14 +4700,33 @@ impl LibraryScanner {
         );
         if let Some(resolver) = &self.rating_resolver {
             let libraries = match cache.rating_libraries.take() {
-                Some(libraries) => libraries,
-                None => resolver.rating_libraries().await?,
+                Some(libraries) => Ok(libraries),
+                None => resolver.rating_libraries().await,
             };
-            let scored = resolver
-                .update_rating_scores_in(std::slice::from_mut(entity), &libraries)
-                .await;
-            cache.rating_libraries = Some(libraries);
-            return scored;
+            let scored = match libraries {
+                Ok(libraries) => {
+                    let scored = resolver
+                        .update_rating_scores_in(std::slice::from_mut(entity), &libraries)
+                        .await;
+                    cache.rating_libraries = Some(libraries);
+                    scored
+                }
+                Err(err) => Err(err),
+            };
+            match scored {
+                Ok(()) => return,
+                Err(err) => {
+                    let id = parse_id(&entity.id).unwrap_or_default();
+                    cache.skipped.note_rating_unread(id, &err);
+                    let rated = [&entity.custom_rating, &entity.official_rating]
+                        .into_iter()
+                        .any(|rating| rating.as_deref().is_some_and(|r| !r.is_empty()));
+                    if !rated {
+                        self.inherit_stored_rating(entity).await;
+                        return;
+                    }
+                }
+            }
         }
         if let Some(localization) = &self.localization {
             let score = entity
@@ -4537,7 +4742,29 @@ impl LibraryScanner {
             entity.inherited_parental_rating_sub_value =
                 score.and_then(|score| score.sub_score.map(i64::from));
         }
-        Ok(())
+    }
+
+    /// Gives `entity` the parental score stored on the parent it inherits its
+    /// rating from: a season's series, an episode's season (a loose episode's
+    /// `ParentId` is the series) and anything else's `ParentId`, as the
+    /// resolver's display chain walks them. A read that fails leaves it the
+    /// score it has.
+    async fn inherit_stored_rating(&self, entity: &mut BaseItemEntity) {
+        let parent = match item_type_lookup::kind_from_type_name(&entity.type_) {
+            Some(BaseItemKind::Episode) => entity.season_id.as_deref(),
+            Some(BaseItemKind::Season) => entity.series_id.as_deref(),
+            _ => entity.parent_id.as_deref(),
+        };
+        let Some(parent) = parent.and_then(parse_id) else {
+            return;
+        };
+        match self.persistence.stored_rating_score(parent).await {
+            Ok(score) => {
+                entity.inherited_parental_rating_value = score.map(|(value, _)| value);
+                entity.inherited_parental_rating_sub_value = score.and_then(|(_, sub)| sub);
+            }
+            Err(err) => tracing::debug!(item_id = %parent, %err, "stored rating unreadable"),
+        }
     }
 
     /// Shares the hierarchy-aware parental-rating resolver with metadata edits.
@@ -4768,8 +4995,9 @@ impl LibraryScanner {
     /// [`scan_with`](Self::scan_with).
     ///
     /// # Errors
-    /// Propagates the item-store failure if listing libraries, saving an item,
-    /// or writing its ancestor closure fails.
+    /// Propagates the item-store failure if planning the scan or sweeping
+    /// user data fails. One item that cannot be read or written fails only
+    /// itself ([`ScanOutcome::skipped`]), unless a refresh asked for that item.
     pub async fn scan(&self, only: Option<Uuid>) -> Result<ScanOutcome, ServiceError> {
         self.scan_with(only, &MetadataRefreshOptions::default())
             .await
@@ -4821,8 +5049,8 @@ impl LibraryScanner {
             ScanTarget::All => self.scan_libraries(None, run).await,
             ScanTarget::Library(id) => self.scan_libraries(Some(*id), run).await,
             ScanTarget::Paths(paths) => {
-                self.scan_scoped(PathScope::of(paths, true), None, paths.len(), run)
-                    .await
+                let scope = PathScope::of(paths, true).requested();
+                self.scan_scoped(scope, None, paths.len(), run).await
             }
             ScanTarget::Changed(paths) => Box::pin(self.scan_changed(paths, run)).await,
             ScanTarget::Items(paths) => {
@@ -4843,8 +5071,8 @@ impl LibraryScanner {
                 // a kept item in `plan_movies`), covered by
                 // `plan_paths_tests`, plus a prune of only the `ExtraType`
                 // rows under that folder.
-                self.scan_scoped(PathScope::of(paths, false), None, paths.len(), run)
-                    .await
+                let scope = PathScope::of(paths, false).requested();
+                self.scan_scoped(scope, None, paths.len(), run).await
             }
             ScanTarget::Artist { id, path, folders } => {
                 // `RefreshArtist`: the artist folders' children, and the
@@ -5118,9 +5346,15 @@ impl LibraryScanner {
         if let Ok(outcome) = &mut result {
             outcome.removed += orphaned.iter().map(|(_, ids)| ids.len()).sum::<usize>();
             // Each library this scan went over to its end now holds rows this
-            // scanner wrote: a delete may remove files there.
+            // scanner wrote: a delete may remove files there. A skipped item's
+            // row is one it did not write, so no library counts as gone over
+            // until a scan skips nothing.
             if !outcome.stopped && !run.cancel.is_cancelled() {
-                for library in folders.iter().filter_map(collection_folder_id) {
+                let libraries = folders
+                    .iter()
+                    .filter_map(collection_folder_id)
+                    .filter(|_| outcome.skipped == 0);
+                for library in libraries {
                     if let Err(err) = self
                         .persistence
                         .record_library_scanned(library, LIBRARY_LAYOUT_GENERATION)
@@ -5368,38 +5602,42 @@ impl LibraryScanner {
         // The sidecars directly in a library location, by folder: each
         // with the stems of the items it may belong to.
         let mut sidecars: HashMap<&str, Vec<(&String, Vec<String>)>> = HashMap::new();
-        for (path, chain) in &chains {
-            let nearest = chain
-                .iter()
-                .find(|at| items.contains(at.as_str()) && self.file_system.path_exists(at));
-            let (root, via) = match nearest {
-                Some(item) => (item, "nearest existing item"),
-                None => match chain
+        // Each changed path is a stat or more, and a sidecar a listing, on
+        // whatever the library is mounted from.
+        off_runtime(|| {
+            for (path, chain) in &chains {
+                let nearest = chain
                     .iter()
-                    .find(|at| self.file_system.directory_exists(at))
+                    .find(|at| items.contains(at.as_str()) && self.file_system.path_exists(at));
+                let (root, via) = match nearest {
+                    Some(item) => (item, "nearest existing item"),
+                    None => match chain
+                        .iter()
+                        .find(|at| self.file_system.directory_exists(at))
+                    {
+                        Some(folder) => (folder, "nearest existing folder"),
+                        None => (*path, "changed path"),
+                    },
+                };
+                tracing::debug!(path = %path, root = %root, via, "changed path refreshes");
+                roots.push(root.clone());
+                // Nothing between it and the library, and it is no item and no
+                // folder: a sidecar (or a file the library does not resolve)
+                // beside the library's loose items.
+                if nearest.is_none()
+                    && chain.len() == 1
+                    && !items.contains(path.as_str())
+                    && !self.file_system.directory_exists(path)
+                    && let Some(dir) = Path::new(path.as_str()).parent().and_then(|d| d.to_str())
                 {
-                    Some(folder) => (folder, "nearest existing folder"),
-                    None => (*path, "changed path"),
-                },
-            };
-            tracing::debug!(path = %path, root = %root, via, "changed path refreshes");
-            roots.push(root.clone());
-            // Nothing between it and the library, and it is no item and no
-            // folder: a sidecar (or a file the library does not resolve)
-            // beside the library's loose items.
-            if nearest.is_none()
-                && chain.len() == 1
-                && !items.contains(path.as_str())
-                && !self.file_system.directory_exists(path)
-                && let Some(dir) = Path::new(path.as_str()).parent().and_then(|d| d.to_str())
-            {
-                let stems = sidecar_stems(path);
-                if !stems.is_empty() {
-                    sidecars.entry(dir).or_default().push((path, stems));
+                    let stems = sidecar_stems(path);
+                    if !stems.is_empty() {
+                        sidecars.entry(dir).or_default().push((path, stems));
+                    }
                 }
             }
-        }
-        roots.extend(self.sidecar_owners(&sidecars));
+            roots.extend(self.sidecar_owners(&sidecars));
+        });
         roots.extend(self.removed_files_groups(&chains, &items).await);
         collapse_roots(roots)
     }
@@ -5419,11 +5657,13 @@ impl LibraryScanner {
         chains: &[(&String, Vec<String>)],
         items: &std::collections::HashSet<&str>,
     ) -> Vec<String> {
-        let gone: Vec<String> = chains
-            .iter()
-            .map(|(path, _)| (*path).clone())
-            .filter(|path| items.contains(path.as_str()) && !self.file_system.path_exists(path))
-            .collect();
+        let gone: Vec<String> = off_runtime(|| {
+            chains
+                .iter()
+                .map(|(path, _)| (*path).clone())
+                .filter(|path| items.contains(path.as_str()) && !self.file_system.path_exists(path))
+                .collect()
+        });
         if gone.is_empty() {
             return Vec::new();
         }
@@ -6119,6 +6359,20 @@ impl LibraryScanner {
     /// chapters and images) or not at all, and a cancelled scan skips the
     /// pruning and the post-scan passes, as upstream's
     /// `ThrowIfCancellationRequested` between children does.
+    ///
+    /// One item's failure is that item's alone
+    /// (`LimitedConcurrencyLibraryScheduler.ProcessItem`, which logs what a
+    /// child threw and goes on): it is counted in [`ScanOutcome::skipped`],
+    /// stays out of the prune (it is planned), and the walk, the prune and
+    /// the closing passes run on. A row saved before the failure loses its
+    /// refresh stamp ([`ItemPersistenceService::clear_date_last_refreshed`]),
+    /// so the next scan refreshes it whatever its file did. A new item that
+    /// left no row takes what is planned below it along
+    /// (`Folder.RefreshChildMetadata` recurses only into a child that
+    /// refreshed): those would hang off nothing. A refresh of an item or a
+    /// folder still ends with that item's own failure, after the rest has
+    /// run, so a caller awaiting it hears of it
+    /// ([`PathScope::is_requested`]).
     // The scan loop reads best as one straight line; serving the priority
     // lane between items and choosing the closing passes tipped it over the
     // line count.
@@ -6341,6 +6595,12 @@ impl LibraryScanner {
         // The playlists whose local readers this walk runs, read once every
         // row is saved ([`playlists`]).
         let mut due_playlists: Vec<playlists::DuePlaylist> = Vec::new();
+        // The new items that failed and left no row.
+        let mut unwritten: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        // The first failure of an item a refresh was asked for
+        // ([`PathScope::is_requested`]).
+        let mut target_failure: Option<ServiceError> = None;
+        let targeted = |item: &Planned| scope.is_some_and(|scope| scope.is_requested(item));
         for (scanned, item) in planned.iter().enumerate() {
             report_items(&run, scanned, planned.len(), &mut reported);
             probes.pause_foreground();
@@ -6378,6 +6638,7 @@ impl LibraryScanner {
                     &mut probes,
                     (&items_added, &items_updated, &moved_away),
                     outcome,
+                    &art_cache.skipped,
                     "between items",
                 );
                 return Ok(stop);
@@ -6386,6 +6647,21 @@ impl LibraryScanner {
             // refreshed (`superseded_copies`). Nothing is written for it.
             if refresh.superseded.contains(&scanned) {
                 outcome.unchanged += 1;
+                if let Some(tracking) = run.tracking
+                    && let Some(&library) = item.ancestors.first()
+                {
+                    tracking.advance(library);
+                }
+                continue;
+            }
+            if item.ancestors.iter().any(|id| unwritten.contains(id)) {
+                probes.discard(scanned);
+                let err = ServiceError::backend("a parent of the item failed to save");
+                art_cache.skipped.note(item.id, &err);
+                outcome.skipped += 1;
+                if targeted(item) {
+                    target_failure.get_or_insert(err);
+                }
                 if let Some(tracking) = run.tracking
                     && let Some(&library) = item.ancestors.first()
                 {
@@ -6468,12 +6744,66 @@ impl LibraryScanner {
                 folders: key_folders,
                 refresh: &refresh,
                 renamed_extra: false,
+                save_attempted: false,
             };
             // Boxed: the per-item pipeline is the deepest future the scan
             // holds, and inlining it puts the scan future over clippy's
             // `large_futures` ceiling.
-            let saved = Box::pin(self.scan_item(pass, &mut state)).await?;
+            let scanned_item = Box::pin(self.scan_item(pass, &mut state)).await;
             let extra_renamed = state.renamed_extra;
+            let save_attempted = state.save_attempted;
+            if undecodable || scanned_item.is_err() {
+                self.keep_stored_series_key(item, &mut series_keys).await;
+            }
+            let saved = match scanned_item {
+                Ok(saved) => saved,
+                Err(err) => {
+                    art_cache.skipped.note(item.id, &err);
+                    outcome.skipped += 1;
+                    // A failed clear leaves a new item's row unknown, so it
+                    // counts as unwritten: that store is failing anyway, and
+                    // the next scan refreshes it either way.
+                    let mut row_stands = false;
+                    if save_attempted {
+                        match self.persistence.clear_date_last_refreshed(item.id).await {
+                            Ok(found) => row_stands = found,
+                            Err(err) => art_cache.skipped.note_stamp_kept(item.id, &err),
+                        }
+                    }
+                    if row_stands {
+                        // What the rest of the walk records for a saved item
+                        // and the retry could not tell: the row now says
+                        // neither who owned it nor that it is new.
+                        if let Some(owner) = released_by {
+                            released.entry(owner).or_default().push(item.id);
+                        }
+                        owners.note_saved(item, is_new || moved_ids.contains(&item.id));
+                        if item.entity.extra_type.is_some() {
+                            owners.note_extra(
+                                item,
+                                extra_changed(stored, item, extra_renamed, request.options),
+                            );
+                        }
+                        if announce && !is_new {
+                            items_updated.push(item);
+                        }
+                    } else if is_new {
+                        unwritten.insert(item.id);
+                        if announce {
+                            items_added.pop();
+                        }
+                    }
+                    if let Some(tracking) = run.tracking
+                        && let Some(&library) = item.ancestors.first()
+                    {
+                        tracking.advance(library);
+                    }
+                    if targeted(item) {
+                        target_failure.get_or_insert(err);
+                    }
+                    continue;
+                }
+            };
             if scope.is_some() && !matches!(saved, ItemSaved::Cancelled) {
                 let reason = if refresh.is_context(item, !is_new) {
                     "context"
@@ -6597,6 +6927,7 @@ impl LibraryScanner {
                         &mut probes,
                         (&items_added, &items_updated, &moved_away),
                         outcome,
+                        &art_cache.skipped,
                         at,
                     ));
                 }
@@ -6612,18 +6943,7 @@ impl LibraryScanner {
             // its title metadata to its parts (`Video.RefreshedOwnedItems`,
             // `Video.cs:549-555`); that copy writes only a part that differs.
             if matches!(saved, ItemSaved::Saved) {
-                if crate::video_versions::owns_videos(item.entity.data.as_deref()) {
-                    owners.saved.push(item.id);
-                } else if (is_new || moved_ids.contains(&item.id))
-                    && item.entity.extra_type.is_none()
-                    && let Some(owner) = item
-                        .entity
-                        .owner_id
-                        .as_deref()
-                        .and_then(|o| Uuid::parse_str(o).ok())
-                {
-                    owners.saved.push(owner);
-                }
+                owners.note_saved(item, is_new || moved_ids.contains(&item.id));
             } else if matches!(saved, ItemSaved::Unchanged)
                 && crate::video_versions::additional_part_count(item.entity.data.as_deref()) > 0
             {
@@ -6633,21 +6953,11 @@ impl LibraryScanner {
             // extra this walk created, re-owned or renamed, or refreshes in
             // full, gives its owner's extras the owner's title metadata; any
             // other, the owner's dates.
-            if !matches!(saved, ItemSaved::Cancelled)
-                && item.entity.extra_type.is_some()
-                && let Some(owner) = item
-                    .entity
-                    .owner_id
-                    .as_deref()
-                    .and_then(|o| Uuid::parse_str(o).ok())
-            {
-                // A row not stored before (or not readable) is a new extra.
-                let changed = match stored {
-                    Stored::Existing(row) => row.owner_id != item.entity.owner_id || extra_renamed,
-                    _ => true,
-                } || request.options.replace_all_metadata
-                    || request.options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh;
-                owners.extras.push((owner, item.id, changed));
+            if !matches!(saved, ItemSaved::Cancelled) && item.entity.extra_type.is_some() {
+                owners.note_extra(
+                    item,
+                    extra_changed(stored, item, extra_renamed, request.options),
+                );
             }
             if let Some(owner) = released_by {
                 released.entry(owner).or_default().push(item.id);
@@ -6673,10 +6983,12 @@ impl LibraryScanner {
                 &mut probes,
                 (&items_added, &items_updated, &moved_away),
                 outcome,
+                &art_cache.skipped,
                 "after the last item",
             );
             return Ok(stop);
         }
+        art_cache.skipped.report("library walk");
         probes.abort();
         // After every row is saved, so each version is stored, and before
         // the prune, whose delete follows `OwnerId`.
@@ -6714,9 +7026,13 @@ impl LibraryScanner {
             }
         };
         outcome.removed = removed.iter().map(|(_, ids)| ids.len()).sum();
+        // A failed sweep still fails the scan, after what it saved is announced.
+        let mut recovered = Ok(());
         if !outcome.stopped {
-            self.recover_user_data(run.passes).await?;
-            run.report(100.0);
+            recovered = self.recover_user_data(run.passes).await;
+            if recovered.is_ok() {
+                run.report(100.0);
+            }
         }
         // Announce what the scan changed (`LibraryChanged`) so open clients
         // refresh their library views without a manual reload. Clients must
@@ -6725,7 +7041,12 @@ impl LibraryScanner {
         // pruned rows and the rows a fold or move took away.
         moved_away.extend(removed);
         self.announce_changes(&items_added, &items_updated, &moved_away);
-        Ok(outcome)
+        recovered?;
+        // A stopped refresh answers as stopped, whatever it got through.
+        match target_failure {
+            Some(err) if !outcome.stopped => Err(err),
+            _ => Ok(outcome),
+        }
     }
 
     /// Each resolved primary's local alternate versions as ids
@@ -6994,6 +7315,7 @@ impl LibraryScanner {
         cache.omdb_poster.retain(|id, _| !keys.contains(id));
         cache.season_names.retain(|id, _| !keys.contains(id));
         cache.series_names.retain(|id, _| !keys.contains(id));
+        cache.unread_parents.retain(|id| !keys.contains(id));
         cache.locale_parents.retain(|id, _| !keys.contains(id));
         cache.resolved_locales.retain(|id, _| !keys.contains(id));
         let albums: Vec<Uuid> = touched
@@ -7015,11 +7337,7 @@ impl LibraryScanner {
             }
         }
         match self.persistence.image_metadata_for_items(touched).await {
-            Ok(stored) => {
-                for image in stored {
-                    cache.stored_images.insert(image.path.clone(), image);
-                }
-            }
+            Ok(stored) => remember_stored_images(&mut cache.stored_images, stored),
             Err(err) => tracing::warn!(%err, "could not re-read the images a refresh touched"),
         }
         let series: Vec<Uuid> = touched
@@ -7174,13 +7492,16 @@ impl LibraryScanner {
         probes: &mut ProbePipeline<'_>,
         (items_added, items_updated, removed): ScanChanges<'_>,
         mut outcome: ScanOutcome,
+        skipped: &SkippedItems,
         at: &'static str,
     ) -> ScanOutcome {
+        skipped.report("library walk");
         tracing::debug!(
             at,
             created = outcome.created,
             updated = outcome.updated,
             unchanged = outcome.unchanged,
+            skipped = outcome.skipped,
             "library scan cancelled"
         );
         probes.abort();
@@ -7747,13 +8068,14 @@ impl LibraryScanner {
         ) {
             settle_sort_name(&mut entity);
         }
-        self.sync_series_name(&mut entity, state.art_cache).await?;
-        self.sync_season_name(&mut entity, state.art_cache).await?;
+        self.sync_series_name(&mut entity, state.art_cache).await;
+        self.sync_season_name(&mut entity, state.art_cache).await;
+        self.remember_series_folder(&entity, state.art_cache).await;
         // `EpisodeMetadataService.BeforeSaveInternal`'s range guard: an
         // episode cannot end before it starts.
         ferrofin_providers::episode::discard_invalid_episode_range(&mut entity);
         self.apply_parental_rating_score(&mut entity, state.art_cache)
-            .await?;
+            .await;
         let chosen_ids_differ = identified.is_some_and(|result| {
             let chosen = search_result_ids(result);
             let before = state
@@ -8019,6 +8341,7 @@ impl LibraryScanner {
         // re-dated file, or a date a reader supplied, writes its
         // `DateCreated` over the stored one, which the first-import guard
         // would otherwise keep.
+        state.save_attempted = true;
         if writes_date_created {
             self.persistence
                 .save_scanned_items_with_date_created(std::slice::from_ref(&entity))
@@ -8472,6 +8795,14 @@ impl LibraryScanner {
         std::collections::HashSet<Uuid>,
         Vec<Uuid>,
     ) {
+        // TheTVDB's responses are kept as long as its client keeps its own
+        // (the plugin's one `CacheDurationInHours` covers them all).
+        let tvdb_duration = self
+            .tvdb
+            .as_ref()
+            .map_or(ferrofin_providers::tvdb::DEFAULT_CACHE_DURATION, |tvdb| {
+                tvdb.cache_duration()
+            });
         // Carries matched series' TMDB ids + their episode-still URLs across
         // the scan so seasons/episodes resolve against the same series lookup,
         // pre-seeded with the external ids previous scans recorded.
@@ -8480,6 +8811,8 @@ impl LibraryScanner {
         // small (clippy's `large_futures` ceiling is the tripwire).
         let mut art_cache = Box::new(ArtworkCache {
             dirs: run.dirs.cloned(),
+            series_tvdb: tvdb_cache(tvdb_duration),
+            episode_tvdb_still: tvdb_cache(tvdb_duration),
             ..ArtworkCache::default()
         });
         self.preload_provider_ids(planned, &mut art_cache).await;
@@ -8527,11 +8860,7 @@ impl LibraryScanner {
         }
         let ids: Vec<Uuid> = planned.iter().map(|p| p.id).collect();
         match self.persistence.image_metadata_for_items(&ids).await {
-            Ok(stored) => {
-                for image in stored {
-                    art_cache.stored_images.insert(image.path.clone(), image);
-                }
-            }
+            Ok(stored) => remember_stored_images(&mut art_cache.stored_images, stored),
             Err(err) => tracing::warn!(%err, "could not preload stored image metadata"),
         }
     }
@@ -8571,7 +8900,7 @@ impl LibraryScanner {
         for (&id, album) in &albums {
             touched.extend(Box::pin(self.serve_lane(run)).await);
             let images = off_runtime(|| {
-                let mut images = discover_local_images(album, &FsDirectoryService::new());
+                let mut images = discover_local_images(album, None, &FsDirectoryService::new());
                 self.append_art_dir_images(album, &mut images);
                 images
             });
@@ -9545,7 +9874,7 @@ impl LibraryScanner {
                     ))
                     && keep_on_disk(row)
             };
-            let Some((ids, paths)) = self
+            let Some((ids, children)) = self
                 .stale_rows(cf, &existing, &live, &keep_row, &listed, &own)
                 .await
             else {
@@ -9559,11 +9888,7 @@ impl LibraryScanner {
             match self.persistence.delete_items(&ids).await {
                 Ok(deleted) => {
                     if scope.is_some() {
-                        let gone: Vec<(Uuid, Option<String>)> = deleted
-                            .iter()
-                            .map(|id| (*id, paths.get(id).cloned().flatten()))
-                            .collect();
-                        log_pruned(&gone);
+                        log_pruned(&deleted, &existing, &children);
                     }
                     tracing::info!(library = %cf, removed = deleted.len(), "pruned missing or excluded items");
                     removed.push((cf, deleted));
@@ -9607,7 +9932,7 @@ impl LibraryScanner {
     /// folders (`own`), and not still on disk (unless invented at a location,
     /// [`LibraryFolders::invented`]) — less the ones still holding
     /// a row this scan keeps ([`hold_back_kept_children`]). Returns the ids
-    /// to delete and the paths of the rows read, for the report; `None` when
+    /// to delete and the rows found under them, for the report; `None` when
     /// the rows under them could not be read, when nothing is pruned.
     async fn stale_rows(
         &self,
@@ -9617,7 +9942,7 @@ impl LibraryScanner {
         keep_on_disk: &(dyn Fn(&ItemPathRow) -> bool + Sync),
         listed: &(dyn Fn(Option<&str>) -> bool + Sync),
         own: &LibraryFolders<'_>,
-    ) -> Option<(Vec<Uuid>, HashMap<Uuid, Option<String>>)> {
+    ) -> Option<(Vec<Uuid>, Vec<ferrofin_traits::persistence::ItemChildLink>)> {
         // A path-less row sits in its parent's folder: it is known only
         // where that folder is — a parent that is unknown or has no path of
         // its own leaves it unknown. And only a virtual season, which this
@@ -9674,7 +9999,7 @@ impl LibraryScanner {
             );
         }
         if stale.is_empty() {
-            return Some((Vec::new(), HashMap::new()));
+            return Some((Vec::new(), Vec::new()));
         }
         // What the deletes would take with them: never a row this scan keeps.
         let ids: Vec<Uuid> = stale.iter().copied().collect();
@@ -9712,14 +10037,7 @@ impl LibraryScanner {
             .map(|row| row.id)
             .filter(|id| stale.contains(id))
             .collect();
-        let mut paths: HashMap<Uuid, Option<String>> = existing
-            .iter()
-            .map(|row| (row.id, row.path.clone()))
-            .collect();
-        for child in &children {
-            paths.entry(child.id).or_insert_with(|| child.path.clone());
-        }
-        Some((ids, paths))
+        Some((ids, children))
     }
 
     /// Releases the stacked parts and local alternate versions (owned, no
@@ -10748,16 +11066,62 @@ impl LibraryScanner {
         fold.result
     }
 
+    /// The stored row of the parent `id` (a database id) a child's refresh
+    /// reads, `None` when there is none. A row that fails to read (see
+    /// [`Stored::Undecodable`]) counts as none, so the child keeps its own
+    /// values (`series is null ? SeriesName`, `FindSeriesName`), and is asked
+    /// for once per pass: every child of the row would otherwise read it and
+    /// warn, and all a transient error costs is this pass's names, which the
+    /// next scan puts right.
+    async fn parent_row(&self, id: &str, cache: &mut ArtworkCache) -> Option<BaseItemEntity> {
+        let items = self.item_repository.as_ref()?;
+        let parsed = parse_id(id)?;
+        if cache.unread_parents.contains(id) {
+            return None;
+        }
+        match items.retrieve_item(parsed).await {
+            Ok(row) => row,
+            Err(err) => {
+                tracing::warn!(
+                    item_id = id,
+                    %err,
+                    "could not read a parent row; its children keep their own values this scan"
+                );
+                cache.unread_parents.insert(id.to_owned());
+                None
+            }
+        }
+    }
+
+    /// The children of a series whose row the walk did not write (it is
+    /// undecodable, or its refresh failed first) take the key stored on it,
+    /// which came from its provider ids, rather than the plan's or one the
+    /// row never got. One column is read: the row may not decode.
+    async fn keep_stored_series_key(
+        &self,
+        item: &Planned,
+        series_keys: &mut HashMap<Uuid, String>,
+    ) {
+        if item_type_lookup::kind_from_type_name(&item.entity.type_) != Some(BaseItemKind::Series) {
+            return;
+        }
+        match self.persistence.presentation_unique_key(item.id).await {
+            Ok(Some(key)) => {
+                series_keys.insert(item.id, key);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::debug!(item_id = %item.id, %err, "stored series key unreadable");
+            }
+        }
+    }
+
     /// `Episode/SeasonMetadataService.BeforeSaveInternal`: `SeriesName =
     /// FindSeriesName()` — the finalized parent series' name (including locked
     /// edits and preserved case) when the series exists, else the child's
     /// own. A series' rename reaches the children this scan does not refresh
     /// through the save (`push_name_to_children` in the persistence service).
-    async fn sync_series_name(
-        &self,
-        row: &mut BaseItemEntity,
-        cache: &mut ArtworkCache,
-    ) -> Result<(), ServiceError> {
+    async fn sync_series_name(&self, row: &mut BaseItemEntity, cache: &mut ArtworkCache) {
         match item_type_lookup::kind_from_type_name(&row.type_) {
             Some(BaseItemKind::Series) => {
                 cache.series_names.insert(row.id.clone(), row.name.clone());
@@ -10765,9 +11129,7 @@ impl LibraryScanner {
             Some(BaseItemKind::Season | BaseItemKind::Episode) => {
                 if let Some(key) = row.series_id.as_ref() {
                     if !cache.series_names.contains_key(key)
-                        && let Some(items) = &self.item_repository
-                        && let Some(id) = parse_id(key)
-                        && let Some(series) = items.retrieve_item(id).await?
+                        && let Some(series) = self.parent_row(key, cache).await
                     {
                         cache.series_names.insert(key.clone(), series.name);
                     }
@@ -10778,7 +11140,34 @@ impl LibraryScanner {
             }
             _ => {}
         }
-        Ok(())
+    }
+
+    /// Records in the pass's cache the folder of the series `row` is, or
+    /// that a season `row` hangs off (`Season.Series`): `LocalImageProvider`
+    /// reads the season's `seasonNN-poster`-style images from it
+    /// (`PopulateSeasonImagesFromSeriesFolder`). A series this pass scans
+    /// records its own path, before its seasons; a season whose series it
+    /// did not scan reads the stored series once.
+    async fn remember_series_folder(&self, row: &BaseItemEntity, cache: &mut ArtworkCache) {
+        let folder = |path: Option<String>| path.filter(|path| !path.is_empty());
+        match item_type_lookup::kind_from_type_name(&row.type_) {
+            Some(BaseItemKind::Series) => {
+                cache
+                    .series_folders
+                    .insert(row.id.clone(), folder(row.path.clone()));
+            }
+            Some(BaseItemKind::Season) => {
+                if let Some(key) = row.series_id.as_ref()
+                    && !cache.series_folders.contains_key(key)
+                {
+                    let series = self.parent_row(key, cache).await;
+                    cache
+                        .series_folders
+                        .insert(key.clone(), folder(series.and_then(|series| series.path)));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// `SeasonMetadataService.EnableUpdatingPremiereDateFromChildren`
@@ -10818,11 +11207,7 @@ impl LibraryScanner {
     /// season's name, including locked edits and preserved case. A season's
     /// rename reaches the episodes this scan does not refresh through the
     /// save (`push_name_to_children` in the persistence service).
-    async fn sync_season_name(
-        &self,
-        row: &mut BaseItemEntity,
-        cache: &mut ArtworkCache,
-    ) -> Result<(), ServiceError> {
+    async fn sync_season_name(&self, row: &mut BaseItemEntity, cache: &mut ArtworkCache) {
         match item_type_lookup::kind_from_type_name(&row.type_) {
             Some(BaseItemKind::Season) => {
                 cache.season_names.insert(row.id.clone(), row.name.clone());
@@ -10830,9 +11215,7 @@ impl LibraryScanner {
             Some(BaseItemKind::Episode) => {
                 if let Some(key) = row.season_id.as_ref() {
                     if !cache.season_names.contains_key(key)
-                        && let Some(items) = &self.item_repository
-                        && let Some(id) = parse_id(key)
-                        && let Some(season) = items.retrieve_item(id).await?
+                        && let Some(season) = self.parent_row(key, cache).await
                     {
                         cache.season_names.insert(key.clone(), season.name);
                     }
@@ -10843,7 +11226,6 @@ impl LibraryScanner {
             }
             _ => {}
         }
-        Ok(())
     }
 
     /// `BaseItem.GetPreferredMetadataLanguage/CountryCode`: own override,
@@ -11001,10 +11383,10 @@ impl LibraryScanner {
     /// A movie or series is fetched by the IMDb id in the lookup — an NFO's, a
     /// previous match's, or the one a provider that ran before it in this
     /// pass found — and only without one found by OMDb's exact-title
-    /// endpoint (`OmdbItemProvider.GetResult` → `GetImdbId`). An episode is
-    /// read out of its series' season listing, keyed by the series' IMDb id
-    /// recorded earlier in this scan. `None` when OMDb has nothing (or has no
-    /// key).
+    /// endpoint, by its parsed name (`OmdbItemProvider.GetResult` →
+    /// `GetImdbId`, [`video_resolver::parse_name`]). An episode is read out of
+    /// its series' season listing, keyed by the series' IMDb id recorded
+    /// earlier in this scan. `None` when OMDb has nothing (or has no key).
     ///
     /// `Rated` and `Genres` are only taken for an English library (OMDb has no
     /// localization — C# `IsConfiguredForEnglish`), and `Rated` additionally
@@ -11042,8 +11424,14 @@ impl LibraryScanner {
                 match (own_imdb.as_deref(), name) {
                     (Some(imdb), _) => omdb.item(imdb).await,
                     (None, Some(name)) => {
-                        let cleaned = ferrofin_providers::tmdb::clean_name(name);
-                        omdb.find_by_title(kind, &cleaned, year).await
+                        // `GetSearchResultsInternal` (`OmdbItemProvider.cs:106-125`):
+                        // the name is a file or folder name (`Movie (2016)`), so
+                        // `&t=` gets `ParseName`'s title, as it is (no TMDb
+                        // `CleanName`), and `&y=` the year in the name when the
+                        // item has none.
+                        let parsed = video_resolver::parse_name(name, &PATH_NAMING);
+                        omdb.find_by_title(kind, &parsed.name, year.or(parsed.year))
+                            .await
                     }
                     (None, None) => None,
                 }
@@ -11097,11 +11485,11 @@ impl LibraryScanner {
     ///
     /// The title is fetched by the `Tmdb` id in the lookup, else resolved
     /// through `/find` by its IMDb id (a series also by its TVDB id), and
-    /// searched by name only without any of them — so a `Tmdb` id a provider
-    /// that ran before it found (TVDB's remote ids) spares the search. Its
-    /// answer carries the title's IMDb id and, for a series, its TVDB id
-    /// (`TmdbSeriesProvider.cs:306-312`), which the providers after it resolve
-    /// by.
+    /// searched by its parsed name ([`video_resolver::parse_name`]) only
+    /// without any of them — so a `Tmdb` id a provider that ran before it found
+    /// (TVDB's remote ids) spares the search. Its answer carries the title's
+    /// IMDb id and, for a series, its TVDB id (`TmdbSeriesProvider.cs:306-312`),
+    /// which the providers after it resolve by.
     async fn fetch_tmdb_metadata(
         &self,
         row: &BaseItemEntity,
@@ -11124,7 +11512,6 @@ impl LibraryScanner {
             "Series" => TmdbKind::Series,
             _ => return None,
         };
-        let year = lookup.year(row);
         // C# `TmdbMovieProvider.GetMetadata` reads `info.GetProviderId(Tmdb)`
         // first and only searches by title when there is none, so a `<tmdbid>`
         // the user pinned in an NFO is honoured rather than re-guessed.
@@ -11141,12 +11528,18 @@ impl LibraryScanner {
         let tmdb_id = if let Some(id) = pinned {
             id
         } else {
-            let name = lookup.name(row)?;
-            let cleaned = ferrofin_providers::tmdb::clean_name(&name);
+            // "ParseName is required here" (`TmdbMovieProvider.cs:162-170`,
+            // `TmdbSeriesProvider.cs:201-208`): the name is a file or folder
+            // name (`Movie (2016)`), so the search and the match go by the
+            // parsed title, and by the year in the name when the item has none.
+            let parsed = video_resolver::parse_name(&lookup.name(row)?, &PATH_NAMING);
+            let year = lookup.year(row).or(parsed.year);
+            let cleaned = ferrofin_providers::tmdb::clean_name(&parsed.name);
             let results = tmdb
                 .search(kind, &cleaned, year, lookup.tmdb_language().as_deref())
                 .await;
-            ferrofin_providers::tmdb::find_best_match(&results, &name, year).map(|h| h.tmdb_id)?
+            ferrofin_providers::tmdb::find_best_match(&results, &parsed.name, year)
+                .map(|h| h.tmdb_id)?
         };
         // The seasons/episodes below this series key off the cached id.
         // Cached however the id was resolved — a pinned series id serves its
@@ -11259,11 +11652,12 @@ impl LibraryScanner {
         ) else {
             return None;
         };
-        let ep = self
-            .season_details_cached(cache, &series_id, season, lookup.tmdb_language().as_deref())
-            .await
-            .and_then(|d| episode_in_season(d, number))?
-            .clone();
+        let ep = {
+            let details = self
+                .season_details_cached(cache, &series_id, season, lookup.tmdb_language().as_deref())
+                .await?;
+            episode_in_season(&details, number)?.clone()
+        };
         let mut answer = RemoteAnswer::for_row(row, None);
         apply_tmdb_episode(&mut answer.item, &ep);
         // The episode's external ids, trailers and credits, in one request
@@ -11326,8 +11720,8 @@ impl LibraryScanner {
     /// this scan's match, the one TheTVDB carried, else the one recorded for
     /// the series ([`series_tmdb_id_of`]); without a number or a series id
     /// there is no answer and no request (`:53-56`). Its response is the
-    /// series' `/tv/{id}/season/{n}`, fetched at most once per scan and
-    /// shared with the season's episodes and its poster
+    /// series' `/tv/{id}/season/{n}`, fetched once while the cache keeps it
+    /// and shared with the season's episodes and its poster
     /// ([`season_details_cached`](Self::season_details_cached)), as
     /// upstream's `TmdbClientManager.GetSeasonAsync` serves the season
     /// provider, the episode provider and the image providers from one
@@ -11350,7 +11744,7 @@ impl LibraryScanner {
         let import_season_name = tmdb.import_season_name().await;
         Some(RemoteAnswer::of_result(
             row,
-            ferrofin_providers::season::tmdb_answer(details, number, import_season_name),
+            ferrofin_providers::season::tmdb_answer(&details, number, import_season_name),
             None,
         ))
     }
@@ -11643,25 +12037,21 @@ impl LibraryScanner {
     async fn stored_person_image_metadata(
         &self,
         written: &[ferrofin_traits::persistence::WrittenPerson],
-    ) -> std::collections::HashMap<String, StoredImageMetadata> {
+    ) -> ProbedImages {
+        let mut images = ProbedImages::new();
         let with_art: Vec<Uuid> = written
             .iter()
             .filter(|p| p.image_url.is_some())
             .map(|p| p.id)
             .collect();
         if with_art.is_empty() {
-            return std::collections::HashMap::new();
+            return images;
         }
         match self.persistence.image_metadata_for_items(&with_art).await {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|row| (row.path.clone(), row))
-                .collect(),
-            Err(err) => {
-                tracing::warn!(%err, "could not read stored person image metadata");
-                std::collections::HashMap::new()
-            }
+            Ok(rows) => remember_stored_images(&mut images, rows),
+            Err(err) => tracing::warn!(%err, "could not read stored person image metadata"),
         }
+        images
     }
 
     /// The stored row and `LockedFields` of every credited person whose
@@ -12452,16 +12842,7 @@ impl LibraryScanner {
             .finish_artwork(entity, &mut images, stored, dirs.as_deref())
             .await;
         for image in &images {
-            art_cache.stored_images.insert(
-                image.path.clone(),
-                StoredImageMetadata {
-                    path: image.path.clone(),
-                    width: image.width,
-                    height: image.height,
-                    blur_hash: image.blur_hash.clone(),
-                    date_modified: image.date_modified,
-                },
-            );
+            remember_settled_image(&mut art_cache.stored_images, image);
         }
         // Validation that finds none of the stored images any more removes
         // them (`ValidateImages` drops the deleted ones and saves), so an
@@ -13167,7 +13548,7 @@ impl LibraryScanner {
             return Ok(false);
         };
         let dir = FsDirectoryService::new();
-        let mut found = discover_local_images(&row, &dir);
+        let mut found = discover_local_images(&row, None, &dir);
         if let Some(mut library) = local_image_item(&row) {
             // Its own folder is the first of upstream's `PhysicalLocations`,
             // and already read above.
@@ -13549,13 +13930,17 @@ impl LibraryScanner {
                 // of a type supplies it, the later ones fill the types it
                 // lacks. The stored Tvdb id also keys Fanart on an image-only
                 // refresh.
+                // One instant for the check and the read (as in
+                // `season_details_cached`): a record stored after it is
+                // still live then.
+                let now = std::time::Instant::now();
                 let tvdb_id = cache
                     .series_tvdb
-                    .get(&entity.id)
+                    .get_at(&entity.id, now)
                     .map(|d| d.tvdb_id)
                     .or_else(|| recorded_provider_id(cache, &entity.id, "Tvdb"));
                 if policy.image_enabled(short, fetcher_names::TVDB)
-                    && !cache.series_tvdb.contains_key(&entity.id)
+                    && !cache.series_tvdb.contains_key_at(&entity.id, now)
                     && let (Some(tvdb), Some(id)) = (&self.tvdb, tvdb_id)
                     && let Some(details) = tvdb
                         .series_details(id, &self.three_letter_country(&locale.1))
@@ -13565,7 +13950,7 @@ impl LibraryScanner {
                 }
                 let tvdb_art = policy
                     .image_enabled(short, fetcher_names::TVDB)
-                    .then(|| cache.series_tvdb.get(&entity.id))
+                    .then(|| cache.series_tvdb.get_at(&entity.id, now))
                     .flatten();
                 let mut sources = vec![(
                     fetcher_names::TVDB,
@@ -13642,8 +14027,9 @@ impl LibraryScanner {
             .await
     }
 
-    /// The `/tv/{id}/season/{n}` response for one season, fetched at most once
-    /// per scan.
+    /// The `/tv/{id}/season/{n}` response for one season, fetched once while
+    /// the scan's TMDB cache keeps it (`TmdbClientManager`'s rules,
+    /// [`tmdb_season_cache`]): an hour, within its size limit.
     ///
     /// That single response carries the season poster, every episode's still
     /// URL, and every episode's name/overview — so the metadata pass (episode
@@ -13664,9 +14050,12 @@ impl LibraryScanner {
         series_id: &str,
         season: i32,
         language: Option<&str>,
-    ) -> Option<&'a ferrofin_providers::tmdb::SeasonDetails> {
+    ) -> Option<std::borrow::Cow<'a, ferrofin_providers::tmdb::SeasonDetails>> {
         let key = (series_id.to_owned(), season, language.map(str::to_owned));
-        if !cache.season_details.contains_key(&key) {
+        // One instant for the check and the read, so an entry that expires
+        // between them cannot read as a miss nothing was asked for.
+        let now = std::time::Instant::now();
+        if !cache.season_details.contains_key_at(&key, now) {
             let tmdb = self.tmdb.as_ref()?;
             // No series match yet → no request to make, and no miss to record.
             let tmdb_id = series_tmdb_id_of(cache, series_id)?;
@@ -13679,17 +14068,23 @@ impl LibraryScanner {
                 None if failures > 0 => SeasonLookup::Failed,
                 None => SeasonLookup::Missing,
             };
-            cache.season_details.insert(key.clone(), lookup);
-        }
-        match cache.season_details.get(&key)? {
-            SeasonLookup::Found(details) => Some(details),
-            SeasonLookup::Missing => None,
-            SeasonLookup::Failed => {
-                // Counted into the reading item's own refresh (the scope the
-                // original request ran in is the first reader's only).
-                ferrofin_providers::rate_limit::note_request_failure();
-                None
+            // A response the cache has no room for is not kept (the next
+            // reader asks again), but it still answers this one, as
+            // `GetSeasonAsync` returns what it fetched whether or not its
+            // `MemoryCache` kept it.
+            if let Some(unkept) = cache.season_details.insert(key.clone(), lookup) {
+                unkept.count_failure();
+                return match unkept {
+                    SeasonLookup::Found(details) => Some(std::borrow::Cow::Owned(details)),
+                    SeasonLookup::Missing | SeasonLookup::Failed => None,
+                };
             }
+        }
+        let lookup = cache.season_details.get_at(&key, now)?;
+        lookup.count_failure();
+        match lookup {
+            SeasonLookup::Found(details) => Some(std::borrow::Cow::Borrowed(details)),
+            SeasonLookup::Missing | SeasonLookup::Failed => None,
         }
     }
 
@@ -13923,6 +14318,10 @@ impl LibraryScanner {
         if let Some(order) = cache.display_orders.get(series_id) {
             return Some(order.clone());
         }
+        if cache.unread_parents.contains(series_id) {
+            ferrofin_providers::rate_limit::note_request_failure();
+            return None;
+        }
         let (Some(items), Ok(id)) = (&self.item_repository, Uuid::parse_str(series_id)) else {
             return Some(String::new());
         };
@@ -13952,6 +14351,7 @@ impl LibraryScanner {
             return false;
         };
         let Some(order) = self.series_display_order(cache, series_id).await else {
+            cache.unread_parents.insert(series_id.to_owned());
             return false;
         };
         let absolute = order.eq_ignore_ascii_case("absolute");
@@ -14644,11 +15044,10 @@ impl LibraryScanner {
                     // `list` applies the ignore rules here too; upstream's
                     // `GetFiles` of an extras folder applies none (gl-755,
                     // awaiting the owner: Jellyfin bug or behaviour to port).
-                    let files: Vec<_> = self
+                    let files = self
                         .list(&entry.path, ctx)
                         .into_iter()
-                        .filter(|file| file.type_ != FileSystemEntryType::Directory)
-                        .collect();
+                        .filter(|file| file.type_ != FileSystemEntryType::Directory);
                     let mixed = ctx
                         .direct_file_counts
                         .borrow()
@@ -14656,7 +15055,7 @@ impl LibraryScanner {
                         .copied()
                         .unwrap_or(0)
                         > 1;
-                    candidates.extend(files.into_iter().map(|file| (file.path, mixed)));
+                    candidates.extend(files.map(|file| (file.path, mixed)));
                 }
             } else {
                 candidates.push((entry.path.clone(), false));
@@ -15039,7 +15438,7 @@ impl LibraryScanner {
         };
         // The movie, or the lone video of a folder that is no photo album,
         // owns the folder's extras.
-        if let Some(owner) = movie.as_ref().or(lone.filter(|_| album.is_none())) {
+        if let Some(owner) = movie.as_ref().or_else(|| lone.filter(|_| album.is_none())) {
             self.register_extras_owner(dir, owner, kind, ctx, movies_by_dir);
         }
         let folder = MovieFolder {
@@ -21127,7 +21526,8 @@ fn embedded_video_people(info: &MediaInfo) -> Vec<PeopleEntity> {
         .collect()
 }
 
-/// The naming rules [`before_metadata_refresh`] reads a path by.
+/// The naming rules [`before_metadata_refresh`] reads a path by, and the
+/// remote lookups parse a name by (`LibraryManager.ParseName`'s `_namingOptions`).
 static PATH_NAMING: std::sync::LazyLock<NamingOptions> =
     std::sync::LazyLock::new(NamingOptions::new);
 
@@ -21552,6 +21952,23 @@ fn overlay_file_facts(row: &mut BaseItemEntity, scanned: &BaseItemEntity, probe_
     }
 }
 
+/// Whether the walk created, re-owned or renamed the extra `item` or refreshed
+/// it in full. A row not stored before (or not readable) is a new extra.
+fn extra_changed(
+    stored: Stored<'_>,
+    item: &Planned,
+    renamed: bool,
+    options: &MetadataRefreshOptions,
+) -> bool {
+    let new_or_changed = match stored {
+        Stored::Existing(row) => row.owner_id != item.entity.owner_id || renamed,
+        _ => true,
+    };
+    new_or_changed
+        || options.replace_all_metadata
+        || options.metadata_refresh_mode == MetadataRefreshMode::FullRefresh
+}
+
 /// The owners whose owned videos a walk copies metadata to
 /// ([`LibraryScanner::copy_to_owned_videos`]).
 #[derive(Debug, Default)]
@@ -21564,6 +21981,37 @@ struct OwnedCopies {
     /// Each extra the walk refreshed: its owner, its id, and whether the
     /// walk created, re-owned or renamed it or refreshed it in full.
     extras: Vec<(Uuid, Uuid, bool)>,
+}
+
+impl OwnedCopies {
+    /// The walk saved `item`, which is `created_or_moved` if so: an owner
+    /// copies to what it owns, and a part or version it did not have yet
+    /// makes its owner copy.
+    fn note_saved(&mut self, item: &Planned, created_or_moved: bool) {
+        if crate::video_versions::owns_videos(item.entity.data.as_deref()) {
+            self.saved.push(item.id);
+        } else if created_or_moved
+            && item.entity.extra_type.is_none()
+            && let Some(owner) = owner_of(item)
+        {
+            self.saved.push(owner);
+        }
+    }
+
+    /// The walk refreshed the extra `item`: it is listed under its owner.
+    fn note_extra(&mut self, item: &Planned, changed: bool) {
+        if let Some(owner) = owner_of(item) {
+            self.extras.push((owner, item.id, changed));
+        }
+    }
+}
+
+/// The id of `item`'s owner, when it has one.
+fn owner_of(item: &Planned) -> Option<Uuid> {
+    item.entity
+        .owner_id
+        .as_deref()
+        .and_then(|owner| Uuid::parse_str(owner).ok())
 }
 
 /// Whether `entity` is a stacked movie's additional part as the planner
@@ -22806,73 +23254,6 @@ impl SeasonNames {
     }
 }
 
-/// Port of `ItemImageProvider.MergeImages` for images found on disk: for each
-/// singular type, the first found image replaces the item's first image of
-/// that type when the paths differ (ignoring case). Found backdrops are added
-/// as `BaseItem.AddImages` adds them: one not stored yet is appended, and
-/// none is removed or reordered. An image found again at the path it is
-/// stored under is refreshed (`refresh_found`). Returns whether anything is to
-/// be written.
-fn merge_local_images(images: &mut Vec<ItemImageInfo>, found: &[ItemImageInfo]) -> bool {
-    let mut changed = false;
-    let mut singular: Vec<ImageType> = Vec::new();
-    for image in found {
-        if image.image_type != ImageType::Backdrop && !singular.contains(&image.image_type) {
-            singular.push(image.image_type);
-        }
-    }
-    for image_type in singular {
-        let Some(new) = found.iter().find(|i| i.image_type == image_type) else {
-            continue;
-        };
-        match images.iter_mut().find(|i| i.image_type == image_type) {
-            Some(current) if current.path.eq_ignore_ascii_case(&new.path) => {
-                changed |= refresh_found(current, new);
-            }
-            Some(current) => {
-                *current = new.clone();
-                changed = true;
-            }
-            None => {
-                images.push(new.clone());
-                changed = true;
-            }
-        }
-    }
-    for new in found.iter().filter(|i| i.image_type == ImageType::Backdrop) {
-        if let Some(current) = images
-            .iter_mut()
-            .find(|i| i.image_type == ImageType::Backdrop && i.path.eq_ignore_ascii_case(&new.path))
-        {
-            changed |= refresh_found(current, new);
-        } else {
-            images.push(new.clone());
-            changed = true;
-        }
-    }
-    changed
-}
-
-/// An image found again at the path it is stored under: when its file's
-/// modification time moved by more than a second and it has stored
-/// dimensions, they are cleared and the time taken, and the row is to be
-/// written. A smaller difference is the database's precision, not a change
-/// (`MergeImages`/`AddImages`: "an exact comparison would treat every
-/// unchanged image as modified").
-fn refresh_found(current: &mut ItemImageInfo, new: &ItemImageInfo) -> bool {
-    let moved = (current.date_modified - new.date_modified)
-        .num_milliseconds()
-        .abs()
-        > 1000;
-    if moved && (current.width > 0 || current.height > 0) {
-        current.width = 0;
-        current.height = 0;
-        current.date_modified = new.date_modified;
-        return true;
-    }
-    false
-}
-
 fn image_item_kind(type_: &str) -> ImageItemKind {
     match type_.rsplit('.').next().unwrap_or(type_) {
         "Movie" => ImageItemKind::Movie,
@@ -22900,7 +23281,13 @@ fn image_item_kind(type_: &str) -> ImageItemKind {
 /// Whether an image row already carries everything the DTO layer needs, so
 /// nothing has to decode the file.
 fn image_metadata_is_complete(image: &ItemImageInfo) -> bool {
-    image.width > 0 && image.height > 0 && image.blur_hash.as_ref().is_some_and(|b| !b.is_empty())
+    probe_is_complete(image.width, image.height, image.blur_hash.as_deref())
+}
+
+/// The first test of `ImageNeedsRefresh`: a width, a height and a non-empty
+/// blurhash are all recorded.
+fn probe_is_complete(width: i32, height: i32, blur_hash: Option<&str>) -> bool {
+    width > 0 && height > 0 && blur_hash.is_some_and(|b| !b.is_empty())
 }
 
 /// Copies a previous scan's dimensions and blurhash onto each discovered image
@@ -22911,10 +23298,7 @@ fn image_metadata_is_complete(image: &ItemImageInfo) -> bool {
 /// selecting only the `ImageNeedsRefresh` images: upstream's `BaseItem` already
 /// holds the previous values in memory, so it simply leaves the untouched ones
 /// alone. Here they come from the scan's one-query image preread.
-fn adopt_stored_image_metadata(
-    images: &mut [ItemImageInfo],
-    stored: &std::collections::HashMap<String, StoredImageMetadata>,
-) {
+fn adopt_stored_image_metadata(images: &mut [ItemImageInfo], stored: &ProbedImages) {
     if stored.is_empty() {
         return;
     }
@@ -22929,6 +23313,93 @@ fn adopt_stored_image_metadata(
     }
 }
 
+/// Image file path → what a probe recorded for that file
+/// ([`remember_probed_image`]).
+type ProbedImages = HashMap<String, ProbedImage>;
+
+/// What a probe recorded for one image file: a stored row
+/// ([`StoredImageMetadata`]), or an image the scan just finished, without
+/// the path the map holding it is keyed by.
+#[derive(Debug, Clone)]
+struct ProbedImage {
+    /// The pixel width (`0` when never probed).
+    width: i32,
+    /// The pixel height (`0` when never probed).
+    height: i32,
+    /// The blurhash, absent when never computed.
+    blur_hash: Option<String>,
+    /// The file mtime the values were computed from.
+    date_modified: chrono::DateTime<Utc>,
+}
+
+impl ProbedImage {
+    /// A stored row's probe, and the path it is of.
+    fn of_row(row: StoredImageMetadata) -> (String, Self) {
+        let StoredImageMetadata {
+            path,
+            width,
+            height,
+            blur_hash,
+            date_modified,
+        } = row;
+        (
+            path,
+            Self {
+                width,
+                height,
+                blur_hash,
+                date_modified,
+            },
+        )
+    }
+
+    /// What the scan settled for `image`.
+    fn of_image(image: &ItemImageInfo) -> Self {
+        Self {
+            width: image.width,
+            height: image.height,
+            blur_hash: image.blur_hash.clone(),
+            date_modified: image.date_modified,
+        }
+    }
+
+    /// [`probe_is_complete`]: a probe without a width, a height or a
+    /// blurhash is never adopted ([`image_metadata_is_current`]).
+    fn is_complete(&self) -> bool {
+        probe_is_complete(self.width, self.height, self.blur_hash.as_deref())
+    }
+}
+
+/// Records `image` as the probe of the file at `path`. Only a complete one
+/// is kept, as no other can be adopted; an incomplete one removes what the
+/// path held, as replacing it would.
+fn remember_probed_image(images: &mut ProbedImages, path: String, image: ProbedImage) {
+    if image.is_complete() {
+        images.insert(path, image);
+    } else {
+        images.remove(&path);
+    }
+}
+
+/// Records what the scan settled for `image` as its file's probe, as
+/// [`remember_probed_image`] would, cloning only a probe it keeps.
+fn remember_settled_image(images: &mut ProbedImages, image: &ItemImageInfo) {
+    if image_metadata_is_complete(image) {
+        images.insert(image.path.clone(), ProbedImage::of_image(image));
+    } else {
+        images.remove(&image.path);
+    }
+}
+
+/// Records each stored row's probe ([`remember_probed_image`]), later rows
+/// over earlier ones.
+fn remember_stored_images(images: &mut ProbedImages, rows: Vec<StoredImageMetadata>) {
+    for row in rows {
+        let (path, image) = ProbedImage::of_row(row);
+        remember_probed_image(images, path, image);
+    }
+}
+
 /// Whether `stored` still describes the file, so its dimensions and blurhash
 /// can be reused instead of re-probing.
 ///
@@ -22939,13 +23410,8 @@ fn adopt_stored_image_metadata(
 /// one-second tolerance is upstream's, and it is load-bearing — a filesystem
 /// that stores mtimes at whole-second resolution would otherwise never agree
 /// with a sub-second timestamp Ferrofin wrote.
-fn image_metadata_is_current(
-    stored: &StoredImageMetadata,
-    file_modified: chrono::DateTime<Utc>,
-) -> bool {
-    stored.width > 0
-        && stored.height > 0
-        && stored.blur_hash.as_ref().is_some_and(|b| !b.is_empty())
+fn image_metadata_is_current(stored: &ProbedImage, file_modified: chrono::DateTime<Utc>) -> bool {
+    stored.is_complete()
         && stored
             .date_modified
             .signed_duration_since(file_modified)
@@ -22960,21 +23426,31 @@ fn image_metadata_is_current(
 /// Dimensions are left `0` (unknown) here; they are filled in afterwards, either
 /// by adopting a previous scan's probe or by decoding the file. Episodes use the
 /// episode provider; everything the generic provider supports uses it;
-/// unsupported kinds yield nothing.
+/// unsupported kinds yield nothing. `series_folder` is a season's series
+/// folder ([`season_image_item`]); other kinds ignore it. Of what the provider
+/// lists, the first image of each singular type is kept, as `MergeImages`
+/// keeps it ([`first_of_each_singular_type`]): the rows the scan stores are
+/// the item's images, so a second Primary must not reach them.
 fn discover_local_images<D: ferrofin_providers::DirectoryService>(
     entity: &BaseItemEntity,
+    series_folder: Option<&str>,
     dir: &D,
 ) -> Vec<ItemImageInfo> {
-    let Some(item) = local_image_item(entity) else {
+    let item = if image_item_kind(&entity.type_) == ImageItemKind::Season {
+        Some(season_image_item(entity, series_folder))
+    } else {
+        local_image_item(entity)
+    };
+    let Some(item) = item else {
         return Vec::new();
     };
-    local_image_infos(if item.kind == ImageItemKind::Episode {
+    first_of_each_singular_type(local_image_infos(if item.kind == ImageItemKind::Episode {
         EpisodeLocalImageProvider::get_images(&item, dir)
     } else if LocalImageProvider::supports(&item) {
         LocalImageProvider::get_images(&item, dir)
     } else {
         Vec::new()
-    })
+    }))
 }
 
 /// The item as the local image providers see it: its kind, name, path,
@@ -23005,19 +23481,20 @@ fn local_image_item(entity: &BaseItemEntity) -> Option<ImageItem> {
     Some(item)
 }
 
-/// Image rows for images a local provider found, dated by their files.
-fn local_image_infos(found: Vec<ferrofin_providers::LocalImageInfo>) -> Vec<ItemImageInfo> {
-    found
-        .into_iter()
-        .map(|local| ItemImageInfo {
-            date_modified: file_date_modified(Path::new(&local.file_info.full_name)),
-            path: local.file_info.full_name,
-            image_type: local.type_,
-            width: 0,
-            height: 0,
-            blur_hash: None,
+/// A season as the local image provider sees it: [`local_image_item`], plus
+/// what `PopulateSeasonImagesFromSeriesFolder` reads, its `IndexNumber` and
+/// its series' folder (`Season.Series.ContainingFolderPath`), whose
+/// `seasonNN-poster`-style images come before its own folder's. A season with
+/// no folder of its own (`LocationType.Virtual`) has no path or folder, so
+/// only its series' folder is read.
+fn season_image_item(entity: &BaseItemEntity, series_folder: Option<&str>) -> ImageItem {
+    local_image_item(entity)
+        .filter(|_| !is_path_less(entity))
+        .unwrap_or_else(|| ImageItem {
+            name: entity.name.clone().unwrap_or_default(),
+            ..ImageItem::default()
         })
-        .collect()
+        .with_season(entity.index_number, series_folder.map(str::to_owned))
 }
 
 mod artwork;
@@ -23027,6 +23504,7 @@ mod missing_episodes;
 mod music;
 mod obsolete_episodes;
 mod playlists;
+mod provider_cache;
 mod trickplay;
 
 #[cfg(test)]
@@ -24339,7 +24817,8 @@ mod tests {
         let scanner = scanner.with_tvdb(Arc::new(
             ferrofin_providers::TvdbClient::new().with_base_url(&base),
         ));
-        assert!(scanner.tvdb_child_images(&episode, &cache).await.is_empty());
+        let tvdb_child_images = scanner.tvdb_child_images(&episode, &cache).await;
+        assert!(tvdb_child_images.is_empty(), "{tvdb_child_images:?}");
         assert!(requests.lock().unwrap().is_empty());
         cache.item_provider_ids.insert(
             "SERIES".to_owned(),
@@ -25186,8 +25665,10 @@ mod tests {
                 "{movie}"
             );
         }
-        assert!(embedded_image_types(&stored("Audio.Audio")).is_empty());
-        assert!(embedded_image_types(&stored("TV.Series")).is_empty());
+        let found = embedded_image_types(&stored("Audio.Audio"));
+        assert!(found.is_empty(), "{found:?}");
+        let found = embedded_image_types(&stored("TV.Series"));
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[allow(clippy::too_many_lines)]
@@ -26264,7 +26745,8 @@ mod tests {
             [Tmdb, Tvdb],
             "Identify's provider first"
         );
-        assert!(scanner.remote_sources(default, "Audio", None).is_empty());
+        let remote_sources = scanner.remote_sources(default, "Audio", None);
+        assert!(remote_sources.is_empty(), "{remote_sources:?}");
         let tvdb_first = tvdb_first_options();
         let saved = super::FetcherPolicy {
             options: Some(&tvdb_first),
@@ -26714,7 +27196,7 @@ mod tests {
             },
             "Movie",
         );
-        assert!(images.is_empty());
+        assert!(images.is_empty(), "{images:?}");
     }
 
     /// Serves `manifest` for `thumbs.txt` requests and `image` for everything
@@ -27461,13 +27943,8 @@ mod tests {
             let row = items.retrieve_item(id).await.unwrap().unwrap();
             assert!(row.date_last_refreshed.is_some(), "{:?} stamped", row.name);
         }
-        assert!(
-            items
-                .get_image_infos(unknown_id)
-                .await
-                .expect("images")
-                .is_empty()
-        );
+        let image_infos = items.get_image_infos(unknown_id).await.expect("images");
+        assert!(image_infos.is_empty(), "{image_infos:?}");
 
         // Idempotent: a second pass leaves the single image row in place.
         scanner
@@ -28746,7 +29223,7 @@ mod tests {
             ..BaseItemEntity::default()
         };
         super::apply_audio_metadata(&mut row, &info, None);
-        assert_eq!(row.normalization_gain, expected.or(Some(-9.0)));
+        assert_eq!(row.normalization_gain, Some(expected.unwrap_or(-9.0)));
     }
 
     /// A rescan lays the probed gain over the stored row; a probe that read
@@ -29362,7 +29839,7 @@ mod tests {
 
         let images = LibraryScanner::series_tmdb_images(&tmdb, &series, &mut cache, None).await;
 
-        assert!(images.is_empty());
+        assert!(images.is_empty(), "{images:?}");
         assert_eq!(
             all.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -29474,7 +29951,7 @@ mod tests {
         assert!(with_tvdb.wants_backfill(&series(Some("x"), None), policy));
         // TVDB arm (TVDB ranked first): overview only for the series; the
         // episode gate as is.
-        assert!(with_tvdb.wants_backfill(&series(None, trailers.clone()), tvdb_policy));
+        assert!(with_tvdb.wants_backfill(&series(None, trailers), tvdb_policy));
         assert!(
             !with_tvdb.wants_backfill(&series(Some("x"), None), tvdb_policy),
             "TVDB never supplies trailers, so their absence is no trigger"
@@ -30671,6 +31148,7 @@ mod tests {
             carried: None,
             regrouped: None,
             moved: None,
+            roots_requested: false,
         };
         let at = |id: u128, path: &str| super::Planned {
             id: uuid::Uuid::from_u128(id),
@@ -31497,11 +31975,8 @@ mod tests {
             9,
             "an item without library options allows all embedded subtitles"
         );
-        assert!(
-            super::LibraryScanner::apply_probe(&mut row, None, false, policy)
-                .streams
-                .is_empty()
-        );
+        let streams = super::LibraryScanner::apply_probe(&mut row, None, false, policy).streams;
+        assert!(streams.is_empty(), "{streams:?}");
     }
 
     #[tokio::test]
@@ -31574,9 +32049,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(rows.streams.is_empty());
+        assert!(rows.streams.is_empty(), "{:?}", rows.streams);
         scanner.persist_probe_rows(id, &rows, None).await.unwrap();
-        assert!(streams.get_media_streams(&query).await.unwrap().is_empty());
+        let media_streams = streams.get_media_streams(&query).await.unwrap();
+        assert!(media_streams.is_empty(), "{media_streams:?}");
     }
 
     /// `FFProbeVideoInfo.Fetch` (`FFProbeVideoInfo.cs:263-266`): a video's
@@ -31798,7 +32274,7 @@ mod tests {
         assert_eq!(kept.merged, recorded);
         assert!(!kept.changed);
         let dropped = settle(&mut cache, true, &[]);
-        assert!(dropped.merged.is_empty());
+        assert!(dropped.merged.is_empty(), "{:?}", dropped.merged);
         assert!(dropped.drops_stored && dropped.changed);
         let replaced = settle(&mut cache, true, &[("Tmdb".to_owned(), "603".to_owned())]);
         assert_eq!(replaced.merged, [("Tmdb".to_owned(), "603".to_owned())]);
@@ -32682,6 +33158,249 @@ mod tests {
         );
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(cache.season_details.is_empty());
+    }
+
+    // A season's response is kept for `TmdbClientManager.CacheDurationInHours`
+    // after it was fetched, then asked for again, as `GetSeasonAsync` asks
+    // once its `MemoryCache` entry has expired. Before, the scan kept every
+    // season it fetched until it ended.
+    #[tokio::test]
+    async fn a_season_is_fetched_again_once_the_tmdb_cache_duration_has_passed() {
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, mut cache, episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        let guesses = super::ResolverGuesses::default();
+        let season_requests = || hits.load(std::sync::atomic::Ordering::SeqCst);
+        let second = std::time::Duration::from_secs(1);
+
+        let first = scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &guesses)
+            .await
+            .expect("the first read");
+        assert_eq!(first.item.name.as_deref(), Some("Winter Is Coming"));
+        cache
+            .season_details
+            .pass(super::TMDB_CACHE_DURATION.saturating_sub(second));
+        scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &guesses)
+            .await
+            .expect("a read within the hour");
+        assert_eq!(season_requests(), 1, "kept for the hour");
+
+        cache.season_details.pass(second);
+        let again = scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &guesses)
+            .await
+            .expect("a read after the hour");
+        assert_eq!(again.item.name.as_deref(), Some("Winter Is Coming"));
+        assert_eq!(season_requests(), 2, "expired, so asked again");
+        scanner
+            .fetch_tmdb_episode(&episode, &mut cache, &guesses)
+            .await
+            .expect("a read of the new response");
+        assert_eq!(season_requests(), 2, "kept for an hour from then");
+    }
+
+    // A season the cache has no room for is not kept, but still answers the
+    // item that fetched it, as `GetSeasonAsync` returns what it fetched
+    // whether or not its `MemoryCache` kept it; the next reader asks again.
+    // A miss and a failure it could not keep answer `None` the same way, and
+    // the failure still counts against the reading item.
+    #[tokio::test]
+    async fn a_season_the_cache_cannot_keep_still_answers_its_reader() {
+        use std::io::{Read as _, Write as _};
+        let no_room = || {
+            super::ProviderCache::bounded(
+                super::TMDB_CACHE_DURATION,
+                0,
+                super::SeasonLookup::estimate_size,
+            )
+        };
+        let guesses = super::ResolverGuesses::default();
+        let tmp = tempfile::tempdir().unwrap();
+
+        let (base, hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (scanner, mut cache, episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        cache.season_details = no_room();
+        for read in 1..=2 {
+            let answer = scanner
+                .fetch_tmdb_episode(&episode, &mut cache, &guesses)
+                .await
+                .expect("the fetched season answers");
+            assert_eq!(answer.item.name.as_deref(), Some("Winter Is Coming"));
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), read);
+        }
+        assert!(cache.season_details.is_empty(), "nothing kept");
+
+        let (base, hits, _all) = spawn_tmdb_server(None, Some(CREDITS_JSON));
+        let (scanner, mut cache, _episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        cache.season_details = no_room();
+        for read in 1..=2 {
+            assert!(
+                scanner
+                    .season_details_cached(&mut cache, "SERIES", 1, None)
+                    .await
+                    .is_none(),
+                "a miss"
+            );
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), read);
+        }
+
+        // TMDB refuses every request: a failure.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                );
+            }
+        });
+        let (scanner, mut cache, _episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        cache.season_details = no_room();
+        let (found, failures) = ferrofin_providers::rate_limit::count_request_failures(Box::pin(
+            scanner.season_details_cached(&mut cache, "SERIES", 1, None),
+        ))
+        .await;
+        assert!(found.is_none());
+        assert_eq!(failures, 1, "the reader counts the failure");
+    }
+
+    // The scan's season cache holds at most `TmdbClientManager.CacheSizeLimit`
+    // TMDB records, each season weighed by `EstimateSize` (the season and its
+    // episodes and people). A season it has no room for is not kept, and the
+    // least recently read go until it is back under 95% of the limit, as
+    // `MemoryCache` does over capacity.
+    #[test]
+    fn the_season_cache_holds_at_most_the_tmdb_size_limit_in_records() {
+        use super::{SeasonLookup, TMDB_CACHE_SIZE_LIMIT};
+        use ferrofin_providers::tmdb::{EpisodeDetails, SeasonDetails};
+
+        let season = |records: u64| {
+            SeasonLookup::Found(SeasonDetails {
+                episodes: vec![EpisodeDetails::default(); usize::try_from(records - 1).unwrap()],
+                ..SeasonDetails::default()
+            })
+        };
+        let key = |number: i32| ("SERIES".to_owned(), number, None);
+        assert_eq!(season(20).estimate_size(), 20);
+        assert_eq!(SeasonLookup::Missing.estimate_size(), 1);
+        assert_eq!(SeasonLookup::Failed.estimate_size(), 1);
+
+        let mut cache = super::ArtworkCache::default();
+        let details = &mut cache.season_details;
+        assert!(
+            details
+                .insert(key(1), season(TMDB_CACHE_SIZE_LIMIT - 10))
+                .is_none()
+        );
+        assert!(details.insert(key(2), SeasonLookup::Missing).is_none());
+        assert!(
+            details.insert(key(3), season(20)).is_some(),
+            "past the limit: not kept, handed back to the reader"
+        );
+        assert!(
+            details.get(&key(1)).is_none(),
+            "the least recently read went"
+        );
+        assert!(details.get(&key(2)).is_some());
+        assert!(details.get(&key(3)).is_none());
+        assert!(
+            details.insert(key(3), season(20)).is_none(),
+            "the next reader's store has room"
+        );
+    }
+
+    // A series' TheTVDB record and an episode's TheTVDB still are kept as long
+    // as the plugin's `TvdbClientManager` keeps the responses they come from:
+    // its `CacheDurationInHours`, the duration the scan's TVDB client is
+    // configured with (`FERROFIN_TVDB_CACHE_HOURS`).
+    #[tokio::test]
+    async fn the_scan_keeps_tvdb_responses_for_its_clients_cache_duration() {
+        let (base, _hits, _all) = spawn_tmdb_server(None, None);
+        let tmp = tempfile::tempdir().unwrap();
+        let (scanner, _cache, _episode) = tmdb_episode_fixture(&base, tmp.path()).await;
+        let duration = std::time::Duration::from_hours(3);
+        let scanner = scanner.with_tvdb(Arc::new(
+            ferrofin_providers::TvdbClient::new().with_cache_duration(duration),
+        ));
+        let (mut cache, _, _) = scanner.scan_prereads(&[], super::ScanRun::defaults()).await;
+        let series = "SERIES".to_owned();
+        cache.series_tvdb.insert(
+            series.clone(),
+            ferrofin_providers::TvdbSeriesDetails {
+                tvdb_id: 121_361,
+                ..Default::default()
+            },
+        );
+        cache
+            .episode_tvdb_still
+            .insert("EPISODE".to_owned(), "https://tvdb/still.jpg".to_owned());
+        let second = std::time::Duration::from_secs(1);
+        cache.series_tvdb.pass(duration.saturating_sub(second));
+        cache
+            .episode_tvdb_still
+            .pass(duration.saturating_sub(second));
+        assert!(cache.series_tvdb.get(&series).is_some());
+        assert!(cache.episode_tvdb_still.get("EPISODE").is_some());
+        cache.series_tvdb.pass(second);
+        cache.episode_tvdb_still.pass(second);
+        assert!(cache.series_tvdb.get(&series).is_none(), "expired");
+        assert!(cache.episode_tvdb_still.get("EPISODE").is_none());
+    }
+
+    // The scan's image cache keeps a probe only when it can be adopted, keyed
+    // by the file's path alone: an incomplete one (no width, height or
+    // blurhash) is never adopted, so it is not kept, and it removes a complete
+    // probe of the same file as replacing it did.
+    #[test]
+    fn the_scan_keeps_only_the_image_probes_it_can_adopt() {
+        use ferrofin_model::entities::ImageType;
+        use ferrofin_traits::options::ItemImageInfo;
+        use ferrofin_traits::persistence::StoredImageMetadata;
+
+        let at = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
+        let row = |path: &str, width: i32| StoredImageMetadata {
+            path: path.to_owned(),
+            width,
+            height: 1500,
+            blur_hash: Some("LEHV6nWB2yk8".to_owned()),
+            date_modified: at,
+        };
+        let folder = "/tv/GoT/folder.jpg";
+        let mut probes = super::ProbedImages::new();
+        super::remember_stored_images(
+            &mut probes,
+            vec![row(folder, 1000), row("/tv/GoT/backdrop.jpg", 0)],
+        );
+        assert_eq!(probes.len(), 1, "the incomplete probe is not kept");
+        let shared = || {
+            vec![ItemImageInfo {
+                path: folder.to_owned(),
+                image_type: ImageType::Primary,
+                date_modified: at,
+                ..Default::default()
+            }]
+        };
+        // The series' and the season's rows share the file's one probe.
+        let mut series = shared();
+        let mut season = shared();
+        super::adopt_stored_image_metadata(&mut series, &probes);
+        super::adopt_stored_image_metadata(&mut season, &probes);
+        assert_eq!((series[0].width, series[0].height), (1000, 1500));
+        assert_eq!(season[0].blur_hash.as_deref(), Some("LEHV6nWB2yk8"));
+
+        // A later incomplete probe of the file, as the walk settles one,
+        // leaves nothing to adopt.
+        super::remember_settled_image(&mut probes, &shared()[0]);
+        assert!(probes.is_empty());
+        let mut later = shared();
+        super::adopt_stored_image_metadata(&mut later, &probes);
+        assert_eq!(later[0].width, 0, "decoded again");
     }
 
     /// A TVDB stand-in: `/login` issues a token, `/search` answers from
@@ -34039,7 +34758,8 @@ mod tests {
         library.scanner(&base).scan_all().await.unwrap();
         library.mark_probed().await;
         library.set_cast(&[]).await;
-        assert!(library.cast().await.is_empty());
+        let cast = library.cast().await;
+        assert!(cast.is_empty(), "{cast:?}");
 
         library.scanner(&base).scan_all().await.unwrap();
 
@@ -34417,7 +35137,7 @@ mod tests {
                 &mut cache,
             )
             .await;
-        assert!(images.is_empty());
+        assert!(images.is_empty(), "{images:?}");
         assert_eq!(requests.lock().unwrap().len(), usize::from(replace));
     }
 
@@ -35351,7 +36071,7 @@ mod tests {
         let none = scanner
             .extract_embedded_cover(track_id, &track, &streams[..1])
             .await;
-        assert!(none.is_empty());
+        assert!(none.is_empty(), "{none:?}");
     }
 
     use crate::media_stream_repository::FerrofinMediaStreamRepository;
@@ -35583,6 +36303,32 @@ mod tests {
             second.info.is_none() && !second.failed,
             "dropped, not failed"
         );
+    }
+
+    /// An item the walk gives up leaves no probe at the head of the queue:
+    /// `take` only answers for the head, so every later item would go
+    /// unprobed.
+    #[tokio::test]
+    async fn a_discarded_item_leaves_the_next_probe_at_the_head() {
+        let track = |n: u128| super::Planned {
+            id: uuid::Uuid::from_u128(n),
+            entity: ferrofin_db::entities::base_items::BaseItemEntity {
+                media_type: Some("Audio".into()),
+                path: Some(format!("/music/{n}.mp3")),
+                ..Default::default()
+            },
+            ancestors: Vec::new(),
+            generated_names: Vec::new(),
+        };
+        let planned = vec![track(1), track(2), track(3), track(4)];
+        let encoder: Arc<dyn MediaEncoder> = Arc::new(FakeProbe);
+        // A window of one: only the first is dispatched.
+        let mut probes = super::ProbePipeline::new(Some(encoder), None, &planned, 1);
+        probes.decide(0, [true, true, true, true]);
+        probes.discard(2); // not dispatched yet: it never will be
+        probes.discard(0);
+        probes.discard(1);
+        assert!(probes.take(3).await.info.is_some());
     }
 
     struct AlbumCoverProbe {
@@ -36742,6 +37488,37 @@ mod tests {
         }
     }
 
+    /// A plugin's rating lands on the provider's fresh item, whose
+    /// `CommunityRating` setter runs `FiniteOrNull`: a NaN or infinite rating
+    /// supplies nothing, so a later provider can still fill it.
+    #[test]
+    fn a_plugin_answer_with_a_non_finite_rating_supplies_none() {
+        use ferrofin_traits::providers::DynamicMetadataResult;
+        let row = BaseItemEntity {
+            id: "movie".into(),
+            type_: "MediaBrowser.Controller.Entities.Movies.Movie".into(),
+            ..BaseItemEntity::default()
+        };
+        for rating in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let plugin = super::dynamic_answer(
+                &row,
+                DynamicMetadataResult {
+                    community_rating: Some(rating),
+                    ..DynamicMetadataResult::default()
+                },
+            );
+            assert_eq!(plugin.item.community_rating, None, "{rating}");
+        }
+        let plugin = super::dynamic_answer(
+            &row,
+            DynamicMetadataResult {
+                community_rating: Some(6.5),
+                ..DynamicMetadataResult::default()
+            },
+        );
+        assert_eq!(plugin.item.community_rating, Some(6.5));
+    }
+
     #[rstest::rstest]
     #[case::disabled(0)]
     #[case::enabled(1)]
@@ -37408,6 +38185,7 @@ mod tests {
                 updated: 0,
                 unchanged: total - 1,
                 removed: 1,
+                skipped: 0,
                 stopped: false,
             }
         );
@@ -37908,7 +38686,8 @@ mod tests {
             serde_json::from_str(changes.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(changes.lock().unwrap().len(), 2, "a save is announced");
         assert_eq!(saved["ItemsUpdated"].as_array().unwrap().len(), 1);
-        assert!(saved["ItemsAdded"].as_array().unwrap().is_empty());
+        let items_added = saved["ItemsAdded"].as_array().unwrap();
+        assert!(items_added.is_empty(), "{items_added:?}");
 
         // Delete a movie → the next scan announces the removal.
         std::fs::remove_file(movies.join("Dune (2021).mkv")).unwrap();
@@ -37917,7 +38696,8 @@ mod tests {
         let third: serde_json::Value =
             serde_json::from_str(changes.lock().unwrap().last().unwrap()).unwrap();
         assert_eq!(third["ItemsRemoved"].as_array().unwrap().len(), 1);
-        assert!(third["ItemsAdded"].as_array().unwrap().is_empty());
+        let items_added = third["ItemsAdded"].as_array().unwrap();
+        assert!(items_added.is_empty(), "{items_added:?}");
     }
 
     // `POST /Items/{id}/Refresh` on one library must not scan the other three:
@@ -38255,7 +39035,8 @@ mod tests {
             !stems("/movies/Heat 2 (2027).nfo").contains(&"Heat".to_owned()),
             "a space is no separator: another title"
         );
-        assert!(stems("/").is_empty());
+        let found = stems("/");
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -38993,7 +39774,7 @@ mod tests {
             .find(|i| i.image_type == ImageType::Primary)
             .expect("library tile image row");
         let bytes = std::fs::read(&primary.path).expect("tile file on disk");
-        assert!(!bytes.is_empty());
+        assert!(!bytes.is_empty(), "{bytes:?}");
         assert_eq!(primary.width, 960);
         assert_eq!(primary.height, 540);
     }
@@ -39136,14 +39917,14 @@ mod tests {
             movies[0].path.as_deref(),
             Some(folder.join("La Chimera (2023).mkv").to_str().unwrap())
         );
-        let samples: Vec<_> = scanned_by_kind(&db, BaseItemKind::Video)
+        let samples = scanned_by_kind(&db, BaseItemKind::Video)
             .await
             .into_iter()
             .filter(|v| {
                 v.extra_type == Some(ferrofin_model::entities::ExtraType::Sample.json_value())
             })
-            .collect();
-        assert_eq!(samples.len(), 2, "both are the movie's Sample extras");
+            .count();
+        assert_eq!(samples, 2, "both are the movie's Sample extras");
     }
 
     /// `IgnorePatterns` reaches extras too: `FindExtras` resolves each
@@ -40627,7 +41408,7 @@ mod tests {
         };
         let movies = library("m", "/media/films/");
         let home = library("h", "/media");
-        let all = [movies.clone(), home.clone()];
+        let all = [movies, home.clone()];
         let clip = "/media/films/Day 1.mp4";
         assert!(super::held_by_unscanned(
             clip,
@@ -41223,11 +42004,10 @@ mod tests {
     // from the file's mtime by MORE than one second.
     #[test]
     fn image_metadata_is_current_matches_jellyfins_image_needs_refresh() {
-        use ferrofin_traits::persistence::StoredImageMetadata;
+        use super::ProbedImage;
 
         let base = chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("timestamp");
-        let complete = |dm: chrono::DateTime<chrono::Utc>| StoredImageMetadata {
-            path: "/m/poster.jpg".to_owned(),
+        let complete = |dm: chrono::DateTime<chrono::Utc>| ProbedImage {
             width: 1000,
             height: 1500,
             blur_hash: Some("LEHV6nWB2yk8".to_owned()),
@@ -41254,28 +42034,28 @@ mod tests {
         for (label, broken) in [
             (
                 "no width",
-                StoredImageMetadata {
+                ProbedImage {
                     width: 0,
                     ..complete(base)
                 },
             ),
             (
                 "no height",
-                StoredImageMetadata {
+                ProbedImage {
                     height: 0,
                     ..complete(base)
                 },
             ),
             (
                 "no blurhash",
-                StoredImageMetadata {
+                ProbedImage {
                     blur_hash: None,
                     ..complete(base)
                 },
             ),
             (
                 "empty blurhash",
-                StoredImageMetadata {
+                ProbedImage {
                     blur_hash: Some(String::new()),
                     ..complete(base)
                 },
@@ -41341,10 +42121,10 @@ mod tests {
         }
         async fn get_image_cache_tag(
             &self,
-            item_id: uuid::Uuid,
+            item_path: Option<&str>,
             image: &ferrofin_traits::options::ItemImageInfo,
         ) -> Result<Option<String>, ServiceError> {
-            self.inner.get_image_cache_tag(item_id, image).await
+            self.inner.get_image_cache_tag(item_path, image).await
         }
         async fn get_image_cache_tag_for_path(
             &self,
@@ -41968,7 +42748,8 @@ mod chapter_image_refresh_tests {
             )
             .await
             .unwrap();
-        assert!(repo.get_chapters(id).await.unwrap().is_empty());
+        let chapters = repo.get_chapters(id).await.unwrap();
+        assert!(chapters.is_empty(), "{chapters:?}");
         assert!(
             Path::new(saved[0].image_path.as_deref().unwrap()).exists(),
             "source's empty chapter set returns before image cleanup"
@@ -42209,7 +42990,8 @@ mod chapter_image_refresh_tests {
             )
             .await
             .unwrap();
-        assert!(repo.get_chapters(id).await.unwrap().is_empty());
+        let chapters = repo.get_chapters(id).await.unwrap();
+        assert!(chapters.is_empty(), "{chapters:?}");
         duration.store(12, Ordering::Relaxed);
         scanner
             .persist_video_chapters(
@@ -42345,12 +43127,8 @@ mod chapter_image_refresh_tests {
         }
         for runtime in [None, Some(0)] {
             fixture.video.run_time_ticks = runtime;
-            assert!(
-                scanner
-                    .video_chapters(&fixture.video, &probe)
-                    .unwrap()
-                    .is_empty()
-            );
+            let video_chapters = scanner.video_chapters(&fixture.video, &probe).unwrap();
+            assert!(video_chapters.is_empty(), "{video_chapters:?}");
         }
         fixture.video.run_time_ticks = Some(12 * 3600 * 10_000_000);
         assert_eq!(

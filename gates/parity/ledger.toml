@@ -592,6 +592,14 @@ kind = "value"
 issue = 220
 reason = "The bundled ListenBrainz plugin and its two settings pages are missing, so the pages shift."
 
+# Ferrofin's own plugin lists its settings page, the one in the dashboard menu, after the in-tree ones.
+[[entry]]
+request = "GetConfigurationPages"
+path = "[].EnableInMainMenu"
+kind = "value"
+issue = 540
+reason = "Ferrofin's own plugin lists its settings page, the one in the dashboard menu, after the in-tree ones."
+
 # The HLS ffmpeg arguments lack upstream's -map_metadata -1 -map_chapters -1 and -max_delay 5000000.
 [[entry]]
 request = "GetHlsAudioSegment"
@@ -967,6 +975,14 @@ path = "[].Id"
 kind = "value"
 issue = 220
 reason = "The bundled ListenBrainz plugin is missing, so the plugin rows shift."
+
+# Ferrofin's own plugin, its settings, is listed beside the in-tree ones, so the list is one longer.
+[[entry]]
+request = "GetPlugins"
+path = "$"
+kind = "length"
+issue = 539
+reason = "Ferrofin's own plugin, its settings, is listed beside the in-tree ones, so the list is one longer."
 
 # Ferrofin does not read the task history an adopted Jellyfin data directory keeps.
 [[entry]]

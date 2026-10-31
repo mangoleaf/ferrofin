@@ -69,8 +69,10 @@ const TICKS_PER_SECOND: i64 = 10_000_000;
 /// The upstream Library category display string (`TasksLibraryCategory`).
 const LIBRARY: &str = "Library";
 
-/// Items examined per page (the upstream `QueryPageLimit`).
-const PAGE_SIZE: i32 = 100;
+/// Items examined per page (the upstream `QueryPageLimit`). The extensions'
+/// library walks (Intro Skipper's queue, Merge Versions) read their rows in
+/// pages of the same size.
+pub const PAGE_SIZE: i32 = 100;
 
 /// An interval trigger firing every `hours` hours.
 fn interval_hours(hours: i64) -> TaskTriggerInfo {
@@ -243,7 +245,10 @@ impl FfmpegRunner for TokioFfmpegRunner {
             .wait_with_output()
             .await
             .map_err(|e| ServiceError::backend(format!("failed to run {program}: {e}")))?;
-        Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+        // ffmpeg's log is UTF-8 unless a tag in it is not, so normally this keeps
+        // the buffer rather than copying it: a long file's `framelog` is megabytes.
+        Ok(String::from_utf8(output.stderr)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
     }
 }
 
@@ -347,7 +352,9 @@ impl AudioNormalizationTask {
         if lufs.is_none() {
             tracing::warn!("failed to find LUFS value in ffmpeg output");
         }
-        Ok(lufs)
+        // The reading is assigned to `BaseItem.LUFS`, whose setter runs
+        // `FiniteOrNull`: a `nan` or infinite one is no measurement.
+        Ok(ferrofin_util::finite::finite_or_none(lufs))
     }
 
     /// Stores a measured LUFS value on an item.
@@ -805,9 +812,14 @@ const PERSON_TYPE: &str = "MediaBrowser.Controller.Entities.Person";
 ///
 /// 1. deduplicates `Peoples` rows sharing (name, type), re-pointing their item
 ///    links to one survivor, and removes people with no item links;
-/// 2. `PeopleValidator`: removes `Person` items whose people row is gone,
-///    and refreshes the new and never-refreshed ones (`isNew ||
-///    neverRefreshed`, `PeopleValidator.cs:76-80`) with the default options;
+/// 2. `PeopleValidator`: removes the unlocked `Person` items no credit calls
+///    for, creates one for each credit with none
+///    (`partition_credits_by_person_id` has the liveness rule), and refreshes
+///    the new and never-refreshed ones (`isNew || neverRefreshed`) with the
+///    default options. Upstream deletes last; here the deletion follows its
+///    read directly, so a scan starting during the refreshes cannot have
+///    credited a person the deletion still takes for dead, and the refresh
+///    walks every never-refreshed row, which would include the dead ones;
 /// 3. `RefreshPeopleImagesAsync`: refreshes the `Person` items missing a
 ///    primary image or overview that were not refreshed in the last 30 days,
 ///    fetching only what each lacks (a `FullRefresh` of the missing half,
@@ -816,22 +828,26 @@ pub struct PeopleValidationTask {
     db: Database,
     providers: Arc<dyn ProviderManager>,
     library: Arc<dyn LibraryManager>,
+    people: crate::people_repository::FerrofinPeopleRepository,
 }
 
 impl PeopleValidationTask {
-    /// Builds the task over the database and provider-manager seams, and the
+    /// Builds the task over the database and provider-manager seams, the
     /// library manager (the run is skipped, as upstream, while a library scan
-    /// runs).
+    /// runs) and the people repository, whose identity seam says which item
+    /// each credit calls for.
     #[must_use]
     pub fn new(
         db: Database,
         providers: Arc<dyn ProviderManager>,
         library: Arc<dyn LibraryManager>,
+        people: crate::people_repository::FerrofinPeopleRepository,
     ) -> Self {
         Self {
             db,
             providers,
             library,
+            people,
         }
     }
 
@@ -886,11 +902,30 @@ impl PeopleValidationTask {
         Ok(())
     }
 
-    /// Phase 2: drop `Person` items whose people row no longer exists.
+    /// Phase 2: drop the unlocked `Person` items no credit calls for and
+    /// create the ones credits lack, which the refresh below then picks up as
+    /// never refreshed.
     async fn validate_person_items(&self) -> Result<(), ServiceError> {
-        let removed =
-            crate::item_persistence_service::remove_orphaned_person_items(&self.db).await?;
-        tracing::info!(removed, "removed dead person items");
+        let partition = self.people.partition_person_items().await?;
+        for person in &partition.dead {
+            tracing::debug!(
+                item_id = %person.id,
+                name = person.name.as_deref().unwrap_or_default(),
+                "deleting dead person"
+            );
+        }
+        let dead: Vec<Uuid> = partition.dead.iter().map(|person| person.id).collect();
+        let removed = crate::item_persistence_service::remove_person_items(&self.db, &dead).await?;
+        let created = self
+            .people
+            .create_person_items(&partition.new_names)
+            .await?;
+        tracing::info!(
+            removed,
+            created,
+            locked = partition.locked,
+            "validated person items"
+        );
         Ok(())
     }
 
@@ -1739,6 +1774,25 @@ mod tests {
         assert_eq!(stderr.trim().parse::<i32>().expect("a number"), expected);
     }
 
+    /// ffmpeg's log is text, and a stray byte in it (a tag in a legacy encoding)
+    /// must not cost the summary after it.
+    #[tokio::test]
+    async fn stderr_with_a_stray_byte_is_still_read() {
+        let script = r"printf 'title: caf\351\n    I: -23.1 LUFS\n' >&2";
+        let stderr = super::TokioFfmpegRunner
+            .run_stderr("sh", &["-c".to_owned(), script.to_owned()])
+            .await
+            .expect("sh runs");
+        assert_eq!(stderr, "title: caf\u{fffd}\n    I: -23.1 LUFS\n");
+        assert_eq!(parse_lufs(&stderr), Some(-23.1));
+
+        let clean = super::TokioFfmpegRunner
+            .run_stderr("sh", &["-c".to_owned(), "printf 'ok' >&2".to_owned()])
+            .await
+            .expect("sh runs");
+        assert_eq!(clean, "ok");
+    }
+
     // -- pure helpers -------------------------------------------------------
 
     #[test]
@@ -2463,6 +2517,46 @@ mod tests {
         let calls = runner.calls.lock().expect("lock");
         assert_eq!(calls.len(), 3);
         assert!(calls[0].iter().any(|a| a == "concat"));
+    }
+
+    /// The measured value is assigned to `BaseItem.LUFS`, whose setter runs
+    /// `FiniteOrNull`: a `nan` or infinite reading is no measurement, so
+    /// nothing is stored and the next run measures again.
+    #[tokio::test]
+    async fn a_non_finite_lufs_reading_is_no_measurement() {
+        let db = test_db().await;
+        let media = tempfile::tempdir().expect("tempdir");
+        for (reading, expected) in [
+            ("nan", None),
+            ("-inf", None),
+            ("inf", None),
+            ("-21.5", Some(-21.5)),
+        ] {
+            let task = AudioNormalizationTask::new(
+                db.clone(),
+                library_manager_over(db.clone()),
+                Arc::new(FakeFolders(Vec::new())),
+                Arc::new(FakeEncoder {
+                    fail_extract: false,
+                }),
+                Arc::new(FakeRunner {
+                    stderr: format!("    I:         {reading} LUFS\n"),
+                    calls: Mutex::new(Vec::new()),
+                }),
+                Arc::new(crate::FerrofinServerApplicationPaths::new(
+                    media.path().join("data"),
+                    media.path().join("logs"),
+                    media.path().join("config"),
+                    media.path().join("cache"),
+                    media.path().join("web"),
+                )),
+            );
+            let measured = task
+                .measure(vec!["-i".to_owned(), "t.flac".to_owned()])
+                .await
+                .expect("measure");
+            assert_eq!(measured, expected, "{reading}");
+        }
     }
 
     #[tokio::test]
@@ -3382,11 +3476,7 @@ mod tests {
         .await;
 
         let providers = Arc::new(RecordingProviders::default());
-        let task = PeopleValidationTask::new(
-            db.clone(),
-            providers.clone(),
-            crate::test_support::library_manager_over(db.clone()),
-        );
+        let task = unwired_people_task(&db, providers.clone());
         assert_eq!(task.key(), "RefreshPeople");
         task.execute(&TaskProgress::default()).await.expect("run");
 
@@ -3457,6 +3547,7 @@ mod tests {
             db.clone(),
             providers.clone(),
             crate::test_support::library_manager_mid_scan(db.clone()).await,
+            crate::people_repository::FerrofinPeopleRepository::new(db.clone()),
         );
         let progress = TaskProgress::default();
         task.execute(&progress).await.expect("skip is Ok");
@@ -3492,11 +3583,7 @@ mod tests {
         )
         .await;
         let providers = Arc::new(RecordingProviders::default());
-        let task = PeopleValidationTask::new(
-            db.clone(),
-            providers.clone(),
-            crate::test_support::library_manager_over(db.clone()),
-        );
+        let task = unwired_people_task(&db, providers.clone());
         task.refresh_new_person_items(&TaskProgress::default(), 0.0, 1.0)
             .await
             .expect("new people");
@@ -3512,6 +3599,228 @@ mod tests {
         assert_eq!(refreshed[0].0, person);
         assert_eq!(refreshed[0].1.metadata_refresh_mode, ValidationOnly);
         assert_eq!(refreshed[0].1.image_refresh_mode, FullRefresh);
+    }
+
+    /// The task over a people repository with no identity seam: a credit
+    /// derives no id, so only names say which items it calls for.
+    fn unwired_people_task(
+        db: &Database,
+        providers: Arc<RecordingProviders>,
+    ) -> PeopleValidationTask {
+        PeopleValidationTask::new(
+            db.clone(),
+            providers,
+            crate::test_support::library_manager_over(db.clone()),
+            crate::people_repository::FerrofinPeopleRepository::new(db.clone()),
+        )
+    }
+
+    /// A Refresh People run over a wired identity seam, the production shape.
+    struct PeopleRun {
+        db: Database,
+        providers: Arc<RecordingProviders>,
+        task: PeopleValidationTask,
+        people_root: tempfile::TempDir,
+    }
+
+    impl PeopleRun {
+        async fn new() -> Self {
+            let db = test_db().await;
+            let people_root = tempfile::tempdir().expect("people root");
+            let people = crate::people_repository::FerrofinPeopleRepository::new(db.clone())
+                .with_identity(Self::mode(), Self::root(&people_root));
+            let providers = Arc::new(RecordingProviders::default());
+            let task = PeopleValidationTask::new(
+                db.clone(),
+                providers.clone(),
+                crate::test_support::library_manager_over(db.clone()),
+                people,
+            );
+            Self {
+                db,
+                providers,
+                task,
+                people_root,
+            }
+        }
+
+        fn mode() -> crate::item_type_lookup::IdDerivation {
+            crate::item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: None,
+            }
+        }
+
+        fn root(people_root: &tempfile::TempDir) -> String {
+            people_root.path().to_string_lossy().into_owned()
+        }
+
+        /// The id `name`'s credit calls for.
+        fn id_of(&self, name: &str) -> Uuid {
+            crate::item_type_lookup::person_item_id(
+                &Self::mode(),
+                &Self::root(&self.people_root),
+                name,
+            )
+            .expect("person id")
+        }
+
+        /// A movie crediting `names`, none of them with an item.
+        async fn credit(&self, movie: u128, names: &[&str]) {
+            let item = Uuid::from_u128(movie);
+            seed_item(&self.db, item, BaseItemKind::Movie).await;
+            for (offset, name) in (1u128..).zip(names) {
+                let credit = Uuid::from_u128(movie + offset);
+                crate::people_repository::seed_credit(&self.db, item, credit, name).await;
+            }
+        }
+
+        async fn run(&self) {
+            self.task
+                .execute(&TaskProgress::default())
+                .await
+                .expect("run");
+        }
+
+        /// The names of the stored `Person` rows, sorted.
+        async fn names(&self) -> Vec<String> {
+            crate::people_repository::person_names(&self.db).await
+        }
+
+        fn refreshed(&self) -> Vec<Uuid> {
+            let refreshed = self.providers.refreshed.lock().expect("lock");
+            refreshed.iter().map(|(id, _)| *id).collect()
+        }
+
+        /// As a refresh that finds everything leaves `id`.
+        async fn mark_refreshed(&self, id: Uuid) {
+            crate::item_persistence_service::seed_refreshed_overview(
+                &self.db,
+                id,
+                &datetime_to_db(Utc::now()),
+                "Bio.",
+            )
+            .await;
+        }
+    }
+
+    /// `PeopleValidator.Run`: "A person somebody locked is theirs, not ours,
+    /// however little the library still credits them." The unlocked orphan
+    /// beside it still goes.
+    #[tokio::test]
+    async fn refresh_people_keeps_a_locked_person_nothing_credits() {
+        let run = PeopleRun::new().await;
+        let (locked, orphan) = (Uuid::from_u128(0xD1), Uuid::from_u128(0xD2));
+        seed_named_item(&run.db, locked, BaseItemKind::Person, "Locked Lena").await;
+        seed_named_item(&run.db, orphan, BaseItemKind::Person, "Orphan Otto").await;
+        crate::people_repository::lock_item(&run.db, locked).await;
+
+        run.run().await;
+
+        assert_eq!(run.names().await, ["Locked Lena"]);
+    }
+
+    /// The credit still says `AURORA`; a provider renamed the item it made.
+    /// The item is the credit's by id, so nothing is deleted or created. The
+    /// name-keyed sweep deleted it, and the next people write made it again.
+    #[tokio::test]
+    async fn refresh_people_keeps_a_person_renamed_away_from_their_credit() {
+        let run = PeopleRun::new().await;
+        run.credit(0xE0, &["AURORA"]).await;
+        let id = run.id_of("AURORA");
+        seed_named_item(&run.db, id, BaseItemKind::Person, "Aurora Aksnes").await;
+        run.mark_refreshed(id).await;
+
+        run.run().await;
+
+        assert_eq!(run.names().await, ["Aurora Aksnes"]);
+    }
+
+    /// `GetOrCreatePerson` for a credit with no item: the row the people write
+    /// makes, its folder, and one first refresh with the default options. The
+    /// next run has nothing to do, so a refreshed person costs no more
+    /// requests.
+    #[tokio::test]
+    async fn refresh_people_creates_an_item_for_a_credit_with_none() {
+        use ferrofin_traits::providers::MetadataRefreshMode::Default as DefaultMode;
+        let run = PeopleRun::new().await;
+        run.credit(0xF0, &["Wanted Person"]).await;
+        let id = run.id_of("Wanted Person");
+
+        run.run().await;
+
+        assert_eq!(run.names().await, ["Wanted Person"]);
+        let row = crate::test_support::item_repository_over(run.db.clone())
+            .retrieve_item(id)
+            .await
+            .expect("read")
+            .expect("the credit's item exists");
+        assert_eq!(row.clean_name.as_deref(), Some("wanted person"));
+        assert_eq!(row.sort_name.as_deref(), Some("Wanted Person"));
+        assert_eq!(
+            row.presentation_unique_key.as_deref(),
+            Some("Person-Wanted Person")
+        );
+        let path = row.path.expect("the row has its metadata path");
+        assert!(Path::new(&path).is_dir(), "{path} is created");
+        let first = run.providers.refreshed.lock().expect("lock")[0].clone();
+        assert_eq!(first.0, id);
+        assert_eq!(first.1.metadata_refresh_mode, DefaultMode);
+
+        run.mark_refreshed(id).await;
+        crate::item_persistence_service::seed_primary_image(
+            &run.db,
+            Uuid::from_u128(0xF9),
+            id,
+            "/p.jpg",
+        )
+        .await;
+        run.providers.refreshed.lock().expect("lock").clear();
+        run.run().await;
+        assert_eq!(run.names().await, ["Wanted Person"]);
+        assert_eq!(
+            run.refreshed(),
+            Vec::<Uuid>::new(),
+            "a refreshed person costs nothing more"
+        );
+    }
+
+    /// Spellings sharing a clean name are one person on one row: it survives
+    /// the loss of the spelling it carries, as the credit left still resolves
+    /// to it, and no second item appears. The name-keyed sweep deleted it.
+    #[tokio::test]
+    async fn refresh_people_keeps_the_item_a_second_spelling_resolves_to() {
+        let run = PeopleRun::new().await;
+        run.credit(0xA10, &["H Jon Benjamin"]).await;
+        let first = run.id_of("H. Jon Benjamin");
+        seed_named_item(&run.db, first, BaseItemKind::Person, "H. Jon Benjamin").await;
+        crate::test_support::set_clean_name(&run.db, first, "H. Jon Benjamin").await;
+        run.mark_refreshed(first).await;
+
+        run.run().await;
+
+        assert_eq!(run.names().await, ["H. Jon Benjamin"]);
+    }
+
+    /// An item whose id is not the derived one, as in a database whose metadata
+    /// moved: its exact-name credit keeps it, and no second item is made for
+    /// the credit, which would refresh every person of such a library.
+    #[tokio::test]
+    async fn refresh_people_keeps_a_credited_name_under_another_id() {
+        let run = PeopleRun::new().await;
+        run.credit(0xA20, &["Moved Mary"]).await;
+        let moved = Uuid::from_u128(0xA2F);
+        seed_named_item(&run.db, moved, BaseItemKind::Person, "Moved Mary").await;
+        run.mark_refreshed(moved).await;
+
+        run.run().await;
+
+        assert_eq!(run.names().await, ["Moved Mary"]);
+        assert_ne!(moved, run.id_of("Moved Mary"));
+        assert_eq!(
+            run.refreshed(),
+            Vec::<Uuid>::new(),
+            "nothing new to refresh"
+        );
     }
 
     /// A [`ProviderManager`] fake recording `refresh_single_item` calls.
@@ -3655,7 +3964,8 @@ mod tests {
         );
         let task = KeyframeExtractionTask::with_extractors(library, vec![Arc::new(probe)]);
         assert_eq!(task.key(), "KeyframeExtraction");
-        assert!(task.default_triggers().is_empty());
+        let default_triggers = task.default_triggers();
+        assert!(default_triggers.is_empty(), "{default_triggers:?}");
         task.execute(&TaskProgress::default()).await.expect("run");
 
         assert_eq!(*log.lock().expect("log"), ["probe:fresh.mkv"]);
@@ -3664,13 +3974,8 @@ mod tests {
         assert_eq!(kept[0].total_duration, 42);
         assert_eq!(kept[0].keyframe_ticks.as_deref(), Some("[1,2,3]"));
         // The failed probe stored nothing for the new item.
-        assert!(
-            keyframes
-                .get_keyframe_data(fresh)
-                .await
-                .expect("read")
-                .is_empty()
-        );
+        let keyframe_data = keyframes.get_keyframe_data(fresh).await.expect("read");
+        assert!(keyframe_data.is_empty(), "{keyframe_data:?}");
     }
 
     /// A keyframe extractor that logs `name:file` for each call and answers

@@ -901,7 +901,11 @@ async fn items_filters2_sorts_languages_linguistically_not_ordinally() {
         filters.audio_languages,
         pairs(&[("abc", "abc"), ("Basque (eus)", "eus")])
     );
-    assert!(filters.subtitle_languages.is_empty());
+    assert!(
+        filters.subtitle_languages.is_empty(),
+        "{:?}",
+        filters.subtitle_languages
+    );
 }
 
 /// Which type sets get the language facets (v12.2 `FilterController.cs:242-245`)
@@ -942,11 +946,23 @@ async fn items_filters2_language_facets_gate_and_widen_by_type(
         let query = stream_query.expect("stream languages queried");
         assert_eq!(query.include_item_types, kinds);
         assert!(query.include_owned_items, "owned items are included");
-        assert!(!filters.audio_languages.is_empty());
+        assert!(
+            !filters.audio_languages.is_empty(),
+            "{:?}",
+            filters.audio_languages
+        );
     } else {
         assert!(stream_query.is_none(), "no stream query for {types:?}");
-        assert!(filters.audio_languages.is_empty());
-        assert!(filters.subtitle_languages.is_empty());
+        assert!(
+            filters.audio_languages.is_empty(),
+            "{:?}",
+            filters.audio_languages
+        );
+        assert!(
+            filters.subtitle_languages.is_empty(),
+            "{:?}",
+            filters.subtitle_languages
+        );
     }
 }
 
@@ -986,7 +1002,7 @@ async fn items_filters2_stream_query_shares_the_genre_query_scope(#[case] recurs
         assert_eq!(stream.ancestor_ids, vec![parent]);
     } else {
         assert_eq!(stream.parent_id, parent);
-        assert!(stream.ancestor_ids.is_empty());
+        assert!(stream.ancestor_ids.is_empty(), "{:?}", stream.ancestor_ids);
     }
     assert_eq!(stream.ancestor_ids, genre.ancestor_ids);
     assert_eq!(stream.parent_id, genre.parent_id);
@@ -1225,7 +1241,7 @@ async fn items_filters2_trailer_type_skips_the_parent(
         .expect("genre query lock")
         .clone()
         .expect("get_genres called");
-    assert!(query.ancestor_ids.is_empty());
+    assert!(query.ancestor_ids.is_empty(), "{:?}", query.ancestor_ids);
     assert_eq!(query.parent_id, Uuid::nil());
     assert!(!query.physical_children_only);
 }

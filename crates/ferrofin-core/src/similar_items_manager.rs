@@ -2778,7 +2778,7 @@ mod tests {
             .await
             .expect("similar")
             .expect("seed resolves");
-        assert!(similar.is_empty());
+        assert!(similar.is_empty(), "{similar:?}");
     }
 
     #[tokio::test]
@@ -3854,7 +3854,7 @@ mod tests {
                     "Plain Program" | "Series Program"
                 ));
             } else {
-                assert!(names.is_empty());
+                assert!(names.is_empty(), "{names:?}");
             }
             // The ordinary Program branch uses its public Program alias; the
             // source storage lookup has no mapping, so it matches nothing.

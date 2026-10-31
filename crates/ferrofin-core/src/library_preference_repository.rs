@@ -59,7 +59,13 @@ pub(crate) async fn rewrite_preferences(
     kinds: &[PreferenceKind],
     mut rewrite: impl FnMut(Uuid, PreferenceKind, &[String]) -> Option<Vec<String>>,
 ) -> Result<usize, ServiceError> {
-    let mut tx = db.writer().begin().await.map_err(db_err)?;
+    // It reads before it writes, and a boot repair calls it while the previous
+    // version may be writing: take the lock first (CONTRIBUTING.md).
+    let mut tx = db
+        .writer()
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .map_err(db_err)?;
     let users: Vec<String> = sqlx::query_scalar(r#"SELECT "Id" FROM "Users""#)
         .fetch_all(&mut *tx)
         .await

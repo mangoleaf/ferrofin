@@ -116,14 +116,18 @@ overload can still reject compliant requests.
 
 ## Settings
 
-Read when each limiter is constructed (restart to apply):
+Resolved with the rest of the bootstrap configuration (the variable, else the `config.toml`
+key, else the default; see [CONFIG.md](CONFIG.md)) and handed to every limiter for each server
+lifetime, so a change applies at the next restart, Dashboard → Restart included. A limiter reads
+them when it sends, so limiters made before the restart see the new values too:
 
-| Environment variable | Default | Range | Meaning |
-| --- | --- | --- | --- |
-| `FERROFIN_PROVIDER_TIMEOUT_SECONDS` | 20 | 10–60 | Default timeout per HTTP attempt; an explicitly set request timeout takes precedence. |
-| `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` | 60 | 30–300 | Maximum pending pacing/quota wait before skipping a lookup. Open circuits always skip until their probe deadline. |
+| Environment variable | `config.toml` key | Default | Range | Meaning |
+| --- | --- | --- | --- | --- |
+| `FERROFIN_PROVIDER_TIMEOUT_SECONDS` | `provider_timeout_seconds` | 20 | 10–60 | Default timeout per HTTP attempt; an explicitly set request timeout takes precedence. |
+| `FERROFIN_PROVIDER_MAX_WAIT_SECONDS` | `provider_max_wait_seconds` | 60 | 30–300 | Maximum pending pacing/quota wait before skipping a lookup. Open circuits always skip until their probe deadline. |
 
-Malformed values use the default; numeric values are clamped to the range.
+A variable that is not a whole number logs a warning and is ignored, so the `config.toml` value
+or the default applies; a value outside the range logs a warning and is clamped to it.
 Attempts, the adaptive backoff cap, recovery streak/quiet period, and jitter
 remain internal policy rather than user settings. The gate deliberately holds
 its lock through response headers; supporting concurrent in-flight requests

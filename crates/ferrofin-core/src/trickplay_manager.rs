@@ -1123,10 +1123,7 @@ impl TrickplayManager for FerrofinTrickplayManager {
         // One query for the page's resolutions, grouped into a per-item manifest
         // (media-source id = the item's own id, as the single-item form does).
         for chunk in item_ids.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
-            let ph = (1..=chunk.len())
-                .map(|i| format!("?{i}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            let ph = ferrofin_db::numbered_placeholders(1..=chunk.len());
             let sql = format!(
                 r#"SELECT * FROM "TrickplayInfos" WHERE "ItemId" IN ({ph})
                    ORDER BY "ItemId", "Width""#,
@@ -2496,13 +2493,8 @@ mod tests {
             .expect("no runtime ok");
 
         assert_eq!(r.extractor.calls(), 0);
-        assert!(
-            r.mgr
-                .get_trickplay_items(10, 0)
-                .await
-                .expect("items")
-                .is_empty()
-        );
+        let trickplay_items = r.mgr.get_trickplay_items(10, 0).await.expect("items");
+        assert!(trickplay_items.is_empty(), "{trickplay_items:?}");
     }
 
     #[tokio::test]

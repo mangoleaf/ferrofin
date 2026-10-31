@@ -8,6 +8,11 @@
 //! fresh database, an upgraded install, an adopted 10.11.8 or 12.0 database —
 //! and are written so a database that is already in the 12.0 state is left
 //! alone (an adopted 12.0 database went through the real routines in Jellyfin).
+//!
+//! A repair runs while the previous version can still be writing: the chart's
+//! default rolling update keeps the old pod up until this boot is ready. A row
+//! saved after a repair ran stays as it was, so read "Migrations and one-shot
+//! repairs" in `CONTRIBUTING.md` before adding one.
 
 use std::path::Path;
 
@@ -828,6 +833,8 @@ pub async fn repair_alternate_version_links(db: &Database) -> Result<(usize, usi
         };
         primary_by_child.entry(child).or_insert(parent);
     }
+    // The loop removes from the map it would otherwise borrow.
+    #[allow(clippy::needless_collect)]
     for child in primary_by_child
         .iter()
         .filter(|(child, parent)| child == parent)
@@ -924,6 +931,9 @@ async fn set_primary(
 /// primary and drops that id's own link.
 fn resolve_primaries(primary_by_child: &mut BTreeMap<Uuid, Uuid>) {
     let mut resolved: BTreeMap<Uuid, Uuid> = BTreeMap::new();
+    // The walk reads the map and removes a loop's primary link, so it cannot
+    // borrow the keys it iterates.
+    #[allow(clippy::needless_collect)]
     for start in primary_by_child.keys().copied().collect::<Vec<_>>() {
         if resolved.contains_key(&start) {
             continue;
@@ -1632,6 +1642,142 @@ pub async fn run_rekey_pathless_playlists(
     Ok(())
 }
 
+/// The extension of the database snapshot
+/// [`merge_legacy_collections_library`] takes
+/// (`jellyfin.db.pre-collections-library`).
+const COLLECTIONS_SNAPSHOT_EXTENSION: &str = "db.pre-collections-library";
+
+/// What [`merge_legacy_collections_library`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedCollectionsLibrary {
+    /// The row it retired.
+    pub retired: Uuid,
+    /// The library that holds the box sets now.
+    pub library: Uuid,
+    /// The folder they hang off now.
+    pub folder: Uuid,
+    /// How many items moved.
+    pub moved: u64,
+}
+
+/// Retires the bare `CollectionFolder` an older Ferrofin stored at
+/// `{data}/collections` for the Collections library
+/// (`6f929a39…` under the Jellyfin derivation).
+///
+/// Upstream's library is a real one (`AddVirtualFolder` in
+/// `CollectionManager.EnsureLibraryFolder`), and a box set's parent is the
+/// plain `Folder` for that directory, a child of the aggregate root
+/// ([`crate::collections_library`]). A database whose row is the old one has
+/// no such library, or, where an older build ran on a database adopted from
+/// Jellyfin, has both, with the box sets split between them. Either way this
+/// leaves one library: the one that lists the directory if there is one (under
+/// whatever name, in whatever language), else a new one taking the old row's
+/// name; that library's `Folder`; and every box set under it.
+///
+/// Decided from the rows alone, so it needs no marker and runs again after any
+/// step that failed. The order keeps each stop usable:
+///
+/// 1. The database file goes aside once, as before a table-rebuilding migration.
+/// 2. The library and its `Folder` are made. The old row still stands, and
+///    a box set still finds a parent.
+/// 3. Users' preferences (`EnabledFolders`, `BlockedMediaFolders` and the rest)
+///    move to the library. They go before the row: the row's presence is what
+///    brings this repair back, so a stop here is finished by the next boot,
+///    where a row gone first would leave users naming an id nothing retries.
+/// 4. In one transaction, what hangs off the old row moves and the row goes
+///    ([`merge_into_location`](crate::library_structure_repository::merge_into_location)).
+///
+/// # Errors
+/// Returns [`ServiceError`] if a step fails. The old row stays, and with it every
+/// box set where it was; the next boot starts over.
+pub async fn merge_legacy_collections_library(
+    db: &Database,
+    virtual_folders: &crate::FerrofinVirtualFolderManager,
+    derivation: &IdDerivation,
+    (data_path, root_folder_path): (&str, &str),
+    paths: &VirtualPathExpander,
+) -> Result<Option<MergedCollectionsLibrary>, ServiceError> {
+    use crate::collections_library::{CollectionsLibrary, parse_id};
+    use crate::library_structure_repository::{LocationTarget, merge_into_location};
+    let library = CollectionsLibrary::new(
+        db.clone(),
+        derivation.clone(),
+        data_path,
+        root_folder_path,
+        paths.clone(),
+    );
+    let Some(legacy) = library.legacy_container().await? else {
+        return Ok(None);
+    };
+    let retired = parse_id(&legacy)?;
+    let name = legacy.name.as_deref().unwrap_or("Collections");
+    if let Some(backup) = db
+        .snapshot_once(COLLECTIONS_SNAPSHOT_EXTENSION)
+        .await
+        .map_err(meta_err)?
+    {
+        tracing::info!(
+            backup = %backup.display(),
+            "database snapshot taken before moving the collections library"
+        );
+    }
+    let cannot = |what: &str| ServiceError::backend(format!("no {what} to move box sets to"));
+    let target = library.ensure_library(virtual_folders, name).await?;
+    let folder = library
+        .ensure_folder()
+        .await?
+        .ok_or_else(|| cannot("folder"))?;
+    let aggregate = library.aggregate().ok_or_else(|| cannot("root"))?;
+    virtual_folders
+        .move_boxsets_preferences((retired, name), (target.id, &target.name))
+        .await?;
+    let moved = merge_into_location(
+        db,
+        retired,
+        LocationTarget {
+            folder: folder.id,
+            aggregate,
+            library: target.id,
+        },
+    )
+    .await?;
+    Ok(Some(MergedCollectionsLibrary {
+        retired,
+        library: target.id,
+        folder: folder.id,
+        moved,
+    }))
+}
+
+/// [`merge_legacy_collections_library`] and its log line, for the composition
+/// root. A failure is a warning and never stops the boot: the old row keeps
+/// working, as it did before this version, and the next boot tries again.
+pub async fn run_merge_legacy_collections_library(
+    db: &Database,
+    virtual_folders: &crate::FerrofinVirtualFolderManager,
+    derivation: &IdDerivation,
+    directories: (&str, &str),
+    paths: &VirtualPathExpander,
+) {
+    match merge_legacy_collections_library(db, virtual_folders, derivation, directories, paths)
+        .await
+    {
+        Ok(None) => {}
+        Ok(Some(merged)) => tracing::info!(
+            count = merged.moved,
+            item_id = %merged.folder,
+            library = %merged.library,
+            "moved the box sets of the retired row {} into the collections library",
+            merged.retired
+        ),
+        Err(err) => tracing::warn!(
+            %err,
+            "could not move the collections library; box sets stay where they are, \
+             and the next boot tries again"
+        ),
+    }
+}
+
 /// The extension of the database snapshot [`sweep_missing_items`] takes
 /// (`jellyfin.db.pre-missing-items`).
 const SWEEP_SNAPSHOT_EXTENSION: &str = "db.pre-missing-items";
@@ -2188,7 +2334,7 @@ async fn version_pairs(db: &Database) -> Result<Vec<OwnedPair>, ServiceError> {
     .await
     .map_err(db_err)?;
     for (id, type_, path, child_path) in linked {
-        primaries.entry(id.clone()).or_insert(GroupRow {
+        primaries.entry(id.clone()).or_insert_with(|| GroupRow {
             id: id.clone(),
             type_,
             path,
@@ -2947,7 +3093,7 @@ const CONFLICTING_GROUPS: &str = r#"SELECT "ItemId", "UserId" FROM "UserData"
 /// and `run_rekey_virtual_seasons`, called from
 /// `apps/ferrofin-server/src/state.rs`, which fold through [`rekey_rows`]).
 /// Every save brings them back into agreement, as upstream's
-/// `SaveUserData` does (`FerrofinUserDataManager::upsert_row`); keeping a fold itself
+/// `SaveUserData` does (`FerrofinUserDataManager::mutate_row`); keeping a fold itself
 /// in agreement is open work item gl-714.
 ///
 /// Returns the number of rows updated, and logs one summary when it
@@ -3286,7 +3432,8 @@ mod tests {
                 .expect("again"),
             0
         );
-        assert!(links(&db).await.is_empty());
+        let found = links(&db).await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// `MigrateLinkedChildren.ResolveChildId`: a cached `ItemId` counts only
@@ -5424,12 +5571,10 @@ mod tests {
             date_texts(&db, &ids[0]).await,
             [Some(text.to_owned()), Some(text.to_owned())]
         );
-        assert!(
-            conflicting_groups(&db, ("", ""), REPAIR_PARTITION)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let found = conflicting_groups(&db, ("", ""), REPAIR_PARTITION)
+            .await
+            .unwrap();
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// One instant written two ways — EF trims fraction zeros, Ferrofin
@@ -5536,7 +5681,8 @@ mod tests {
             .unwrap();
         assert_eq!(harmonize_in_partitions(&db, 1).await.unwrap(), 1);
         assert!(db.meta_get(HARMONIZE_KEY).await.unwrap().is_some());
-        assert!(fossils().await.is_empty());
+        let found = fossils().await;
+        assert!(found.is_empty(), "{found:?}");
     }
 
     /// A file-backed database is copied to `<db>.pre-harmonize` before a

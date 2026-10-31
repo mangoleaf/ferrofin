@@ -793,7 +793,8 @@ async fn subtitle_remote_search_is_empty_list() {
         call(app, &format!("/Items/{ITEM_ID}/RemoteSearch/Subtitles/eng")).await;
     assert_eq!(status, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(v.as_array().unwrap().is_empty());
+    let items = v.as_array().unwrap();
+    assert!(items.is_empty(), "{items:?}");
 }
 
 // ---- OpenSubtitles login validation ----------------------------------------
@@ -946,7 +947,7 @@ async fn fallback_font_unconfigured_path_is_ok_empty() {
     );
     let (status, body, _) = call(app, "/FallbackFont/Fonts/roboto.ttf").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "{body:?}");
 }
 
 #[tokio::test]
@@ -960,7 +961,255 @@ async fn fallback_font_missing_named_file_is_ok_empty() {
     );
     let (status, body, _) = call(app, "/FallbackFont/Fonts/absent.ttf").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.is_empty());
+    assert!(body.is_empty(), "{body:?}");
+}
+
+/// Fetches `name` with `headers` from a folder holding `Roboto.ttf`.
+async fn get_font(
+    file_system: impl FileSystem + 'static,
+    name: &str,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .uri(format!("/FallbackFont/Fonts/{name}"))
+        .header("x-emby-token", "tok");
+    for (header, value) in headers {
+        request = request.header(*header, *value);
+    }
+    let app = build_state(
+        Arc::new(OneItemLibrary),
+        Arc::new(FontConfig(options_with_path(Some("/fonts")))),
+        Arc::new(file_system),
+        Arc::new(FixedSources(Vec::new())),
+        Arc::new(FakeSubtitles),
+        Arc::new(StubEncoder(Ok(Vec::new()))),
+    );
+    create_router(app)
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+fn roboto() -> FontFs {
+    FontFs {
+        files: vec![font("Roboto.ttf", 42)],
+        bytes: b"FONTBYTES".to_vec(),
+    }
+}
+
+/// What `font()` stamps on a file, as an HTTP date.
+const FONT_DATE: &str = "Mon, 01 Jan 2024 00:00:00 GMT";
+
+/// Oracle: Jellyfin 12.4. `PhysicalFile(path, type)` sends the length and the
+/// date, and leaves range processing off, so a `Range` gets the whole font.
+#[tokio::test]
+async fn a_font_answers_as_upstreams_physical_file() {
+    let response = get_font(roboto(), "ROBOTO.TTF", &[("Range", "bytes=0-1")]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(headers["content-type"], "font/ttf");
+    assert_eq!(headers["content-length"], "9");
+    assert_eq!(headers["last-modified"], FONT_DATE);
+    assert!(!headers.contains_key("accept-ranges"));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(body.as_ref(), b"FONTBYTES");
+}
+
+/// A font dated before 1970 sends its date, as upstream's `Last-Modified` does.
+#[tokio::test]
+async fn a_font_from_before_the_epoch_keeps_its_date() {
+    let mut old = font("Roboto.ttf", 42);
+    old.date_modified = Utc.with_ymd_and_hms(1969, 7, 20, 20, 17, 0).unwrap();
+    let fs = FontFs {
+        files: vec![old],
+        bytes: b"FONTBYTES".to_vec(),
+    };
+    let response = get_font(fs, "roboto.ttf", &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["last-modified"],
+        "Sun, 20 Jul 1969 20:17:00 GMT"
+    );
+}
+
+/// Oracle: Jellyfin 12.4's `PhysicalFile`, but for two cases. `modified_since_later`
+/// was not run (the file was dated the day it ran), so its 304 is inferred from the
+/// same-date case. `no_entity_tag_to_match` sends together two headers that were
+/// run singly, each a 200.
+#[rstest::rstest]
+#[case::modified_since_the_same_date(&[("If-Modified-Since", FONT_DATE)], StatusCode::NOT_MODIFIED)]
+#[case::modified_since_rfc_850(&[("If-Modified-Since", "Monday, 01-Jan-24 00:00:00 GMT")], StatusCode::NOT_MODIFIED)]
+#[case::modified_since_asctime(&[("If-Modified-Since", "Mon Jan  1 00:00:00 2024")], StatusCode::NOT_MODIFIED)]
+#[case::modified_since_later(&[("If-Modified-Since", "Tue, 02 Jan 2024 00:00:00 GMT")], StatusCode::NOT_MODIFIED)]
+#[case::modified_since_earlier(&[("If-Modified-Since", "Sun, 31 Dec 2023 00:00:00 GMT")], StatusCode::OK)]
+#[case::modified_since_the_future(&[("If-Modified-Since", "Fri, 01 Jan 2100 00:00:00 GMT")], StatusCode::OK)]
+#[case::modified_since_garbage(&[("If-Modified-Since", "garbage")], StatusCode::OK)]
+#[case::modified_since_the_wrong_weekday(&[("If-Modified-Since", "Tue, 01 Jan 2024 00:00:00 GMT")], StatusCode::OK)]
+#[case::unmodified_since_earlier(&[("If-Unmodified-Since", "Sun, 31 Dec 2023 00:00:00 GMT")], StatusCode::PRECONDITION_FAILED)]
+#[case::unmodified_since_the_same_date(&[("If-Unmodified-Since", FONT_DATE)], StatusCode::OK)]
+#[case::failed_beats_not_modified(
+    &[("If-Modified-Since", FONT_DATE), ("If-Unmodified-Since", "Sun, 31 Dec 2023 00:00:00 GMT")],
+    StatusCode::PRECONDITION_FAILED
+)]
+#[case::passed_beats_not_modified(
+    &[("If-Modified-Since", FONT_DATE), ("If-Unmodified-Since", FONT_DATE)],
+    StatusCode::OK
+)]
+#[case::no_entity_tag_to_match(&[("If-None-Match", "*"), ("If-Match", "\"x\"")], StatusCode::OK)]
+#[tokio::test]
+async fn a_fonts_preconditions_answer_as_upstream_does(
+    #[case] headers: &[(&str, &str)],
+    #[case] expected: StatusCode,
+) {
+    let response = get_font(roboto(), "roboto.ttf", headers).await;
+    assert_eq!(response.status(), expected);
+    assert_eq!(response.headers()["last-modified"], FONT_DATE);
+    if expected != StatusCode::OK {
+        assert!(!response.headers().contains_key("content-type"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "{body:?}");
+    }
+}
+
+/// Oracle: Jellyfin 12.4, `MimeTypes.GetMimeType` on each extension.
+#[rstest::rstest]
+#[case("a.ttf", "font/ttf")]
+#[case("a.TTF", "font/ttf")]
+#[case(".ttf", "font/ttf")]
+#[case("a.otf", "font/otf")]
+#[case("a.OTF", "font/otf")]
+#[case("a.woff", "font/woff")]
+#[case("a.woff2", "font/woff2")]
+#[case("a.ttc", "font/collection")]
+#[case("a.eot", "application/vnd.ms-fontobject")]
+#[case("a.pfb", "application/x-font-type1")]
+#[case("a.foo", "application/octet-stream")]
+#[case("noext", "application/octet-stream")]
+#[tokio::test]
+async fn a_font_has_upstreams_content_type(#[case] name: &str, #[case] expected: &str) {
+    let fs = FontFs {
+        files: vec![font(name, 42)],
+        bytes: b"FONTBYTES".to_vec(),
+    };
+    let response = get_font(fs, name, &[]).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], expected);
+}
+
+/// A folder listing `Roboto.ttf`, which then cannot be opened.
+struct UnopenableFont(fn() -> ServiceError);
+
+impl FileSystem for UnopenableFont {
+    fn get_file_system_entries(&self, _path: &str) -> Vec<ferrofin_model::io::FileSystemEntryInfo> {
+        unimplemented!("unused")
+    }
+    fn get_drives(&self) -> Vec<ferrofin_model::io::FileSystemEntryInfo> {
+        unimplemented!("unused")
+    }
+    fn file_exists(&self, _path: &str) -> bool {
+        unimplemented!("unused")
+    }
+    fn directory_exists(&self, _path: &str) -> bool {
+        unimplemented!("unused")
+    }
+    fn validate_writable(&self, _path: &str) -> Result<(), ServiceError> {
+        unimplemented!("unused")
+    }
+    fn get_files(&self, _path: &str, _extensions: &[&str]) -> Vec<FileMetadata> {
+        vec![font("Roboto.ttf", 42)]
+    }
+    fn read_file(&self, _path: &str) -> Result<Vec<u8>, ServiceError> {
+        Err((self.0)())
+    }
+}
+
+/// Oracle: Jellyfin 12.4 answers 500 for a font it cannot read. One gone since
+/// the listing is a `FileNotFoundException`, a 404. Both as before streaming.
+#[tokio::test]
+async fn a_font_that_cannot_be_opened_keeps_its_status() {
+    let refused = UnopenableFont(|| ServiceError::backend("permission denied"));
+    let response = get_font(refused, "roboto.ttf", &[]).await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let gone = UnopenableFont(|| ServiceError::not_found("gone"));
+    let response = get_font(gone, "roboto.ttf", &[]).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // Only a 200 opens the file: `PhysicalFile` stats it for the preconditions.
+    let refused = UnopenableFont(|| ServiceError::backend("permission denied"));
+    let response = get_font(refused, "roboto.ttf", &[("If-Modified-Since", FONT_DATE)]).await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+}
+
+/// `[FromRoute, Required] string name`: a blank value is no value.
+#[tokio::test]
+async fn a_blank_font_name_is_a_bad_request() {
+    let response = get_font(roboto(), "%20", &[]).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `ThenBy(i => i.Name)` is the culture's order, not the bytes'.
+#[tokio::test]
+async fn fallback_font_list_orders_names_by_the_culture() {
+    let app = font_state(
+        options_with_path(Some("/fonts")),
+        FontFs {
+            files: vec![font("Z.ttf", 1), font("a.ttf", 1), font("B.ttf", 1)],
+            bytes: Vec::new(),
+        },
+    );
+    let (status, body, _) = call(app, "/FallbackFont/Fonts").await;
+    assert_eq!(status, StatusCode::OK);
+    let fonts: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let names: Vec<&str> = fonts
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|font| font["Name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["a.ttf", "B.ttf", "Z.ttf"]);
+}
+
+/// Listing the fallback fonts and serving one run on the blocking pool, never
+/// inline on a runtime worker: the endpoint is hit on every ASS playback and
+/// a CJK font runs to 20 MB. With the pool's only thread held busy neither
+/// request can finish, which an inline read would ignore.
+#[test]
+fn fallback_font_calls_go_through_the_blocking_pool() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hog = tokio::task::spawn_blocking(move || {
+            busy_tx.send(()).ok();
+            release_rx.recv().ok();
+        });
+        busy_rx.await.unwrap();
+
+        for uri in ["/FallbackFont/Fonts", "/FallbackFont/Fonts/roboto.ttf"] {
+            let app = font_state(
+                options_with_path(Some("/fonts")),
+                FontFs {
+                    files: vec![font("Roboto.ttf", 42)],
+                    bytes: b"FONTBYTES".to_vec(),
+                },
+            );
+            let starved =
+                tokio::time::timeout(std::time::Duration::from_millis(250), call(app, uri)).await;
+            assert!(starved.is_err(), "{uri} answered inline");
+        }
+
+        release_tx.send(()).unwrap();
+        hog.await.unwrap();
+    });
 }
 
 /// Mirrors a production token-cache snapshot; FakeUsers must never be queried.

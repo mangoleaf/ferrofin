@@ -1800,13 +1800,13 @@ mod tests {
         }
         let text = logs.text();
         for file in [&mgr.branding_file, &mgr.encoding_file] {
-            let warnings: Vec<&str> = text
+            let warnings = text
                 .lines()
                 .filter(|line| {
                     line.contains(" WARN ") && line.contains(&file.display().to_string())
                 })
-                .collect();
-            assert_eq!(warnings.len(), 1, "one warning per broken file:\n{text}");
+                .count();
+            assert_eq!(warnings, 1, "one warning per broken file:\n{text}");
         }
 
         // A save overwrites the broken file, as the dashboard's would.
@@ -2954,7 +2954,7 @@ mod tests {
     fn no_configuration_means_setup_was_never_completed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let files = startup_wizard_completed_files(&tmp.path().join("config")).expect("read");
-        assert!(files.is_empty());
+        assert!(files.is_empty(), "{files:?}");
     }
 
     #[rstest::rstest]

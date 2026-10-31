@@ -95,14 +95,15 @@ fn num_cpus_for_analysis() -> usize {
 const PACKAGE_NAME: &str = "ferrofin-server";
 
 /// The **Jellyfin server version Ferrofin reports** in `SystemInfo`/`PublicSystemInfo`
-/// (`Version`): the Jellyfin release Ferrofin targets for adoption and schema
-/// (12.2.0; handlers are ported from `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
+/// (`Version`): the newest Jellyfin release Ferrofin adopts (12.4.0, whose database
+/// carries 12.2's migration-id set and adopts as generation `12.2.0`; handlers are
+/// ported from `UPSTREAM_TAG`) — NOT Ferrofin's own crate version (`CARGO_PKG_VERSION`, used only for
 /// build/log lines). Clients gate on it: jellyfin-web's SDK refuses any server below
 /// `MINIMUM_VERSION = 10.10.0` with an "Update Required" screen, and jellyfin-sdk-kotlin
 /// (Android TV and friends) flags anything below `Jellyfin.minimumVersion = 12.0.0`
 /// as unsupported. The route gate stays pinned to the 10.11.8 contract, which covers
 /// every 12.x operation except `GET /Items/{itemId}/Collections` (added in 12.1).
-const JELLYFIN_API_VERSION: &str = "12.2.0";
+const JELLYFIN_API_VERSION: &str = "12.4.0";
 
 /// The assembled application state plus the handles the composition root still
 /// needs after wiring (the concrete host, to flip its startup flag and drive
@@ -354,8 +355,9 @@ pub async fn build_app_state(
         .await
         .context("failed to provision the aggregate root folder")?;
     // Adopted Jellyfin rows store the metadata/data directories as
-    // `%MetadataPath%`/`%AppDataPath%`; every reader of image paths expands
-    // them against this server's directories (`BaseItemRepository.Map`).
+    // `%MetadataPath%`/`%AppDataPath%`; every reader of item and image paths
+    // expands them against this server's directories (`BaseItemRepository.Map`),
+    // and the item save keeps a stored token the path it writes expands from.
     let virtual_paths =
         ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(Arc::clone(&paths));
     // Live TV is built after the repository and must not be owned by it, so the
@@ -377,7 +379,9 @@ pub async fn build_app_state(
             .with_root_ids(root_folder_ids)
             .with_visibility(Arc::clone(&scope_visibility)),
     );
-    let item_persistence_impl = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+    let item_persistence_impl = Arc::new(
+        FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(virtual_paths.clone()),
+    );
     let item_persistence_service: Arc<dyn ferrofin_traits::persistence::ItemPersistenceService> =
         Arc::clone(&item_persistence_impl) as _;
     // One-shot (12.0 `RefreshCleanNamesAndValues`): move every stored
@@ -490,6 +494,7 @@ pub async fn build_app_state(
             tracing::warn!(%err, "person metadata repair failed; person sort order and Path may diverge until the next scan");
         }
     }
+    let people_validation_repository = (*people_repository_impl).clone();
     let people_repository: Arc<dyn ferrofin_traits::persistence::PeopleRepository> =
         people_repository_impl;
     let media_stream_repository: Arc<dyn ferrofin_traits::persistence::MediaStreamRepository> =
@@ -533,6 +538,15 @@ pub async fn build_app_state(
     // environment): the end-to-end scan test points every provider a scan
     // reaches at its mock server. Unset, each client keeps its public host.
     let endpoints = &config.provider_endpoints;
+    // Every provider limiter's timeout and longest wait, set before any request
+    // of this lifetime, so a changed `config.toml` applies on an in-process
+    // restart (the image limiters live for the whole process).
+    ferrofin_providers::rate_limit::set_request_limits(
+        ferrofin_providers::rate_limit::RequestLimits::from_seconds(
+            config.provider_timeout_seconds,
+            config.provider_max_wait_seconds,
+        ),
+    );
     let mut tmdb_client = ferrofin_providers::TmdbClient::new();
     if let Some(base) = endpoints.tmdb.as_deref() {
         tmdb_client = tmdb_client.with_base_url(base);
@@ -1054,6 +1068,17 @@ pub async fn build_app_state(
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
     trickplay_impl.attach_virtual_folders(Arc::clone(&virtual_folders));
+    // A bare `CollectionFolder` an older build made for the Collections library
+    // becomes the real library: before any scan, and before the sweep below
+    // reads the libraries' locations.
+    ferrofin_core::adoption_repairs::run_merge_legacy_collections_library(
+        db,
+        &virtual_folders_impl,
+        &id_derivation,
+        (&paths.data_path(), &paths.root_folder_path()),
+        &virtual_paths,
+    )
+    .await;
     // One-shot (Jellyfin 12.2 `20260915120000_MigrateRatingLevels`): recompute
     // every row's inherited parental-rating columns from its OWN
     // `OfficialRating` through `GetRatingScore`, so a rating string an older
@@ -1591,7 +1616,10 @@ pub async fn build_app_state(
         .with_providers(Arc::clone(&providers))
         .with_self_writes(Arc::clone(&self_writes_guard))
         // …and names a new Collections library in the server's language.
-        .with_localization(Arc::clone(&localization)),
+        .with_localization(Arc::clone(&localization))
+        // …which the first box set makes, like any library.
+        .with_virtual_folders(Arc::clone(&virtual_folders))
+        .with_virtual_paths(virtual_paths.clone()),
     );
     library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);
@@ -1682,15 +1710,17 @@ pub async fn build_app_state(
     // feed the plugin manager below (so they appear in `/Plugins`); their tasks
     // are registered once `media_segments` exists, and the `task_manager` is
     // wrapped into the `tasks` seam after that.
-    // Suppressed wholesale when `disable_extensions` is set: no descriptors in
+    // Suppressed when `disable_extensions` is set: no descriptors in
     // `/Plugins`, no scheduled tasks, no event hooks. A benchmark leg must
-    // compare like with like, and the Jellyfin leg runs with no plugins.
-    let extensions = if config.disable_extensions {
-        tracing::info!("extensions disabled by configuration");
-        Vec::new()
-    } else {
-        ferrofin_extensions::builtin_extensions()
-    };
+    // compare like with like, and the Jellyfin leg runs with no plugins. The
+    // Ferrofin settings extension stays (owner decision D4): it ports no
+    // plugin and has no tasks or hooks, only the server's own settings page.
+    if config.disable_extensions {
+        tracing::info!(
+            "extensions disabled by configuration; the Ferrofin settings extension stays"
+        );
+    }
+    let extensions = ferrofin_extensions::registered_extensions(config.disable_extensions);
     let media_sources: Arc<dyn ferrofin_traits::library::MediaSourceManager> = Arc::new(
         FerrofinMediaSourceManager::new(
             Arc::clone(&item_repository),
@@ -2062,6 +2092,7 @@ pub async fn build_app_state(
             db.clone(),
             Arc::clone(&providers),
             Arc::clone(&library),
+            people_validation_repository,
         )));
         task_manager.register(Arc::new(lib_tasks::SubtitleDownloadTask::new(
             Arc::clone(&library),
@@ -2615,9 +2646,6 @@ pub async fn build_app_state(
     );
 
     let state = state.with_request_culture(&server_config.ui_culture)?;
-    let state = state.with_websocket_min_stream_period(std::time::Duration::from_millis(
-        u64::from(config.websocket_min_stream_period_ms),
-    ));
 
     // ---- media-encoding pair (real transcode/HLS + attachments) -----------
     // Replace the disabled stubs `AppState::new` installed with the
@@ -2716,6 +2744,16 @@ pub async fn build_app_state(
     // list and per-plugin configuration under `{config}/plugins/` and stages WASM
     // installs for the next start; `docs/EXTENSIONS.md` describes the two tiers.
     let state = state.with_plugins(Arc::clone(&plugins));
+
+    // ---- Ferrofin settings -----------------------------------------------
+    // `GET /Ferrofin/Settings`: the bootstrap configuration this lifetime runs
+    // with and where each value comes from, while the Ferrofin plugin is
+    // enabled in the plugin manager.
+    let state = state.with_server_settings(Arc::new(crate::settings::FerrofinServerSettings::new(
+        config.clone(),
+        Arc::clone(&lifecycle),
+        Arc::clone(&plugins),
+    )));
 
     // ---- SyncPlay ---------------------------------------------------------
     // The SyncPlay manager shares the session message bus (created with the
@@ -2840,12 +2878,9 @@ struct SessionLibraryAudience {
 #[async_trait::async_trait]
 impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
     async fn active_user_ids(&self) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
-        // The admin view of the session table (`_sessionManager.Sessions`):
-        // a nil user id with the api-key flag is the unfiltered enumeration.
-        let sessions = self
-            .sessions
-            .get_sessions(Uuid::nil(), None, None, None, true)
-            .await?;
+        // The session table itself (`_sessionManager.Sessions`): only the
+        // user ids are read, so no session DTO is copied out.
+        let sessions = self.sessions.get_session_summaries().await?;
         let mut seen = std::collections::HashSet::new();
         Ok(sessions
             .into_iter()

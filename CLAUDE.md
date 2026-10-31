@@ -37,7 +37,7 @@ Consequences you must respect:
 
 ## Workspace layout
 
-Rust workspace, edition 2024, toolchain pinned to **1.98.1** (stable). Library crates in
+Rust workspace, edition 2024, toolchain pinned to **1.99.1** (stable). Library crates in
 `crates/`, the server binary in `apps/`.
 
 ```
@@ -64,7 +64,7 @@ chromaprint      health       │          ├─ drawing
 | `ferrofin-networking` | bind / published-URL resolution |
 | `ferrofin-health` | liveness/readiness router |
 | `ferrofin-metrics` | Prometheus `/metrics` with Jellyfin-parity names (see `docs/conventions/METRICS.md`) |
-| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 12.0; adopts 10.11.8–10.11.11, 12.0, 12.1 and 12.2 databases in place) |
+| `ferrofin-db` | **sqlx + SQLite** — entity `FromRow` structs, the migration chain, `Database` handle (schema pinned byte-equal to Jellyfin 12.0; adopts 10.11.8–10.11.11, 12.0, 12.1, 12.2, 12.3 and 12.4 databases in place) |
 | `ferrofin-traits` | the manager/service **traits** — the dependency-injection seam (see below) |
 | `ferrofin-mediaencoding` | ffmpeg/ffprobe: probing, transcode arg-building, the live transcode runtime |
 | `ferrofin-hls` | HLS playlist generation + the stream manager |
@@ -135,7 +135,8 @@ The schema is an ordered migration chain (`crates/ferrofin-db/migrations/`) whos
 Jellyfin-owned shape is **pinned byte-equal to a real Jellyfin 12.0 database** (`0032` converges the
 10.11.8 shape the chain carried through `0029`; the gate adopts the exact
 `__EFMigrationsHistory` sets for 10.11.8–10.11.11, 12.0.0, 12.1.0 and 12.2.0, including both
-12.1 and both 12.2 upgrade routes in the [support matrix](gates/adoption/README.md#supported-and-tested-versions)) — that is
+12.1 and both 12.2 upgrade routes in the [support matrix](gates/adoption/README.md#supported-and-tested-versions);
+12.3.0 and 12.4.0 record 12.2.0's set and adopt as that generation) — that is
 what makes drop-in adoption of an existing Jellyfin DB possible (point Ferrofin at it and it
 migrates in place). Ferrofin-own tables/indexes live in a collision-proof
 `Ferrofin*`/`FerrofinIX_*` namespace. The `schema_conformance` test guards the pin.
@@ -156,6 +157,13 @@ swap as two-way or round-trip in user-facing text. (Suite v3 exercises adoption 
 boots a disposable copy of a Jellyfin-scanned database and Ferrofin migrates it in place —
 but nothing checks that Jellyfin still opens the result, and nothing is expected to.)
 
+**A migration or one-shot repair runs beside the previous version.** The chart's default
+`RollingUpdate` keeps the old pod serving and writing until the new one is ready, and nothing
+serializes the two (sqlx's SQLite migration lock is a no-op), so a row saved after your statement
+ran stays in the old shape. The rules for writing one are under "Migrations and one-shot repairs"
+in `CONTRIBUTING.md`. A refusal or a process-long lock is not an answer: it would wedge a
+`maxUnavailable: 0` rollout.
+
 ### Errors
 Libraries use per-crate `thiserror` enums; the binary uses `anyhow` at the top level.
 Never `.unwrap()` on fallible paths; prefer `?` or explicit handling. `ferrofin-api` maps its
@@ -171,6 +179,10 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
 - **Lints are workspace-wide** (`[workspace.lints]`): `missing_docs` and `clippy::pedantic`
   are warnings, and CI treats warnings as errors. So **every `pub` item needs a `///` doc**,
   and pedantic clippy must pass.
+- **Modules are self-named files.** Under `src/`, a module with children is `foo.rs` beside
+  `foo/`, never `foo/mod.rs`; clippy's `mod_module_files` enforces it. The lint does not look
+  outside `src/`: integration-test helpers live at `tests/<name>/mod.rs` (a `tests/common.rs`
+  would compile as a test binary of its own) or come in with `#[path = "…"]`.
 - **Match the surrounding code.** New HTTP crates mirror the existing `ferrofin-api` shape
   (`create_router`, `AppState`, `error.rs` with `IntoResponse`, a `utoipa` `ApiDoc`).
 - **Port faithfully.** When implementing behavior that mirrors Jellyfin, port it faithfully
@@ -179,7 +191,7 @@ error enum to HTTP status via `IntoResponse` (`NotImplemented → 501`, `Unautho
   (owner decisions 2026-10-16 and 2026-10-25), never a release candidate. The release branch
   keeps it until its release, and the next release branch moves to the newest release. If
   `git ls-remote --tags https://github.com/jellyfin/jellyfin` shows a newer release, say so: the
-  next release branch moves to it (see `UPSTREAM_TAG` in `handlers/mod.rs`).
+  next release branch moves to it (see `UPSTREAM_TAG` in `handlers.rs`).
   Where Jellyfin ships xUnit tests, transliterate the `[Theory]/[InlineData]` cases directly
   into `rstest` `#[case]` tests: the C# expected values are the oracle.
 - **Metrics** (`/metrics`, `ferrofin-metrics`): all metric work follows
@@ -364,15 +376,16 @@ never exists.
 ### Adoption has its own live check — `gates/adoption/`
 `gates/adoption/run.sh --image ferrofin:bench` (fixtures and work directory from `FERROFIN_GATES_DIR`, or
 `--fixtures DIR`) covers 10.11.8, 10.11.9,
-10.11.10, 10.11.11, 12.0.0, 12.1.0 and 12.2.0 databases, with separate 12.1 and 12.2
-fixtures upgraded from 10.11.8 and from 12.0.0.  Every fixture is **synthetic**: build them
+10.11.10, 10.11.11, 12.0.0, 12.1.0, 12.2.0, 12.3.0 and 12.4.0 databases. The 12.1 and 12.2
+fixtures are upgraded from 10.11.8 and from 12.0.0; the 12.3 and 12.4 fixtures from 10.11.8 and from
+the previous 12.x release; and 12.2, 12.3 and 12.4 each have a fresh install.  Every fixture is **synthetic**: build them
 once with `gates/adoption/build-fixtures.sh` (invented media; the official Jellyfin images seed and upgrade
 each database themselves); they are never committed.  Never point the suite at a real
 library or a network share — the scripts refuse a DIR on a network filesystem, because every
 fixture is booted and scanned repeatedly.  A build that fails part-way is never retried
 (seeding is not idempotent): build into a new DIR (`--fixtures`), or move the half-built
 one aside.  On fresh copies it checks
-generation, migrations, Jellyfin 12.2's normalised smoke summaries, file integrity and a
+generation, migrations, Jellyfin 12.4's normalised smoke summaries, file integrity and a
 repair-free second boot.  The [test record](gates/adoption/README.md#supported-and-tested-versions)
 identifies which versions passed and the image used.  Run it for any change to the migration
 chain, the adoption gate or the boot repairs, because those risk user data. This per-change
@@ -399,7 +412,7 @@ which is a different pin from the C# release named below, deliberately. The cont
 API real clients speak, and Jellyfin 12's own surface is smaller (12.0-rc7 and 12.1.0: 364 operations to 10.11.8's 412 — it drops the
 DynamicHls family, `/MusicGenres`, `/CriticReviews` and more), so satisfying it would break
 clients. See `contracts/README.md`. The Jellyfin C# release each `VERIFIED` row was compared
-*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers/mod.rs`, currently `v12.2`, the release
+*against* is `UPSTREAM_TAG`/`UPSTREAM_COMMIT` in `handlers.rs`, currently `v12.4`, the release
 this branch pins; rows compared against an earlier pin are listed in
 `VERIFIED_AGAINST_EARLIER_PIN` until they are re-checked.
 Owner's standing definition: **"deep verified" means the

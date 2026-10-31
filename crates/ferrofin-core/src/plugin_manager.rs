@@ -213,7 +213,7 @@ const DEFAULT_PLUGIN_DOWNLOAD_MB: u32 = 128;
 /// It is the left-hand side of upstream's compatibility test
 /// `_applicationHost.ApplicationVersion < targetAbi`, so it decides which
 /// manifest versions a client is offered.
-const DEFAULT_APPLICATION_VERSION: &str = "12.2.0";
+const DEFAULT_APPLICATION_VERSION: &str = "12.4.0";
 
 /// Whether `url` points at a loopback host (`localhost`, `127.x`, `[::1]`).
 fn is_loopback_url(url: &str) -> bool {
@@ -1599,7 +1599,7 @@ fn project_config(
         return serde_json::to_vec(body)
             .map_err(|e| ServiceError::backend(format!("serialize plugin config: {e}")));
     }
-    let mut out = schema.clone();
+    let mut out = schema;
     for (key, value) in body {
         let Some(slot) = out.get_mut(key) else {
             continue; // unknown key: the deserializer drops it
@@ -1862,7 +1862,8 @@ mod tests {
     #[tokio::test]
     async fn empty_manager_lists_nothing() {
         let (mgr, _dir) = manager(Vec::new());
-        assert!(mgr.list_plugins().await.expect("list").is_empty());
+        let plugins = mgr.list_plugins().await.expect("list");
+        assert!(plugins.is_empty(), "{plugins:?}");
         assert!(mgr.get_plugin(Uuid::new_v4()).await.expect("get").is_none());
     }
 
@@ -2019,7 +2020,8 @@ mod tests {
     #[tokio::test]
     async fn repositories_persist() {
         let (mgr, _dir) = manager(Vec::new());
-        assert!(mgr.get_repositories().await.expect("repos").is_empty());
+        let repositories = mgr.get_repositories().await.expect("repos");
+        assert!(repositories.is_empty(), "{repositories:?}");
         let repo = RepositoryInfo {
             name: Some("Main".to_owned()),
             url: Some("https://example.test/manifest.json".to_owned()),
@@ -2855,33 +2857,27 @@ mod tests {
 
         // Already on the newest catalog version → nothing to do.
         let rig = update_rig("0.10.0", true, true).await;
+        let available_plugin_updates = rig.mgr.available_plugin_updates().await.expect("updates");
         assert!(
-            rig.mgr
-                .available_plugin_updates()
-                .await
-                .expect("updates")
-                .is_empty()
+            available_plugin_updates.is_empty(),
+            "{available_plugin_updates:?}"
         );
 
         // A compiled-in extension (no staged artifact) is never offered an
         // update — `install_package` refuses its id outright.
         let rig = update_rig("0.9.0", false, true).await;
+        let available_plugin_updates = rig.mgr.available_plugin_updates().await.expect("updates");
         assert!(
-            rig.mgr
-                .available_plugin_updates()
-                .await
-                .expect("updates")
-                .is_empty()
+            available_plugin_updates.is_empty(),
+            "{available_plugin_updates:?}"
         );
 
         // A disabled plugin is skipped, matching upstream's gate.
         let rig = update_rig("0.9.0", true, false).await;
+        let available_plugin_updates = rig.mgr.available_plugin_updates().await.expect("updates");
         assert!(
-            rig.mgr
-                .available_plugin_updates()
-                .await
-                .expect("updates")
-                .is_empty()
+            available_plugin_updates.is_empty(),
+            "{available_plugin_updates:?}"
         );
     }
 
@@ -2941,11 +2937,10 @@ mod tests {
             vec![RegisteredPlugin::new(d, None)],
             dir.path().to_path_buf(),
         );
+        let available_plugin_updates = bare.available_plugin_updates().await.expect("updates");
         assert!(
-            bare.available_plugin_updates()
-                .await
-                .expect("updates")
-                .is_empty()
+            available_plugin_updates.is_empty(),
+            "{available_plugin_updates:?}"
         );
     }
 
@@ -3081,11 +3076,10 @@ mod tests {
         .await
         .unwrap();
 
+        let available_plugin_updates = mgr.available_plugin_updates().await.expect("updates");
         assert!(
-            mgr.available_plugin_updates()
-                .await
-                .expect("updates")
-                .is_empty()
+            available_plugin_updates.is_empty(),
+            "{available_plugin_updates:?}"
         );
         assert_eq!(
             hits.load(Ordering::SeqCst),
@@ -3322,7 +3316,8 @@ mod tests {
         // Disabled: gone from discovery AND from the (unauthenticated)
         // content endpoint — Disable must disarm the browser-side surface.
         mgr.disable_plugin(PKG_ID).await.unwrap();
-        assert!(mgr.get_configuration_pages().await.unwrap().is_empty());
+        let configuration_pages = mgr.get_configuration_pages().await.unwrap();
+        assert!(configuration_pages.is_empty(), "{configuration_pages:?}");
         assert!(
             mgr.get_configuration_page("paged-settings")
                 .await

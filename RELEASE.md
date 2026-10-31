@@ -23,7 +23,7 @@ itself (override its choice with the `force_version` input when needed).
 
 | Tag | Triggers | Notes |
 |---|---|---|
-| `vX.Y.Z` | image `:vX.Y.Z` + `:latest`, GitHub Release with notes + binaries, chart `X.Y.Z` | Final release |
+| `vX.Y.Z` | image `:vX.Y.Z` + `:latest`, GitHub Release (a draft until its notes are written) with binaries, chart `X.Y.Z` | Final release |
 | `vX.Y.Z-rc.N` | image `:vX.Y.Z-rc.N` and binaries only | Pre-release; never moves `:latest`, no Release, no chart |
 | `chart-vA.B.C` | chart `A.B.C` only | Chart-only fix (templates/values), no app change |
 
@@ -50,6 +50,11 @@ from.
    PR (release branch → `main`) shows the same run's checks and runs no CI of its own.
 2. **Freeze and measure the release branch.** PRs are not benchmarked individually, so this
    is the only performance gate.
+
+   **Overview.** For a feature release, before the freeze, refresh the release PR's description
+   (release branch → `main`; a patch release from `main` has no such PR) with a high-level overview of everything since the previous release: what changed by
+   area, the scale, and the upgrade notes. The `github-release-overview` skill collects the
+   commits and PRs and drafts it.
 
    **Freeze.** From here until the tag exists, nothing merges into the release branch. If its
    head moves anyway, start again from step 1: the workflow tags the head at the time it
@@ -206,13 +211,18 @@ from.
    sessions, and the A/B gate, from a checkout of the frozen head: a result records the commit
    its harness checkout was at, not the image's, and step 6 publishes only results that
    record the tag's commit.
+   On a branch whose `UPSTREAM_TAG` moved since the corpus was last prepared, prepare it for
+   the new oracle first: `docker pull "$(cat gates/bench/testdata/jellyfin-image.txt)"`, move
+   `$FERROFIN_GATES_DIR/fixtures/bench-testdata/jellyfin/` aside, and run
+   `gates/bench/testdata/build.sh "$FERROFIN_GATES_DIR/fixtures/bench-testdata" --prepare-jellyfin`;
+   until then every run with Jellyfin refuses to start ("Jellyfin preparation does not match").
 
    **Validate adoption.** The evidence is a green run of the `Adoption` workflow
    (`.github/workflows/adoption.yml`) on the frozen release commit. It builds the image from
    that commit and runs the full adoption validation in
-   [`gates/adoption/README.md`](gates/adoption/README.md): `gates/adoption/run.sh` (eleven paths, including the
-   fresh-install 12.2 row) **and** the synthetic preservation matrix (ten paths; the seedless
-   fresh-install row is validated by `run.sh` alone). Every push to `release/**` starts it; for a patch
+   [`gates/adoption/README.md`](gates/adoption/README.md): `gates/adoption/run.sh` (seventeen paths, including the
+   fresh-install 12.2, 12.3 and 12.4 rows) **and** the synthetic preservation matrix (fourteen paths; the
+   seedless fresh-install rows are validated by `run.sh` alone). Every push to `release/**` starts it; for a patch
    release from `main`, start it with **Actions → Adoption → Run workflow** on `main`. Keep
    the run's link for step 5. A manual run of the same commands is for debugging only and
    does not replace the CI run. An adoption failure is never waived; fix it, which means
@@ -225,7 +235,13 @@ from.
    it does **not** commit to the branch. A release branch merges back into `main` with a merge
    commit (never squash or rebase), so the release tag stays reachable from `main`.
 4. The tag push re-triggers the workflow: `docker-image` → `github-release` → `helm-chart`.
-   Watch it finish, then verify (below).
+   Watch it finish, then verify (below). `github-release` creates the GitHub Release as a
+   **draft** with git-cliff placeholder notes, so nobody sees them. It stays a draft, and
+   `releases/latest` (what `docs/INSTALL.md` reads) keeps pointing at the previous release,
+   until the notes are written and the Release is published: the `github-release-notes`
+   skill collects every commit and merged PR since the previous final tag, drafts notes by
+   area with each PR linked, and on approval edits the Release and publishes it. Do this
+   after the verification below and before announcing the release.
 5. **Record the results** after the tag, so the record never moves the frozen head: attach
    the benchmark gate's `report.md` files (A/B, scan, endpoints and, when it was run, ramp) to the release
    PR (release branch → `main`), or to the GitHub Release for a patch release from `main`, and
@@ -284,8 +300,12 @@ docker pull ghcr.io/mangoleaf/ferrofin:vX.Y.Z
 docker run --rm -p 8096:8096 ghcr.io/mangoleaf/ferrofin:vX.Y.Z &
 curl -s localhost:8096/System/Info/Public | jq .Version      # prints vX.Y.Z
 helm pull oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin --version X.Y.Z
+gh release list --limit 3 --json tagName,isDraft           # vX.Y.Z is a draft until published
 gh release view vX.Y.Z --json assets -q '.assets[].name'    # tarballs + checksums
 ```
+
+The Release is a draft until its notes are written and it is published (step 4 above).
+The GitLab mirror creates no Release: the GitHub Release is the only one.
 
 ## Not yet automated (do manually / add later)
 

@@ -478,8 +478,12 @@ mod tests {
         assert!(result.people.is_none());
         assert!(!result.has_metadata);
         assert!(!result.queried_by_id);
-        assert!(result.remote_images.is_empty());
-        assert!(result.images.is_empty());
+        assert!(
+            result.remote_images.is_empty(),
+            "{:?}",
+            result.remote_images
+        );
+        assert!(result.images.is_empty(), "{:?}", result.images);
     }
 
     #[test]
@@ -558,7 +562,7 @@ mod tests {
             ..PersonInfo::new("Carol")
         };
         actor.role = Some("Herself".to_owned());
-        add_person(&mut people, actor.clone());
+        add_person(&mut people, actor);
         // First Carol was Unknown, so the Actor is a distinct (Name,Type) entry.
         assert_eq!(people.len(), 2);
 
@@ -691,7 +695,7 @@ mod tests {
     fn add_person_drops_empty_name() {
         let mut people = Vec::new();
         add_person(&mut people, PersonInfo::new("   "));
-        assert!(people.is_empty());
+        assert!(people.is_empty(), "{people:?}");
     }
 
     #[test]

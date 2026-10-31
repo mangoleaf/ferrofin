@@ -361,7 +361,7 @@ impl FerrofinVirtualFolderManager {
         let db = self.user_preferences.as_ref().map(|(db, _)| db);
         SnapshotInvalidation(
             &self.snapshot,
-            db.or(self.physical_root.as_ref().map(|(db, _)| db)),
+            db.or_else(|| self.physical_root.as_ref().map(|(db, _)| db)),
         )
     }
 
@@ -542,6 +542,24 @@ impl FerrofinVirtualFolderManager {
             new_name: file_name(target),
             view_type,
         }))
+    }
+
+    /// Moves every user's library preferences from the row `old_id`, which held
+    /// a `boxsets` library, to the `boxsets` library `new_id`: the same rewrite a
+    /// rename makes, for a library whose row is being replaced.
+    pub(crate) async fn move_boxsets_preferences(
+        &self,
+        (old_id, old_name): (uuid::Uuid, &str),
+        (new_id, new_name): (uuid::Uuid, &str),
+    ) -> Result<(), ServiceError> {
+        self.remap_user_preferences(&LibraryRename {
+            old_id,
+            new_id,
+            old_name: old_name.to_owned(),
+            new_name: new_name.to_owned(),
+            view_type: Self::collection_type_marker(CollectionTypeOptions::boxsets),
+        })
+        .await
     }
 
     /// Rewrites every user's library preferences from the renamed library's old
@@ -841,9 +859,8 @@ impl FerrofinVirtualFolderManager {
     /// and shows up as a phantom library in `/UserViews` and `/Items`.
     ///
     /// The `Directory.Exists` test is the whole guard, exactly as upstream: a
-    /// `CollectionFolder` whose directory is still there is never touched — which
-    /// is what keeps the manual-collections folder (whose directory lives outside
-    /// the user-views root) safe. Two extra safety stances, neither of which
+    /// `CollectionFolder` whose directory is still there is never touched. Two
+    /// extra safety stances, neither of which
     /// upstream needs because it holds the folders in memory:
     /// - a row with no `Path` at all is left alone (upstream cannot have one), and
     /// - if the user-views root itself is unreadable the pass is skipped entirely,
@@ -2793,15 +2810,13 @@ mod tests {
         );
         mgr.remove_media_path("Root", "/").await.unwrap();
         let folders = mgr.get_virtual_folders().await.unwrap();
-        assert!(folders[0].locations.is_empty());
         assert!(
-            folders[0]
-                .library_options
-                .as_ref()
-                .unwrap()
-                .path_infos
-                .is_empty()
+            folders[0].locations.is_empty(),
+            "{:?}",
+            folders[0].locations
         );
+        let path_infos = &folders[0].library_options.as_ref().unwrap().path_infos;
+        assert!(path_infos.is_empty(), "{path_infos:?}");
     }
 
     #[tokio::test]
@@ -2837,7 +2852,11 @@ mod tests {
             options.metadata_savers.as_deref(),
             Some(&["Nfo".to_owned()][..])
         );
-        assert!(options.disabled_local_metadata_readers.is_empty());
+        assert!(
+            options.disabled_local_metadata_readers.is_empty(),
+            "{:?}",
+            options.disabled_local_metadata_readers
+        );
         // The nested per-type table with its own lists and ImageOption entries.
         assert_eq!(options.type_options.len(), 1);
         let series = &options.type_options[0];
@@ -3232,7 +3251,11 @@ mod tests {
 
         mgr.remove_media_path("Home", &media).await.expect("remove");
         let folders = mgr.get_virtual_folders().await.expect("list");
-        assert!(folders[0].locations.is_empty());
+        assert!(
+            folders[0].locations.is_empty(),
+            "{:?}",
+            folders[0].locations
+        );
         assert_eq!(
             path_infos(&folders),
             [format!("{metadata}/library")],
@@ -3612,8 +3635,10 @@ mod tests {
     #[tokio::test]
     async fn missing_root_lists_empty() {
         let (_tmp, mgr) = manager();
-        assert!(mgr.get_virtual_folders().await.unwrap().is_empty());
-        assert!(mgr.get_physical_paths().await.unwrap().is_empty());
+        let virtual_folders = mgr.get_virtual_folders().await.unwrap();
+        assert!(virtual_folders.is_empty(), "{virtual_folders:?}");
+        let physical_paths = mgr.get_physical_paths().await.unwrap();
+        assert!(physical_paths.is_empty(), "{physical_paths:?}");
     }
 
     #[tokio::test]
@@ -3735,7 +3760,8 @@ mod tests {
             .await
             .unwrap();
         mgr.remove_virtual_folder("Lib").await.unwrap();
-        assert!(mgr.get_virtual_folders().await.unwrap().is_empty());
+        let virtual_folders = mgr.get_virtual_folders().await.unwrap();
+        assert!(virtual_folders.is_empty(), "{virtual_folders:?}");
     }
 
     #[tokio::test]
@@ -3901,11 +3927,9 @@ mod tests {
         mgr.remove_media_path("Lib", &media.replace("Élan", "élan"))
             .await
             .unwrap();
-        assert!(
-            mgr.get_virtual_folders().await.unwrap()[0]
-                .locations
-                .is_empty()
-        );
+        let folders = mgr.get_virtual_folders().await.unwrap();
+        let locations = &folders[0].locations;
+        assert!(locations.is_empty(), "{locations:?}");
     }
 
     /// A case-only rename that differs in a non-ASCII letter is case-only as
@@ -3942,7 +3966,8 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(mgr.get_virtual_folders().await.unwrap().is_empty());
+        let virtual_folders = mgr.get_virtual_folders().await.unwrap();
+        assert!(virtual_folders.is_empty(), "{virtual_folders:?}");
         let media = media_dir(&tmp, "media");
         mgr.add_virtual_folder("Lib", None, &opts_with_paths(std::slice::from_ref(&media)))
             .await

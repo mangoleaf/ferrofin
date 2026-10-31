@@ -30,7 +30,7 @@ pub trait Extension: Send + Sync {
     fn id(&self) -> Uuid;                                  // also its /Plugins id
     fn descriptor(&self) -> PluginDescriptor;              // name, version, description
     fn default_config(&self) -> Vec<u8>;                   // seed config on first run
-    fn config_pages(&self) -> Vec<PluginConfigPage> { … }  // vendored settings page(s)
+    fn config_pages(&self) -> Vec<PluginConfigPage> { … }  // its settings page(s)
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>>;
 }
 ```
@@ -55,6 +55,8 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
 - **Vendored settings pages.** The upstream plugin's HTML settings page is committed into
   `crates/ferrofin-extensions/assets/<name>/` at build time, so normal builds are hermetic
   (no network fetch). Refresh with `FERROFIN_REFRESH_PLUGIN_ASSETS=1 cargo build -p ferrofin-extensions`.
+  The Ferrofin extension's own page is the exception: it is authored here
+  ([below](#the-ferrofin-extension)).
 - **The `CanUninstall=true` quirk.** jellyfin-web gates the enable/disable toggle on the
   plugin reporting `CanUninstall=true`, so compiled-in extensions report `true` to surface
   the toggle — even though the actual uninstall call is still rejected (you can't uninstall
@@ -79,6 +81,30 @@ surface. Intro Skipper fingerprints with `ffmpeg -f chromaprint` (jellyfin-ffmpe
 that muxer), falling back to `fpcalc`; without either, the analyzers that need no fingerprint
 (chapters, black frames) still run. The precise per-plugin list is in
 [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md).
+
+### The Ferrofin extension
+
+Beside the ports, one extension is Ferrofin's own: **Ferrofin**
+(`crates/ferrofin-extensions/src/ferrofin_settings.rs`). It ports no plugin and has no tasks,
+hooks or providers; it gives the server's own settings (`GET` and `POST /Ferrofin/Settings`, see
+[`CONFIG.md`](CONFIG.md#seeing-what-is-set)) a plugin identity and an enabled flag, so the
+dashboard's Disable toggle turns them off. Its version is the server's release.
+`FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.
+
+Its settings page, the Settings link under Dashboard → Plugins → Ferrofin and the dashboard
+menu's **Ferrofin** entry, lists every setting that route reports, in groups: the value in use,
+the default, a badge for where the value comes from (default, `config.toml`, environment or
+flag), the environment variable and flag that set it, and, for a setting the page may not
+change, a lock with the reason and where it is changed instead. Secrets are shown to the
+administrator, marked as secrets. The page is read-only so far. It holds no setting itself,
+since `GET /web/ConfigurationPage` is anonymous: its script reads them from the admin-only route
+and sets every string as text, never as HTML. Disabling the plugin removes the page and the menu
+entry.
+
+The extension is first-party, so it has no row or pin in
+[`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md): its page
+(`crates/ferrofin-extensions/assets/ferrofin/settings.html`) is authored in this repository,
+not vendored, and `build.rs` neither fetches nor pins it.
 
 ## Adding an extension
 

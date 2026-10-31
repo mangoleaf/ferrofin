@@ -263,8 +263,16 @@ mod tests {
         assert!(internal.include_owned_items);
 
         let internal = bind("recursive=true");
-        assert!(internal.audio_languages.is_empty());
-        assert!(internal.subtitle_languages.is_empty());
+        assert!(
+            internal.audio_languages.is_empty(),
+            "{:?}",
+            internal.audio_languages
+        );
+        assert!(
+            internal.subtitle_languages.is_empty(),
+            "{:?}",
+            internal.subtitle_languages
+        );
         assert!(!internal.include_owned_items);
     }
 

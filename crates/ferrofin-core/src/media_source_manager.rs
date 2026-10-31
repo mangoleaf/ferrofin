@@ -3776,7 +3776,7 @@ mod tests {
             .get_static_media_sources(Uuid::from_u128(99), false, None)
             .await
             .expect("sources");
-        assert!(sources.is_empty());
+        assert!(sources.is_empty(), "{sources:?}");
     }
 
     #[tokio::test]

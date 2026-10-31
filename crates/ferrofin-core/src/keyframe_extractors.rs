@@ -573,13 +573,8 @@ mod tests {
             cached.try_extract_keyframes(item, "/media/a.mkv").await,
             None
         );
-        assert!(
-            repository
-                .get_keyframe_data(item)
-                .await
-                .expect("read")
-                .is_empty()
-        );
+        let keyframe_data = repository.get_keyframe_data(item).await.expect("read");
+        assert!(keyframe_data.is_empty(), "{keyframe_data:?}");
     }
 
     /// A keyframe repository whose every call fails.
