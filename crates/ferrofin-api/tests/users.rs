@@ -124,6 +124,9 @@ struct MemUsers {
     deleted: Mutex<Option<Uuid>>,
     /// Makes `delete_user` refuse, as the last user or the last admin.
     refuse_delete: std::sync::atomic::AtomicBool,
+    /// Makes `get_user_dto` answer the policy last saved for that user, so the
+    /// device check after a policy save reads what was saved.
+    echo_saved_policy: std::sync::atomic::AtomicBool,
 }
 
 /// The fixed two-user table shared by [`MemUsers`] and the assertions.
@@ -220,16 +223,23 @@ impl UserManager for MemUsers {
     ) -> Result<UserDto, ServiceError> {
         // The admin user reports IsAdministrator; everyone else does not.
         let is_admin = user.id == ADMIN_ID.to_string();
+        let saved = self
+            .echo_saved_policy
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then(|| self.updated_policy.lock().unwrap().clone())
+            .flatten()
+            .filter(|(id, _)| id.to_string() == user.id)
+            .map(|(_, policy)| policy);
         Ok(UserDto {
             id: Uuid::parse_str(&user.id).unwrap_or_else(|_| Uuid::nil()),
             name: Some(user.username.clone()),
             server_id,
-            policy: Some(UserPolicy {
+            policy: Some(saved.unwrap_or_else(|| UserPolicy {
                 is_administrator: is_admin,
                 // This account fixture has no device restrictions.
                 enable_all_devices: true,
                 ..UserPolicy::default()
-            }),
+            })),
             configuration: Some(UserConfiguration::default()),
             ..UserDto::default()
         })
@@ -1821,6 +1831,153 @@ async fn update_policy_records_and_guards_last_admin() {
     assert_eq!(recorded.1.max_active_sessions, 5);
 }
 
+/// Upstream binds the body into `new UserPolicy()`, so a member it leaves out
+/// keeps the constructor's value (`UserPolicy.cs`), not `false`/`0`. With
+/// `EnableAllDevices` kept, `DeviceAccessHost` signs no device out: the saved
+/// policy is what the device check reads here, and a check that went on to the
+/// devices would reach `FakeDevices`, which panics.
+#[tokio::test]
+async fn update_policy_partial_body_keeps_the_constructor_defaults() {
+    let users = Arc::new(MemUsers::default());
+    users
+        .echo_saved_policy
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let router = create_router(state(users.clone(), Arc::new(MemConfig::new(true))));
+    let body = serde_json::json!({
+        "AuthenticationProviderId": "a",
+        "PasswordResetProviderId": "b",
+        "IsDisabled": false,
+    });
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/Users/{BOB_ID}/Policy"))
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let (_, saved) = users.updated_policy.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        saved,
+        UserPolicy {
+            is_hidden: true,
+            enable_user_preference_access: true,
+            enable_shared_device_control: true,
+            enable_remote_access: true,
+            enable_live_tv_management: true,
+            enable_live_tv_access: true,
+            enable_media_playback: true,
+            enable_audio_playback_transcoding: true,
+            enable_video_playback_transcoding: true,
+            enable_playback_remuxing: true,
+            enable_content_downloading: true,
+            enable_sync_transcoding: true,
+            enable_media_conversion: true,
+            enable_all_devices: true,
+            enable_all_channels: true,
+            enable_all_folders: true,
+            login_attempts_before_lockout: -1,
+            enable_public_sharing: true,
+            authentication_provider_id: "a".to_owned(),
+            password_reset_provider_id: "b".to_owned(),
+            ..UserPolicy::default()
+        }
+    );
+}
+
+/// `UserManager.GetUserById(Guid.Empty)` throws `ArgumentException`, a `400`:
+/// a nil route id, a nil `?userId=`, or an API key's empty user claim when
+/// `userId` is left out (`userId ?? User.GetUserId()`).
+#[rstest::rstest]
+#[case::get("GET", "/Users/00000000-0000-0000-0000-000000000000", "", false)]
+#[case::delete("DELETE", "/Users/00000000-0000-0000-0000-000000000000", "", false)]
+#[case::policy(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Policy",
+    r#"{"AuthenticationProviderId":"a","PasswordResetProviderId":"b"}"#,
+    false
+)]
+#[case::update(
+    "POST",
+    "/Users?userId=00000000-0000-0000-0000-000000000000",
+    r#"{"Name":"bob","Policy":null}"#,
+    false
+)]
+#[case::update_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000",
+    r#"{"Name":"bob","Policy":null}"#,
+    false
+)]
+#[case::configuration(
+    "POST",
+    "/Users/Configuration?userId=00000000-0000-0000-0000-000000000000",
+    "{}",
+    false
+)]
+#[case::configuration_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Configuration",
+    "{}",
+    false
+)]
+#[case::password_path(
+    "POST",
+    "/Users/00000000-0000-0000-0000-000000000000/Password",
+    r#"{"ResetPassword":true}"#,
+    false
+)]
+#[case::password(
+    "POST",
+    "/Users/Password?userId=00000000-0000-0000-0000-000000000000",
+    r#"{"ResetPassword":true}"#,
+    false
+)]
+#[case::api_key_update("POST", "/Users", r#"{"Name":"bob","Policy":null}"#, true)]
+#[case::api_key_configuration("POST", "/Users/Configuration", "{}", true)]
+#[case::api_key_password("POST", "/Users/Password", r#"{"ResetPassword":true}"#, true)]
+#[tokio::test]
+async fn a_nil_user_id_is_a_bad_request(
+    #[case] method: &str,
+    #[case] uri: &str,
+    #[case] body: &str,
+    #[case] api_key: bool,
+) {
+    let users = Arc::new(MemUsers::default());
+    let auth: Arc<dyn AuthService> = if api_key {
+        Arc::new(ferrofin_api::test_support::ApiKeyAuthService)
+    } else {
+        Arc::new(AdminAuth)
+    };
+    let router = create_router(state_with_auth(
+        users.clone(),
+        Arc::new(MemConfig::new(true)),
+        Arc::new(ferrofin_api::test_support::FakeActivity),
+        auth,
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("X-Emby-Token", "t")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_owned()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(users.updated_policy.lock().unwrap().is_none());
+    assert!(users.deleted.lock().unwrap().is_none());
+    assert!(users.updated_configuration.lock().unwrap().is_none());
+}
+
 /// A policy whose two `[Required]` provider ids are set, as every client that
 /// echoes a `GET /Users/{id}` policy back sends it.
 fn complete_policy() -> UserPolicy {
@@ -1856,6 +2013,7 @@ fn complete_policy() -> UserPolicy {
     &["PasswordResetProviderId"]
 )]
 #[case::unknown_user(r"{}", Uuid::from_u128(0xDEAD), &["AuthenticationProviderId", "PasswordResetProviderId"])]
+#[case::nil_user(r"{}", Uuid::nil(), &["AuthenticationProviderId", "PasswordResetProviderId"])]
 #[tokio::test]
 async fn update_policy_requires_both_provider_ids(
     #[case] body: &str,
@@ -2077,7 +2235,8 @@ async fn authenticate_by_name_returns_authentication_result() {
 
 /// The obsolete `UserController.AuthenticateUser` (`POST /Users/{userId}/
 /// Authenticate?pw=`, hidden from the OpenAPI document but served): anonymous,
-/// 404 for an unknown user, `[Required] pw`, else `AuthenticateUserByName`.
+/// 400 for a nil id, 404 for an unknown user, `[Required] pw`, else
+/// `AuthenticateUserByName`.
 #[tokio::test]
 async fn authenticate_by_id_signs_in_as_that_user() {
     let post = |uri: String| async move {
@@ -2103,6 +2262,12 @@ async fn authenticate_by_id_signs_in_as_that_user() {
     ))
     .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = post(format!("/Users/{}/Authenticate?pw=secret", Uuid::nil())).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "GetUserById(Guid.Empty) throws"
+    );
     let response = post(format!("/Users/{USER_ID}/Authenticate")).await;
     assert_eq!(
         response.status(),

@@ -42,6 +42,10 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   folders; play state moves to the placeholder item
 
 ### Tooling
+- A release's A/B gate compares against the latest release of the minor line before it (v1.4.1
+  against v1.3.2): for a release (its `release/vX.Y.Z` branch, or `--release vX.Y.Z` for a patch cut
+  from `main`), `gates/run --previous` and every `gates/bench/gate.py` mode that takes a previous
+  image refuse any other one and name the right one
 - `gates/adoption/run.sh` stops at once when terminated, under bash 5.2 too (a TERM was
   sometimes lost and the run waited out its deadlines); GitHub's shell-tests job gets a
   15-minute timeout
@@ -178,6 +182,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 - Refuse a `POST /Users/{userId}/Policy` body that leaves out `AuthenticationProviderId` or
   `PasswordResetProviderId`, or sends either blank, with Jellyfin's `400` naming each missing
   member, instead of saving the user's providers as empty strings
+- A `POST /Users/{userId}/Policy` body that leaves a member out saves Jellyfin's default for
+  it (`new UserPolicy()`: playback, all libraries, all devices, remote access and the rest
+  allowed, no login lockout), not `false`/`0`. Such a save used to strip the user's access,
+  set a 3-attempt lockout and sign the user out of every device
+- `GET` and `DELETE /Users/{userId}`, and `POST /Users/{userId}/Policy`, `POST /Users`,
+  `POST /Users/Configuration`, `POST /Users/Password` and the hidden
+  `POST /Users/{userId}/Authenticate`, answer a nil user id with Jellyfin's `400`, not a
+  `404`. That includes an API key that leaves `userId` out
 - `GET /Items` honours `seriesStatus` (jellyfin-web's TV Status filter), `minOfficialRating`,
   `maxOfficialRating`, `personTypes`, `isPlaceHolder` and `hasOfficialRating`, and
   `hasParentalRating=false` returns only the unrated items, as Jellyfin 12.2's `TranslateQuery`
@@ -557,6 +569,22 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   `FERROFIN_ROW_CACHE_TTL_SECS` and `FERROFIN_AUTH_CACHE_TTL_SECS`
   (5–300, default 30) bound how long a change made outside the server, in the database
   itself, goes unseen
+- The libraries' physical folders and `Enabled` option come from that same in-memory library
+  set, and the Live TV view is found among the views the user scope has already read. The
+  home screen's `/Users/{id}/Views` resolved a library's physical folders three times and
+  looked the Live TV view up once, a statement each, and read every library's options file;
+  every query scoped to the user's libraries read the files and the Live TV view too. On the
+  benchmark corpus (release builds before and after, requests interleaved) the views went
+  from 21 statements to 17, as in 1.3.2, and from 1.11 to 0.95 ms. A library's options file
+  or row edited outside the server is now seen by these reads within
+  `FERROFIN_ROW_CACHE_TTL_SECS`, as the per-item check already saw it; changes made through
+  the server still apply on the next request
+- A folder's played and total leaf counts read one folder at a time (a series' or season's
+  detail page, a box set or playlist, a plain folder, and any folder a list page's batch
+  leaves out) are one statement, as Jellyfin counts them, and test each leaf's played state
+  on its own rows instead of building the user's whole watch history first. On the
+  benchmark corpus (release builds before and after, requests interleaved) a series' two
+  counts went from 0.61 to 0.15 ms, and a 7,490-leaf folder's from 34 to 19 ms
 
 ### Security
 - A server whose setup was completed no longer starts when its database is missing, empty or
@@ -668,7 +696,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   (an admin search/replace whose replace text multiplies the file, or another plugin's
   transform) is skipped with one warning, leaving the file as it was before that step
 - Dependencies with published RustSec advisories are upgraded: wasmtime and wasmtime-wasi
-  49.0.0 → 49.0.4 (25 advisories against the WASM plugin host, among them a WASI symlink-rename
+  49.0.0 → 49.0.5 (29 advisories against the WASM plugin host, among them a WASI symlink-rename
   sandbox escape, an aarch64 Cranelift miscompile and fuel-limit bypasses), zip 8 → 9 (three
   extraction advisories), h2, tokio, ctutils, event-listener, webpki-root-certs (distrusted CA
   roots), and quinn-proto, which Cargo.lock records although nothing builds it
@@ -679,6 +707,17 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
+- The web client's Next Up row loads again: jellyfin-web 12.x sends `nextUpDateCutoff` as a
+  bare date, which Ferrofin answered with a `400`. Every `DateTime` query parameter now binds
+  as Jellyfin's does: a date or an offset-less date-time is accepted and read as server
+  time (`nextUpDateCutoff`, activity-log `minDate`/`maxDate`, `datePlayed`, and the
+  `GET /LiveTv/Programs` window, which read such values as UTC before), and `datePlayed` also accepts
+  the legacy `yyyyMMddHHmmss` form as UTC
+- Seeking or resuming an HLS stream whose video is transcoded and audio copied (an HEVC
+  movie on an H.264-only client) plays again: the copied-audio trim cut at the absolute
+  seek time on timestamps that start at the seek, so every audio packet was dropped, fMP4
+  segments came out empty ("Source error" in Jellyfin for Android) and TS segments had no
+  audio. The cut now counts from the seek, and the audio starts with the video
 - A Live TV tuner, guide provider, series timer or timer whose stored settings no longer
   parse is logged (a warning naming its table and id, once) instead of vanishing silently,
   and a `livetv.json` that cannot be read or parsed logs a warning naming it once per change

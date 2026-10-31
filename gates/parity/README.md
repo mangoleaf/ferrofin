@@ -75,7 +75,8 @@ release is noted and recorded with the oracle in `run.json`, never refused, on `
 
 `result.json` is the run's overview in the envelope every gate shares ([`gates/result.py`](../result.py)): each
 request's outcome counted overall and by API area (the path's first segment: `/Items`, `/Users`, `/Shows` …):
-**identical**, **accepted** (every difference is in the ledger), **filed** (every difference the ledger does not
+**identical**, **order** (the same answer in another order, every `order` difference in the ledger; never counted
+identical), **accepted** (every difference is in the ledger), **filed** (every difference the ledger does not
 accept is filed as an issue), **new**, or **oracle failed** (Jellyfin did not answer as expected, so nothing was
 compared, and it is never counted identical). It also holds the new differences, the groups of them not filed yet,
 the issues filed and the Jellyfin version. The gates session page, the viewer and the README's parity overview
@@ -165,13 +166,23 @@ Bodies are compared as JSON, after the normalisation rules:
 | `null` | a value on one side is `null` on the other, **always reported, even inside an otherwise matching object** |
 | `missing` / `extra` | a field only Jellyfin / only Ferrofin has: an extra field on Ferrofin is a difference too |
 | `length` | arrays of different length |
+| `order` | arrays that hold the same items in another order, reported once at the array (`Items`, `$` for a root array) |
 
-Arrays are compared in order unless a rule says otherwise. Two elements in the same place that are objects with
-different `Id`s are different items: the order or the selection differs, and that is reported once, as a `value`
-difference at `<array>[].Id`, without comparing the two items field by field, and the rules under them are not
-counted as used by that pair. Ids that differ only in dashes or case are the same item (the format is reported at
-`.Id` and the fields are compared), and a rule on the element itself or one making its `Id` opaque turns the
-collapse off. A body that is not JSON must be byte-equal.
+Arrays are compared in order unless a rule says otherwise. When two arrays hold the same items in another order,
+that is one `order` difference at the array (its values name the first position where the orders part and the item
+each side has there), and each item is then compared with its own, field by field, reported at the item's index in
+Jellyfin's answer. Object items are the same item by the first of `Id`, `ItemId` and `Key` that every item on both
+sides has and no rule makes opaque (dashes and case set aside); if that key repeats on either side, the arrays
+compare by position. Scalars are the same by value. An `unordered` rule pairs its array by its own `by` field
+instead, and a rule on the element itself keeps position. Whether an order difference matters is the
+ledger's call, per request: a reorder where the contract fixes no order (ties, no `SortBy`) can be accepted; a page
+holding other items than Jellyfin's page is not a reorder at all, and stays the difference below.
+
+Otherwise, two elements in the same place that are objects with different `Id`s are different items: the selection
+differs, and that is reported once, as a `value` difference at `<array>[].Id`, without comparing the two items field
+by field, and the rules under them are not counted as used by that pair. Ids that differ only in dashes or case are
+the same item (the format is reported at `.Id` and the fields are compared), and a rule on the element itself or one
+making its `Id` opaque turns the collapse off. A body that is not JSON must be byte-equal.
 
 ### Normalisation (`normalise.toml`)
 

@@ -165,7 +165,7 @@ prometheus = { version = "0.14", default-features = false }
 # so the list is the sandbox's grant (`threads`, `gc` with exceptions,
 # `component-model-async` and `stack-switching` stay off, and so do the
 # profiling, cache, coredump and pooling extras). Only WASIp2 is linked.
-wasmtime = { version = "49.0.4", default-features = false, features = [
+wasmtime = { version = "49.0.5", default-features = false, features = [
     "addr2line",
     "anyhow",
     "backtrace",
@@ -177,7 +177,7 @@ wasmtime = { version = "49.0.4", default-features = false, features = [
     "std",
 ] }
 # Locked-down empty WASI ctx (no preopens/sockets) so std guests link.
-wasmtime-wasi = { version = "49.0.4", default-features = false, features = ["p2"] }
+wasmtime-wasi = { version = "49.0.5", default-features = false, features = ["p2"] }
 wat = "1.259.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────

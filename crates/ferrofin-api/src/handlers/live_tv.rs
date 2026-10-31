@@ -28,7 +28,7 @@ use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use ferrofin_db::entities::users::UserEntity;
@@ -258,20 +258,20 @@ struct ProgramsQuery {
     #[serde(deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid")]
     user_id: Option<Uuid>,
     /// The minimum programme start date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time")]
     min_start_date: Option<DateTime<Utc>>,
     /// Filter by programmes that have finished airing.
     has_aired: Option<bool>,
     /// Filter by programmes airing right now.
     is_airing: Option<bool>,
     /// The maximum programme start date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time")]
     max_start_date: Option<DateTime<Utc>>,
     /// The minimum programme end date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time")]
     min_end_date: Option<DateTime<Utc>>,
     /// The maximum programme end date.
-    #[serde(deserialize_with = "deserialize_optional_date_time")]
+    #[serde(deserialize_with = "crate::handlers::query_date_time::deserialize_optional_date_time")]
     max_end_date: Option<DateTime<Utc>>,
     /// Filter for movies.
     is_movie: Option<bool>,
@@ -666,43 +666,6 @@ fn program_dto_options(
         options.image_types = enable_image_types;
     }
     options
-}
-
-/// Deserializes an optional `date-time` parameter.
-///
-/// RFC 3339 first (what every Jellyfin client sends), then the offset-less
-/// forms ASP.NET's `DateTime` model binder also accepts, read as UTC. An
-/// unparseable value fails the bind — a `400`, as it is upstream.
-pub(crate) fn deserialize_optional_date_time<'de, D>(
-    deserializer: D,
-) -> Result<Option<DateTime<Utc>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize as _;
-    let raw = Option::<String>::deserialize(deserializer)?;
-    let Some(raw) = raw.filter(|s| !s.trim().is_empty()) else {
-        return Ok(None);
-    };
-    parse_date_time(raw.trim())
-        .map(Some)
-        .ok_or_else(|| serde::de::Error::custom(format!("invalid date-time {raw:?}")))
-}
-
-/// Parses one `date-time` value: RFC 3339, else an offset-less date-time, else
-/// a bare date — the latter two read as UTC.
-fn parse_date_time(raw: &str) -> Option<DateTime<Utc>> {
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
-        return Some(parsed.with_timezone(&Utc));
-    }
-    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(raw, format) {
-            return Some(naive.and_utc());
-        }
-    }
-    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
-        .ok()
-        .map(|date| date.and_time(chrono::NaiveTime::MIN).and_utc())
 }
 
 /// `GET /LiveTv/Programs` — EPG programs (query-string form).
@@ -3254,22 +3217,29 @@ mod tests {
 
     #[tokio::test]
     async fn programs_query_rejects_a_malformed_date_and_id() {
+        if crate::test_support::rerun_in_time_zone(
+            "handlers::live_tv::tests::programs_query_rejects_a_malformed_date_and_id",
+        ) {
+            return;
+        }
         let bad_date: axum::http::Uri = "/LiveTv/Programs?minStartDate=whenever".parse().unwrap();
         assert!(Query::<ProgramsQuery>::try_from_uri(&bad_date).is_err());
         // A bare date and an offset-less date-time both bind (ASP.NET's
-        // `DateTime` binder accepts them), read as UTC.
+        // `DateTime` binder accepts them), read as server-local time: EF's
+        // DateTimeKindValueConverter calls ToUniversalTime on the parameter.
         let lenient: axum::http::Uri =
             "/LiveTv/Programs?minStartDate=2026-08-19&maxEndDate=2026-08-19T13:00:00"
                 .parse()
                 .unwrap();
         let bound = Query::<ProgramsQuery>::try_from_uri(&lenient).expect("binds");
+        // Asia/Kolkata (+05:30) wall time.
         assert_eq!(
             bound.0.min_start_date,
-            Some("2026-08-19T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+            Some("2026-08-18T18:30:00Z".parse::<DateTime<Utc>>().unwrap())
         );
         assert_eq!(
             bound.0.max_end_date,
-            Some("2026-08-19T13:00:00Z".parse::<DateTime<Utc>>().unwrap())
+            Some("2026-08-19T07:30:00Z".parse::<DateTime<Utc>>().unwrap())
         );
         // A malformed channel id is a 400 from the handler, not a silent drop.
         let bad_id: axum::http::Uri = "/LiveTv/Programs?channelIds=nope".parse().unwrap();

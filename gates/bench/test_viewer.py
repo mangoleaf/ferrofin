@@ -131,7 +131,16 @@ class ViewerTests(unittest.TestCase):
         self.assertIn('parity-20261026-0107', {n for n, _ in report.discover('parity', str(self.parity))})
         status, _, page = self.get('/report/parity/parity-20261026-0107')
         self.assertEqual(status, 200)
-        for text in ('Parity parity-20261026-0107', '5 identical', 'against Jellyfin 12.2.0', '<th>/Items</th>'):
+        for text in ('Parity parity-20261026-0107', '5 identical', 'against Jellyfin 12.2.0', '<th>/Items</th>',
+                     '<th>Identical</th><th>Known</th>', "<td class='num'>5</td><td class='num'>1</td>"):
+            self.assertIn(text, page)
+        self.assertNotIn('another order', page)   # a run from before the order bucket is shown without it
+        doc = json.loads((run / 'result.json').read_text())
+        doc['counts']['order'] = doc['detail']['areas'][0]['order'] = 2
+        (run / 'result.json').write_text(json.dumps(doc))
+        page = self.get('/report/parity/parity-20261026-0107')[2]
+        for text in ('2 the same answer in another order', '<th>Identical</th><th>Order only</th><th>Known</th>',
+                     "<td class='num'>5</td><td class='num'>2</td><td class='num'>1</td>"):
             self.assertIn(text, page)
         (run / 'report.html').write_text('<p>the full report</p>')   # the full page wins when it is there
         self.assertEqual(self.get('/report/parity/parity-20261026-0107')[2], '<p>the full report</p>')
