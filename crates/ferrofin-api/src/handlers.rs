@@ -918,11 +918,6 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     ("post", "/LiveTv/ListingProviders", "v12.2"),
     // gl-762: livetv lists tuners and listing providers by id, not as added.
     ("get", "/System/Configuration/{key}", "v12.2"),
-    // gl-1029 (Policy: omitted members are false/0, not the constructor
-    // defaults) and gl-1030 (a nil user id is a 404, not a 400).
-    ("post", "/Users/{userId}/Policy", "v12.2"),
-    ("post", "/Users", "v12.2"),
-    ("post", "/Users/Configuration", "v12.2"),
 ];
 
 /// [`VERIFIED_SUBSYSTEMS`] rows last compared against an earlier pin, as
@@ -1677,12 +1672,14 @@ pub const VERIFIED: &[Verified] = &[
         path: "/Users/{userId}/Policy",
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "UpdateUserPolicy",
-        ferrofin: "handlers/users.rs update_user_policy (policy_validation: UserPolicy's \
-               [Required(AllowEmptyStrings = false)] provider ids) → ferrofin-core \
+        ferrofin: "handlers/users.rs update_user_policy (ferrofin-model UserPolicy's serde \
+               default constructor_policy: new UserPolicy()'s values for a member the body \
+               leaves out; policy_validation: UserPolicy's [Required(AllowEmptyStrings = false)] \
+               provider ids; load_user: GetUserById's 400 for a nil id) → ferrofin-core \
                user_manager.rs update_policy_guarded (save_policy: UserManager.UpdatePolicyAsync \
                behind ferrofin-traits policy_update_refusal) → session_manager.rs \
                revoke_user_tokens; handlers/users.rs refresh_device_access (DeviceAccessHost)",
-        date: "2026-10-25",
+        date: "2026-10-29",
         divergences: &[
             "The three guards (the last administrator, an administrator disabled, the last \
          enabled user) are read inside the transaction that saves, and a newly disabled \
@@ -1690,8 +1687,8 @@ pub const VERIFIED: &[Verified] = &[
          before saving and revokes first, so two concurrent saves could both pass a guard and \
          leave the server without an administrator or an enabled user. Jellyfin bug not \
          ported.",
-            "The 403 (a guard refused) and 404 (unknown user) bodies are Ferrofin's error \
-         shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil user id), 403 (a guard refused) and 404 (unknown user) bodies are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1702,18 +1699,27 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UpdateUser",
         ferrofin: "handlers/users.rs update_user (also behind the hidden POST /Users/{userId}; \
                policy_validation for the nested Policy's [Required] provider ids; UserDto's \
-               serde default for a missing Configuration) → ferrofin-core user_manager.rs \
-               rename_user (require_valid_username: ThrowIfInvalidUsername), \
-               update_configuration (one writer transaction, as one SaveChangesAsync; \
-               accepted_cast_receiver_id); handlers/users.rs notify_user_updated \
-               (UserUpdatedNotifier) and refresh_device_access (DeviceAccessHost), both after a \
-               rename only",
-        date: "2026-10-25",
+               serde default for a missing Configuration; load_user: GetUserById's 400 for a \
+               nil id, an API key's userId ?? User.GetUserId() included) → ferrofin-core \
+               user_manager.rs rename_user (require_valid_username: ThrowIfInvalidUsername; \
+               move_profile_image_on), update_configuration (one writer transaction, as one \
+               SaveChangesAsync; accepted_cast_receiver_id); handlers/users.rs \
+               notify_user_updated (UserUpdatedNotifier) and refresh_device_access \
+               (DeviceAccessHost), both after a rename only",
+        date: "2026-10-29",
         divergences: &[
             "\"Configuration\": null skips the configuration save, where upstream dereferences \
          the null in UpdateConfigurationAsync and answers 500. Jellyfin bug not ported.",
-            "The 400 (invalid or taken name), 403 (update not allowed) and 404 (unknown user) \
-         bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "A name ending in a newline (\"alice\\n\") is refused as invalid. Upstream's \
+         ValidUsernameRegex ends in $, which .NET also matches before a final newline, so it \
+         saves the name. Jellyfin bug not ported.",
+            "A rename moves a profile image stored in the old name's directory to the new \
+         name's directory, so its PrimaryImageTag changes, and a move that fails answers 500 \
+         and rolls the rename back. \
+         Upstream's RenameUser leaves the file where it is, and a later user given the old \
+         name then overwrites the renamed user's image. Jellyfin bug not ported.",
+            "The 400 (nil user id, invalid or taken name), 403 (update not allowed) and 404 \
+         (unknown user) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1724,6 +1730,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "UpdateUserConfiguration",
         ferrofin: "handlers/users.rs update_user_configuration (also behind the hidden \
                POST /Users/{userId}/Configuration; JsonBody for the [Required] body; \
+               load_user: GetUserById's 400 for a nil id, an API key's \
+               userId ?? User.GetUserId() included; \
                assert_can_update_user: RequestHelpers.AssertCanUpdateUser with \
                restrictUserPreferences) → ferrofin-core user_manager.rs update_configuration \
                (UserManager.UpdateConfigurationAsync: the Users columns and the OrderedViews, \
@@ -1731,10 +1739,10 @@ pub const VERIFIED: &[Verified] = &[
                transaction; accepted_cast_receiver_id: a non-empty id naming a configured \
                receiver, else the stored one is kept); no UserUpdated push, as \
                UpdateConfigurationAsync raises no event",
-        date: "2026-10-25",
+        date: "2026-10-29",
         divergences: &[
-            "The 403 (update not allowed) and 404 (unknown user) bodies are Ferrofin's error \
-         shape, not upstream's. Fix path: gl-666.",
+            "The 400 (nil user id), 403 (update not allowed) and 404 (unknown user) bodies are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
