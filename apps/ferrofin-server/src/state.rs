@@ -1264,8 +1264,8 @@ pub async fn build_app_state(
             // The playlists folder it lists is `aggregate_store.ensure()`'s,
             // made once above, as `CreateRootFolder` makes it once per process.
             .with_item_store(Arc::clone(&item_persistence_service))
-            // Settles the `UserRootFolder` row on the first
-            // `GET /Library/MediaFolders`, memoized by the store.
+            // Settles the `UserRootFolder` row on the first read of the root
+            // folders, memoized by the store.
             .with_user_root(user_root_store.clone())
             .with_metadata_path(metadata_root.clone())
             .with_id_derivation(id_derivation.clone())
