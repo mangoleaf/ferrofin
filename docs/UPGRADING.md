@@ -262,6 +262,13 @@ a sign-in restores `AuthenticationProviderId`; set `PasswordResetProviderId` (no
 `Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider`) with a
 `POST /Users/{userId}/Policy` that carries the user's full policy.
 
+A policy body that leaves other members out now saves Jellyfin's default for each one
+(`new UserPolicy()`: media playback, all libraries, all devices and remote access allowed, no
+login lockout, among others), where an earlier Ferrofin saved `false` or `0`. A script that
+relied on an omitted member being `false` must now send it. A user an earlier Ferrofin saved
+from such a body keeps that stripped policy until it is saved again in full, from the
+dashboard or with the user's complete policy.
+
 ## Unreleased — library tiles are drawn as Jellyfin 12.2 draws them
 
 Nothing to do. Some "My Media" tiles change on their next refresh:
