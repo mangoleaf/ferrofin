@@ -1642,7 +1642,7 @@ pub const VERIFIED: &[Verified] = &[
                (read_named; BaseConfigurationManager.GetConfiguration and \
                LoadConfiguration, the seven ConfigurationStore registrations) → \
                encoding_response for encoding, the Live TV manager's tuner and provider rows \
-               for livetv",
+               for livetv, blank_for_non_administrator for livetv and network",
         date: "2026-10-23",
         divergences: &[
             "The stored document is reread on every call instead of cached from the first load \
@@ -1661,9 +1661,14 @@ pub const VERIFIED: &[Verified] = &[
             "livetv's TunerHosts and ListingProviders are the Live TV manager's rows, kept in \
          the database rather than in the document; when they cannot be read the lists are \
          empty and the failure is logged.",
-            "For a caller who is not an administrator, livetv's TunerHosts[].Url and \
-         ListingProviders[].Password are blanked; upstream's plain [Authorize] serves those \
-         credentials to every signed-in user (owner decision 2026-10-23).",
+            "For a caller who is not an administrator, every string, list or object member of \
+         livetv and network that handlers/config.rs does not list as open reads empty: today \
+         a tuner's Url and UserAgent, a listing provider's \
+         Username, Password, ListingsId, ZipCode, Path, UserAgent and ChannelMappings, livetv's \
+         RecordingPostProcessor and RecordingPostProcessorArguments, and network's \
+         CertificatePath and CertificatePassword. Upstream's plain [Authorize] serves them to \
+         every signed-in user (owner decision 2026-10-23, widened by gl-1093). encoding stays \
+         whole: the player reads it.",
         ],
         refs: &[],
     },

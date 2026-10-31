@@ -142,6 +142,10 @@ async fn update_branding_configuration(
 /// stored document to its type, reads one that does not parse as its
 /// defaults, and fails on one it cannot read. A key no store is registered
 /// under is `404`, as `GetConfiguration`'s `ResourceNotFoundException` is.
+/// Unless the caller is an administrator, every string, list and object member
+/// of `livetv` and `network` not listed as open reads empty
+/// ([`blank_for_non_administrator`]); `encoding`, which the player reads, stays
+/// whole.
 ///
 /// [`ServerConfigurationManager::get_named_configuration`]: ferrofin_traits::configuration::ServerConfigurationManager::get_named_configuration
 #[utoipa::path(
@@ -213,28 +217,109 @@ async fn get_named_configuration(
             to_value(serde_json::to_value(providers))?,
         );
     }
-    // Divergence (owner decision 2026-10-23): upstream's plain [Authorize]
-    // hands these credentials to every signed-in user, and only the
-    // dashboard's admin pages read them. Blanked on the document itself, so
-    // the lists a dashboard save left in `livetv.json` are covered too.
-    if key.eq_ignore_ascii_case("livetv") && !is_administrator_identity(&state, &auth.0).await? {
-        blank_live_tv_credentials(&mut value);
+    // Divergence (owner decision 2026-10-23, widened by gl-1093): upstream's
+    // plain [Authorize] hands these credentials to every signed-in user, and
+    // only the dashboard's admin pages read them. Blanked on the document
+    // itself, so the lists a dashboard save left in `livetv.json` are covered
+    // too. An administrator, who alone can save, reads every value.
+    if !is_administrator_identity(&state, &auth.0).await? {
+        blank_for_non_administrator(&key, &mut value);
     }
     Ok(Json(value))
 }
 
-/// Blanks the credentials in a `livetv` document: each tuner's `Url` (an IPTV
-/// playlist's usually carries the account's user name and password) and each
-/// listing provider's `Password` (Schedules Direct accepts the stored hash as
-/// the credential). A member the document does not have stays absent.
-fn blank_live_tv_credentials(document: &mut Value) {
-    for (list, member) in [("TunerHosts", "Url"), ("ListingProviders", "Password")] {
-        if let Some(Value::Array(rows)) = document.get_mut(list) {
-            for row in rows {
-                if let Some(credential @ Value::String(_)) = row.get_mut(member) {
-                    *credential = Value::String(String::new());
+/// The string and list members of a `livetv` document a caller who is not an
+/// administrator reads. Left out: `RecordingPostProcessor` and its arguments, a command line
+/// that can hold anything.
+///
+/// These lists say what is open, not what is secret, so a string, list or object
+/// member a later port adds reads empty until someone decides otherwise here.
+const OPEN_LIVE_TV_MEMBERS: &[&str] = &[
+    "RecordingPath",
+    "MovieRecordingPath",
+    "SeriesRecordingPath",
+    "TunerHosts",
+    "ListingProviders",
+    "MediaLocationsCreated",
+];
+
+/// The string members of a tuner row a caller who is not an administrator reads.
+/// Left out: `Url`, which for an IPTV playlist usually carries the account's
+/// user name and password, and `UserAgent`, which some providers check.
+const OPEN_TUNER_HOST_MEMBERS: &[&str] = &["Id", "Type", "DeviceId", "FriendlyName", "Source"];
+
+/// The string and list members of a listing provider row a caller who is not an
+/// administrator reads. Left out: `Username`; `Password` (Schedules Direct
+/// accepts the stored hash as the credential); `Path`, the XMLTV URL; `ZipCode`
+/// and `ListingsId` (a Schedules Direct lineup id such as `USA-OTA-90210` holds
+/// the ZIP code); `UserAgent`, as on a tuner; and `ChannelMappings`, keyed by
+/// tuner channel id, which for an M3U channel hashes the tuner URL.
+const OPEN_LISTING_PROVIDER_MEMBERS: &[&str] = &[
+    "Id",
+    "Type",
+    "Country",
+    "EnabledTuners",
+    "NewsCategories",
+    "SportsCategories",
+    "KidsCategories",
+    "MovieCategories",
+    "MoviePrefix",
+    "PreferredLanguage",
+];
+
+/// The string and list members of a `network` document a caller who is not an
+/// administrator reads. Left out: `CertificatePassword`, the password `tls.rs` opens the
+/// certificate with, and `CertificatePath`, the file it opens.
+const OPEN_NETWORK_MEMBERS: &[&str] = &[
+    "BaseUrl",
+    "LocalNetworkSubnets",
+    "LocalNetworkAddresses",
+    "KnownProxies",
+    "VirtualInterfaceNames",
+    "PublishedServerUriBySubnet",
+    "RemoteIPFilter",
+];
+
+/// Blanks what a caller who is not an administrator may not read of the
+/// document `key` names: of `livetv` and each of its rows, and of `network`. The
+/// other stores hold no credential.
+fn blank_for_non_administrator(key: &str, document: &mut Value) {
+    if key.eq_ignore_ascii_case("network") {
+        blank_unlisted(document, OPEN_NETWORK_MEMBERS);
+    } else if key.eq_ignore_ascii_case("livetv") {
+        blank_unlisted(document, OPEN_LIVE_TV_MEMBERS);
+        for (list, open) in [
+            ("TunerHosts", OPEN_TUNER_HOST_MEMBERS),
+            ("ListingProviders", OPEN_LISTING_PROVIDER_MEMBERS),
+        ] {
+            if let Some(Value::Array(rows)) = document.get_mut(list) {
+                for row in rows {
+                    blank_unlisted(row, open);
                 }
             }
+        }
+    }
+}
+
+/// Empties every string, list and object member of `object` that `open` does
+/// not name. The whole value goes, because an Xtream URL carries the account in
+/// its path as well as its query. The member stays, with its type, because
+/// clients decode these documents into fields that may not be null or missing.
+/// A number or a flag holds no text to hide, and a member the document does not
+/// have stays absent.
+fn blank_unlisted(object: &mut Value, open: &[&str]) {
+    let Value::Object(members) = object else {
+        return;
+    };
+    for (name, value) in members {
+        if open.contains(&name.as_str()) {
+            continue;
+        }
+        match value {
+            Value::String(text) => text.clear(),
+            Value::Array(items) => items.clear(),
+            Value::Object(fields) => fields.clear(),
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
         }
     }
 }
