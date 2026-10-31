@@ -11,7 +11,6 @@
 //! an extensionless URL is stored as a PNG, and a URL that answers JSON is
 //! refused instead of being written into the library as artwork.
 
-use crate::rate_limit::CountedBody as _;
 use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -49,6 +48,17 @@ pub(crate) async fn send(
 
 use ferrofin_model::net::mime_types;
 
+/// Largest remote image body accepted, in bytes. A 4K PNG backdrop is well
+/// under 20 MiB. Without a cap the whole body was buffered (twice) whatever
+/// its size.
+pub(crate) const MAX_REMOTE_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Longest a remote image body may take to arrive once the response headers
+/// are in. The request itself is bounded by the limiter's per-attempt timeout;
+/// this is a hard ceiling on the body read whatever that is configured to.
+pub(crate) const REMOTE_IMAGE_BODY_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
 /// GETs `url` and returns its bytes plus the media type resolved the way the
 /// C# does:
 ///
@@ -59,10 +69,24 @@ use ferrofin_model::net::mime_types;
 ///    `application/octet-stream`, the type implied by the URL's PATH (query
 ///    string stripped, as `Uri.GetLeftPart(UriPartial.Path)` does).
 ///
-/// `None` when the request fails or the response is not a success — the caller
-/// turns that into its own error. The media type is NOT validated here; see
-/// [`reject_non_image`].
+/// `None` when the request fails, the response is not a success, or the body
+/// is over [`MAX_REMOTE_IMAGE_BYTES`] (by `Content-Length`, or once the
+/// streamed count passes it, aborting the read) or takes longer than
+/// [`REMOTE_IMAGE_BODY_TIMEOUT`] — the caller turns that into its own error.
+///
+/// A response whose resolved type is not an image comes back with an EMPTY
+/// body: its body is never read, as upstream checks the type before copying
+/// the stream. The caller still rejects it through [`non_image_reason`].
 pub(crate) async fn download_image(http: &reqwest::Client, url: &str) -> Option<(Vec<u8>, String)> {
+    download_image_capped(http, url, MAX_REMOTE_IMAGE_BYTES).await
+}
+
+/// [`download_image`] with the body cap as a parameter, for tests.
+async fn download_image_capped(
+    http: &reqwest::Client,
+    url: &str,
+    cap: u64,
+) -> Option<(Vec<u8>, String)> {
     let resp = send(http, url).await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -74,8 +98,94 @@ pub(crate) async fn download_image(http: &reqwest::Client, url: &str) -> Option<
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase())
         .filter(|v| !v.is_empty());
     let content_type = resolve_content_type(declared.as_deref(), url);
-    let bytes = resp.counted_bytes().await.ok()?;
+    if non_image_reason(&content_type).is_some() {
+        return Some((Vec::new(), content_type));
+    }
+    let bytes = read_capped(resp, cap).await?;
     Some((bytes, content_type))
+}
+
+/// Reads `resp`'s body into one buffer, giving up (and dropping the
+/// connection) as soon as it is known to exceed `cap` bytes or the read
+/// outlasts [`REMOTE_IMAGE_BODY_TIMEOUT`]. A failed read counts as a request
+/// failure, as the rate limiter's `CountedBody` reads do.
+async fn read_capped(mut resp: reqwest::Response, cap: u64) -> Option<Vec<u8>> {
+    let over = |len: u64| {
+        tracing::debug!(cap, len, "remote image is over the size limit");
+        crate::rate_limit::note_request_failure();
+    };
+    if let Some(len) = resp.content_length().filter(|len| *len > cap) {
+        over(len);
+        return None;
+    }
+    let initial = resp.content_length().unwrap_or(0).min(cap);
+    let read = async move {
+        let mut bytes = Vec::with_capacity(usize::try_from(initial).unwrap_or(0));
+        while let Some(chunk) = resp.chunk().await.transpose() {
+            let chunk = chunk.ok()?;
+            let len = (bytes.len() + chunk.len()) as u64;
+            if len > cap {
+                over(len);
+                return None;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Some(bytes)
+    };
+    let result = tokio::time::timeout(REMOTE_IMAGE_BODY_TIMEOUT, read)
+        .await
+        .ok()
+        .flatten();
+    if result.is_none() {
+        crate::rate_limit::note_request_failure();
+    }
+    result
+}
+
+/// How long a remote image URL that could not be downloaded as an image is
+/// skipped by [`recently_failed`].
+const FAILED_URL_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Most failed URLs remembered at once; past it the oldest half is dropped.
+const FAILED_URL_CAPACITY: usize = 1024;
+
+fn failed_urls() -> &'static Mutex<HashMap<String, std::time::Instant>> {
+    static FAILED: OnceLock<Mutex<HashMap<String, std::time::Instant>>> = OnceLock::new();
+    FAILED.get_or_init(Mutex::default)
+}
+
+/// Whether `url` failed to download as an image within [`FAILED_URL_TTL`].
+///
+/// A URL that answered a non-image (or failed) was not cached, so every
+/// request fetched it again. This negative cache keeps a request from
+/// re-triggering that download more than once per TTL.
+pub(crate) fn recently_failed(url: &str) -> bool {
+    let mut failed = failed_urls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match failed.get(url) {
+        Some(at) if at.elapsed() < FAILED_URL_TTL => true,
+        Some(_) => {
+            failed.remove(url);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Records that `url` could not be downloaded as an image (see
+/// [`recently_failed`]).
+pub(crate) fn note_failed(url: &str) {
+    let mut failed = failed_urls()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if failed.len() >= FAILED_URL_CAPACITY {
+        let mut ages: Vec<std::time::Instant> = failed.values().copied().collect();
+        ages.sort_unstable();
+        let cutoff = ages[ages.len() / 2];
+        failed.retain(|_, at| *at > cutoff);
+    }
+    failed.insert(url.to_owned(), std::time::Instant::now());
 }
 
 /// The media-type resolution above, without the I/O.
@@ -104,6 +214,94 @@ pub(crate) fn non_image_reason(content_type: &str) -> Option<String> {
 mod tests {
     use super::{non_image_reason, resolve_content_type};
     use rstest::rstest;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// Serves one fixed response head, then `body_len` zero bytes in 16 KiB
+    /// writes, to every connection; returns the base URL. With `length`, the
+    /// head declares `Content-Length: body_len`; without, the body is
+    /// delimited by the connection closing, so only a streamed count can
+    /// catch an oversized one.
+    async fn serve(content_type: &'static str, body_len: usize, length: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let length = if length {
+                        format!("Content-Length: {body_len}\r\n")
+                    } else {
+                        String::new()
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\n{length}Connection: close\r\n\r\n"
+                    );
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let chunk = vec![0u8; 16 * 1024];
+                    let mut left = body_len;
+                    while left > 0 {
+                        let n = left.min(chunk.len());
+                        if sock.write_all(&chunk[..n]).await.is_err() {
+                            return;
+                        }
+                        left -= n;
+                    }
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// An image body over the cap is refused, whether its `Content-Length`
+    /// says so up front or only the streamed count finds out; one under it
+    /// downloads whole.
+    #[rstest]
+    #[case::declared_over(true, 4096, None)]
+    #[case::streamed_over(false, 4096, None)]
+    #[case::declared_under(true, 512, Some(512))]
+    #[case::streamed_under(false, 512, Some(512))]
+    #[tokio::test]
+    async fn image_bodies_are_capped(
+        #[case] length: bool,
+        #[case] body_len: usize,
+        #[case] expected: Option<usize>,
+    ) {
+        let base = serve("image/png", body_len, length).await;
+        let http = reqwest::Client::new();
+        let got = super::download_image_capped(&http, &format!("{base}/a.png"), 1024).await;
+        assert_eq!(got.map(|(bytes, _)| bytes.len()), expected);
+    }
+
+    /// A non-image response is answered with its type and no body: the body,
+    /// however large, is never read.
+    #[tokio::test]
+    async fn non_image_bodies_are_not_read() {
+        let base = serve("application/json", 8 * 1024 * 1024, true).await;
+        let http = reqwest::Client::new();
+        let (bytes, mime) = super::download_image_capped(&http, &format!("{base}/x"), 1024)
+            .await
+            .expect("response");
+        assert!(bytes.is_empty());
+        assert!(non_image_reason(&mime).is_some());
+    }
+
+    /// A failed URL is skipped until its entry ages out, and only that URL.
+    #[test]
+    fn failed_urls_are_remembered() {
+        let url = "https://neg-cache.example/logo.png";
+        assert!(!super::recently_failed(url));
+        super::note_failed(url);
+        assert!(super::recently_failed(url));
+        assert!(!super::recently_failed(
+            "https://neg-cache.example/other.png"
+        ));
+    }
 
     /// The label never picks the gate: an artwork download and a subtitle
     /// download from one origin share its pacing and cooldowns, each counted
@@ -249,10 +447,11 @@ pub(crate) async fn download_artwork(
         return Err(ArtworkDownloadFailure::Stop);
     }
     let content_length = response.content_length();
-    let bytes = response
-        .counted_bytes()
+    // The same cap and body deadline as `download_image`: a provider (or a
+    // CDN it points at) answering a huge body must not be buffered whole.
+    let bytes = read_capped(response, MAX_REMOTE_IMAGE_BYTES)
         .await
-        .map_err(|_| ArtworkDownloadFailure::Stop)?;
+        .ok_or(ArtworkDownloadFailure::Stop)?;
     Ok(ArtworkDownload {
         bytes,
         content_type,

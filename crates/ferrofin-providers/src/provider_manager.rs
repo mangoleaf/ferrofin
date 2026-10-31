@@ -4827,13 +4827,20 @@ impl ProviderManager for LocalProviderManager {
             if let Some(file) = cached_file(&folder).await {
                 return Ok(file);
             }
+            // A URL that failed is not cached: skip one that failed recently
+            // rather than fetching it again on every request.
+            if crate::image_download::recently_failed(url) {
+                continue;
+            }
             // Upstream moves on to the next URL only on a 404 or 403 and
             // throws on anything else; any failed URL moves on here.
             let Some((bytes, mime)) = crate::image_download::download_image(&self.http, url).await
             else {
+                crate::image_download::note_failed(url);
                 continue;
             };
             if crate::image_download::non_image_reason(&mime).is_some() {
+                crate::image_download::note_failed(url);
                 continue;
             }
             let ext = mime_types::to_extension(&mime).unwrap_or(".jpg");
