@@ -813,6 +813,11 @@ async fn an_unregistered_named_configuration_is_neither_served_nor_saved() {
     }
 
     let document = serde_json::json!({"CustomSetting":{"NestedValue":[1,"two",false]}});
+    // `[FromRoute, Required]`: a whitespace-only key never reaches the action.
+    assert_eq!(
+        post(app.clone(), "/System/Configuration/%20", &document).await,
+        StatusCode::BAD_REQUEST
+    );
     assert_eq!(
         post(app, "/System/Configuration/never-saved", &document).await,
         StatusCode::INTERNAL_SERVER_ERROR

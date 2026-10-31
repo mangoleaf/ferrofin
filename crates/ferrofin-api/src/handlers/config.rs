@@ -327,6 +327,13 @@ async fn update_named_configuration(
     Path(key): Path<String>,
     JsonValueBody(raw): JsonValueBody<Box<serde_json::value::RawValue>>,
 ) -> Result<StatusCode, ApiError> {
+    // `[FromRoute, Required]`: the binder nulls a whitespace-only value, and
+    // `[ApiController]` answers before the action runs.
+    if key.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "The key field is required.".to_owned(),
+        ));
+    }
     let body = normalize_named_configuration(&key, raw.get())?;
     if key.eq_ignore_ascii_case("branding") {
         let branding: BrandingOptions =
@@ -357,7 +364,7 @@ pub(crate) async fn save_named_configuration(
     use ferrofin_traits::error::ServiceError;
     let path = named_config_file(&state, &key)
         .ok_or_else(|| ApiError::BadRequest("invalid configuration key".to_owned()))?;
-    let _save = state.configuration_write_lock.lock().await;
+    let save = state.configuration_write_lock.lock().await;
     // Parse everything needed by the live consumer before replacing the file.
     let network = if key.eq_ignore_ascii_case("network") {
         Some(
@@ -394,7 +401,16 @@ pub(crate) async fn save_named_configuration(
         state.update_network_settings(&config).await;
     }
     state.config.named_configuration_updated(&key, committed);
-    run_committed_checks(&state, &key)
+    let checked = run_committed_checks(&state, &key);
+    // `RecordingsManager.OnNamedConfigurationUpdated`, whatever the checks
+    // answered. It saves `livetv` itself, so the lock goes first.
+    drop(save);
+    if key.eq_ignore_ascii_case("livetv")
+        && let Some(live_tv) = state.live_tv.as_ref()
+    {
+        live_tv.create_recording_folders().await;
+    }
+    checked
 }
 
 /// Runs the checks registered for after a named save (Jellyfin's

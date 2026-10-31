@@ -4057,6 +4057,8 @@ pub struct LibraryScanner {
     /// materialized itself — Jellyfin's carry one and the DTO emits it
     /// unconditionally. Absent → those rows keep a `NULL` `Path`.
     by_name: Option<crate::by_name_store::ByNameStore>,
+    /// The files being recorded ([`with_recording_paths`](Self::with_recording_paths)).
+    recording_paths: Option<Arc<dyn Fn() -> Vec<String> + Send + Sync>>,
     /// Brackets the files the scan writes beside the media (embedded lyrics
     /// saved as `.lrc`), as upstream's `LyricManager` does. `None` in unit
     /// tests.
@@ -4323,6 +4325,7 @@ impl LibraryScanner {
             item_repository: None,
             years: None,
             by_name: None,
+            recording_paths: None,
             self_writes: None,
             studios_client: None,
             metadata_dir: None,
@@ -4584,6 +4587,26 @@ impl LibraryScanner {
     #[must_use]
     pub fn with_years(mut self, years: crate::years::YearStore) -> Self {
         self.years = Some(years);
+        self
+    }
+
+    /// Reads the files Live TV is recording to right now, which the walk leaves
+    /// out until the capture's own refresh finds them.
+    ///
+    /// TODO(parity, open work item — NOT an accepted divergence; gl-1077):
+    /// upstream gives such a file an item from `OnStarted`, which
+    /// `Video.SourceType` (`LiveTV`), `IsCompleteMedia` and `DtoService`'s
+    /// `Type: Recording` keep away from everything a finished video reaches.
+    /// None of that is ported, so an item here would be a partial file posing
+    /// as a finished one. Un-defer path: port those, then remove this.
+    ///
+    /// Called once by the composition root.
+    #[must_use]
+    pub fn with_recording_paths(
+        mut self,
+        read: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
+        self.recording_paths = Some(read);
         self
     }
 
@@ -5602,38 +5625,42 @@ impl LibraryScanner {
         // The sidecars directly in a library location, by folder: each
         // with the stems of the items it may belong to.
         let mut sidecars: HashMap<&str, Vec<(&String, Vec<String>)>> = HashMap::new();
-        for (path, chain) in &chains {
-            let nearest = chain
-                .iter()
-                .find(|at| items.contains(at.as_str()) && self.file_system.path_exists(at));
-            let (root, via) = match nearest {
-                Some(item) => (item, "nearest existing item"),
-                None => match chain
+        // Each changed path is a stat or more, and a sidecar a listing, on
+        // whatever the library is mounted from.
+        off_runtime(|| {
+            for (path, chain) in &chains {
+                let nearest = chain
                     .iter()
-                    .find(|at| self.file_system.directory_exists(at))
+                    .find(|at| items.contains(at.as_str()) && self.file_system.path_exists(at));
+                let (root, via) = match nearest {
+                    Some(item) => (item, "nearest existing item"),
+                    None => match chain
+                        .iter()
+                        .find(|at| self.file_system.directory_exists(at))
+                    {
+                        Some(folder) => (folder, "nearest existing folder"),
+                        None => (*path, "changed path"),
+                    },
+                };
+                tracing::debug!(path = %path, root = %root, via, "changed path refreshes");
+                roots.push(root.clone());
+                // Nothing between it and the library, and it is no item and no
+                // folder: a sidecar (or a file the library does not resolve)
+                // beside the library's loose items.
+                if nearest.is_none()
+                    && chain.len() == 1
+                    && !items.contains(path.as_str())
+                    && !self.file_system.directory_exists(path)
+                    && let Some(dir) = Path::new(path.as_str()).parent().and_then(|d| d.to_str())
                 {
-                    Some(folder) => (folder, "nearest existing folder"),
-                    None => (*path, "changed path"),
-                },
-            };
-            tracing::debug!(path = %path, root = %root, via, "changed path refreshes");
-            roots.push(root.clone());
-            // Nothing between it and the library, and it is no item and no
-            // folder: a sidecar (or a file the library does not resolve)
-            // beside the library's loose items.
-            if nearest.is_none()
-                && chain.len() == 1
-                && !items.contains(path.as_str())
-                && !self.file_system.directory_exists(path)
-                && let Some(dir) = Path::new(path.as_str()).parent().and_then(|d| d.to_str())
-            {
-                let stems = sidecar_stems(path);
-                if !stems.is_empty() {
-                    sidecars.entry(dir).or_default().push((path, stems));
+                    let stems = sidecar_stems(path);
+                    if !stems.is_empty() {
+                        sidecars.entry(dir).or_default().push((path, stems));
+                    }
                 }
             }
-        }
-        roots.extend(self.sidecar_owners(&sidecars));
+            roots.extend(self.sidecar_owners(&sidecars));
+        });
         roots.extend(self.removed_files_groups(&chains, &items).await);
         collapse_roots(roots)
     }
@@ -5653,11 +5680,13 @@ impl LibraryScanner {
         chains: &[(&String, Vec<String>)],
         items: &std::collections::HashSet<&str>,
     ) -> Vec<String> {
-        let gone: Vec<String> = chains
-            .iter()
-            .map(|(path, _)| (*path).clone())
-            .filter(|path| items.contains(path.as_str()) && !self.file_system.path_exists(path))
-            .collect();
+        let gone: Vec<String> = off_runtime(|| {
+            chains
+                .iter()
+                .map(|(path, _)| (*path).clone())
+                .filter(|path| items.contains(path.as_str()) && !self.file_system.path_exists(path))
+                .collect()
+        });
         if gone.is_empty() {
             return Vec::new();
         }
@@ -14691,12 +14720,17 @@ impl LibraryScanner {
                 // `DotIgnoreIgnoreRule` (`.ignore` files). Every listing of the
                 // walk comes through here, `FindExtras`' own filter included.
                 let mut dot_ignore = ctx.dot_ignore.borrow_mut();
+                // Read after the listing: a capture registers before it
+                // creates its file, so a file listed here is never missed.
+                let recording = self.recording_paths.as_ref().map(|read| read());
+                let recording = recording.as_deref().unwrap_or_default();
                 entries
                     .into_iter()
                     .filter(|entry| {
                         let is_dir = entry.type_ == FileSystemEntryType::Directory;
                         if crate::resolvers::should_ignore_path(&entry.path)
                             || dot_ignore.should_ignore(&entry.path, is_dir)
+                            || recording.contains(&entry.path)
                         {
                             ctx.excluded.borrow_mut().push(entry.path.clone());
                             false

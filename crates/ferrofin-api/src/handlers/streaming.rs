@@ -8,10 +8,15 @@
 //! `videos`/`audio` don't each duplicate it; everything else is transcoded by
 //! [`transcode_stream_fallback`].
 
-use axum::body::Body;
+use std::io::Read as _;
+
+use axum::body::{Body, Bytes};
 use axum::extract::Request;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::Response;
+use chrono::{DateTime, Utc};
 use ferrofin_model::entities::VideoType;
+use ferrofin_traits::filesystem::OpenedFile;
 use ferrofin_traits::media_encoding::HlsStreamRequest;
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
@@ -324,6 +329,89 @@ pub(crate) async fn serve_static_file(path: &str, request: Request) -> Result<Re
         tracing::warn!(path, error = reason, "direct-stream file is not accessible");
     }
     Ok(response.map(Body::new))
+}
+
+/// How much of a file one blocking-pool hop of [`opened_file_response`] reads.
+const FILE_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// The `200` for a file opened through the
+/// [`FileSystem`](ferrofin_traits::filesystem::FileSystem) seam, read on the
+/// blocking pool a chunk at a time as the client takes it, what
+/// `FileStreamResult` and `PhysicalFileResult` send: `Content-Length`, and no
+/// `Accept-Ranges` (both leave `EnableRangeProcessing` off).
+///
+/// The reads take no slot of [`AppState::blocking_file_system`]: the mount
+/// answered the open, so a read that hangs is one the mount took down with it,
+/// at most one per response under way, and a body must not stall on calls
+/// hung on some other mount.
+///
+/// The body stops at the length it declared. A log still being written is
+/// longer by the time the reader gets there, and a body that outran its
+/// `Content-Length` would abort the response; upstream's does. One that comes
+/// up short (the file was truncated) ends the connection early.
+pub(crate) fn opened_file_response(
+    file: OpenedFile,
+    content_type: &str,
+) -> Result<Response, ApiError> {
+    let OpenedFile {
+        path,
+        length,
+        reader,
+    } = file;
+    let unread = (reader.take(length), path);
+    let chunks = futures_util::stream::try_unfold(unread, |(mut reader, path)| async move {
+        let read = tokio::task::spawn_blocking(move || {
+            let mut chunk = Vec::new();
+            let read = reader
+                .by_ref()
+                .take(FILE_CHUNK_BYTES)
+                .read_to_end(&mut chunk);
+            read.map(|_| (reader, chunk))
+        })
+        .await;
+        let (reader, chunk) = read
+            .map_err(std::io::Error::from)
+            .and_then(|read| read)
+            .inspect_err(|error| {
+                tracing::warn!(path, %error, "reading a file for a response failed");
+            })?;
+        Ok::<_, std::io::Error>((!chunk.is_empty()).then(|| (Bytes::from(chunk), (reader, path))))
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, length)
+        .body(Body::from_stream(chunks))
+        .map_err(|error| ApiError::BadRequest(error.to_string()))
+}
+
+/// `FileResultExecutorBase.GetPreconditionState` for a `PhysicalFile`, which
+/// has a last-modified date and no entity tag: the status that answers instead
+/// of the file, if any. `last_modified` counts in whole seconds, as the executor
+/// rounds it down to, and a date in the future is ignored.
+///
+/// `If-Unmodified-Since` failing beats everything. An `If-Modified-Since` that
+/// says "not modified" holds only when nothing says to go on, and a passing
+/// `If-Unmodified-Since` does (`PreconditionState` takes the highest of the
+/// two).
+pub(crate) fn physical_file_precondition(
+    headers: &HeaderMap,
+    last_modified: DateTime<Utc>,
+) -> Option<StatusCode> {
+    let now = Utc::now();
+    let date = |name| {
+        let value = headers.get(name)?.to_str().ok()?;
+        let date = DateTime::<Utc>::from(httpdate::parse_http_date(value).ok()?);
+        (date <= now).then_some(date.timestamp())
+    };
+    let last_modified = last_modified.timestamp();
+    match (
+        date(header::IF_MODIFIED_SINCE),
+        date(header::IF_UNMODIFIED_SINCE),
+    ) {
+        (_, Some(since)) if since < last_modified => Some(StatusCode::PRECONDITION_FAILED),
+        (Some(since), None) if since >= last_modified => Some(StatusCode::NOT_MODIFIED),
+        _ => None,
+    }
 }
 
 /// Runs the response-completion callback when the body terminates, including

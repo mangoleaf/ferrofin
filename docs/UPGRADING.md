@@ -8,6 +8,18 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Unreleased — recording folders become libraries
+
+Nothing to do unless you record Live TV. A recording folder whose directory exists now becomes a
+library, as on Jellyfin: `Recordings`, and `Recorded Movies` and `Recorded Shows` for the custom
+movie and series paths. It is scanned like any other library, so recordings appear in search and
+on the home screen of every user who may see all libraries. A folder a library already holds is
+left to that library.
+
+If you change a recording path, or its directory goes missing (a share not mounted when the server
+starts counts), the library Ferrofin made for it is removed, as on Jellyfin. A library you made
+yourself, or one adopted from Jellyfin whose path is not a recording folder here, stays.
+
 ## Kubernetes: stop the old pod first for heavy migrations
 
 The Helm chart's default rolling update keeps the old pod serving and writing the database

@@ -26,6 +26,7 @@ use ferrofin_model::dto::{
     BaseItemDto, DayOfWeek, MediaSourceInfo, MediaSourceType, NameIdPair, NameValuePair, SortOrder,
 };
 use ferrofin_model::entities::ImageType;
+use ferrofin_model::entities_media::VirtualFolderInfo;
 use ferrofin_model::live_tv::LiveTvOptions;
 use ferrofin_model::live_tv::{
     ChannelMappingOptionsDto, ChannelType, GuideInfo, ItemSortBy, ListingsProviderInfo, LiveTvInfo,
@@ -37,7 +38,7 @@ use ferrofin_model::querying::{ItemFields, QueryResult};
 use ferrofin_traits::drawing::ImageProcessor;
 use ferrofin_traits::dto::DtoService;
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{SelfWrite, SelfWriteGuard, UserViewManager};
+use ferrofin_traits::library::{RecordingLibrary, SelfWrite, SelfWriteGuard, UserViewManager};
 use ferrofin_traits::media_encoding::MediaEncoder;
 use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository};
@@ -459,6 +460,18 @@ pub struct FerrofinLiveTvManager {
     /// The media encoder, for the encoded recorder's ffmpeg. Absent in tests
     /// and on a server with no ffmpeg, where only the direct recorder runs.
     encoder: Option<Arc<dyn MediaEncoder>>,
+    /// The library side of the recording folders
+    /// ([`set_recording_library`](Self::set_recording_library)), in an
+    /// `Arc<OnceLock<_>>` so every clone sees it once the composition root has
+    /// built the library layer. Unset, a recording is never a library item.
+    recording_library: Arc<OnceLock<Arc<dyn RecordingLibrary>>>,
+    /// One `CreateRecordingFolders` pass at a time. Upstream's triggers can
+    /// overlap, and two passes would each add a "Recordings" library.
+    recording_folders_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes writing `named/livetv.json` with a save over the API, which
+    /// holds the same lock
+    /// ([`set_recording_library`](Self::set_recording_library)).
+    options_write_lock: Arc<OnceLock<Arc<tokio::sync::Mutex<()>>>>,
     /// Brackets each recording as it is written, so a recording inside a
     /// watched library is not rescanned mid-write (`RecordingsManager`'s
     /// `ReportFileSystemChangeBeginning`/`Complete`). `None` in unit tests.
@@ -1025,6 +1038,9 @@ impl FerrofinLiveTvManager {
             unparseable_rows: Arc::new(Mutex::new(HashMap::new())),
             options_warned: Arc::new(Mutex::new(None)),
             encoder: None,
+            recording_library: Arc::new(OnceLock::new()),
+            recording_folders_lock: Arc::new(tokio::sync::Mutex::new(())),
+            options_write_lock: Arc::new(OnceLock::new()),
             self_writes: None,
             release_date_format: crate::recording_metadata::default_release_date_format(),
             metadata_language: None,
@@ -1115,6 +1131,21 @@ impl FerrofinLiveTvManager {
     pub fn with_tuner_source(mut self, source: Arc<dyn TunerStreamSource>) -> Self {
         self.tuner_source = source;
         self
+    }
+
+    /// Attaches the library side of the recording folders, which is what makes
+    /// a recording a library item, and the lock a save of the `livetv` named
+    /// configuration holds, which keeps `MediaLocationsCreated` from racing one.
+    ///
+    /// The composition root calls this once the library layer exists; a second
+    /// call is ignored.
+    pub fn set_recording_library(
+        &self,
+        library: Arc<dyn RecordingLibrary>,
+        options_write_lock: Arc<tokio::sync::Mutex<()>>,
+    ) {
+        let _ = self.recording_library.set(library);
+        let _ = self.options_write_lock.set(options_write_lock);
     }
 
     /// Attaches the host that answers where this server's API is reached
@@ -2769,6 +2800,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         )
         .await?;
         self.tuner_flag.store(true, Ordering::Relaxed);
+        self.spawn_recording_folders();
         Ok(info)
     }
 
@@ -2855,6 +2887,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             Ok(any) => self.tuner_flag.store(any, Ordering::Relaxed),
             Err(e) => tracing::warn!(error = %e, "live tv: tuner-host recount failed"),
         }
+        self.spawn_recording_folders();
         Ok(())
     }
 
@@ -2898,7 +2931,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
                     .await?;
             }
         }
-        self.store_listing_provider(info).await
+        let saved = self.store_listing_provider(info).await?;
+        self.spawn_recording_folders();
+        Ok(saved)
     }
 
     async fn delete_listing_provider(&self, id: &str) -> Result<(), ServiceError> {
@@ -2911,6 +2946,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         .await
         .map_err(db_err)?;
         self.xmltv.invalidate(id).await;
+        self.spawn_recording_folders();
         Ok(())
     }
 
@@ -3018,6 +3054,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
         // Stored as it is: `SetChannelMapping` saves the configuration
         // without running the provider's `Validate`.
         let info = self.store_listing_provider(info).await?;
+        self.spawn_recording_folders();
 
         let tuner_channels = self.channels_for_listings_provider(&info).await?;
         let provider_channels = self.provider_channels(&info).await?;
@@ -3313,6 +3350,8 @@ impl LiveTvManager for FerrofinLiveTvManager {
     }
 
     async fn refresh_guide(&self) -> Result<(), ServiceError> {
+        // `GuideManager.RefreshGuide` starts here.
+        self.create_recording_folders().await;
         let generation = self.refresh_generation.fetch_add(1, Ordering::SeqCst) + 1;
         // FETCH FIRST, OUTSIDE THE LOCK. `guide_lock` exists to keep two passes
         // from interleaving their WRITES (see the field doc); holding it across
@@ -3440,28 +3479,7 @@ impl LiveTvManager for FerrofinLiveTvManager {
             });
         }
         if clean_database {
-            // `CleanDatabase(newChannelIdList, [LiveTvChannel], …)` then
-            // `CleanDatabase(newProgramIdList, [LiveTvProgram], …)`: everything
-            // this pass did not re-emit goes. With no listings provider left the
-            // kept programme set is empty and the whole guide drains, which is
-            // what removing a provider is supposed to do. Channels go first so a
-            // dropped channel takes its airings with it via the FK cascade.
-            let stale: Vec<String> = crate::guide_repository::all_channel_ids(&self.db)
-                .await?
-                .into_iter()
-                .filter(|id| !kept_channels.contains(id))
-                .collect();
-            if !stale.is_empty() {
-                crate::guide_repository::delete_channels(&self.db, &stale).await?;
-            }
-            let stale: Vec<String> = crate::guide_repository::all_program_ids(&self.db)
-                .await?
-                .into_iter()
-                .filter(|id| !Uuid::parse_str(id).is_ok_and(|id| kept_programs.contains_key(&id)))
-                .collect();
-            if !stale.is_empty() {
-                crate::guide_repository::delete_programs(&self.db, &stale).await?;
-            }
+            self.clean_guide(&kept_channels, &kept_programs).await?;
         }
         // The lineup is settled; mirror it into `BaseItems` before the
         // programmes, exactly as `RefreshChannelsInternal` stores each channel
@@ -4175,7 +4193,14 @@ impl LiveTvManager for FerrofinLiveTvManager {
         user: Option<&UserEntity>,
         options: &DtoOptions,
     ) -> Result<QueryResult<BaseItemDto>, ServiceError> {
-        let rows = crate::dvr_repository::recording_rows(&self.db, query).await?;
+        let mut rows = crate::dvr_repository::recording_rows(&self.db, query).await?;
+        let mut gone = HashSet::new();
+        for row in &rows {
+            if Self::recording_file_is_gone(row).await {
+                gone.insert(row.id.clone());
+            }
+        }
+        rows.retain(|row| !gone.contains(&row.id));
         let start_index = query.start_index.unwrap_or(0);
         let total = i32::try_from(rows.len()).unwrap_or(i32::MAX);
         let page: Vec<crate::projection::RecordingRow> = rows
@@ -4207,6 +4232,9 @@ impl LiveTvManager for FerrofinLiveTvManager {
         let Some(row) = crate::dvr_repository::recording_row(&self.db, id).await? else {
             return Ok(None);
         };
+        if Self::recording_file_is_gone(&row).await {
+            return Ok(None);
+        }
         // The single-recording path keeps every requested field (upstream's
         // `GetRecording` uses `new DtoOptions()` and never strips).
         Ok(self
@@ -4342,11 +4370,66 @@ impl LiveTvManager for FerrofinLiveTvManager {
         if let Some(timer_id) = row.as_ref().and_then(|row| row.timer_id.as_deref()) {
             self.cancel_recording(timer_id);
         }
-        if let Some(path) = row.and_then(|row| row.path) {
+        let path = row.and_then(|row| row.path);
+        if let Some(path) = &path {
             // Best-effort: a row whose file has already gone still deletes.
-            let _ = tokio::fs::remove_file(&path).await;
+            let _ = tokio::fs::remove_file(path).await;
         }
-        crate::dvr_repository::delete_recording(&self.db, id).await
+        crate::dvr_repository::delete_recording(&self.db, id).await?;
+        // The library item goes with the file, as upstream's `DeleteItem`
+        // removes it. The refresh of a path that has gone drops its row.
+        if let Some(path) = &path {
+            self.refresh_recording_path(path).await;
+        }
+        Ok(())
+    }
+
+    async fn forget_recordings(&self, path: &str) -> Result<(), ServiceError> {
+        crate::dvr_repository::delete_recordings_at(&self.db, path).await
+    }
+
+    async fn get_recording_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
+        let options = self.live_tv_options().await;
+        Ok(crate::recording_folders::recording_folders(&options, &self.paths.data_dir).await)
+    }
+
+    async fn create_recording_folders(&self) {
+        let Some(library) = self.recording_library.get().cloned() else {
+            return;
+        };
+        // On a task of its own: upstream's belongs to no request, and a client
+        // that hangs up must not stop a pass between adding a library and
+        // saving that it did, which would leave the library unrecorded.
+        let manager = self.clone();
+        // The caller's own span, or a root of its own for the two that have
+        // none: a save's worker and a queued guide refresh.
+        let span = match tracing::Span::current() {
+            current if current.is_none() => {
+                tracing::info_span!(parent: None, "recording_folders", trigger = "api")
+            }
+            current => current,
+        };
+        let pass = tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                let _one_pass = manager.recording_folders_lock.lock().await;
+                // `CreateRecordingFolders`' catch-all: nothing here fails a guide
+                // refresh, a recording or a configuration save.
+                if let Err(error) = manager.sync_recording_folders(library.as_ref()).await {
+                    tracing::error!(%error, "live tv: error creating the recording folders");
+                }
+            },
+            span,
+        ));
+        if let Err(error) = pass.await {
+            tracing::error!(%error, "live tv: the recording folders pass failed");
+        }
+    }
+
+    fn paths_being_recorded(&self) -> Vec<String> {
+        self.active_recordings_lock()
+            .values()
+            .map(|recording| recording.path.display().to_string())
+            .collect()
     }
 
     async fn start_dvr(&self) -> Result<(), ServiceError> {
@@ -4661,6 +4744,210 @@ impl FerrofinLiveTvManager {
             );
         }
         LiveTvOptions::default()
+    }
+
+    /// `CleanDatabase(newChannelIdList, [LiveTvChannel], …)` then
+    /// `CleanDatabase(newProgramIdList, [LiveTvProgram], …)`: everything a
+    /// guide refresh did not re-emit goes. With no listings provider left the
+    /// kept programme set is empty and the whole guide drains, which is what
+    /// removing a provider is supposed to do. Channels go first so a dropped
+    /// channel takes its airings with it via the FK cascade.
+    async fn clean_guide(
+        &self,
+        kept_channels: &HashSet<String>,
+        kept_programs: &HashMap<Uuid, ProgramImages>,
+    ) -> Result<(), ServiceError> {
+        let stale: Vec<String> = crate::guide_repository::all_channel_ids(&self.db)
+            .await?
+            .into_iter()
+            .filter(|id| !kept_channels.contains(id))
+            .collect();
+        if !stale.is_empty() {
+            crate::guide_repository::delete_channels(&self.db, &stale).await?;
+        }
+        let stale: Vec<String> = crate::guide_repository::all_program_ids(&self.db)
+            .await?
+            .into_iter()
+            .filter(|id| !Uuid::parse_str(id).is_ok_and(|id| kept_programs.contains_key(&id)))
+            .collect();
+        if !stale.is_empty() {
+            crate::guide_repository::delete_programs(&self.db, &stale).await?;
+        }
+        Ok(())
+    }
+
+    /// `OnNamedConfigurationUpdated` for a save of a tuner or a listings
+    /// provider, which upstream keeps in the `livetv` configuration. Its
+    /// `async void` is waited for by nobody, so neither is this: the handler's
+    /// `queue_guide_refresh` comes right after the save, and a client that
+    /// hangs up during a pass must not lose it.
+    fn spawn_recording_folders(&self) {
+        if self.recording_library.get().is_none() {
+            return;
+        }
+        let manager = self.clone();
+        tokio::spawn(tracing::Instrument::instrument(
+            async move { manager.create_recording_folders().await },
+            tracing::info_span!(parent: None, "recording_folders", trigger = "api"),
+        ));
+    }
+
+    /// `RecordingsManager.CreateRecordingFolders`, inside its catch-all: see
+    /// [`crate::recording_folders`].
+    ///
+    /// One known limit: when a failed adoption left no `livetv.json` and this
+    /// pass adds a library, the file it creates holds the defaults, and the
+    /// seed, which skips an existing file, is not retried at the next boot.
+    async fn sync_recording_folders(
+        &self,
+        library: &dyn RecordingLibrary,
+    ) -> Result<(), ServiceError> {
+        let pass = crate::recording_folders::RecordingFolders {
+            library,
+            data_dir: &self.paths.data_dir,
+        };
+        // Nothing is decided from a document that cannot be read: the defaults
+        // `live_tv_options` answers for it would add a library at the default
+        // path, and an empty list would settle what it inherited.
+        let stored = self.stored_live_tv_options().await?;
+        let on_file = stored.is_some();
+        let options = stored.unwrap_or_default();
+        let folders =
+            crate::recording_folders::recording_folders(&options, &self.paths.data_dir).await;
+        let mut created = options.media_locations_created;
+        // No file yet settles nothing: an adoption whose seed failed retries
+        // it on the next boot, and that list still has to be read.
+        if on_file && !pass.is_settled().await {
+            let kept = crate::recording_folders::RecordingFolders::settle_inherited_locations(
+                created.clone(),
+                &folders,
+            );
+            if kept != created {
+                self.save_media_locations(&kept).await?;
+                created = kept;
+            }
+            pass.mark_settled().await;
+        }
+
+        let added = pass.add_missing(&folders).await?;
+        let Some((locations, to_remove)) =
+            crate::recording_folders::updated_locations(&created, added, &folders)
+        else {
+            return Ok(());
+        };
+        self.save_media_locations(&locations).await?;
+        if !on_file {
+            // That made the file, so every entry in it is this server's own.
+            pass.mark_settled().await;
+        }
+        for path in to_remove {
+            pass.remove_from_libraries(&path).await?;
+        }
+        Ok(())
+    }
+
+    /// The stored Live TV options, `None` when there is no file yet. Unlike
+    /// [`live_tv_options`](Self::live_tv_options), a file that cannot be read
+    /// or parsed is an error.
+    async fn stored_live_tv_options(&self) -> Result<Option<LiveTvOptions>, ServiceError> {
+        let path = &self.paths.options_file;
+        if path.as_os_str().is_empty() {
+            return Ok(None);
+        }
+        let failed = |error: &dyn std::fmt::Display| {
+            ServiceError::backend(format!("{}: {error}", path.display()))
+        };
+        match tokio::fs::read_to_string(path).await {
+            Ok(body) => serde_json::from_str(&body)
+                .map(Some)
+                .map_err(|e| failed(&e)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(failed(&error)),
+        }
+    }
+
+    /// `_config.SaveConfiguration("livetv", config)` after `CreateRecordingFolders`
+    /// changed `MediaLocationsCreated`.
+    ///
+    /// Edits the stored document rather than writing the options back, so the
+    /// members this manager does not model survive, and refuses one it cannot
+    /// read: `live_tv_options` answered the defaults for that, and writing them
+    /// would lose what is there.
+    async fn save_media_locations(&self, locations: &[String]) -> Result<(), ServiceError> {
+        let path = self.paths.options_file.clone();
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        let lock = self.options_write_lock.get().cloned();
+        let _save = match &lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let failed = |error: &dyn std::fmt::Display| {
+            ServiceError::backend(format!("{}: {error}", path.display()))
+        };
+        let mut document = match tokio::fs::read_to_string(&path).await {
+            Ok(body) => serde_json::from_str::<serde_json::Value>(&body).map_err(|e| failed(&e))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                serde_json::to_value(LiveTvOptions::default()).map_err(|e| failed(&e))?
+            }
+            Err(error) => return Err(failed(&error)),
+        };
+        let Some(members) = document.as_object_mut() else {
+            return Err(failed(&"not a JSON object"));
+        };
+        members.insert(
+            "MediaLocationsCreated".to_owned(),
+            serde_json::json!(locations),
+        );
+        let json = serde_json::to_vec_pretty(&document).map_err(|e| failed(&e))?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| failed(&e))?;
+        }
+        let target = path.clone();
+        tokio::task::spawn_blocking(move || {
+            ferrofin_util::file_helper::atomic_write(&target, &json)
+        })
+        .await
+        .map_err(|e| failed(&e))?
+        .map_err(|e| failed(&e))
+    }
+
+    /// Whether a finished recording's file has gone from under the server. A
+    /// recording is a library item upstream, so that ends it.
+    /// ([`forget_recordings`](LiveTvManager::forget_recordings) is the same for
+    /// a library delete, which can take the folder too.)
+    ///
+    /// A capture still has a file to come, a file that cannot be checked is
+    /// taken to be there, and so is one whose folder has gone too, which is
+    /// what an unmounted share looks like: upstream keeps an offline library's
+    /// items.
+    async fn recording_file_is_gone(row: &crate::projection::RecordingRow) -> bool {
+        let path = match row.path.as_deref() {
+            Some(path) if !path.is_empty() && row.status != "InProgress" => {
+                std::path::Path::new(path)
+            }
+            _ => return false,
+        };
+        if tokio::fs::try_exists(path).await.unwrap_or(true) {
+            return false;
+        }
+        match path.parent() {
+            Some(folder) => tokio::fs::try_exists(folder).await.unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Port of `RecordingsManager.TriggerRefresh`. A failure is logged: the
+    /// next scan finds the file anyway.
+    async fn refresh_recording_path(&self, path: &str) {
+        if let Some(library) = self.recording_library.get()
+            && let Err(error) = library.refresh_path(path).await
+        {
+            tracing::warn!(path, %error, "live tv: could not refresh a recording's path");
+        }
     }
 
     /// Every stored timer, whatever its status — C# `TimerManager.GetAll()`,
@@ -5416,6 +5703,10 @@ impl FerrofinLiveTvManager {
         if crate::dvr::is_empty_file(&target).await {
             let _ = tokio::fs::remove_file(&target).await;
         }
+        // `TriggerRefresh(recordingPath)`: scans leave a file being written
+        // alone (`paths_being_recorded`), so this is what makes the recording
+        // a library item.
+        self.refresh_recording_path(&target.to_string_lossy()).await;
         let recorded = tokio::fs::try_exists(&target).await.unwrap_or(false);
         self.settle_timer(timer, &info, recording_id, &target, recorded, outcome)
             .await
@@ -5527,6 +5818,24 @@ impl FerrofinLiveTvManager {
                 span,
             ));
         }
+        // `OnStarted`'s `CreateRecordingFolders`, which is what makes a first
+        // recording's directory a library, and which upstream's `async void`
+        // keeps from holding the recorder up. The recorder makes the directory
+        // upstream before this runs, so it is made here first; failing to make
+        // it is the recorder's to report.
+        if let Err(error) = crate::dvr::create_target_dir(target).await {
+            tracing::debug!(path = %target.display(), %error, "live tv: no recording directory yet");
+        }
+        let manager = self.clone();
+        tokio::spawn(tracing::Instrument::instrument(
+            async move { manager.create_recording_folders().await },
+            tracing::info_span!(
+                parent: None,
+                "recording_folders",
+                trigger = "schedule",
+                timer_id = %info.id
+            ),
+        ));
         // TODO(parity, open work item — NOT an accepted divergence; gl-749):
         // with `save_recording_images`, upstream also copies the programme's
         // artwork beside the recording (`SaveRecordingImages`), but the guide
@@ -6873,6 +7182,7 @@ fn db_err(e: sqlx::Error) -> ServiceError {
 #[cfg(test)]
 mod tests {
     mod guide_mirror;
+    mod recording_folders;
     mod schedules_direct;
 
     use std::collections::HashMap;
