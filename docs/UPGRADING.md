@@ -1,8 +1,8 @@
 # Upgrading Ferrofin
 
 Operator-facing notes for upgrades that need a manual step or change behaviour in a
-way the release notes do not make obvious. Newest first. `CHANGELOG.md` lists *what*
-changed; this file says *what you have to do about it*.
+way the release notes do not make obvious. Newest first. The release notes on
+GitHub list *what* changed; this file says *what you have to do about it*.
 
 Ferrofin's own database upgrades in place: start the new version against the same
 data directory and its migrations run on boot. Back up the data directory before a
