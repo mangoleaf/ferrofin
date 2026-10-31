@@ -28,8 +28,19 @@ fn test_config(root: &std::path::Path) -> Config {
 
 /// Boots the real composition root over a fresh in-memory database.
 async fn boot() -> (WiredApp, Database, tempfile::TempDir) {
+    boot_with_network(None).await
+}
+
+/// [`boot`] with a saved `network.json` (the dashboard's network settings)
+/// in place first, when one is given.
+async fn boot_with_network(network: Option<&str>) -> (WiredApp, Database, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+    if let Some(network) = network {
+        let named = tmp.path().join("config/users/named");
+        std::fs::create_dir_all(&named).unwrap();
+        std::fs::write(named.join("network.json"), network).unwrap();
+    }
     let config = test_config(tmp.path());
     let db = Database::connect_in_memory().await.unwrap();
     db.run_migrations().await.unwrap();
@@ -78,12 +89,21 @@ async fn metrics_disabled_by_default_and_route_absent() {
 
 #[tokio::test]
 async fn metrics_enabled_serves_exposition() {
-    let (wired, db, _tmp) = boot().await;
+    // A blocklist naming one remote subnet; the in-process requests below
+    // carry no peer address and read as loopback, which the gate exempts.
+    let (wired, db, _tmp) = boot_with_network(Some(
+        r#"{"RemoteIPFilter":["198.51.100.0/24"],"IsRemoteIPFilterBlacklist":true}"#,
+    ))
+    .await;
 
     // Mirror what the composition root does when EnableMetrics is set.
     let handle =
         ferrofin_metrics::init(RouteLabels::default(), tokio::runtime::Handle::current()).unwrap();
-    let router = metrics_wiring::mount(ferrofin_api::create_router(wired.state.clone()), &handle);
+    let router = metrics_wiring::mount(
+        ferrofin_api::create_router(wired.state.clone()),
+        &handle,
+        &wired.state,
+    );
     let _sampler = metrics_wiring::spawn_sampler(
         metrics_wiring::register_gauges(&handle),
         Arc::clone(&wired.state.sessions),
@@ -98,7 +118,7 @@ async fn metrics_enabled_serves_exposition() {
     let (warm, _) = get(router.clone(), "/metrics").await;
     assert_eq!(warm, StatusCode::OK);
 
-    let (status, body) = get(router, "/metrics").await;
+    let (status, body) = get(router.clone(), "/metrics").await;
     assert_eq!(status, StatusCode::OK);
     for name in [
         "http_requests_received_total", // HTTP family (from the warm scrape)
@@ -109,5 +129,22 @@ async fn metrics_enabled_serves_exposition() {
             body.contains(name),
             "missing `{name}` in exposition:\n{body}"
         );
+    }
+    // `/metrics` is behind the same IP-access gate as the API (upstream maps
+    // it after `UseIPBasedAccessValidation`): a peer the network policy
+    // refuses gets the gate's 503, an admitted one the exposition.
+    for (peer, expected) in [
+        ("198.51.100.4:5000", StatusCode::SERVICE_UNAVAILABLE),
+        ("203.0.113.9:5000", StatusCode::OK),
+    ] {
+        let mut request = Request::builder()
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let status = router.clone().oneshot(request).await.unwrap().status();
+        assert_eq!(status, expected, "{peer}");
     }
 }
