@@ -4384,6 +4384,10 @@ impl LiveTvManager for FerrofinLiveTvManager {
         Ok(())
     }
 
+    async fn forget_recordings(&self, path: &str) -> Result<(), ServiceError> {
+        crate::dvr_repository::delete_recordings_at(&self.db, path).await
+    }
+
     async fn get_recording_folders(&self) -> Result<Vec<VirtualFolderInfo>, ServiceError> {
         let options = self.live_tv_options().await;
         Ok(crate::recording_folders::recording_folders(&options, &self.paths.data_dir).await)
@@ -4911,9 +4915,10 @@ impl FerrofinLiveTvManager {
         .map_err(|e| failed(&e))
     }
 
-    /// Whether a finished recording's file has gone, by `DELETE /Items/{id}` or
-    /// from under the server. A recording is a library item upstream, so that
-    /// ends it.
+    /// Whether a finished recording's file has gone from under the server. A
+    /// recording is a library item upstream, so that ends it.
+    /// ([`forget_recordings`](LiveTvManager::forget_recordings) is the same for
+    /// a library delete, which can take the folder too.)
     ///
     /// A capture still has a file to come, a file that cannot be checked is
     /// taken to be there, and so is one whose folder has gone too, which is

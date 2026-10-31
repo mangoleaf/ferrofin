@@ -277,6 +277,95 @@ async fn a_folder_inside_a_library_is_answered_with_that_library() {
     );
 }
 
+/// `DELETE /Items/{id}` of a movie in its own folder takes the folder, which
+/// must end the recording too, where nothing else would: no file and no
+/// folder is what an unmounted share looks like.
+#[tokio::test]
+async fn a_library_delete_ends_the_recording() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let wired = boot(temp.path()).await;
+    let router = ferrofin_api::create_router(wired.state.clone());
+    let token = login(&router, ADMIN_USER, ADMIN_PASSWORD).await;
+    let movies = made(temp.path(), "dvr");
+    let file = temp.path().join("dvr/Evening Movie/Evening Movie.ts");
+    std::fs::create_dir_all(file.parent().expect("a folder")).expect("dir");
+    std::fs::write(&file, b"recorded").expect("file");
+    let (status, body) = call(
+        &router,
+        "POST",
+        &format!(
+            "/Library/VirtualFolders?name=Films&collectionType=movies&paths={movies}\
+             &refreshLibrary=false"
+        ),
+        Some(&token),
+        Some(&json!({ "LibraryOptions": {} })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let db = Database::connect(&Config::test_stub(temp.path()).database_url())
+        .await
+        .expect("open db");
+    let id = uuid::Uuid::new_v4();
+    let info = ferrofin_livetv::TimerRecordingInfo {
+        id: "timer".to_owned(),
+        name: "Evening Movie".to_owned(),
+        ..ferrofin_livetv::TimerRecordingInfo::default()
+    };
+    let created = "2026-10-30T00:00:00Z".parse().expect("a date");
+    ferrofin_livetv::dvr_repository::insert_recording(&db, id, &info, &file, created)
+        .await
+        .expect("insert");
+    ferrofin_livetv::dvr_repository::finish_recording(
+        &db,
+        id,
+        ferrofin_model::live_tv::RecordingStatus::Completed,
+        file.to_str(),
+    )
+    .await
+    .expect("finish");
+
+    let recordings = async |router: &axum::Router| -> usize {
+        let (status, body) = call(router, "GET", "/LiveTv/Recordings", Some(&token), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["Items"].as_array().expect("items").len()
+    };
+    assert_eq!(recordings(&router).await, 1);
+
+    assert!(
+        wired
+            .state
+            .library
+            .run_library_scan(ferrofin_traits::library::ScanTrigger::Api, None)
+            .await
+            .expect("scan"),
+        "the scan ran to its end"
+    );
+    let (status, body) = call(
+        &router,
+        "GET",
+        "/Items?recursive=true&includeItemTypes=Movie",
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let item = body["Items"][0]["Id"].as_str().expect("the scanned item");
+
+    let (status, body) = call(
+        &router,
+        "DELETE",
+        &format!("/Items/{item}"),
+        Some(&token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    assert!(!file.exists());
+    assert_eq!(recordings(&router).await, 0);
+}
+
 /// `RecordingsHost.StartAsync`: the pass runs at boot, for a directory that
 /// appeared while the server was down.
 #[tokio::test]

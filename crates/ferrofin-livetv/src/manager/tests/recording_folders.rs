@@ -778,3 +778,124 @@ async fn a_recording_lists_while_it_has_a_file_and_deletes_with_its_item() {
     assert!(!Path::new(&path).exists());
     assert_eq!(library.refreshed()[before..], [path]);
 }
+
+/// A library delete names the item's path: the file, or a series' folder. It
+/// takes the recordings there, and leaves one beside them and a capture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_library_delete_forgets_the_recordings_under_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = FakeLibrary::with(Vec::new());
+    let mgr = manager(dir.path(), &library).await;
+    let listed = |mgr: FerrofinLiveTvManager| async move {
+        mgr.get_recordings_matching(
+            &ferrofin_model::live_tv::RecordingQuery::default(),
+            None,
+            &DtoOptions::default(),
+        )
+        .await
+        .expect("recordings")
+        .items
+        .len()
+    };
+    let program = now_playing(&mgr).await;
+    let defaults = mgr
+        .get_new_timer_defaults(Some(Uuid::parse_str(&program.id).expect("guid")))
+        .await
+        .expect("defaults");
+    let timer_id = mgr
+        .create_timer(timer_from_defaults(&defaults))
+        .await
+        .expect("create");
+    let path = wait_for(|| async {
+        mgr.get_active_recording_path(&timer_id)
+            .await
+            .ok()
+            .flatten()
+    })
+    .await
+    .expect("the capture must start");
+    let folder = Path::new(&path)
+        .parent()
+        .expect("a folder")
+        .display()
+        .to_string();
+
+    let bytes = wait_for(|| async {
+        let written = tokio::fs::metadata(&path).await.is_ok_and(|m| m.len() > 0);
+        written.then_some(())
+    })
+    .await;
+    assert!(bytes.is_some(), "an empty capture leaves no recording");
+
+    mgr.forget_recordings(&folder).await.expect("forget");
+    assert_eq!(listed(mgr.clone()).await, 1, "a capture keeps its row");
+
+    mgr.cancel_timer(&timer_id).await.expect("cancel");
+    let settled = wait_for(|| async {
+        let done = !library.refreshed().is_empty() && mgr.paths_being_recorded().is_empty();
+        let in_progress = mgr
+            .get_recordings_matching(
+                &ferrofin_model::live_tv::RecordingQuery {
+                    is_in_progress: Some(true),
+                    ..ferrofin_model::live_tv::RecordingQuery::default()
+                },
+                None,
+                &DtoOptions::default(),
+            )
+            .await
+            .expect("recordings")
+            .items
+            .len();
+        (done && in_progress == 0).then_some(())
+    })
+    .await;
+    assert!(settled.is_some(), "the capture settles as a recording");
+
+    // A path that only starts the same is another folder, and a blank or root
+    // one names nothing: an item with no path must not take every recording.
+    for other in [&folder[..folder.len() - 1], "", "/"] {
+        mgr.forget_recordings(other).await.expect("forget");
+        assert_eq!(listed(mgr.clone()).await, 1, "{other:?}");
+    }
+
+    mgr.forget_recordings(&folder).await.expect("forget");
+    assert_eq!(listed(mgr.clone()).await, 0);
+}
+
+/// The file's own path is what a movie's or an episode's delete names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_library_delete_forgets_the_recording_at_its_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = FakeLibrary::with(Vec::new());
+    let mgr = manager(dir.path(), &library).await;
+    let id = Uuid::new_v4();
+    let file = dir.path().join("Evening Movie.ts");
+    std::fs::write(&file, b"recorded").unwrap();
+    let info = crate::dvr::TimerRecordingInfo {
+        id: "timer".to_owned(),
+        name: "Evening Movie".to_owned(),
+        ..crate::dvr::TimerRecordingInfo::default()
+    };
+    crate::dvr_repository::insert_recording(&mgr.db, id, &info, &file, chrono::Utc::now())
+        .await
+        .expect("insert");
+    let path = file.display().to_string();
+    crate::dvr_repository::finish_recording(
+        &mgr.db,
+        id,
+        ferrofin_model::live_tv::RecordingStatus::Completed,
+        Some(path.as_str()),
+    )
+    .await
+    .expect("finish");
+    assert!(mgr.get_recording(id).await.expect("read").is_some());
+
+    mgr.forget_recordings(&path).await.expect("forget");
+
+    assert!(
+        crate::dvr_repository::recording_row(&mgr.db, id)
+            .await
+            .expect("read")
+            .is_none()
+    );
+}

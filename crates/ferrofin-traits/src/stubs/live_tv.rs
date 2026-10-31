@@ -784,6 +784,14 @@ pub trait LiveTvManager: Send + Sync {
         Vec::new()
     }
 
+    /// Drops the finished recordings at or under `path`, whose library item
+    /// was deleted. Upstream's recording is that item, so nothing is left of it
+    /// to list. The default has none.
+    async fn forget_recordings(&self, path: &str) -> Result<(), ServiceError> {
+        let _ = path;
+        Ok(())
+    }
+
     /// Gets a single recording by id, or `None` when unknown.
     async fn get_recording(&self, id: Uuid) -> Result<Option<BaseItemDto>, ServiceError>;
 

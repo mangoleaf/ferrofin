@@ -1277,6 +1277,14 @@ async fn delete_one(state: &AppState, auth: &AuthorizationInfo, id: Uuid) -> Res
         .ok_or_else(|| ApiError::NotFound(format!("item {id}")))?;
     require_can_delete(state, auth, &item).await?;
     state.library.delete_item(id, &delete_with_files()).await?;
+    // A recording is this item upstream, so `/LiveTv/Recordings` ends with it.
+    // The delete has happened, so a failure here does not undo that answer.
+    let path = item.path.as_deref().filter(|path| !path.is_empty());
+    if let (Some(live_tv), Some(path)) = (state.live_tv.as_ref(), path)
+        && let Err(error) = live_tv.forget_recordings(path).await
+    {
+        tracing::warn!(item_id = %id, %error, "could not forget a deleted item's recordings");
+    }
     Ok(())
 }
 
