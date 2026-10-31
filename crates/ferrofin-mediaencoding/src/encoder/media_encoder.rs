@@ -86,6 +86,35 @@ pub fn analyze_duration_value(source_ms: Option<i32>, configured: &str) -> Strin
     }
 }
 
+/// The `-threads` count of a probe that decodes its first video frame, when
+/// the encoding options leave the count to ffmpeg.
+///
+/// Upstream passes its automatic `0` here too. That starts frame threading on
+/// every core, and a frame-threaded decoder holds its first frame back until it
+/// has one frame per thread in flight, so a many-core host decodes that many
+/// frames, each on its own copy of the buffers, to report one. Two threads keep
+/// the same frame threading with the least delay. `-threads 1` would not do:
+/// ffprobe then reports the h264 and HEVC decoders' real `refs`, where a
+/// frame-threaded run reports `1`, and clients read that as `RefFrames`. Across
+/// a 10,531-file corpus and samples of AV1, VP9, MPEG-2 and MPEG-4, `2` and `0`
+/// print identical bytes, at half the CPU.
+const FIRST_FRAME_PROBE_THREADS: i32 = 2;
+
+/// The `-threads` count of a probe with `cores` usable cores. A configured
+/// count stands, as upstream passes it. An unset or automatic count changes
+/// only where the probe decodes ([`FIRST_FRAME_PROBE_THREADS`]) and more than
+/// one core is usable. Pinned to one core, ffmpeg's automatic count is a single
+/// thread, which reports `refs` differently from two, so upstream's value
+/// stands there, and under a one-CPU cgroup quota too, where `cores` cannot
+/// tell the two apart.
+fn probe_threads(configured: i32, first_video_frame: bool, cores: usize) -> i32 {
+    if first_video_frame && configured <= 0 && cores > 1 {
+        FIRST_FRAME_PROBE_THREADS
+    } else {
+        configured
+    }
+}
+
 /// Tunable knobs read from the encoding configuration.
 ///
 /// Groups the handful of `IConfiguration`/`EncodingOptions`-derived values the
@@ -155,6 +184,9 @@ pub struct MediaEncoderImpl<T: Transcoder> {
     /// `_proberSupportsFirstVideoFrame`: whether ffprobe accepts
     /// `-only_first_vframe`. Off until the host reports the probed answer.
     prober_first_video_frame: bool,
+    /// The usable cores, read once: a scan probes thousands of files
+    /// ([`probe_threads`]).
+    cores: usize,
 }
 
 impl<T: Transcoder> MediaEncoderImpl<T> {
@@ -293,6 +325,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
             }),
             normalizer: ProbeResultNormalizer::new(Box::new(PassthroughLocalization)),
             prober_first_video_frame: false,
+            cores: std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
         }
     }
 
@@ -355,7 +388,8 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
     /// A local, non-audio probe also asks for the first video frame
     /// (`-show_frames -only_first_vframe`) when ffprobe supports it, so the
     /// normalizer can read that frame's side data and set
-    /// `Hdr10PlusPresentFlag`.
+    /// `Hdr10PlusPresentFlag`. That decode is the one departure from upstream's
+    /// line: [`probe_threads`].
     fn probe_arguments(
         &self,
         input_path: &str,
@@ -373,7 +407,7 @@ impl<T: Transcoder> MediaEncoderImpl<T> {
         } else {
             ""
         };
-        let threads = self.config.threads;
+        let threads = probe_threads(self.config.threads, first_video_frame, self.cores);
         format!(
             "{extra} -i {input_path} -threads {threads} -v warning -print_format json \
              -show_streams{chapters} -show_format{frames}"
@@ -966,7 +1000,9 @@ mod tests {
     use ferrofin_model::media_info::MediaProtocol;
     use ferrofin_traits::media_encoding::{MediaEncoder, MediaInfoRequest};
 
-    use super::{ExtractionSettings, MediaEncoderConfig, MediaEncoderImpl, TICKS_PER_SECOND};
+    use super::{
+        ExtractionSettings, MediaEncoderConfig, MediaEncoderImpl, TICKS_PER_SECOND, probe_threads,
+    };
     use crate::encoder::Transcoder;
     use crate::encoding_helper::hw::FfmpegCapabilities;
     use async_trait::async_trait;
@@ -2897,5 +2933,65 @@ mod tests {
             "{arguments}"
         );
         assert!(arguments.contains("-show_format"), "{arguments}");
+    }
+
+    /// A probe that decodes its first frame takes two threads when the
+    /// encoding options leave the count to ffmpeg: its automatic count holds
+    /// that frame back behind one decoded frame per core. A configured count
+    /// stands, a probe that decodes nothing keeps upstream's argument, and so
+    /// does a single core, where the automatic count is already one thread.
+    #[rstest]
+    #[case::automatic_with_frame(0, true, 16, 2)]
+    #[case::unset_with_frame(-1, true, 16, 2)]
+    #[case::automatic_on_two_cores(0, true, 2, 2)]
+    #[case::automatic_on_one_core(0, true, 1, 0)]
+    #[case::automatic_without_frame(0, false, 16, 0)]
+    #[case::configured_with_frame(3, true, 16, 3)]
+    #[case::single_with_frame(1, true, 16, 1)]
+    fn a_first_frame_probe_never_decodes_on_every_core(
+        #[case] configured: i32,
+        #[case] first_video_frame: bool,
+        #[case] cores: usize,
+        #[case] expected: i32,
+    ) {
+        assert_eq!(
+            probe_threads(configured, first_video_frame, cores),
+            expected
+        );
+    }
+
+    /// The probe line carries that count, for the cores the encoder read.
+    #[rstest]
+    #[case::many_cores(16, "2")]
+    #[case::one_core(1, "0")]
+    #[tokio::test]
+    async fn a_first_frame_probe_line_carries_the_probe_thread_count(
+        #[case] cores: usize,
+        #[case] expected: &str,
+    ) {
+        let transcoder = Arc::new(RecordingProbe(std::sync::Mutex::new(Vec::new())));
+        let mut enc = MediaEncoderImpl::new(
+            Arc::clone(&transcoder),
+            "/usr/bin/ffmpeg",
+            "/usr/bin/ffprobe",
+            MediaEncoderConfig::default(),
+        )
+        .with_first_video_frame_probe(true);
+        enc.cores = cores;
+        let request = MediaInfoRequest {
+            media_source: MediaSourceInfo {
+                path: Some("/media/movie.mkv".to_owned()),
+                protocol: MediaProtocol::File,
+                ..MediaSourceInfo::default()
+            },
+            extract_chapters: false,
+            media_is_audio: false,
+        };
+        enc.get_media_info(&request).await.expect("probe parses");
+
+        let arguments = transcoder.0.lock().unwrap().last().unwrap().clone();
+        let tokens = crate::encoder::split_args(&arguments).unwrap();
+        let threads = tokens.iter().position(|a| a == "-threads").unwrap();
+        assert_eq!(tokens[threads + 1], expected, "{arguments}");
     }
 }

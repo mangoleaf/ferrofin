@@ -154,6 +154,11 @@ pub struct LibraryChangedNotifier {
     /// before wiring completes — falls back to publishing one payload on the
     /// event bus, which nothing forwards to clients.
     audience: std::sync::OnceLock<Arc<dyn LibraryChangeAudience>>,
+    /// Held while a batch is published. Each batch's per-user filter reads its
+    /// items' whole rows, and a scan's chunks fill batches faster than they go
+    /// out, so batches filtered together would hold a first scan's every row
+    /// in memory at once.
+    publishing: tokio::sync::Mutex<()>,
 }
 
 impl LibraryChangedNotifier {
@@ -169,6 +174,7 @@ impl LibraryChangedNotifier {
             pending: Mutex::new(Pending::default()),
             next_window: AtomicU64::new(0),
             audience: std::sync::OnceLock::new(),
+            publishing: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -336,8 +342,10 @@ impl LibraryChangedNotifier {
     }
 
     /// Folds one taken batch and publishes it, per user when an audience is
-    /// wired.
+    /// wired. One batch at a time ([`Self::publishing`]): a later batch waits
+    /// for this one's consumers and its sends.
     async fn publish(&self, pending: Pending) {
+        let _one_batch_at_a_time = self.publishing.lock().await;
         let folded = fold(&pending);
         if folded.info.is_empty {
             return;
@@ -838,6 +846,63 @@ mod tests {
         let pushed = events.library_updates();
         assert_eq!(pushed.len(), 5);
         assert_eq!(pushed[4].items_added.len(), 1);
+    }
+
+    /// Counts how many batches are being filtered for a user at once.
+    #[derive(Default)]
+    struct OverlapAudience {
+        library: Uuid,
+        filtering: AtomicU64,
+        most_at_once: AtomicU64,
+        filtered: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl LibraryChangeAudience for OverlapAudience {
+        async fn active_user_ids(&self) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(vec![Uuid::nil()])
+        }
+        async fn visible_library_ids(&self, _: Uuid) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(vec![self.library])
+        }
+        async fn library_top_parents(&self, libraries: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+            Ok(libraries.to_vec())
+        }
+        async fn visible_item_ids(&self, _: Uuid, ids: &[Uuid]) -> Result<Vec<Uuid>, ServiceError> {
+            let now = self.filtering.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_at_once.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            self.filtering.fetch_sub(1, Ordering::SeqCst);
+            self.filtered.fetch_add(1, Ordering::SeqCst);
+            Ok(ids.to_vec())
+        }
+        async fn deliver(&self, _: Uuid, _: &str) -> Result<(), ServiceError> {
+            Ok(())
+        }
+    }
+
+    /// Each batch's per-user filter reads its items' whole rows. A scan records
+    /// its changes a chunk at a time, so the batches it fills would otherwise
+    /// all be filtered together, with every row of a first scan in memory at
+    /// once on top of the scan's own plan.
+    #[tokio::test(start_paused = true)]
+    async fn full_batches_recorded_apart_are_filtered_one_at_a_time() {
+        let (n, _events) = notifier(Duration::from_secs(30));
+        let (parent, library) = (Uuid::new_v4(), Uuid::new_v4());
+        let audience = Arc::new(OverlapAudience {
+            library,
+            ..OverlapAudience::default()
+        });
+        n.set_audience(Arc::clone(&audience) as Arc<dyn LibraryChangeAudience>);
+        for _ in 0..3 {
+            let items: Vec<BaseItemEntity> = (0..MAX_BATCH_SIZE)
+                .map(|_| movie(Uuid::new_v4(), parent, library))
+                .collect();
+            n.record_added(&items);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(audience.filtered.load(Ordering::SeqCst), 3);
+        assert_eq!(audience.most_at_once.load(Ordering::SeqCst), 1);
     }
 
     /// `LibraryUpdateDuration` is read as each window opens
