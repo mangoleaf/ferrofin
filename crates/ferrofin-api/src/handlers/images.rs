@@ -24,8 +24,10 @@
 //!
 //! A missing item (or by-name item, or user), or an item with no image of the
 //! requested type/index, or an image whose file is remote/absent, is a `404` —
-//! exactly the contract's not-found outcome. `HEAD` shares each handler with
-//! `GET` (the file service is `HEAD`-aware).
+//! exactly the contract's not-found outcome. So is a Live TV item's row that is
+//! neither a URL nor a file in the internal metadata directory
+//! ([`live_tv_image_is_servable`]). `HEAD` shares each handler with `GET` (the
+//! file service is `HEAD`-aware).
 //!
 //! ## Write side
 //!
@@ -49,11 +51,12 @@ use axum::handler::Handler;
 use axum::http::StatusCode;
 use axum::response::Response;
 use axum::routing::get;
+use ferrofin_db::entities::base_items::BaseItemEntity;
 use ferrofin_model::data::BaseItemKind;
 use ferrofin_model::drawing::ImageFormat;
 use ferrofin_model::dto::ImageInfo;
 use ferrofin_model::entities::ImageType;
-use ferrofin_traits::options::{ImageProcessingOptions, ItemImageInfo};
+use ferrofin_traits::options::{ImageProcessingOptions, ItemImageInfo, ItemImagesToServe};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 use uuid::Uuid;
@@ -412,6 +415,34 @@ fn select_image(
         .nth(usize::try_from(index).unwrap_or(0))
 }
 
+/// Whether a Live TV channel's or programme's `image` may be served.
+///
+/// Its rows hold what a tuner or a guide supplied, which is kept only as a URL
+/// (`ferrofin_livetv::projection::is_artwork_url`), but a row saved before that
+/// rule, or by the previous version during a rolling update, can hold a value
+/// that is not one. A local row is served only from the internal metadata
+/// directory, where the server itself writes (a logo set in the metadata
+/// editor, or the logo an adopted Jellyfin database downloaded). The paths are
+/// resolved before they are compared. A row whose file is gone goes by the
+/// nearest ancestor that exists, so one in the metadata directory stays listed
+/// with no size, as upstream lists it, and can be deleted in the image editor.
+/// Every other item's images may legitimately be anywhere in its library.
+async fn live_tv_image_is_servable(state: &AppState, image: &ItemImageInfo) -> bool {
+    if !image.is_local_file() {
+        return true;
+    }
+    let root = state.config.application_paths().internal_metadata_path();
+    let Ok(root) = tokio::fs::canonicalize(root).await else {
+        return false;
+    };
+    for ancestor in std::path::Path::new(&image.path).ancestors() {
+        if let Ok(resolved) = tokio::fs::canonicalize(ancestor).await {
+            return resolved.starts_with(root);
+        }
+    }
+    false
+}
+
 /// `image` with a local path: itself when local, else its downloaded copy
 /// (`ImageController.ConvertImageToLocal`), or a `404` when that fails.
 async fn local_image<'a>(
@@ -680,13 +711,14 @@ async fn serve_item_image(
     } else {
         None
     };
-    let (images, auto_orient) = if chapter_image.is_some() {
-        (Vec::new(), false)
+    let ItemImagesToServe {
+        images,
+        auto_orient,
+        live_tv,
+    } = if chapter_image.is_some() {
+        ItemImagesToServe::default()
     } else {
-        state
-            .library
-            .get_item_images_with_auto_orient(item_id)
-            .await?
+        state.library.get_item_images_to_serve(item_id).await?
     };
     let image = chapter_image
         .as_ref()
@@ -699,6 +731,11 @@ async fn serve_item_image(
             "item {item_id} has no {image_type:?} image at {index}"
         )));
     };
+    if live_tv && !live_tv_image_is_servable(state, image).await {
+        return Err(ApiError::NotFound(format!(
+            "item {item_id} has no {image_type:?} image at {index}"
+        )));
+    }
     serve_image_file(state, item_id, image, index, auto_orient, query, request).await
 }
 
@@ -895,14 +932,31 @@ async fn get_item_image_infos(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))?;
     let images = state.library.get_item_images(item_id).await?;
+    let mut hidden = Vec::new();
+    if is_live_tv_item(&item) {
+        for image in &images {
+            if !live_tv_image_is_servable(&state, image).await {
+                hidden.push(image);
+            }
+        }
+    }
     Ok(axum::Json(
         project_image_infos(
             &images,
+            &hidden,
             state.image_processor.as_deref(),
             item.path.as_deref(),
         )
         .await,
     ))
+}
+
+/// Whether `item` is a Live TV channel or programme.
+fn is_live_tv_item(item: &BaseItemEntity) -> bool {
+    matches!(
+        BaseItemKind::from_stored_type_name(&item.type_),
+        Some(BaseItemKind::LiveTvChannel | BaseItemKind::LiveTvProgram)
+    )
 }
 
 /// Projects an item's image rows into the [`ImageInfo`] list the API returns.
@@ -912,14 +966,17 @@ async fn get_item_image_infos(
 /// Jellyfin's `GetItemImageInfos` two-pass grouping. Width/height of `0` (the
 /// "unknown" sentinel) are nulled out, as in `GetImageInfo`. `item_path` is
 /// the item's path as the library read it (expanded), which every tag hashes.
+/// `hidden` rows are left out but keep their place in the numbering, so an
+/// index stays the one the image routes and the item's tags use.
 async fn project_image_infos(
     images: &[ItemImageInfo],
+    hidden: &[&ItemImageInfo],
     processor: Option<&dyn ferrofin_traits::drawing::ImageProcessor>,
     item_path: Option<&str>,
 ) -> Vec<ImageInfo> {
     let mut list = Vec::with_capacity(images.len());
     for image in images {
-        if !allows_multiple_images(image.image_type) {
+        if !allows_multiple_images(image.image_type) && !hidden.contains(&image) {
             list.push(image_info_dto(image, None, processor, item_path).await);
         }
     }
@@ -929,6 +986,9 @@ async fn project_image_infos(
             .filter(|i| i.image_type == multi_type)
             .enumerate()
         {
+            if hidden.contains(&image) {
+                continue;
+            }
             list.push(
                 image_info_dto(
                     image,

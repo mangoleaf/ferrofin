@@ -31,7 +31,7 @@ use ferrofin_model::providers::{ImageProviderInfo, RemoteImageInfo, RemoteImageQ
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{LibraryManager, UserManager};
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
-use ferrofin_traits::options::{AuthorizationInfo, ItemImageInfo};
+use ferrofin_traits::options::{AuthorizationInfo, ItemImageInfo, ItemImagesToServe};
 use ferrofin_traits::providers::{
     ItemUpdateType, MetadataRefreshOptions, ProviderManager, RefreshPriority,
 };
@@ -280,6 +280,8 @@ struct StubLibrary {
     item_reads: Mutex<usize>,
     /// Whether [`ITEM_ID`] is a photo whose images are auto-oriented.
     photo: bool,
+    /// Whether [`ITEM_ID`] is a Live TV channel.
+    live_tv: bool,
 }
 
 impl StubLibrary {
@@ -309,6 +311,13 @@ impl LibraryManager for StubLibrary {
     async fn get_item_by_id(&self, id: Uuid) -> Result<Option<BaseItemEntity>, ServiceError> {
         *self.item_reads.lock().expect("lock") += 1;
         Ok(match id {
+            _ if id == ITEM_ID && self.live_tv => Some(item_entity(
+                ITEM_ID,
+                "Channel",
+                BaseItemKind::LiveTvChannel
+                    .stored_type_name()
+                    .expect("stored name"),
+            )),
             _ if id == ITEM_ID => Some(item_entity(ITEM_ID, "Imaged Movie", "Movie")),
             _ if id == GENRE_ID => Some(item_entity(GENRE_ID, "Drama", "Genre")),
             _ => None,
@@ -322,14 +331,15 @@ impl LibraryManager for StubLibrary {
         Ok(id == ITEM_ID || id == GENRE_ID)
     }
 
-    async fn get_item_images_with_auto_orient(
+    async fn get_item_images_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
-        Ok((
-            self.get_item_images(item_id).await?,
-            self.photo && item_id == ITEM_ID,
-        ))
+    ) -> Result<ItemImagesToServe, ServiceError> {
+        Ok(ItemImagesToServe {
+            images: self.get_item_images(item_id).await?,
+            auto_orient: self.photo && item_id == ITEM_ID,
+            live_tv: self.live_tv && item_id == ITEM_ID,
+        })
     }
 
     async fn get_item_images(&self, item_id: Uuid) -> Result<Vec<ItemImageInfo>, ServiceError> {
@@ -899,6 +909,7 @@ fn stubs(image_path: String, profile_path: String) -> Stubs {
             swaps: Mutex::new(Vec::new()),
             item_reads: Mutex::new(0),
             photo: false,
+            live_tv: false,
         }),
         users: Arc::new(StubUsers {
             profile_path,
@@ -1076,6 +1087,7 @@ async fn a_photos_image_is_processed_with_auto_orientation() {
             swaps: Mutex::new(Vec::new()),
             item_reads: Mutex::new(0),
             photo: true,
+            live_tv: false,
         }),
         processor: Some(photo.clone()),
         ..stubs(img.path(), String::new())
@@ -1303,6 +1315,58 @@ async fn remote_image_backdrop_is_served_from_its_local_copy() {
         *asked.lock().expect("lock"),
         ["https://remote.example/backdrop.jpg"]
     );
+}
+
+/// A Live TV item's row outside the metadata directory is not served and not
+/// listed, though the file exists and another item's row may point at it; a URL
+/// is served from its copy as on any item. `FakeConfig` has no metadata
+/// directory, so here every local row is outside it.
+#[tokio::test]
+async fn a_live_tv_items_local_row_is_not_served_outside_the_metadata_directory() {
+    let img = TempImage::new(b"X");
+    let copy = TempImage::new(b"REMOTE");
+    let s = Stubs {
+        library: Arc::new(StubLibrary {
+            image_path: img.path(),
+            swaps: Mutex::new(Vec::new()),
+            item_reads: Mutex::new(0),
+            photo: false,
+            live_tv: true,
+        }),
+        providers: Arc::new(StubProviders {
+            saved: Arc::new(Mutex::new(Vec::new())),
+            deleted: Arc::new(Mutex::new(Vec::new())),
+            updates: Arc::new(Mutex::new(Vec::new())),
+            remote_copy: Some(copy.path()),
+            remote_asked: Arc::new(Mutex::new(Vec::new())),
+        }),
+        ..stubs(img.path(), String::new())
+    };
+    for method in ["GET", "HEAD"] {
+        let (status, body) = send(
+            &s,
+            method,
+            &format!("/Items/{ITEM_ID}/Images/Primary"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}");
+        assert_ne!(body, b"X", "{method}");
+    }
+    let (status, body) = send(
+        &s,
+        "GET",
+        &format!("/Items/{ITEM_ID}/Images/Backdrop"),
+        None,
+    )
+    .await;
+    assert_eq!((status, body.as_slice()), (StatusCode::OK, &b"REMOTE"[..]));
+
+    let (status, body) = send(&s, "GET", &format!("/Items/{ITEM_ID}/Images"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(listed.as_array().expect("infos").len(), 1, "{listed}");
+    assert_eq!(listed[0]["ImageType"], "Backdrop");
 }
 
 #[tokio::test]

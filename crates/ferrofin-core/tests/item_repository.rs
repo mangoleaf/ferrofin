@@ -2274,11 +2274,12 @@ async fn series_date_played_plan_groups_the_users_plays_once() {
 
 /// `ImageProcessor.ProcessImage`'s `autoOrient` comes back with the image
 /// rows: a photo is oriented unless its stored orientation is `TopLeft`, and
-/// nothing else is; the rows are those `get_image_infos` reads.
+/// nothing else is. So does whether the owner is a Live TV channel or
+/// programme. The rows are those `get_image_infos` reads.
 #[tokio::test]
-async fn image_infos_carry_the_photo_auto_orientation() {
+async fn image_infos_carry_what_their_owner_decides_about_serving_them() {
     use ferrofin_model::entities::ImageType;
-    use ferrofin_traits::options::ItemImageInfo;
+    use ferrofin_traits::options::{ItemImageInfo, ItemImagesToServe};
 
     let db = fresh_db().await;
     let persist = FerrofinItemPersistenceService::new(db.clone());
@@ -2286,6 +2287,8 @@ async fn image_infos_carry_the_photo_auto_orientation() {
     let upright = Uuid::new_v4();
     let unknown = Uuid::new_v4();
     let movie = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    let program = Uuid::new_v4();
     // Stored the way the image rows' foreign key reads it.
     let with_data = |id: Uuid, kind, data: Option<&str>| BaseItemEntity {
         id: id.to_string().to_uppercase(),
@@ -2310,10 +2313,12 @@ async fn image_infos_carry_the_photo_auto_orientation() {
                 BaseItemKind::Movie,
                 Some(r#"{"Orientation":"RightTop"}"#),
             ),
+            with_data(channel, BaseItemKind::LiveTvChannel, None),
+            with_data(program, BaseItemKind::LiveTvProgram, None),
         ])
         .await
         .expect("save");
-    for id in [rotated, upright, unknown, movie] {
+    for id in [rotated, upright, unknown, movie, channel, program] {
         let image = |image_type| ItemImageInfo {
             path: format!("/media/{id}.jpg"),
             image_type,
@@ -2332,26 +2337,27 @@ async fn image_infos_carry_the_photo_auto_orientation() {
         (upright, false),
         (unknown, true),
         (movie, false),
+        (channel, false),
+        (program, false),
     ] {
-        let (images, auto_orient) = repo
-            .get_image_infos_with_auto_orient(id)
-            .await
-            .expect("read");
-        assert_eq!(auto_orient, expected, "{id}");
-        assert_eq!(images, repo.get_image_infos(id).await.expect("read"));
+        let served = repo.get_image_infos_to_serve(id).await.expect("read");
+        assert_eq!(served.auto_orient, expected, "{id}");
+        assert_eq!(served.live_tv, id == channel || id == program, "{id}");
+        assert_eq!(served.images, repo.get_image_infos(id).await.expect("read"));
     }
-    let (images, auto_orient) = repo
-        .get_image_infos_with_auto_orient(Uuid::new_v4())
+    let served = repo
+        .get_image_infos_to_serve(Uuid::new_v4())
         .await
         .expect("read");
-    assert!(images.is_empty() && !auto_orient);
+    assert_eq!(served, ItemImagesToServe::default());
 
     // The owner is read by primary key beside the image rows' own index, and
     // that index already yields the order: no scan, no sort.
     let shown = plan(
         &db,
         r#"SELECT ii.*, bi."Type" = 'x' AS "IsPhoto",
-                CASE WHEN bi."Type" = 'x' THEN bi."Data" END AS "PhotoData"
+                CASE WHEN bi."Type" = 'x' THEN bi."Data" END AS "PhotoData",
+                bi."Type" IN ('a', 'b') AS "IsLiveTv"
             FROM "BaseItemImageInfos" ii
             JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
             WHERE ii."ItemId" = 'y'
