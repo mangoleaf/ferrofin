@@ -10,6 +10,7 @@ use async_trait::async_trait;
 
 use ferrofin_traits::error::ServiceError;
 use ferrofin_util::http_client::HTTP_CLIENT_DEFAULT_TIMEOUT;
+pub(crate) use ferrofin_util::source_url::{is_http, redact_url};
 
 use crate::error::LiveTvError;
 
@@ -69,7 +70,8 @@ pub trait SourceFetcher: Send + Sync {
         let opened = self.open(url, None).await?;
         if !opened.is_success() {
             return Err(ServiceError::backend(format!(
-                "fetch {url} answered {}",
+                "fetch {} answered {}",
+                redact_url(url),
                 opened.status
             )));
         }
@@ -93,7 +95,8 @@ pub trait SourceFetcher: Send + Sync {
         {
             return Err(ServiceError::backend(format!(
                 "this fetcher cannot send a {:?} request to {}",
-                request.method, request.url
+                request.method,
+                redact_url(&request.url)
             )));
         }
         let opened = self.open(&request.url, None).await?;
@@ -292,7 +295,7 @@ impl std::io::Read for BlockingBody {
 struct HttpBody {
     /// The response, headers read.
     response: reqwest::Response,
-    /// The URL, for errors.
+    /// The URL, for [`http_failure`] to redact.
     url: String,
 }
 
@@ -472,7 +475,7 @@ enum Deadline {
 
 /// The error a request to `url` that ran out of time answers.
 fn timed_out(url: &str) -> ServiceError {
-    ServiceError::Backend(format!("Timed out fetching {url}"))
+    ServiceError::Backend(format!("Timed out fetching {}", redact_url(url)))
 }
 
 /// Maps a `reqwest` failure of `operation` on `url`: a timeout reads as one,
@@ -481,7 +484,7 @@ fn http_failure(operation: &str, url: &str, error: reqwest::Error) -> ServiceErr
     if error.is_timeout() {
         timed_out(url)
     } else {
-        LiveTvError::http(format!("{operation} {url}"), error).into()
+        LiveTvError::http(format!("{operation} {}", redact_url(url)), error).into()
     }
 }
 
@@ -551,17 +554,19 @@ impl ReqwestFetcher {
         let resp = self.request(url, None, deadline).await?;
         Ok(resp
             .error_for_status()
-            .map_err(|e| LiveTvError::http(format!("fetch {url}"), e))?)
+            .map_err(|e| LiveTvError::http(format!("fetch {}", redact_url(url)), e))?)
     }
 }
 
-/// Whether `url` names a remote source rather than a local path, by upstream's
-/// rule everywhere it makes that choice: it starts with `http`, ignoring ASCII
-/// case (`StartsWith("http", StringComparison.OrdinalIgnoreCase)`, v12.2
-/// M3uParser.cs:52, XmlTvListingsProvider.cs:76,343).
-pub(crate) fn is_http(url: &str) -> bool {
-    url.get(..4)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http"))
+/// Whether `url` starts with `scheme://` for one of `schemes`, scheme compared
+/// ignoring ASCII case. Stricter than [`is_http`], which only compares the first
+/// four characters.
+pub(crate) fn has_scheme(url: &str, schemes: &[&str]) -> bool {
+    url.split_once("://").is_some_and(|(scheme, _)| {
+        schemes
+            .iter()
+            .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+    })
 }
 
 /// `error` as a `404` when it is a local file that does not exist, the way
@@ -612,7 +617,7 @@ struct GunzipBody {
     /// The decoder, writing what it extracts into its `Vec`; `None` once the
     /// body has ended.
     decoder: Option<flate2::write::MultiGzDecoder<Vec<u8>>>,
-    /// The URL after redirects, or the path, for errors.
+    /// The URL after redirects, redacted, or the path, for errors.
     name: String,
 }
 
@@ -673,11 +678,11 @@ impl SourceFetcher for ReqwestFetcher {
                 .await?
                 .text()
                 .await
-                .map_err(|e| LiveTvError::http(format!("read {url}"), e).into())
+                .map_err(|e| LiveTvError::http(format!("read {}", redact_url(url)), e).into())
         } else {
             tokio::fs::read_to_string(url)
                 .await
-                .map_err(|e| LiveTvError::io(format!("read {url}"), e).into())
+                .map_err(|e| LiveTvError::io(format!("read {}", redact_url(url)), e).into())
         }
     }
 
@@ -699,12 +704,12 @@ impl SourceFetcher for ReqwestFetcher {
             // is the path as given: `file:///x` is a relative path there too.
             let file = tokio::fs::File::open(url)
                 .await
-                .map_err(|e| LiveTvError::io(format!("read {url}"), e))?;
+                .map_err(|e| LiveTvError::io(format!("read {}", redact_url(url)), e))?;
             // `AsyncFile.OpenRead` refuses a directory (`UnauthorizedAccessException`),
             // where a Unix `open` succeeds and only the first read fails.
             if file.metadata().await.is_ok_and(|meta| meta.is_dir()) {
                 return Err(LiveTvError::io(
-                    format!("read {url}"),
+                    format!("read {}", redact_url(url)),
                     std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory"),
                 )
                 .into());
@@ -732,7 +737,7 @@ impl SourceFetcher for ReqwestFetcher {
             (url.to_owned(), self.open(url, None).await?.body)
         };
         Ok(if is_gzip_name(&name) {
-            Box::new(GunzipBody::new(body, name))
+            Box::new(GunzipBody::new(body, redact_url(&name)))
         } else {
             body
         })
@@ -749,7 +754,7 @@ impl SourceFetcher for ReqwestFetcher {
         } else {
             tokio::fs::read(url)
                 .await
-                .map_err(|e| LiveTvError::io(format!("read {url}"), e).into())
+                .map_err(|e| LiveTvError::io(format!("read {}", redact_url(url)), e).into())
         }
     }
 
@@ -809,23 +814,6 @@ mod tests {
             .expect("fetch");
         assert_eq!(body, "#EXTM3U\n");
         let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    /// `StartsWith("http", StringComparison.OrdinalIgnoreCase)`: the scheme in
-    /// any case is remote; a path, `file://` and anything shorter are not.
-    #[rstest::rstest]
-    #[case("http://guide/x.xml", true)]
-    #[case("HTTP://guide/x.xml", true)]
-    #[case("Http://guide/x.xml", true)]
-    #[case("https://guide/x.xml", true)]
-    #[case("/srv/guide.xml", false)]
-    #[case("file:///srv/guide.xml", false)]
-    #[case("C:\\guide.xml", false)]
-    #[case("htt", false)]
-    #[case("", false)]
-    #[case("htté://x", false)]
-    fn a_source_is_remote_when_it_starts_with_http(#[case] url: &str, #[case] remote: bool) {
-        assert_eq!(super::is_http(url), remote, "{url}");
     }
 
     #[tokio::test]
@@ -1476,10 +1464,7 @@ mod tests {
             .fetch_bytes("http://127.0.0.1:0/countries")
             .await
             .expect_err("connect must fail");
-        assert!(
-            err.to_string()
-                .contains("fetch http://127.0.0.1:0/countries")
-        );
+        assert!(err.to_string().contains("fetch http://127.0.0.1:0"));
     }
 
     /// The deadline these tests give the fetcher in place of the 100 s.
@@ -1557,10 +1542,10 @@ mod tests {
         base
     }
 
-    fn assert_timed_out(result: Result<impl std::fmt::Debug, ServiceError>, url: &str) {
+    fn assert_timed_out(result: Result<impl std::fmt::Debug, ServiceError>, base: &str) {
         let err = result.expect_err("a silent source must fail");
         assert!(
-            matches!(&err, ServiceError::Backend(why) if *why == format!("Timed out fetching {url}")),
+            matches!(&err, ServiceError::Backend(why) if *why == format!("Timed out fetching {base}")),
             "{err:?}"
         );
     }
@@ -1572,11 +1557,11 @@ mod tests {
     async fn a_silent_source_times_out_on_every_bounded_path() {
         let base = silent_peer().await;
         let fetcher = short_timeout_fetcher();
-        let url = format!("{base}/list.m3u");
+        let url = format!("{base}/live/acct-user/path-secret/list.m3u?password=query-secret");
         let outcome = tokio::time::timeout(GUARD, async {
-            assert_timed_out(fetcher.open(&url, None).await, &url);
-            assert_timed_out(fetcher.fetch(&url).await, &url);
-            assert_timed_out(fetcher.fetch_bytes(&url).await, &url);
+            assert_timed_out(fetcher.open(&url, None).await, &base);
+            assert_timed_out(fetcher.fetch(&url).await, &base);
+            assert_timed_out(fetcher.fetch_bytes(&url).await, &base);
             assert_timed_out(
                 fetcher
                     .send(super::SourceRequest::new(
@@ -1584,7 +1569,7 @@ mod tests {
                         url.clone(),
                     ))
                     .await,
-                &url,
+                &base,
             );
         })
         .await;
@@ -1656,7 +1641,7 @@ mod tests {
         let fetcher = short_timeout_fetcher();
         let url = format!("{base}/available/countries");
         let outcome = tokio::time::timeout(GUARD, async {
-            assert_timed_out(fetcher.fetch_bytes(&url).await, &url);
+            assert_timed_out(fetcher.fetch_bytes(&url).await, &base);
             assert_timed_out(
                 fetcher
                     .send(super::SourceRequest::new(
@@ -1664,7 +1649,7 @@ mod tests {
                         url.clone(),
                     ))
                     .await,
-                &url,
+                &base,
             );
         })
         .await;
@@ -1714,8 +1699,7 @@ mod tests {
                 (refused.status, refused.body),
                 (400, br#"{"code":2100}"#.to_vec())
             );
-            let url = format!("{stalled_refusal}/lineups/X");
-            assert_timed_out(fetcher.send(put(&stalled_refusal)).await, &url);
+            assert_timed_out(fetcher.send(put(&stalled_refusal)).await, &stalled_refusal);
         })
         .await;
         assert!(outcome.is_ok(), "a headers-only request never answered");

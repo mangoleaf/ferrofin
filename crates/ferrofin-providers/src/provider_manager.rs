@@ -4797,7 +4797,10 @@ impl ProviderManager for LocalProviderManager {
         let (bytes, mime) = crate::image_download::download_image(&self.http, url)
             .await
             .ok_or_else(|| {
-                ServiceError::backend(format!("could not download remote image {url}"))
+                ServiceError::backend(format!(
+                    "could not download remote image {}",
+                    ferrofin_util::source_url::redact_url(url)
+                ))
             })?;
         // `if (!contentType.StartsWith("image/")) throw` — C#
         // `ProviderManager.SaveImage`. Without this ANY URL becomes artwork:
@@ -9691,6 +9694,33 @@ mod tests {
             "a refused download writes no artwork"
         );
     }
+
+    /// The error is logged at the handler boundary, and an image URL can carry
+    /// an account or a token (Schedules Direct's `?token=`).
+    #[tokio::test]
+    async fn a_failed_image_download_names_only_the_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = LocalProviderManager::default().with_image_store(
+            Arc::new(RecordingStore::default()),
+            dir.path().to_path_buf(),
+        );
+
+        let err = mgr
+            .save_image_from_url(
+                Uuid::new_v4(),
+                "http://acct-user:info-secret@127.0.0.1:0/path-secret/1.jpg?token=query-secret",
+                ImageType::Primary,
+                None,
+            )
+            .await
+            .expect_err("nothing listens there");
+
+        assert_eq!(
+            err.to_string(),
+            "backend error: could not download remote image http://127.0.0.1:0"
+        );
+    }
+
     #[rstest::rstest]
     #[case::first(ImageType::Backdrop, 0, &[], Some(0))]
     #[case::count_collision(ImageType::Backdrop, 1, &["backdrop1.png"], Some(2))]

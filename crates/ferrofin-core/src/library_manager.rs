@@ -2878,14 +2878,14 @@ impl LibraryManager for FerrofinLibraryManager {
         self.items.get_image_infos(item_id).await
     }
 
-    async fn get_item_images_with_auto_orient(
+    async fn get_item_images_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ferrofin_traits::options::ItemImageInfo>, bool), ServiceError> {
+    ) -> Result<ferrofin_traits::options::ItemImagesToServe, ServiceError> {
         if item_id.is_nil() {
-            return Ok((Vec::new(), false));
+            return Ok(ferrofin_traits::options::ItemImagesToServe::default());
         }
-        self.items.get_image_infos_with_auto_orient(item_id).await
+        self.items.get_image_infos_to_serve(item_id).await
     }
 
     async fn get_chapter_image(
