@@ -1700,19 +1700,15 @@ impl ResumeQuery {
 /// first lifted to its group's primary, and the group is the primaries plus
 /// every alternate under them.
 async fn active_session_item_ids(state: &AppState, user_id: Uuid) -> Result<Vec<Uuid>, ApiError> {
-    // `is_api_key: true` is the elevated view: C# reads the raw
-    // `_sessionManager.Sessions` list, so the caller-visibility gate and the
-    // two permission reads `GetSessions` would otherwise run are skipped, and
-    // the `s.UserId.Equals(requestUserId)` filter below is the controller's own.
-    let sessions = state
-        .sessions
-        .get_sessions(user_id, None, None, None, true)
-        .await?;
+    // C# reads the raw `_sessionManager.Sessions` list, which the summaries
+    // are: no caller-visibility gate, no permission reads and no session DTO,
+    // and the `s.UserId.Equals(requestUserId)` filter below is the
+    // controller's own.
+    let sessions = state.sessions.get_session_summaries().await?;
     let mut playing: Vec<Uuid> = sessions
         .iter()
         .filter(|s| s.user_id == user_id)
-        .filter_map(|s| s.now_playing_item.as_ref())
-        .map(|item| item.id)
+        .filter_map(|s| s.now_playing_item_id)
         .collect();
     playing.sort_unstable();
     playing.dedup();

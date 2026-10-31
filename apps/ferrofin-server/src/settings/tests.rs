@@ -13,16 +13,16 @@ use super::*;
 
 /// A fake environment backed by a map — no real `std::env` mutation.
 #[derive(Clone, Default)]
-struct FakeEnv(HashMap<String, String>);
+pub(super) struct FakeEnv(HashMap<String, String>);
 
 impl FakeEnv {
     /// An environment whose default data directory no host has, so a test
     /// reads no `config.toml` of the host's.
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::default().with("XDG_DATA_HOME", "/nonexistent/ferrofin-settings-test")
     }
 
-    fn with(mut self, key: &str, value: &str) -> Self {
+    pub(super) fn with(mut self, key: &str, value: &str) -> Self {
         self.0.insert(key.to_owned(), value.to_owned());
         self
     }
@@ -41,12 +41,12 @@ impl Env for FakeEnv {
 
 /// A temporary data directory and its `config.toml`, written from `lines`
 /// (none: no file).
-struct DataDir {
+pub(super) struct DataDir {
     dir: tempfile::TempDir,
 }
 
 impl DataDir {
-    fn new(lines: &[String]) -> Self {
+    pub(super) fn new(lines: &[String]) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         if !lines.is_empty() {
             std::fs::write(dir.path().join("config.toml"), lines.join("\n")).expect("write");
@@ -54,16 +54,16 @@ impl DataDir {
         Self { dir }
     }
 
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         self.dir.path()
     }
 
-    fn config_file(&self) -> PathBuf {
+    pub(super) fn config_file(&self) -> PathBuf {
         self.path().join("config.toml")
     }
 
     /// The flags that start the server on this data directory.
-    fn cli(&self) -> Cli {
+    pub(super) fn cli(&self) -> Cli {
         Cli {
             data_dir: Some(self.path().to_path_buf()),
             ..Cli::default()
@@ -71,7 +71,7 @@ impl DataDir {
     }
 }
 
-fn spec(key: &str) -> &'static SettingSpec {
+pub(super) fn spec(key: &str) -> &'static SettingSpec {
     SETTINGS
         .iter()
         .find(|spec| spec.key == key)
@@ -80,7 +80,7 @@ fn spec(key: &str) -> &'static SettingSpec {
 
 /// A `config.toml` value for `spec`'s key that the loader takes and that is
 /// not the default.
-fn sample(spec: &SettingSpec) -> String {
+pub(super) fn sample(spec: &SettingSpec) -> String {
     match spec.key {
         "bind_addr" => "\"127.0.0.2\"".to_owned(),
         "log_level" => "\"debug\"".to_owned(),
@@ -118,7 +118,7 @@ fn entry<'a>(report: &'a ServerSettingsDto, key: &str) -> &'a ServerSettingDto {
         .unwrap_or_else(|| panic!("no setting `{key}` in the report"))
 }
 
-fn load(cli: Cli, env: &FakeEnv) -> Config {
+pub(super) fn load(cli: Cli, env: &FakeEnv) -> Config {
     Config::load_from(cli, env).expect("load")
 }
 
@@ -650,7 +650,7 @@ fn a_config_file_whose_directory_takes_no_file_is_not_writable() {
 // ---- the manager ---------------------------------------------------------------
 
 /// The Ferrofin plugin, registered as the server registers it.
-fn plugins(dir: &Path) -> Arc<dyn PluginManager> {
+pub(super) fn plugins(dir: &Path) -> Arc<dyn PluginManager> {
     Arc::new(ferrofin_core::FerrofinPluginManager::new(
         ferrofin_extensions::registered_plugins(&ferrofin_extensions::registered_extensions(true)),
         dir.to_path_buf(),

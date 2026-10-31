@@ -494,6 +494,7 @@ pub async fn build_app_state(
             tracing::warn!(%err, "person metadata repair failed; person sort order and Path may diverge until the next scan");
         }
     }
+    let people_validation_repository = (*people_repository_impl).clone();
     let people_repository: Arc<dyn ferrofin_traits::persistence::PeopleRepository> =
         people_repository_impl;
     let media_stream_repository: Arc<dyn ferrofin_traits::persistence::MediaStreamRepository> =
@@ -2077,6 +2078,7 @@ pub async fn build_app_state(
             db.clone(),
             Arc::clone(&providers),
             Arc::clone(&library),
+            people_validation_repository,
         )));
         task_manager.register(Arc::new(lib_tasks::SubtitleDownloadTask::new(
             Arc::clone(&library),
@@ -2862,12 +2864,9 @@ struct SessionLibraryAudience {
 #[async_trait::async_trait]
 impl ferrofin_traits::events::LibraryChangeAudience for SessionLibraryAudience {
     async fn active_user_ids(&self) -> Result<Vec<Uuid>, ferrofin_traits::error::ServiceError> {
-        // The admin view of the session table (`_sessionManager.Sessions`):
-        // a nil user id with the api-key flag is the unfiltered enumeration.
-        let sessions = self
-            .sessions
-            .get_sessions(Uuid::nil(), None, None, None, true)
-            .await?;
+        // The session table itself (`_sessionManager.Sessions`): only the
+        // user ids are read, so no session DTO is copied out.
+        let sessions = self.sessions.get_session_summaries().await?;
         let mut seen = std::collections::HashSet::new();
         Ok(sessions
             .into_iter()

@@ -70,6 +70,123 @@ struct PeopleWithCount {
 /// user-data set (C# `itemTypeLookup.BaseItemKindNames[Person]`).
 const PERSON_TYPE_NAME: &str = "MediaBrowser.Controller.Entities.Person";
 
+/// A stored `Person` row, as [`partition_credits_by_person_id`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredPerson {
+    /// The item id.
+    pub(crate) id: Uuid,
+    /// `BaseItems.Name`, which a refresh may have changed.
+    pub(crate) name: Option<String>,
+    /// `BaseItems.CleanName`.
+    pub(crate) clean_name: Option<String>,
+    /// `BaseItems.IsLocked`.
+    pub(crate) is_locked: bool,
+}
+
+/// What the Refresh People task has to do to the `Person` items
+/// ([`partition_credits_by_person_id`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PersonPartition {
+    /// The credit names that need an item, one per id.
+    pub(crate) new_names: Vec<String>,
+    /// The unlocked items nothing credits.
+    pub(crate) dead: Vec<StoredPerson>,
+    /// How many items nothing credits are kept because they are locked.
+    pub(crate) locked: usize,
+}
+
+/// `PeopleValidator.PartitionCreditsByPersonId`: splits the person items into
+/// the ones a credit still calls for and the ones nothing does, keyed on the
+/// id a credit name derives (`person_ids`, the current id first), never on the
+/// name the item carries now: a provider may have renamed it. Keying on the
+/// name put upstream's two halves in a loop that created, refreshed and
+/// deleted the same people on every run.
+///
+/// Upstream's rule alone cannot be applied here, because Ferrofin's identity
+/// has more paths to a row. So a row also lives, and a credit needs no item,
+/// where:
+///
+/// - the id is the older derivation the write path keeps
+///   ([`resolved_person_item_id`](FerrofinPeopleRepository::resolved_person_item_id));
+/// - the row carries the credit's exact name. That keeps a database whose
+///   stored ids are not the derived ones (a metadata path moved outside the
+///   data dir, a changed id setting) from reading every person as dead and
+///   new at once, and leaves what this deletes a subset of what the name-keyed
+///   sweep it replaced deleted;
+/// - the row is the one a credit's clean name resolves to
+///   ([`person_item_by_clean_name`]: the first by `SortName`, `Id`). The write
+///   path and every person read path treat spellings sharing a clean name as
+///   one person on that row. Upstream gives each spelling its own item, and
+///   `GetPerson` reads it by id; here a second row would be shown for the
+///   first by those paths, so no spelling gets one until they read by id
+///   (`MustHaveItem` still compares the exact name, so a spelling nobody else
+///   carries stays out of `/Persons`).
+///
+/// `stored` is in `SortName`, `Id` order. A blank credit needs no item and keeps
+/// only a row as blank as itself, which the name-keyed sweep kept too.
+fn partition_credits_by_person_id(
+    credit_names: &[String],
+    person_ids: impl Fn(&str) -> Vec<Uuid>,
+    stored: &[StoredPerson],
+) -> PersonPartition {
+    let stored_ids: HashSet<Uuid> = stored.iter().map(|person| person.id).collect();
+    let stored_names: HashSet<&str> = stored
+        .iter()
+        .filter_map(|person| person.name.as_deref().map(str::trim))
+        .collect();
+    let mut by_clean_name: HashMap<&str, Uuid> = HashMap::new();
+    for person in stored {
+        if let Some(clean_name) = person.clean_name.as_deref() {
+            by_clean_name.entry(clean_name).or_insert(person.id);
+        }
+    }
+
+    let mut new_names = Vec::new();
+    let mut new_clean_names: HashSet<String> = HashSet::new();
+    let mut credited: HashSet<&str> = HashSet::new();
+    let mut live_ids: HashSet<Uuid> = HashSet::new();
+    for credit in credit_names {
+        let name = credit.trim();
+        credited.insert(name);
+        if name.is_empty() {
+            continue;
+        }
+        let clean_name = crate::text_util::get_clean_value(name);
+        let resolved = by_clean_name.get(clean_name.as_str()).copied();
+        live_ids.extend(resolved);
+        let ids = person_ids(name);
+        // Distinct credit names can normalize onto one id; only the first of
+        // them needs an item.
+        let first_of_its_id = ids.first().is_some_and(|id| !live_ids.contains(id));
+        let has_item = resolved.is_some()
+            || stored_names.contains(name)
+            || ids.iter().any(|id| stored_ids.contains(id));
+        live_ids.extend(ids);
+        // A spelling sharing a clean name with a credit just listed resolves to
+        // the item that credit gets.
+        if first_of_its_id && !has_item && new_clean_names.insert(clean_name) {
+            new_names.push(name.to_owned());
+        }
+    }
+
+    let (locked, dead): (Vec<_>, Vec<_>) = stored
+        .iter()
+        .filter(|person| {
+            !live_ids.contains(&person.id)
+                && !person
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| credited.contains(name.trim()))
+        })
+        .cloned()
+        .partition(|person| person.is_locked);
+    PersonPartition {
+        new_names,
+        dead,
+        locked: locked.len(),
+    }
+}
+
 /// The concrete people repository.
 #[derive(Clone)]
 pub struct FerrofinPeopleRepository {
@@ -179,6 +296,104 @@ impl FerrofinPeopleRepository {
     fn person_metadata_path(&self, name: &str) -> Option<String> {
         let (_, people_path) = self.identity.as_ref()?;
         Some(item_type_lookup::person_path(people_path, name))
+    }
+
+    /// Every id `name`'s credit may have an item under: the current derivation
+    /// first, then the older one the write path keeps. Empty when the identity
+    /// seam is unwired.
+    fn person_ids(&self, name: &str) -> Vec<Uuid> {
+        let Some((mode, root)) = self.identity.as_ref() else {
+            return Vec::new();
+        };
+        let path = item_type_lookup::person_path(root, name);
+        let current = item_type_lookup::person_item_id(mode, root, name);
+        let previous =
+            item_type_lookup::previous_by_name_item_id(mode, BaseItemKind::Person, &path);
+        let mut ids: Vec<Uuid> = current.into_iter().chain(previous).collect();
+        ids.dedup();
+        ids
+    }
+
+    /// Reads what the Refresh People task has to do to the `Person` items
+    /// ([`partition_credits_by_person_id`]).
+    ///
+    /// The rows are read before the credits: a scan commits a new person's row
+    /// with its credit, so every row read here has its credit in the names read
+    /// next, where the other order could read a person just added as dead. A
+    /// scan that credits a row again after these reads can still lose that row
+    /// to the deletion that follows them; the next run makes its item again.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when a read fails.
+    pub(crate) async fn partition_person_items(&self) -> Result<PersonPartition, ServiceError> {
+        let rows: Vec<(String, Option<String>, Option<String>, bool)> = sqlx::query_as(
+            r#"SELECT "Id", "Name", "CleanName", "IsLocked" FROM "BaseItems"
+               WHERE "Type" = ?1 ORDER BY "SortName", "Id""#,
+        )
+        .bind(PERSON_TYPE_NAME)
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(db_err)?;
+        let stored: Vec<StoredPerson> = rows
+            .into_iter()
+            .filter_map(|(id, name, clean_name, is_locked)| {
+                let Ok(parsed) = Uuid::parse_str(&id) else {
+                    tracing::debug!(id, "skipping a person row whose id is not a guid");
+                    return None;
+                };
+                Some(StoredPerson {
+                    id: parsed,
+                    name,
+                    clean_name,
+                    is_locked,
+                })
+            })
+            .collect();
+        let names: Vec<String> =
+            sqlx::query_scalar(r#"SELECT DISTINCT "Name" FROM "Peoples" ORDER BY "Name""#)
+                .fetch_all(self.db.pool())
+                .await
+                .map_err(db_err)?;
+        Ok(partition_credits_by_person_id(
+            &names,
+            |name| self.person_ids(name),
+            &stored,
+        ))
+    }
+
+    /// `LibraryManager.GetOrCreatePerson` for each of `names`, which had no item
+    /// when they were read: the row
+    /// [`insert_person_item`](Self::insert_person_item) writes, unrefreshed,
+    /// and its metadata folder. Each name resolves as the write path resolves
+    /// it, so a row a scan made in the meantime is reused. Each row commits on
+    /// its own, as upstream's `CreateItem` does, so a long list never holds the
+    /// writer. Returns how many rows were written.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServiceError`] when a read or write fails.
+    pub(crate) async fn create_person_items(
+        &self,
+        names: &[String],
+    ) -> Result<usize, ServiceError> {
+        if self.identity.is_none() {
+            return Ok(0);
+        }
+        let mut created = 0;
+        for name in names {
+            let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+            let item_id = self.person_item_id_for_write(&mut tx, name, "").await?;
+            let inserted = self
+                .insert_person_item(&mut tx, PERSON_TYPE_NAME, name, &item_id)
+                .await?;
+            tx.commit().await.map_err(db_err)?;
+            if inserted {
+                self.create_person_directory(name).await;
+                created += 1;
+            }
+        }
+        Ok(created)
     }
 
     /// Collapses one duplicate `Person` row onto `target` inside `tx`:
@@ -356,14 +571,15 @@ impl FerrofinPeopleRepository {
     /// `ORDER BY SortName` and `nameStartsWith` (which filters
     /// `lower(SortName)`, faithfully to `ApplyNameFilters`) actually read — and
     /// it uses the `Person` branch of `CreateSortName`, the verbatim name.
+    /// Returns whether a row was written: `false` when `item_id` has one.
     async fn insert_person_item(
         &self,
         tx: &mut sqlx::Transaction<'_, Sqlite>,
         type_name: &str,
         name: &str,
         item_id: &str,
-    ) -> Result<(), ServiceError> {
-        sqlx::query(
+    ) -> Result<bool, ServiceError> {
+        let inserted = sqlx::query(
             r#"INSERT OR IGNORE INTO "BaseItems"
                ("Id","Type","Name","CleanName","SortName","PresentationUniqueKey","Path",
                 "IsFolder","IsInMixedFolder",
@@ -379,8 +595,9 @@ impl FerrofinPeopleRepository {
         .bind(self.person_metadata_path(name))
         .execute(&mut **tx)
         .await
-        .map_err(db_err)?;
-        Ok(())
+        .map_err(db_err)?
+        .rows_affected();
+        Ok(inserted > 0)
     }
 
     /// Repairs `Person` rows written before their columns were complete:
@@ -1193,12 +1410,17 @@ impl FerrofinPeopleRepository {
             if !seen.insert(person_key(person)) {
                 continue;
             }
-            let Some(path) = self.person_metadata_path(person.name.trim()) else {
-                continue;
-            };
-            if let Err(e) = tokio::fs::create_dir_all(&path).await {
-                tracing::debug!(%path, error = %e, "could not create person metadata directory");
-            }
+            self.create_person_directory(person.name.trim()).await;
+        }
+    }
+
+    /// `Directory.CreateDirectory(path)` for one person. Best-effort.
+    async fn create_person_directory(&self, name: &str) {
+        let Some(path) = self.person_metadata_path(name) else {
+            return;
+        };
+        if let Err(e) = tokio::fs::create_dir_all(&path).await {
+            tracing::debug!(%path, error = %e, "could not create person metadata directory");
         }
     }
 
@@ -1653,6 +1875,40 @@ pub(crate) async fn seed_people_row(db: &Database, id: uuid::Uuid, name: &str, p
         .expect("seed people row");
 }
 
+/// Test-only: a credit of `name` on `item`, with no `Person` item behind it.
+#[cfg(test)]
+pub(crate) async fn seed_credit(db: &Database, item: uuid::Uuid, id: uuid::Uuid, name: &str) {
+    seed_people_row(db, id, name, "Actor").await;
+    sqlx::query(
+        r#"INSERT INTO "PeopleBaseItemMap" ("ItemId", "PeopleId", "Role") VALUES (?1, ?2, '')"#,
+    )
+    .bind(guid_to_db(item))
+    .bind(guid_to_db(id))
+    .execute(db.writer())
+    .await
+    .expect("seed credit");
+}
+
+/// Test-only: locks an item (`LockData`).
+#[cfg(test)]
+pub(crate) async fn lock_item(db: &Database, id: uuid::Uuid) {
+    sqlx::query(r#"UPDATE "BaseItems" SET "IsLocked" = 1 WHERE "Id" = ?1"#)
+        .bind(guid_to_db(id))
+        .execute(db.writer())
+        .await
+        .expect("lock item");
+}
+
+/// Test-only: the names of the stored `Person` rows, sorted.
+#[cfg(test)]
+pub(crate) async fn person_names(db: &Database) -> Vec<String> {
+    sqlx::query_scalar(r#"SELECT "Name" FROM "BaseItems" WHERE "Type" = ?1 ORDER BY "Name""#)
+        .bind(PERSON_TYPE_NAME)
+        .fetch_all(db.pool())
+        .await
+        .expect("person names")
+}
+
 /// Test-only: how many `Peoples` rows there are, so the raw SQL stays inside
 /// the repository boundary.
 #[cfg(test)]
@@ -1689,7 +1945,10 @@ mod tests {
         );
     }
 
-    use super::{FerrofinPeopleRepository, PERSON_TYPE_NAME};
+    use super::{
+        FerrofinPeopleRepository, PERSON_TYPE_NAME, PersonPartition, StoredPerson,
+        partition_credits_by_person_id,
+    };
     use crate::test_support::{seed_item, seed_named_item, test_db};
     use ferrofin_db::entities::base_items::PeopleEntity;
     use ferrofin_db::store::guid_to_db;
@@ -1809,6 +2068,261 @@ mod tests {
             person_type: Some(person_type.to_owned()),
             ..Default::default()
         }
+    }
+
+    /// Stands in for the real item-by-name id, as upstream's
+    /// `PeopleValidatorPartitionTests.PersonId` does: derived from the credit
+    /// name, case-insensitively, and from nothing else. The property that
+    /// matters is that it does not depend on the item's own name.
+    fn partition_id(name: &str) -> Uuid {
+        ferrofin_common::extensions::get_md5(&ferrofin_util::string_extensions::lower_invariant(
+            name,
+        ))
+    }
+
+    fn stored(id: Uuid, name: &str) -> StoredPerson {
+        StoredPerson {
+            id,
+            name: Some(name.to_owned()),
+            clean_name: Some(crate::text_util::get_clean_value(name)),
+            is_locked: false,
+        }
+    }
+
+    fn partition(credits: &[&str], rows: &[StoredPerson]) -> PersonPartition {
+        let credits: Vec<String> = credits.iter().map(|name| (*name).to_owned()).collect();
+        partition_credits_by_person_id(&credits, |name| vec![partition_id(name)], rows)
+    }
+
+    /// `PartitionCreditsByPersonId_ProviderRenamedThePerson_KeepsThemAndCreatesNothing`,
+    /// with the rename that also changes the clean name beside upstream's.
+    #[rstest::rstest]
+    #[case("Aurora")]
+    #[case("Aurora Aksnes")]
+    fn partition_keeps_a_renamed_person_and_creates_nothing(#[case] renamed: &str) {
+        let rows = [stored(partition_id("AURORA"), renamed)];
+        assert_eq!(partition(&["AURORA"], &rows), PersonPartition::default());
+    }
+
+    /// `PartitionCreditsByPersonId_CreditWithAnItem_IsNeverBothCreatedAndDeleted`.
+    #[rstest::rstest]
+    #[case("AURORA")]
+    #[case("Amir AboulEla")]
+    #[case("Miguel Ángel Fuentes")]
+    #[case("a‐ha")]
+    #[case("윤현민")]
+    fn partition_never_creates_and_deletes_a_credited_person(#[case] credit: &str) {
+        let rows = [stored(partition_id(credit), credit)];
+        assert_eq!(partition(&[credit], &rows), PersonPartition::default());
+    }
+
+    /// `PartitionCreditsByPersonId_CreditWithNoItem_IsCreated`.
+    #[test]
+    fn partition_creates_an_item_for_a_credit_with_none() {
+        let found = partition(&["Wanted Person"], &[]);
+        assert_eq!(found.new_names, ["Wanted Person"]);
+        assert_eq!(found.dead, []);
+    }
+
+    /// `PartitionCreditsByPersonId_ItemNoCreditNames_IsDead`.
+    #[test]
+    fn partition_finds_an_item_no_credit_names_dead() {
+        let orphan = stored(partition_id("Nobody Credits Me"), "Nobody Credits Me");
+        let rows = [stored(partition_id("Credited"), "Credited"), orphan.clone()];
+        let found = partition(&["Credited"], &rows);
+        assert_eq!(found.new_names, Vec::<String>::new());
+        assert_eq!(found.dead, [orphan]);
+    }
+
+    /// `PartitionCreditsByPersonId_CreditsNormalizingOntoOneId_CreateOneItem`.
+    #[test]
+    fn partition_creates_one_item_for_credits_normalizing_onto_one_id() {
+        let found = partition(&["AURORA", "Aurora", "aurora"], &[]);
+        assert_eq!(found.new_names, ["AURORA"]);
+        assert_eq!(found.dead, []);
+    }
+
+    /// `PartitionCreditsByPersonId_SecondRunAfterCreating_AsksForNothingFurther`.
+    #[test]
+    fn partition_asks_for_nothing_further_on_the_run_after_creating() {
+        let credits = ["AURORA", "Amir AboulEla", "Miguel Ángel Fuentes"];
+        let first = partition(&credits, &[]);
+        assert_eq!(first.new_names.len(), 3);
+        assert_eq!(first.dead, []);
+        let created: Vec<StoredPerson> = first
+            .new_names
+            .iter()
+            .map(|name| stored(partition_id(name), name))
+            .collect();
+        assert_eq!(partition(&credits, &created), PersonPartition::default());
+    }
+
+    /// "A person somebody locked is theirs, not ours": left out of the dead,
+    /// and counted so the run can say so.
+    #[test]
+    fn partition_spares_a_locked_item_no_credit_names() {
+        let mut locked = stored(partition_id("Locked Lena"), "Locked Lena");
+        locked.is_locked = true;
+        let found = partition(&[], &[locked]);
+        assert_eq!(found.dead, []);
+        assert_eq!(found.locked, 1);
+    }
+
+    /// The older derivation the write path keeps: the row lives under it, and
+    /// the credit needs no item of the current id.
+    #[test]
+    fn partition_counts_the_older_derivation_as_the_credits_item() {
+        let older = Uuid::from_u128(0x0D1);
+        let rows = [stored(older, "Renamed")];
+        let credits = ["Credited".to_owned()];
+        let found =
+            partition_credits_by_person_id(&credits, |name| vec![partition_id(name), older], &rows);
+        assert_eq!(found, PersonPartition::default());
+    }
+
+    /// A stored id that is not the derived one, as a moved metadata folder
+    /// leaves every id: the exact name keeps the row and is its item, so the
+    /// library is neither deleted nor made again.
+    #[test]
+    fn partition_keeps_a_row_of_the_credits_exact_name_under_another_id() {
+        let rows = [stored(Uuid::from_u128(0x0D2), "Moved Mary")];
+        assert_eq!(
+            partition(&["Moved Mary"], &rows),
+            PersonPartition::default()
+        );
+    }
+
+    /// Spellings sharing a clean name are one person on one row, whichever of
+    /// them is credited: no second item, and the row lives while any is.
+    #[test]
+    fn partition_keeps_a_second_spelling_on_the_row_it_resolves_to() {
+        let first = stored(partition_id("H. Jon Benjamin"), "H. Jon Benjamin");
+        assert_eq!(
+            partition(&["H Jon Benjamin"], std::slice::from_ref(&first)),
+            PersonPartition::default()
+        );
+    }
+
+    /// Two rows share a clean name, as an adopted Jellyfin database holds them.
+    /// A credit keeps its own row by id, and the row it resolves to: the first
+    /// by `SortName`, `Id`, the order `stored` comes in.
+    #[test]
+    fn partition_keeps_the_row_a_credit_resolves_to_beside_its_own() {
+        let resolved = stored(partition_id("Jose"), "Jose");
+        let own = stored(partition_id("José"), "José");
+        assert_eq!(
+            partition(&["José"], &[resolved, own]),
+            PersonPartition::default()
+        );
+    }
+
+    /// Two new credits sharing a clean name are one person, as they are with a
+    /// row behind them: one item, under the first of them.
+    #[test]
+    fn partition_creates_one_item_for_new_spellings_of_one_clean_name() {
+        let found = partition(&["H Jon Benjamin", "H. Jon Benjamin"], &[]);
+        assert_eq!(found.new_names, ["H Jon Benjamin"]);
+    }
+
+    /// A blank credit needs no item, and no other row lives by it.
+    #[test]
+    fn partition_ignores_a_blank_credit() {
+        let orphan = stored(partition_id("Orphan"), "Orphan");
+        let found = partition(&["  "], std::slice::from_ref(&orphan));
+        assert_eq!(found.new_names, Vec::<String>::new());
+        assert_eq!(found.dead, [orphan]);
+    }
+
+    /// Without the identity seam a credit derives no id: names alone keep a
+    /// row, and nothing is created.
+    #[test]
+    fn partition_creates_nothing_without_an_identity() {
+        let rows = [stored(Uuid::from_u128(0x0D3), "Credited")];
+        let credits = ["Credited".to_owned(), "Wanted".to_owned()];
+        let found = partition_credits_by_person_id(&credits, |_| Vec::new(), &rows);
+        assert_eq!(found, PersonPartition::default());
+    }
+
+    /// What this deletes is a subset of what the name-keyed sweep it replaced
+    /// deleted (a `NULL` name, or no credit of exactly that name), so the
+    /// change of key costs a long-lived database no row.
+    #[test]
+    fn partition_deletes_nothing_the_name_keyed_sweep_kept() {
+        let credits = ["Exact", " Untrimmed ", "Credited Id", "H Jon Benjamin"];
+        let nameless = StoredPerson {
+            name: None,
+            clean_name: None,
+            ..stored(Uuid::from_u128(0x0D4), "")
+        };
+        let mut locked = stored(Uuid::from_u128(0x0D5), "Locked");
+        locked.is_locked = true;
+        let rows = [
+            stored(Uuid::from_u128(0x0D6), "Exact"),
+            stored(Uuid::from_u128(0x0D7), " Untrimmed "),
+            stored(Uuid::from_u128(0x0D8), "Untrimmed"),
+            stored(partition_id("Credited Id"), "Renamed"),
+            stored(Uuid::from_u128(0x0D9), "H. Jon Benjamin"),
+            stored(Uuid::from_u128(0x0DA), "Orphan"),
+            nameless.clone(),
+            locked,
+        ];
+        let found = partition(&credits, &rows);
+        for dead in &found.dead {
+            assert!(
+                dead.name
+                    .as_deref()
+                    .is_none_or(|name| !credits.contains(&name)),
+                "{dead:?} was kept by the name-keyed sweep"
+            );
+        }
+        assert_eq!(found.dead, [rows[5].clone(), nameless]);
+        assert_eq!(found.locked, 1);
+    }
+
+    /// A row whose id is no guid can be neither judged nor deleted. It is
+    /// passed over, and the people beside it are still judged.
+    #[tokio::test]
+    async fn partition_person_items_passes_over_a_row_whose_id_is_no_guid() {
+        let db = test_db().await;
+        let parent = Uuid::from_u128(0x0DB);
+        seed_item(&db, parent, BaseItemKind::Folder).await;
+        crate::test_support::seed_child_with_raw_id(&db, "no-guid", BaseItemKind::Person, parent)
+            .await;
+        let orphan = Uuid::from_u128(0x0DC);
+        seed_named_item(&db, orphan, BaseItemKind::Person, "Orphan").await;
+
+        let found = FerrofinPeopleRepository::new(db)
+            .partition_person_items()
+            .await
+            .unwrap();
+
+        let dead: Vec<Uuid> = found.dead.iter().map(|person| person.id).collect();
+        assert_eq!(dead, [orphan]);
+    }
+
+    /// A scan made the person's row after the partition read: creating the
+    /// credit's item reuses it, as the write path does, whatever its spelling.
+    #[tokio::test]
+    async fn create_person_items_reuses_a_row_a_scan_made_meanwhile() {
+        let db = test_db().await;
+        let people = tempfile::tempdir().unwrap();
+        let repo = FerrofinPeopleRepository::new(db.clone()).with_identity(
+            crate::item_type_lookup::IdDerivation::Jellyfin {
+                program_data_path: None,
+            },
+            people.path().to_string_lossy().into_owned(),
+        );
+        let scanned = Uuid::from_u128(0x0DD);
+        seed_named_item(&db, scanned, BaseItemKind::Person, "H. Jon Benjamin").await;
+        crate::test_support::set_clean_name(&db, scanned, "H. Jon Benjamin").await;
+
+        let created = repo
+            .create_person_items(&["H Jon Benjamin".to_owned()])
+            .await
+            .unwrap();
+
+        assert_eq!(created, 0);
+        assert_eq!(super::person_names(&db).await, ["H. Jon Benjamin"]);
     }
 
     /// A credit with no role round-trips as `Some("")`, NOT `None`.

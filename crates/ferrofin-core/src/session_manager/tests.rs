@@ -74,9 +74,9 @@ impl ServerConfigurationManager for FixedConfig {
     }
 }
 
-/// A DTO service for the tests that never build a `NowPlayingItem` (no session
-/// in them is playing when its sessions are listed); [`RecordingDtoService`]
-/// serves the ones that do.
+/// A DTO service for the tests that do not look at a `NowPlayingItem`: a
+/// playback report naming a library item still builds one, which is the bare
+/// item (its id and name). [`RecordingDtoService`] serves the tests that look.
 struct UnusedDtoService;
 
 #[async_trait]
@@ -98,13 +98,20 @@ impl DtoService for UnusedDtoService {
     }
     async fn get_base_item_dtos(
         &self,
-        _items: &[BaseItemEntity],
+        items: &[BaseItemEntity],
         _options: &DtoOptions,
         _user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
         _skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
-        unreachable!("dto service is not exercised by these tests")
+        Ok(items
+            .iter()
+            .map(|row| BaseItemDto {
+                id: Uuid::parse_str(&row.id).expect("item id"),
+                name: row.name.clone(),
+                ..BaseItemDto::default()
+            })
+            .collect())
     }
     async fn get_item_by_name_dto(
         &self,
@@ -1566,8 +1573,9 @@ async fn progress_remembers_the_reported_audio_and_subtitle_tracks() {
     );
 }
 
-/// A media-source manager that records every `close_live_stream` id. Only the
-/// live-stream half of the trait is reachable from the session manager.
+/// A media-source manager that records every `close_live_stream` id. A
+/// playback report's `NowPlayingItem` build also looks up its media source,
+/// which finds none here.
 struct RecordingMediaSources {
     closed: Mutex<Vec<String>>,
 }
@@ -1601,7 +1609,7 @@ impl ferrofin_traits::library::MediaSourceManager for RecordingMediaSources {
         _enable_path_substitution: bool,
         _user_id: Option<Uuid>,
     ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
-        unreachable!("not reached from the session manager")
+        Ok(Vec::new())
     }
     async fn open_live_stream(
         &self,
@@ -1611,9 +1619,9 @@ impl ferrofin_traits::library::MediaSourceManager for RecordingMediaSources {
     }
     async fn get_live_stream(
         &self,
-        _id: &str,
+        id: &str,
     ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
-        unreachable!("not reached from the session manager")
+        Err(ServiceError::NotFound(format!("live stream {id}")))
     }
     async fn close_live_stream(&self, id: &str) -> Result<(), ServiceError> {
         self.closed
@@ -4155,7 +4163,7 @@ impl DtoService for RecordingDtoService {
         &self,
         _item_id: Uuid,
     ) -> Result<Option<f64>, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_base_item_dto(
         &self,
@@ -4164,7 +4172,7 @@ impl DtoService for RecordingDtoService {
         _user: Option<&UserEntity>,
         _owner_id: Option<Uuid>,
     ) -> Result<BaseItemDto, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_base_item_dtos(
         &self,
@@ -4198,7 +4206,7 @@ impl DtoService for RecordingDtoService {
         _tagged_item_ids: Option<&[Uuid]>,
         _user: Option<&UserEntity>,
     ) -> Result<BaseItemDto, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
 }
 
@@ -4217,13 +4225,13 @@ impl ferrofin_traits::library::MediaSourceManager for CannedSources {
         &self,
         _item_id: Uuid,
     ) -> Result<Vec<ferrofin_model::entities_media::MediaStream>, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_media_attachments(
         &self,
         _item_id: Uuid,
     ) -> Result<Vec<ferrofin_model::entities_media::MediaAttachment>, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_playback_media_sources(
         &self,
@@ -4232,7 +4240,7 @@ impl ferrofin_traits::library::MediaSourceManager for CannedSources {
         _allow_media_probe: bool,
         _enable_path_substitution: bool,
     ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_static_media_sources(
         &self,
@@ -4250,7 +4258,7 @@ impl ferrofin_traits::library::MediaSourceManager for CannedSources {
         &self,
         _request: &ferrofin_model::media_info::LiveStreamRequest,
     ) -> Result<ferrofin_model::dto::MediaSourceInfo, ServiceError> {
-        unreachable!("not reached from get_sessions")
+        unreachable!("not reached from a NowPlayingItem build")
     }
     async fn get_live_stream(
         &self,
@@ -4486,3 +4494,7 @@ async fn the_now_playing_item_shows_the_reported_media_source(
 /// What a session request reads from its device: only the request that
 /// creates the session reads it.
 mod device_reads;
+
+/// The session's `NowPlayingItem`, built once per item on the report that
+/// names it, and the session summaries that read it.
+mod now_playing_item;

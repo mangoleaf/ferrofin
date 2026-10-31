@@ -13,12 +13,23 @@ replicaCount: 1
 
 # -- Deployment update strategy. RollingUpdate + maxUnavailable 0 starts the new pod
 # and waits for its readiness probe (/health/ready) before the old one is torn down,
-# so an upgrade doesn't drop playback. The two pods briefly share the data dir; SQLite
-# runs in WAL with a 30s busy timeout, so concurrent access is safe (one writer at a
-# time) — this is what jellyfin-helm does too. Requirements for the surge pod to
-# schedule: the config PVC must be mountable twice (RWX, or RWO with both pods on the
-# same node) and any exclusive resource in `resources` (e.g. nvidia.com/gpu) must have
-# a spare unit. If neither holds, set `type: Recreate` (and drop `rollingUpdate`).
+# so an upgrade doesn't drop playback. The cost is an overlap: the old version keeps
+# serving and writing the database for the whole of the new pod's boot, migrations and
+# one-shot repairs included. On one node SQLite's locks protect the file, not the logic:
+# rows the old version writes in that window can miss a one-shot repair for good, it can
+# answer with errors while a long transaction holds the write lock (past the 30s busy
+# timeout) or a migration changes a table it reads, and it cannot restart once the
+# database has been migrated. `type: Recreate` opts out: only one version ever touches
+# the database, and playback stops for the whole boot. See "Upgrades and the database"
+# in the chart README.
+#
+# Two pods may share the database only from ONE node. SQLite's WAL needs a shared-memory
+# index that two nodes cannot share, so a surge pod on a second node over an RWX volume
+# (NFS, CephFS) can corrupt the database. Use RWO on one node, or keep both pods on one
+# node (podAffinity or a node pin, see the README), or use Recreate. The surge pod must
+# also schedule: with RWO it has to land on the old pod's node, and any exclusive
+# resource in `resources` (e.g. nvidia.com/gpu) must have a spare unit. If that cannot
+# hold, use Recreate.
 strategy:
   type: RollingUpdate
   rollingUpdate:
@@ -144,6 +155,8 @@ persistence:
     existingClaim: ""
     # -- Size for the chart-created PVC (ignored when existingClaim is set).
     size: 10Gi
+    # -- Access mode for the chart-created PVC. RWX does not make a rolling update safe
+    # across nodes: see `strategy`.
     accessMode: ReadWriteOnce
     # -- StorageClass for the chart-created PVC. "" → cluster default. null → no storageClassName field.
     storageClass: ""
