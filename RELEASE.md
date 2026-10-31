@@ -23,7 +23,7 @@ itself (override its choice with the `force_version` input when needed).
 
 | Tag | Triggers | Notes |
 |---|---|---|
-| `vX.Y.Z` | image `:vX.Y.Z` + `:latest`, GitHub Release with notes + binaries, chart `X.Y.Z` | Final release |
+| `vX.Y.Z` | image `:vX.Y.Z` + `:latest`, GitHub Release (a draft until its notes are written) with binaries, chart `X.Y.Z` | Final release |
 | `vX.Y.Z-rc.N` | image `:vX.Y.Z-rc.N` and binaries only | Pre-release; never moves `:latest`, no Release, no chart |
 | `chart-vA.B.C` | chart `A.B.C` only | Chart-only fix (templates/values), no app change |
 
@@ -50,6 +50,11 @@ from.
    PR (release branch → `main`) shows the same run's checks and runs no CI of its own.
 2. **Freeze and measure the release branch.** PRs are not benchmarked individually, so this
    is the only performance gate.
+
+   **Overview.** For a feature release, before the freeze, refresh the release PR's description
+   (release branch → `main`; a patch release from `main` has no such PR) with a high-level overview of everything since the previous release: what changed by
+   area, the scale, and the upgrade notes. The `github-release-overview` skill collects the
+   commits and PRs and drafts it.
 
    **Freeze.** From here until the tag exists, nothing merges into the release branch. If its
    head moves anyway, start again from step 1: the workflow tags the head at the time it
@@ -230,7 +235,13 @@ from.
    it does **not** commit to the branch. A release branch merges back into `main` with a merge
    commit (never squash or rebase), so the release tag stays reachable from `main`.
 4. The tag push re-triggers the workflow: `docker-image` → `github-release` → `helm-chart`.
-   Watch it finish, then verify (below).
+   Watch it finish, then verify (below). `github-release` creates the GitHub Release as a
+   **draft** with git-cliff placeholder notes, so nobody sees them. It stays a draft, and
+   `releases/latest` (what `docs/INSTALL.md` reads) keeps pointing at the previous release,
+   until the notes are written and the Release is published: the `github-release-notes`
+   skill collects every commit and merged PR since the previous final tag, drafts notes by
+   area with each PR linked, and on approval edits the Release and publishes it. Do this
+   after the verification below and before announcing the release.
 5. **Record the results** after the tag, so the record never moves the frozen head: attach
    the benchmark gate's `report.md` files (A/B, scan, endpoints and, when it was run, ramp) to the release
    PR (release branch → `main`), or to the GitHub Release for a patch release from `main`, and
@@ -289,8 +300,12 @@ docker pull ghcr.io/mangoleaf/ferrofin:vX.Y.Z
 docker run --rm -p 8096:8096 ghcr.io/mangoleaf/ferrofin:vX.Y.Z &
 curl -s localhost:8096/System/Info/Public | jq .Version      # prints vX.Y.Z
 helm pull oci://ghcr.io/mangoleaf/ferrofin/charts/ferrofin --version X.Y.Z
+gh release list --limit 3 --json tagName,isDraft           # vX.Y.Z is a draft until published
 gh release view vX.Y.Z --json assets -q '.assets[].name'    # tarballs + checksums
 ```
+
+The Release is a draft until its notes are written and it is published (step 4 above).
+The GitLab mirror creates no Release: the GitHub Release is the only one.
 
 ## Not yet automated (do manually / add later)
 
