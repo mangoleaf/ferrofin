@@ -39,6 +39,22 @@ database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
 
+## Unreleased — a mount that does not answer is left out of the drive list
+
+Nothing to do, unless your network storage is slow to answer. The library wizard's drive list
+(`GET /Environment/Drives`) now gives each mount 2 s and lists the ones that answered. A mount
+that hangs no longer freezes the server, and it returns to the list once it answers. A mount
+that regularly takes longer than 2 s, such as a NAS waking its disks, is missing from the list
+even though it is healthy: type its path into the folder picker instead.
+
+While a mount hangs, the folder picker, the log pages and the fallback fonts can stop until it
+answers, for local disks too, once 32 calls are stuck on it. Everything else keeps working.
+
+If a script calls these routes, some answers changed to match Jellyfin 12.4:
+`GET /Environment/DirectoryContents` is a `404` for a path that is no directory (it was an empty
+list), and `POST /Environment/ValidatePath` with `ValidateWritable` is a `500` for a read-only
+directory and a `404` when the path is a file (both were `400`).
+
 ## Unreleased — the Helm chart's notes on rolling updates and RWX volumes are corrected
 
 Nothing changes in the chart's behaviour, and the default stays `RollingUpdate`, but what it told

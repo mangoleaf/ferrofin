@@ -8,12 +8,14 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use ferrofin_api::create_router;
-use ferrofin_api::state::AppState;
+use ferrofin_api::state::{AppState, MAX_BLOCKING_FILE_SYSTEM_CALLS};
 use ferrofin_api::test_support::{
     ApiKeyAuthService, AuthedAuthService, FakeApiKeys, FakeAppHost, FakeClientEventLogger,
     FakeCollections, FakeDevices, FakeDisplayPreferences, FakeDto, FakeLibrary, FakeLyrics,
@@ -330,6 +332,11 @@ impl SystemManager for StubSystem {
 /// Builds an [`AppState`] whose filesystem/system/config/activity managers are
 /// stubs and the rest are panic fakes.
 fn full_state() -> AppState {
+    state_with_file_system(Arc::new(StubFileSystem))
+}
+
+/// [`full_state`] over another filesystem.
+fn state_with_file_system(file_system: Arc<dyn FileSystem>) -> AppState {
     let auth = Arc::new(OkAuth);
     AppState::new(
         Arc::new(FakeLibrary),
@@ -362,7 +369,7 @@ fn full_state() -> AppState {
         Arc::new(ferrofin_api::test_support::FakeLocalization),
         Arc::new(FakeDisplayPreferences),
         Arc::new(StubActivity::default()),
-        Arc::new(StubFileSystem),
+        file_system,
         Arc::new(FakeTasks),
     )
 }
@@ -503,4 +510,350 @@ async fn environment_routes_require_an_administrator_once_setup_is_complete() {
     assert_eq!(status, StatusCode::OK);
     let shares = json(&body);
     assert!(shares.as_array().unwrap().is_empty(), "{shares}");
+}
+
+/// Runs `body` on a current-thread runtime whose blocking pool has one thread,
+/// held busy until `body` returns. A filesystem call made inline on the only
+/// runtime worker ignores that hog and answers; one on the pool waits for it.
+fn with_blocking_pool_starved(body: impl AsyncFnOnce()) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let hog = tokio::task::spawn_blocking(move || {
+            busy_tx.send(()).ok();
+            release_rx.recv().ok();
+        });
+        busy_rx.await.unwrap();
+        body().await;
+        release_tx.send(()).unwrap();
+        hog.await.unwrap();
+        let (status, _) = get(full_state(), "/Environment/Drives").await;
+        assert_eq!(status, StatusCode::OK, "the pool's thread is back");
+    });
+}
+
+/// The browse handlers never run the filesystem inline on a runtime worker: a
+/// `statvfs` or a `read_dir` on a hung network mount would pin that worker in
+/// uninterruptible sleep, and one call per core stops all HTTP traffic.
+#[test]
+fn environment_filesystem_calls_go_through_the_blocking_pool() {
+    with_blocking_pool_starved(async || {
+        for uri in [
+            "/Environment/Drives",
+            "/Environment/DirectoryContents?path=/media&includeFiles=true",
+        ] {
+            let starved = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                get(full_state(), uri),
+            )
+            .await;
+            assert!(starved.is_err(), "{uri} answered inline");
+        }
+        for body in [
+            r#"{"Path":"/exists","IsFile":false}"#,
+            r#"{"Path":"/exists/file.txt","IsFile":true}"#,
+            r#"{"Path":"/exists","ValidateWritable":true}"#,
+        ] {
+            let starved = tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                send(
+                    full_state(),
+                    "POST",
+                    "/Environment/ValidatePath",
+                    Body::from(body),
+                    Some("application/json"),
+                ),
+            )
+            .await;
+            assert!(starved.is_err(), "ValidatePath {body} answered inline");
+        }
+    });
+}
+
+/// A filesystem answering its listing and its writable check from a script,
+/// recording the path it was asked to list.
+struct ScriptedFs {
+    listing: fn() -> Result<Vec<FileSystemEntryInfo>, ServiceError>,
+    writable: fn() -> Result<(), ServiceError>,
+    listed: Mutex<Option<String>>,
+}
+
+impl ScriptedFs {
+    fn listing(listing: fn() -> Result<Vec<FileSystemEntryInfo>, ServiceError>) -> Arc<Self> {
+        Arc::new(Self {
+            listing,
+            writable: || Ok(()),
+            listed: Mutex::new(None),
+        })
+    }
+
+    fn writable(writable: fn() -> Result<(), ServiceError>) -> Arc<Self> {
+        Arc::new(Self {
+            listing: || Ok(Vec::new()),
+            writable,
+            listed: Mutex::new(None),
+        })
+    }
+}
+
+impl FileSystem for ScriptedFs {
+    fn get_file_system_entries(&self, path: &str) -> Vec<FileSystemEntryInfo> {
+        self.try_get_file_system_entries(path).unwrap_or_default()
+    }
+    fn try_get_file_system_entries(
+        &self,
+        path: &str,
+    ) -> Result<Vec<FileSystemEntryInfo>, ServiceError> {
+        *self.listed.lock().unwrap() = Some(path.to_owned());
+        (self.listing)()
+    }
+    fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
+        Vec::new()
+    }
+    fn file_exists(&self, _path: &str) -> bool {
+        false
+    }
+    fn directory_exists(&self, _path: &str) -> bool {
+        true
+    }
+    fn validate_writable(&self, _path: &str) -> Result<(), ServiceError> {
+        (self.writable)()
+    }
+    fn get_files(&self, _path: &str, _extensions: &[&str]) -> Vec<FileMetadata> {
+        Vec::new()
+    }
+    fn read_file(&self, _path: &str) -> Result<Vec<u8>, ServiceError> {
+        Err(ServiceError::not_found("no file"))
+    }
+}
+
+fn entry(path: &str) -> FileSystemEntryInfo {
+    FileSystemEntryInfo {
+        name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+        path: path.to_owned(),
+        type_: FileSystemEntryType::File,
+    }
+}
+
+/// `OrderBy(i => i.FullName)` is `string.CompareTo`, the current culture's order.
+/// Oracle: Jellyfin 12.4 listing these five names.
+#[tokio::test]
+async fn directory_contents_order_by_the_culture_not_by_bytes() {
+    let fs = ScriptedFs::listing(|| {
+        Ok(["/d/Z", "/d/A.txt", "/d/b", "/d/a.txt", "/d/_x"]
+            .map(entry)
+            .into())
+    });
+    let (status, body) = get(
+        state_with_file_system(fs),
+        "/Environment/DirectoryContents?path=/d&includeFiles=true",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<String> = json(&body)
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["Name"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(names, ["_x", "a.txt", "A.txt", "b", "Z"]);
+}
+
+/// Oracle: Jellyfin 12.4. A missing path and a path that is a file are
+/// `DirectoryNotFoundException`, a 404; a directory the server may not read
+/// lists empty (`IgnoreInaccessible`); anything else is a 500.
+#[tokio::test]
+async fn directory_contents_failures_answer_as_upstream_does() {
+    let uri = "/Environment/DirectoryContents?path=/d&includeFiles=true";
+
+    let gone = ScriptedFs::listing(|| Err(ServiceError::not_found("no directory")));
+    let (status, _) = get(state_with_file_system(gone), uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let shut = ScriptedFs::listing(|| Err(ServiceError::Forbidden("permission denied".into())));
+    let (status, body) = get(state_with_file_system(shut), uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body), serde_json::json!([]));
+
+    let broken = ScriptedFs::listing(|| Err(ServiceError::backend("input/output error")));
+    let (status, _) = get(state_with_file_system(broken), uri).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+/// `new DirectoryInfo(path)` runs `Path.GetFullPath`, so the entries come back
+/// under the resolved path.
+#[tokio::test]
+async fn directory_contents_lists_the_full_path() {
+    let fs = ScriptedFs::listing(|| Ok(Vec::new()));
+    let uri = "/Environment/DirectoryContents?path=/media/movies/../tv/./";
+    let (status, _) = get(state_with_file_system(Arc::clone(&fs) as _), uri).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fs.listed.lock().unwrap().as_deref(), Some("/media/tv"));
+}
+
+/// `[FromQuery, Required] string path`: the binder nulls a blank value, so
+/// whitespace is the same 400 as no value at all. A flag must be a boolean.
+#[tokio::test]
+async fn directory_contents_rejects_what_the_binder_rejects() {
+    for uri in [
+        "/Environment/DirectoryContents",
+        "/Environment/DirectoryContents?path=",
+        "/Environment/DirectoryContents?path=%20",
+        "/Environment/DirectoryContents?path=/d&includeFiles=maybe",
+    ] {
+        let (status, _) = get(full_state(), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+    }
+}
+
+/// Oracle: Jellyfin 12.4. A read-only directory is a 500, a path that is a file
+/// a 404 (`DirectoryNotFoundException` from the write under it), and the `IsFile`
+/// branches never try to write.
+#[tokio::test]
+async fn validate_path_writable_failures_answer_as_upstream_does() {
+    let writable_body = r#"{"Path":"/d","ValidateWritable":true}"#;
+    let post = async |fs: Arc<ScriptedFs>, body: &'static str| {
+        send(
+            state_with_file_system(fs),
+            "POST",
+            "/Environment/ValidatePath",
+            Body::from(body),
+            Some("application/json"),
+        )
+        .await
+    };
+
+    let read_only = ScriptedFs::writable(|| Err(ServiceError::backend("read-only")));
+    let (status, _) = post(read_only, writable_body).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+
+    let under_a_file = ScriptedFs::writable(|| Err(ServiceError::not_found("not a directory")));
+    let (status, _) = post(under_a_file, writable_body).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let never_written = ScriptedFs::writable(|| panic!("the IsFile branch never writes"));
+    let (status, _) = post(
+        never_written,
+        r#"{"Path":"/d","IsFile":false,"ValidateWritable":true}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// `NotFound()`: the ProblemDetails body, not a message.
+#[tokio::test]
+async fn validate_path_missing_is_upstreams_problem_details() {
+    let (status, body) = send(
+        full_state(),
+        "POST",
+        "/Environment/ValidatePath",
+        Body::from(r#"{"Path":"/nope"}"#),
+        Some("application/json"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(json(&body)["title"], "Not Found");
+    assert_eq!(json(&body)["status"], 404);
+}
+
+/// A listing that sleeps until released, as one on a hung mount does.
+#[derive(Default)]
+struct HungListingFs {
+    in_listing: AtomicUsize,
+    released: Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+impl HungListingFs {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
+impl FileSystem for HungListingFs {
+    fn get_file_system_entries(&self, _path: &str) -> Vec<FileSystemEntryInfo> {
+        unimplemented!("the handler tells a failed listing from an empty one")
+    }
+    fn try_get_file_system_entries(
+        &self,
+        _path: &str,
+    ) -> Result<Vec<FileSystemEntryInfo>, ServiceError> {
+        self.in_listing.fetch_add(1, Ordering::SeqCst);
+        let released = self.released.lock().unwrap();
+        drop(self.release.wait_while(released, |released| !*released));
+        self.in_listing.fetch_sub(1, Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+    fn get_drives(&self) -> Vec<FileSystemEntryInfo> {
+        vec![entry("/")]
+    }
+    fn file_exists(&self, _path: &str) -> bool {
+        false
+    }
+    fn directory_exists(&self, _path: &str) -> bool {
+        false
+    }
+    fn validate_writable(&self, _path: &str) -> Result<(), ServiceError> {
+        Ok(())
+    }
+    fn get_files(&self, _path: &str, _extensions: &[&str]) -> Vec<FileMetadata> {
+        Vec::new()
+    }
+    fn read_file(&self, _path: &str) -> Result<Vec<u8>, ServiceError> {
+        Err(ServiceError::not_found("no file"))
+    }
+}
+
+/// Clicks on a hung mount cannot use up the blocking pool: past the cap they
+/// wait without a thread, and the drive list still opens, which is how the
+/// admin picks another path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hung_listings_hold_no_more_threads_than_the_cap() {
+    /// Lets the hung calls go whatever the test's outcome: the runtime waits
+    /// for its blocking threads when it is dropped.
+    struct ReleaseAtTheEnd(Arc<HungListingFs>);
+    impl Drop for ReleaseAtTheEnd {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    let fs = Arc::new(HungListingFs::default());
+    let release = ReleaseAtTheEnd(Arc::clone(&fs));
+    let app = state_with_file_system(Arc::clone(&fs) as _);
+    let uri = "/Environment/DirectoryContents?path=/mnt/nas&includeFiles=true";
+    let requests: Vec<_> = (0..MAX_BLOCKING_FILE_SYSTEM_CALLS * 2)
+        .map(|_| tokio::spawn(get(app.clone(), uri)))
+        .collect();
+
+    let give_up = tokio::time::Instant::now() + Duration::from_secs(30);
+    while fs.in_listing.load(Ordering::SeqCst) < MAX_BLOCKING_FILE_SYSTEM_CALLS {
+        assert!(tokio::time::Instant::now() < give_up, "calls never started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fs.in_listing.load(Ordering::SeqCst),
+        MAX_BLOCKING_FILE_SYSTEM_CALLS
+    );
+
+    let (status, _) = tokio::time::timeout(
+        Duration::from_secs(30),
+        get(app.clone(), "/Environment/Drives"),
+    )
+    .await
+    .expect("the drive list must not wait for a slot");
+    assert_eq!(status, StatusCode::OK);
+
+    drop(release);
+    for request in requests {
+        let (status, _) = request.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+    }
 }
