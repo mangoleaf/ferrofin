@@ -138,7 +138,9 @@ only check on this.
 ## Commits: Conventional Commits + sign-off
 
 Commit messages follow [Conventional Commits](https://www.conventionalcommits.org)
-— this drives the automated changelog (`cliff.toml` → `CHANGELOG.md`):
+— this drives the version bump (`scripts/version.sh`) and the release notes (`cliff.toml`).
+There is no changelog file to edit: the notes are written from the commits and merged PRs
+when a release is cut. Examples:
 
 ```
 feat(sessions): remote-control bus-registered sockets
