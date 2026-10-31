@@ -964,20 +964,6 @@ async fn browse_and_userless_exceptions_keep_their_upstream_contract() {
         .0,
         StatusCode::OK
     );
-    let (status, ids) = call(
-        &f.router,
-        "GET",
-        &format!("/Items?ids={id}"),
-        Some(&f.viewer),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(ids["Items"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        uuid::Uuid::parse_str(ids["Items"][0]["Id"].as_str().unwrap()).unwrap(),
-        uuid::Uuid::parse_str(id).unwrap()
-    );
     assert_eq!(
         call(
             &f.router,
@@ -1725,6 +1711,312 @@ async fn grouping_options_sort_by_culture_not_by_code_point() {
         .collect();
     // Byte order would put the lower-case name last.
     assert_eq!(names, ["aardvark", "Allowed", "Hidden"]);
+}
+
+/// Every item a scope can name inside libraries the viewer cannot open.
+struct HiddenScopes {
+    /// The TV, music and home-video libraries.
+    libraries: Vec<String>,
+    /// The TV library.
+    library: String,
+    series: String,
+    season: String,
+    album: String,
+    folder: String,
+}
+
+/// The id of the first item of `kind`, as the administrator sees it.
+async fn first_of_kind(f: &Fixture, kind: &str) -> String {
+    let uri = format!("/Items?recursive=true&includeItemTypes={kind}");
+    let (status, items) = call(&f.router, "GET", &uri, Some(&f.admin), None).await;
+    assert_eq!(status, StatusCode::OK, "{items}");
+    items["Items"][0]["Id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no {kind}: {items}"))
+        .to_owned()
+}
+
+/// Adds a TV, a music and a home-video library. The viewer's policy names
+/// only the fixture's Allowed library, so all three are closed to them.
+async fn hidden_scopes(f: &Fixture) -> HiddenScopes {
+    for path in [
+        "shows/Show/Season 1/Show S01E01.mkv",
+        "tunes/Band/Album/01 Song.mp3",
+        "home/Trip/Day/clip.mkv",
+    ] {
+        touch(&f.h.path(path), "");
+    }
+    for (name, kind, dir) in [
+        ("Shows", "tvshows", "shows"),
+        ("Tunes", "music", "tunes"),
+        ("Home", "homevideos", "home"),
+    ] {
+        let path = encode(&f.h.path(dir).to_string_lossy());
+        let uri = format!(
+            "/Library/VirtualFolders?name={name}&collectionType={kind}&paths={path}&refreshLibrary=false"
+        );
+        let (status, _) = call(&f.router, "POST", &uri, Some(&f.admin), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    assert!(
+        f.h.wired
+            .state
+            .library
+            .run_library_scan(ScanTrigger::Api, None)
+            .await
+            .unwrap()
+    );
+    let (_, folders) = call(
+        &f.router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let libraries: Vec<String> = ["Shows", "Tunes", "Home"]
+        .iter()
+        .map(|name| {
+            folders
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|folder| folder["Name"] == *name)
+                .unwrap()["ItemId"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    HiddenScopes {
+        library: libraries[0].clone(),
+        libraries,
+        series: first_of_kind(f, "Series").await,
+        season: first_of_kind(f, "Season").await,
+        album: first_of_kind(f, "MusicAlbum").await,
+        folder: first_of_kind(f, "Folder").await,
+    }
+}
+
+/// Every route that takes an item as its scope, for one id.
+fn scope_routes(id: &str, viewer_id: &str) -> Vec<String> {
+    let mut routes: Vec<String> = [
+        "/Items",
+        "/UserItems/Resume",
+        "/Trailers",
+        "/Items/Latest",
+        "/Items/Filters",
+        "/Items/Filters2",
+        "/Artists",
+        "/Artists/AlbumArtists",
+        "/Genres",
+        "/MusicGenres",
+        "/Studios",
+        "/Persons",
+        "/Years",
+        "/Movies/Recommendations",
+        "/Shows/NextUp",
+        "/Shows/Upcoming",
+    ]
+    .iter()
+    .map(|route| format!("{route}?parentId={id}"))
+    .collect();
+    routes.extend([
+        format!("/Items?parentId={id}&recursive=true"),
+        format!("/Users/{viewer_id}/Items?parentId={id}"),
+        format!("/Users/{viewer_id}/Items/Latest?parentId={id}"),
+        format!("/Search/Hints?searchTerm=s&parentId={id}"),
+        format!("/Persons?appearsInItemId={id}"),
+    ]);
+    routes
+}
+
+// Divergence (owner decision 2026-10-31, gl-1091): see `require_scope_visible`.
+#[tokio::test]
+async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
+    let f = fixture().await;
+    let s = hidden_scopes(&f).await;
+    let mut open = Vec::new();
+    for id in [&s.library, &s.series, &s.season, &s.album, &s.folder] {
+        let mut routes = scope_routes(id, &f.viewer_id);
+        routes.push(format!("/Shows/NextUp?seriesId={id}"));
+        for route in routes {
+            let (status, _) = call(&f.router, "GET", &route, Some(&f.viewer), None).await;
+            if status != StatusCode::UNAUTHORIZED {
+                open.push(format!("{status} {route}"));
+            }
+        }
+    }
+    assert!(open.is_empty(), "{open:#?}");
+    let both = format!("/Items?ids={}&parentId={}", f.hidden, s.library);
+    let (status, _) = call(&f.router, "GET", &both, Some(&f.viewer), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the scope answers first");
+
+    // An administrator can open them all, and an API key is not a user.
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            "/Auth/Keys?app=scope-fixture",
+            Some(&f.admin),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, keys) = call(&f.router, "GET", "/Auth/Keys", Some(&f.admin), None).await;
+    let key = keys["Items"][0]["AccessToken"].as_str().unwrap();
+    let series = format!("/Items?parentId={}", s.series);
+    for token in [f.admin.as_str(), key] {
+        let (status, _) = call(&f.router, "GET", &series, Some(token), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let for_viewer = format!("{series}&userId={}", f.viewer_id);
+    let (status, _) = call(&f.router, "GET", &for_viewer, Some(key), None).await;
+    assert_eq!(status, StatusCode::OK, "an API key naming a user is exempt");
+    // An administrator reading as the viewer gets the viewer's answer.
+    let (status, _) = call(&f.router, "GET", &for_viewer, Some(&f.admin), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Opening the library opens everything inside it.
+    let viewer_id = &f.viewer_id;
+    let (_, user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{viewer_id}"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let mut policy = user["Policy"].clone();
+    policy["EnabledFolders"]
+        .as_array_mut()
+        .unwrap()
+        .extend(s.libraries.iter().map(|library| json!(library)));
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Users/{viewer_id}/Policy"),
+        Some(&f.admin),
+        Some(policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    for id in [&s.library, &s.series, &s.season, &s.album, &s.folder] {
+        let mut routes = scope_routes(id, viewer_id);
+        routes.push(format!("/Shows/NextUp?seriesId={id}"));
+        for route in routes {
+            let (status, body) = call(&f.router, "GET", &route, Some(&f.viewer), None).await;
+            assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_scope_the_user_can_open_answers_on_every_route() {
+    let f = fixture().await;
+    let (_, folders) = call(
+        &f.router,
+        "GET",
+        "/Library/VirtualFolders",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let library = folders
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|folder| folder["Name"] == "Allowed")
+        .unwrap()["ItemId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for id in [&library, &f.allowed] {
+        for route in scope_routes(id, &f.viewer_id) {
+            let (status, body) = call(&f.router, "GET", &route, Some(&f.viewer), None).await;
+            assert_eq!(status, StatusCode::OK, "{route}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_scope_naming_no_item_answers_as_it_did() {
+    let f = fixture().await;
+    let missing = uuid::Uuid::from_u128(0xDEAD).simple().to_string();
+    for token in [&f.viewer, &f.admin] {
+        for (route, expected) in [
+            (
+                format!("/Items?parentId={missing}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/Genres?parentId={missing}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (format!("/Items/Latest?parentId={missing}"), StatusCode::OK),
+            (format!("/Shows/NextUp?seriesId={missing}"), StatusCode::OK),
+            (format!("/Items?ids={missing}"), StatusCode::OK),
+            // The id filter comes last: a request it would empty is still refused.
+            (
+                format!("/Items?ids={missing}&parentId={missing}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/Items?ids={missing}&filters=IsPlayed,IsUnplayed"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let (status, body) = call(&f.router, "GET", &route, Some(token), None).await;
+            assert_eq!(status, expected, "{route}: {body}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn explicit_ids_keep_to_what_the_user_can_open() {
+    let f = fixture().await;
+    let (allowed, hidden) = (&f.allowed, &f.hidden);
+    let total = |page: &Value| page["TotalRecordCount"].as_i64().unwrap();
+    // An empty id list means no filter, so this must not become the whole
+    // library. `ids_the_user_may_not_open_never_reach_the_query` holds `/Trailers`
+    // to the same, which this fixture cannot: it has no trailers.
+    let uri = format!("/Items?ids={hidden}");
+    let (status, page) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item_ids(&page["Items"]).is_empty(), "{page}");
+    assert_eq!(total(&page), 0);
+    let both = format!("/Items?ids={hidden},{allowed}");
+    let (_, page) = call(&f.router, "GET", &both, Some(&f.viewer), None).await;
+    assert_eq!(
+        item_ids(&page["Items"]),
+        [uuid::Uuid::parse_str(allowed).unwrap()]
+    );
+    assert_eq!(total(&page), 1);
+    let (_, page) = call(&f.router, "GET", &both, Some(&f.admin), None).await;
+    assert_eq!(item_ids(&page["Items"]).len(), 2);
+    // An API key is exempt, even when it names the viewer.
+    assert_eq!(
+        call(
+            &f.router,
+            "POST",
+            "/Auth/Keys?app=ids-fixture",
+            Some(&f.admin),
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, keys) = call(&f.router, "GET", "/Auth/Keys", Some(&f.admin), None).await;
+    let key = keys["Items"][0]["AccessToken"].as_str().unwrap();
+    let as_viewer = format!("/Items?ids={hidden}&userId={}", f.viewer_id);
+    let (_, page) = call(&f.router, "GET", &as_viewer, Some(key), None).await;
+    assert_eq!(
+        item_ids(&page["Items"]),
+        [uuid::Uuid::parse_str(hidden).unwrap()]
+    );
 }
 
 /// The viewer's `GET /Items/{allowed}` status.

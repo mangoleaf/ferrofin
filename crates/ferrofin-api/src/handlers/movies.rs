@@ -70,6 +70,8 @@ async fn get_movie_recommendations(
     Query(query): Query<RecommendationsQuery>,
 ) -> Result<Json<Vec<RecommendationDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    crate::handlers::items::require_scope_id_visible(&state, &auth, query.parent_id, user.as_ref())
+        .await?;
     let user_uuid = user.as_ref().and_then(|u| Uuid::parse_str(&u.id).ok());
     // Honour the requested `Fields` like Jellyfin's `new DtoOptions { Fields = fields }`:
     // absent ⇒ empty ⇒ the base DTO, not all 47 fields (which meant a per-item query

@@ -626,6 +626,8 @@ async fn get_latest_media(
     use crate::handlers::query_parse::parse_csv_enums_lenient;
 
     let user = resolve_user(&state, &auth, query.user_id).await?;
+    crate::handlers::items::require_scope_id_visible(&state, &auth, query.parent_id, Some(&user))
+        .await?;
 
     // C#: an unset `isPlayed` defaults to `false` when the user hides played
     // items from the "latest" rows.

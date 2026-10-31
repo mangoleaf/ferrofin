@@ -199,7 +199,17 @@ async fn get_trailers(
     Query(query): Query<TrailersQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
-    let internal = trailers_query_options(&query, user)?;
+    let mut internal = trailers_query_options(&query, user)?;
+    crate::handlers::items::require_scope_id_visible(
+        &state,
+        &auth,
+        Some(internal.parent_id),
+        internal.user.as_ref(),
+    )
+    .await?;
+    if !crate::handlers::items::retain_visible_ids(&state, &auth, &mut internal).await? {
+        return Ok(Json(crate::handlers::items::empty_page(&internal)));
+    }
 
     let mut result = state.library.query_items(&internal).await?;
     // `GetItems` answers explicit ids through `Folder.GetItems`.

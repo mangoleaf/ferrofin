@@ -108,6 +108,8 @@ async fn get_search_hints(
     // A user id resolves for visibility scoping; an absent one is the nil id (the
     // C# `RequestHelpers.GetUserId` fallback), searching all libraries.
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    crate::handlers::items::require_scope_id_visible(&state, &auth, query.parent_id, user.as_ref())
+        .await?;
     let user_id = user
         .as_ref()
         .and_then(|u| Uuid::parse_str(&u.id).ok())

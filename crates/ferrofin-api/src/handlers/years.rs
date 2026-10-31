@@ -115,7 +115,7 @@ async fn get_years(
     //
     // A `parentId` naming no item, the zero id included, is `GetParentItem`'s
     // `ArgumentException`: a 400.
-    resolve_parent(&state, query.parent_id).await?;
+    resolve_parent(&state, &auth, query.parent_id, user.as_ref()).await?;
     let parent_id = match query.parent_id {
         Some(parent) => parent,
         None if !recursive => state

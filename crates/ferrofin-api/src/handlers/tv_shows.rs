@@ -445,6 +445,9 @@ async fn get_next_up(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     let user_id = user_uuid(&user)?;
+    for scope in [query.parent_id, query.series_id] {
+        crate::handlers::items::require_scope_id_visible(&state, &auth, scope, Some(&user)).await?;
+    }
     let options = build_dto_options(
         query.fields.as_deref(),
         query.enable_images,
@@ -530,6 +533,8 @@ async fn get_upcoming_episodes(
     Query(query): Query<UpcomingParams>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_opt(&state, &auth, query.user_id).await?;
+    crate::handlers::items::require_scope_id_visible(&state, &auth, query.parent_id, user.as_ref())
+        .await?;
     let options = build_dto_options(
         query.fields.as_deref(),
         query.enable_images,
