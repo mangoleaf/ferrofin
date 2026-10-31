@@ -264,7 +264,7 @@ async fn get_universal_audio_stream(
                 .collect()
         })
         .unwrap_or_default();
-    let profile = universal_device_profile(&query, &containers);
+    let profile = std::sync::Arc::new(universal_device_profile(&query, &containers));
     let negotiated = universal_audio_source(
         &state,
         &auth,

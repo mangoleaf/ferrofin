@@ -22,6 +22,13 @@ use crate::state::AppState;
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectionLocalAddr(pub std::net::SocketAddr);
 
+/// The client address [`ip_access_layer`] resolved for a request, which
+/// [`AppState::client_address`] answers with from then on: the policy checks
+/// behind the gate need the same address, and resolving it walks the forwarded
+/// chain.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ResolvedClientAddress(pub(crate) std::net::IpAddr);
+
 /// Rejects a request whose peer the network policy excludes.
 ///
 /// Upstream's shape exactly:
@@ -40,7 +47,7 @@ pub struct ConnectionLocalAddr(pub std::net::SocketAddr);
 /// defaults it.
 pub async fn ip_access_layer(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let peer = request
@@ -53,6 +60,7 @@ pub async fn ip_access_layer(
     // filter the wrong host — and let every real client through. The forwarded
     // chain is consulted only when the peer is a configured `KnownProxy`.
     let ip = state.client_address_for(peer, &crate::state::forwarded_for(request.headers()));
+    request.extensions_mut().insert(ResolvedClientAddress(ip));
     // Absent where the accept loop could not read the connection's local
     // address (or a router built without it): only loopback is exempt then.
     let local = request
@@ -80,7 +88,78 @@ pub async fn ip_access_layer(
 
 #[cfg(test)]
 mod tests {
+    use super::{ResolvedClientAddress, ip_access_layer};
     use crate::state::normalize_ip;
+    use crate::test_support::fake_state;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::extract::{ConnectInfo, State};
+    use axum::http::request::Parts;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use ferrofin_networking::{NetworkConfiguration, NetworkManager};
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::{Arc, RwLock};
+    use tower::ServiceExt as _;
+
+    /// The gate leaves what it resolved for the checks behind it, and they
+    /// get the forwarded client from it.
+    #[tokio::test]
+    async fn the_gate_hands_the_resolved_client_to_what_runs_behind_it() {
+        async fn echo(State(state): State<crate::state::AppState>, parts: Parts) -> String {
+            let resolved = parts
+                .extensions
+                .get::<ResolvedClientAddress>()
+                .expect("resolved by the gate");
+            assert_eq!(resolved.0, state.client_address(&parts));
+            resolved.0.to_string()
+        }
+        let network = NetworkManager::with_defaults(
+            NetworkConfiguration {
+                known_proxies: vec!["10.0.0.0/8".to_owned()],
+                ..NetworkConfiguration::default()
+            },
+            "",
+        );
+        let state = fake_state().with_network(Arc::new(RwLock::new(network)));
+        let router = Router::new()
+            .route("/echo", get(echo))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                ip_access_layer,
+            ))
+            .with_state(state);
+        let mut request = Request::builder()
+            .uri("/echo")
+            .header("x-forwarded-for", "203.0.113.7")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(ConnectInfo(
+            "10.4.0.9:5000".parse::<SocketAddr>().expect("peer"),
+        ));
+        let response = router.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], b"203.0.113.7");
+    }
+
+    /// `client_address` reads what the gate resolved rather than resolving it
+    /// again, and resolves it itself where no gate ran.
+    #[test]
+    fn client_address_answers_with_the_resolved_client() {
+        let state = fake_state();
+        let (mut parts, ()) = Request::new(()).into_parts();
+        assert_eq!(
+            state.client_address(&parts),
+            IpAddr::from([127, 0, 0, 1]),
+            "no gate ran, no peer: loopback"
+        );
+        let client = IpAddr::from([203, 0, 113, 7]);
+        parts.extensions.insert(ResolvedClientAddress(client));
+        assert_eq!(state.client_address(&parts), client);
+    }
 
     #[test]
     fn an_ipv4_mapped_peer_is_compared_as_ipv4() {

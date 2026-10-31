@@ -815,15 +815,32 @@ impl AppState {
     ///
     /// Falls back to loopback when there is no peer at all, exactly as C#
     /// `GetNormalizedRemoteIP` defaults it.
+    ///
+    /// A request that came through the IP gate already carries the answer
+    /// (`ip_access::ResolvedClientAddress`), which saves walking the
+    /// forwarded chain again for each check behind it.
     #[must_use]
     pub fn client_address(&self, parts: &axum::http::request::Parts) -> std::net::IpAddr {
-        let peer = parts
-            .extensions
+        self.client_address_of(&parts.extensions, &parts.headers)
+    }
+
+    /// [`Self::client_address`] for a caller that holds a request's extensions
+    /// and headers rather than its `Parts`.
+    #[must_use]
+    pub(crate) fn client_address_of(
+        &self,
+        extensions: &axum::http::Extensions,
+        headers: &axum::http::HeaderMap,
+    ) -> std::net::IpAddr {
+        if let Some(resolved) = extensions.get::<crate::ip_access::ResolvedClientAddress>() {
+            return resolved.0;
+        }
+        let peer = extensions
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), |ci| {
                 normalize_ip(ci.0.ip())
             });
-        self.client_address_for(peer, &forwarded_for(&parts.headers))
+        self.client_address_for(peer, &forwarded_for(headers))
     }
 
     /// [`walk_forwarded_headers`](crate::forwarded_headers::walk_forwarded_headers)

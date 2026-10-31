@@ -22,7 +22,7 @@
 //! Two pieces mirror the C# `MediaBrowser.Controller.Net` layer:
 //!
 //! - [`auth_context_layer`] — a middleware that builds a transport-agnostic
-//!   [`RequestContext`] from the request's headers + query, asks
+//!   [`RequestContext`] from the request's credential headers + query, asks
 //!   [`AuthorizationContext`] to parse it into an [`AuthorizationInfo`], and
 //!   stashes that as a request extension. It never rejects: an anonymous request
 //!   still gets a (default) [`AuthorizationInfo`], matching the C# behaviour
@@ -33,7 +33,7 @@
 
 use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, Request};
+use axum::http::{HeaderMap, HeaderName, Request, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use ferrofin_traits::net::RequestContext;
@@ -42,15 +42,61 @@ use ferrofin_traits::options::AuthorizationInfo;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-/// Builds a [`RequestContext`] from an axum request's headers and query string.
+/// The headers [`AuthorizationContext`] reads: the two authorization headers
+/// and the two bare-token ones (`GetAuthorizationDictionary` and
+/// `GetAuthorizationInfoFromDictionary` in `AuthorizationContext.cs`).
+///
+/// [`auth_request_context`] copies no others, so a header the parser starts
+/// reading has to be added here too.
+static CREDENTIAL_HEADERS: [HeaderName; 4] = [
+    header::AUTHORIZATION,
+    HeaderName::from_static("x-emby-authorization"),
+    HeaderName::from_static("x-emby-token"),
+    HeaderName::from_static("x-mediabrowser-token"),
+];
+
+/// Builds the [`RequestContext`] authentication runs on: the
+/// [`CREDENTIAL_HEADERS`], the raw query string for the `ApiKey`/`api_key`
+/// parameter, and the caller's address.
+///
+/// This runs on every request, images and segments included, so it copies only
+/// what the parser reads. A repeated header keeps its order and a non-UTF-8
+/// value is dropped, as in [`request_context`].
+pub(crate) fn auth_request_context(
+    headers: &HeaderMap,
+    query: Option<&str>,
+    remote: Option<String>,
+) -> RequestContext {
+    // Not sized up front: an anonymous request, as an image fetch usually is,
+    // then allocates nothing here.
+    let mut copied = Vec::new();
+    for name in &CREDENTIAL_HEADERS {
+        copied.extend(headers.get_all(name).iter().filter_map(|value| {
+            value
+                .to_str()
+                .ok()
+                .map(|v| (name.as_str().to_owned(), v.to_owned()))
+        }));
+    }
+    RequestContext {
+        headers: copied,
+        query_string: query.map(ToOwned::to_owned),
+        remote_endpoint: remote,
+        scheme: None,
+    }
+}
+
+/// Builds a [`RequestContext`] from an axum request's headers and query string,
+/// for what reads more of the request than authentication does: the `Host` a
+/// system address is built from.
 ///
 /// Copies every header as a `(name, value)` pair (dropping non-UTF-8 values,
 /// which Jellyfin's ASCII header grammar never uses) and carries the raw query
-/// string so the authorization logic can read the `api_key`/`ApiKey` parameter.
+/// string.
 ///
-/// The scheme is left unresolved (`None`, read as `http`): authorization does
-/// not need it. A context that builds addresses comes from
-/// `handlers::system::context_from_parts`, which resolves it.
+/// The scheme is left unresolved (`None`, read as `http`). A context that
+/// builds addresses comes from `handlers::system::context_from_parts`, which
+/// resolves it.
 pub(crate) fn request_context(
     headers: &HeaderMap,
     query: Option<&str>,
@@ -97,7 +143,7 @@ pub async fn auth_context_layer(
     // session reports an empty address and every activity-log `ShortOverview`
     // built from it is null.
     let remote = state.client_address(&parts).to_string();
-    let ctx = request_context(&parts.headers, parts.uri.query(), Some(remote));
+    let ctx = auth_request_context(&parts.headers, parts.uri.query(), Some(remote));
     let info = state
         .auth_context()
         .get_authorization_info(&ctx)
@@ -119,7 +165,7 @@ async fn authenticated_info(
     {
         return Ok(info.clone());
     }
-    let ctx = request_context(
+    let ctx = auth_request_context(
         &parts.headers,
         parts.uri.query(),
         Some(state.client_address(parts).to_string()),
@@ -606,7 +652,6 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let ctx = request_context(&parts.headers, parts.uri.query(), None);
         // Wizard incomplete → allow anonymous (still surface a token if one is
         // present, but never reject). Treat a config read error as "not complete"
         // so a fresh install can never lock itself out of its own setup wizard.
@@ -616,6 +661,7 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrAuth {
             .await
             .is_ok_and(|c| c.is_startup_wizard_completed);
         if !wizard_complete {
+            let ctx = auth_request_context(&parts.headers, parts.uri.query(), None);
             let info = state.auth_service().authenticate(&ctx).await.ok();
             let info = match info {
                 Some(info) if info.is_api_key || !info.user_id().is_nil() => {
@@ -656,7 +702,6 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrElevated {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let ctx = request_context(&parts.headers, parts.uri.query(), None);
         // A config read error reads as "not complete", exactly as in
         // `FirstTimeSetupOrAuth`: a fresh install must never be able to lock
         // itself out of its own setup wizard.
@@ -666,6 +711,7 @@ impl FromRequestParts<AppState> for FirstTimeSetupOrElevated {
             .await
             .is_ok_and(|c| c.is_startup_wizard_completed);
         if !wizard_complete {
+            let ctx = auth_request_context(&parts.headers, parts.uri.query(), None);
             let info = state.auth_service().authenticate(&ctx).await.ok();
             let info = match info {
                 Some(info) if info.is_api_key || !info.user_id().is_nil() => {

@@ -1821,6 +1821,73 @@ async fn items_adds_the_tags_field_for_a_user_with_allowed_tags() {
     assert_eq!(json["Items"][0]["Tags"], serde_json::json!([]));
 }
 
+/// The caller's policy rides on the request, so a browse reads its whitelist
+/// from there rather than rebuilding the caller's user DTO. [`OkUsers`] reports
+/// no whitelist, so `Tags` here can only have come from the request's policy.
+#[tokio::test]
+async fn items_reads_the_callers_tag_whitelist_from_the_request_policy() {
+    struct WhitelistedAuth;
+    impl WhitelistedAuth {
+        fn info() -> AuthorizationInfo {
+            AuthorizationInfo {
+                user: Some(user_entity(USER_ID, "alice")),
+                user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+                    allowed_tags: vec!["kids".to_owned()],
+                    ..ferrofin_model::users::UserPolicy::default()
+                })),
+                is_authenticated: true,
+                ..AuthorizationInfo::default()
+            }
+        }
+    }
+    #[async_trait]
+    impl AuthService for WhitelistedAuth {
+        async fn authenticate(
+            &self,
+            _request: &RequestContext,
+        ) -> Result<AuthorizationInfo, ServiceError> {
+            Ok(Self::info())
+        }
+    }
+    #[async_trait]
+    impl AuthorizationContext for WhitelistedAuth {
+        async fn get_authorization_info(
+            &self,
+            _request: &RequestContext,
+        ) -> Result<AuthorizationInfo, ServiceError> {
+            Ok(Self::info())
+        }
+    }
+
+    let library = OkLibrary {
+        item_id: Uuid::from_u128(0xABCD),
+        adopted_tree: false,
+        last_query: Arc::default(),
+        deleted: Arc::default(),
+        gate: None,
+        ..Default::default()
+    };
+    let state = ok_state_full(
+        library,
+        Arc::new(OkUsers),
+        Arc::new(OkDto),
+        (Arc::new(WhitelistedAuth), Arc::new(WhitelistedAuth)),
+    );
+    let response = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/Items?recursive=true")
+                .header("X-Emby-Token", "valid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = json_body(response).await;
+    assert_eq!(json["Items"][0]["Tags"], serde_json::json!([]), "{json}");
+}
+
 #[tokio::test]
 async fn item_by_id_returns_base_item_dto() {
     let item_id = Uuid::from_u128(0xABCD);

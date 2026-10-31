@@ -143,26 +143,52 @@ pub struct NextUpEpisodeUserData {
     pub last_played_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// An episode a next-up batch names: what `DetermineNextEpisode` reads of it,
+/// not its row.
+///
+/// C# hands back whole `BaseItem`s, but the manager only compares these
+/// episodes and dates them: a series' last watched episode is never shown, and
+/// its pick is shown only when it lands on the requested page. So the batch
+/// carries this much, and the manager reads the full rows of the page's picks
+/// afterwards with [`NextUpService::get_next_up_episode_rows`].
+///
+/// Never a special: the pools leave season 0 out, so the `Airs*` numbers
+/// `AiredEpisodeOrder` reads off a special's `Data` blob do not apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NextUpEpisode {
+    /// The stored id, as [`BaseItemEntity::id`].
+    pub id: String,
+    /// `ParentIndexNumber`: the season number.
+    pub parent_index_number: Option<i64>,
+    /// `IndexNumber`: the episode number.
+    pub index_number: Option<i64>,
+    /// `PremiereDate`: breaks a tie between two episodes in aired order.
+    pub premiere_date: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Result of a batched next-up query for a single series.
 ///
 /// Port of `MediaBrowser.Controller.Persistence.NextUpEpisodeBatchResult`. Each
-/// `BaseItem?` field becomes an `Option<BaseItemEntity>` (repository rows), and
-/// the specials list becomes `Vec<BaseItemEntity>`.
+/// `BaseItem?` field becomes an `Option<NextUpEpisode>` (see [`NextUpEpisode`]
+/// for why it is not the row), and the specials list becomes
+/// `Vec<BaseItemEntity>`: `DetermineNextEpisode` needs a special's `Data` blob,
+/// so specials arrive as full rows.
 #[derive(Debug, Clone, Default)]
 pub struct NextUpEpisodeBatchResult {
     /// The highest played season/episode.
-    pub last_watched: Option<BaseItemEntity>,
+    pub last_watched: Option<NextUpEpisode>,
     /// The next unwatched episode after the last watched position.
-    pub next_up: Option<BaseItemEntity>,
+    pub next_up: Option<NextUpEpisode>,
     /// Specials that may air between episodes (only when specials were requested).
     pub specials: Vec<BaseItemEntity>,
     /// The most recently played episode, for rewatching mode.
-    pub last_watched_for_rewatching: Option<BaseItemEntity>,
+    pub last_watched_for_rewatching: Option<NextUpEpisode>,
     /// The next played episode, for rewatching mode.
-    pub next_played_for_rewatching: Option<BaseItemEntity>,
-    /// The user-data facts for every row this result carries, keyed by the
-    /// row's stored id ([`BaseItemEntity::id`]). Not a C# field: it stands in
-    /// for the `IUserDataManager` reads the C# manager makes per episode.
+    pub next_played_for_rewatching: Option<NextUpEpisode>,
+    /// The user-data facts for every episode this result names, keyed by its
+    /// stored id ([`NextUpEpisode::id`], [`BaseItemEntity::id`]). Not a C#
+    /// field: it stands in for the `IUserDataManager` reads the C# manager
+    /// makes per episode.
     pub user_data: HashMap<String, NextUpEpisodeUserData>,
 }
 
@@ -1698,6 +1724,52 @@ pub trait ItemPersistenceService: Send + Sync {
         Ok(0)
     }
 
+    /// Clears `item_id`'s `DateLastRefreshed`, so the next scan takes it as
+    /// never refreshed: its refresh failed after the row was saved, and the
+    /// saved row no longer shows what is left to do. Nothing else on the row
+    /// moves. Returns whether there is such a row.
+    ///
+    /// The default clears nothing and answers `false` (for stub/fake
+    /// services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn clear_date_last_refreshed(&self, item_id: Uuid) -> Result<bool, ServiceError> {
+        let _ = item_id;
+        Ok(false)
+    }
+
+    /// `item_id`'s stored `PresentationUniqueKey`, read as that one column so
+    /// a row the decoder rejects still answers. `None` for no row or no key.
+    ///
+    /// The default answers `None` (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn presentation_unique_key(&self, item_id: Uuid) -> Result<Option<String>, ServiceError> {
+        let _ = item_id;
+        Ok(None)
+    }
+
+    /// `item_id`'s stored `InheritedParentalRatingValue` and
+    /// `InheritedParentalRatingSubValue`, read as those two columns so a row
+    /// the decoder rejects still answers. `None` for no row or no score.
+    ///
+    /// The default answers `None` (for stub/fake services).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] on a storage failure.
+    async fn stored_rating_score(
+        &self,
+        item_id: Uuid,
+    ) -> Result<Option<(i64, Option<i64>)>, ServiceError> {
+        let _ = item_id;
+        Ok(None)
+    }
+
     /// The locked metadata fields (`BaseItemMetadataFields`, upstream's
     /// `BaseItem.LockedFields`) of each of `item_ids`, in field order. An
     /// item with none is absent from the map.
@@ -2718,6 +2790,14 @@ pub trait NextUpService: Send + Sync {
         include_specials: bool,
         include_watched_for_rewatching: bool,
     ) -> Result<HashMap<String, NextUpEpisodeBatchResult>, ServiceError>;
+
+    /// Reads the full rows of the given episodes, keyed by id: the picks of
+    /// the requested page, once the batch has decided and ordered them. An id
+    /// with no row has no entry.
+    async fn get_next_up_episode_rows(
+        &self,
+        ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, BaseItemEntity>, ServiceError>;
 }
 
 fn _assert_object_safe_next_up_service(_: &dyn NextUpService) {}
