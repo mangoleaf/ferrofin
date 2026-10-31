@@ -1124,6 +1124,32 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              set on a container through the UserData API survives it there. Fix path: gl-1064.",
         ],
     },
+    VerifiedSubsystem {
+        key: "access-filtering",
+        upstream_file: "MediaBrowser.Controller/Entities/BaseItem.cs",
+        upstream_method: "IsVisibleStandaloneInternal",
+        ferrofin: "The library half of access filtering: which libraries a user may open, and \
+                   what a request naming an item may reach; the rating and tag rules are \
+                   compared per operation. ferrofin-core item_visibility.rs visible, \
+                   standalone, folder_allowed (BaseItem.IsVisibleStandalone, Folder.IsVisible, \
+                   CollectionFolder.IsVisible, BoxSet.IsVisibleStandalone, \
+                   Playlist.IsVisibleStandalone) and user_view_manager.rs \
+                   get_user_root_children (Folder.GetChildren, \
+                   UserRootFolder.GetEligibleChildrenForRecursiveChildren); handlers/items.rs \
+                   require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
+                   routes that take a scope (ItemsController.GetItems, \
+                   LibraryManager.AddUserToQuery)",
+        date: "2026-10-31",
+        divergences: &[
+            "A request naming an item as its scope (parentId, ids, seriesId, appearsInItemId) \
+             stops at the libraries the user may open, on every route that takes one: a \
+             library or view must pass IsVisible and anything else IsVisibleStandalone, or \
+             the request answers 401, and ids are reduced to those that pass \
+             IsVisibleStandalone. Upstream applies IsVisible alone, on GET /Items and GET \
+             /Trailers. A BoxSet or Playlist browse that re-roots to the user root skips the \
+             check, as upstream. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091).",
+        ],
+    },
 ];
 
 /// One contract operation whose Ferrofin implementation was compared against
@@ -1205,7 +1231,7 @@ pub const VERIFIED: &[Verified] = &[
          403 (another user's id without the administrator role) and 404 (a userId naming no \
          account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
-        refs: &["images"],
+        refs: &["images", "access-filtering"],
     },
     Verified {
         method: "get",
@@ -1218,7 +1244,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts, item_counts_by_clean_name)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
-        refs: &["images"],
+        refs: &["images", "access-filtering"],
     },
     Verified {
         method: "get",
@@ -1230,7 +1256,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_album_artists (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_ARTISTS,
-        refs: &["images"],
+        refs: &["images", "access-filtering"],
     },
     Verified {
         method: "get",
@@ -1243,7 +1269,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &["images"],
+        refs: &["images", "access-filtering"],
     },
     Verified {
         method: "get",
@@ -1255,7 +1281,7 @@ pub const VERIFIED: &[Verified] = &[
                item_repository.rs get_music_genres (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &["images"],
+        refs: &["images", "access-filtering"],
     },
     Verified {
         method: "get",
@@ -1267,7 +1293,7 @@ pub const VERIFIED: &[Verified] = &[
                (item_values_with_counts)",
         date: "2026-10-25",
         divergences: BY_NAME_DIVERGENCES_GENRES_STUDIOS,
-        refs: &["images"],
+        refs: &["images", "access-filtering"],
     },
     Verified {
         method: "get",
@@ -1280,7 +1306,7 @@ pub const VERIFIED: &[Verified] = &[
                push_order_expression DatePlayed)",
         date: "2026-10-30",
         divergences: RESUME_DIVERGENCES,
-        refs: &["images"],
+        refs: &["images", "access-filtering"],
     },
     Verified {
         method: "get",
@@ -2103,6 +2129,51 @@ pub const VERIFIED: &[Verified] = &[
          on GET /FallbackFont/Fonts.",
             "The 400 (no name) and the 404 and 500 of a font that cannot be opened have \
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Items/Latest",
+        upstream_file: "Jellyfin.Api/Controllers/UserLibraryController.cs",
+        upstream_method: "GetLatestMedia",
+        ferrofin: "handlers/user_library.rs get_latest_media → ferrofin-core \
+               user_view_manager.rs get_latest_items, items_for_latest_items, latest_parents \
+               (UserViewManager.GetItemsForLatestItems)",
+        date: "2026-10-31",
+        divergences: &[
+            "A grouped request whose parents carry no collection type (a mixed library) takes \
+         the plain query: v12's CollectionType.unknown arm of GetLatestItemList is not \
+         ported. Fix path: gl-383.",
+            "The plain query over-fetches 10.11.8's limit * 5 where v12 fetches limit * 2, so \
+         a request answered by it can reach containers upstream's cut leaves out. Fix path: \
+         gl-303.",
+            "A UserView parent reports no collection type, so a grouped movies or TV view is \
+         neither narrowed to Movie or Episode nor short-circuited, where upstream reads \
+         UserView.CollectionType. Fix path: gl-1108.",
+            "The playlists folder sorts among the libraries, where upstream appends it after \
+         them, so it can be an unscoped grouped request's first typed parent, which then \
+         takes the plain query. Fix path: gl-1110.",
+            "A Channel parent answers empty: upstream's channel manager reads plugin channels, \
+         and Ferrofin has none (native .NET plugin loading is out of scope).",
+            "The 400 (an API key with no userId, or a value the query binder cannot convert), \
+         403 (another user's id without the administrator role) and 404 (a userId naming no \
+         account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &["images", "access-filtering"],
+    },
+    Verified {
+        method: "get",
+        path: "/UserViews/GroupingOptions",
+        upstream_file: "Jellyfin.Api/Controllers/UserViewsController.cs",
+        upstream_method: "GetGroupingOptions",
+        ferrofin: "handlers/user_views.rs get_grouping_options → ferrofin-core \
+               user_view_manager.rs get_user_root_children",
+        date: "2026-10-31",
+        divergences: &[
+            "The 400 (an API key with no userId, or a value the query binder cannot convert), \
+         403 (another user's id without the administrator role) and 404 (a userId naming no \
+         account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },

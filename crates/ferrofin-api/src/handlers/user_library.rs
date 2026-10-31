@@ -605,8 +605,9 @@ struct LatestQuery {
 ///
 /// Port of `UserLibraryController.GetLatestMedia`. The
 /// [`UserViewManager`](ferrofin_traits::library::UserViewManager) returns the
-/// C# `(container, items)` tuples — one query across the user's views (or the
-/// `parentId` folder), grouped by index container up to `limit` groups — and
+/// C# `(container, items)` tuples — one query across the root folders the user
+/// may open (or the `parentId` folder), grouped by index container up to
+/// `limit` groups — and
 /// this handler applies the controller's projection: a container with more
 /// than one new item, or a `MusicAlbum` with any, is emitted in place of its
 /// items with `ChildCount` = the number of new items; everything else is the
@@ -625,6 +626,8 @@ async fn get_latest_media(
     use crate::handlers::query_parse::parse_csv_enums_lenient;
 
     let user = resolve_user(&state, &auth, query.user_id).await?;
+    crate::handlers::items::require_scope_id_visible(&state, &auth, query.parent_id, Some(&user))
+        .await?;
 
     // C#: an unset `isPlayed` defaults to `false` when the user hides played
     // items from the "latest" rows.

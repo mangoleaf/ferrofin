@@ -519,10 +519,10 @@ impl UserViewManager for StubUserViews {
     }
     async fn get_user_views_with_hidden(
         &self,
-        user_id: Uuid,
+        _user_id: Uuid,
         include_hidden: bool,
     ) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        let mut views = self.get_media_folders(user_id).await?;
+        let mut views = self.get_media_folders().await?;
         if !include_hidden {
             views.retain(|view| {
                 !self
@@ -532,7 +532,13 @@ impl UserViewManager for StubUserViews {
         }
         Ok(views)
     }
-    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_user_root_children(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        self.get_media_folders().await
+    }
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
         Ok(vec![
             item_entity(SHOWS_ID, "Shows", BaseItemKind::CollectionFolder),
             item_entity(MOVIES_ID, "Movies", BaseItemKind::CollectionFolder),
@@ -1389,7 +1395,13 @@ impl UserViewManager for LatestViews {
     async fn get_user_views(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("latest fake")
     }
-    async fn get_media_folders(&self, _user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        unimplemented!("latest fake")
+    }
+    async fn get_user_root_children(
+        &self,
+        _user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
         unimplemented!("latest fake")
     }
     async fn get_latest_items(

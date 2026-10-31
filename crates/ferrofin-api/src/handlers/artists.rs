@@ -43,7 +43,7 @@ async fn get_artists(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
-    query.parent(&state).await?;
+    query.parent(&state, &auth, user.as_ref()).await?;
     let internal = query.artists_query(&state, user.clone()).await?;
     let result = state.library.get_artists(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
@@ -75,7 +75,7 @@ async fn get_album_artists(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     // `GetParentItem`: an id naming no item is a 400.
-    query.parent(&state).await?;
+    query.parent(&state, &auth, user.as_ref()).await?;
     let internal = query.artists_query(&state, user.clone()).await?;
     let result = state.library.get_album_artists(&internal).await?;
     let options = query.dto_options(query.enable_user_data);
