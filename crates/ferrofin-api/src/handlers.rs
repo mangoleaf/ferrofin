@@ -933,7 +933,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// The subsystems a [`VERIFIED_SUBSYSTEMS`] row may cover, by key. Every
 /// operation crosses several of them, so one row states their divergences once
 /// and operation rows name it in [`Verified::refs`]. `websocket-streams` is
-/// the `/socket` dashboard streams, which no contract operation describes.
+/// the `/socket` dashboard streams, which no contract operation describes;
+/// `scan-failure-isolation` is what the library scan does about a row or a
+/// write that fails, which no operation's response shows.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -942,6 +944,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "images",
     "paging-sort",
     "websocket-streams",
+    "scan-failure-isolation",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -969,6 +972,55 @@ pub struct VerifiedSubsystem {
 /// [`VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN`] names), under the rules of
 /// [`VERIFIED`]. Subsystem rows never count towards the operation parity line.
 pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
+    VerifiedSubsystem {
+        key: "scan-failure-isolation",
+        upstream_file: "MediaBrowser.Controller/Entities/TV/Episode.cs",
+        upstream_method: "FindSeriesName",
+        ferrofin: "What a child's refresh in the library scan does when its parent row cannot \
+                   be read, and what the walk does when an item fails. ferrofin-core \
+                   library_scan.rs run_scan (the item's error is counted in \
+                   ScanOutcome::skipped, the walk goes on, a saved row loses its \
+                   DateLastRefreshed, a new item with no row takes its descendants along, a \
+                   refresh of an item or folder ends with that item's own failure) \
+                   ← parent_row (a failed read counts as \
+                   no row, once per pass) ← sync_series_name (FindSeriesName), \
+                   sync_season_name, remember_series_folder; apply_parental_rating_score and \
+                   inherit_stored_rating; keep_stored_series_key. Compared with \
+                   MediaBrowser.Controller/LibraryTaskScheduler/\
+                   LimitedConcurrencyLibraryScheduler.cs (ProcessItem), \
+                   MediaBrowser.Controller/Entities/Folder.cs (RunTasks, \
+                   RefreshChildMetadata), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (RefreshMetadata), \
+                   MediaBrowser.Providers/Manager/ProviderManager.cs (RefreshItem), \
+                   MediaBrowser.Providers/Manager/MetadataService.cs (RefreshMetadata), \
+                   MediaBrowser.Controller/Entities/TV/Season.cs (FindSeriesName), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (GetParentalRatingScore) and \
+                   MediaBrowser.Providers/TV/EpisodeMetadataService.cs (BeforeSaveInternal)",
+        date: "2026-10-30",
+        divergences: &[
+            "An item whose parent chain cannot be read is scored from its own rating and \
+             country, an ancestor's custom rating not counting, else takes the score stored on \
+             its parent, and the children of an undecodable series keep the series key stored \
+             on its row. Upstream has no such row to fall back from: the read would throw into \
+             the per-child catch and the item would not refresh.",
+            "A stored item that fails after its row was saved has its DateLastRefreshed \
+             cleared, so the next scan retries it as a first refresh where upstream, which \
+             saves the row after the providers and the probe, retries it because the row kept \
+             its old DateModified; the rows a save hangs off it by foreign key are why \
+             Ferrofin saves first, and the retry is the same but runs every provider.",
+            "A new item that fails before its first save has no row until the next scan, \
+             where upstream's CreateItems and first-refresh save keep one, so a new folder \
+             that fails takes its descendants with it for this scan.",
+            "A stored folder that fails leaves its children to refresh, where \
+             RefreshChildMetadata does not recurse into a folder that threw, because the \
+             flat walk has already planned them and a persistent failure on a season must \
+             not hide its new episodes for good.",
+            "An episode whose season row is absent or unreadable keeps the season name it has, \
+             the planner's localized one, where FindSeasonName answers a literal \"Season N\" or \
+             \"Season Unknown\". Fix path: port that branch to sync_season_name for a row that \
+             is truly absent, leaving a row that fails to read out of it.",
+        ],
+    },
     VerifiedSubsystem {
         key: "websocket-streams",
         upstream_file: "MediaBrowser.Controller/Net/BasePeriodicWebSocketListener.cs",
@@ -1050,6 +1102,33 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              and Backdrop tags) is not ported. Fix path: gl-853.",
         ],
     },
+    VerifiedSubsystem {
+        key: "user-data",
+        upstream_file: "Emby.Server.Implementations/Library/UserDataManager.cs",
+        upstream_method: "SaveUserData",
+        ferrofin: "The write path only. ferrofin-core user_data_manager.rs mutate_row \
+                   (SaveUserData with its retired-key update, GetUserData, ResolveUserDataRow), \
+                   save_user_data_with_reason (the UpdateUserItemDataDto SaveUserData), \
+                   save_play_state and apply_play_report (UpdatePlayState), \
+                   reset_playback_stream_selections (ResetPlaybackStreamSelections), \
+                   record_playback_start, set_likes, mark_item_played, mark_item_unplayed, \
+                   clear_own_play_state and propagate_played_state. Compared with \
+                   Emby.Server.Implementations/Session/SessionManager.cs (OnPlaybackStart, \
+                   OnPlaybackProgress, UpdatePlaybackSettings, OnPlaybackStopped), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (MarkPlayed, MarkUnplayed), \
+                   MediaBrowser.Controller/Entities/Video.cs (PropagatePlayedState) and \
+                   Jellyfin.Api/Controllers/UserLibraryController.cs (MarkFavorite, \
+                   UpdateUserItemRatingInternal)",
+        date: "2026-10-30",
+        divergences: &[
+            "Each change reads the row inside its write transaction, so two overlapping saves of \
+             one item both land; upstream's GetUserData hands each caller a copy and SaveUserData \
+             writes every column back, so there the later save undoes the earlier one.",
+            "Marking a container unplayed also clears the play state on the container's own rows, \
+             which earlier Ferrofin builds wrote; upstream's MarkUnplayed leaves them, so a Played \
+             set on a container through the UserData API survives it there. Fix path: gl-1064.",
+        ],
+    },
 ];
 
 /// One contract operation whose Ferrofin implementation was compared against
@@ -1127,6 +1206,9 @@ pub const VERIFIED: &[Verified] = &[
          statement ignores, so the answer is always empty; Ferrofin scopes by TopParentId = \
          that item (a physical library folder answers, anything else is empty as upstream). \
          Jellyfin bug not ported.",
+            "The 400 (an API key with no userId, or a value the query binder cannot convert), \
+         403 (another user's id without the administrator role) and 404 (a userId naming no \
+         account) bodies are Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &["images"],
     },
@@ -1197,12 +1279,29 @@ pub const VERIFIED: &[Verified] = &[
         path: "/UserItems/Resume",
         upstream_file: "Jellyfin.Api/Controllers/ItemsController.cs",
         upstream_method: "GetResumeItems",
-        ferrofin: "handlers/items.rs get_resume_items → ferrofin-core item_repository.rs \
-               get_items → translate_query.rs (push_resumable_predicate, \
+        ferrofin: "handlers/items.rs get_resume_items (active_session_item_ids → \
+               ferrofin-core session_manager.rs get_session_summaries) → ferrofin-core \
+               item_repository.rs get_items → translate_query.rs (push_resumable_predicate, \
                push_order_expression DatePlayed)",
-        date: "2026-10-29",
+        date: "2026-10-30",
         divergences: RESUME_DIVERGENCES,
         refs: &["images"],
+    },
+    Verified {
+        method: "get",
+        path: "/Sessions",
+        upstream_file: "Jellyfin.Api/Controllers/SessionController.cs",
+        upstream_method: "GetSessions",
+        ferrofin: "handlers/session.rs get_sessions (items.rs effective_user_id) → \
+               ferrofin-core session_manager.rs get_sessions (shared_device_control_for, \
+               retain_accessible_session_devices, to_dto → session_info_to_dto) \
+               (SessionManager.GetSessions, ToSessionInfoDto); the NowPlayingItem it copies \
+               is built by on_playback_start and on_playback_progress \
+               (kept_now_playing_item, now_playing_item → get_item_info; UpdateNowPlayingItem, \
+               GetItemInfo) and cleared by on_playback_stopped (RemoveNowPlayingItem)",
+        date: "2026-10-30",
+        divergences: SESSIONS_DIVERGENCES,
+        refs: &[],
     },
     Verified {
         method: "post",
@@ -1997,6 +2096,32 @@ const NO_USER_USER_DATA_FILTER_DIVERGENCE: &str = "A user-data filter (`isFavori
      IsPlayed, IsUnplayed) with no user (an API key without userId) is ignored and the list is \
      unfiltered (200); upstream's TranslateQuery dereferences the null User for the user-data \
      subqueries and fails (500). Jellyfin bug not ported.";
+
+/// The accepted divergences of `GET /Sessions`.
+const SESSIONS_DIVERGENCES: &[&str] = &[
+    "PlayState carries only PositionTicks, IsPaused and a CanSeek derived from the \
+     now-playing item, NowPlayingQueue is always empty, TranscodingInfo is never cleared, \
+     and PlaylistItemId, NowViewingItem and UserPrimaryImageTag are never filled, where \
+     upstream's UpdateNowPlayingItem, RemoveNowPlayingItem and LogSessionActivity keep them. \
+     Fix path: gl-119.",
+    "LastPlaybackCheckIn starts at the session's creation, where upstream's is \
+     0001-01-01 until a playback report; NowPlayingQueueFullItems is sent as [], a member \
+     v12.4's SessionInfoDto no longer has. Fix path: gl-837.",
+    "A playback report's own Item is ignored and the NowPlayingItem is always built from the \
+     library item; upstream shows a reported Item as sent. Fix path: gl-1062.",
+    "A NowPlayingItem whose media source lookup fails is shown without its streams, and one \
+     whose build fails is not shown, while the report itself succeeds and saves the user's \
+     progress; the next report naming the item builds it again. Upstream fails the report, \
+     which keeps the session's previous NowPlayingItem.",
+    "A non-administrator's response carries the hardware accelerator blanked, and only that \
+     response; upstream blanks it on the stored session's TranscodingInfo, so every later \
+     reader, an administrator included, sees it blanked until the next transcoding report \
+     replaces it (the websocket-streams row records the Sessions stream's side). Jellyfin \
+     bug not ported.",
+    "The 403 (controllableByUserId naming another user without the administrator role) and \
+     400 (a value the query binder cannot convert) bodies are Ferrofin's error shape, not \
+     upstream's. Fix path: gl-666.",
+];
 
 /// What `/UserItems/Resume` — and its legacy twin `/Users/{userId}/Items/Resume`,
 /// the same handler with the user from the route, which is hidden from the

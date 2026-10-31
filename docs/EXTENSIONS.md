@@ -86,7 +86,7 @@ that muxer), falling back to `fpcalc`; without either, the analyzers that need n
 
 Beside the ports, one extension is Ferrofin's own: **Ferrofin**
 (`crates/ferrofin-extensions/src/ferrofin_settings.rs`). It ports no plugin and has no tasks,
-hooks or providers; it gives the server's own settings (`GET /Ferrofin/Settings`, see
+hooks or providers; it gives the server's own settings (`GET` and `POST /Ferrofin/Settings`, see
 [`CONFIG.md`](CONFIG.md#seeing-what-is-set)) a plugin identity and an enabled flag, so the
 dashboard's Disable toggle turns them off. Its version is the server's release.
 `FERROFIN_DISABLE_EXTENSIONS` leaves it registered: it has nothing to fire inside a benchmark.

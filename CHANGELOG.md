@@ -11,6 +11,12 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
 ## [Unreleased]
 
 ### Features
+- `POST /Ferrofin/Settings` (administrators only) saves changes to `config.toml`: each value is
+  checked by the rules the server applies at startup, the file keeps its comments, its layout and
+  every key the save does not name, and the server reports a pending restart. A setting a flag or
+  an environment variable sets, a read-only setting and an invalid value are refused with the
+  reason (`400`), a file or directory that cannot be written answers `409` naming the path, and
+  either way nothing is written (see [docs/CONFIG.md](docs/CONFIG.md#saving-from-the-web))
 - `GET /Ferrofin/Settings` (administrators only) reports every Ferrofin setting (each
   `config.toml` key and the OpenTelemetry variables) with the value in use, its default and
   where it comes from (flag, environment variable, `config.toml` or default), a value
@@ -60,10 +66,18 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   on a retry instead of being replaced
 - Take the copies made before migrating or adopting with `VACUUM INTO` when another process
   is reading or writing the database, instead of a file copy that missed what was still in
-  the write-ahead log
+  the write-ahead log. A file copy that another process wrote through while it ran is taken
+  again the same way: its checkpoint could leave the copy corrupt with nothing to report it
 - On a database adopted from Jellyfin 10.11, remove once the items whose file or library is
   gone, as Jellyfin 12's `MigrateLinkedChildren` does, with its guards for unmounted media
   folders; play state moves to the placeholder item
+
+### Documentation
+- The Helm chart no longer calls a rolling update's overlap "safe": the old version keeps
+  writing through the new pod's migrations and one-shot repairs. It no longer endorses RWX
+  across nodes either, because SQLite's write-ahead log cannot be shared between hosts. The chart
+  README, `docs/UPGRADING.md` (stop the old pod first for heavy migrations) and `CONTRIBUTING.md`
+  (what a migration or repair must assume) say what happens and how to opt out
 
 ### Tooling
 - A release's A/B gate compares against the latest release of the minor line before it (v1.4.1
@@ -617,6 +631,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Jellyfin answers `500`
 
 ### Performance
+- `/Shows/NextUp` no longer reads every series' last watched and next episodes in full and
+  copies each pick: the picks are decided, ordered and counted from the episode projection,
+  which now also carries the premiere date, and only the regular episodes on the requested page
+  are read in full. While specials are displayed within seasons, every special of the requested
+  series is still read in full, since the merge needs its `Data`. Items, order, paging and
+  `TotalRecordCount` are unchanged. A regular episode's row that cannot be decoded outside the
+  page no longer fails the request; a corrupt `PremiereDate` on any episode of a requested
+  series now does, as a corrupt play date already did
 - A JPEG's blur hash and its resized images decode at a reduced scale (1/8, 1/4 or 1/2 of
   each side, by DCT scaling, as Jellyfin's blur hash decodes through Skia) instead of at full
   size. A 24 MP baseline photo's blur hash peaks at about 2 MB of memory instead of 80 MB (a
@@ -688,8 +710,27 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   read each item on its own (four to six statements per item and per parent). Only a
   folder's played counts are still read per folder. Marking a five-episode series played
   now runs 14 statements for the push instead of 44; the message is unchanged
+- A playing session's `NowPlayingItem` is built once, on the start or progress report that
+  first names the item, and kept until another item plays or playback stops, as Jellyfin's
+  `UpdateNowPlayingItem` does. `GET /Sessions` and the WebSocket `Sessions` stream used to
+  rebuild it for every playing session on every read: an item lookup, a media-source lookup
+  and an item build each. So, as in Jellyfin, the session keeps showing the item as it was
+  built until another item plays or playback restarts: a metadata edit made while it plays,
+  a progress report naming another version of the same item, and the item's deletion do not
+  change it. `GET /UserItems/Resume?excludeActiveSessions=true`, the library-change notices
+  and the metrics sampler now read each session's user and shown item id only, without
+  copying any session or item
 
 ### Security
+- A connection can no longer be held open for free. As on Jellyfin's web server (Kestrel), a
+  connection that has no request under way is closed after 130 s, and a request whose headers
+  have not all arrived 30 s after its first byte is answered `408` and closed; before, either
+  could stay open forever, and enough of them used up the server's file descriptors. Nothing
+  changes for a running request: a download, an upload and a slow response keep their
+  connection for as long as they take, and so does a WebSocket. Accepted sockets also turn on
+  TCP keep-alive, so the system ends a connection whose peer vanished, on the host's own
+  schedule (about 2 hours and 10 minutes by Linux's defaults). See
+  [docs/UPGRADING.md](docs/UPGRADING.md)
 - A server whose setup was completed no longer starts when its database is missing, empty or
   has no migration history, as Jellyfin 12.2 refuses. It created an empty database and seeded
   a new `admin`; without `FERROFIN_ADMIN_PASSWORD` that admin had no password, so anyone who
@@ -799,7 +840,7 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   (an admin search/replace whose replace text multiplies the file, or another plugin's
   transform) is skipped with one warning, leaving the file as it was before that step
 - Dependencies with published RustSec advisories are upgraded: wasmtime and wasmtime-wasi
-  49.0.0 → 49.0.4 (25 advisories against the WASM plugin host, among them a WASI symlink-rename
+  49.0.0 → 49.0.5 (29 advisories against the WASM plugin host, among them a WASI symlink-rename
   sandbox escape, an aarch64 Cranelift miscompile and fuel-limit bypasses), zip 8 → 9 (three
   extraction advisories), h2, tokio, ctutils, event-listener, webpki-root-certs (distrusted CA
   roots), and quinn-proto, which Cargo.lock records although nothing builds it
@@ -810,6 +851,17 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   ([CONTRIBUTING.md](CONTRIBUTING.md) says what to do when it fails)
 
 ### Bug Fixes
+- One item that cannot be read or written no longer ends a library scan: it is skipped, counted
+  in the scan's summary and refreshed again by the next scan, as Jellyfin does, while the rest of
+  the scan, the removal of deleted files, the closing passes and the client notification all run
+- A Series or Season row the database cannot decode no longer fails every later library scan at
+  its first child: its children keep the names and the parental rating they have, and new
+  episodes, later libraries and deleted files are all handled again
+- Two user-data changes to one item that overlap now both land. A progress report used to undo
+  a favourite, like or played mark made while it waited for the database writer (for seconds
+  during a library scan), and overlapping play starts counted once
+- A stop report with no position now marks a video's other versions played too, as a stop with
+  one does
 - The web client's Next Up row loads again: jellyfin-web 12.x sends `nextUpDateCutoff` as a
   bare date, which Ferrofin answered with a `400`. Every `DateTime` query parameter now binds
   as Jellyfin's does: a date or an offset-less date-time is accepted and read as server

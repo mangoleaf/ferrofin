@@ -98,6 +98,7 @@ sevenz-rust2 = { version = "0.24.1", default-features = false, features = ["bzip
 brotli = "9.0.0"
 tokio = { version = "1", features = ["full"] }
 socket2 = "0.6"
+http-body = "1.0"
 # The `Stream` trait `axum::body::Body::from_stream` takes — the progressive
 # (tail-following) response bodies the Live TV live-stream/recording routes serve.
 futures-core = "0.3.34"
@@ -119,6 +120,9 @@ libsqlite3-sys = "0.37.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
+# Edits config.toml in place, keeping its comments and layout: the settings
+# page's save (ferrofin-server `settings::save`).
+toml_edit = { version = "0.25.17", default-features = false, features = ["parse", "display"] }
 # The `$.Field[0]` path in a body-binder rejection: serde's own error names the
 # type, not the member that failed, and ASP.NET's ValidationProblemDetails keys
 # its `errors` dictionary by path. ferrofin-api's JsonBody extractor only.
@@ -173,7 +177,7 @@ prometheus = { version = "0.14", default-features = false }
 # so the list is the sandbox's grant (`threads`, `gc` with exceptions,
 # `component-model-async` and `stack-switching` stay off, and so do the
 # profiling, cache, coredump and pooling extras). Only WASIp2 is linked.
-wasmtime = { version = "49.0.4", default-features = false, features = [
+wasmtime = { version = "49.0.5", default-features = false, features = [
     "addr2line",
     "anyhow",
     "backtrace",
@@ -185,7 +189,7 @@ wasmtime = { version = "49.0.4", default-features = false, features = [
     "std",
 ] }
 # Locked-down empty WASI ctx (no preopens/sockets) so std guests link.
-wasmtime-wasi = { version = "49.0.4", default-features = false, features = ["p2"] }
+wasmtime-wasi = { version = "49.0.5", default-features = false, features = ["p2"] }
 wat = "1.259.0"            # dev-only in practice: inline-WAT test fixtures (no committed .wasm)
 
 # ── domain helpers ─────────────────────────────────────────────────

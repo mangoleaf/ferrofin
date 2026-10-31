@@ -1043,19 +1043,34 @@ fn activity_wake(
         return None;
     }
     mark_sent(stream);
-    Some(envelope("ActivityLogEntry", &serde_json::json!([])))
+    activity_log_message()
+}
+
+/// The `ActivityLogEntry` frame: always an empty array.
+fn activity_log_message() -> Option<String> {
+    envelope("ActivityLogEntry", &serde_json::json!([]))
 }
 
 /// One outbound envelope: `{MessageType, MessageId, Data}` with the required
 /// `MessageId` (strict Kotlin-SDK clients crash without it), spelled as every
-/// Jellyfin guid is (`JsonGuidConverter`: 32 hex digits).
-fn envelope(message_type: &str, data: &serde_json::Value) -> String {
-    serde_json::json!({
-        "MessageType": message_type,
-        "MessageId": uuid::Uuid::new_v4().simple().to_string(),
-        "Data": data,
+/// Jellyfin guid is (`JsonGuidConverter`: 32 hex digits). `data` is written
+/// where it stands, with no second tree built around it. It stays a `Value`
+/// because that is what sorts the keys inside it: `serde_json::Map` is a
+/// `BTreeMap` here, and the envelope's own fields are declared in that order.
+fn envelope(message_type: &str, data: &serde_json::Value) -> Option<String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Envelope<'a> {
+        data: &'a serde_json::Value,
+        message_id: uuid::fmt::Simple,
+        message_type: &'a str,
+    }
+    serde_json::to_string(&Envelope {
+        data,
+        message_id: uuid::Uuid::new_v4().simple(),
+        message_type,
     })
-    .to_string()
+    .ok()
 }
 
 /// The `Sessions` stream payload, the port of
@@ -1084,8 +1099,13 @@ async fn sessions_message(state: &AppState, caller: &SocketCaller) -> Option<Str
     if !caller.is_admin && !caller.is_api_key {
         sessions.retain(|session| is_session_member(session, caller.user_id));
     }
+    sessions_snapshot_message(sessions)
+}
+
+/// The `Sessions` frame for `sessions`.
+fn sessions_snapshot_message(sessions: Vec<ferrofin_model::dto::SessionInfoDto>) -> Option<String> {
     match serde_json::to_value(sessions) {
-        Ok(data) => Some(envelope("Sessions", &data)),
+        Ok(data) => envelope("Sessions", &data),
         Err(error) => {
             tracing::warn!(%error, "websocket Sessions snapshot could not be serialized");
             None
@@ -1128,10 +1148,10 @@ fn task_snapshot_message(tasks: Vec<ferrofin_model::tasks::TaskInfo>) -> Option<
             );
         }
     }
-    Some(envelope(
+    envelope(
         "ScheduledTasksInfo",
         &serde_json::to_value(visible_tasks(tasks)).ok()?,
-    ))
+    )
 }
 
 type TaskUpdateReceiver = tokio::sync::broadcast::Receiver<Vec<ferrofin_model::tasks::TaskInfo>>;
@@ -1840,6 +1860,69 @@ mod tests {
                 .filter_map(|t| t.name.as_deref())
                 .collect::<Vec<_>>(),
             vec!["Clean Activity Log", "Scan Media Library"]
+        );
+    }
+
+    /// A frame with its random `MessageId` taken out, after checking that it is
+    /// the 32 hex digits every Jellyfin guid is written in.
+    fn without_message_id(frame: &str) -> String {
+        let (head, rest) = frame
+            .split_once(r#""MessageId":""#)
+            .expect("a frame carries a MessageId");
+        let (id, tail) = rest.split_once('"').expect("the id is a string");
+        assert_eq!(id.len(), 32, "{frame}");
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{frame}");
+        format!("{head}\"MessageId\":\"\"{tail}")
+    }
+
+    /// The exact bytes the three streams send: keys sorted at every level,
+    /// `Data` first, as `serde_json::Map` has always ordered them here.
+    #[test]
+    fn the_stream_frames_keep_their_bytes() {
+        let session = ferrofin_model::dto::SessionInfoDto {
+            id: Some("session-1".to_owned()),
+            user_name: Some("Zoë \"Z\"".to_owned()),
+            play_state: Some(ferrofin_model::session::PlayerStateInfo {
+                position_ticks: Some(5),
+                can_seek: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            without_message_id(&super::sessions_snapshot_message(vec![session]).expect("a frame")),
+            concat!(
+                r#"{"Data":[{"HasCustomDeviceName":false,"Id":"session-1","IsActive":false,"#,
+                r#""LastActivityDate":"1970-01-01T00:00:00.0000000Z","#,
+                r#""LastPlaybackCheckIn":"1970-01-01T00:00:00.0000000Z","#,
+                r#""PlayState":{"CanSeek":true,"IsMuted":false,"IsPaused":false,"#,
+                r#""PlaybackOrder":"Default","PositionTicks":5,"RepeatMode":"RepeatNone"},"#,
+                r#""PlayableMediaTypes":[],"SupportedCommands":[],"#,
+                r#""SupportsMediaControl":false,"SupportsRemoteControl":false,"#,
+                r#""UserId":"00000000000000000000000000000000","UserName":"Zoë \"Z\""}],"#,
+                r#""MessageId":"","MessageType":"Sessions"}"#,
+            )
+        );
+
+        let task = ferrofin_model::tasks::TaskInfo {
+            name: Some("Scan Media Library".to_owned()),
+            key: Some("RefreshLibrary".to_owned()),
+            id: Some("task-1".to_owned()),
+            current_progress_percentage: Some(12.5),
+            ..Default::default()
+        };
+        assert_eq!(
+            without_message_id(&super::task_snapshot_message(vec![task]).expect("a frame")),
+            concat!(
+                r#"{"Data":[{"CurrentProgressPercentage":12.5,"Id":"task-1","IsHidden":false,"#,
+                r#""Key":"RefreshLibrary","Name":"Scan Media Library","State":"Idle","#,
+                r#""Triggers":[]}],"MessageId":"","MessageType":"ScheduledTasksInfo"}"#,
+            )
+        );
+
+        assert_eq!(
+            without_message_id(&super::activity_log_message().expect("a frame")),
+            r#"{"Data":[],"MessageId":"","MessageType":"ActivityLogEntry"}"#
         );
     }
 

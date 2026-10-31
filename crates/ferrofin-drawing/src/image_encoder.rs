@@ -37,6 +37,7 @@
 //!   format-convert only, so `has_default_options` and `auto_orient` already
 //!   decide whether re-encoding is needed.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -52,7 +53,7 @@ use ferrofin_traits::drawing::ImageEncoder;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{ImageCollageOptions, ImageProcessingOptions};
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageFormat as CrateFormat, ImageReader, RgbaImage, imageops};
+use image::{DynamicImage, ImageFormat as CrateFormat, ImageReader, RgbImage, RgbaImage, imageops};
 use jpeg_encoder::{
     ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor,
 };
@@ -325,7 +326,10 @@ impl ImageCrateEncoder {
         // Truncation is safe: quality is clamped to 0..=100.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let quality = quality as u8;
-        let rgb = image.to_rgb8();
+        let rgb = match image {
+            DynamicImage::ImageRgb8(rgb) => Cow::Borrowed(rgb),
+            other => Cow::Owned(other.to_rgb8()),
+        };
         // JPEG's frame header stores the dimensions in 16 bits, so anything wider
         // or taller than 65535 cannot be written; Skia fails the same encode.
         let (Ok(width), Ok(height)) = (u16::try_from(rgb.width()), u16::try_from(rgb.height()))
@@ -509,7 +513,7 @@ impl ImageCrateEncoder {
         )
     }
 
-    /// The decode + overlay + JPEG-encode body of
+    /// The decode + copy + JPEG-encode body of
     /// [`ImageEncoder::create_trickplay_tile`]: up to `tile_width`×`tile_height`
     /// (default 100) JPEG decodes packed into one large grid. CPU- and
     /// file-I/O-bound with no yield points, so it runs on the blocking pool.
@@ -540,7 +544,7 @@ impl ImageCrateEncoder {
             _ => i32::try_from(first.height()).unwrap_or(i32::MAX),
         };
 
-        // Checked: a wrapped i32 product would ask RgbaImage::new for a huge buffer.
+        // Checked: a wrapped i32 product would ask RgbImage::new for a huge buffer.
         let (Some(grid_w), Some(grid_h)) = (
             img_width
                 .checked_mul(tile_width)
@@ -553,8 +557,11 @@ impl ImageCrateEncoder {
                 "A {tile_width}x{tile_height} grid of {img_width}x{img_height} images is too large.",
             )));
         };
-        let mut grid = RgbaImage::new(grid_w, grid_h);
+        // RGB, as the JPEG it becomes: the frames are JPEGs with no alpha to
+        // composite, and an empty cell stays black.
+        let mut grid = RgbImage::new(grid_w, grid_h);
 
+        let mut first = Some(first);
         let mut img_index = 0usize;
         'outer: for y in 0..tile_height {
             for x in 0..tile_width {
@@ -562,10 +569,9 @@ impl ImageCrateEncoder {
                     break 'outer;
                 }
 
-                let img = if img_index == 0 {
-                    first.clone()
-                } else {
-                    Self::decode(&paths[img_index])?
+                let img = match first.take() {
+                    Some(first) => first,
+                    None => Self::decode(&paths[img_index])?,
                 };
                 img_index += 1;
 
@@ -582,12 +588,12 @@ impl ImageCrateEncoder {
 
                 let px = u32::try_from(x * img_width).unwrap_or(0);
                 let py = u32::try_from(y * img_height).unwrap_or(0);
-                imageops::overlay(&mut grid, &img.to_rgba8(), i64::from(px), i64::from(py));
+                imageops::replace(&mut grid, &img.into_rgb8(), i64::from(px), i64::from(py));
             }
         }
 
         Self::write(
-            &DynamicImage::ImageRgba8(grid),
+            &DynamicImage::ImageRgb8(grid),
             &options.output_path,
             CrateFormat::Jpeg,
             quality,
@@ -2310,6 +2316,58 @@ mod tests {
         // Grid is imgW*tileW x imgH*tileH = 640 x 360.
         let dims = enc.get_image_size(&output).await.expect("probe tile");
         assert_eq!(dims, ImageDimensions::new(640, 360));
+    }
+
+    /// A tile is its frames in reading order on black, with the bytes an RGBA
+    /// canvas flattened for JPEG gives, whichever format a frame decodes to.
+    #[tokio::test]
+    async fn a_trickplay_tile_is_its_frames_on_black() {
+        let dir = TempDir::new().expect("tempdir");
+        let (width, height) = (32_u32, 18_u32);
+        let colour = image::RgbImage::from_fn(width, height, |x, y| {
+            // Truncation is the point: wrap coordinates into channel space.
+            #[allow(clippy::cast_possible_truncation)]
+            image::Rgb([(x * 7) as u8, (y * 13) as u8, ((x + y) * 3) as u8])
+        });
+        let gray = DynamicImage::ImageRgb8(colour.clone()).to_luma8();
+        let frames = ["colour.jpg", "gray.jpg", "rgba.png"].map(|name| out_path(&dir, name));
+        DynamicImage::ImageRgb8(colour.clone())
+            .save(&frames[0])
+            .expect("write the colour frame");
+        DynamicImage::ImageLuma8(gray)
+            .save(&frames[1])
+            .expect("write the gray frame");
+        DynamicImage::ImageRgb8(colour)
+            .to_rgba8()
+            .save(&frames[2])
+            .expect("write the RGBA frame");
+        let output = out_path(&dir, "tile.jpg");
+
+        let options = ImageCollageOptions {
+            input_paths: frames.to_vec(),
+            output_path: output.clone(),
+            width: 2,
+            height: 2,
+        };
+        ImageCrateEncoder::new()
+            .create_trickplay_tile(&options, 90, 32, None)
+            .await
+            .expect("trickplay");
+
+        let mut canvas = RgbaImage::new(width * 2, height * 2);
+        for (index, cell) in [(0, 0), (1, 0), (0, 1)].into_iter().enumerate() {
+            let frame = ImageCrateEncoder::decode(&frames[index]).expect("decodes");
+            let (x, y) = (i64::from(cell.0 * width), i64::from(cell.1 * height));
+            imageops::overlay(&mut canvas, &frame.to_rgba8(), x, y);
+        }
+        let expected = ImageCrateEncoder::encode(
+            &DynamicImage::ImageRgba8(canvas),
+            &output,
+            CrateFormat::Jpeg,
+            90,
+        )
+        .expect("encodes");
+        assert_eq!(std::fs::read(&output).expect("reads the tile"), expected);
     }
 
     #[tokio::test]
