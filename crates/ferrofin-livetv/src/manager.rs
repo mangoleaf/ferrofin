@@ -57,8 +57,8 @@ use crate::mapping::{
 };
 use crate::projection::{
     ChannelRow, ProgramImages, ProgramRow as GuideProgramRow, channel_entity,
-    channel_images_update, channel_item_update, program_entity, program_images_update,
-    program_item_update, remove_fields,
+    channel_images_update, channel_item_update, is_artwork_url, program_entity,
+    program_images_update, program_item_update, remove_fields,
 };
 use crate::schedules_direct::{SchedulesDirect, SdChannel, SdProgram};
 use crate::stream::{LiveStreamHandle, LiveStreamKind, TunerStreamSource};
@@ -299,6 +299,7 @@ fn epg_channel(c: &XmltvChannel) -> EpgChannel {
 /// providers whose guide was read, as upstream skips one whose
 /// `GetEpgChannels` throws: while a guide cannot be read, its channels carry
 /// the playlist's logo again, and the guide's returns with it, as upstream.
+/// A guide logo that is not a URL never replaces a playlist's that is one.
 fn add_provider_metadata(
     lineups: &mut [(String, String, Vec<crate::tuner_host::TunerChannel>)],
     guides: &[(ListingsProviderInfo, GuideSource)],
@@ -326,11 +327,29 @@ fn add_provider_metadata(
                     epg_channel_for_tuner_channel(&provider.channel_mappings, &tuner, &epg)
                         .and_then(|matched| matched.image_url.as_deref())
                         .filter(|url| !url.trim().is_empty())
+                        .filter(|url| {
+                            is_artwork_url(url)
+                                || !channel.image_url.as_deref().is_some_and(is_artwork_url)
+                        })
                 {
                     channel.image_url = Some(url.to_owned());
                 }
             }
         }
+    }
+}
+
+/// Says once per guide refresh how many of a playlist's or guide's artwork
+/// values were left out for not being URLs, so a source whose logos stop
+/// showing leaves a trace. The count, not the values: it stays one line
+/// however long the lineup is.
+fn warn_refused_artwork(count: usize, artwork: &'static str) {
+    if count > 0 {
+        tracing::warn!(
+            count,
+            artwork,
+            "live tv: ignored artwork that is not an http or https URL"
+        );
     }
 }
 
@@ -1399,6 +1418,12 @@ impl FerrofinLiveTvManager {
             .filter_map(|row| Uuid::parse_str(&row.id).ok().map(|id| (id, row)))
             .collect();
         let ids: Vec<Uuid> = channels.iter().map(|(id, _)| *id).collect();
+        let refused = rows
+            .iter()
+            .filter_map(|row| row.image_url.as_deref())
+            .filter(|url| !url.trim().is_empty() && !is_artwork_url(url))
+            .count();
+        warn_refused_artwork(refused, "channel logo");
         let images = store.items.get_image_infos_batch(&ids).await?;
         let changed: Vec<(Uuid, Vec<ItemImageInfo>)> = channels
             .into_iter()
@@ -1518,6 +1543,10 @@ impl FerrofinLiveTvManager {
         let Some(store) = self.item_store.get() else {
             return Ok(Vec::new());
         };
+        warn_refused_artwork(
+            listings.values().map(ProgramImages::refused).sum(),
+            "programme image",
+        );
         let view_id = self.live_tv_view_id().await;
         // Upstream's `newProgramIdList`: every airing the guide still holds.
         let mut kept: HashSet<Uuid> = HashSet::new();

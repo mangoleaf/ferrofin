@@ -355,6 +355,70 @@ async fn one_channels_airings_are_read_through_the_channel_index() {
     );
 }
 
+/// A logo that is not a URL, from the playlist or the guide, becomes no image,
+/// and a refresh takes out the row an earlier version stored from it. A rolling
+/// update can store it after a one-shot cleanup would have run, so this happens
+/// on every refresh.
+#[rstest::rstest]
+#[case::playlist(" tvg-logo=\"/var/lib/art/one.png\"", None)]
+#[case::guide(
+    "",
+    Some(
+        "<tv><channel id=\"one.tv\"><display-name>One</display-name>\
+         <icon src=\"/var/lib/art/one.png\"/></channel></tv>"
+    )
+)]
+#[tokio::test]
+async fn a_logo_that_is_no_url_leaves_no_row_and_takes_the_stored_one(
+    #[case] playlist_logo: &str,
+    #[case] xmltv: Option<&str>,
+) {
+    let logo = "/var/lib/art/one.png";
+    let lab = item_lab_reading_through(
+        &format!(
+            "#EXTM3U\n#EXTINF:-1 tvg-id=\"one.tv\" tvg-chno=\"1\"{playlist_logo},One\n\
+             http://tuner/one\n"
+        ),
+        xmltv.map(str::to_owned),
+        |inner| inner,
+    )
+    .await;
+    lab.mgr.refresh_guide().await.expect("first refresh");
+    let channels = crate::guide_repository::channel_rows(&lab.mgr.db)
+        .await
+        .expect("channels");
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].image_url.as_deref(), Some(logo));
+    let channel = Uuid::parse_str(&channels[0].id).expect("guid");
+    assert!(
+        lab.items
+            .get_image_infos(channel)
+            .await
+            .expect("images")
+            .is_empty(),
+        "the logo is no image"
+    );
+
+    let stored = ItemImageInfo {
+        path: logo.to_owned(),
+        image_type: ImageType::Primary,
+        ..ItemImageInfo::default()
+    };
+    lab.persistence
+        .save_items_images(&[(channel, vec![stored])])
+        .await
+        .expect("row of an earlier version");
+    lab.mgr.refresh_guide().await.expect("second refresh");
+    assert!(
+        lab.items
+            .get_image_infos(channel)
+            .await
+            .expect("images")
+            .is_empty(),
+        "the refresh removed the row"
+    );
+}
+
 /// A channel whose airings all left the guide has nothing to mirror, so its
 /// turn is skipped and its items go in the `CleanDatabase` at the end; the
 /// other channel's items, images and genres are untouched.

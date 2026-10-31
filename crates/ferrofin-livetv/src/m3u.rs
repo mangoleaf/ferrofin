@@ -171,11 +171,8 @@ const EXTINF: &str = "#EXTINF:";
 /// quoted argument.
 #[must_use]
 pub fn is_valid_channel_url(url: &str) -> bool {
-    url.split_once("://").is_some_and(|(scheme, _)| {
-        ["http", "https", "rtsp", "rtp", "udp"]
-            .iter()
-            .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
-    }) && !url.contains(['"', '\\'])
+    crate::fetch::has_scheme(url, &["http", "https", "rtsp", "rtp", "udp"])
+        && !url.contains(['"', '\\'])
         && !url.contains(|c: char| c.is_control())
         && reqwest::Url::parse(url).is_ok()
 }

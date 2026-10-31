@@ -1072,7 +1072,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Album* and People[] tags, ImageBlurHashes' keys, Chapters[].ImageTag, \
                    search hints, GET /Items/{itemId}/Images, ChannelPrimaryImageTag, a user's \
                    PrimaryImageTag); image serving and processing are compared per \
-                   operation. ferrofin-drawing processor.rs get_image_cache_tag (the owning \
+                   operation, apart from the Live TV artwork rule below (ferrofin-livetv \
+                   projection.rs is_artwork_url, channel_images_update, \
+                   program_images_update, manager.rs add_provider_metadata; handlers/images.rs \
+                   live_tv_image_is_servable). ferrofin-drawing processor.rs \
+                   get_image_cache_tag (the owning \
                    item's path, null as empty) and get_image_cache_tag_for_path (md5 of the \
                    UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
                    dto_service.rs image_tag, tag_and_fill_blur_hash (attach_images, \
@@ -1088,13 +1092,19 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
                    Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
                    Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
-                   src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag) and \
+                   src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag), \
+                   src/Jellyfin.LiveTv/Guide/GuideManager.cs (GetChannel, UpdateImage), \
+                   MediaBrowser.Controller/Entities/BaseItemExtensions.cs (SetImagePath) and \
                    Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto)",
-        date: "2026-10-30",
+        date: "2026-10-31",
         divergences: &[
             "Timers, series timers and the new-timer defaults carry no image tags: \
              LiveTvDtoService.FillImages (the program's and the library series' Primary, Thumb \
              and Backdrop tags) is not ported. Fix path: gl-853.",
+            "A tuner's or guide's artwork is kept only as an absolute http or https URL, and a \
+             channel's or programme's stored row that is neither a URL nor a file in the \
+             internal metadata directory is neither served nor listed. Upstream's SetImagePath \
+             also accepts a local file path there. Jellyfin bug not ported.",
         ],
     },
     VerifiedSubsystem {

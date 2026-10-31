@@ -558,6 +558,17 @@ impl ReqwestFetcher {
     }
 }
 
+/// Whether `url` starts with `scheme://` for one of `schemes`, scheme compared
+/// ignoring ASCII case. Stricter than [`is_http`], which only compares the first
+/// four characters.
+pub(crate) fn has_scheme(url: &str, schemes: &[&str]) -> bool {
+    url.split_once("://").is_some_and(|(scheme, _)| {
+        schemes
+            .iter()
+            .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+    })
+}
+
 /// `error` as a `404` when it is a local file that does not exist, the way
 /// upstream's middleware answers the `FileNotFoundException` or
 /// `DirectoryNotFoundException` that `AsyncFile.OpenRead` throws
