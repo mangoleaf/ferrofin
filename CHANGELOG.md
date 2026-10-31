@@ -152,6 +152,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   release (`oracle.py matches`). `oracle.py check` no longer takes `--gate`
 
 ### Parity
+- The directory browser and the log and fallback-font routes answer as Jellyfin 12.4 does,
+  checked against a live one. `GET /Environment/DirectoryContents` is a 404 for a path that is
+  no directory, lists an unreadable one as empty, resolves the path and orders by the culture.
+  `POST /Environment/ValidatePath` is a 500 for a read-only directory and a 404 under a file.
+  `GET /FallbackFont/Fonts/{name}` sends `Last-Modified` and answers `If-Modified-Since` (304)
+  and `If-Unmodified-Since` (412), and an unknown extension is `application/octet-stream`. The
+  log and font listings keep links, a file named `.log` and everything else but directories,
+  and a filesystem with no birth time gets a real `DateCreated`
 - A playing session's `NowPlayingItem` (`GET /Sessions` and the WebSocket `Sessions` stream)
   is the trimmed item Jellyfin sends. It no longer carries `People`, `MediaSources`, `Tags`,
   `SortName`, `Etag`, `CanDelete`, `CanDownload`, `DisplayPreferencesId`,
@@ -871,6 +879,14 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   during a library scan), and overlapping play starts counted once
 - A stop report with no position now marks a video's other versions played too, as a stop with
   one does
+- A hung network mount can no longer freeze the server through the directory browser, the log
+  routes or the fallback fonts: every `FileSystem` call from a handler runs on the blocking pool,
+  at most 32 at a time, so calls hung on a dead mount can stop those routes until it answers but
+  nothing else. `GET /Environment/Drives` leaves out a mount that does not answer within 2 s,
+  keeping to one probe thread per mount however often it is called. The log and font routes
+  stream the file instead of reading it into memory, and a log that grows while it is read no
+  longer overruns its `Content-Length`. A monitor scan's stats and sidecar listing leave the
+  runtime worker too
 - The web client's Next Up row loads again: jellyfin-web 12.x sends `nextUpDateCutoff` as a
   bare date, which Ferrofin answered with a `400`. Every `DateTime` query parameter now binds
   as Jellyfin's does: a date or an offset-less date-time is accepted and read as server

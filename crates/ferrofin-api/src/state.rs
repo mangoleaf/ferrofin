@@ -15,6 +15,7 @@ use ferrofin_traits::collections::{CollectionManager, PlaylistManager};
 use ferrofin_traits::configuration::{DisplayPreferencesManager, ServerConfigurationManager};
 use ferrofin_traits::devices::DeviceManager;
 use ferrofin_traits::dto::DtoService;
+use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::events::ClientEventLogger;
 use ferrofin_traits::filesystem::FileSystem;
 use ferrofin_traits::library::{
@@ -40,6 +41,8 @@ use ferrofin_traits::system::{ServerApplicationHost, SystemManager};
 use ferrofin_traits::tasks::TaskManager;
 use ferrofin_traits::trickplay::TrickplayManager;
 use ferrofin_traits::tv::TvSeriesManager;
+
+use crate::error::ApiError;
 
 /// C# `GetNormalizedRemoteIP`: an IPv4-mapped IPv6 peer is compared as the IPv4
 /// address it actually is.
@@ -291,6 +294,12 @@ pub struct Inner {
     pub merge_versions: Option<Arc<dyn ferrofin_traits::merge_versions::MergeVersionsManager>>,
 }
 
+/// How many [`FileSystem`] calls handlers may have on the blocking pool at once
+/// ([`AppState::blocking_file_system`]). Well above the few a browse click or a
+/// font takes, and well below the pool's 512. A candidate setting, recorded
+/// with the owner on gl-26.
+pub const MAX_BLOCKING_FILE_SYSTEM_CALLS: usize = 32;
+
 /// The shared application state passed to every axum handler as
 /// [`axum::extract::State`].
 ///
@@ -301,6 +310,7 @@ pub struct Inner {
 pub struct AppState {
     inner: Arc<Inner>,
     request_culture: Arc<crate::request_culture::RequestCultureOptions>,
+    file_system_calls: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -318,7 +328,47 @@ impl AppState {
         Self {
             inner: Arc::new(inner),
             request_culture: Arc::new(request_culture),
+            file_system_calls: Arc::new(tokio::sync::Semaphore::new(
+                MAX_BLOCKING_FILE_SYSTEM_CALLS,
+            )),
         }
+    }
+
+    /// Runs `work` against the [`FileSystem`] on the blocking pool, the one way
+    /// a handler reaches it, since every one of its calls blocks.
+    ///
+    /// A call on a hung network mount sleeps uninterruptibly and takes its
+    /// thread with it, whatever becomes of the request: the pool's 512 threads
+    /// would go one browse click or ASS playback at a time, and with them every
+    /// `tokio::fs` read the server's direct play depends on. So at most
+    /// [`MAX_BLOCKING_FILE_SYSTEM_CALLS`] run at once. Past that a request
+    /// waits here, holding no thread, until a call returns or its client
+    /// gives up. A hung call keeps its slot until the mount answers, so with
+    /// every slot hung, every path behind this method waits, the local disk's
+    /// too: the browser, the log routes and the fallback fonts stop and
+    /// everything else goes on. `/Environment/Drives` and a body already
+    /// streaming take no slot.
+    ///
+    /// # Errors
+    /// [`ApiError`] when the call panicked.
+    pub(crate) async fn blocking_file_system<R>(
+        &self,
+        work: impl FnOnce(&dyn FileSystem) -> R + Send + 'static,
+    ) -> Result<R, ApiError>
+    where
+        R: Send + 'static,
+    {
+        let slot = Arc::clone(&self.file_system_calls)
+            .acquire_owned()
+            .await
+            .map_err(|error| ServiceError::backend(format!("filesystem call: {error}")))?;
+        let file_system = Arc::clone(&self.inner.file_system);
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            work(file_system.as_ref())
+        })
+        .await
+        .map_err(|error| ServiceError::backend(format!("filesystem call: {error}")).into())
     }
 
     /// Snapshots Startup's request-localization culture and supported UI list.

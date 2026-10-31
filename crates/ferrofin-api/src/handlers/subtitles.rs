@@ -21,14 +21,15 @@
 //! stub `404`s), and the `subtitles.m3u8` route builds the segment playlist from
 //! the media source's runtime. The `FallbackFont` routes resolve
 //! `EncodingOptions.FallbackFontPath` (via the config seam's new
-//! `get_encoding_options`) and enumerate / serve fonts through the
-//! [`FileSystem`](ferrofin_traits::filesystem::FileSystem) seam.
+//! `get_encoding_options`) and enumerate / stream fonts through the
+//! [`FileSystem`](ferrofin_traits::filesystem::FileSystem) seam, on the
+//! blocking pool.
 
 use std::fmt::Write as _;
 
 use axum::extract::{Path, Request, State};
 use axum::handler::Handler;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -38,6 +39,7 @@ use ferrofin_model::providers::RemoteSubtitleInfo;
 use ferrofin_model::secret::Secret;
 use ferrofin_model::subtitles::FontFile;
 use ferrofin_traits::subtitles::{SubtitleResponse, SubtitleSearchRequest};
+use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 use uuid::Uuid;
 
 use crate::auth::{RequireAdmin, RequireAuth, RequireSubtitleManagement};
@@ -46,6 +48,7 @@ use crate::extract::{JsonBody, Query, upload_body_limit};
 use crate::handlers::image_upload::decode_base64;
 use crate::handlers::items::resolve_user_opt;
 use crate::handlers::queue_high_priority_refresh;
+use crate::handlers::streaming::{opened_file_response, physical_file_precondition};
 use crate::state::AppState;
 
 /// The MIME type Jellyfin serves an HLS subtitle playlist with
@@ -693,7 +696,7 @@ fn build_subtitle_playlist(
 ///
 /// Port of `SubtitleController.GetFallbackFontList`: when `FallbackFontPath` is
 /// configured, enumerate the `.woff`/`.woff2`/`.ttf`/`.otf` files, order them
-/// (size, then name), and yield until the running total would reach the 20 MiB
+/// (size, then name in the request's culture, then newest), and yield until the running total would reach the 20 MiB
 /// cap. An unset path yields an empty list (the C# logs a warning and returns
 /// nothing).
 #[utoipa::path(
@@ -711,10 +714,26 @@ async fn get_fallback_font_list(
         return Ok(Json(Vec::new()));
     };
 
-    let mut files = state.file_system.get_files(&path, FALLBACK_FONT_EXTENSIONS);
-    // Order by size, then name (the C# `OrderBy(Size).ThenBy(Name)`); the later
-    // date tiebreakers never change the size/name ordering for distinct files.
-    files.sort_by(|a, b| a.length.cmp(&b.length).then_with(|| a.name.cmp(&b.name)));
+    let mut files = state
+        .blocking_file_system(move |file_system| {
+            file_system.get_files(&path, FALLBACK_FONT_EXTENSIONS)
+        })
+        .await?;
+    let comparer =
+        ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture()).ok();
+    // The C# `OrderBy(Size).ThenBy(Name).ThenByDescending(DateModified)
+    // .ThenByDescending(DateCreated)`.
+    files.sort_by(|a, b| {
+        a.length
+            .cmp(&b.length)
+            .then_with(|| {
+                comparer
+                    .as_ref()
+                    .map_or_else(|| a.name.cmp(&b.name), |c| c.compare(&a.name, &b.name))
+            })
+            .then_with(|| b.date_modified.cmp(&a.date_modified))
+            .then_with(|| b.date_created.cmp(&a.date_created))
+    });
 
     let mut fonts = Vec::new();
     let mut size_counter: i64 = 0;
@@ -736,53 +755,81 @@ async fn get_fallback_font_list(
 /// `GET /FallbackFont/Fonts/{name}` — serve a single fallback font file.
 ///
 /// Port of `SubtitleController.GetFallbackFont`: locate the named file under
-/// `FallbackFontPath` (case-insensitively) and stream it with a font MIME type.
-/// A missing path / font returns `200` with an empty body (the C# returns `Ok()`
-/// rather than `204`, which would break SubtitlesOctopus).
+/// `FallbackFontPath` (case-insensitively) and stream it as `PhysicalFile` does,
+/// with a font MIME type, a `Last-Modified` the request's preconditions are
+/// checked against, and no ranges. A missing path / font returns `200` with an
+/// empty body (the C# returns `Ok()` rather than `204`, which would break
+/// SubtitlesOctopus).
 #[utoipa::path(
     get,
     path = "/FallbackFont/Fonts/{name}",
     params(("name" = String, Path, description = "The name of the fallback font file to get")),
-    responses((status = 200, description = "Fallback font file retrieved")),
+    responses(
+        (status = 200, description = "Fallback font file retrieved"),
+        (status = 304, description = "Not modified since the date the client holds"),
+        (status = 412, description = "Modified since the date the client required")
+    ),
     tag = "ferrofin"
 )]
 async fn get_fallback_font(
     State(state): State<AppState>,
     RequireAuth(_auth): RequireAuth,
     Path(name): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    if name.trim().is_empty() {
+        return Err(ApiError::BadRequest("missing required 'name'".to_owned()));
+    }
     let options = state.config.get_encoding_options().await?;
     let Some(path) = options.fallback_font_path.filter(|p| !p.is_empty()) else {
         return Ok(StatusCode::OK.into_response());
     };
 
     let file = state
-        .file_system
-        .get_files(&path, &[])
-        .into_iter()
-        .find(|f| f.name.eq_ignore_ascii_case(&name));
+        .blocking_file_system(move |file_system| {
+            file_system
+                .get_files(&path, &[])
+                .into_iter()
+                .find(|f| equals_ordinal_ignore_case(&f.name, &name))
+        })
+        .await?;
+    // Null/empty font: the C# returns `Ok()` (200, empty) to avoid breaking
+    // the SubtitlesOctopus renderer.
+    let Some(file) = file.filter(|f| f.length > 0) else {
+        return Ok(StatusCode::OK.into_response());
+    };
 
-    match file {
-        Some(f) if f.length > 0 => {
-            let bytes = state.file_system.read_file(&f.full_name)?;
-            let mime = font_mime(&f.name);
-            Ok(([(header::CONTENT_TYPE, mime)], bytes).into_response())
-        }
-        // Null/empty font: the C# returns `Ok()` (200, empty) to avoid breaking
-        // the SubtitlesOctopus renderer.
-        _ => Ok(StatusCode::OK.into_response()),
+    // chrono, not httpdate: a font dated before 1970 is a date to send, and
+    // httpdate's formatter panics on one.
+    let last_modified = file
+        .date_modified
+        .format("%a, %d %b %Y %H:%M:%S GMT")
+        .to_string();
+    if let Some(status) = physical_file_precondition(&headers, file.date_modified) {
+        return Ok((status, [(header::LAST_MODIFIED, last_modified)]).into_response());
     }
+    let mime = font_mime(&file.name);
+    let opened = state
+        .blocking_file_system(move |file_system| file_system.open_file(&file.full_name))
+        .await??;
+    let mut response = opened_file_response(opened, mime)?;
+    response.headers_mut().insert(
+        header::LAST_MODIFIED,
+        HeaderValue::from_str(&last_modified)
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+    );
+    Ok(response)
 }
 
-/// The MIME type for a font file, keyed on its extension (unknown → the generic
-/// `font/sfnt`).
+/// The MIME type of a font file, keyed on its extension: `MimeTypes.GetMimeType`
+/// (`get_mime_type`), plus the font rows of the `MimeTypes` package it falls
+/// back to, which that port does not carry.
 fn font_mime(name: &str) -> &'static str {
     match name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()) {
-        Some(ext) if ext == "woff" => "font/woff",
-        Some(ext) if ext == "woff2" => "font/woff2",
-        Some(ext) if ext == "ttf" => "font/ttf",
         Some(ext) if ext == "otf" => "font/otf",
-        _ => "font/sfnt",
+        Some(ext) if ext == "ttc" => "font/collection",
+        Some(ext) if ext == "pfb" => "application/x-font-type1",
+        _ => ferrofin_model::net::mime_types::get_mime_type(name),
     }
 }
 
