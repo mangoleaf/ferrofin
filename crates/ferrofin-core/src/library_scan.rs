@@ -11042,8 +11042,13 @@ impl LibraryScanner {
                 match (own_imdb.as_deref(), name) {
                     (Some(imdb), _) => omdb.item(imdb).await,
                     (None, Some(name)) => {
-                        let cleaned = ferrofin_providers::tmdb::clean_name(name);
-                        omdb.find_by_title(kind, &cleaned, year).await
+                        // `_libraryManager.ParseName(name)` before the title
+                        // query, an in-name year as the `&y=` filter when
+                        // the item has none (`OmdbItemProvider.cs:107-115`).
+                        let parsed = video_resolver::parse_name(name, &PATH_NAMING);
+                        let cleaned = ferrofin_providers::tmdb::clean_name(&parsed.name);
+                        omdb.find_by_title(kind, &cleaned, year.or(parsed.year))
+                            .await
                     }
                     (None, None) => None,
                 }
@@ -11141,12 +11146,22 @@ impl LibraryScanner {
         let tmdb_id = if let Some(id) = pinned {
             id
         } else {
-            let name = lookup.name(row)?;
-            let cleaned = ferrofin_providers::tmdb::clean_name(&name);
+            // "ParseName is required here": the lookup name is the item's
+            // own — for a movie in its own folder the raw folder name, year
+            // and all (`MovieResolver`) — so the year and release clutter are
+            // lifted out before the search, and an in-name year stands in for
+            // a missing one (`TmdbMovieProvider.cs:162-169`,
+            // `TmdbSeriesProvider.cs:203-210`). `Heat (1995)` searches for
+            // `Heat`, not `Heat 1995`, which TMDB answers with nothing.
+            let raw = lookup.name(row)?;
+            let parsed = video_resolver::parse_name(&raw, &PATH_NAMING);
+            let year = year.or(parsed.year);
+            let cleaned = ferrofin_providers::tmdb::clean_name(&parsed.name);
             let results = tmdb
                 .search(kind, &cleaned, year, lookup.tmdb_language().as_deref())
                 .await;
-            ferrofin_providers::tmdb::find_best_match(&results, &name, year).map(|h| h.tmdb_id)?
+            ferrofin_providers::tmdb::find_best_match(&results, &parsed.name, year)
+                .map(|h| h.tmdb_id)?
         };
         // The seasons/episodes below this series key off the cached id.
         // Cached however the id was resolved — a pinned series id serves its
@@ -33631,6 +33646,227 @@ mod tests {
             [("Sean Bean".to_owned(), Some("Ned Stark".to_owned()))],
             "TheTVDB's episode characters"
         );
+    }
+
+    /// The words of a request line's `query=` parameter, decoded (`+` and
+    /// `%XX` as a form-encoded query has them).
+    fn query_param(line: &str) -> Option<String> {
+        let start = line.find("query=")? + "query=".len();
+        let raw: String = line[start..]
+            .chars()
+            .take_while(|c| *c != '&' && *c != ' ')
+            .collect();
+        let bytes = raw.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'+' => out.push(b' '),
+                b'%' if i + 2 < bytes.len() => {
+                    let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+                    out.push(u8::from_str_radix(hex, 16).ok()?);
+                    i += 2;
+                }
+                b => out.push(b),
+            }
+            i += 1;
+        }
+        String::from_utf8(out).ok()
+    }
+
+    /// A TheMovieDb stand-in that, like the real one, finds a title by its
+    /// words only: `/search/movie?query=Fargo` hits, `query=Fargo 1996`
+    /// does not. `titles` are `(query, id, title, release date)`; each id's
+    /// details answer at `/tmdb/movie/{id}`. Returns the base URL and every
+    /// request line.
+    fn spawn_title_only_tmdb(
+        titles: &'static [(&'static str, u32, &'static str, &'static str)],
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read as _, Write as _};
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&requests);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let line = req.lines().next().unwrap_or_default().to_owned();
+                log.lock().unwrap().push(line.clone());
+                let (status, payload) = if line.contains("/tmdb/search/movie") {
+                    let query = query_param(&line).unwrap_or_default();
+                    let hits: Vec<String> = titles
+                        .iter()
+                        .filter(|(q, ..)| *q == query)
+                        .map(|(_, id, title, date)| {
+                            format!(
+                                r#"{{"id": {id}, "title": "{title}", "release_date": "{date}"}}"#
+                            )
+                        })
+                        .collect();
+                    ("200 OK", format!(r#"{{"results": [{}]}}"#, hits.join(",")))
+                } else if let Some((_, id, title, date)) = titles
+                    .iter()
+                    .find(|(_, id, ..)| line.contains(&format!("/tmdb/movie/{id}?")))
+                {
+                    (
+                        "200 OK",
+                        format!(
+                            r#"{{"id": {id}, "title": "{title}", "release_date": "{date}",
+                                "overview": "From TMDB.", "credits": {{"cast": [], "crew": []}}}}"#
+                        ),
+                    )
+                } else {
+                    ("404 Not Found", "{}".to_owned())
+                };
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+            }
+        });
+        (format!("http://{addr}"), requests)
+    }
+
+    /// A movie in its own folder is named by that folder, year and all
+    /// (`MovieResolver`), so TheMovieDb's name search must parse the name
+    /// first — `ParseName` (`TmdbMovieProvider.cs:162-169`) — and search
+    /// `Fargo` in 1996, not `Fargo 1996`, which TMDB answers with nothing.
+    /// The shapes are a name-only library's: no NFO, no id in the path, a
+    /// quality token after the year in the file name.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn a_movie_named_by_its_folder_is_searched_without_the_year() {
+        const TITLES: &[(&str, u32, &str, &str)] = &[
+            ("Groundhog Day", 137, "Groundhog Day", "1993-02-11"),
+            ("Fargo", 275, "Fargo", "1996-03-08"),
+            (
+                "The Hunger Games Mockingjay Part 1",
+                131_631,
+                "The Hunger Games: Mockingjay - Part 1",
+                "2014-11-18",
+            ),
+            (
+                "Dave Chappelle Killin Them Softly",
+                16_275,
+                "Dave Chappelle: Killin' Them Softly",
+                "2000-07-01",
+            ),
+        ];
+        let files: [(&str, &str, u32, i64, &str); 4] = [
+            (
+                "Groundhog Day (1993)",
+                "Groundhog Day (1993) Unknown.m2ts",
+                137,
+                1993,
+                "Groundhog Day",
+            ),
+            (
+                "Fargo (1996)",
+                "Fargo (1996) WEBDL-1080p.mkv",
+                275,
+                1996,
+                "Fargo",
+            ),
+            (
+                "The Hunger Games - Mockingjay - Part 1 (2014)",
+                "The Hunger Games - Mockingjay - Part 1 (2014) Bluray-1080p Proper.mkv",
+                131_631,
+                2014,
+                "The Hunger Games: Mockingjay - Part 1",
+            ),
+            (
+                "Dave Chappelle - Killin' Them Softly (2000)",
+                "Dave Chappelle - Killin' Them Softly (2000).m4v",
+                16_275,
+                2000,
+                "Dave Chappelle: Killin' Them Softly",
+            ),
+        ];
+        let (base, requests) = spawn_title_only_tmdb(TITLES);
+        let tmp = tempfile::tempdir().unwrap();
+        let media = tmp.path().join("movies");
+        for (folder, file, ..) in &files {
+            let path = media.join(folder).join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"").unwrap();
+        }
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("views"))
+                .with_item_store(persistence.clone()),
+        );
+        vf.add_virtual_folder(
+            "Movies",
+            Some(CollectionTypeOptions::movies),
+            &LibraryOptions {
+                path_infos: vec![MediaPathInfo {
+                    path: media.to_string_lossy().into_owned(),
+                }],
+                ..LibraryOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let items = crate::test_support::item_repository_over(db.clone());
+
+        LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence.clone())
+            .with_items(Arc::clone(&items))
+            .with_metadata(
+                Arc::new(
+                    ferrofin_providers::TmdbClient::new().with_base_url(&format!("{base}/tmdb")),
+                ),
+                tmp.path().join("metadata"),
+            )
+            .scan_all()
+            .await
+            .unwrap();
+
+        let asked = requests.lock().unwrap().clone();
+        let mut queries: Vec<String> = asked
+            .iter()
+            .filter(|l| l.contains("/tmdb/search/movie"))
+            .filter_map(|l| query_param(l))
+            .collect();
+        queries.sort();
+        let mut expected: Vec<String> = TITLES.iter().map(|(q, ..)| (*q).to_owned()).collect();
+        expected.sort();
+        assert_eq!(
+            queries, expected,
+            "one search per movie, by its title without the year: {asked:?}"
+        );
+        for (folder, file, tmdb_id, year, title) in files {
+            let path = media.join(folder).join(file);
+            let id = crate::item_type_lookup::derive_item_id(
+                BaseItemKind::Movie,
+                &path.to_string_lossy(),
+            )
+            .expect("id");
+            let ids = persistence
+                .provider_ids_for_items(&[id])
+                .await
+                .unwrap()
+                .remove(&id)
+                .unwrap_or_default();
+            assert!(
+                ids.contains(&("Tmdb".to_owned(), tmdb_id.to_string())),
+                "{folder}: matched TMDB {tmdb_id}, has {ids:?}; searched {queries:?}"
+            );
+            let row = items.retrieve_item(id).await.unwrap().expect("the movie");
+            assert_eq!(row.name.as_deref(), Some(title), "{folder}: TMDB's title");
+            assert_eq!(row.production_year, Some(year), "{folder}: its year");
+            assert!(
+                asked.iter().any(
+                    |l| l.contains("/tmdb/search/movie") && l.contains(&format!("year={year}"))
+                ),
+                "{folder}: searched in {year}: {asked:?}"
+            );
+        }
     }
 
     /// A TheMovieDb + OMDb stand-in for one movie, Heat (TMDB 949, IMDb

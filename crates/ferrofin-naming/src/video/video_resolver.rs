@@ -147,6 +147,23 @@ pub fn clean_date_time(name: &str, naming_options: &NamingOptions) -> CleanDateT
     clean_date_time_parser::clean(name, &naming_options.clean_date_time_regexes)
 }
 
+/// Splits an item's name into the title and year a metadata provider searches
+/// by — port of `LibraryManager.ParseName` (`LibraryManager.cs:3430-3440`):
+/// [`clean_date_time`] lifts out the trailing year, then [`try_clean_string`]
+/// drops release clutter from what is left.
+///
+/// A movie in its own folder keeps the raw folder name, year included
+/// (`MovieResolver`), so a provider that searches by name must parse it
+/// first: `Heat (1995)` searches for `Heat`, in 1995.
+#[must_use]
+pub fn parse_name(name: &str, naming_options: &NamingOptions) -> CleanDateTimeResult {
+    let result = clean_date_time(name, naming_options);
+    match try_clean_string(Some(&result.name), naming_options) {
+        Some(cleaned) => CleanDateTimeResult::new(cleaned, result.year),
+        None => result,
+    }
+}
+
 #[cfg(test)]
 mod sample_filename_tests {
     #[test]
