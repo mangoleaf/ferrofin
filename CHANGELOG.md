@@ -631,6 +631,15 @@ called out in [docs/UPGRADING.md](docs/UPGRADING.md).
   Jellyfin answers `500`
 
 ### Performance
+- The client's address is resolved once per request, at the IP gate, instead of walking
+  `X-Forwarded-For` again for the auth layer and each policy check behind it
+- `GET /Items` reads the caller's tag whitelist from the policy the request already holds instead
+  of cloning the whole cached user DTO for it
+- A request whose path needs no rewriting, which covers image, segment and `/web/*` fetches, costs
+  no allocation for path-case routing, and the route is found by a binary search instead of a
+  walk of the whole route table
+- Authenticating a request copies only the four credential headers into its context instead of
+  every header the client sent, on every request including image and segment fetches
 - `/Shows/NextUp` no longer reads every series' last watched and next episodes in full and
   copies each pick: the picks are decided, ordered and counted from the episode projection,
   which now also carries the premiere date, and only the regular episodes on the requested page
