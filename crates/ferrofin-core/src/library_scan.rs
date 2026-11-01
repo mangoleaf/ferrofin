@@ -12779,7 +12779,17 @@ impl LibraryScanner {
             } else {
                 keep_stored_images(&mut images, stored, &self.virtual_paths);
             }
-            adopt_stored_image_metadata(&mut images, &art_cache.stored_images);
+            // Embedded images mean `PhotoProvider` ran: a first, full or
+            // required refresh (`GetProviders`), never a plain rescan of an
+            // unchanged photo. Its `ImageUpdate` result forces
+            // `UpdateImagesAsync` (`RunMetadataSavers`), so the photo's own
+            // file is measured again whatever its date says.
+            for image in images
+                .iter_mut()
+                .filter(|image| Some(image.path.as_str()) != entity.path.as_deref())
+            {
+                adopt_stored_image_metadata(std::slice::from_mut(image), &art_cache.stored_images);
+            }
             cut_short |= self
                 .finish_artwork(entity, &mut images, stored, dirs.as_deref())
                 .await;

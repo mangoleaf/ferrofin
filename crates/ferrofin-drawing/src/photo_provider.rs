@@ -198,19 +198,30 @@ pub struct PhotoExif {
 }
 
 impl PhotoItem {
-    /// Sets the path of the [`ImageType::Primary`] image, inserting the entry if
-    /// absent. Port of `BaseItem.SetImagePath(ImageType.Primary, path)`.
-    fn set_image_path(&mut self, image_type: ImageType, path: &str) {
+    /// Points the `image_type` image at the file `path`, last written at
+    /// `date_modified`, inserting the entry if absent. Port of
+    /// `BaseItem.SetImagePath(ImageType, int, FileSystemMetadata)`: an
+    /// existing image has its size reset, which leaves the file to be
+    /// measured again, and keeps its blurhash until that happens.
+    ///
+    /// The `http` arm of the C# string overload has no caller here: the scan's
+    /// photos are files.
+    fn set_image_path(&mut self, image_type: ImageType, path: &str, date_modified: DateTime<Utc>) {
         if let Some(existing) = self
             .images
             .iter_mut()
             .find(|info| info.image_type == image_type)
         {
             path.clone_into(&mut existing.path);
+            existing.date_modified = date_modified;
+            // "reset these values"
+            existing.width = 0;
+            existing.height = 0;
         } else {
             self.images.push(ItemImageInfo {
                 path: path.to_owned(),
                 image_type,
+                date_modified,
                 ..Default::default()
             });
         }
@@ -223,6 +234,16 @@ impl PhotoItem {
             .iter()
             .find(|info| info.image_type == image_type)
     }
+}
+
+/// `path`'s last write time: the value `file_date_modified` in
+/// `ferrofin-providers` stores for every other local image, the current time
+/// when the file cannot be read included, so the scan's
+/// `image_metadata_is_current` compares like with like.
+fn last_write_time(path: &str) -> DateTime<Utc> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map_or_else(|_| Utc::now(), DateTime::<Utc>::from)
 }
 
 /// Metadata provider for photos — the embedded-information provider.
@@ -275,8 +296,9 @@ impl PhotoProvider {
     /// Refreshes the item's embedded information, returning what changed. Port of
     /// `FetchAsync`.
     ///
-    /// Always-on behaviour: set the [`ImageType::Primary`] image path to the
-    /// item's path, then — when the stored width or height is `<= 0` — probe the
+    /// Always-on behaviour: point the [`ImageType::Primary`] image at the
+    /// item's file, dated by its last write time and with an existing image's
+    /// size reset, then — when the stored width or height is `<= 0` — probe the
     /// primary image's dimensions through the
     /// [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor) and write back
     /// any positive result. A "format not supported" probe error
@@ -295,7 +317,13 @@ impl PhotoProvider {
     /// reason other than an unsupported format.
     pub async fn fetch(&self, item: &mut PhotoItem) -> Result<ItemUpdateType, ServiceError> {
         let path = item.path.clone();
-        item.set_image_path(ImageType::Primary, &path);
+        // On the blocking pool like the EXIF read below: a stalled mount holds
+        // a stat as long as it holds an open.
+        let owned = path.clone();
+        let modified = tokio::task::spawn_blocking(move || last_write_time(&owned))
+            .await
+            .unwrap_or_else(|_| Utc::now());
+        item.set_image_path(ImageType::Primary, &path, modified);
 
         // The EXIF branch, gated on the extension set (C#: "other extensions
         // might cause taglib to hang"). A file that cannot be read or carries no
@@ -946,6 +974,73 @@ mod tests {
     fn name_is_embedded_information() {
         let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(1, 1)));
         assert_eq!(provider.name(), "Embedded Information");
+    }
+
+    /// A file on disk whose last write time is `modified`.
+    fn file_modified_at(dir: &tempfile::TempDir, modified: DateTime<Utc>) -> String {
+        // `.gif` stays out of the EXIF branch: these tests are about the image row.
+        let path = write_temp(dir, "photo.gif", b"GIF89a");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(modified.into())
+            .expect("set mtime");
+        path
+    }
+
+    #[tokio::test]
+    async fn fetch_dates_a_new_primary_image_by_the_files_last_write_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modified = ts(1_700_000_000);
+        let path = file_modified_at(&dir, modified);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(10, 20)));
+        let mut item = PhotoItem {
+            path: path.clone(),
+            ..Default::default()
+        };
+
+        provider.fetch(&mut item).await.expect("fetch");
+
+        let image = item.image_info(ImageType::Primary).expect("primary");
+        assert_eq!(image.path, path);
+        assert_eq!(image.date_modified, modified);
+        assert_eq!((image.width, image.height), (0, 0));
+    }
+
+    /// `BaseItem.SetImagePath`: "reset these values". The blurhash is not one
+    /// of them: it stands until the image pass measures the file.
+    #[tokio::test]
+    async fn fetch_resets_the_size_of_an_existing_primary_image() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let modified = ts(1_700_000_000);
+        let path = file_modified_at(&dir, modified);
+        let provider = PhotoProvider::new(Arc::new(FakeProcessor::reporting(10, 20)));
+        let mut item = PhotoItem {
+            path: path.clone(),
+            images: vec![ItemImageInfo {
+                path: "/moved/from/here.gif".to_owned(),
+                image_type: ImageType::Primary,
+                date_modified: ts(1_000),
+                width: 6000,
+                height: 4000,
+                blur_hash: Some("stale".to_owned()),
+            }],
+            ..Default::default()
+        };
+
+        provider.fetch(&mut item).await.expect("fetch");
+
+        let [image] = item.images.as_slice() else {
+            panic!(
+                "the existing row is updated, not added to: {:?}",
+                item.images
+            );
+        };
+        assert_eq!(image.path, path);
+        assert_eq!(image.date_modified, modified);
+        assert_eq!((image.width, image.height), (0, 0));
+        assert_eq!(image.blur_hash.as_deref(), Some("stale"));
     }
 
     /// A minimal but real JPEG carrying an EXIF APP1 segment built from
