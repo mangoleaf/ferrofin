@@ -701,6 +701,7 @@ async fn get_video_master_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    crate::handlers::streaming::require_streamable_item(&state, &auth, item_id).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.master_playlist(&req, false).await?;
@@ -716,6 +717,7 @@ async fn get_video_variant_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    crate::handlers::streaming::require_streamable_item(&state, &auth, item_id).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.variant_playlist(&req, false).await?;
@@ -731,6 +733,7 @@ async fn get_video_live_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    crate::handlers::streaming::require_streamable_item(&state, &auth, item_id).await?;
     // `GetLiveHlsStream` defaults `EnableSubtitlesInManifest` to true.
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, true);
     let req = build_request(item_id, query, raw, ctx);
@@ -747,6 +750,7 @@ async fn get_audio_master_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    crate::handlers::streaming::require_streamable_item(&state, &auth, item_id).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_audio_request(item_id, query, raw, ctx);
     let playlist = state.hls.master_playlist(&req, true).await?;
@@ -762,6 +766,7 @@ async fn get_audio_variant_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    crate::handlers::streaming::require_streamable_item(&state, &auth, item_id).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_audio_request(item_id, query, raw, ctx);
     let playlist = state.hls.variant_playlist(&req, true).await?;
@@ -797,6 +802,7 @@ async fn get_video_hls_segment(
     RawQuery(raw): RawQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
+    crate::handlers::streaming::require_streamable_item(&state, &auth, item_id).await?;
     let index = parse_segment_index(&segment_id)?;
     let (parts, body) = request.into_parts();
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
@@ -816,6 +822,7 @@ async fn get_audio_hls_segment(
     RawQuery(raw): RawQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
+    crate::handlers::streaming::require_streamable_item(&state, &auth, item_id).await?;
     let index = parse_segment_index(&segment_id)?;
     let (parts, body) = request.into_parts();
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);

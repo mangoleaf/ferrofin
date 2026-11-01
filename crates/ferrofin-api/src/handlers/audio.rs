@@ -236,6 +236,10 @@ const HLS_SEGMENT_CONTAINERS: [&str; 2] = ["ts", "mp4"];
 /// may fetch itself, the original file (Range/`HEAD`), an HLS master playlist
 /// (`transcodingProtocol=hls`), or a progressive transcode. Requires
 /// authentication (`[Authorize]`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one negotiation, read top to bottom as upstream's controller is"
+)]
 async fn get_universal_audio_stream(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
@@ -243,6 +247,7 @@ async fn get_universal_audio_stream(
     Query(query): Query<UniversalAudioQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
+    crate::handlers::streaming::require_streamable_item(&state, &auth, item_id).await?;
     // Upstream's `[RegularExpression(ContainerValidationRegexStr)]` binding.
     for value in [&query.audio_codec, &query.transcoding_container]
         .into_iter()

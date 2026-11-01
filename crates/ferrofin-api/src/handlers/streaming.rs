@@ -48,6 +48,29 @@ pub(crate) struct StaticSource {
     pub user_agent: Option<String>,
 }
 
+/// `404` unless the caller may see `item_id`: the library access check
+/// `/Items/{id}`, `/Download` and `/PlaybackInfo` already apply, run before a
+/// stream, HLS or subtitle route resolves a source or starts a transcode.
+///
+/// Divergence from upstream (gl-1090): `StreamingHelpers.GetStreamingState`
+/// reads the item with no user, so a restricted account could stream, and
+/// download through `static=true`, any item of a library it was not granted.
+pub(crate) async fn require_streamable_item(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    item_id: Uuid,
+) -> Result<(), ApiError> {
+    if state
+        .library
+        .get_item_by_id_for_user(item_id, auth.user.as_ref())
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound(format!("item {item_id}")));
+    }
+    Ok(())
+}
+
 /// Resolves the direct-play source a stream request names.
 ///
 /// The source is chosen by
