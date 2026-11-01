@@ -2119,22 +2119,41 @@ pub trait UserViewManager: Send + Sync {
         self.get_user_views(user_id).await
     }
 
-    /// Gets the server's media folders — the user-root children.
+    /// Gets the server's media folders — the user-root children — for an
+    /// administrator. It reads no user, so it lists libraries a user may not
+    /// open: on a user's behalf, read
+    /// [`get_user_root_children`](Self::get_user_root_children) instead.
     ///
     /// Port of `LibraryController.GetMediaFolders`, which returns
-    /// `GetUserRootFolder().Children` sorted by `SortName`. Unlike
+    /// `GetUserRootFolder().Children` sorted by `SortName`, less the libraries
+    /// whose options disable them. Unlike
     /// [`get_user_views`](Self::get_user_views) (the library collection folders
     /// only), this also includes the playlists folder
     /// ([`BaseItemKind`]`::PlaylistsFolder`, `ManualPlaylistsFolder` to
     /// clients), which startup provisions once, as Jellyfin's
     /// `CreateRootFolder` does; a read never writes it.
-    async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError>;
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError>;
+
+    /// Gets the user-root children `user` may open.
+    ///
+    /// Port of `GetUserRootFolder().GetChildren(user, true)`: the rows of
+    /// [`get_media_folders`](Self::get_media_folders) that pass `IsVisible`.
+    /// Unlike [`get_user_views`](Self::get_user_views), the user's home-screen
+    /// choice (`MyMediaExcludes`) does not narrow it.
+    ///
+    /// # Errors
+    /// Returns a backend error when the implementation has no visibility
+    /// evaluator: every library is never the fallback for an access check.
+    async fn get_user_root_children(
+        &self,
+        user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError>;
 
     /// Gets the user's latest media, grouped by index container.
     ///
     /// Port of `UserViewManager.GetLatestItems`: ONE query across every parent
-    /// (the user's views minus `latest_item_excludes`, or the `parent_id`
-    /// folder), ordered `DateCreated DESC, SortName DESC, ProductionYear DESC`
+    /// (the root folders the user may open minus `latest_item_excludes`, or
+    /// the `parent_id` folder), ordered `DateCreated DESC, SortName DESC, ProductionYear DESC`
     /// and over-fetched to `limit * 5` rows; a tvshows or music parent takes
     /// its own per-collection-type query instead
     /// ([`ItemRepository::get_latest_item_list`] — one Episode, Season or

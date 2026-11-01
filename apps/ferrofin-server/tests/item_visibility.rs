@@ -1598,6 +1598,135 @@ async fn current_web_schedule_payload_saves_and_revokes_existing_requests() {
     }
 }
 
+/// The `Id`s of an item array.
+fn item_ids(items: &Value) -> Vec<uuid::Uuid> {
+    items
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| uuid::Uuid::parse_str(item["Id"].as_str().unwrap()).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn latest_and_grouping_options_keep_to_the_libraries_the_user_can_open() {
+    let f = fixture().await;
+    let allowed = uuid::Uuid::parse_str(&f.allowed).unwrap();
+    let hidden = uuid::Uuid::parse_str(&f.hidden).unwrap();
+    // Grouped (the movies arm of `GetLatestItemList`) and ungrouped (the plain query).
+    for route in [
+        "/Items/Latest?limit=100",
+        "/Items/Latest?limit=100&groupItems=false",
+    ] {
+        let (status, latest) = call(&f.router, "GET", route, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+        let ids = item_ids(&latest);
+        assert!(ids.contains(&allowed), "{route}: {ids:?}");
+        assert!(!ids.contains(&hidden), "{route}: {ids:?}");
+        let (_, latest) = call(&f.router, "GET", route, Some(&f.admin), None).await;
+        assert!(item_ids(&latest).contains(&hidden), "{route}: admin");
+    }
+
+    let names = |options: &Value| -> Vec<String> {
+        options
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["Name"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let viewer_id = &f.viewer_id;
+    // An administrator reading the viewer's list gets the viewer's list.
+    for (route, token, expected) in [
+        (
+            "/UserViews/GroupingOptions".to_owned(),
+            &f.viewer,
+            vec!["Allowed"],
+        ),
+        (
+            format!("/Users/{viewer_id}/GroupingOptions"),
+            &f.viewer,
+            vec!["Allowed"],
+        ),
+        (
+            format!("/UserViews/GroupingOptions?userId={viewer_id}"),
+            &f.admin,
+            vec!["Allowed"],
+        ),
+        (
+            "/UserViews/GroupingOptions".to_owned(),
+            &f.admin,
+            vec!["Allowed", "Hidden"],
+        ),
+    ] {
+        let (status, options) = call(&f.router, "GET", &route, Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+        assert_eq!(names(&options), expected, "{route}");
+    }
+
+    // No library left is an empty answer, never an unscoped query.
+    let (_, user) = call(
+        &f.router,
+        "GET",
+        &format!("/Users/{viewer_id}"),
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    let mut policy = user["Policy"].clone();
+    policy["EnabledFolders"] = json!([]);
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!("/Users/{viewer_id}/Policy"),
+        Some(&f.admin),
+        Some(policy),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let viewer = Some(f.viewer.as_str());
+    let (_, latest) = call(&f.router, "GET", "/Items/Latest?limit=100", viewer, None).await;
+    assert!(item_ids(&latest).is_empty(), "{latest}");
+    let (_, options) = call(&f.router, "GET", "/UserViews/GroupingOptions", viewer, None).await;
+    assert!(names(&options).is_empty(), "{options}");
+}
+
+#[tokio::test]
+async fn grouping_options_sort_by_culture_not_by_code_point() {
+    let f = fixture().await;
+    std::fs::create_dir_all(f.h.path("lower")).unwrap();
+    let path = encode(&f.h.path("lower").to_string_lossy());
+    let (status, _) = call(&f.router, "POST", &format!(
+        "/Library/VirtualFolders?name=aardvark&collectionType=movies&paths={path}&refreshLibrary=false"
+    ), Some(&f.admin), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        f.h.wired
+            .state
+            .library
+            .run_library_scan(ScanTrigger::Api, None)
+            .await
+            .unwrap()
+    );
+    let (status, options) = call(
+        &f.router,
+        "GET",
+        "/UserViews/GroupingOptions?culture=en-US",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<_> = options
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|option| option["Name"].as_str().unwrap())
+        .collect();
+    // Byte order would put the lower-case name last.
+    assert_eq!(names, ["aardvark", "Allowed", "Hidden"]);
+}
+
 /// The viewer's `GET /Items/{allowed}` status.
 async fn viewer_reads_allowed(f: &Fixture) -> StatusCode {
     call(
@@ -1658,6 +1787,24 @@ async fn library_option_and_library_row_edits_reach_the_next_request() {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         assert_eq!(read_library().await.0, expected, "Enabled = {enabled}");
+        // `LibraryController.GetMediaFolders` drops it too, for every caller.
+        let (_, media_folders) = call(
+            &f.router,
+            "GET",
+            "/Library/MediaFolders",
+            Some(&f.admin),
+            None,
+        )
+        .await;
+        let listed = |name: &str| {
+            media_folders["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|folder| folder["Name"] == name)
+        };
+        assert_eq!(listed("Allowed"), enabled, "Enabled = {enabled}");
+        assert!(listed("Playlists"), "no options, so never disabled");
     }
     // A tag on the library's own row is inherited by its items, so a blocked tag hides them.
     let (_, mut user) = call(

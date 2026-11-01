@@ -605,8 +605,9 @@ struct LatestQuery {
 ///
 /// Port of `UserLibraryController.GetLatestMedia`. The
 /// [`UserViewManager`](ferrofin_traits::library::UserViewManager) returns the
-/// C# `(container, items)` tuples — one query across the user's views (or the
-/// `parentId` folder), grouped by index container up to `limit` groups — and
+/// C# `(container, items)` tuples — one query across the root folders the user
+/// may open (or the `parentId` folder), grouped by index container up to
+/// `limit` groups — and
 /// this handler applies the controller's projection: a container with more
 /// than one new item, or a `MusicAlbum` with any, is emitted in place of its
 /// items with `ChildCount` = the number of new items; everything else is the

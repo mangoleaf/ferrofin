@@ -228,6 +228,27 @@ impl ItemVisibility {
             .collect()
     }
 
+    /// Drops the libraries whose options disable them (`LibraryOptions.Enabled`),
+    /// for a read with no user. Any other row has no options and stays. Reads
+    /// the cached library set, as the evaluator's own `Enabled` check does.
+    ///
+    /// # Errors
+    /// Propagates repository failures.
+    pub(crate) async fn without_disabled_libraries(
+        &self,
+        mut rows: Vec<BaseItemEntity>,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let libraries = self.rating_libraries().await?;
+        rows.retain(|row| {
+            libraries
+                .set
+                .options
+                .get(&row_id(row))
+                .is_none_or(|options| options.enabled)
+        });
+        Ok(rows)
+    }
+
     /// Applies Folder.GetChildren's child visibility and, for playlists and
     /// collections, GetLinkedChildren's owner/library check. Root children are
     /// supplied by the secure UserRootFolder loader; all hierarchy reads are
@@ -2436,6 +2457,37 @@ mod tests {
             .await;
         assert!(!f.visible(&folder).await);
         assert!(!dir.path().join("options.json").exists());
+    }
+
+    #[tokio::test]
+    async fn only_a_library_whose_options_disable_it_is_dropped() {
+        let f = Fixture::new().await;
+        let dir = tempfile::tempdir().expect("dir");
+        tokio::fs::write(
+            dir.path().join("options.xml"),
+            "<LibraryOptions><Enabled>false</Enabled></LibraryOptions>",
+        )
+        .await
+        .expect("xml");
+        let disabled = f
+            .item(
+                88,
+                BaseItemKind::CollectionFolder,
+                dir.path().to_str(),
+                None,
+            )
+            .await;
+        let open = f
+            .item(89, BaseItemKind::CollectionFolder, Some("/open"), None)
+            .await;
+        let playlists = f.item(91, BaseItemKind::PlaylistsFolder, None, None).await;
+        let kept = f
+            .service
+            .without_disabled_libraries(vec![disabled, open.clone(), playlists.clone()])
+            .await
+            .expect("kept");
+        let kept: Vec<_> = kept.iter().map(row_id).collect();
+        assert_eq!(kept, [row_id(&open), row_id(&playlists)]);
     }
 
     #[tokio::test]
