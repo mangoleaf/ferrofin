@@ -50,16 +50,8 @@ async fn boot() -> Harness {
     };
     for (path, contents) in [
         ("movies/Alpha (1999)/Alpha (1999).mkv", String::new()),
-        (
-            "movies/Alpha (1999)/Alpha (1999).en.srt",
-            "1\n00:00:00,500 --> 00:00:02,000\nAlpha\n".to_owned(),
-        ),
         ("movies/Epsilon (2003)/Epsilon (2003).mkv", String::new()),
         ("more/Gamma (2001)/Gamma (2001).mkv", String::new()),
-        (
-            "more/Gamma (2001)/Gamma (2001).en.srt",
-            "1\n00:00:00,500 --> 00:00:02,000\nGamma\n".to_owned(),
-        ),
         ("more/Delta (2002)/Delta (2002).mkv", String::new()),
     ] {
         touch(&temp.path().join(path), &contents);
@@ -2578,6 +2570,28 @@ fn anonymous_routes(id: &str) -> Vec<String> {
     routes
 }
 
+/// Gives `id` an external subtitle as a scan stores one, whether or not this
+/// host has an ffprobe to read the scanned file with.
+async fn store_sidecar(f: &Fixture, id: &str) {
+    use ferrofin_traits::persistence::MediaStreamRepository as _;
+    let path = f.h.path(&format!("subtitles/{id}.srt"));
+    touch(&path, "1\n00:00:00,500 --> 00:00:02,000\nA line\n");
+    let item: uuid::Uuid = id.parse().unwrap();
+    let row = ferrofin_db::entities::base_items::MediaStreamInfoEntity {
+        item_id: ferrofin_db::store::guid_to_db(item),
+        stream_index: 0,
+        stream_type: i32::from(ferrofin_db::enums::MediaStreamTypeEntity::Subtitle),
+        codec: Some("subrip".to_owned()),
+        path: Some(path.to_string_lossy().into_owned()),
+        is_external: true,
+        ..ferrofin_db::entities::base_items::MediaStreamInfoEntity::default()
+    };
+    ferrofin_core::media_stream_repository::FerrofinMediaStreamRepository::new(f.h.db.clone())
+        .save_media_streams(item, &[row])
+        .await
+        .unwrap();
+}
+
 /// A signed-in user is held to the libraries it may open on every route that
 /// reads bytes (gl-1090). Upstream's `GetStreamingState` reads the item with no
 /// user, so Jellyfin streams it.
@@ -2663,6 +2677,7 @@ async fn no_user_on_a_stream_route_means_no_user_check() {
     }
     // A subtitle read answers from the sidecar, whichever library it is in.
     for id in [&f.allowed, &f.hidden] {
+        store_sidecar(&f, id).await;
         for uri in [
             format!("/Videos/{id}/{id}/Subtitles/0/Stream.srt"),
             format!("/Videos/{id}/{id}/Subtitles/0/0/Stream.srt"),
