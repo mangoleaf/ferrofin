@@ -31,6 +31,9 @@
 //!   Skia's codec decodes it for upstream's blur hash, so its full-size bitmap
 //!   is never built (see `scaled_jpeg`). Other formats, and targets no reduced
 //!   scale covers, decode in full.
+//! - Every decode and resize runs under [`ImageLimits`] ([`crate::limits`]),
+//!   which upstream has no counterpart for. An image they refuse is
+//!   [`ServiceError::InvalidInput`], and the processor serves the original.
 //! - The overlay work Skia does inside `EncodeImage` (background colour, blur,
 //!   foreground layer: gl-805; unplayed/percent-played indicators: gl-806) is
 //!   **not** ported yet — this encoder does auto-orientation, resize and
@@ -39,11 +42,12 @@
 
 use std::borrow::Cow;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use tokio::sync::Semaphore;
 
 use crate::error::DrawingError;
+use crate::limits::{ImageLimits, ImageMemory};
 use crate::scaled_jpeg::{ScalableJpeg, swaps_axes};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -53,7 +57,7 @@ use ferrofin_traits::drawing::ImageEncoder;
 use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::options::{ImageCollageOptions, ImageProcessingOptions};
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageFormat as CrateFormat, ImageReader, RgbImage, RgbaImage, imageops};
+use image::{DynamicImage, ImageFormat as CrateFormat, RgbImage, RgbaImage, imageops};
 use jpeg_encoder::{
     ChromaSubsamplingMethod, ColorType as JpegColorType, Encoder as JpegEncoder, SamplingFactor,
 };
@@ -91,6 +95,9 @@ pub struct ImageCrateEncoder {
     /// The server's data directory, where [`ImageEncoder::create_splashscreen`]
     /// writes `splashscreen.png` (upstream's `IApplicationPaths.DataPath`).
     data_path: Option<std::path::PathBuf>,
+    /// The limits every decode and resize runs under, and the resize budget
+    /// all of them share.
+    memory: Arc<ImageMemory>,
 }
 
 impl ImageCrateEncoder {
@@ -104,6 +111,13 @@ impl ImageCrateEncoder {
     #[must_use]
     pub fn with_data_path(mut self, data_path: impl Into<std::path::PathBuf>) -> Self {
         self.data_path = Some(data_path.into());
+        self
+    }
+
+    /// The encoder running under `limits` instead of [`ImageLimits`]'s defaults.
+    #[must_use]
+    pub fn with_limits(mut self, limits: ImageLimits) -> Self {
+        self.memory = Arc::new(ImageMemory::new(limits));
         self
     }
 
@@ -123,51 +137,6 @@ impl ImageCrateEncoder {
     /// case-insensitive `SupportedInputFormats.Contains(inputFormat)` guard.
     fn is_supported_input(path: &str) -> bool {
         SUPPORTED_INPUT_FORMATS.contains(&Self::input_format(path).as_str())
-    }
-
-    /// Decodes the image at `path` into memory, mapping the C# `throw` sites onto
-    /// [`ServiceError`]. A missing file is [`ServiceError::NotFound`]; an
-    /// undecodable one is [`ServiceError::InvalidInput`] (the port of Skia's
-    /// `InvalidDataException`/`return null` fallbacks).
-    pub(crate) fn decode(path: &str) -> Result<DynamicImage, ServiceError> {
-        if !Path::new(path).exists() {
-            return Err(ServiceError::not_found(format!(
-                "image file not found: {path}"
-            )));
-        }
-        let reader = ImageReader::open(path)
-            .map_err(|e| DrawingError::io(format!("open {path}"), e))?
-            .with_guessed_format()
-            .map_err(|e| DrawingError::io(format!("probe {path}"), e))?;
-        reader
-            .decode()
-            .map_err(|e| ServiceError::invalid_input(format!("decode {path}: {e}")))
-    }
-
-    /// `SkiaEncoder.GetBitmap(path, autoOrient: true, …)`: decodes `path` and
-    /// applies its own EXIF origin (`codec.EncodedOrigin` → `OrientImage`), so
-    /// the pixels stand as the photo was taken. A file whose orientation
-    /// cannot be read is taken as stored.
-    fn decode_oriented(path: &str) -> Result<DynamicImage, ServiceError> {
-        use image::ImageDecoder as _;
-        if !Path::new(path).exists() {
-            return Err(ServiceError::not_found(format!(
-                "image file not found: {path}"
-            )));
-        }
-        let mut decoder = ImageReader::open(path)
-            .map_err(|e| DrawingError::io(format!("open {path}"), e))?
-            .with_guessed_format()
-            .map_err(|e| DrawingError::io(format!("probe {path}"), e))?
-            .into_decoder()
-            .map_err(|e| ServiceError::invalid_input(format!("decode {path}: {e}")))?;
-        let orientation = decoder
-            .orientation()
-            .unwrap_or(image::metadata::Orientation::NoTransforms);
-        let mut image = DynamicImage::from_decoder(decoder)
-            .map_err(|e| ServiceError::invalid_input(format!("decode {path}: {e}")))?;
-        image.apply_orientation(orientation);
-        Ok(image)
     }
 
     /// Maps an output [`ImageFormat`] onto the `image` crate's writer format.
@@ -360,14 +329,16 @@ impl ImageCrateEncoder {
     /// `maxHeight`), and `ScaleDownToFit` passes that through.
     /// Skia's `SKSurface.Create` returns null for an empty target and the encode
     /// throws, so that is an error here too (the processor then serves the
-    /// original), never a 1-pixel axis beside an unclamped one.
+    /// original), never a 1-pixel axis beside an unclamped one. So is a resize
+    /// past the budget ([`ImageMemory::resize_exact`]).
     fn resize_exact(
+        memory: &ImageMemory,
         image: &DynamicImage,
         size: ImageDimensions,
     ) -> Result<DynamicImage, ServiceError> {
         match (u32::try_from(size.width), u32::try_from(size.height)) {
             (Ok(width @ 1..), Ok(height @ 1..)) => {
-                Ok(image.resize_exact(width, height, imageops::FilterType::Lanczos3))
+                memory.resize_exact(image, width, height, imageops::FilterType::Lanczos3)
             }
             _ => Err(ServiceError::invalid_input(format!(
                 "cannot resize to {}x{}",
@@ -378,7 +349,10 @@ impl ImageCrateEncoder {
 
     /// The synchronous body of [`get_image_size`](ImageEncoder::get_image_size),
     /// split out so it can run on the blocking pool via `spawn_blocking`.
-    fn image_size_blocking(path: &str) -> Result<ImageDimensions, ServiceError> {
+    fn image_size_blocking(
+        memory: &ImageMemory,
+        path: &str,
+    ) -> Result<ImageDimensions, ServiceError> {
         if !Path::new(path).exists() {
             return Err(ServiceError::not_found(format!(
                 "image file not found: {path}"
@@ -393,9 +367,9 @@ impl ImageCrateEncoder {
         }
 
         // Probe dimensions from the header only; undecodable → default (0×0).
-        let dims = ImageReader::open(path)
+        let dims = memory
+            .reader(path)
             .ok()
-            .and_then(|r| r.with_guessed_format().ok())
             .and_then(|r| r.into_dimensions().ok());
 
         match dims {
@@ -412,6 +386,7 @@ impl ImageCrateEncoder {
     /// [`encode_image`](ImageEncoder::encode_image), split out so it can run on
     /// the blocking pool via `spawn_blocking` (all CPU-bound, no `.await`).
     fn encode_image_blocking(
+        memory: &ImageMemory,
         input_path: &str,
         output_path: &str,
         auto_orient: bool,
@@ -426,7 +401,7 @@ impl ImageCrateEncoder {
 
         // A JPEG is only opened here: its header gives the size, and the
         // decode waits for the target so it can run at a reduced scale.
-        let source = EncodeSource::open(input_path, auto_orient)?;
+        let source = EncodeSource::open(memory, input_path, auto_orient)?;
         let original = source.dimensions();
 
         // "Just spit out the original file if all the options are default."
@@ -436,7 +411,7 @@ impl ImageCrateEncoder {
 
         let new_size = get_new_image_size(options, original);
 
-        let decoded = source.decode_covering(input_path, new_size)?;
+        let decoded = source.decode_covering(memory, input_path, new_size)?;
         // A full decode measures the upright image itself. When it differs
         // from what the header read planned with (an EXIF orientation stored
         // after the frame header, which the header read cannot see), plan from
@@ -447,7 +422,7 @@ impl ImageCrateEncoder {
         } else {
             new_size
         };
-        let resized = Self::resize_exact(&decoded.image, new_size)?;
+        let resized = Self::resize_exact(memory, &decoded.image, new_size)?;
         Self::write(
             &resized,
             output_path,
@@ -460,8 +435,13 @@ impl ImageCrateEncoder {
     /// The synchronous body of [`ImageEncoder::get_image_blur_hash`]: decode,
     /// resize to fit 128×128, then BlurHash-encode. CPU-bound (plus the
     /// decode's file read), so it runs on the blocking pool, never inline.
-    fn blur_hash_blocking(x_comp: i32, y_comp: i32, path: &str) -> Result<String, ServiceError> {
-        let small = Self::blur_hash_pixels(path)?;
+    fn blur_hash_blocking(
+        memory: &ImageMemory,
+        x_comp: i32,
+        y_comp: i32,
+        path: &str,
+    ) -> Result<String, ServiceError> {
+        let small = Self::blur_hash_pixels(memory, path)?;
         let x = u32::try_from(x_comp.clamp(1, 9)).unwrap_or(1);
         let y = u32::try_from(y_comp.clamp(1, 9)).unwrap_or(1);
         blurhash::encode(x, y, small.width(), small.height(), small.as_raw())
@@ -482,31 +462,36 @@ impl ImageCrateEncoder {
     /// size, as Skia's codec decodes it for upstream (BlurHashSharp asks it for
     /// `GetScaledDimensions`), so a photo never builds its full-size bitmap. Any
     /// other input, or a JPEG too small to reduce, decodes in full as before.
-    fn blur_hash_pixels(path: &str) -> Result<RgbaImage, ServiceError> {
+    fn blur_hash_pixels(memory: &ImageMemory, path: &str) -> Result<RgbaImage, ServiceError> {
         let filter = imageops::FilterType::Triangle;
-        if let Some(jpeg) = ScalableJpeg::open(path) {
+        if let Some(jpeg) = ScalableJpeg::open(path, memory.limits()) {
             let (width, height) = jpeg.dimensions();
             let (fit_width, fit_height) = fit_within(width, height, BLUR_HASH_MAX_SIDE);
             if let Some(scaled) = jpeg.decode_at_least(fit_width, fit_height, None) {
-                return Ok(scaled
-                    .resize_exact(fit_width, fit_height, filter)
+                return Ok(memory
+                    .resize_exact(&scaled, fit_width, fit_height, filter)?
                     .to_rgba8());
             }
         }
-        Ok(Self::decode(path)?
-            .resize(BLUR_HASH_MAX_SIDE, BLUR_HASH_MAX_SIDE, filter)
+        let image = memory.decode(path)?;
+        let (fit_width, fit_height) = fit_within(image.width(), image.height(), BLUR_HASH_MAX_SIDE);
+        Ok(memory
+            .resize_exact(&image, fit_width, fit_height, filter)?
             .to_rgba8())
     }
 
     /// The build + write body of [`ImageEncoder::create_image_collage`]: several
     /// decodes, Lanczos3 resizes and an encode. CPU-bound, so it runs on the
     /// blocking pool. Assumes the caller has validated `width`/`height`.
-    fn create_image_collage_blocking(options: &ImageCollageOptions) -> Result<(), ServiceError> {
+    fn create_image_collage_blocking(
+        memory: &ImageMemory,
+        options: &ImageCollageOptions,
+    ) -> Result<(), ServiceError> {
         let ratio = f64::from(options.width) / f64::from(options.height);
         let canvas = if ratio >= COLLAGE_THUMB_RATIO {
-            build_thumb_collage(&options.input_paths, options.width, options.height)
+            build_thumb_collage(memory, &options.input_paths, options.width, options.height)
         } else {
-            build_square_collage(&options.input_paths, options.width, options.height)
+            build_square_collage(memory, &options.input_paths, options.width, options.height)
         };
 
         let format = Self::format_for_path(&options.output_path);
@@ -527,6 +512,7 @@ impl ImageCrateEncoder {
     /// positive tile dimensions and `img_width`, and that the inputs fit the
     /// grid); the per-image dimension checks stay here with the decode.
     fn create_trickplay_tile_blocking(
+        memory: &ImageMemory,
         options: &ImageCollageOptions,
         quality: i32,
         img_width: i32,
@@ -538,7 +524,7 @@ impl ImageCrateEncoder {
 
         // If no height provided, use the first image's height (after validating
         // its width matches img_width), matching the Skia default path.
-        let first = Self::decode(&paths[0])?;
+        let first = memory.decode(&paths[0])?;
         let first_w = i32::try_from(first.width()).unwrap_or(i32::MAX);
         if first_w != img_width {
             return Err(ServiceError::invalid_input(
@@ -577,7 +563,7 @@ impl ImageCrateEncoder {
 
                 let img = match first.take() {
                     Some(first) => first,
-                    None => Self::decode(&paths[img_index])?,
+                    None => memory.decode(&paths[img_index])?,
                 };
                 img_index += 1;
 
@@ -626,15 +612,15 @@ enum EncodeSource {
 
 impl EncodeSource {
     /// Opens `path`: reads a JPEG's header only, decodes anything else.
-    fn open(path: &str, auto_orient: bool) -> Result<Self, ServiceError> {
-        if let Some(jpeg) = ScalableJpeg::open(path) {
+    fn open(memory: &ImageMemory, path: &str, auto_orient: bool) -> Result<Self, ServiceError> {
+        if let Some(jpeg) = ScalableJpeg::open(path, memory.limits()) {
             let orientation = auto_orient.then(|| jpeg.orientation());
             return Ok(Self::Jpeg {
                 jpeg: Box::new(jpeg),
                 orientation,
             });
         }
-        Ok(Self::Decoded(full_decode(path, auto_orient)?))
+        Ok(Self::Decoded(full_decode(memory, path, auto_orient)?))
     }
 
     /// The size of the image as it will be drawn (after any orientation).
@@ -663,6 +649,7 @@ impl EncodeSource {
     /// full through the `image` crate as before.
     fn decode_covering(
         self,
+        memory: &ImageMemory,
         path: &str,
         target: ImageDimensions,
     ) -> Result<CoveringImage, ServiceError> {
@@ -685,7 +672,7 @@ impl EncodeSource {
                 full_size: false,
             });
         }
-        full_decode(path, orientation.is_some()).map(full_size)
+        full_decode(memory, path, orientation.is_some()).map(full_size)
     }
 }
 
@@ -731,11 +718,15 @@ fn image_dimensions(image: &DynamicImage) -> ImageDimensions {
 }
 
 /// The full-size decode through the `image` crate, oriented when asked.
-fn full_decode(path: &str, auto_orient: bool) -> Result<DynamicImage, ServiceError> {
+fn full_decode(
+    memory: &ImageMemory,
+    path: &str,
+    auto_orient: bool,
+) -> Result<DynamicImage, ServiceError> {
     if auto_orient {
-        ImageCrateEncoder::decode_oriented(path)
+        memory.decode_oriented(path)
     } else {
-        ImageCrateEncoder::decode(path)
+        memory.decode(path)
     }
 }
 
@@ -860,7 +851,8 @@ impl ImageEncoder for ImageCrateEncoder {
     /// thread for seconds.
     async fn get_image_size(&self, path: &str) -> Result<ImageDimensions, ServiceError> {
         let path = path.to_owned();
-        tokio::task::spawn_blocking(move || Self::image_size_blocking(&path))
+        let memory = Arc::clone(&self.memory);
+        tokio::task::spawn_blocking(move || Self::image_size_blocking(&memory, &path))
             .await
             .map_err(|e| ServiceError::backend(format!("image probe task failed: {e}")))?
     }
@@ -896,9 +888,12 @@ impl ImageEncoder for ImageCrateEncoder {
             .await
             .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
         let path = path.to_owned();
-        tokio::task::spawn_blocking(move || Self::blur_hash_blocking(x_comp, y_comp, &path))
-            .await
-            .map_err(|e| ServiceError::backend(format!("blur hash task failed: {e}")))?
+        let memory = Arc::clone(&self.memory);
+        tokio::task::spawn_blocking(move || {
+            Self::blur_hash_blocking(&memory, x_comp, y_comp, &path)
+        })
+        .await
+        .map_err(|e| ServiceError::backend(format!("blur hash task failed: {e}")))?
     }
 
     /// Port of `EncodeImage`. Rejects unsupported inputs (returns `input_path`
@@ -952,8 +947,10 @@ impl ImageEncoder for ImageCrateEncoder {
         let input_path = input_path.to_owned();
         let output_path = output_path.to_owned();
         let options = options.clone();
+        let memory = Arc::clone(&self.memory);
         tokio::task::spawn_blocking(move || {
             Self::encode_image_blocking(
+                &memory,
                 &input_path,
                 &output_path,
                 auto_orient,
@@ -989,7 +986,8 @@ impl ImageEncoder for ImageCrateEncoder {
             .await
             .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
         let options = options.clone();
-        tokio::task::spawn_blocking(move || Self::create_image_collage_blocking(&options))
+        let memory = Arc::clone(&self.memory);
+        tokio::task::spawn_blocking(move || Self::create_image_collage_blocking(&memory, &options))
             .await
             .map_err(|e| ServiceError::backend(format!("image collage task failed: {e}")))?
     }
@@ -1020,10 +1018,11 @@ impl ImageEncoder for ImageCrateEncoder {
             .await
             .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
         let (posters, backdrops) = (posters.to_vec(), backdrops.to_vec());
+        let memory = Arc::clone(&self.memory);
         tokio::task::spawn_blocking(move || {
             // Each write goes through its own temporary file, so two
             // validations finishing together never touch each other's file.
-            let splash = crate::splashscreen::generate_splash(&posters, &backdrops)?;
+            let splash = crate::splashscreen::generate_splash(&memory, &posters, &backdrops)?;
             let output = data_path.join("splashscreen.png");
             Self::write(
                 &DynamicImage::ImageRgba8(splash),
@@ -1086,8 +1085,9 @@ impl ImageEncoder for ImageCrateEncoder {
             .await
             .map_err(|e| ServiceError::backend(format!("image encode semaphore closed: {e}")))?;
         let options = options.clone();
+        let memory = Arc::clone(&self.memory);
         tokio::task::spawn_blocking(move || {
-            Self::create_trickplay_tile_blocking(&options, quality, img_width, img_height)
+            Self::create_trickplay_tile_blocking(&memory, &options, quality, img_width, img_height)
         })
         .await
         .map_err(|e| ServiceError::backend(format!("trickplay tile task failed: {e}")))?
@@ -1106,8 +1106,14 @@ const COLLAGE_QUALITY: i32 = 90;
 /// Decodes the first path that loads, tiling the rest into a `2×2` square,
 /// each cell `width/2 × height/2`. Port of
 /// `StripCollageBuilder.BuildSquareCollageBitmap`; [`next_valid`] wraps, so
-/// fewer than four images repeat.
-fn build_square_collage(paths: &[String], width: i32, height: i32) -> RgbaImage {
+/// fewer than four images repeat, and an image the limits refuse is skipped
+/// like an undecodable one.
+fn build_square_collage(
+    memory: &ImageMemory,
+    paths: &[String],
+    width: i32,
+    height: i32,
+) -> RgbaImage {
     let cell_w = (width / 2).max(1);
     let cell_h = (height / 2).max(1);
     let mut canvas = RgbaImage::new(
@@ -1118,17 +1124,23 @@ fn build_square_collage(paths: &[String], width: i32, height: i32) -> RgbaImage 
     let mut index = 0usize;
     for x in 0..2 {
         for y in 0..2 {
-            let Some((decoded, next)) = next_valid_image(paths, index) else {
+            let scaled = next_valid(paths, index, &mut |path| {
+                let decoded = memory.decode(path).ok()?;
+                memory
+                    .resize_exact(
+                        &decoded,
+                        u32::try_from(cell_w).unwrap_or(1),
+                        u32::try_from(cell_h).unwrap_or(1),
+                        imageops::FilterType::Lanczos3,
+                    )
+                    .ok()
+            });
+            let Some((cell, next)) = scaled else {
                 index = paths.len();
                 continue;
             };
             index = next;
 
-            let cell = decoded.resize_exact(
-                u32::try_from(cell_w).unwrap_or(1),
-                u32::try_from(cell_h).unwrap_or(1),
-                imageops::FilterType::Lanczos3,
-            );
             let px = i64::from(x * cell_w);
             let py = i64::from(y * cell_h);
             imageops::overlay(&mut canvas, &cell.to_rgba8(), px, py);
@@ -1142,24 +1154,36 @@ fn build_square_collage(paths: &[String], width: i32, height: i32) -> RgbaImage 
 /// width (aspect-preserved) and drawn at the top on a black canvas, under a
 /// black rectangle at alpha `0x78`. Port of
 /// `StripCollageBuilder.BuildThumbCollageBitmap` without its library-name text
-/// (TODO(gl-804): the text needs a font rasterizer and a bundled font).
-fn build_thumb_collage(paths: &[String], width: i32, height: i32) -> RgbaImage {
+/// (TODO(gl-804): the text needs a font rasterizer and a bundled font). An image
+/// the limits refuse is skipped like an undecodable one.
+fn build_thumb_collage(
+    memory: &ImageMemory,
+    paths: &[String],
+    width: i32,
+    height: i32,
+) -> RgbaImage {
     let mut canvas = RgbaImage::from_pixel(
         u32::try_from(width).unwrap_or(1),
         u32::try_from(height).unwrap_or(1),
         image::Rgba([0, 0, 0, 0xFF]),
     );
 
-    if let Some((backdrop, _)) = next_valid_image(paths, 0) {
-        // resize to the same aspect as the original (C# width * h / w).
-        let bw = i32::try_from(backdrop.width()).unwrap_or(1).max(1);
-        let bh = i32::try_from(backdrop.height()).unwrap_or(1);
-        let backdrop_height = (width * bh / bw).abs().max(1);
-        let resized = backdrop.resize_exact(
-            u32::try_from(width).unwrap_or(1),
-            u32::try_from(backdrop_height).unwrap_or(1),
-            imageops::FilterType::Lanczos3,
-        );
+    let backdrop = next_valid(paths, 0, &mut |path| {
+        let decoded = memory.decode(path).ok()?;
+        // resize to the same aspect as the original (C# width * h / w), in i64:
+        // the product overflows an i32 for an image far taller than it is wide.
+        let backdrop_height =
+            i64::from(width) * i64::from(decoded.height()) / i64::from(decoded.width().max(1));
+        memory
+            .resize_exact(
+                &decoded,
+                u32::try_from(width).unwrap_or(1),
+                u32::try_from(backdrop_height.max(1)).unwrap_or(u32::MAX),
+                imageops::FilterType::Lanczos3,
+            )
+            .ok()
+    });
+    if let Some((resized, _)) = backdrop {
         imageops::overlay(&mut canvas, &resized.to_rgba8(), 0, 0);
         // The shadow rectangle: black at alpha 0x78 over every pixel.
         for pixel in canvas.pixels_mut() {
@@ -1176,14 +1200,6 @@ fn build_thumb_collage(paths: &[String], width: i32, height: i32) -> RgbaImage {
 /// The alpha of the black rectangle `BuildThumbCollageBitmap` draws over the
 /// backdrop (`SKColors.Black.WithAlpha(0x78)`).
 const THUMB_SHADOW_ALPHA: u16 = 0x78;
-
-/// Returns the first decodable image from `start` on, plus the index one past
-/// it. See [`next_valid`].
-fn next_valid_image(paths: &[String], start: usize) -> Option<(DynamicImage, usize)> {
-    next_valid(paths, start, &mut |path| {
-        ImageCrateEncoder::decode(path).ok()
-    })
-}
 
 /// Port of `SkiaHelper.GetNextValidImage`: the first path from `start` that
 /// `load` accepts, wrapping to the start of the list, plus the index one past
@@ -1847,10 +1863,11 @@ mod tests {
         let image = DynamicImage::ImageRgb8(smooth_photo(width, height));
         ImageCrateEncoder::write(&image, &path, format.1, 90).expect("fixture");
 
-        let pixels = ImageCrateEncoder::blur_hash_pixels(&path).expect("pixels");
+        let memory = ImageMemory::default();
+        let pixels = ImageCrateEncoder::blur_hash_pixels(&memory, &path).expect("pixels");
         assert_eq!(pixels.dimensions(), (expected_width, expected_height));
         // Well-formed length: 6 + (xComp*yComp - 1)*2 base83 chars.
-        let hash = ImageCrateEncoder::blur_hash_blocking(4, 3, &path).expect("hash");
+        let hash = ImageCrateEncoder::blur_hash_blocking(&memory, 4, 3, &path).expect("hash");
         assert_eq!(
             hash.len(),
             6 + (4 * 3 - 1) * 2,
@@ -2423,7 +2440,9 @@ mod tests {
 
         let mut canvas = RgbaImage::new(width * 2, height * 2);
         for (index, cell) in [(0, 0), (1, 0), (0, 1)].into_iter().enumerate() {
-            let frame = ImageCrateEncoder::decode(&frames[index]).expect("decodes");
+            let frame = ImageMemory::default()
+                .decode(&frames[index])
+                .expect("decodes");
             let (x, y) = (i64::from(cell.0 * width), i64::from(cell.1 * height));
             imageops::overlay(&mut canvas, &frame.to_rgba8(), x, y);
         }
