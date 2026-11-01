@@ -1336,21 +1336,23 @@ pub const VERIFIED: &[Verified] = &[
         path: "/UserImage",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "GetUserImage",
-        ferrofin: "handlers/images.rs get_user_image → serve_image_file (GetImageInternal, \
+        ferrofin: "handlers/images.rs get_user_image (UserImageQuery; ImageQuery::tagged, \
+               no sizes and quality 90) → serve_image_file (GetImageInternal, \
                GetImageResult) → ferrofin-drawing processor.rs process_image \
                (ImageProcessor.ProcessImage) → image_encoder.rs encode_image \
                (SkiaEncoder.EncodeImage) → limits.rs ImageMemory (SkiaEncoder.Decode, GetBitmap). \
-               userId falls back to the caller, a nil result is a 400, no user or no profile \
-               image a 404, and no credentials are needed, as upstream",
+               Only userId, tag and format are bound, so a size or a quality has no effect \
+               and a malformed one is no 400; every request reaches the processor. userId \
+               falls back to the caller, a nil result is a 400, no user or no profile image \
+               a 404, and no credentials are needed, as upstream. The hidden \
+               get_user_image_legacy and get_user_image_by_index_legacy \
+               (LegacyUserImageQuery; GetUserImageLegacy, GetUserImageByIndexLegacy) take \
+               userId from the route and bind every member those actions declare, then pass \
+               on only tag and format: measured on 12.4, a malformed size, quality, blur, \
+               percentPlayed or unplayedCount is a 400 there, a valid one has no effect, and \
+               imageIndex is a query member only on the form with no index in its route",
         date: "2026-10-31",
         divergences: &[
-            "width, height, maxWidth, maxHeight, fillWidth, fillHeight, blur and quality are \
-         honoured, and a malformed one is a 400, where upstream binds only userId, tag and \
-         format and ignores them; the default quality is 100 where upstream passes 90. Fix \
-         path: gl-1114.",
-            "A request naming no transform is served the stored file without reaching the \
-         processor, where upstream calls ProcessImage and re-encodes a source format the \
-         client's output formats do not list. Fix path: gl-1114.",
             "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
