@@ -64,6 +64,28 @@ database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
 
+## Unreleased — `/health` and `/metrics` follow the network access rules
+
+`/health` and, when metrics are on, `/metrics` now obey `EnableRemoteAccess` and the remote IP
+filter, as they do in Jellyfin. A client those rules refuse gets `503`, like every API route.
+
+A client on the local network is never refused. That network is the private address ranges, or
+what `LocalNetworkSubnets` names if it is set.
+
+**Do this if** you turned remote access off or set a remote IP filter, and a Prometheus server or
+an uptime check reads either route from outside the local network:
+
+- with remote access on, allow it in the remote IP filter;
+- with remote access off, the filter is not read, so it must be on the local network. If you add
+  it to `LocalNetworkSubnets`, list your LAN subnets too: a non-empty list replaces the private
+  ranges, and any client left out of it becomes remote and is refused;
+- or point an uptime check at `/health/ready`, which runs the same checks as `/health` and is not
+  filtered. `/health/live` is not filtered either, but it only says the process is up.
+
+`/health/live` and `/health/ready` stay unfiltered, so Kubernetes probes keep working. Loopback
+and the machine itself are always allowed. While the server is still starting, `/health` answers
+`Degraded` to everyone, as Jellyfin's does.
+
 ## Unreleased — the Collections library becomes a real library
 
 Usually nothing to do. A server that has made a collection stored its Collections library as a

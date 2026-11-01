@@ -330,3 +330,47 @@ async fn a_forwarded_entry_may_carry_a_port() {
         StatusCode::SERVICE_UNAVAILABLE
     );
 }
+
+/// `/health` is behind the gate, as upstream maps `MapHealthChecks` after
+/// `UseIPBasedAccessValidation`. `/health/live` and `/health/ready` are not:
+/// they are Ferrofin's own probes, and a kubelet's address need not be on the
+/// list an operator keeps for clients.
+#[tokio::test]
+async fn the_health_check_is_gated_and_the_orchestrator_probes_are_not() {
+    let config = NetworkConfiguration {
+        remote_ip_filter: vec!["198.51.100.0/24".to_owned()],
+        is_remote_ip_filter_blacklist: true,
+        ..NetworkConfiguration::default()
+    };
+    for (path, peer, expected) in [
+        (
+            "/health",
+            "198.51.100.4:5000",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        (
+            "/health/",
+            "198.51.100.4:5000",
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        ("/health", "203.0.113.9:5000", StatusCode::OK),
+        ("/health", "127.0.0.1:5000", StatusCode::OK),
+        ("/health/live", "198.51.100.4:5000", StatusCode::OK),
+        ("/health/ready", "198.51.100.4:5000", StatusCode::OK),
+        // The gate covers those two routes alone, not the router's fallback.
+        ("/no/such/path", "198.51.100.4:5000", StatusCode::NOT_FOUND),
+    ] {
+        let mut request = Request::builder()
+            .uri(path)
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            peer.parse::<std::net::SocketAddr>().expect("peer address"),
+        ));
+        let response = create_router(state_with_network(config.clone()))
+            .oneshot(request)
+            .await
+            .expect("response");
+        assert_eq!(response.status(), expected, "{path} from {peer}");
+    }
+}

@@ -1,8 +1,9 @@
 # Configuration
 
 Every runtime setting below is listed in jellyfin-web under **Dashboard → Plugins → Ferrofin →
-Settings** ([Seeing what is set](#seeing-what-is-set)). The page is read-only so far: a setting
-is changed in one of the three places below.
+Settings** ([Seeing what is set](#seeing-what-is-set)). That page edits the ones it may change and
+saves them to `config.toml` ([Editing settings from the dashboard](#editing-settings-from-the-dashboard)),
+the last of the three places below; the first two are set where the server is started.
 
 Ferrofin is configured three ways, **highest precedence first**:
 
@@ -62,6 +63,51 @@ dashboard menu's **Ferrofin** entry. It lists the settings in groups (Paths, Net
 identity, ffmpeg, Library and database, Observability, Metadata providers, Images, WASM plugins), each
 with its value, default, source, variable and flag, and the reason for any it may not change;
 secrets are marked as secrets. Disabling the plugin hides the page and the menu entry.
+
+### Editing settings from the dashboard
+
+The same page edits the settings it may change, and saves them to `config.toml`: the file it
+names at the top, chosen as [above](#configuration). When the server cannot write that file the
+page says so beside its name, and a save fails with a message naming it.
+
+Each editable setting has a control for its kind: a checkbox for on or off, a number box with the
+setting's limits, an **Auto** checkbox with a number box for a count that can be `auto`, a text
+box for text, a URL or a path, and a text box with its items separated by commas for a list (so a
+list here cannot hold a path with a comma in it). A secret is a plain text box, marked as a
+secret: administrators see these values.
+
+**Save** sends only the settings changed ([`POST /Ferrofin/Settings`](#saving-from-the-web)). The
+server checks them, not the browser, and a refused change shows the server's message next to the
+setting it names, or at the top of the page when it names none, such as a file that cannot be
+written. Nothing is saved then, and every edit stays on the page to correct. **Reset to default**
+marks a setting `config.toml` holds, and Save removes its key, so the default applies after the
+restart. Restarting with edits not yet saved asks first, since it drops them.
+
+Flags and variables outrank `config.toml`, so a setting one of them sets has no control. The page
+shows it locked, with a note naming the flag or variable and where that is changed. These have no
+control whatever sets them, each with its reason on the page:
+
+- the directories (`data_dir`, `config_dir`, `cache_dir`, `web_dir`): changing one from the web
+  could point the server at other files;
+- `ffmpeg_path` and `ffprobe_path`: the web may not choose an executable the server runs;
+- the first-boot seed settings (`library_roots`, `admin_user`, `admin_password`): they are used
+  only when the database is created;
+- `disable_extensions`: a measurement switch, set where a benchmark starts the server;
+- `wasm_private_http_allow`: it lets the plugins it names reach private addresses, so it is set by
+  hand in `config.toml` or its variable, and an admin session alone cannot grant it;
+- the settings jellyfin-web's own pages cover: `bind_addr`, `published_url`, `port`, `https_port`
+  and `base_url` under Dashboard → Networking, `server_name` and `enable_metrics` under
+  Dashboard → General (Networking does not drive `port`, `https_port` and `base_url` yet, so their
+  notes say to set them by hand in `config.toml`, or with their variable or flag);
+- the OpenTelemetry variables, which `config.toml` has no key for.
+
+A saved change [applies at the next restart](#when-a-change-applies). After a save the page shows
+the new value beside the one in use, marked as saved, and a **Restart now** button beside the
+pending-restart notice. It runs the in-process restart, waits for the server to answer again and
+shows the values now in effect. The settings the in-process restart keeps (`log_level`,
+`log_format`, `metrics_scan_duration_buckets`) say so on their row before and after saving, and
+the notice lists any just saved: they need a full process restart, so restart the container or
+service.
 
 ### When a change applies
 
