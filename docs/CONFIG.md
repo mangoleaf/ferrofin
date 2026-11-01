@@ -293,6 +293,21 @@ it, or the server can reach the limit first. At log level `debug`, a thumbnail r
 image and the setting that refused it. A change applies at the next restart, the dashboard's
 in-process restart included.
 
+## Remote images
+
+Artwork that lives at a URL, such as a channel logo from an M3U playlist, is downloaded the first
+time a client asks for it. These settings bound what that can cost. One URL is downloaded by one
+request at a time, and the others wait for the result.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` | `64` | The largest remote image Ferrofin downloads, in MiB, clamped to `16`–`256` (a value outside logs a warning). A response that declares more is refused unread, and a read stops at the limit whatever the response declared. The limit covers everything downloaded from a metadata provider as bytes: channel logos, scan artwork, the **Download** button in the image editor, and OMDb and OpenSubtitles responses. The scan moves on to the provider's next image, saying so at log level `debug`. A download also has to finish within `FERROFIN_PROVIDER_TIMEOUT_SECONDS`, so raising the limit may need that raised too. The `config.toml` key is `image_download_max_mb`. |
+| `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS` | `3600` | How long a logo URL that gave no image is left alone before it is tried again, in seconds, clamped to `300`–`86400` (a value outside logs a warning). That is a `404` or `403`, a response that is not an image, an empty one included, or one over the limit. A connection failure, a timeout, another status or a provider cooldown is not remembered, so it cannot hide a good image. Until the time is up the client gets a `404`, and Ferrofin keeps the image's row, where Jellyfin removes it. The memory is held per process and a restart clears it. The `config.toml` key is `image_negative_cache_ttl_secs`. |
+
+An image must look like one, whatever the response declares: JPEG, PNG, GIF, WebP, BMP, TIFF, ICO,
+AVIF, HEIC, JPEG XL, JPEG 2000 or uncompressed SVG. Anything else is refused and never stored. A
+change applies at the next restart, the dashboard's in-process restart included.
+
 ## Remote metadata provider keys
 
 Every remote provider is compiled in and enabled per library through the fetcher

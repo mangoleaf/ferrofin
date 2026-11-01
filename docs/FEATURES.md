@@ -73,6 +73,10 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     saved again; a new one goes last. Jellyfin lists them by a random id it draws again on
     every save, so its backdrop order reshuffles. An item adopted from Jellyfin can show
     its backdrops in a different order once.
+  - **Accepted divergence (a fix, not a gap):** a tuner's or guide's artwork must be an
+    `http` or `https` URL, and any other value is ignored. Jellyfin also accepts a local
+    path there. Logos set in the metadata editor, and the ones an adopted Jellyfin database
+    downloaded, keep working.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's

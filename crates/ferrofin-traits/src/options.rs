@@ -38,5 +38,5 @@ pub use internal_items_query::{
     ConflictingFilters, DescendantQueryRoots, InternalItemsQuery, SourceType,
 };
 pub use internal_people_query::InternalPeopleQuery;
-pub use item_image_info::ItemImageInfo;
+pub use item_image_info::{ItemImageInfo, ItemImagesToServe};
 pub use latest_items_query::{LATEST_ITEMS_FALLBACK_LIMIT, LatestItemsQuery};

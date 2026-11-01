@@ -172,12 +172,16 @@ impl TunerStreamSource for ReqwestTunerSource {
         url: &str,
         headers: &HashMap<String, String>,
     ) -> Result<Box<dyn TunerStreamBody>, ServiceError> {
+        let failed = |e| {
+            let source = crate::fetch::redact_url(url);
+            LiveTvError::http(format!("open tuner stream {source}"), e)
+        };
         let response = Self::with_headers(self.client.get(url), headers)
             .send()
             .await
-            .map_err(|e| LiveTvError::http(format!("open tuner stream {url}"), e))?
+            .map_err(failed)?
             .error_for_status()
-            .map_err(|e| LiveTvError::http(format!("open tuner stream {url}"), e))?;
+            .map_err(failed)?;
         Ok(Box::new(ReqwestTunerBody { response }))
     }
 
@@ -600,7 +604,8 @@ pub async fn open_shared_http_stream(
         task.abort();
         let _ = tokio::fs::remove_file(&temp_path).await;
         Err(ServiceError::backend(format!(
-            "zero bytes copied from live stream {url}"
+            "zero bytes copied from live stream {}",
+            crate::fetch::redact_url(url)
         )))
     }
 }
