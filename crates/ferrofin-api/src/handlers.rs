@@ -1175,8 +1175,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    UserRootFolder.GetEligibleChildrenForRecursiveChildren); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
                    routes that take a scope (ItemsController.GetItems, \
-                   LibraryManager.AddUserToQuery)",
-        date: "2026-10-31",
+                   LibraryManager.AddUserToQuery); handlers/live_tv.rs \
+                   query_programs_inner (LiveTvController.GetLiveTvPrograms, GetPrograms)",
+        date: "2026-11-01",
         divergences: &[
             "A request naming an item as its scope (parentId, ids, seriesId, appearsInItemId) \
              stops at the libraries the user may open, on every route that takes one: a \
@@ -1185,6 +1186,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              IsVisibleStandalone. Upstream applies IsVisible alone, on GET /Items and GET \
              /Trailers. A BoxSet or Playlist browse that re-roots to the user root skips the \
              check, as upstream. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091).",
+            "GET and POST /LiveTv/Programs read librarySeriesId's row as the request's user, so \
+             a series that user cannot open (library, rating or tag rules) answers like an id \
+             that is no series: IsSeries stays forced and its title is not searched for. \
+             Upstream's GetItemById<Series> reads it with no user, and a request with no user \
+             still does here. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091; \
+             gl-1113). Fix path for the rest: gl-1130.",
         ],
     },
 ];
