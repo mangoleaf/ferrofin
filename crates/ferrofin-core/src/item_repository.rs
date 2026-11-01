@@ -11271,6 +11271,7 @@ mod tests {
                 rows,
                 ancestors: Vec::new(),
                 options,
+                physical_locations: HashMap::new(),
             });
         assert!(db.cached_libraries().is_some(), "the set is cached");
     }

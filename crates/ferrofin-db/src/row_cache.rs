@@ -1,6 +1,7 @@
 //! Cross-request caches of the rows the per-user visibility check reads on every by-id request: a
 //! user's `Permissions` and `Preferences`, and the library set (every `CollectionFolder` row and
-//! each library's options). They change rarely and were read several times per request (gl-973).
+//! each library's options and physical locations). They change rarely and were read several times
+//! per request (gl-973).
 //!
 //! Every runtime writer of those rows invalidates what it wrote, after its commit:
 //! [`Database::invalidate_user_policy`], [`Database::invalidate_all_user_policies`],
@@ -67,7 +68,7 @@ impl UserPolicyRows {
 }
 
 /// The library set: every `CollectionFolder` row, the rows above them (the user root and the root
-/// folder), and each library's options, keyed by row id.
+/// folder), and each library's options and physical locations, keyed by row id.
 #[derive(Debug, Clone, Default)]
 pub struct LibrarySet {
     /// The `CollectionFolder` rows.
@@ -76,6 +77,10 @@ pub struct LibrarySet {
     pub ancestors: Vec<BaseItemEntity>,
     /// Each library's options, by the row's id.
     pub options: HashMap<Uuid, LibraryOptions>,
+    /// Each library's `PhysicalLocationsList` from its row's `Data`, by the row's id, parsed once
+    /// when the set is read. As stored, like the rows: a virtual-path token is still in it, and
+    /// a reader that compares real paths expands them itself.
+    pub physical_locations: HashMap<Uuid, Vec<String>>,
 }
 
 #[derive(Debug)]
