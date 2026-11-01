@@ -1139,7 +1139,9 @@ impl FerrofinItemRepository {
             // like Live TV or Playlists, or any id on a Ferrofin database,
             // where the view IS the top parent — contributes itself. Replacing
             // the whole set whenever *one* id expanded would silently drop the
-            // scopes that did not.
+            // scopes that did not. A view that stands for libraries is not
+            // expanded here, so it matches nothing: scope one with a recursive
+            // `parent_id`, which the branch above translates.
             let by_view = library_top_parents_by_view(&self.db, &filter.top_parent_ids).await?;
             let mut expanded = Vec::with_capacity(filter.top_parent_ids.len());
             let changed = !by_view.is_empty();

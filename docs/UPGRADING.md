@@ -8,6 +8,12 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Restarting the server needs an administrator
+
+`POST /System/Restart` now requires an administrator or an API key from every address, as
+`POST /System/Shutdown` always has. An ordinary account on the local network could use it
+before and now gets a `403`, so a script that restarts the server with one needs an API key.
+
 ## Image limits
 
 Decoding and resizing images are now bounded, and the bounds are settings
@@ -79,6 +85,31 @@ The reason is in the server log, as a `login failed` warning with a `reason` fie
 `max_sessions`. A Quick Connect exchange refused because Quick Connect is off is logged at
 `debug` only. Other failures on these routes (`400`, `404`, `500`) and every other route keep
 their bodies.
+
+## Unreleased — a progressive transcode needs a token
+
+Usually nothing to do. A `GET` on `/Videos/{id}/stream[.{container}]` or
+`/Audio/{id}/stream[.{container}]` that would start ffmpeg now needs a user token or an API key,
+in the `Authorization` header or the `ApiKey` query parameter. With neither it answers `401`. This
+differs from Jellyfin on purpose, where these routes are anonymous. The usual account rules apply
+to it too: a disabled account gets `401`, and a user outside their access schedule, or remote with
+remote access off, gets `403`.
+
+- Clients that follow the server's `TranscodingUrl` are unaffected: it carries `ApiKey`.
+- `HEAD` requests and static reads (`static=true`) stay anonymous, as on Jellyfin. The exception
+  is a static read of a Blu-ray or DVD folder, which only ffmpeg can serve, so it needs a token too.
+- A script or player that builds its own transcode URL has to add `ApiKey=`. The lowercase
+  `api_key=` counts only with `EnableLegacyAuthorization` on, which is off by default.
+## Unreleased — a photo's image follows its file
+
+A photo's image now carries the file's date and is measured again each time the photo refreshes,
+as in Jellyfin. A photo edited in place gets its new size, aspect ratio, blur hash and image tag
+on the next scan, and clients fetch the new picture. A plain scan of an unchanged library still
+reads no photo. A full refresh now reads every photo it covers, once.
+
+**Do this if** you edited photos in place on an earlier version: they keep their old size and blur
+hash until they next refresh, because nothing tells a scan they changed. Refresh those photos, or
+the library, with **Replace all metadata** or **Search for missing metadata**.
 
 ## Unreleased — `/health` and `/metrics` follow the network access rules
 
