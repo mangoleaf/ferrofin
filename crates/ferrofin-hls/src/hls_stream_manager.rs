@@ -1583,6 +1583,7 @@ mod tests {
                 segment_container: Some(self.segment_container.clone()),
                 play_session_id: Some("sess".to_owned()),
                 device_id: Some("dev".to_owned()),
+                user_id: None,
             };
             // The real planner's event args differ; the fake tags them so the
             // live path's choice of plan is observable.

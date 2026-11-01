@@ -339,6 +339,10 @@ pub struct EncodingJobInfo {
     pub play_session_id: Option<String>,
     /// The device id this job streams to (`Request.DeviceId`).
     pub device_id: Option<String>,
+    /// The authenticated user this job transcodes for (`StreamState.User`);
+    /// `None` for a userless API key. The transcode manager's per-user cap
+    /// counts by it.
+    pub user_id: Option<uuid::Uuid>,
 }
 
 impl EncodingJobInfo {
@@ -688,6 +692,7 @@ mod derived_state_tests {
             segment_container: None,
             play_session_id: None,
             device_id: None,
+            user_id: None,
         }
     }
 

@@ -463,6 +463,10 @@ struct RegisteredJob {
     /// The live process + cache metadata when this job was spawned via
     /// `start_ffmpeg`; `None` for registry-only jobs (lookup tests).
     running: Option<RunningJob>,
+    /// The user the job transcodes for, counted against
+    /// [`TranscodeManagerImpl::with_max_transcodes_per_user`]; `None` for a
+    /// userless API key and for registry-only jobs.
+    user_id: Option<uuid::Uuid>,
 }
 
 impl RegisteredJob {
@@ -489,6 +493,9 @@ pub struct TranscodeManagerImpl<S: SessionReporter, C: FileCleaner = FsFileClean
     /// that cannot be read once rather than on every due timer.
     throttle_options: crate::configuration::EncodingOptionsReader,
     pause_keys: super::throttler::PauseKeySlot,
+    /// The most transcodes one user may have running at once; `None` is no
+    /// limit. See [`Self::with_max_transcodes_per_user`].
+    max_transcodes_per_user: Option<usize>,
 }
 
 /// An active-consumer mark on a transcode job, released on drop.
@@ -529,7 +536,24 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
                 "transcode throttle",
             ),
             pause_keys: super::throttler::PauseKeySlot::default(),
+            max_transcodes_per_user: None,
         }
+    }
+
+    /// Caps how many transcodes one user may have running at once (`0` is no
+    /// limit). A start past the cap fails before ffmpeg is spawned, and an
+    /// API key (no user) is never capped.
+    ///
+    /// Divergence from upstream, which has no cap: one account could start
+    /// ffmpeg after ffmpeg by varying `PlaySessionId`/`DeviceId`, each pinning
+    /// CPU until the idle reaper caught it, and starve every other stream.
+    /// A job counts while its process runs; a killed job is out of the
+    /// registry at once, so a seek or a quality change (which kills the old
+    /// job before starting the new) never counts twice.
+    #[must_use]
+    pub fn with_max_transcodes_per_user(mut self, max: u32) -> Self {
+        self.max_transcodes_per_user = usize::try_from(max).ok().filter(|max| *max > 0);
+        self
     }
 
     /// Uses the persisted encoding document for each running job's timer tick.
@@ -805,9 +829,56 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
             last_activity: std::time::Instant::now(),
             handle: handle.clone(),
             running: None,
+            user_id: None,
         };
         self.jobs.lock().expect("jobs lock poisoned").push(job);
         handle
+    }
+
+    /// [`register_job`](Self::register_job) for `user`, refused when the user
+    /// already has [`max_transcodes_per_user`](Self::with_max_transcodes_per_user)
+    /// jobs whose process has not exited (a job still starting counts). The
+    /// count and the insert happen under one lock, so concurrent starts cannot
+    /// both pass the check.
+    fn register_job_for_user(
+        &self,
+        handle: &TranscodingJobHandle,
+        user: Option<uuid::Uuid>,
+    ) -> Result<(), String> {
+        let mut jobs = self.jobs.lock().expect("jobs lock poisoned");
+        if let (Some(max), Some(user)) = (self.max_transcodes_per_user, user) {
+            let running = jobs
+                .iter()
+                .filter(|job| job.user_id == Some(user))
+                .filter(|job| {
+                    job.running
+                        .as_ref()
+                        .is_none_or(|running| !running.child.has_exited())
+                })
+                .count();
+            if running >= max {
+                tracing::warn!(
+                    user_id = %user,
+                    running,
+                    limit = max,
+                    "transcode refused: the user is at the concurrent transcode limit"
+                );
+                return Err(format!(
+                    "too many concurrent transcodes for this user (limit {max})"
+                ));
+            }
+        }
+        jobs.push(RegisteredJob {
+            ping_timeout_ms: RegisteredJob::ping_timeout_for(handle.job_type),
+            display: String::new(),
+            is_user_paused: false,
+            active_request_count: 0,
+            last_activity: std::time::Instant::now(),
+            handle: handle.clone(),
+            running: None,
+            user_id: user,
+        });
+        Ok(())
     }
 
     /// Returns the number of currently registered jobs (test/inspection helper).
@@ -916,8 +987,9 @@ impl<S: SessionReporter, C: FileCleaner> TranscodeManagerImpl<S, C> {
         };
 
         // 4. Register the job FIRST (OnTranscodeBeginning), naming what it
-        // plays so a later kill/reap log doesn't reduce to ids.
-        self.register_job(handle.clone());
+        // plays so a later kill/reap log doesn't reduce to ids. Refused, before
+        // anything is spawned, when its user is at the per-user cap.
+        self.register_job_for_user(&handle, state.user_id)?;
         self.set_job_display(&handle, &display);
         // The startup wait below is the job's first consumer, as upstream's
         // `OnTranscodeBeginning` starts it at `ActiveRequestCount = 1`: it can
@@ -2059,6 +2131,7 @@ mod start_ffmpeg_tests {
             segment_container: Some("ts".to_owned()),
             play_session_id: Some("sess".to_owned()),
             device_id: Some("dev".to_owned()),
+            user_id: None,
         }
     }
 
@@ -2237,6 +2310,62 @@ mod start_ffmpeg_tests {
             vec!["-i".to_owned(), "in.mkv".to_owned()]
         );
         assert_eq!(reqs[0].output_dir, out_dir);
+    }
+
+    /// A user at the per-user cap gets an error and no ffmpeg; another user,
+    /// an API key (no user) and the same user once a job is killed still
+    /// start.
+    #[tokio::test]
+    async fn start_ffmpeg_refuses_a_user_past_the_concurrent_transcode_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = FakeSegmentTranscoder::new(FakeScript {
+            segment_files: vec!["out0.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned()],
+            ..FakeScript::default()
+        });
+        let m = manager().with_max_transcodes_per_user(2);
+        let alice = Some(uuid::Uuid::from_u128(0xA11CE));
+        let start = |name: &str, user: Option<uuid::Uuid>| {
+            let playlist = tmp.path().join(name).join("out.m3u8");
+            let mut st = state(&playlist, Some(&playlist));
+            st.play_session_id = Some(name.to_owned());
+            st.user_id = user;
+            (playlist, st)
+        };
+        let mut handles = Vec::new();
+        for name in ["a1", "a2"] {
+            let (playlist, st) = start(name, alice);
+            handles.push(
+                m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, Vec::new()))
+                    .await
+                    .expect("under the cap"),
+            );
+        }
+        let spawned = fake.requests.lock().unwrap().len();
+        let (playlist, st) = start("a3", alice);
+        let refused = m
+            .start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, Vec::new()))
+            .await
+            .expect_err("over the cap");
+        assert!(refused.contains("limit 2"), "{refused}");
+        assert_eq!(
+            fake.requests.lock().unwrap().len(),
+            spawned,
+            "nothing spawned"
+        );
+        assert_eq!(m.active_job_count(), 2);
+
+        for (name, user) in [("b1", Some(uuid::Uuid::from_u128(0xB0B))), ("key", None)] {
+            let (playlist, st) = start(name, user);
+            m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, Vec::new()))
+                .await
+                .expect("not alice's cap");
+        }
+        m.kill_and_remove(&handles[0], false, false).await;
+        let (playlist, st) = start("a4", alice);
+        m.start_ffmpeg(&fake, ffmpeg_req(&st, &playlist, Vec::new()))
+            .await
+            .expect("a killed job frees its slot");
     }
 
     #[tokio::test]
@@ -3019,6 +3148,7 @@ pub(super) mod throttle_tests {
             segment_container: Some("ts".to_owned()),
             play_session_id: Some("throttle-session".to_owned()),
             device_id: Some("throttle-device".to_owned()),
+            user_id: None,
         }
     }
     async fn fixture(

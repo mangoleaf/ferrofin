@@ -371,6 +371,7 @@ mod tests {
             segment_container: Some("ts".to_owned()),
             play_session_id: None,
             device_id: None,
+            user_id: None,
         }
     }
 

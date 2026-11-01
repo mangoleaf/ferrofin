@@ -193,6 +193,7 @@ fn state(output_path: &Path, wait_for: &Path, segment_container: &str) -> Encodi
         segment_container: Some(segment_container.to_owned()),
         play_session_id: Some("sess".to_owned()),
         device_id: Some("dev".to_owned()),
+        user_id: None,
     }
 }
 

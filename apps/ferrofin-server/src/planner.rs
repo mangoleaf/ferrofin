@@ -1022,6 +1022,7 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             segment_container: Some(segment_container.clone()),
             play_session_id: request.play_session_id.clone(),
             device_id: request.device_id.clone(),
+            user_id: request.user_id,
         };
 
         // `GetStreamingState` order: the output audio channels and bitrate are
