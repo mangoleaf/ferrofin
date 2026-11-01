@@ -96,10 +96,12 @@ menu's **Ferrofin** entry, lists every setting that route reports, in groups: th
 the default, a badge for where the value comes from (default, `config.toml`, environment or
 flag), the environment variable and flag that set it, and, for a setting the page may not
 change, a lock with the reason and where it is changed instead. Secrets are shown to the
-administrator, marked as secrets. The page is read-only so far. It holds no setting itself,
-since `GET /web/ConfigurationPage` is anonymous: its script reads them from the admin-only route
-and sets every string as text, never as HTML. Disabling the plugin removes the page and the menu
-entry.
+administrator, marked as secrets. A setting the page may change has a control for its kind and
+**Reset to default**: Save posts the changed ones, a refused value shows the server's message next
+to it, and **Restart now** applies them ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)).
+The page holds no setting itself, since `GET /web/ConfigurationPage` is anonymous: its script reads
+them from the admin-only route and sets every string as text, never as HTML. Disabling the plugin
+removes the page and the menu entry.
 
 The extension is first-party, so it has no row or pin in
 [`PLUGINS_UPSTREAM.md`](PLUGINS_UPSTREAM.md): its page

@@ -1079,6 +1079,18 @@ fn present(value: Value) -> Option<Value> {
     (!value.is_null()).then_some(value)
 }
 
+/// The value `file`, `config.toml` as it is now, gives `spec`, when `in_use` is
+/// the value in use. A count's `auto` runs as no value, so it is named here:
+/// the file holds it, and the page shows it as saved.
+fn file_value(spec: &SettingSpec, file: &Config, in_use: Option<&Value>) -> Option<Value> {
+    match (spec.running)(file) {
+        Value::Null if spec.kind == SettingKind::CountOrAuto && in_use.is_some() => {
+            Some(json!("auto"))
+        }
+        value => present(value),
+    }
+}
+
 /// What the page receives for `spec`. `running` is the configuration in use;
 /// `saved` is `config.toml` as it is now, loaded alone, when it has keys.
 fn setting(
@@ -1104,7 +1116,7 @@ fn setting(
         .filter(|_| {
             spec.access != SettingAccess::EnvOnly && file_keys.iter().any(|key| key == spec.key)
         })
-        .and_then(|saved| present((spec.running)(saved)))
+        .and_then(|saved| file_value(spec, saved, value.as_ref()))
         .filter(|saved| Some(saved) != value.as_ref());
     let locked_reason = locked_reason(spec, source, env);
     let (kind, min, max) = spec.kind.to_dto();
