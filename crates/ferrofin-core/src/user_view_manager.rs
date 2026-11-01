@@ -1179,6 +1179,7 @@ pub(crate) fn visible_item_query(
         user: Some(user.clone()),
         top_parent_ids,
         group_by_presentation_unique_key: false,
+        checks_playlist_visibility: true,
         ..Default::default()
     }
 }

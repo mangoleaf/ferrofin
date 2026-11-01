@@ -70,6 +70,31 @@ database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
 
+## Unreleased — stream routes hold a signed-in user to their account
+
+Usually nothing to do. A request that carries a user's token is now checked on the video and audio
+stream, HLS, universal audio, subtitle `Stream.{format}` and attachment routes, as it already was
+on `/Items/{id}` and `PlaybackInfo`. This differs from Jellyfin on purpose, where the stream and
+HLS routes read an item by id alone.
+
+- An item, or a version named by `mediaSourceId`, in a library the user may not open answers `404`.
+  That includes an item in a disabled library, for an administrator too, as on `PlaybackInfo`.
+- A user outside their access schedule (administrators are not held to one), or remote with remote access
+  off, gets `403`. A locked-out account's token gets `401`.
+- A channel answers as its `PlaybackInfo` does. A DVR recording needs "Allow Live TV access" unless
+  the user is an administrator, or it answers `404`.
+- A recording whose file lies in a library the user may not open, or on a channel hidden from them,
+  is `404`. That also applies to `GET` and `DELETE /LiveTv/Recordings/{id}`.
+
+**What this does not do:** it binds a client that sends its token, not someone who leaves it off.
+
+- A request with no credential stays anonymous, and so does a token the server does not recognise,
+  such as a revoked one: disabling an account from the dashboard revokes its tokens. A static read
+  or an anonymous subtitle read still works for such a request. Starting a transcode does not.
+- An API key is not limited to any library.
+- The lowercase `api_key=` counts only with `EnableLegacyAuthorization` on, which is off by default.
+  Without it a URL carrying only that reads as no credential.
+
 ## Unreleased — a progressive transcode needs a token
 
 Usually nothing to do. A `GET` on `/Videos/{id}/stream[.{container}]` or

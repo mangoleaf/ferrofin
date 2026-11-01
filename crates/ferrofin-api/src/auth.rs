@@ -204,24 +204,40 @@ pub(crate) async fn default_authorization(
     if info.is_api_key {
         return Ok(info);
     }
+    let client = state.client_address(parts);
+    let policy = user_authorization(&info, client, state, validate_schedule).await?;
+    info.user_policy = Some(policy);
+    Ok(info)
+}
+
+/// The user half of [`default_authorization`], for a caller that holds the
+/// [`AuthorizationInfo`] and has only to know the verdict: the user's policy
+/// once it allows `client`, read from `info` when the token cache supplied it.
+///
+/// A stream route answers a request this way, so that one with no credential
+/// stays anonymous while one naming a user is held to that user's account
+/// (`handlers::streaming::require_streamable_item`).
+pub(crate) async fn user_authorization(
+    info: &AuthorizationInfo,
+    client: std::net::IpAddr,
+    state: &AppState,
+    validate_schedule: bool,
+) -> Result<std::sync::Arc<ferrofin_model::users::UserPolicy>, ApiError> {
     if info.user_id().is_nil() {
         return Err(ApiError::Forbidden("user identity required".to_owned()));
     }
-    if info.user_policy.is_none()
-        && let Some(user) = &info.user
-    {
-        info.user_policy = crate::handlers::users::user_policy(state, user)
+    let policy = match (&info.user_policy, &info.user) {
+        (Some(policy), _) => Some(std::sync::Arc::clone(policy)),
+        (None, Some(user)) => crate::handlers::users::user_policy(state, user)
             .await?
-            .map(std::sync::Arc::new);
+            .map(std::sync::Arc::new),
+        (None, None) => None,
     }
-    let policy = info
-        .user_policy
-        .as_ref()
-        .ok_or_else(|| ApiError::Forbidden("user policy required".to_owned()))?;
+    .ok_or_else(|| ApiError::Forbidden("user policy required".to_owned()))?;
     if policy.is_disabled {
         return Err(ApiError::Unauthorized("account disabled".to_owned()));
     }
-    if !state.is_in_local_network(state.client_address(parts)) && !policy.enable_remote_access {
+    if !state.is_in_local_network(client) && !policy.enable_remote_access {
         return Err(ApiError::Forbidden(
             "remote access is not permitted for this user".to_owned(),
         ));
@@ -234,7 +250,7 @@ pub(crate) async fn default_authorization(
             "outside this user's access schedule".to_owned(),
         ));
     }
-    Ok(info)
+    Ok(policy)
 }
 
 /// Jellyfin's default policy: authenticated API key or user, with remote access

@@ -84,9 +84,11 @@ async fn get_suggestions(
 
     let result = state.library.query_items(&internal).await?;
     let options = DtoOptions::default();
+    // `SuggestionsController` passes no `skipVisibilityCheck`: unlike `/Items`,
+    // the page goes through `IsVisible`.
     let dtos = state
         .dto
-        .get_base_item_dtos(&result.items, &options, user.as_ref(), None, true)
+        .get_base_item_dtos(&result.items, &options, user.as_ref(), None, false)
         .await?;
     Ok(Json(QueryResult::new(
         query.start_index,
