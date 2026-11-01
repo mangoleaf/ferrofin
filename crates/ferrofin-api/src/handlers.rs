@@ -2219,9 +2219,6 @@ pub const VERIFIED: &[Verified] = &[
             "A UserView parent reports no collection type, so a grouped movies or TV view is \
          neither narrowed to Movie or Episode nor short-circuited, where upstream reads \
          UserView.CollectionType. Fix path: gl-1108.",
-            "The playlists folder sorts among the libraries, where upstream appends it after \
-         them, so it can be an unscoped grouped request's first typed parent, which then \
-         takes the plain query. Fix path: gl-1110.",
             "A Channel parent answers empty: upstream's channel manager reads plugin channels, \
          and Ferrofin has none (native .NET plugin loading is out of scope).",
             "The 400 (an API key with no userId, or a value the query binder cannot convert), \

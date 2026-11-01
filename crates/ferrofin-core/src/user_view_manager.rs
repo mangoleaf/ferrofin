@@ -1076,11 +1076,18 @@ impl UserViewManager for FerrofinUserViewManager {
             .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
         let folders = self.root_children().await?;
         let visible = visibility.visible(&folders, user, false).await?;
-        Ok(folders
+        // `UserRootFolder.GetEligibleChildrenForRecursiveChildren`: the
+        // libraries in the `SortName` order `Children` reads them, then
+        // `RootFolder.VirtualChildren`, the playlists folder.
+        let (libraries, virtual_children): (Vec<_>, Vec<_>) = folders
             .into_iter()
             .zip(visible)
             .filter_map(|(folder, allowed)| allowed.then_some(folder))
-            .collect())
+            .partition(|folder| {
+                item_type_lookup::kind_from_type_name(&folder.type_)
+                    == Some(BaseItemKind::CollectionFolder)
+            });
+        Ok(libraries.into_iter().chain(virtual_children).collect())
     }
 
     async fn get_latest_items(
@@ -1596,9 +1603,7 @@ impl FerrofinUserViewManager {
             // EVERY library, one per key, grouped below — a burst of new tracks
             // can fill it with a few album cards. That is upstream's behaviour
             // (the owner chose to follow v12 here on 2026-10-24), not an
-            // artifact of this port. Upstream's parents end with the playlists
-            // folder, though, and here it sorts among the libraries, so it can
-            // be the first typed parent and take the plain query: gl-1110.
+            // artifact of this port.
             //
             // The `null`-collection-type arm v12 added beside them
             // (`:425-429`, a MIXED library's latest movies and shows) is not
@@ -3519,6 +3524,91 @@ mod tests {
             .filter_map(|row| row.name.as_deref())
             .collect();
         assert_eq!(names, ["Music", "Playlists"]);
+    }
+
+    /// `UserRootFolder.GetEligibleChildrenForRecursiveChildren` appends
+    /// `RootFolder.VirtualChildren` to the libraries, which `GetChildren`
+    /// keeps in `SortName` order. `LibraryController.GetMediaFolders` sorts the
+    /// concatenation instead, so there the folder stays among the libraries.
+    /// Both spellings: `root_children` reads the one an older Ferrofin wrote too.
+    #[rstest]
+    #[case(BaseItemKind::PlaylistsFolder)]
+    #[case(BaseItemKind::ManualPlaylistsFolder)]
+    #[tokio::test]
+    async fn the_user_root_children_list_the_playlists_folder_after_the_libraries(
+        #[case] kind: BaseItemKind,
+    ) {
+        let db = test_db().await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0xAA24)).await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        let playlists = Uuid::from_u128(0xAA25);
+        seed_named_item(&db, playlists, kind, "Playlists").await;
+        seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "TV Shows").await;
+        let mgr = manager(&db).with_visibility(visibility(&db));
+        let names = |rows: Vec<BaseItemEntity>| {
+            rows.into_iter()
+                .filter_map(|row| row.name)
+                .collect::<Vec<String>>()
+        };
+
+        assert_eq!(
+            names(mgr.get_user_root_children(&user).await.expect("children")),
+            ["Movies", "TV Shows", "Playlists"]
+        );
+        assert_eq!(
+            names(mgr.get_media_folders().await.expect("folders")),
+            ["Movies", "Playlists", "TV Shows"]
+        );
+    }
+
+    /// The first typed parent decides an unscoped grouped request, and the
+    /// playlists folder's type matches no arm of `GetItemsForLatestItems`. So
+    /// it must not come before a tvshows library that sorts after it: series A
+    /// has twelve newer episodes, the plain query's `limit * 5 = 10` rows are
+    /// all A's, and only the tvshows arm reaches B.
+    #[tokio::test]
+    async fn an_unscoped_latest_takes_the_arm_of_a_library_sorting_after_playlists() {
+        let db = test_db().await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0xAA26)).await;
+        seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "TV Shows").await;
+        let playlists = Uuid::from_u128(0xAA27);
+        seed_named_item(&db, playlists, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        let (sa, sb) = (Uuid::from_u128(0xAA31), Uuid::from_u128(0xAA32));
+        let b_new = Uuid::from_u128(0xAA33);
+        let a_eps: Vec<Uuid> = (1..=12).map(|n| Uuid::from_u128(0xAA40 + n)).collect();
+        let a_names: Vec<String> = (1..=12).map(|n| format!("A e{n:02}")).collect();
+        let mut rows = vec![
+            Row::new(sa, BaseItemKind::Series, "A", day(1), SHOWS),
+            Row::new(sb, BaseItemKind::Series, "B", day(1), SHOWS),
+            Row::new(b_new, BaseItemKind::Episode, "B e1", day(8), SHOWS)
+                .under(sb)
+                .of_series(sb, "B"),
+        ];
+        for (id, name) in a_eps.iter().zip(&a_names) {
+            rows.push(
+                Row::new(*id, BaseItemKind::Episode, name, day(9), SHOWS)
+                    .under(sa)
+                    .of_series(sa, "A"),
+            );
+        }
+        seed(&db, &rows).await;
+        let mgr = manager_with_folders(&db, vec![(SHOWS, Some(CollectionTypeOptions::tvshows))])
+            .with_visibility(visibility(&db));
+
+        let groups = latest(
+            &mgr,
+            LatestItemsQuery {
+                user: Some(user),
+                limit: Some(2),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            shape(&groups),
+            vec![(Some(sa), vec![a_eps[11]]), (Some(sb), vec![b_new])]
+        );
     }
 
     /// Every library is not a fallback for an evaluator that was never wired.
