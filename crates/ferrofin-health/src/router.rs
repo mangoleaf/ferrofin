@@ -29,7 +29,8 @@ type Checkers = Arc<Vec<(Arc<dyn HealthChecker>, AtomicBool)>>;
 ///   fail.
 ///
 /// The returned [`Router`] carries no other state and can be `.merge`d into a
-/// service's main router.
+/// service's main router. It carries no IP filter either: a server that has
+/// one and wants `/health` behind it, as Jellyfin has, uses [`health_routers`].
 ///
 /// # Examples
 ///
@@ -43,6 +44,15 @@ type Checkers = Arc<Vec<(Arc<dyn HealthChecker>, AtomicBool)>>;
 /// let _router = health_router(checkers);
 /// ```
 pub fn health_router(checkers: Vec<Arc<dyn HealthChecker>>) -> Router {
+    let (check, probes) = health_routers(checkers);
+    check.merge(probes)
+}
+
+/// [`health_router`] in two parts, for a server that puts different middleware
+/// in front of each. Returns `(check, probes)`: `/health` (and `/health/`),
+/// which is Jellyfin's route, and the orchestrator probes `GET /health/live` and
+/// `GET /health/ready`, which are Ferrofin's own.
+pub fn health_routers(checkers: Vec<Arc<dyn HealthChecker>>) -> (Router, Router) {
     let checkers: Checkers = Arc::new(
         checkers
             .into_iter()
@@ -50,12 +60,15 @@ pub fn health_router(checkers: Vec<Arc<dyn HealthChecker>>) -> Router {
             .collect(),
     );
 
-    Router::new()
+    let check = Router::new()
         .route("/health", any(health))
         .route("/health/", any(health))
+        .with_state(checkers.clone());
+    let probes = Router::new()
         .route("/health/live", get(liveness))
         .route("/health/ready", get(readiness))
-        .with_state(checkers)
+        .with_state(checkers);
+    (check, probes)
 }
 
 /// The name [`startup_router`]'s readiness reports as failing.

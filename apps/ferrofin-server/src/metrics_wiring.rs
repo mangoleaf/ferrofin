@@ -73,9 +73,23 @@ const UPTIME_SECONDS: &str = "ferrofin_uptime_seconds";
 /// The layer is added via [`Router::layer`] so it runs AFTER routing (it sees
 /// `MatchedPath` + the final status). It sits inside the outermost
 /// `canonicalize_path_case` wrap the caller applies later.
-pub fn mount(router: Router, metrics: &MetricsHandle) -> Router {
+///
+/// `/metrics` sits behind the same IP-access gate as the API
+/// ([`ferrofin_api::ip_access::ip_access_layer`]), as upstream's `MapMetrics`
+/// runs after `UseIPBasedAccessValidation` (`Startup.cs`). Merged beside the
+/// API router it was outside that gate, so `RemoteIPFilter` and
+/// `EnableRemoteAccess = false` did not cover it. `route_layer`, because `layer`
+/// would also take over the merged router's fallback, so turning metrics on
+/// would change what a refused peer gets for an unknown path.
+pub fn mount(router: Router, metrics: &MetricsHandle, state: &ferrofin_api::AppState) -> Router {
+    let gated = metrics
+        .router()
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            ferrofin_api::ip_access::ip_access_layer,
+        ));
     router
-        .merge(metrics.router())
+        .merge(gated)
         .layer(axum::middleware::from_fn(ferrofin_metrics::track_http))
 }
 

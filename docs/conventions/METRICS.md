@@ -186,9 +186,10 @@ enumerable at review time:
   Ferrofin is a LAN media server whose exposure model is Jellyfin's, and matching
   Jellyfin's behavior is the product requirement. If Ferrofin ever grows a
   public-ingress deployment story, revisit this rule before shipping it.
-- The endpoint is unauthenticated when enabled (Jellyfin parity). The cardinality
-  rules (rule 5) are what keep that acceptable — nothing user-identifying may
-  appear in the exposition. Content-Type is
+- The endpoint is unauthenticated when enabled (Jellyfin parity), and behind the
+  IP-access gate (`EnableRemoteAccess`, `RemoteIPFilter`), as upstream maps it after
+  `UseIPBasedAccessValidation`. The cardinality rules (rule 5) are what keep that
+  acceptable — nothing user-identifying may appear in the exposition. Content-Type is
   `text/plain; version=0.0.4; charset=utf-8`.
 - Scrape cadence assumption is 15 s (`contrib/metrics/prometheus.yml`); the
   sampler interval matches it (default 15 s), and is tunable via the bootstrap knob

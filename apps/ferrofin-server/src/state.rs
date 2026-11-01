@@ -525,7 +525,15 @@ pub async fn build_app_state(
     // honoured instead of serving the full-size original.
     // One encoder for the processor, trickplay and the scan's splashscreen
     // pass, which writes `{data}/splashscreen.png`.
-    let image_encoder = Arc::new(ImageCrateEncoder::new().with_data_path(paths.data_path()));
+    let image_encoder = Arc::new(
+        ImageCrateEncoder::new()
+            .with_data_path(paths.data_path())
+            .with_limits(ferrofin_drawing::ImageLimits::from_settings(
+                config.image_decode_max_megapixels,
+                config.image_decode_max_memory_mb,
+                config.image_resize_budget_mb,
+            )),
+    );
     let image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
         ImageProcessor::new(Arc::clone(&image_encoder) as _, cache_root.child("images"))
             .with_encoding_limit(image_encoding_limit),

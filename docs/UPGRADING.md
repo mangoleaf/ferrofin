@@ -8,6 +8,19 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Image limits
+
+Decoding and resizing images are now bounded, and the bounds are settings
+([Image limits](CONFIG.md#image-limits)). The defaults keep what most libraries do, but past
+one of them a client gets the original file instead of a thumbnail:
+
+- an image over 200 megapixels, which also gets no blur hash;
+- a Photo item needing more than 512 MiB to decode, which other images were already held to;
+- a resize needing more than 2 GiB of working memory, about 13000 pixels of source width by
+  10000 of output height.
+
+A photo library with larger panoramas may want `FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS` raised.
+
 ## Kubernetes: stop the old pod first for heavy migrations
 
 The Helm chart's default rolling update keeps the old pod serving and writing the database
@@ -38,6 +51,28 @@ is marked failed while the migration goes on running. Do not use `--atomic` or
 database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
+
+## Unreleased — `/health` and `/metrics` follow the network access rules
+
+`/health` and, when metrics are on, `/metrics` now obey `EnableRemoteAccess` and the remote IP
+filter, as they do in Jellyfin. A client those rules refuse gets `503`, like every API route.
+
+A client on the local network is never refused. That network is the private address ranges, or
+what `LocalNetworkSubnets` names if it is set.
+
+**Do this if** you turned remote access off or set a remote IP filter, and a Prometheus server or
+an uptime check reads either route from outside the local network:
+
+- with remote access on, allow it in the remote IP filter;
+- with remote access off, the filter is not read, so it must be on the local network. If you add
+  it to `LocalNetworkSubnets`, list your LAN subnets too: a non-empty list replaces the private
+  ranges, and any client left out of it becomes remote and is refused;
+- or point an uptime check at `/health/ready`, which runs the same checks as `/health` and is not
+  filtered. `/health/live` is not filtered either, but it only says the process is up.
+
+`/health/live` and `/health/ready` stay unfiltered, so Kubernetes probes keep working. Loopback
+and the machine itself are always allowed. While the server is still starting, `/health` answers
+`Degraded` to everyone, as Jellyfin's does.
 
 ## Unreleased — the Collections library becomes a real library
 

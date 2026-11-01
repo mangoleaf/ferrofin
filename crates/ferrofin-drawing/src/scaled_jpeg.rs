@@ -30,6 +30,8 @@ use image::metadata::Orientation;
 use image::{DynamicImage, GrayImage, RgbImage};
 use jpeg_decoder::{CodingProcess, Decoder, PixelFormat};
 
+use crate::limits::ImageLimits;
+
 /// The numerators of the reduced DCT scales `jpeg-decoder` implements, in
 /// eighths, smallest first: 1/8, 1/4 and 1/2. 8/8 is the full decode, which the
 /// `image` crate already does.
@@ -50,12 +52,11 @@ impl ScalableJpeg {
     /// decoder does not turn into the same pixels the `image` crate would:
     /// anything but an 8-bit YCbCr/RGB or grayscale DCT image.
     ///
-    /// Also `None` for an image the `image` crate refuses to decode in full
-    /// (its default allocation limit, the one the full decode runs under): a
-    /// progressive JPEG keeps its coefficients for the whole frame whatever
-    /// the output scale, so the scaled decode must not take on a size the full
-    /// one would turn away. The full decode then reports the limit, as before.
-    pub(crate) fn open(path: &str) -> Option<Self> {
+    /// Also `None` for an image over `limits`, the ones the full decode runs
+    /// under: a progressive JPEG keeps its coefficients for the whole frame
+    /// whatever the output scale, so the scaled decode must not take on a size
+    /// the full one would turn away. The full decode then reports the limit.
+    pub(crate) fn open(path: &str, limits: &ImageLimits) -> Option<Self> {
         let file = File::open(path).ok()?;
         let mut decoder = Decoder::new(BufReader::new(file));
         decoder.read_info().ok()?;
@@ -65,18 +66,19 @@ impl ScalableJpeg {
             PixelFormat::L8 => 1,
             PixelFormat::L16 | PixelFormat::CMYK32 => return None,
         };
-        let full_decode_bytes = u64::from(info.width) * u64::from(info.height) * channels;
-        let refused = image::Limits::default()
-            .max_alloc
-            .is_some_and(|max| full_decode_bytes > max);
+        let (width, height) = (u32::from(info.width), u32::from(info.height));
+        let full_decode_bytes = u64::from(width) * u64::from(height) * channels;
+        let refused = limits
+            .check_decode(width, height, full_decode_bytes)
+            .is_err();
         if refused || info.coding_process == CodingProcess::Lossless {
             return None;
         }
         Some(Self {
             decoder,
             path: path.to_owned(),
-            width: u32::from(info.width),
-            height: u32::from(info.height),
+            width,
+            height,
         })
     }
 
@@ -212,6 +214,11 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, // no next IFD
     ];
 
+    /// [`ScalableJpeg::open`] under the default limits.
+    fn open(path: &str) -> Option<ScalableJpeg> {
+        ScalableJpeg::open(path, &ImageLimits::default())
+    }
+
     /// Writes a `width`×`height` JPEG of `color` pixels (`[r, g, b]`, or
     /// `[l]` for grayscale) to `dir/name`, with `exif` when given.
     fn jpeg(
@@ -249,7 +256,7 @@ mod tests {
     fn a_large_jpeg_decodes_at_the_smallest_covering_scale() {
         let dir = TempDir::new().expect("tempdir");
         let path = jpeg(&dir, "photo.jpg", 1600, 1200, &[200, 120, 40], None);
-        let jpeg = ScalableJpeg::open(&path).expect("a baseline JPEG opens");
+        let jpeg = open(&path).expect("a baseline JPEG opens");
         assert_eq!(jpeg.dimensions(), (1600, 1200));
         let image = jpeg
             .decode_at_least(128, 96, None)
@@ -310,7 +317,7 @@ mod tests {
             sampling,
             progressive,
         );
-        let image = ScalableJpeg::open(&path)
+        let image = open(&path)
             .expect("opens")
             .decode_at_least(300, 200, None)
             .expect("a quarter covers 300x200");
@@ -337,7 +344,7 @@ mod tests {
         );
         let bytes = std::fs::read(&path).expect("read");
         std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("truncate");
-        let jpeg = ScalableJpeg::open(&path).expect("the header is intact");
+        let jpeg = open(&path).expect("the header is intact");
         assert!(jpeg.decode_at_least(200, 150, None).is_none());
     }
 
@@ -345,7 +352,7 @@ mod tests {
     fn a_grayscale_jpeg_decodes_to_luma() {
         let dir = TempDir::new().expect("tempdir");
         let path = jpeg(&dir, "gray.jpg", 1024, 512, &[90], None);
-        let image = ScalableJpeg::open(&path)
+        let image = open(&path)
             .expect("a grayscale JPEG opens")
             .decode_at_least(256, 128, None)
             .expect("a quarter covers 256x128");
@@ -358,7 +365,7 @@ mod tests {
     fn a_target_past_half_size_is_left_to_the_full_decode() {
         let dir = TempDir::new().expect("tempdir");
         let path = jpeg(&dir, "photo.jpg", 1600, 1200, &[1, 2, 3], None);
-        let jpeg = ScalableJpeg::open(&path).expect("opens");
+        let jpeg = open(&path).expect("opens");
         assert!(jpeg.decode_at_least(801, 600, None).is_none());
     }
 
@@ -375,11 +382,11 @@ mod tests {
         );
         let plain = jpeg(&dir, "plain.jpg", 64, 32, &[1, 2, 3], None);
         assert_eq!(
-            ScalableJpeg::open(&tagged).expect("opens").orientation(),
+            open(&tagged).expect("opens").orientation(),
             Orientation::Rotate90
         );
         assert_eq!(
-            ScalableJpeg::open(&plain).expect("opens").orientation(),
+            open(&plain).expect("opens").orientation(),
             Orientation::NoTransforms
         );
     }
@@ -397,18 +404,18 @@ mod tests {
             &[1, 2, 3],
             Some(&ORIENTATION_6_EXIF),
         );
-        let open = || ScalableJpeg::open(&path).expect("opens");
+        let opened = || open(&path).expect("opens");
         assert!(
-            open()
+            opened()
                 .decode_at_least(200, 100, Some(Orientation::NoTransforms))
                 .is_none()
         );
         assert!(
-            open()
+            opened()
                 .decode_at_least(200, 100, Some(Orientation::Rotate90))
                 .is_some()
         );
-        assert!(open().decode_at_least(200, 100, None).is_some());
+        assert!(opened().decode_at_least(200, 100, None).is_some());
     }
 
     /// A frame header alone (no scan data): `width`×`height`, 8-bit, three
@@ -423,19 +430,34 @@ mod tests {
         bytes
     }
 
-    /// A size the `image` crate's full decode refuses is refused here too, so
-    /// the scaled decode never allocates for a frame the full one would not.
+    /// A size the full decode refuses is refused here too, so the scaled
+    /// decode never allocates for a frame the full one would not.
     #[test]
     fn a_frame_the_full_decode_refuses_is_not_opened() {
         let dir = TempDir::new().expect("tempdir");
-        let open = |name: &str, width: u16, height: u16| {
+        let open_frame = |name: &str, width: u16, height: u16, limits: &ImageLimits| {
             let path = dir.path().join(name);
             std::fs::write(&path, frame_header(width, height)).expect("write fixture");
-            ScalableJpeg::open(path.to_str().expect("utf-8")).map(|jpeg| jpeg.dimensions())
+            ScalableJpeg::open(path.to_str().expect("utf-8"), limits).map(|jpeg| jpeg.dimensions())
         };
-        // 20000x10000 RGB is 600 MB, over the image crate's 512 MiB default.
-        assert_eq!(open("huge.jpg", 20_000, 10_000), None);
-        assert_eq!(open("large.jpg", 10_000, 5_000), Some((10_000, 5_000)));
+        let defaults = ImageLimits::default();
+        // 20000x10000 RGB is 600 MB, over the 512 MiB default.
+        assert_eq!(open_frame("huge.jpg", 20_000, 10_000, &defaults), None);
+        assert_eq!(
+            open_frame("large.jpg", 10_000, 5_000, &defaults),
+            Some((10_000, 5_000))
+        );
+        // Over either limit it was given, whichever the file is under.
+        let few_pixels = ImageLimits {
+            max_pixels: 49_999_999,
+            ..defaults
+        };
+        assert_eq!(open_frame("large.jpg", 10_000, 5_000, &few_pixels), None);
+        let little_memory = ImageLimits {
+            max_alloc: 149_999_999,
+            ..defaults
+        };
+        assert_eq!(open_frame("large.jpg", 10_000, 5_000, &little_memory), None);
     }
 
     /// Files the scaled decoder would not turn into the pixels the `image`
@@ -460,7 +482,7 @@ mod tests {
             .expect("write fixture");
         for path in [cmyk, png, dir.path().join("missing.jpg")] {
             assert!(
-                ScalableJpeg::open(path.to_str().expect("utf-8")).is_none(),
+                open(path.to_str().expect("utf-8")).is_none(),
                 "{}",
                 path.display()
             );
