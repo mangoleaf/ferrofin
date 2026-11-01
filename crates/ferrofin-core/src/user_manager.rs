@@ -1194,6 +1194,7 @@ impl UserManager for FerrofinUserManager {
         if !self.is_local_client(remote_endpoint)
             && !has_permission(self.db.pool(), &user.id, PermissionKind::EnableRemoteAccess).await?
         {
+            tracing::warn!(username, user_id = %user.id, reason = "remote_access", "login failed");
             return Err(ServiceError::Forbidden(
                 "remote access is not permitted for this user".to_owned(),
             ));
