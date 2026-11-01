@@ -146,7 +146,8 @@ pub struct FerrofinLibraryManager {
 /// `Folder.QueryRecursive`'s post-filter gate (v12.2 Folder.cs:1008-1014): a
 /// user's recursive query for box sets and/or playlists only. Their per-user
 /// access (shares, open access, owner) lives in the item data, so SQL cannot
-/// decide it.
+/// decide it. Any other query has the playlists the user cannot see excluded
+/// by the repository ([`crate::item_visibility::ItemVisibility::hidden_playlists`]).
 fn post_filters_containers(query: &InternalItemsQuery) -> bool {
     query.user.is_some()
         && !query.include_item_types.is_empty()
@@ -1711,6 +1712,7 @@ impl FerrofinLibraryManager {
         let unpaged = InternalItemsQuery {
             start_index: None,
             limit: None,
+            checks_playlist_visibility: true,
             ..query.clone()
         };
         let mut items = self.items.get_item_list(&unpaged).await?;

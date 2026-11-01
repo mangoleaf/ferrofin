@@ -1145,9 +1145,24 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    UserRootFolder.GetEligibleChildrenForRecursiveChildren); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
                    routes that take a scope (ItemsController.GetItems, \
-                   LibraryManager.AddUserToQuery)",
-        date: "2026-10-31",
+                   LibraryManager.AddUserToQuery); item_repository.rs \
+                   resolve_views_with_parent and item_visibility.rs hidden_playlists on \
+                   listings that can hold a playlist (Folder.QueryRecursive, \
+                   Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
+                   get_base_item_dtos' IsVisible pass (DtoService.GetBaseItemDtos), which of \
+                   the handlers only GET /Items/Suggestions asks for, as its controller does",
+        date: "2026-11-01",
         divergences: &[
+            "A listing with a user leaves out the playlists that fail \
+             Playlist.IsVisibleStandalone, by id in its SQL, so its paging and \
+             TotalRecordCount stay right: GET /Items, GET /Search/Hints and the facet routes \
+             over the same query. Upstream checks only a recursive query limited to BoxSet \
+             and Playlist, so a mixed one lists every user's private playlists. GET \
+             /Items/Suggestions hides them upstream too, through IsVisible on the page; here \
+             they leave the SQL as well, so these rows no longer shorten a non-administrator's \
+             page or count in its total. An administrator keeps upstream's answer on every \
+             one of these routes. Jellyfin bug not ported (owner decision 2026-10-31, gl-831). TODO(gl-1127): box sets \
+             hidden by BoxSet.IsVisible are still listed, as upstream.",
             "A request naming an item as its scope (parentId, ids, seriesId, appearsInItemId) \
              stops at the libraries the user may open, on every route that takes one: a \
              library or view must pass IsVisible and anything else IsVisibleStandalone, or \

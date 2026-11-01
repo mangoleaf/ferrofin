@@ -3913,8 +3913,18 @@ impl ferrofin_traits::dto::DtoService for FerrofinDtoService {
         options: &DtoOptions,
         user: Option<&UserEntity>,
         owner_id: Option<Uuid>,
-        _skip_visibility_check: bool,
+        skip_visibility_check: bool,
     ) -> Result<Vec<BaseItemDto>, ServiceError> {
+        // `items.Where(x => x.IsVisible(user))` (`DtoService.cs:166`).
+        if let Some(user) = user.filter(|_| !skip_visibility_check) {
+            let visible = self
+                .library
+                .filter_visible_items(items.to_vec(), user)
+                .await?;
+            return self
+                .project(&visible, options, Some(user), owner_id, RowRead::List)
+                .await;
+        }
         self.project(items, options, user, owner_id, RowRead::List)
             .await
     }
@@ -6396,6 +6406,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(anyone.media_source_count, Some(3));
+
+        // `GetBaseItemDtos`' `IsVisible` pass runs unless the caller skips it.
+        let rows = [fetch_item(&db, open).await, rated_row];
+        let names = async |skip: bool| {
+            svc.get_base_item_dtos(&rows, &count_only, Some(&user), None, skip)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|dto| dto.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(false).await, ["Cut 0"]);
+        assert_eq!(names(true).await, ["Cut 0", "Cut 1"]);
     }
 
     /// `PartCount` (DtoService.cs:1418-1421): a stacked video counts itself
@@ -9903,7 +9926,7 @@ mod tests {
                 &options,
                 Some(&user),
                 None,
-                false,
+                true,
             )
             .await
             .unwrap();
@@ -10071,7 +10094,7 @@ mod tests {
                 &options,
                 Some(&user),
                 None,
-                false,
+                true,
             )
             .await
             .expect("page");
@@ -10138,7 +10161,7 @@ mod tests {
         };
 
         let page = svc
-            .get_base_item_dtos(&channels, &options, Some(&user), None, false)
+            .get_base_item_dtos(&channels, &options, Some(&user), None, true)
             .await
             .expect("page");
         let single = svc

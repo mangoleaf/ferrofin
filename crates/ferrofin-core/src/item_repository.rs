@@ -959,7 +959,31 @@ impl FerrofinItemRepository {
             .await
     }
 
+    /// [`Self::resolve_scope`], less the playlists the user cannot see
+    /// ([`ItemVisibility::hidden_playlists`]), whichever statement runs next.
     async fn resolve_views_with_parent(
+        &self,
+        filter: &InternalItemsQuery,
+        parent: Option<&ViewRow>,
+    ) -> Result<Option<InternalItemsQuery>, ServiceError> {
+        let resolved = self.resolve_scope(filter, parent).await?;
+        let scoped = resolved.as_ref().unwrap_or(filter);
+        let (Some(user), Some(visibility)) = (
+            scoped.user.as_ref().filter(|_| may_list_playlists(scoped)),
+            self.visibility(),
+        ) else {
+            return Ok(resolved);
+        };
+        let hidden = Box::pin(visibility.hidden_playlists(user, &scoped.top_parent_ids)).await?;
+        if hidden.is_empty() {
+            return Ok(resolved);
+        }
+        let mut excluding = resolved.unwrap_or_else(|| filter.clone());
+        excluding.exclude_item_ids.extend(hidden);
+        Ok(Some(excluding))
+    }
+
+    async fn resolve_scope(
         &self,
         filter: &InternalItemsQuery,
         parent: Option<&ViewRow>,
@@ -2819,6 +2843,22 @@ async fn scope_to_user_libraries_prepared(
     let mut resolved = filter.clone();
     resolved.top_parent_ids = scope;
     Ok(Some(resolved))
+}
+
+/// Whether `filter`'s rows can hold a playlist its user may not see, and no one
+/// else checks: a query limited to kinds or leaves that leave `Playlist` out pays
+/// nothing. Named ids stop at their own check (`retain_visible_ids`), and a plain
+/// folder's direct children at `Folder.GetChildren`'s.
+///
+/// TODO(gl-1127): box sets `BoxSet.IsVisible` hides are still listed.
+fn may_list_playlists(filter: &InternalItemsQuery) -> bool {
+    !filter.checks_playlist_visibility
+        && filter.item_ids.is_empty()
+        && filter.is_folder != Some(false)
+        && (filter.recursive || filter.parent_id.is_nil())
+        && (filter.include_item_types.is_empty()
+            || filter.include_item_types.contains(&BaseItemKind::Playlist))
+        && !filter.exclude_item_types.contains(&BaseItemKind::Playlist)
 }
 
 /// The top parents `views` stand for, in order: each library's entry in
@@ -11502,6 +11542,140 @@ mod tests {
             [1999],
             "nor its year"
         );
+    }
+
+    /// Only a listing that can hold a playlist reads them: a type-limited
+    /// browse without `Playlist`, a named id and a folder's direct children
+    /// pay nothing, and a caller that checks visibility itself is left to it.
+    #[rstest::rstest]
+    #[case::mixed(InternalItemsQuery { recursive: true, ..Default::default() }, true)]
+    #[case::unscoped(InternalItemsQuery::default(), true)]
+    #[case::mixed_types(
+        InternalItemsQuery {
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Movie, BaseItemKind::Playlist],
+            ..Default::default()
+        },
+        true
+    )]
+    #[case::playlists_only(
+        InternalItemsQuery {
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Playlist],
+            ..Default::default()
+        },
+        true
+    )]
+    #[case::movies(
+        InternalItemsQuery {
+            recursive: true,
+            include_item_types: vec![BaseItemKind::Movie],
+            ..Default::default()
+        },
+        false
+    )]
+    #[case::excluded(
+        InternalItemsQuery {
+            recursive: true,
+            exclude_item_types: vec![BaseItemKind::Playlist],
+            ..Default::default()
+        },
+        false
+    )]
+    #[case::leaves(
+        InternalItemsQuery { recursive: true, is_folder: Some(false), ..Default::default() },
+        false
+    )]
+    #[case::named_ids(
+        InternalItemsQuery {
+            item_ids: vec![Uuid::from_u128(0x9F01)],
+            ..Default::default()
+        },
+        false
+    )]
+    #[case::folder_children(
+        InternalItemsQuery { parent_id: Uuid::from_u128(0x9F02), ..Default::default() },
+        false
+    )]
+    #[case::caller_checks(
+        InternalItemsQuery {
+            recursive: true,
+            checks_playlist_visibility: true,
+            ..Default::default()
+        },
+        false
+    )]
+    fn only_a_listing_that_can_hold_a_playlist_reads_them(
+        #[case] filter: InternalItemsQuery,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(may_list_playlists(&filter), expected);
+    }
+
+    /// A playlist the user cannot see is out of every statement a listing runs,
+    /// page, count, ids and facets, while a repository with no evaluator bound
+    /// has no rule to apply.
+    #[tokio::test]
+    async fn a_hidden_playlist_is_out_of_every_statement_of_a_listing() {
+        let db = test_db().await;
+        let slot = VisibilitySlot::default();
+        let repository = Arc::new(repo(&db).with_visibility(Arc::clone(&slot)));
+        let visibility = Arc::new(ItemVisibility::new(
+            db.clone(),
+            repository.clone(),
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            "/server/data".to_owned(),
+        ));
+        slot.set(Arc::downgrade(&visibility)).unwrap();
+        let user_id = Uuid::from_u128(0xA100);
+        let user = seed_user_with_defaults(&db, user_id).await;
+        let folder = Uuid::from_u128(0xA101);
+        seed_named_item(&db, folder, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        let (mine, theirs) = (Uuid::from_u128(0xA102), Uuid::from_u128(0xA103));
+        for (id, name, owner, year) in [
+            (mine, "Mine", user_id, 2001),
+            (theirs, "Theirs", Uuid::from_u128(0xA104), 1901),
+        ] {
+            seed_top_parented_item(&db, id, BaseItemKind::Playlist, name, folder).await;
+            let mut row = repository.retrieve_item(id).await.unwrap().unwrap();
+            row.path = Some(format!("/server/data/playlists/{name}"));
+            row.data = Some(serde_json::json!({ "OwnerUserId": owner }).to_string());
+            row.production_year = Some(year);
+            crate::test_support::save_item(&db, &row).await;
+        }
+        let listing = InternalItemsQuery {
+            user: Some(user),
+            recursive: true,
+            top_parent_ids: vec![folder],
+            group_by_presentation_unique_key: false,
+            ..InternalItemsQuery::default()
+        };
+        let paged = InternalItemsQuery {
+            limit: Some(1),
+            ..listing.clone()
+        };
+
+        let page = repository.get_items(&paged).await.unwrap();
+        assert_eq!(page.total_record_count, 1);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].name.as_deref(), Some("Mine"));
+        assert_eq!(repository.get_item_ids(&listing).await.unwrap(), [mine]);
+        assert_eq!(
+            repository.get_distinct_years(&listing).await.unwrap(),
+            [2001]
+        );
+        assert_eq!(
+            repository
+                .get_query_filters_legacy(&listing)
+                .await
+                .unwrap()
+                .years,
+            [2001]
+        );
+
+        let mut ids = repo(&db).get_item_ids(&listing).await.unwrap();
+        ids.sort();
+        assert_eq!(ids, [mine, theirs], "no evaluator, no rule");
     }
 
     /// A `UserView` resolves through its `DisplayParentId` — C#
