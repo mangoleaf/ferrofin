@@ -26,6 +26,7 @@ use ferrofin_traits::media_encoding::{
 };
 use ferrofin_traits::net::{AuthService, AuthorizationContext, RequestContext};
 use ferrofin_traits::options::{AuthorizationInfo, InternalItemsQuery};
+use rstest::rstest;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -423,12 +424,12 @@ impl Drop for TempFile {
     }
 }
 
-/// A [`MediaSourceManager`] whose static sources are empty, so the direct-play
-/// handlers `404` and fall through to the transcode branch.
-struct NoStaticSources;
+/// A [`MediaSourceManager`] holding these static sources. With none, the
+/// direct-play handlers `404` and fall through to the transcode branch.
+struct StaticSources(Vec<ferrofin_model::dto::MediaSourceInfo>);
 
 #[async_trait]
-impl ferrofin_traits::library::MediaSourceManager for NoStaticSources {
+impl ferrofin_traits::library::MediaSourceManager for StaticSources {
     async fn get_media_streams(
         &self,
         _item_id: Uuid,
@@ -457,7 +458,7 @@ impl ferrofin_traits::library::MediaSourceManager for NoStaticSources {
         _user_id: Option<Uuid>,
     ) -> Result<Vec<ferrofin_model::dto::MediaSourceInfo>, ServiceError> {
         // No direct-playable source → the handler's `404` branch → transcode.
-        Ok(Vec::new())
+        Ok(self.0.clone())
     }
     async fn open_live_stream(
         &self,
@@ -495,13 +496,22 @@ fn router_no_static_with_auth(
     hls: Arc<dyn HlsStreamManager>,
     auth: Arc<impl AuthService + AuthorizationContext + 'static>,
 ) -> axum::Router {
+    router_with_sources(hls, auth, Vec::new())
+}
+
+/// Like [`router_no_static_with_auth`], with these static sources.
+fn router_with_sources(
+    hls: Arc<dyn HlsStreamManager>,
+    auth: Arc<impl AuthService + AuthorizationContext + 'static>,
+    sources: Vec<ferrofin_model::dto::MediaSourceInfo>,
+) -> axum::Router {
     use ferrofin_api::test_support as t;
     let app = AppState::new(
         Arc::new(ItemLibrary { present: true }),
         Arc::new(t::FakeUsers),
         Arc::new(t::FakeUserViews),
         Arc::new(t::FakeUserData),
-        Arc::new(NoStaticSources),
+        Arc::new(StaticSources(sources)),
         Arc::new(t::FakeSessions),
         Arc::new(t::FakeSystem),
         Arc::new(t::FakeAppHost),
@@ -607,6 +617,64 @@ impl AuthService for DenyAuth {
         _request: &RequestContext,
     ) -> Result<AuthorizationInfo, ServiceError> {
         Err(ServiceError::unauthorized("no token"))
+    }
+}
+
+/// Authenticates a request carrying a token, in the `Authorization` header or
+/// the `ApiKey` query parameter, and leaves any other anonymous.
+struct ApiKeyOrHeaderAuth;
+
+impl ApiKeyOrHeaderAuth {
+    fn resolve(request: &RequestContext) -> Option<AuthorizationInfo> {
+        let in_query = request
+            .query_string
+            .as_deref()
+            .is_some_and(|query| query.split('&').any(|pair| pair == "ApiKey=token"));
+        (in_query || request.header("Authorization").is_some()).then(ok_auth_info)
+    }
+}
+
+#[async_trait]
+impl AuthorizationContext for ApiKeyOrHeaderAuth {
+    async fn get_authorization_info(
+        &self,
+        request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(Self::resolve(request).unwrap_or_default())
+    }
+}
+
+#[async_trait]
+impl AuthService for ApiKeyOrHeaderAuth {
+    async fn authenticate(
+        &self,
+        request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Self::resolve(request).ok_or_else(|| ServiceError::unauthorized("no token"))
+    }
+}
+
+/// Resolves every request to this authorization.
+#[derive(Clone)]
+struct PolicyAuth(AuthorizationInfo);
+
+#[async_trait]
+impl AuthorizationContext for PolicyAuth {
+    async fn get_authorization_info(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[async_trait]
+impl AuthService for PolicyAuth {
+    async fn authenticate(
+        &self,
+        _request: &RequestContext,
+    ) -> Result<AuthorizationInfo, ServiceError> {
+        Ok(self.0.clone())
     }
 }
 
@@ -1590,12 +1658,266 @@ async fn ordinary_static_and_progressive_head_allow_anonymous_requests() {
         .uri(format!("/Audio/{ITEM_ID}/stream?static=true"))
         .body(Body::empty())
         .unwrap();
-    let response = app.oneshot(request).await.unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
     assert_eq!(
         response.status(),
         StatusCode::NOT_FOUND,
         "anonymous static requests reach source resolution"
     );
+    let request = axum::http::Request::builder()
+        .uri(format!("/Audio/{ITEM_ID}/stream?static=true"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "an anonymous static read is not refused"
+    );
+}
+
+/// A request with no credentials at all.
+fn anonymous(method: &str, uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// The four progressive stream routes. Each `GET` here is a transcode: none says
+/// `static=true`.
+fn progressive_routes() -> [String; 4] {
+    [
+        format!("/Videos/{ITEM_ID}/stream"),
+        format!("/Videos/{ITEM_ID}/stream.mp4"),
+        format!("/Audio/{ITEM_ID}/stream"),
+        format!("/Audio/{ITEM_ID}/stream.mp3"),
+    ]
+}
+
+/// A deliberate divergence: upstream's `GetVideoStream` and `GetAudioStream`
+/// are anonymous. Here the request is refused before the transcode manager is
+/// reached.
+#[tokio::test]
+async fn a_progressive_transcode_needs_a_caller() {
+    for path in progressive_routes() {
+        let rec = Arc::new(Recorded::default());
+        let app =
+            router_no_static_with_auth(ok_hls("/unused", Arc::clone(&rec)), Arc::new(DenyAuth));
+        let response = app.oneshot(anonymous("GET", &path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        assert!(rec.last.lock().unwrap().is_none(), "{path} was dispatched");
+    }
+}
+
+/// A caller is refused the same way whether the item exists or not, so the
+/// answer says nothing about which ids are real.
+#[tokio::test]
+async fn an_anonymous_transcode_of_a_missing_item_is_refused_alike() {
+    let rec = Arc::new(Recorded::default());
+    let hls = Arc::new(FakeHls {
+        served_path: "/unused".to_owned(),
+        rec: Arc::clone(&rec),
+        fail: Some(ServiceError::NotFound("no item".to_owned())),
+    });
+    let app = router_no_static_with_auth(hls, Arc::new(DenyAuth));
+    let path = format!("/Videos/{ITEM_ID}/stream.mp4");
+    let response = app.oneshot(anonymous("GET", &path)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The transcode a server-issued `TranscodingUrl` asks for: the token is in the
+/// `Authorization` header or, as `to_url` writes it, in `ApiKey`.
+#[rstest]
+#[case::header("", true)]
+#[case::api_key("?ApiKey=token", false)]
+#[tokio::test]
+async fn a_caller_with_a_token_still_transcodes(#[case] query: &str, #[case] header: bool) {
+    for route in progressive_routes() {
+        let path = format!("{route}{query}");
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("output.mp4");
+        std::fs::write(&file, b"progressive bytes").unwrap();
+        let rec = Arc::new(Recorded::default());
+        let app = router_no_static_with_auth(
+            ok_hls(file.to_str().unwrap(), Arc::clone(&rec)),
+            Arc::new(ApiKeyOrHeaderAuth),
+        );
+        let request = if header {
+            authed("GET", &path)
+        } else {
+            anonymous("GET", &path)
+        };
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let captured = rec.last.lock().unwrap().clone().unwrap();
+        assert!(!captured.is_head_request, "{path}");
+        assert!(
+            captured.playback_permissions.is_some(),
+            "{path} lost the caller's policy"
+        );
+    }
+}
+
+/// An API key has no user, and may transcode as it may on the HLS routes.
+#[tokio::test]
+async fn an_api_key_may_transcode() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("output.mp4");
+    std::fs::write(&file, b"progressive bytes").unwrap();
+    let rec = Arc::new(Recorded::default());
+    let auth = PolicyAuth(AuthorizationInfo {
+        is_authenticated: true,
+        is_api_key: true,
+        token: Some(ferrofin_model::secret::Secret::new("key")),
+        ..AuthorizationInfo::default()
+    });
+    let app = router_no_static_with_auth(
+        ok_hls(file.to_str().unwrap(), Arc::clone(&rec)),
+        Arc::new(auth),
+    );
+    let path = format!("/Videos/{ITEM_ID}/stream.mp4");
+    let response = app.oneshot(authed("GET", &path)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(rec.last.lock().unwrap().is_some());
+}
+
+/// The default policy runs on the transcode, as it does on the HLS routes: the
+/// token is real, and the account may still not start one.
+#[rstest]
+#[case::disabled(
+    ferrofin_model::users::UserPolicy {
+        is_disabled: true,
+        enable_remote_access: true,
+        ..ferrofin_model::users::UserPolicy::default()
+    },
+    StatusCode::UNAUTHORIZED,
+)]
+#[case::remote_access_off(
+    ferrofin_model::users::UserPolicy {
+        enable_remote_access: false,
+        ..ferrofin_model::users::UserPolicy::default()
+    },
+    StatusCode::FORBIDDEN,
+)]
+#[case::outside_access_schedule(
+    ferrofin_model::users::UserPolicy {
+        enable_remote_access: true,
+        access_schedules: vec![ferrofin_model::users::AccessSchedule {
+            id: 0,
+            user_id: Uuid::nil(),
+            day_of_week: ferrofin_model::users::DynamicDayOfWeek::Everyday,
+            // No hour of any day is in this window.
+            start_hour: 25.0,
+            end_hour: 26.0,
+        }],
+        ..ferrofin_model::users::UserPolicy::default()
+    },
+    StatusCode::FORBIDDEN,
+)]
+#[tokio::test]
+async fn a_token_does_not_override_the_account_policy(
+    #[case] policy: ferrofin_model::users::UserPolicy,
+    #[case] expected: StatusCode,
+) {
+    let auth = PolicyAuth(AuthorizationInfo {
+        user_policy: Some(Arc::new(policy)),
+        ..ok_auth_info()
+    });
+    for path in progressive_routes() {
+        let rec = Arc::new(Recorded::default());
+        let app =
+            router_no_static_with_auth(ok_hls("/unused", Arc::clone(&rec)), Arc::new(auth.clone()));
+        let mut request = authed("GET", &path);
+        // A peer outside the local network, where the remote-access rule applies.
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "203.0.113.7:1234".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+        assert!(rec.last.lock().unwrap().is_none(), "{path} was dispatched");
+    }
+}
+
+/// ASP.NET matches a route's literals in any case, so `STREAM.mp4` is the stream
+/// route. The container keeps the case it was sent in; a segment that is not
+/// `stream.{container}` is no route.
+#[rstest]
+#[case::lower("stream.mp4", StatusCode::OK, Some("mp4"))]
+#[case::upper("STREAM.mp4", StatusCode::OK, Some("mp4"))]
+#[case::mixed("Stream.MP4", StatusCode::OK, Some("MP4"))]
+#[case::no_container("stream.", StatusCode::NOT_FOUND, None)]
+#[case::another_literal("streams.mp4", StatusCode::NOT_FOUND, None)]
+#[case::shorter_than_the_literal("str", StatusCode::NOT_FOUND, None)]
+#[case::multibyte_at_the_literal_end("stream\u{e9}mp4", StatusCode::NOT_FOUND, None)]
+#[tokio::test]
+async fn the_stream_route_literal_matches_in_any_case(
+    #[case] segment: &str,
+    #[case] expected: StatusCode,
+    #[case] container: Option<&str>,
+) {
+    for route in ["Videos", "Audio"] {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("output.mp4");
+        std::fs::write(&file, b"progressive bytes").unwrap();
+        let rec = Arc::new(Recorded::default());
+        let app = router_no_static(ok_hls(file.to_str().unwrap(), Arc::clone(&rec)));
+        let encoded: String = form_urlencoded::byte_serialize(segment.as_bytes()).collect();
+        let path = format!("/{route}/{ITEM_ID}/{encoded}");
+        let response = app.oneshot(authed("GET", &path)).await.unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+        assert_eq!(
+            rec.last
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|request| request.output_container.as_deref()),
+            container,
+            "{path}"
+        );
+    }
+}
+
+/// A Blu-ray or DVD folder is never served as a file: a `static=true` video
+/// request for one goes to ffmpeg, so it needs a caller too. Its `HEAD` starts
+/// nothing and stays anonymous; audio has no such exception.
+#[tokio::test]
+async fn a_static_request_for_a_disc_folder_needs_a_caller_to_transcode() {
+    let disc = || {
+        vec![ferrofin_model::dto::MediaSourceInfo {
+            path: Some("/media/disc".to_owned()),
+            video_type: Some(ferrofin_model::entities::VideoType::BluRay),
+            ..ferrofin_model::dto::MediaSourceInfo::default()
+        }]
+    };
+    let path = format!("/Videos/{ITEM_ID}/stream?static=true");
+
+    let rec = Arc::new(Recorded::default());
+    let app = router_with_sources(
+        ok_hls("/unused", Arc::clone(&rec)),
+        Arc::new(DenyAuth),
+        disc(),
+    );
+    let response = app.clone().oneshot(anonymous("GET", &path)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(rec.last.lock().unwrap().is_none());
+    let response = app.oneshot(anonymous("HEAD", &path)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(rec.last.lock().unwrap().as_ref().unwrap().is_head_request);
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("output.ts");
+    std::fs::write(&file, b"progressive bytes").unwrap();
+    let rec = Arc::new(Recorded::default());
+    let app = router_with_sources(
+        ok_hls(file.to_str().unwrap(), Arc::clone(&rec)),
+        Arc::new(OkAuth),
+        disc(),
+    );
+    let response = app.oneshot(authed("GET", &path)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!rec.last.lock().unwrap().as_ref().unwrap().is_head_request);
 }
 
 #[tokio::test]

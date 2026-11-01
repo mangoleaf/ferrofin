@@ -235,12 +235,12 @@ async fn shutdown_signal(
 
 /// The graceful-shutdown future handed to axum: waits for the first shutdown
 /// trigger, then tells connected clients before the socket drains, so they
-/// show "server unavailable" instead of silently hanging (C# sends
-/// `ServerShuttingDown` for restart and shutdown alike — 10.11.8 has no
-/// `ServerRestarting` push — so both drain the same way), and closes every
-/// WebSocket: an upgraded connection is outside axum's drain, and a socket
-/// that survived would stay bound to the OLD host's session manager after an
-/// in-process restart (Kestrel closes them on stop; clients reconnect).
+/// show "server unavailable" instead of silently hanging (`ServerShuttingDown`
+/// for restart and shutdown alike, where C# sends `ServerRestarting` for a
+/// restart: gl-1123), and closes every WebSocket: an upgraded connection is
+/// outside axum's drain, and a socket that survived would stay bound to the OLD
+/// host's session manager after an in-process restart (Kestrel closes them on
+/// stop; clients reconnect).
 async fn announce_shutdown(
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     sessions: Arc<dyn ferrofin_traits::session::SessionManager>,

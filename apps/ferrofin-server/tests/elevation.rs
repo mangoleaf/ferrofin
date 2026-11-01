@@ -553,14 +553,40 @@ async fn an_ordinary_account_cannot_stream_the_activity_log() {
     );
 }
 
-// The other half of the restart gate, against the real `UserManager`: an
-// ordinary account calling from off-network. `call_as` inserts no
-// `ConnectInfo`, which the policy treats as remote, so this resolves the
-// caller's role through the composition root's real
-// `get_user_dto().policy.is_administrator` rather than a fake — and asserts the
-// deny, so it never actually restarts the server.
+/// `POST /System/Restart` from `peer`, with `token` if any.
+async fn restart_from(router: &axum::Router, token: Option<&str>, peer: &str) -> StatusCode {
+    let ident = r#"Client="test", Device="d", DeviceId="elev-restart", Version="1""#;
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/System/Restart")
+        .header(
+            header::AUTHORIZATION,
+            match token {
+                Some(t) => format!(r#"MediaBrowser Token="{t}", {ident}"#),
+                None => format!("MediaBrowser {ident}"),
+            },
+        )
+        .body(Body::empty())
+        .expect("request");
+    req.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>().expect("peer"),
+    ));
+    router
+        .clone()
+        .oneshot(req)
+        .await
+        .expect("response")
+        .status()
+}
+
+// `POST /System/Restart` is admin only, by owner decision (gl-1103), against
+// the real `UserManager`: the caller's role comes from the composition root's
+// `get_user_dto().policy.is_administrator` rather than a fake. Upstream's
+// `LocalAccessOrRequiresElevation` admits a local caller; here the address
+// decides nothing. It asserts the deny, so it never actually restarts the
+// server.
 #[tokio::test]
-async fn an_ordinary_account_cannot_restart_from_off_network() {
+async fn an_ordinary_account_cannot_restart_from_any_address() {
     let harness = boot().await;
     let router = ferrofin_api::create_router(harness.wired.state.clone());
     let admin_token = login(&router, ADMIN_USER, ADMIN_PASSWORD, "elev-admin").await;
@@ -576,6 +602,7 @@ async fn an_ordinary_account_cannot_restart_from_off_network() {
     assert_eq!(status, StatusCode::OK);
     let user_token = login(&router, USER_NAME, USER_PASSWORD, "elev-user").await;
 
+    // `call_as` inserts no `ConnectInfo`: a request with no address to ask.
     let (status, _) = call_as(
         &router,
         "POST",
@@ -588,15 +615,20 @@ async fn an_ordinary_account_cannot_restart_from_off_network() {
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "an ordinary account off-network must not restart the server"
+        "an ordinary account must not restart the server"
     );
+    for peer in ["127.0.0.1:5000", "192.168.1.5:5000", "203.0.113.9:5000"] {
+        assert_eq!(
+            restart_from(&router, Some(&user_token), peer).await,
+            StatusCode::FORBIDDEN,
+            "{peer}: an ordinary account must not restart the server"
+        );
+    }
 }
 
-// `POST /System/Restart` is `LocalAccessOrRequiresElevation`, so being on the
-// LAN is enough — but Ferrofin still demands a token, which is the one place it
-// is deliberately stricter than upstream. C# registers the policy with only the
-// local-or-admin requirement, so nothing in it asks for an authenticated user
-// and a LAN caller with no token satisfies it outright.
+// C# registers `LocalAccessOrRequiresElevation` with only the local-or-admin
+// requirement, so nothing in it asks for an authenticated user and a LAN caller
+// with no token satisfies it outright. Ferrofin always demands one.
 //
 // This runs against the composition root's real auth stack rather than a stub,
 // because "does an unauthenticated request get in" is exactly the question a
@@ -606,24 +638,8 @@ async fn restart_still_needs_a_token_even_from_the_local_network() {
     let harness = boot().await;
     let router = ferrofin_api::create_router(harness.wired.state.clone());
 
-    let mut req = Request::builder()
-        .method("POST")
-        .uri("/System/Restart")
-        .header(
-            header::AUTHORIZATION,
-            r#"MediaBrowser Client="test", Device="d", DeviceId="elev-restart", Version="1""#,
-        )
-        .body(Body::empty())
-        .expect("request");
-    req.extensions_mut().insert(axum::extract::ConnectInfo(
-        "127.0.0.1:5000"
-            .parse::<std::net::SocketAddr>()
-            .expect("peer"),
-    ));
-
-    let status = router.oneshot(req).await.expect("response").status();
     assert_eq!(
-        status,
+        restart_from(&router, None, "127.0.0.1:5000").await,
         StatusCode::UNAUTHORIZED,
         "a tokenless loopback caller must not be able to restart the server"
     );
