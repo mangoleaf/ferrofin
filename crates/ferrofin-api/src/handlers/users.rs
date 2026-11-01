@@ -254,16 +254,17 @@ fn redeem_reset_pins(
     Ok(matches)
 }
 
-/// Query parameters carrying an optional `userId` (the update/password routes).
+/// Query parameters carrying an optional `userId` (the update, password and
+/// user-image write routes).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UserIdQuery {
+pub(crate) struct UserIdQuery {
     /// The target user; defaults to the authenticated caller when absent.
     #[serde(
         default,
         deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
     )]
-    user_id: Option<Uuid>,
+    pub(crate) user_id: Option<Uuid>,
 }
 
 /// Query parameters for `GET /Users` (hidden/disabled filters).
@@ -1326,7 +1327,7 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 
 crate::query::query_parameters! {
-    UserIdQuery {} => [("post", "/Users"), ("post", "/Users/Configuration"), ("post", "/Users/Password")];
+    UserIdQuery {} => [("post", "/Users"), ("post", "/Users/Configuration"), ("post", "/Users/Password"), ("post", "/UserImage"), ("delete", "/UserImage")];
     GetUsersQuery {} => [("get", "/Users")];
     AuthenticateByIdQuery {} => [];
 }

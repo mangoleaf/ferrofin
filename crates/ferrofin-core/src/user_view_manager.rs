@@ -1076,11 +1076,18 @@ impl UserViewManager for FerrofinUserViewManager {
             .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
         let folders = self.root_children().await?;
         let visible = visibility.visible(&folders, user, false).await?;
-        Ok(folders
+        // `UserRootFolder.GetEligibleChildrenForRecursiveChildren`: the
+        // libraries in the `SortName` order `Children` reads them, then
+        // `RootFolder.VirtualChildren`, the playlists folder.
+        let (libraries, virtual_children): (Vec<_>, Vec<_>) = folders
             .into_iter()
             .zip(visible)
             .filter_map(|(folder, allowed)| allowed.then_some(folder))
-            .collect())
+            .partition(|folder| {
+                item_type_lookup::kind_from_type_name(&folder.type_)
+                    == Some(BaseItemKind::CollectionFolder)
+            });
+        Ok(libraries.into_iter().chain(virtual_children).collect())
     }
 
     async fn get_latest_items(
@@ -1149,9 +1156,8 @@ const LATEST_EXCLUDED_BY_NAME_KINDS: [BaseItemKind; 5] = [
 pub(crate) struct LatestParent {
     id: Uuid,
     kind: Option<BaseItemKind>,
-    /// The library's configured type — only an `ICollectionFolder` has one
-    /// (a `UserView`'s `ViewType` is not persisted at this seam, so a view
-    /// parent reports `None`, the C# `CollectionType.unknown`-equivalent).
+    /// `IHasCollectionType.CollectionType`, as
+    /// [`latest_parent_collection_type`] reads it.
     collection_type: Option<CollectionType>,
 }
 
@@ -1188,9 +1194,11 @@ pub(crate) fn visible_item_query(
 ///   recognised under BOTH spellings, since this classifies a **stored** row
 ///   and 10.11.8 persists `…Playlists.PlaylistsFolder` while an older Ferrofin
 ///   wrote the `GetClientTypeName()` name `ManualPlaylistsFolder`;
-/// - everything else reports `None`: a `UserView` (its `ViewType` is not
-///   persisted at this seam) and, deliberately, a bare `BasePluginFolder` —
-///   the abstract base declares `CollectionType => null`
+/// - a `UserView` is its `ViewType` (`UserView.CollectionType`, UserView.cs:58),
+///   which the row keeps in `Data`; a name no `CollectionType` member has reads
+///   as `None`, as the DTO's does;
+/// - everything else reports `None`, deliberately so for a bare
+///   `BasePluginFolder`: the abstract base declares `CollectionType => null`
 ///   (BasePluginFolder.cs:14) and only `PlaylistsFolder` overrides it, so this
 ///   arm must NOT be widened to the base class even though
 ///   [`LatestParent::is_collection_folder`] does recognise it.
@@ -1202,12 +1210,15 @@ fn latest_parent_collection_type(
     kind: Option<BaseItemKind>,
     id: Uuid,
     library_types: &HashMap<Uuid, Option<CollectionType>>,
+    data: Option<&str>,
 ) -> Option<CollectionType> {
     match kind {
         Some(BaseItemKind::CollectionFolder) => library_types.get(&id).copied().flatten(),
         Some(BaseItemKind::ManualPlaylistsFolder | BaseItemKind::PlaylistsFolder) => {
             Some(CollectionType::playlists)
         }
+        Some(BaseItemKind::UserView) => crate::user_view_repository::view_type_of(data)
+            .and_then(|name| serde_json::from_value(serde_json::Value::String(name)).ok()),
         _ => None,
     }
 }
@@ -1274,7 +1285,7 @@ pub(crate) fn media_types_for(collection_types: &[Option<CollectionType>]) -> Ve
 
 /// The item-type / media-type rules of `GetItemsForLatestItems`: with no
 /// requested kinds, a set of `UserView` parents that are ALL movies (tvshows)
-/// libraries narrows to `Movie` (`Episode`); still-empty kinds then span the
+/// views narrows to `Movie` (`Episode`); still-empty kinds then span the
 /// media types of the `ICollectionFolder` parents ([`media_types_for`]).
 /// Returns `(include_item_types, media_types)`.
 #[must_use]
@@ -1491,7 +1502,8 @@ impl FerrofinUserViewManager {
         let classify = |row: &BaseItemEntity| -> Option<LatestParent> {
             let id = Uuid::parse_str(&row.id).ok()?;
             let kind = item_type_lookup::kind_from_type_name(&row.type_);
-            let collection_type = latest_parent_collection_type(kind, id, &collection_types);
+            let collection_type =
+                latest_parent_collection_type(kind, id, &collection_types, row.data.as_deref());
             Some(LatestParent {
                 id,
                 kind,
@@ -1528,8 +1540,8 @@ impl FerrofinUserViewManager {
     /// derives the type / media-type / played rules from them, and runs the ONE
     /// query that feeds the grouping in
     /// [`get_latest_items`](UserViewManager::get_latest_items) — the plain form,
-    /// or, for a grouped request whose first typed parent is a library of one of
-    /// the three short-circuited types, that type's own query (one card per
+    /// or, for a grouped request whose first typed parent is a library or view
+    /// of one of the three short-circuited types, that type's own query (one card per
     /// newest series for tvshows, the newest albums for music, the newest row
     /// of each presentation key for movies).
     async fn items_for_latest_items(
@@ -1569,14 +1581,24 @@ impl FerrofinUserViewManager {
         if let Some(user) = &query.user {
             internal.set_user(user.clone());
         }
-        // `LibraryManager.SetTopParentIdsOrAncestors`: libraries and views are
-        // top parents (an index seek on `TopParentId`); any other folder — a
-        // series, a season — scopes through the `AncestorIds` closure.
+        // `LibraryManager.SetTopParentIdsOrAncestors`: libraries are top parents
+        // (an index seek on `TopParentId`), and any other folder — a series, a
+        // season — scopes through the `AncestorIds` closure. A view stands for
+        // the libraries behind it (`GetTopParentIdsForQuery`: a grouped view
+        // for each library the user grouped into it), and no row carries one
+        // as its `TopParentId`, so it cannot go in `top_parent_ids`. The
+        // repository translates it from a recursive parent, as for a browse
+        // of the view. Only `parentId` names a view, so it is the sole parent.
+        // A folders view stands for no library, and a browse of it lists the
+        // root folders, so it keeps upstream's `SetAncestorIds` of itself.
         let parent_ids: Vec<Uuid> = parents.iter().map(|p| p.id).collect();
-        if parents
-            .iter()
-            .all(|p| p.is_collection_folder() || p.is_user_view())
+        if let [view] = parents.as_slice()
+            && view.is_user_view()
+            && view.collection_type != Some(CollectionType::folders)
         {
+            internal.set_parent(Some((view.id, BaseItemKind::UserView)));
+            internal.recursive = true;
+        } else if parents.iter().all(LatestParent::is_collection_folder) {
             internal.top_parent_ids = parent_ids;
         } else {
             internal.ancestor_ids = parent_ids;
@@ -1585,7 +1607,7 @@ impl FerrofinUserViewManager {
         if query.group_items {
             // The first typed parent decides (v12 `UserViewManager.cs:396-430`,
             // `FirstOrDefault(type => type is not null)`): a tvshows, music or
-            // movies library short-circuits into its own per-collection-type
+            // movies library or view short-circuits into its own per-collection-type
             // query, with `limit` now capping GROUPS (tvshows), ALBUMS (music)
             // or presentation keys (movies) rather than rows.
             //
@@ -1596,9 +1618,7 @@ impl FerrofinUserViewManager {
             // EVERY library, one per key, grouped below — a burst of new tracks
             // can fill it with a few album cards. That is upstream's behaviour
             // (the owner chose to follow v12 here on 2026-10-24), not an
-            // artifact of this port. Upstream's parents end with the playlists
-            // folder, though, and here it sorts among the libraries, so it can
-            // be the first typed parent and take the plain query: gl-1110.
+            // artifact of this port.
             //
             // The `null`-collection-type arm v12 added beside them
             // (`:425-429`, a MIXED library's latest movies and shows) is not
@@ -3521,6 +3541,630 @@ mod tests {
         assert_eq!(names, ["Music", "Playlists"]);
     }
 
+    /// `UserRootFolder.GetEligibleChildrenForRecursiveChildren` appends
+    /// `RootFolder.VirtualChildren` to the libraries, which `GetChildren`
+    /// keeps in `SortName` order. `LibraryController.GetMediaFolders` sorts the
+    /// concatenation instead, so there the folder stays among the libraries.
+    /// Both spellings: `root_children` reads the one an older Ferrofin wrote too.
+    #[rstest]
+    #[case(BaseItemKind::PlaylistsFolder)]
+    #[case(BaseItemKind::ManualPlaylistsFolder)]
+    #[tokio::test]
+    async fn the_user_root_children_list_the_playlists_folder_after_the_libraries(
+        #[case] kind: BaseItemKind,
+    ) {
+        let db = test_db().await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0xAA24)).await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        let playlists = Uuid::from_u128(0xAA25);
+        seed_named_item(&db, playlists, kind, "Playlists").await;
+        seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "TV Shows").await;
+        let mgr = manager(&db).with_visibility(visibility(&db));
+        let names = |rows: Vec<BaseItemEntity>| {
+            rows.into_iter()
+                .filter_map(|row| row.name)
+                .collect::<Vec<String>>()
+        };
+
+        assert_eq!(
+            names(mgr.get_user_root_children(&user).await.expect("children")),
+            ["Movies", "TV Shows", "Playlists"]
+        );
+        assert_eq!(
+            names(mgr.get_media_folders().await.expect("folders")),
+            ["Movies", "Playlists", "TV Shows"]
+        );
+    }
+
+    /// The first typed parent decides an unscoped grouped request, and the
+    /// playlists folder's type matches no arm of `GetItemsForLatestItems`. So
+    /// it must not come before a tvshows library that sorts after it: series A
+    /// has twelve newer episodes, the plain query's `limit * 5 = 10` rows are
+    /// all A's, and only the tvshows arm reaches B.
+    #[tokio::test]
+    async fn an_unscoped_latest_takes_the_arm_of_a_library_sorting_after_playlists() {
+        let db = test_db().await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0xAA26)).await;
+        seed_named_item(&db, SHOWS, BaseItemKind::CollectionFolder, "TV Shows").await;
+        let playlists = Uuid::from_u128(0xAA27);
+        seed_named_item(&db, playlists, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        let (sa, sb) = (Uuid::from_u128(0xAA31), Uuid::from_u128(0xAA32));
+        let b_new = Uuid::from_u128(0xAA33);
+        let a_eps: Vec<Uuid> = (1..=12).map(|n| Uuid::from_u128(0xAA40 + n)).collect();
+        let a_names: Vec<String> = (1..=12).map(|n| format!("A e{n:02}")).collect();
+        let mut rows = vec![
+            Row::new(sa, BaseItemKind::Series, "A", day(1), SHOWS),
+            Row::new(sb, BaseItemKind::Series, "B", day(1), SHOWS),
+            Row::new(b_new, BaseItemKind::Episode, "B e1", day(8), SHOWS)
+                .under(sb)
+                .of_series(sb, "B"),
+        ];
+        for (id, name) in a_eps.iter().zip(&a_names) {
+            rows.push(
+                Row::new(*id, BaseItemKind::Episode, name, day(9), SHOWS)
+                    .under(sa)
+                    .of_series(sa, "A"),
+            );
+        }
+        seed(&db, &rows).await;
+        let mgr = manager_with_folders(&db, vec![(SHOWS, Some(CollectionTypeOptions::tvshows))])
+            .with_visibility(visibility(&db));
+
+        let groups = latest(
+            &mgr,
+            LatestItemsQuery {
+                user: Some(user),
+                limit: Some(2),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            shape(&groups),
+            vec![(Some(sa), vec![a_eps[11]]), (Some(sb), vec![b_new])]
+        );
+    }
+
+    /// `user`'s grouped `view_type` view over `libraries`, as `GetUserViews`
+    /// builds one: a `UserView` with a `ViewType`, no parent and no
+    /// `DisplayParentId`, and the libraries in the user's `GroupedFolders`.
+    async fn seed_grouped_view(
+        db: &Database,
+        user: Uuid,
+        view: Uuid,
+        view_type: &str,
+        libraries: &[(Uuid, &str, Option<&str>)],
+    ) -> UserEntity {
+        let entity = crate::test_support::seed_user_with_defaults(db, user).await;
+        for (id, name, collection_type) in libraries {
+            seed_library(db, *id, name, *collection_type).await;
+        }
+        let ids: Vec<Uuid> = libraries.iter().map(|(id, _, _)| *id).collect();
+        group(db, user, &ids).await;
+        seed_item_with_data(
+            db,
+            view,
+            BaseItemKind::UserView,
+            "Grouped",
+            &format!(r#"{{"ViewType":"{view_type}"}}"#),
+        )
+        .await;
+        entity
+    }
+
+    /// A grouped view stands for every library in it
+    /// (`SetTopParentIdsOrAncestors`, `GetTopParentIdsForQuery`'s grouping arm:
+    /// an untyped library joins, an ungrouped one stays out), and every view
+    /// parent being a movies view narrows to `Movie` (`GetItemsForLatestItems`:
+    /// "movies showing up in tv, etc."), so neither the episode nor the music
+    /// video of the untyped library is listed. Grouped or not, the row is the
+    /// same three movies.
+    #[rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn a_grouped_movies_view_lists_the_movies_of_every_library_in_it(
+        #[case] group_items: bool,
+    ) {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0xBB00 + n);
+        let (view, action, comedy, mixed, elsewhere) = (id(1), id(2), id(3), id(4), id(5));
+        let user = seed_grouped_view(
+            &db,
+            id(6),
+            view,
+            "movies",
+            &[
+                (action, "Action", Some("movies")),
+                (comedy, "Comedy", Some("movies")),
+                (mixed, "Mixed", Some("mixed")),
+            ],
+        )
+        .await;
+        seed_library(&db, elsewhere, "Elsewhere", Some("movies")).await;
+        let (first, second, third) = (id(11), id(12), id(13));
+        seed(
+            &db,
+            &[
+                Row::new(first, BaseItemKind::Movie, "First", day(3), action),
+                Row::new(second, BaseItemKind::Movie, "Second", day(4), comedy),
+                Row::new(third, BaseItemKind::Movie, "Third", day(5), mixed),
+                Row::new(id(14), BaseItemKind::MusicVideo, "Clip", day(7), mixed),
+                Row::new(id(15), BaseItemKind::Episode, "Pilot", day(8), mixed),
+                Row::new(id(16), BaseItemKind::Movie, "Outside", day(9), elsewhere),
+            ],
+        )
+        .await;
+
+        let groups = latest(
+            &manager(&db),
+            LatestItemsQuery {
+                user: Some(user),
+                parent_id: Some(view),
+                limit: Some(20),
+                group_items,
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            shape(&groups),
+            vec![
+                (None, vec![third]),
+                (None, vec![second]),
+                (None, vec![first])
+            ]
+        );
+    }
+
+    /// `userView.CollectionType` decides a grouped request, so a movies view
+    /// takes the movies arm (`GetLatestMovieItems`), whose ties break on `Id
+    /// DESC`. The plain query an ungrouped request takes breaks them on
+    /// `SortName DESC`, which here is the other way round.
+    #[tokio::test]
+    async fn a_grouped_movies_view_takes_the_movies_arm() {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0xC200 + n);
+        let (view, action, comedy) = (id(1), id(2), id(3));
+        let user = seed_grouped_view(
+            &db,
+            id(4),
+            view,
+            "movies",
+            &[
+                (action, "Action", Some("movies")),
+                (comedy, "Comedy", Some("movies")),
+            ],
+        )
+        .await;
+        let (low_id, high_id) = (id(11), id(12));
+        seed(
+            &db,
+            &[
+                Row::new(low_id, BaseItemKind::Movie, "Z", day(3), action),
+                Row::new(high_id, BaseItemKind::Movie, "A", day(3), comedy),
+            ],
+        )
+        .await;
+        let mgr = manager(&db);
+        let query = |group_items| LatestItemsQuery {
+            user: Some(user.clone()),
+            parent_id: Some(view),
+            limit: Some(20),
+            group_items,
+            ..LatestItemsQuery::default()
+        };
+
+        assert_eq!(
+            shape(&latest(&mgr, query(true)).await),
+            vec![(None, vec![high_id]), (None, vec![low_id])]
+        );
+        assert_eq!(
+            shape(&latest(&mgr, query(false)).await),
+            vec![(None, vec![low_id]), (None, vec![high_id])]
+        );
+    }
+
+    /// `userView.CollectionType` decides a grouped request too, so a TV view
+    /// takes the tvshows arm across its libraries: series A has twelve newer
+    /// episodes in one library, the plain query's `limit * 5 = 10` rows would
+    /// all be A's, and only that arm reaches B in the other. An ungrouped
+    /// request reads rows, narrowed to `Episode`, so the untyped library's
+    /// movie stays out of both.
+    #[tokio::test]
+    async fn a_grouped_tv_view_answers_one_card_per_series_across_its_libraries() {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0xBC00 + n);
+        let (view, anime, drama, mixed, elsewhere) = (id(1), id(2), id(3), id(4), id(5));
+        let user = seed_grouped_view(
+            &db,
+            id(6),
+            view,
+            "tvshows",
+            &[
+                (anime, "Anime", Some("tvshows")),
+                (drama, "Drama", Some("tvshows")),
+                (mixed, "Mixed", Some("mixed")),
+            ],
+        )
+        .await;
+        seed_library(&db, elsewhere, "Elsewhere", Some("tvshows")).await;
+        let (sa, sb, sc) = (id(11), id(12), id(13));
+        let (b_new, c_new, movie) = (id(14), id(15), id(16));
+        let a_eps: Vec<Uuid> = (1..=12).map(|n| id(0x20 + n)).collect();
+        let a_names: Vec<String> = (1..=12).map(|n| format!("A e{n:02}")).collect();
+        let mut rows = vec![
+            Row::new(sa, BaseItemKind::Series, "A", day(1), anime),
+            Row::new(sb, BaseItemKind::Series, "B", day(1), drama),
+            Row::new(sc, BaseItemKind::Series, "C", day(1), elsewhere),
+            Row::new(b_new, BaseItemKind::Episode, "B e1", day(8), drama)
+                .under(sb)
+                .of_series(sb, "B"),
+            Row::new(c_new, BaseItemKind::Episode, "C e1", day(10), elsewhere)
+                .under(sc)
+                .of_series(sc, "C"),
+            Row::new(movie, BaseItemKind::Movie, "Film", day(10), mixed),
+        ];
+        for (episode, name) in a_eps.iter().zip(&a_names) {
+            rows.push(
+                Row::new(*episode, BaseItemKind::Episode, name, day(9), anime)
+                    .under(sa)
+                    .of_series(sa, "A"),
+            );
+        }
+        seed(&db, &rows).await;
+        let mgr = manager(&db);
+        let query = |limit, group_items| LatestItemsQuery {
+            user: Some(user.clone()),
+            parent_id: Some(view),
+            limit: Some(limit),
+            group_items,
+            ..LatestItemsQuery::default()
+        };
+
+        assert_eq!(
+            shape(&latest(&mgr, query(2, true)).await),
+            vec![(Some(sa), vec![a_eps[11]]), (Some(sb), vec![b_new])]
+        );
+
+        let rows: Vec<Uuid> = latest(&mgr, query(20, false))
+            .await
+            .iter()
+            .flat_map(|(_, items)| items.iter().map(uuid))
+            .collect();
+        assert_eq!(rows.len(), 13, "{rows:?}");
+        assert_eq!(rows.last(), Some(&b_new));
+    }
+
+    /// `GetChildren(user, true)` in the grouping arm: a library the user may
+    /// not open leaves the view, whatever the preference still names.
+    #[tokio::test]
+    async fn a_grouped_view_never_reaches_a_library_the_user_may_not_open() {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0xBD00 + n);
+        let (view, open, closed, user_id) = (id(1), id(2), id(3), id(4));
+        let user = seed_grouped_view(
+            &db,
+            user_id,
+            view,
+            "movies",
+            &[
+                (open, "Open", Some("movies")),
+                (closed, "Closed", Some("movies")),
+            ],
+        )
+        .await;
+        block_folders(&db, user_id, &[closed]).await;
+        let allowed = id(11);
+        seed(
+            &db,
+            &[
+                Row::new(allowed, BaseItemKind::Movie, "Allowed", day(3), open),
+                Row::new(id(12), BaseItemKind::Movie, "Hidden", day(4), closed),
+            ],
+        )
+        .await;
+
+        let groups = latest(
+            &manager(&db),
+            LatestItemsQuery {
+                user: Some(user),
+                parent_id: Some(view),
+                limit: Some(20),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+
+        assert_eq!(shape(&groups), vec![(None, vec![allowed])]);
+    }
+
+    /// A view nothing is grouped into stands for no library: upstream scopes
+    /// to the view itself rather than widen to every library ("Prevent
+    /// searching in all libraries due to empty filter").
+    #[tokio::test]
+    async fn a_view_grouping_no_library_lists_nothing() {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0xBE00 + n);
+        let (view, library, user_id) = (id(1), id(2), id(3));
+        let user = seed_grouped_view(
+            &db,
+            user_id,
+            view,
+            "movies",
+            &[(library, "Movies", Some("movies"))],
+        )
+        .await;
+        group(&db, user_id, &[]).await;
+        seed(
+            &db,
+            &[Row::new(id(11), BaseItemKind::Movie, "M", day(3), library)],
+        )
+        .await;
+
+        let groups = latest(
+            &manager(&db),
+            LatestItemsQuery {
+                user: Some(user),
+                parent_id: Some(view),
+                limit: Some(20),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+
+        assert!(groups.is_empty(), "{:?}", shape(&groups));
+    }
+
+    /// A view of one library follows its `DisplayParentId` to that library,
+    /// and on an adopted database to the physical folder its rows carry as
+    /// their `TopParentId`.
+    #[tokio::test]
+    async fn a_view_of_one_library_lists_that_library() {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0xBF00 + n);
+        let (view, library, physical) = (id(1), id(2), id(3));
+        let user = crate::test_support::seed_user_with_defaults(&db, id(4)).await;
+        seed_item_with_data(
+            &db,
+            library,
+            BaseItemKind::CollectionFolder,
+            "Movies",
+            &format!(
+                r#"{{"CollectionType":"movies","PhysicalFolderIds":["{}"]}}"#,
+                physical.simple()
+            ),
+        )
+        .await;
+        seed_named_item(&db, physical, BaseItemKind::Folder, "Movies").await;
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            &format!(
+                r#"{{"ViewType":"movies","DisplayParentId":"{}"}}"#,
+                library.simple()
+            ),
+        )
+        .await;
+        let movie = id(11);
+        seed(
+            &db,
+            &[Row::new(movie, BaseItemKind::Movie, "M", day(3), physical)],
+        )
+        .await;
+
+        let groups = latest(
+            &manager(&db),
+            LatestItemsQuery {
+                user: Some(user),
+                parent_id: Some(view),
+                limit: Some(20),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+
+        assert_eq!(shape(&groups), vec![(None, vec![movie])]);
+    }
+
+    /// `GetLatestItemList`'s music arm reads albums by the scope a music view
+    /// stands for, which is that library behind its `DisplayParentId`.
+    #[tokio::test]
+    async fn a_music_view_takes_the_albums_arm() {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0xC300 + n);
+        let (view, library, album, track) = (id(1), id(2), id(11), id(12));
+        let user = crate::test_support::seed_user_with_defaults(&db, id(3)).await;
+        seed_library(&db, library, "Music", Some("music")).await;
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Music",
+            &format!(
+                r#"{{"ViewType":"music","DisplayParentId":"{}"}}"#,
+                library.simple()
+            ),
+        )
+        .await;
+        seed(
+            &db,
+            &[
+                Row::new(album, BaseItemKind::MusicAlbum, "Album", day(3), library),
+                Row::new(track, BaseItemKind::Audio, "Track", day(4), library)
+                    .under(album)
+                    .on_album("Album"),
+            ],
+        )
+        .await;
+
+        let groups = latest(
+            &manager(&db),
+            LatestItemsQuery {
+                user: Some(user),
+                parent_id: Some(view),
+                limit: Some(20),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+
+        assert_eq!(shape(&groups), vec![(None, vec![album])]);
+    }
+
+    /// A `DisplayParentId` naming no row stands for no library
+    /// (`GetTopParentIdsForQuery` returns nothing), not for every library.
+    #[tokio::test]
+    async fn a_view_of_a_missing_library_lists_nothing() {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0xC400 + n);
+        let (view, library) = (id(1), id(2));
+        let user = crate::test_support::seed_user_with_defaults(&db, id(3)).await;
+        seed_library(&db, library, "Movies", Some("movies")).await;
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Movies",
+            &format!(
+                r#"{{"ViewType":"movies","DisplayParentId":"{}"}}"#,
+                id(4).simple()
+            ),
+        )
+        .await;
+        seed(
+            &db,
+            &[Row::new(id(11), BaseItemKind::Movie, "M", day(3), library)],
+        )
+        .await;
+
+        let groups = latest(
+            &manager(&db),
+            LatestItemsQuery {
+                user: Some(user),
+                parent_id: Some(view),
+                limit: Some(20),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+
+        assert!(groups.is_empty(), "{:?}", shape(&groups));
+    }
+
+    /// The Live TV view is the one view that stands for itself
+    /// (`GetTopParentIdsForQuery`'s first arm): its channels carry it as
+    /// their top parent.
+    #[tokio::test]
+    async fn a_live_tv_view_lists_what_it_is_the_top_parent_of() {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0xC000 + n);
+        let view = id(1);
+        let user = crate::test_support::seed_user_with_defaults(&db, id(2)).await;
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Live TV",
+            r#"{"ViewType":"livetv"}"#,
+        )
+        .await;
+        let channel = id(11);
+        seed(
+            &db,
+            &[Row::new(
+                channel,
+                BaseItemKind::TvChannel,
+                "BBC",
+                day(3),
+                view,
+            )],
+        )
+        .await;
+
+        let groups = latest(
+            &manager(&db),
+            LatestItemsQuery {
+                user: Some(user),
+                parent_id: Some(view),
+                limit: Some(20),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+
+        assert_eq!(shape(&groups), vec![(None, vec![channel])]);
+    }
+
+    /// A folders view stands for no library, so upstream's scope is the view
+    /// itself and the row is empty. A browse of the view does list the root
+    /// folders; Latest must not, even asked for that kind by name.
+    #[rstest]
+    #[case(vec![])]
+    #[case(vec![BaseItemKind::CollectionFolder])]
+    #[tokio::test]
+    async fn a_folders_view_lists_nothing(#[case] include_item_types: Vec<BaseItemKind>) {
+        let db = test_db().await;
+        let id = |n: u128| Uuid::from_u128(0xC100 + n);
+        let (view, user_root, library) = (id(1), id(2), id(3));
+        let user = crate::test_support::seed_user_with_defaults(&db, id(4)).await;
+        seed_named_item(
+            &db,
+            user_root,
+            BaseItemKind::UserRootFolder,
+            "Media Folders",
+        )
+        .await;
+        seed_item_with_data(
+            &db,
+            view,
+            BaseItemKind::UserView,
+            "Folders",
+            r#"{"ViewType":"folders"}"#,
+        )
+        .await;
+        seed(
+            &db,
+            &[
+                Row::new(
+                    library,
+                    BaseItemKind::CollectionFolder,
+                    "Movies",
+                    day(1),
+                    user_root,
+                ),
+                Row::new(id(11), BaseItemKind::Movie, "M", day(3), library),
+            ],
+        )
+        .await;
+        let lookup: Arc<dyn ferrofin_traits::persistence::ItemTypeLookup> =
+            Arc::new(ItemTypeLookup::new());
+        let repository = FerrofinItemRepository::new(db.clone(), lookup).with_root_ids(
+            crate::aggregate_folder::RootFolderIds {
+                user_root,
+                aggregate: id(5),
+            },
+        );
+
+        let groups = latest(
+            &FerrofinUserViewManager::new(Arc::new(repository)),
+            LatestItemsQuery {
+                user: Some(user),
+                parent_id: Some(view),
+                include_item_types,
+                limit: Some(20),
+                ..LatestItemsQuery::default()
+            },
+        )
+        .await;
+
+        assert!(groups.is_empty(), "{:?}", shape(&groups));
+    }
+
     /// Every library is not a fallback for an evaluator that was never wired.
     #[tokio::test]
     async fn the_user_root_children_refuse_to_answer_without_an_evaluator() {
@@ -3614,13 +4258,18 @@ mod tests {
             BaseItemKind::ManualPlaylistsFolder,
         ] {
             assert_eq!(
-                latest_parent_collection_type(Some(kind), playlists, &types),
+                latest_parent_collection_type(Some(kind), playlists, &types, None),
                 Some(CollectionType::playlists),
                 "{kind:?}"
             );
         }
         assert_eq!(
-            latest_parent_collection_type(Some(BaseItemKind::CollectionFolder), library, &types),
+            latest_parent_collection_type(
+                Some(BaseItemKind::CollectionFolder),
+                library,
+                &types,
+                None
+            ),
             Some(CollectionType::movies),
             "a library still reports its own configured type"
         );
@@ -3628,15 +4277,53 @@ mod tests {
         // it is an `ICollectionFolder` WITHOUT a collection type, so the two
         // predicates deliberately disagree on it.
         assert_eq!(
-            latest_parent_collection_type(Some(BaseItemKind::BasePluginFolder), playlists, &types),
+            latest_parent_collection_type(
+                Some(BaseItemKind::BasePluginFolder),
+                playlists,
+                &types,
+                None
+            ),
             None
         );
         assert!(parent(BaseItemKind::BasePluginFolder, None).is_collection_folder());
         assert_eq!(
-            latest_parent_collection_type(Some(BaseItemKind::UserView), playlists, &types),
+            latest_parent_collection_type(None, playlists, &types, None),
             None
         );
-        assert_eq!(latest_parent_collection_type(None, playlists, &types), None);
+    }
+
+    /// `UserView.CollectionType => ViewType` (UserView.cs:58), read from `Data`
+    /// the way [`view_type_of`](crate::user_view_repository::view_type_of)
+    /// reads it: a name in any case or an adopted blob's discriminant. No
+    /// readable value leaves it null, as on upstream's nullable `ViewType`.
+    #[rstest]
+    #[case(Some(r#"{"ViewType":"movies"}"#), Some(CollectionType::movies))]
+    #[case(Some(r#"{"ViewType":"tvshows"}"#), Some(CollectionType::tvshows))]
+    #[case(Some(r#"{"ViewType":"music"}"#), Some(CollectionType::music))]
+    #[case(Some(r#"{"ViewType":"playlists"}"#), Some(CollectionType::playlists))]
+    #[case(Some(r#"{"ViewType":"livetv"}"#), Some(CollectionType::livetv))]
+    #[case(Some(r#"{"ViewType":"folders"}"#), Some(CollectionType::folders))]
+    #[case(Some(r#"{"ViewType":"unknown"}"#), Some(CollectionType::unknown))]
+    #[case(Some(r#"{"ViewType":"TvShows"}"#), Some(CollectionType::tvshows))]
+    #[case(Some(r#"{"ViewType":2}"#), Some(CollectionType::tvshows))]
+    #[case(Some(r#"{"ViewType":"nonsense"}"#), None)]
+    #[case(Some(r#"{"ViewType":null}"#), None)]
+    #[case(Some(r#"{"UserId":"x"}"#), None)]
+    #[case(Some("not json"), None)]
+    #[case(None, None)]
+    fn a_view_parent_reports_its_view_type(
+        #[case] data: Option<&str>,
+        #[case] expected: Option<CollectionType>,
+    ) {
+        assert_eq!(
+            latest_parent_collection_type(
+                Some(BaseItemKind::UserView),
+                Uuid::new_v4(),
+                &HashMap::new(),
+                data
+            ),
+            expected
+        );
     }
 
     /// `PlaylistsFolder : BasePluginFolder : ICollectionFolder` (v10.11.8
