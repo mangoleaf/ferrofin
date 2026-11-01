@@ -147,4 +147,16 @@ async fn metrics_enabled_serves_exposition() {
         let status = router.clone().oneshot(request).await.unwrap().status();
         assert_eq!(status, expected, "{peer}");
     }
+
+    // The gate covers the `/metrics` route alone. Turning metrics on must not
+    // change what a refused peer gets for a path no route matches.
+    let mut request = Request::builder()
+        .uri("/no/such/path")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "198.51.100.4:5000".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let status = router.oneshot(request).await.unwrap().status();
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
