@@ -1089,7 +1089,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
                    Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
                    src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag) and \
-                   Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto)",
+                   Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto). Also the \
+                   download of a remote image: ferrofin-providers image_download.rs \
+                   open_image, provider_manager.rs cached_remote_image, compared with \
+                   MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage) and \
+                   Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
         date: "2026-10-30",
         divergences: &[
             "Decoding and resizing run under limits upstream does not have (owner decision \
@@ -1099,6 +1103,25 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              served as its original file, as ImageProcessor.ProcessImage's catch-all does with \
              any failed encode, and one too large to decode has no blur hash and is left out of \
              a collage or the splashscreen.",
+            "A remote image is downloaded under a limit upstream does not have (owner decision \
+             2026-10-31, gl-1095), the setting image_download_max_mb: ProviderManager.SaveImage \
+             reads any body into memory. Past the limit it is refused and the read stops. \
+             cached_remote_image streams to a file, so it holds no body in memory. As upstream, \
+             one request at a time downloads a URL (_imageSaveLock, around cached_remote_image \
+             and save_image_from_url), but its 10 s memory cache of the bytes is not ported: an \
+             image request has the file instead, and a second save of a URL downloads it again.",
+            "A remote image's first bytes must be an image whatever the response declares \
+             (owner decision 2026-10-31, gl-1095), where SaveImage trusts any image/* type: the \
+             first file stored for a URL or an item stays there. The formats are listed in \
+             image_download.rs is_image, with SVG and tvheadend's untyped /imagecache/ URLs \
+             allowed.",
+            "A row whose URLs all gave no image stays, and each URL is left alone for \
+             image_negative_cache_ttl_secs (owner decision 2026-10-31, gl-1095), where \
+             LibraryManager.ConvertImageToLocal's removeOnFailure removes the row, for the same \
+             reason, so that a refresh must bring it back. The same answers count: a 404, a 403 \
+             and a non-image, plus a body past the limit or failing the content check. Any \
+             other failure throws there and moves on to the next URL here, and neither removes \
+             the row or remembers the URL.",
             "Timers, series timers and the new-timer defaults carry no image tags: \
              LiveTvDtoService.FillImages (the program's and the library series' Primary, Thumb \
              and Backdrop tags) is not ported. Fix path: gl-853.",

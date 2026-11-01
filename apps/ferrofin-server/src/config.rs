@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use ferrofin_drawing::ImageLimits;
 use ferrofin_providers::rate_limit::RequestLimits;
+use ferrofin_providers::{DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS, IMAGE_NEGATIVE_CACHE_TTL_SECS};
 use serde::Deserialize;
 
 /// Default TCP port for the HTTP endpoint.
@@ -152,6 +153,8 @@ struct FileConfig {
     image_decode_max_megapixels: Option<u32>,
     image_decode_max_memory_mb: Option<u32>,
     image_resize_budget_mb: Option<u32>,
+    image_download_max_mb: Option<u32>,
+    image_negative_cache_ttl_secs: Option<u64>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     ffmpeg_img_extract_perf_tradeoff: Option<bool>,
@@ -457,6 +460,18 @@ pub struct Config {
     /// `config.toml` > 2048, clamped to [`ImageLimits::RESIZE_BUDGET_MB`] with
     /// a warning. A resize that alone needs more serves the original file.
     pub image_resize_budget_mb: u32,
+
+    /// The largest remote image downloaded, in MiB. Resolved
+    /// `FERROFIN_IMAGE_DOWNLOAD_MAX_MB` env > `image_download_max_mb` in
+    /// `config.toml` > 64, clamped to [`RequestLimits::DOWNLOAD_MAX_MB`] with a
+    /// warning. A larger one is refused, and the read stops at the limit.
+    pub image_download_max_mb: u32,
+
+    /// How long a remote image URL that gave no image is left alone, in
+    /// seconds. Resolved `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS` env >
+    /// `image_negative_cache_ttl_secs` in `config.toml` > 3600, clamped to
+    /// [`IMAGE_NEGATIVE_CACHE_TTL_SECS`] with a warning.
+    pub image_negative_cache_ttl_secs: u64,
 
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
@@ -937,6 +952,24 @@ impl Config {
             ImageLimits::RESIZE_BUDGET_MB,
             "MiB",
         );
+        let image_download_max_mb = resolve_clamped(
+            env,
+            "FERROFIN_IMAGE_DOWNLOAD_MAX_MB",
+            "image_download_max_mb",
+            file.image_download_max_mb,
+            RequestLimits::DEFAULT_DOWNLOAD_MAX_MB,
+            RequestLimits::DOWNLOAD_MAX_MB,
+            "MiB",
+        );
+        let image_negative_cache_ttl_secs = resolve_clamped(
+            env,
+            "FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS",
+            "image_negative_cache_ttl_secs",
+            file.image_negative_cache_ttl_secs,
+            DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
+            IMAGE_NEGATIVE_CACHE_TTL_SECS,
+            "seconds",
+        );
 
         let ffmpeg_path = cli
             .ffmpeg_path
@@ -1008,6 +1041,8 @@ impl Config {
             image_decode_max_megapixels,
             image_decode_max_memory_mb,
             image_resize_budget_mb,
+            image_download_max_mb,
+            image_negative_cache_ttl_secs,
             ffmpeg_path,
             ffprobe_path,
             ffmpeg_img_extract_perf_tradeoff: parse_bool_var(
@@ -1290,6 +1325,8 @@ impl Config {
             image_decode_max_megapixels: ImageLimits::DEFAULT_DECODE_MEGAPIXELS,
             image_decode_max_memory_mb: ImageLimits::DEFAULT_DECODE_MEMORY_MB,
             image_resize_budget_mb: ImageLimits::DEFAULT_RESIZE_BUDGET_MB,
+            image_download_max_mb: RequestLimits::DEFAULT_DOWNLOAD_MAX_MB,
+            image_negative_cache_ttl_secs: DEFAULT_IMAGE_NEGATIVE_CACHE_TTL_SECS,
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_img_extract_perf_tradeoff: false,
@@ -2559,6 +2596,45 @@ mod tests {
                 ImageLimits::DEFAULT_RESIZE_BUDGET_MB
             )
         );
+    }
+
+    /// The remote image settings: `config.toml`, then the variables, then the
+    /// defaults; a value out of range warns and is clamped.
+    #[test]
+    fn the_remote_image_settings_resolve_like_the_image_limits() {
+        let settings =
+            |cfg: &Config| (cfg.image_download_max_mb, cfg.image_negative_cache_ttl_secs);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "image_download_max_mb = 128\nimage_negative_cache_ttl_secs = 600\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(settings(&cfg), (128, 600));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_IMAGE_DOWNLOAD_MAX_MB", "32")
+            .with("FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS", "7200");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(settings(&cfg), (32, 7200));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_IMAGE_DOWNLOAD_MAX_MB", "1")
+            .with("FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS", "999999");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(settings(&cfg), (16, 86_400));
+        assert_eq!(cfg.load_warnings.len(), 2, "{:?}", cfg.load_warnings);
+
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(settings(&cfg), (64, 3600));
     }
 
     /// The config file is TOML: a file named for another format is refused,

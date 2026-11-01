@@ -21,6 +21,18 @@ one of them a client gets the original file instead of a thumbnail:
 
 A photo library with larger panoramas may want `FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS` raised.
 
+## Remote images
+
+Downloading artwork from a URL is now bounded, and the bounds are settings
+([Remote images](CONFIG.md#remote-images)). Three things change:
+
+- an image over 64 MiB is no longer downloaded, and the scan takes the provider's next image. A
+  logo over it logs a warning naming `image_download_max_mb`;
+- a response has to be an image, whatever type it declares. An error page sent as `image/png`, or
+  a format Ferrofin does not recognise, used to be stored and is now refused;
+- a logo URL that gave no image is left alone for an hour, so a logo fixed at its source can take
+  that long to appear. Lower `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS`, or restart, to retry sooner.
+
 ## Kubernetes: stop the old pod first for heavy migrations
 
 The Helm chart's default rolling update keeps the old pod serving and writing the database

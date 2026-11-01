@@ -20,7 +20,7 @@
 //! turns a `file_id` into a one-time download link whose body is the subtitle.
 
 use crate::rate_limit::CountedBody as _;
-use crate::rate_limit::{LimitedRequest as _, RateLimiter, RequestError};
+use crate::rate_limit::{BodyError, LimitedRequest as _, RateLimiter, RequestError};
 use std::sync::Arc;
 
 use crate::error::ProvidersError;
@@ -625,7 +625,7 @@ impl OpenSubtitlesProvider {
             tracing::debug!(%status, "OpenSubtitles refused the quota read");
             return Ok(false);
         }
-        let body = response.counted_bytes().await.map_err(net_err)?;
+        let body = response.counted_bytes().await.map_err(body_err)?;
         let Ok(info) = serde_json::from_slice::<UserInfoResponse>(&body) else {
             tracing::debug!("OpenSubtitles sent an unreadable quota");
             return Ok(false);
@@ -784,6 +784,15 @@ fn request_err(error: RequestError) -> ServiceError {
 
 fn net_err(e: reqwest::Error) -> ServiceError {
     ProvidersError::http("OpenSubtitles request failed", e).into()
+}
+
+fn body_err(e: BodyError) -> ServiceError {
+    match e {
+        BodyError::Read(e) => net_err(e),
+        BodyError::TooLarge => {
+            ServiceError::backend("OpenSubtitles sent more than image_download_max_mb")
+        }
+    }
 }
 
 /// The plugin's `RateLimitExceededException`.
@@ -965,7 +974,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
                 .await
                 .map_err(request_err)?;
             let status = response.status();
-            let body = response.counted_bytes().await.map_err(net_err)?;
+            let body = response.counted_bytes().await.map_err(body_err)?;
             let info: DownloadResponse = serde_json::from_slice(&body).unwrap_or_default();
             let mut state = self.state.lock().await;
             if let Some(reset) = info.reset_time {
@@ -1021,7 +1030,7 @@ impl SubtitleProvider for OpenSubtitlesProvider {
             .map_err(net_err)?
             .counted_bytes()
             .await
-            .map_err(net_err)?;
+            .map_err(body_err)?;
 
         Ok(SubtitleResponse {
             language: parsed.language,

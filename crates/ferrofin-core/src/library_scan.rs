@@ -27845,7 +27845,7 @@ mod tests {
             b"x",
         )
         .unwrap();
-        let base = spawn_art_server("Mosfilm\nLenfilm", b"JPEGDATA");
+        let base = spawn_art_server("Mosfilm\nLenfilm", b"GIF89aDATA");
         scanner(&base)
             .enrich_studio_images(super::ScanRun::defaults())
             .await
@@ -27912,7 +27912,7 @@ mod tests {
         };
         let (studio_id, unknown_id) = (studio("Mosfilm"), studio("Nowhere Films"));
 
-        let base = spawn_art_server("Mosfilm", b"JPEGDATA");
+        let base = spawn_art_server("Mosfilm", b"GIF89aDATA");
         let tmp = tempfile::tempdir().unwrap();
         let vf: Arc<dyn VirtualFolderManager> = Arc::new(
             FerrofinVirtualFolderManager::new(tmp.path().join("default"))
@@ -27937,7 +27937,7 @@ mod tests {
             images[0].image_type,
             ferrofin_model::entities::ImageType::Thumb
         );
-        assert_eq!(std::fs::read(&images[0].path).unwrap(), b"JPEGDATA");
+        assert_eq!(std::fs::read(&images[0].path).unwrap(), b"GIF89aDATA");
         // Both were answered for — a thumb, and none — so both are refreshed.
         for id in [studio_id, unknown_id] {
             let row = items.retrieve_item(id).await.unwrap().unwrap();
@@ -34863,7 +34863,7 @@ mod tests {
                 let (status, payload) = if line.contains("/missing/") {
                     ("404 Not Found", "{}".to_owned())
                 } else if line.contains("/img/") {
-                    ("200 OK", "image".to_owned())
+                    ("200 OK", "GIF89aimage".to_owned())
                 } else if line.contains("/tv/1399/season/1/episode/1/images") {
                     (
                         "200 OK",
@@ -35072,7 +35072,7 @@ mod tests {
             if plugin_wins {
                 b"\x89PNG\r\n\x1a\nplugin".as_slice()
             } else {
-                b"image".as_slice()
+                b"GIF89aimage".as_slice()
             }
         );
         assert!(
@@ -35350,7 +35350,7 @@ mod tests {
                 if plugin_wins {
                     b"\x89PNG\r\n\x1a\nplugin".as_slice()
                 } else {
-                    b"remote".as_slice()
+                    b"GIF89aremote".as_slice()
                 }
             );
         }
@@ -35367,7 +35367,7 @@ mod tests {
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]);
                 let (body, content_type) = if request.starts_with("GET /image") {
-                    ("remote".to_owned(), "image/jpeg")
+                    ("GIF89aremote".to_owned(), "image/jpeg")
                 } else if request.contains("/album-mb.php") {
                     (
                         format!(r#"{{"album":[{{"strAlbumThumb":"http://{addr}/image"}}]}}"#),

@@ -826,6 +826,30 @@ pub static SETTINGS: &[SettingSpec] = &[
         running: |c| json!(c.image_resize_budget_mb),
         ..ROW
     },
+    SettingSpec {
+        key: "image_download_max_mb",
+        env: Some("FERROFIN_IMAGE_DOWNLOAD_MAX_MB"),
+        env_read: PARSED_U32,
+        group: Group::Images,
+        kind: image_limit(ferrofin_providers::rate_limit::RequestLimits::DOWNLOAD_MAX_MB),
+        default: "64",
+        description: "Largest remote image downloaded, in MiB; a larger one is refused and the \
+                      read stops there.",
+        running: |c| json!(c.image_download_max_mb),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_negative_cache_ttl_secs",
+        env: Some("FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS"),
+        env_read: EnvRead::Parsed(parses::<u64>),
+        group: Group::Images,
+        kind: provider_seconds(ferrofin_providers::IMAGE_NEGATIVE_CACHE_TTL_SECS),
+        default: "3600",
+        description: "Seconds a remote image URL that gave no image is left alone before it is \
+                      tried again.",
+        running: |c| json!(c.image_negative_cache_ttl_secs),
+        ..ROW
+    },
     // ---- WASM plugins -----------------------------------------------------
     SettingSpec {
         key: "wasm_call_timeout_secs",
@@ -968,7 +992,8 @@ const fn provider_seconds(range: std::ops::RangeInclusive<u64>) -> SettingKind {
     }
 }
 
-/// An image limit's bounds, from `ferrofin_drawing::ImageLimits`.
+/// An image limit's bounds, from `ferrofin_drawing::ImageLimits` or the
+/// download limit in `RequestLimits`.
 const fn image_limit(range: std::ops::RangeInclusive<u32>) -> SettingKind {
     SettingKind::Integer {
         min: *range.start() as i64,
