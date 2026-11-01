@@ -70,6 +70,25 @@ database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
 
+## Unreleased — a Live TV tuner's stream URL is for administrators
+
+IPTV stream URLs usually hold the account's user name and password, so an HTTP channel of an M3U
+tuner no longer shows its URL to an ordinary account. `/Items/{id}/PlaybackInfo` and
+`POST /LiveStreams/Open` answer such a channel with an empty `Path` and `SupportsDirectPlay` false,
+whether it is opened or not and wherever its host is, and `/Audio/{id}/universal` no longer
+redirects to it. An administrator and an API key keep both. Jellyfin sends the URL to every user
+with Live TV access, so this is a deliberate difference.
+
+There is nothing to configure, and playback carries on: a client that follows those two fields
+streams through `/Videos/{id}/stream` or the source's `TranscodingUrl`. What you may notice is a
+channel a browser used to fetch straight from the provider (an M3U tuner with a tuner count of 0, in
+a format the browser plays): for an ordinary account the server now relays it, so its bandwidth
+goes through the server, and the provider sees the server's address and the tuner's user agent. A
+client that plays `Path` without reading `SupportsDirectPlay` stops playing these channels for
+ordinary accounts.
+
+HDHomeRun tuners are unchanged, and so are M3U channels on `rtsp://`, `rtp://` or `udp://` URLs.
+
 ## Unreleased — a progressive transcode needs a token
 
 Usually nothing to do. A `GET` on `/Videos/{id}/stream[.{container}]` or
