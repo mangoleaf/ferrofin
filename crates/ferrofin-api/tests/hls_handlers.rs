@@ -1840,6 +1840,45 @@ async fn a_token_does_not_override_the_account_policy(
     }
 }
 
+/// ASP.NET matches a route's literals in any case, so `STREAM.mp4` is the stream
+/// route. The container keeps the case it was sent in; a segment that is not
+/// `stream.{container}` is no route.
+#[rstest]
+#[case::lower("stream.mp4", StatusCode::OK, Some("mp4"))]
+#[case::upper("STREAM.mp4", StatusCode::OK, Some("mp4"))]
+#[case::mixed("Stream.MP4", StatusCode::OK, Some("MP4"))]
+#[case::no_container("stream.", StatusCode::NOT_FOUND, None)]
+#[case::another_literal("streams.mp4", StatusCode::NOT_FOUND, None)]
+#[case::shorter_than_the_literal("str", StatusCode::NOT_FOUND, None)]
+#[case::multibyte_at_the_literal_end("stream\u{e9}mp4", StatusCode::NOT_FOUND, None)]
+#[tokio::test]
+async fn the_stream_route_literal_matches_in_any_case(
+    #[case] segment: &str,
+    #[case] expected: StatusCode,
+    #[case] container: Option<&str>,
+) {
+    for route in ["Videos", "Audio"] {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("output.mp4");
+        std::fs::write(&file, b"progressive bytes").unwrap();
+        let rec = Arc::new(Recorded::default());
+        let app = router_no_static(ok_hls(file.to_str().unwrap(), Arc::clone(&rec)));
+        let encoded: String = form_urlencoded::byte_serialize(segment.as_bytes()).collect();
+        let path = format!("/{route}/{ITEM_ID}/{encoded}");
+        let response = app.oneshot(authed("GET", &path)).await.unwrap();
+        assert_eq!(response.status(), expected, "{path}");
+        assert_eq!(
+            rec.last
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|request| request.output_container.as_deref()),
+            container,
+            "{path}"
+        );
+    }
+}
+
 /// A Blu-ray or DVD folder is never served as a file: a `static=true` video
 /// request for one goes to ffmpeg, so it needs a caller too. Its `HEAD` starts
 /// nothing and stays anonymous; audio has no such exception.

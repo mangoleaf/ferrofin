@@ -1159,8 +1159,9 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
         upstream_method: "GetVideoStream",
         ferrofin: "Which GET and HEAD requests on the /Videos and /Audio stream routes reach \
                    ffmpeg, and who may send them; the query parameters of those operations are \
-                   not part of this row. handlers/streaming.rs static_or_transcode and \
-                   serve_static_source (the static branches of \
+                   not part of this row. handlers/streaming.rs stream_route_container (the \
+                   stream.{container} literal, in any case, as ASP.NET matches it), \
+                   static_or_transcode and serve_static_source (the static branches of \
                    VideosController.GetVideoStream and AudioHelper.GetAudioStream: open live \
                    stream, remote source, other protocol, file, and for video alone the \
                    disc-folder exception) and handlers/hls.rs transcode_stream_fallback \
