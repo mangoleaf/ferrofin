@@ -95,7 +95,8 @@ pub(crate) async fn static_source(
 /// The shared body of `VideosController.GetVideoStream` and
 /// `AudioHelper.GetAudioStream`: a `Static=true` request is served from the
 /// source it names; anything else, and a static video request for a disc
-/// folder (which only ffmpeg reads), is transcoded.
+/// folder (which only ffmpeg reads), is transcoded, which needs a caller
+/// ([`transcode_stream_fallback`]).
 pub(crate) async fn static_or_transcode(
     state: &AppState,
     item_id: Uuid,
