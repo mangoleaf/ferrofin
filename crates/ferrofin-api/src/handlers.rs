@@ -895,9 +895,6 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     ("delete", "/Audio/{itemId}/Lyrics", "v12.2"),
     ("get", "/Audio/{itemId}/RemoteSearch/Lyrics", "v12.2"),
     ("post", "/Items/{itemId}/ContentType", "v12.2"),
-    // gl-1031: a malformed unrelated query parameter is a 400.
-    ("post", "/UserImage", "v12.2"),
-    ("delete", "/UserImage", "v12.2"),
     // gl-1027: a padded lyric extension is trimmed and saved.
     ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
     // gl-1028: a whitespace-only route id is not the validation 400.
@@ -1363,12 +1360,15 @@ pub const VERIFIED: &[Verified] = &[
         path: "/UserImage",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "PostUserImage",
-        ferrofin: "handlers/images.rs post_user_image → handlers/items.rs resolve_user, \
-               handlers/users.rs assert_can_update_user, handlers/image_upload.rs \
-               (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
-               to_extension, decode_base64) → ferrofin-core user_manager.rs \
-               save_profile_image",
-        date: "2026-10-24",
+        ferrofin: "handlers/images.rs post_user_image (UserIdQuery, userId alone) → \
+               handlers/items.rs resolve_user, handlers/users.rs assert_can_update_user, \
+               handlers/image_upload.rs (try_get_image_extension_from_content_type → \
+               ferrofin-model mime_types.rs to_extension, decode_base64) → ferrofin-core \
+               user_manager.rs save_profile_image. The hidden post_user_image_legacy and \
+               post_user_image_by_index_legacy (PostUserImageLegacy, \
+               PostUserImageByIndexLegacy) take userId from the route and bind no query \
+               member, measured on 12.4",
+        date: "2026-10-31",
         divergences: &[
             "The body is decoded in full before anything is written, so a body the decoder \
          rejects is a 400 that changes nothing. Upstream clears the old profile image row \
@@ -1387,6 +1387,11 @@ pub const VERIFIED: &[Verified] = &[
          cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
          Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
          Jellyfin bug not ported.",
+            "The 400 (a nil effective user, a Content-Type that is not an image type, a body \
+         that is not base64, a username outside the users directory, or a value the query \
+         binder cannot convert), 403 (another user's id without the administrator role, or \
+         a user without EnableUserPreferenceAccess) and 404 (no such user) bodies are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1395,11 +1400,20 @@ pub const VERIFIED: &[Verified] = &[
         path: "/UserImage",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "DeleteUserImage",
-        ferrofin: "handlers/images.rs delete_user_image → handlers/items.rs resolve_user, \
-               handlers/users.rs assert_can_update_user → ferrofin-core user_manager.rs \
-               clear_profile_image",
-        date: "2026-10-20",
-        divergences: &[],
+        ferrofin: "handlers/images.rs delete_user_image (UserIdQuery, userId alone) → \
+               handlers/items.rs resolve_user, handlers/users.rs assert_can_update_user → \
+               ferrofin-core user_manager.rs clear_profile_image. The hidden \
+               delete_user_image_legacy (DeleteUserImageLegacy) and \
+               delete_user_image_by_index_legacy (DeleteUserImageByIndexLegacy) take userId \
+               from the route; the first binds its one query member, int? index, and drops \
+               it, so ?index=x is a 400 there, and the second binds none, measured on 12.4",
+        date: "2026-10-31",
+        divergences: &[
+            "The 400 (a nil effective user, or a value the query binder cannot convert), 403 \
+         (another user's id without the administrator role, or a user without \
+         EnableUserPreferenceAccess) and 404 (no such user) bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
         refs: &[],
     },
     Verified {

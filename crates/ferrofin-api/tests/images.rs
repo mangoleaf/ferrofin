@@ -2439,6 +2439,109 @@ async fn legacy_user_image_forms_bind_every_number_they_declare(
     }
 }
 
+/// `PostUserImage` and `DeleteUserImage` bind `userId` alone, so an undeclared
+/// member is never parsed. Their legacy forms take `userId` from the route and
+/// bind no query member, except `DeleteUserImageLegacy`'s `[FromQuery] int?
+/// index`: the indexed delete takes `index` from its route, and the uploads
+/// declare none. Each row was measured on Jellyfin 12.4 (gl-1031).
+#[rstest::rstest]
+#[case::post_size("POST", "/UserImage?maxWidth=x", StatusCode::NO_CONTENT)]
+#[case::delete_size("DELETE", "/UserImage?maxWidth=x", StatusCode::NO_CONTENT)]
+#[case::post_image_index("POST", "/UserImage?imageIndex=x", StatusCode::NO_CONTENT)]
+#[case::delete_image_index("DELETE", "/UserImage?imageIndex=x", StatusCode::NO_CONTENT)]
+#[case::post_user_id("POST", "/UserImage?userId=junk", StatusCode::BAD_REQUEST)]
+#[case::delete_user_id("DELETE", "/UserImage?userId=junk", StatusCode::BAD_REQUEST)]
+#[case::post_legacy_size(
+    "POST",
+    "/Users/{user}/Images/Primary?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_legacy_size(
+    "DELETE",
+    "/Users/{user}/Images/Primary?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_legacy_user_id(
+    "POST",
+    "/Users/{user}/Images/Primary?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_legacy_user_id(
+    "DELETE",
+    "/Users/{user}/Images/Primary?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_legacy_index("POST", "/Users/{user}/Images/Primary?index=x", StatusCode::NO_CONTENT)]
+#[case::delete_legacy_index(
+    "DELETE",
+    "/Users/{user}/Images/Primary?index=x",
+    StatusCode::BAD_REQUEST
+)]
+#[case::post_indexed_size(
+    "POST",
+    "/Users/{user}/Images/Primary/0?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_indexed_size(
+    "DELETE",
+    "/Users/{user}/Images/Primary/0?maxWidth=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_indexed_user_id(
+    "POST",
+    "/Users/{user}/Images/Primary/0?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_indexed_user_id(
+    "DELETE",
+    "/Users/{user}/Images/Primary/0?userId=junk",
+    StatusCode::NO_CONTENT
+)]
+#[case::post_indexed_index(
+    "POST",
+    "/Users/{user}/Images/Primary/0?index=x",
+    StatusCode::NO_CONTENT
+)]
+#[case::delete_indexed_index(
+    "DELETE",
+    "/Users/{user}/Images/Primary/0?index=x",
+    StatusCode::NO_CONTENT
+)]
+#[tokio::test]
+async fn user_image_writes_bind_what_their_actions_declare(
+    #[case] method: &str,
+    #[case] route: &str,
+    #[case] expected: StatusCode,
+) {
+    let s = stubs(String::new(), String::new());
+    let uri = route.replace("{user}", &USER_ID.to_string());
+    let body = (method == "POST").then_some(("image/png", "aGk="));
+    let (status, _) = send(&s, method, &uri, body).await;
+    assert_eq!(status, expected, "{method} {uri}");
+}
+
+/// No item image action declares `userId`, so a malformed one is never seen.
+/// Measured on Jellyfin 12.4 (gl-1031).
+#[rstest::rstest]
+#[case::get("GET", "/Items/{item}/Images/Primary", StatusCode::OK)]
+#[case::get_indexed("GET", "/Items/{item}/Images/Primary/0", StatusCode::OK)]
+#[case::delete("DELETE", "/Items/{item}/Images/Primary", StatusCode::NO_CONTENT)]
+#[tokio::test]
+async fn item_image_routes_ignore_a_user_id(
+    #[case] method: &str,
+    #[case] route: &str,
+    #[case] expected: StatusCode,
+) {
+    let img = TempImage::new(b"POSTER");
+    let s = elevated_stubs(img.path(), String::new());
+    let uri = format!(
+        "{}?userId=junk",
+        route.replace("{item}", &ITEM_ID.to_string())
+    );
+    let (status, _) = send(&s, method, &uri, None).await;
+    assert_eq!(status, expected, "{method} {uri}");
+}
+
 /// `GetItemImage2` takes `width`, `height`, `quality`, `fillWidth`,
 /// `fillHeight` and `blur` from the query string, and the format, the maximum
 /// size and the tag from the route, where a query parameter of the same name

@@ -65,6 +65,7 @@ use crate::error::ApiError;
 use crate::extract::{Query, upload_body_limit};
 use crate::handlers::image_upload::{decode_base64, try_get_image_extension_from_content_type};
 use crate::handlers::items::resolve_user;
+use crate::handlers::users::UserIdQuery;
 use crate::state::AppState;
 
 /// Binds a `{imageType}` path segment: `[FromRoute, Required] ImageType`, which
@@ -103,20 +104,14 @@ fn dotnet_enum_parse(text: &str, member: impl Fn(&str) -> Option<i32>) -> Option
     Some(combined)
 }
 
-/// The query parameters accepted by every image-serving route.
+/// The query parameters accepted by the item and by-name image routes.
 ///
 /// Every field is optional and mirrors Jellyfin's `GetImage*` signature; the
 /// size/format/blur fields drive the [`ImageProcessor`](ferrofin_traits::drawing::ImageProcessor)
-/// transform, and `user_id` (for the user-image route) selects which file is served.
+/// transform.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImageQuery {
-    /// The target user (user-image route only); defaults to the caller.
-    #[serde(
-        default,
-        deserialize_with = "crate::handlers::query_parse::empty_as_none_uuid"
-    )]
-    user_id: Option<Uuid>,
     /// Optional explicit image index (query-string form of the route segment).
     #[serde(default)]
     image_index: Option<i32>,
@@ -1182,6 +1177,15 @@ struct LegacyImageIndexQuery {
     image_index: Option<i32>,
 }
 
+/// `DeleteUserImageLegacy`'s `[FromQuery] int? index = null`, bound and dropped.
+/// It is the only query member of the four legacy upload and delete forms.
+#[allow(dead_code)] // Only the binder reads it.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct LegacyDeleteIndexQuery {
+    index: Option<i32>,
+}
+
 /// `GET`/`HEAD /UserImage` — serve a user's profile image.
 ///
 /// Port of `ImageController.GetUserImage`. The user is the `userId` query
@@ -1257,7 +1261,7 @@ async fn get_user_image(
 async fn post_user_image(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<ImageQuery>,
+    Query(query): Query<UserIdQuery>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
@@ -1299,7 +1303,7 @@ async fn post_user_image(
 async fn delete_user_image(
     State(state): State<AppState>,
     RequireAuth(auth): RequireAuth,
-    Query(query): Query<ImageQuery>,
+    Query(query): Query<UserIdQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     let user = resolve_user(&state, &auth, query.user_id).await?;
     super::users::assert_can_update_user(&state, &auth, &user).await?;
@@ -1344,18 +1348,19 @@ async fn get_user_image_by_index_legacy(
 }
 
 /// `POST /Users/{userId}/Images/{imageType}` — path-scoped form of
-/// `POST /UserImage`.
+/// `POST /UserImage`. It binds no query member.
 async fn post_user_image_legacy(
     state: State<AppState>,
     auth: RequireAuth,
     Path((user_id, image_type)): Path<(Uuid, String)>,
-    Query(mut query): Query<ImageQuery>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
     parse_image_type(&image_type)?;
-    query.user_id = Some(user_id);
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
     post_user_image(state, auth, Query(query), headers, body).await
 }
 
@@ -1365,11 +1370,13 @@ async fn delete_user_image_legacy(
     state: State<AppState>,
     auth: RequireAuth,
     Path((user_id, image_type)): Path<(Uuid, String)>,
-    Query(mut query): Query<ImageQuery>,
+    Query(_): Query<LegacyDeleteIndexQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
     parse_image_type(&image_type)?;
-    query.user_id = Some(user_id);
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
     delete_user_image(state, auth, Query(query)).await
 }
 
@@ -1379,33 +1386,37 @@ async fn delete_user_image_legacy(
 /// The image type and index are ignored, as upstream does, but both must still
 /// bind: upstream binds the type as an `ImageType` ([`parse_image_type`]) and
 /// the index as an `int`, so anything else fails model binding with a `400`.
+/// It binds no query member.
 async fn post_user_image_by_index_legacy(
     state: State<AppState>,
     auth: RequireAuth,
     Path((user_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
-    Query(mut query): Query<ImageQuery>,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, ApiError> {
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
     parse_image_type(&image_type)?;
-    query.user_id = Some(user_id);
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
     post_user_image(state, auth, Query(query), headers, body).await
 }
 
 /// `DELETE /Users/{userId}/Images/{imageType}/{imageIndex}` — indexed
 /// path-scoped form of `DELETE /UserImage` (`DeleteUserImageByIndexLegacy`),
 /// ignoring the image type and the (integer) index as
-/// [`post_user_image_by_index_legacy`] does.
+/// [`post_user_image_by_index_legacy`] does. It binds no query member: here the
+/// index is the route's.
 async fn delete_user_image_by_index_legacy(
     state: State<AppState>,
     auth: RequireAuth,
     Path((user_id, image_type, _image_index)): Path<(Uuid, String, i32)>,
-    Query(mut query): Query<ImageQuery>,
 ) -> Result<axum::http::StatusCode, ApiError> {
     // `[FromRoute, Required] ImageType`: bound (400 when invalid), then ignored.
     parse_image_type(&image_type)?;
-    query.user_id = Some(user_id);
+    let query = UserIdQuery {
+        user_id: Some(user_id),
+    };
     delete_user_image(state, auth, Query(query)).await
 }
 
@@ -1731,10 +1742,11 @@ pub fn register(router: Router<AppState>) -> Router<AppState> {
 }
 
 crate::query::query_parameters! {
-    ImageQuery {} => [("get", "/Items/{itemId}/Images/{imageType}"), ("get", "/Items/{itemId}/Images/{imageType}/{imageIndex}"), ("post", "/UserImage"), ("delete", "/UserImage"), ("delete", "/Items/{itemId}/Images/{imageType}")];
+    ImageQuery {} => [("get", "/Items/{itemId}/Images/{imageType}"), ("get", "/Items/{itemId}/Images/{imageType}/{imageIndex}"), ("delete", "/Items/{itemId}/Images/{imageType}")];
     UserImageQuery {} => [("get", "/UserImage")];
     LegacyUserImageQuery {} => [];
     LegacyImageIndexQuery {} => [];
+    LegacyDeleteIndexQuery {} => [];
     UpdateImageIndexQuery {} => [("post", "/Items/{itemId}/Images/{imageType}/{imageIndex}/Index")];
 }
 
