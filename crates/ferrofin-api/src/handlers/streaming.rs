@@ -92,10 +92,23 @@ pub(crate) async fn static_source(
     })
 }
 
+/// The container a `stream.{container}` route segment names, or `None` when the
+/// segment is not that route.
+///
+/// The route registers as one capture (`routes::to_axum_path`), so the literal
+/// is checked here, in any case, as ASP.NET matches a route's literals. The
+/// container keeps the case it was sent in.
+pub(crate) fn stream_route_container(segment: &str) -> Option<&str> {
+    const LITERAL: &str = "stream.";
+    let (literal, container) = segment.split_at_checked(LITERAL.len())?;
+    (literal.eq_ignore_ascii_case(LITERAL) && !container.is_empty()).then_some(container)
+}
+
 /// The shared body of `VideosController.GetVideoStream` and
 /// `AudioHelper.GetAudioStream`: a `Static=true` request is served from the
 /// source it names; anything else, and a static video request for a disc
-/// folder (which only ffmpeg reads), is transcoded.
+/// folder (which only ffmpeg reads), is transcoded, which needs a caller
+/// ([`transcode_stream_fallback`]).
 pub(crate) async fn static_or_transcode(
     state: &AppState,
     item_id: Uuid,
@@ -240,7 +253,9 @@ async fn serve_remote_static(
         })?
         .map_err(|error| {
             ApiError::Service(ferrofin_traits::error::ServiceError::backend(format!(
-                "remote stream request failed: {error}"
+                "remote stream request to {} failed: {}",
+                ferrofin_util::source_url::redact_url(url),
+                error.without_url()
             )))
         })?;
     let status =
@@ -573,6 +588,26 @@ mod remote_static_tests {
             error.status(),
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// A pass-through channel's URL can carry the provider's account, and a
+    /// `5xx`'s text is logged at the boundary.
+    #[tokio::test]
+    async fn a_failed_relay_names_only_the_origins_host() {
+        let error = serve_remote_static(
+            "http://acct-user:info-secret@127.0.0.1:0/path-secret/1.ts?password=query-secret",
+            None,
+            Request::new(Body::empty()),
+            SHORT_TIMEOUT,
+        )
+        .await
+        .expect_err("nothing listens there");
+
+        let text = error.to_string();
+        assert!(text.contains("http://127.0.0.1:0"), "{text}");
+        for secret in ["acct-user", "info-secret", "path-secret", "query-secret"] {
+            assert!(!text.contains(secret), "{text}");
+        }
     }
 
     /// The timeout stops at the headers (`ResponseHeadersRead`): a body that

@@ -1,7 +1,7 @@
 # Feature status
 
-**Parity: 30 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
-19 compared against v12.2 and owed a re-check, 5 subsystem rows (as of 2026-10-31; the
+**Parity: 33 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+17 compared against v12.2 and owed a re-check, 6 subsystem rows (as of 2026-11-01; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
 Ferrofin answers the way Jellyfin does (identical, in another order, a known difference, filed, new), is in
@@ -73,6 +73,10 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
     saved again; a new one goes last. Jellyfin lists them by a random id it draws again on
     every save, so its backdrop order reshuffles. An item adopted from Jellyfin can show
     its backdrops in a different order once.
+  - **Accepted divergence (a fix, not a gap):** a tuner's or guide's artwork must be an
+    `http` or `https` URL, and any other value is ignored. Jellyfin also accepts a local
+    path there. Logos set in the metadata editor, and the ones an adopted Jellyfin database
+    downloaded, keep working.
 - **Sessions & playback** — sessions, playstate reporting, remote control, capabilities, and
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's

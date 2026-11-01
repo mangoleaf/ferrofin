@@ -18,7 +18,7 @@ use ferrofin_model::system_info_dtos::SystemStorageDto;
 use ferrofin_traits::net::RequestContext;
 use ferrofin_util::string_extensions::equals_ordinal_ignore_case;
 
-use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth, RequireLocalAccessOrAdmin};
+use crate::auth::{FirstTimeSetupOrAuth, RequireAdmin, RequireAuth};
 use crate::error::ApiError;
 use crate::extract::Query;
 use crate::handlers::streaming::opened_file_response;
@@ -113,23 +113,24 @@ async fn ping_system(State(state): State<AppState>) -> Json<String> {
 
 /// `POST /System/Restart` — begins the application restart process.
 ///
-/// Port of `SystemController.RestartApplication`
-/// (`Policies.LocalAccessOrRequiresElevation`): a caller on the local network
-/// may restart, anyone else must be an administrator. See
-/// [`RequireLocalAccessOrAdmin`] for the two deliberate divergences.
+/// Port of `SystemController.RestartApplication`, stricter than upstream by
+/// owner decision (gl-1103): the caller must be an administrator or an API key
+/// whatever the source address, as on `POST /System/Shutdown`. Upstream's
+/// `Policies.LocalAccessOrRequiresElevation` also admits any caller on the
+/// local network, with or without a token.
 #[utoipa::path(
     post,
     path = "/System/Restart",
     responses(
         (status = 204, description = "Server restarted"),
         (status = 401, description = "Unauthenticated"),
-        (status = 403, description = "Remote caller is not an administrator"),
+        (status = 403, description = "Caller is not an administrator"),
     ),
     tag = "ferrofin"
 )]
 async fn restart_application(
     State(state): State<AppState>,
-    _auth: RequireLocalAccessOrAdmin,
+    _auth: RequireAdmin,
 ) -> Result<StatusCode, ApiError> {
     state.system.restart().await?;
     Ok(StatusCode::NO_CONTENT)

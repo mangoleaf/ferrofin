@@ -28,6 +28,12 @@ next time a restart, a Live TV settings save or a guide refresh checks the recor
 save those settings until the old pod has gone, or
 [stop it first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
 
+## Restarting the server needs an administrator
+
+`POST /System/Restart` now requires an administrator or an API key from every address, as
+`POST /System/Shutdown` always has. An ordinary account on the local network could use it
+before and now gets a `403`, so a script that restarts the server with one needs an API key.
+
 ## Image limits
 
 Decoding and resizing images are now bounded, and the bounds are settings
@@ -40,6 +46,18 @@ one of them a client gets the original file instead of a thumbnail:
   10000 of output height.
 
 A photo library with larger panoramas may want `FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS` raised.
+
+## Remote images
+
+Downloading artwork from a URL is now bounded, and the bounds are settings
+([Remote images](CONFIG.md#remote-images)). Three things change:
+
+- an image over 64 MiB is no longer downloaded, and the scan takes the provider's next image. A
+  logo over it logs a warning naming `image_download_max_mb`;
+- a response has to be an image, whatever type it declares. An error page sent as `image/png`, or
+  a format Ferrofin does not recognise, used to be stored and is now refused;
+- a logo URL that gave no image is left alone for an hour, so a logo fixed at its source can take
+  that long to appear. Lower `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS`, or restart, to retry sooner.
 
 ## Kubernetes: stop the old pod first for heavy migrations
 
@@ -71,6 +89,31 @@ is marked failed while the migration goes on running. Do not use `--atomic` or
 database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
+
+## Unreleased — a progressive transcode needs a token
+
+Usually nothing to do. A `GET` on `/Videos/{id}/stream[.{container}]` or
+`/Audio/{id}/stream[.{container}]` that would start ffmpeg now needs a user token or an API key,
+in the `Authorization` header or the `ApiKey` query parameter. With neither it answers `401`. This
+differs from Jellyfin on purpose, where these routes are anonymous. The usual account rules apply
+to it too: a disabled account gets `401`, and a user outside their access schedule, or remote with
+remote access off, gets `403`.
+
+- Clients that follow the server's `TranscodingUrl` are unaffected: it carries `ApiKey`.
+- `HEAD` requests and static reads (`static=true`) stay anonymous, as on Jellyfin. The exception
+  is a static read of a Blu-ray or DVD folder, which only ffmpeg can serve, so it needs a token too.
+- A script or player that builds its own transcode URL has to add `ApiKey=`. The lowercase
+  `api_key=` counts only with `EnableLegacyAuthorization` on, which is off by default.
+## Unreleased — a photo's image follows its file
+
+A photo's image now carries the file's date and is measured again each time the photo refreshes,
+as in Jellyfin. A photo edited in place gets its new size, aspect ratio, blur hash and image tag
+on the next scan, and clients fetch the new picture. A plain scan of an unchanged library still
+reads no photo. A full refresh now reads every photo it covers, once.
+
+**Do this if** you edited photos in place on an earlier version: they keep their old size and blur
+hash until they next refresh, because nothing tells a scan they changed. Refresh those photos, or
+the library, with **Replace all metadata** or **Search for missing metadata**.
 
 ## Unreleased — `/health` and `/metrics` follow the network access rules
 
@@ -124,6 +167,17 @@ Dashboard → Libraries, with box sets under a plain folder for that directory.
   lands in the new folder. A user's library access saved through it in that moment can name the old
   id, which nothing moves afterwards, so check such a user or
   [stop the old pod first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
+
+## Unreleased — Live TV artwork must be a URL
+
+Usually nothing to do. A playlist's `tvg-logo` or `logo` and a guide's `<icon>` or `<image>` are
+now kept only when they are `http` or `https` URLs. Any other value, such as a path on the server
+or a `file:` URL, is ignored, and each guide refresh logs a warning with how many it left out. If
+your logos were local files, serve them over HTTP or set them on the channel in the metadata
+editor. Logos you set that way, and the ones an adopted Jellyfin database downloaded, are
+unaffected. An image that an earlier version stored from such a value is no longer served. On a
+channel, the next guide refresh removes it if the playlist or guide still gives that value; on a
+programme, it goes when the programme next changes or leaves the guide.
 
 ## Unreleased — a mount that does not answer is left out of the drive list
 

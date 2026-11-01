@@ -546,13 +546,14 @@ pub async fn build_app_state(
     // environment): the end-to-end scan test points every provider a scan
     // reaches at its mock server. Unset, each client keeps its public host.
     let endpoints = &config.provider_endpoints;
-    // Every provider limiter's timeout and longest wait, set before any request
-    // of this lifetime, so a changed `config.toml` applies on an in-process
-    // restart (the image limiters live for the whole process).
+    // Every provider limiter's timeout, longest wait and largest download, set
+    // before any request of this lifetime, so a changed `config.toml` applies on
+    // an in-process restart (the image limiters live for the whole process).
     ferrofin_providers::rate_limit::set_request_limits(
-        ferrofin_providers::rate_limit::RequestLimits::from_seconds(
+        ferrofin_providers::rate_limit::RequestLimits::from_settings(
             config.provider_timeout_seconds,
             config.provider_max_wait_seconds,
+            config.image_download_max_mb,
         ),
     );
     let mut tmdb_client = ferrofin_providers::TmdbClient::new();
@@ -1188,7 +1189,10 @@ pub async fn build_app_state(
                 Arc::clone(&item_persistence_service),
                 metadata_library.clone(),
             )
-            .with_remote_image_cache(cache_root.child("remote-images"))
+            .with_remote_image_cache(
+                cache_root.child("remote-images"),
+                std::time::Duration::from_secs(config.image_negative_cache_ttl_secs),
+            )
             .with_remote_images(Arc::clone(&tmdb_client), Arc::clone(&item_repository))
             .with_remote_search_providers(search_providers)
             .with_dynamic_fetchers(wasm_host.provider_names())
