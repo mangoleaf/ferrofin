@@ -1285,7 +1285,6 @@ mod tests {
             segment_container: Some("ts".to_owned()),
             play_session_id: Some("parity-1".to_owned()),
             device_id: Some("parity-streams".to_owned()),
-            user_id: None,
         }
     }
 

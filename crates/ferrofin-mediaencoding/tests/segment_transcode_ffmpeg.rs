@@ -193,7 +193,6 @@ fn state(output_path: &Path, wait_for: &Path, segment_container: &str) -> Encodi
         segment_container: Some(segment_container.to_owned()),
         play_session_id: Some("sess".to_owned()),
         device_id: Some("dev".to_owned()),
-        user_id: None,
     }
 }
 
@@ -206,6 +205,7 @@ fn start_req<'a>(
     StartFfMpegRequest {
         env: Vec::new(),
         hardware_acceleration_type: ferrofin_model::entities::HardwareAccelerationType::none,
+        user_id: None,
         program: "ffmpeg",
         state,
         output_path,
@@ -460,7 +460,7 @@ async fn manager_start_ffmpeg_surfaces_nonzero_exit_as_error() {
         .await
         .expect_err("bogus input should fail");
     assert!(
-        err.contains("exited with code") || err.contains("timed out"),
+        err.to_string().contains("exited with code") || err.to_string().contains("timed out"),
         "unexpected error: {err}"
     );
     // The failed job left nothing registered (OnTranscodeFailedToStart).

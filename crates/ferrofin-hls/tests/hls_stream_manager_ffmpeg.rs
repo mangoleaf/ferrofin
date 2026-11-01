@@ -253,7 +253,6 @@ impl StreamStatePlanner for FfmpegPlanner {
             segment_container: Some(seg_ext.to_owned()),
             play_session_id: Some("sess".to_owned()),
             device_id: Some("dev".to_owned()),
-            user_id: None,
         };
         Ok(TranscodePlan {
             ffmpeg_env: Vec::new(),

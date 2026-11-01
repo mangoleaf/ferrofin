@@ -86,7 +86,6 @@ fn build_state(
         segment_container: None,
         play_session_id: None,
         device_id: None,
-        user_id: None,
     }
 }
 

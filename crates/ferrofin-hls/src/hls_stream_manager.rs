@@ -39,7 +39,7 @@ use ferrofin_mediaencoding::keyed_locks::KeyedLocks;
 use ferrofin_mediaencoding::transcoding::manager::StartFfMpegRequest;
 use ferrofin_mediaencoding::transcoding::segment_transcoder::SegmentTranscoder;
 use ferrofin_mediaencoding::transcoding::{
-    FsFileCleaner, SessionReporter, WAIT_FOR_FILE_TIMEOUT_MS,
+    FsFileCleaner, SessionReporter, StartFfmpegError, WAIT_FOR_FILE_TIMEOUT_MS,
 };
 use ferrofin_mediaencoding::{EncodingJobInfo, TranscodeDisplayNames, TranscodeManagerImpl};
 use ferrofin_model::configuration::EncodingOptions;
@@ -400,6 +400,16 @@ where
         entry.0
     }
 
+    /// The error for a start of playlist `key` that returned no job. A failed
+    /// start feeds the restart breaker; a refusal does not, since it says
+    /// nothing about the source, and the stream must play once a job ends.
+    fn failed_start(&self, key: &str, error: StartFfmpegError) -> ServiceError {
+        if matches!(error, StartFfmpegError::Failed(_)) {
+            self.record_restart_failure(key);
+        }
+        error.into()
+    }
+
     /// Clears the restart-failure record for playlist `key` (a started job
     /// delivered its segment).
     fn clear_restart_failures(&self, key: &str) {
@@ -647,15 +657,11 @@ where
             working_dir: None,
             env: plan.ffmpeg_env.clone(),
             hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
+            user_id: request.user_id,
         };
         let handle = match self.manager.start_ffmpeg(&self.transcoder, start).await {
             Ok(handle) => handle,
-            Err(e) => {
-                self.record_restart_failure(&playlist_key);
-                return Err(ServiceError::backend(format!(
-                    "failed to start transcode: {e}"
-                )));
-            }
+            Err(e) => return Err(self.failed_start(&playlist_key, e)),
         };
 
         // Consumer mark for the wait on the freshly-started job (see above).
@@ -800,16 +806,14 @@ where
                     working_dir: None,
                     env: plan.ffmpeg_env.clone(),
                     hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
+                    user_id: request.user_id,
                 };
                 if let Err(e) = self
                     .manager
                     .start_ffmpeg(&self.transcoder, start_request)
                     .await
                 {
-                    self.record_restart_failure(&playlist_key);
-                    return Err(ServiceError::backend(format!(
-                        "failed to start transcode: {e}"
-                    )));
+                    return Err(self.failed_start(&playlist_key, e));
                 }
                 self.clear_restart_failures(&playlist_key);
             }
@@ -982,15 +986,11 @@ where
                     working_dir: None,
                     env: plan.ffmpeg_env.clone(),
                     hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
+                    user_id: request.user_id,
                 };
                 let handle = match self.manager.start_ffmpeg(&self.transcoder, start).await {
                     Ok(handle) => handle,
-                    Err(e) => {
-                        self.record_restart_failure(&playlist_key);
-                        return Err(ServiceError::backend(format!(
-                            "failed to start transcode: {e}"
-                        )));
-                    }
+                    Err(e) => return Err(self.failed_start(&playlist_key, e)),
                 };
                 // The wait for `MinSegments` IS an active consumer: without
                 // this mark the idle reaper kills the job we just started (its
@@ -1110,13 +1110,12 @@ where
                 working_dir: None,
                 env: plan.ffmpeg_env.clone(),
                 hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
+                user_id: request.user_id,
             };
             self.manager
                 .start_ffmpeg(&self.transcoder, start)
                 .await
-                .map_err(|error| {
-                    ServiceError::backend(format!("failed to start transcode: {error}"))
-                })?;
+                .map_err(ServiceError::from)?;
         }
         let mut file = served(Path::new(&output), &ext);
         file.progress = self.manager.stream_progress(&output);
@@ -1448,7 +1447,7 @@ mod tests {
     use crate::dynamic_hls_playlist_generator::KeyframeExtractor;
     use ferrofin_mediaencoding::TranscodeDisplayNames;
     use ferrofin_mediaencoding::transcoding::{
-        FakeScript, FakeSegmentTranscoder, NoopSessionReporter,
+        FakeScript, FakeSegmentTranscoder, NoopSessionReporter, TranscodeLimits,
     };
     use ferrofin_mediaencoding::{BaseEncodingJobOptions, EncodingJobInfo};
     use ferrofin_model::dto::MediaSourceInfo;
@@ -1583,7 +1582,6 @@ mod tests {
                 segment_container: Some(self.segment_container.clone()),
                 play_session_id: Some("sess".to_owned()),
                 device_id: Some("dev".to_owned()),
-                user_id: None,
             };
             // The real planner's event args differ; the fake tags them so the
             // live path's choice of plan is observable.
@@ -1653,6 +1651,23 @@ mod tests {
         container: &str,
         keyframes: Option<ferrofin_keyframes::keyframe_data::KeyframeData>,
     ) -> (Mgr, PlanCalls, FakeSegmentTranscoder, PlanTicks) {
+        manager_limited(
+            dir,
+            script,
+            container,
+            keyframes,
+            TranscodeLimits::default(),
+        )
+    }
+
+    /// [`manager_remuxing`] under `limits`.
+    fn manager_limited(
+        dir: &Path,
+        script: FakeScript,
+        container: &str,
+        keyframes: Option<ferrofin_keyframes::keyframe_data::KeyframeData>,
+        limits: TranscodeLimits,
+    ) -> (Mgr, PlanCalls, FakeSegmentTranscoder, PlanTicks) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let runtime_ticks = Arc::new(Mutex::new(Vec::new()));
         let planner = FakePlanner {
@@ -1665,7 +1680,8 @@ mod tests {
         };
         let transcoder = FakeSegmentTranscoder::new(script);
         let spawns = transcoder.clone();
-        let manager = Arc::new(TranscodeManagerImpl::new(NoopSessionReporter));
+        let manager =
+            Arc::new(TranscodeManagerImpl::new(NoopSessionReporter).with_transcode_limits(limits));
         let paths = Arc::new(FakePaths {
             transcode: dir.to_string_lossy().into_owned(),
         });
@@ -2095,6 +2111,171 @@ mod tests {
             mgr.restart_breaker_open("/cache/hot/out.m3u8"),
             "sweeping stale records must not reset a live breaker"
         );
+    }
+
+    /// A manager running at most one re-encoding job.
+    fn manager_capped_at_one(dir: &Path) -> Mgr {
+        let script = FakeScript {
+            segment_files: vec!["out0.ts".to_owned(), "out-1.ts".to_owned()],
+            extra_files: vec!["out.m3u8".to_owned(), "out.ts".to_owned()],
+            ..FakeScript::default()
+        };
+        let limits = TranscodeLimits {
+            server: 1,
+            per_user: 0,
+        };
+        let (mgr, ..) = manager_limited(dir, script, "ts", None, limits);
+        mgr
+    }
+
+    /// Starts a job of `user` that takes the only slot, on another playlist.
+    async fn take_the_slot(
+        mgr: &Mgr,
+        dir: &Path,
+        user: Option<uuid::Uuid>,
+    ) -> ferrofin_traits::media_encoding::TranscodingJobHandle {
+        let plan = mgr
+            .planner
+            .plan(&req(), false, Some(0), PlaylistKind::Vod)
+            .await
+            .unwrap();
+        let mut state = plan.state;
+        state.wait_for_path = None;
+        let output_path = dir.join("held").join("out.m3u8");
+        mgr.manager
+            .start_ffmpeg(
+                &mgr.transcoder,
+                StartFfMpegRequest {
+                    program: "ffmpeg",
+                    state: &state,
+                    output_path: &output_path,
+                    arguments: Vec::new(),
+                    log_dir: dir.join("log"),
+                    working_dir: None,
+                    env: Vec::new(),
+                    hardware_acceleration_type: plan.encoding_options.hardware_acceleration_type,
+                    user_id: user,
+                },
+            )
+            .await
+            .expect("the first job fits under the cap")
+    }
+
+    /// The four places a transcode starts.
+    #[derive(Debug, Clone, Copy)]
+    enum StartPath {
+        Segment,
+        InitSegment,
+        LivePlaylist,
+        Progressive,
+    }
+
+    const START_PATHS: [StartPath; 4] = [
+        StartPath::Segment,
+        StartPath::InitSegment,
+        StartPath::LivePlaylist,
+        StartPath::Progressive,
+    ];
+
+    async fn start_through(
+        mgr: &Mgr,
+        path: StartPath,
+        request: &HlsStreamRequest,
+    ) -> Result<(), ServiceError> {
+        match path {
+            StartPath::Segment => mgr.dynamic_segment(request, 0, false).await.map(drop),
+            StartPath::InitSegment => mgr.dynamic_segment(request, -1, false).await.map(drop),
+            StartPath::LivePlaylist => mgr.live_playlist(request).await.map(drop),
+            StartPath::Progressive => mgr.transcode_stream(request, false).await.map(drop),
+        }
+    }
+
+    fn assert_refused(path: StartPath, result: &Result<(), ServiceError>) {
+        assert!(
+            matches!(
+                result,
+                Err(ServiceError::Busy {
+                    retry_after_secs: 10,
+                    ..
+                })
+            ),
+            "{path:?}: {result:?}"
+        );
+    }
+
+    /// Every start path answers a refusal as busy, not as a failed transcode:
+    /// a client gets 503 with `Retry-After`, not 500.
+    #[tokio::test]
+    async fn every_start_path_answers_a_refusal_as_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_capped_at_one(tmp.path());
+        let held = take_the_slot(&mgr, tmp.path(), None).await;
+        let _reading = mgr.manager.begin_request_guard(&held.path, held.job_type);
+        for path in START_PATHS {
+            assert_refused(path, &start_through(&mgr, path, &req()).await);
+        }
+    }
+
+    /// A refusal says nothing about the source, so however many there are, the
+    /// breaker stays shut and the stream plays once a slot frees.
+    #[tokio::test]
+    async fn refusals_do_not_feed_the_restart_breaker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = manager_capped_at_one(tmp.path());
+        let held = take_the_slot(&mgr, tmp.path(), None).await;
+        let reading = mgr.manager.begin_request_guard(&held.path, held.job_type);
+        for _ in 0..=RESTART_FAILURE_LIMIT {
+            for path in START_PATHS {
+                assert_refused(path, &start_through(&mgr, path, &req()).await);
+            }
+        }
+        assert!(
+            mgr.restart_failures.lock().unwrap().is_empty(),
+            "a refusal leaves no record"
+        );
+
+        drop(reading);
+        mgr.manager.kill_and_remove(&held, false, false).await;
+        mgr.dynamic_segment(&req(), 0, false)
+            .await
+            .expect("the refused stream plays once a slot frees");
+    }
+
+    /// The other half of the rule: a start that really failed still counts.
+    #[tokio::test]
+    async fn a_failed_start_still_feeds_the_restart_breaker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, _) = manager_with(tmp.path(), FakeScript::default(), "ts");
+        let key = "/cache/out.m3u8";
+        let error = mgr.failed_start(key, StartFfmpegError::Failed("no input".to_owned()));
+        assert!(matches!(error, ServiceError::Backend(_)), "{error:?}");
+        assert_eq!(mgr.restart_failures.lock().unwrap()[key].0, 1);
+    }
+
+    /// The manager learns the user from the request on every start path: a
+    /// user's idle job yields to that user and to nobody else.
+    #[tokio::test]
+    async fn every_start_path_passes_the_authenticated_user_on() {
+        let alice = Some(uuid::Uuid::from_u128(0xA11CE));
+        let bob = Some(uuid::Uuid::from_u128(0xB0B));
+        for path in START_PATHS {
+            let tmp = tempfile::tempdir().unwrap();
+            let mgr = manager_capped_at_one(tmp.path());
+            take_the_slot(&mgr, tmp.path(), alice).await;
+
+            let as_bob = HlsStreamRequest {
+                user_id: bob,
+                ..req()
+            };
+            assert_refused(path, &start_through(&mgr, path, &as_bob).await);
+            let as_alice = HlsStreamRequest {
+                user_id: alice,
+                ..req()
+            };
+            start_through(&mgr, path, &as_alice)
+                .await
+                .unwrap_or_else(|error| panic!("{path:?}: {error}"));
+        }
     }
 
     #[tokio::test]

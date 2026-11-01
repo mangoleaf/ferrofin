@@ -393,10 +393,7 @@ impl HlsRequestContext {
 
 /// The authenticated caller's user id; `None` for a userless API key.
 fn auth_user_id(auth: &ferrofin_traits::options::AuthorizationInfo) -> Option<Uuid> {
-    auth.user
-        .as_ref()
-        .and_then(|user| Uuid::parse_str(&user.id).ok())
-        .filter(|id| !id.is_nil())
+    Some(auth.user_id()).filter(|id| !id.is_nil())
 }
 
 /// Builds an [`HlsStreamRequest`] for `item_id` from the parsed query, the raw

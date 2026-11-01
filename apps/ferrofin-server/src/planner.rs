@@ -1022,7 +1022,6 @@ impl StreamStatePlanner for FerrofinStreamStatePlanner {
             segment_container: Some(segment_container.clone()),
             play_session_id: request.play_session_id.clone(),
             device_id: request.device_id.clone(),
-            user_id: request.user_id,
         };
 
         // `GetStreamingState` order: the output audio channels and bitrate are
@@ -8355,6 +8354,48 @@ mod tests {
         req.audio_codec = Some("aac".to_owned());
         let plan = p.plan(&req, false, None, PlaylistKind::Vod).await.unwrap();
         assert_eq!(plan.state.output_audio_codec.as_deref(), Some("copy"));
+    }
+
+    /// What the transcode caps count, read off real plans: only a job copying
+    /// every stream is free.
+    #[tokio::test]
+    async fn only_a_plan_copying_every_stream_escapes_the_transcode_caps() {
+        let both = || vec![video_stream("h264"), audio_stream("aac")];
+        let codecs = |video: &str, audio: &str| {
+            let mut req = request("abc");
+            req.video_codec = Some(video.to_owned());
+            req.audio_codec = Some(audio.to_owned());
+            req
+        };
+        let encodes = async |streams: Vec<MediaStream>, req: HlsStreamRequest, is_audio: bool| {
+            planner(vec![source("abc", streams)])
+                .plan(&req, is_audio, None, PlaylistKind::Vod)
+                .await
+                .unwrap()
+                .state
+                .encodes_any_stream()
+        };
+
+        assert!(
+            !encodes(both(), codecs("h264", "aac"), false).await,
+            "a remux"
+        );
+        assert!(
+            encodes(both(), codecs("h264", "mp3"), false).await,
+            "copied video, re-encoded audio"
+        );
+        assert!(
+            encodes(both(), codecs("hevc", "aac"), false).await,
+            "re-encoded video, copied audio"
+        );
+        assert!(
+            encodes(vec![audio_stream("aac")], codecs("h264", "aac"), true).await,
+            "a music transcode"
+        );
+        assert!(
+            !encodes(vec![video_stream("h264")], codecs("h264", "aac"), false).await,
+            "a silent video copied, whatever audio codec the plan names"
+        );
     }
 
     /// An EVENT plan (`live.m3u8`) writes an event playlist with routed

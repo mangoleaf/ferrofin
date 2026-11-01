@@ -929,7 +929,8 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// `scan-failure-isolation` is what the library scan does about a row or a
 /// write that fails, which no operation's response shows;
 /// `progressive-transcode` is who may reach ffmpeg through the stream routes,
-/// whose operations have no row of their own yet.
+/// whose operations have no row of their own yet, and how many jobs ffmpeg may
+/// run for them and the HLS routes.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -1205,8 +1206,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    (FileStreamResponseHelpers.GetTranscodedFile, which answers a HEAD before \
                    ffmpeg), which the transcode branch of /Audio/{itemId}/universal also \
                    reaches (UniversalAudioController, [Authorize]); the default policy is \
-                   auth.rs RequireAuth (DefaultAuthorizationHandler)",
-        date: "2026-10-31",
+                   auth.rs RequireAuth (DefaultAuthorizationHandler). Also the admission of a \
+                   job on those routes and the HLS ones: ferrofin-mediaencoding \
+                   transcoding/manager.rs start_ffmpeg, compared with \
+                   MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs (StartFfMpeg, \
+                   PingTimer) and Emby.Server.Implementations/Session/SessionManager.cs \
+                   (MaxActiveSessions)",
+        date: "2026-11-01",
         divergences: &[
             "A GET that would start a transcode on /Videos/{itemId}/stream, \
              /Videos/{itemId}/stream.{container}, /Audio/{itemId}/stream or \
@@ -1218,6 +1224,16 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              upstream, and a TranscodingUrl carries ApiKey. The lowercase api_key counts only \
              with EnableLegacyAuthorization on, so it is no caller by default. Deliberate \
              divergence (owner decision 2026-10-31, gl-1089).",
+            "Jobs re-encoding any stream run under caps upstream does not have (owner decisions \
+             2026-10-31 and 2026-11-01, gl-1098), the settings max_transcodes and \
+             max_transcodes_per_user, both 0, off, by default, which leaves StartFfMpeg's \
+             behaviour as upstream's: it starts whatever it is asked to, and MaxActiveSessions \
+             applies only at login. Past a cap a start ends the same user's longest-idle job \
+             (no active request), the teardown the ping timeout would have brought, and with \
+             none idle answers 503 with Retry-After: 10 before anything is created. A job \
+             copying every stream is free. The user is the authorization's, as upstream's \
+             StartFfMpeg userId is; an API key has none, so it is outside the per-user cap \
+             and inside the server-wide one.",
         ],
     },
 ];
