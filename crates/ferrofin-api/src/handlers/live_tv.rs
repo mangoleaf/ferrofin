@@ -17,11 +17,11 @@
 //! `/LiveTv/Programs/Recommended`) bind the contract's whole filter set — channel
 //! ids, the start/end date window, the airing/kind flags, genres, paging and
 //! sort — and carry it into the `InternalItemsQuery` the manager seam takes; see
-//! [`query_programs`]. Two divergences are deliberate and documented at their
+//! [`query_programs`]. Three divergences are deliberate and documented at their
 //! handlers: `GET /LiveTv/Channels` cannot page (its seam method takes no
-//! query), and `Programs/Recommended` does not apply upstream's per-user
+//! query), `Programs/Recommended` does not apply upstream's per-user
 //! recommendation *score* re-ordering (it needs channel user-data the seam does
-//! not expose).
+//! not expose), and `librarySeriesId` reads the series as the request's user.
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -807,9 +807,17 @@ async fn query_programs_inner(
     // port of the controller's `GetItemById<Series>` block, which forces
     // `IsSeries` and matches on the series' name (an id that is not a series
     // leaves the name unset, exactly as the C# null-check does).
+    //
+    // Divergence (owner decision 2026-10-31, gl-1091): the row is read as the
+    // request's user, where upstream reads it with none, so a series that user
+    // cannot open answers like an id that is no series and its title never
+    // reaches the query. A request with no user reads it as upstream does.
     if let Some(series_id) = library_series_id.filter(|id| !id.is_nil()) {
         query.is_series = Some(true);
-        if let Some(series) = state.library.get_item_by_id(series_id).await?
+        if let Some(series) = state
+            .library
+            .get_item_by_id_for_user(series_id, query.user.as_ref())
+            .await?
             && series.type_.ends_with("Series")
         {
             query.name = series.name;

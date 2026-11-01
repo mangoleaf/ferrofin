@@ -399,6 +399,10 @@ pub struct InternalItemsQuery {
     pub enable_total_record_count: bool,
     /// Whether the query is forced to run directly against the store.
     pub force_direct: bool,
+    /// Whether the caller evaluates each playlist's visibility itself, so the
+    /// repository leaves the playlists the user cannot see in the rows. Every
+    /// other query with a user has them excluded in its SQL (gl-831).
+    pub checks_playlist_visibility: bool,
     /// Provider ids to exclude (name → value).
     pub exclude_provider_ids: Option<HashMap<String, String>>,
     /// Whether the caller de-duplicates the rows by metadata key itself: the
@@ -617,6 +621,7 @@ impl Default for InternalItemsQuery {
             group_by_series_presentation_unique_key: false,
             enable_total_record_count: true,
             force_direct: false,
+            checks_playlist_visibility: false,
             exclude_provider_ids: None,
             enable_group_by_metadata_key: false,
             has_chapter_images: None,

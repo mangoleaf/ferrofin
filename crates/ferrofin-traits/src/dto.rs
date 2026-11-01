@@ -60,9 +60,9 @@ pub trait DtoService: Send + Sync {
 
     /// Projects many item rows into [`BaseItemDto`]s in one pass.
     ///
-    /// Port of `GetBaseItemDtos(...)`. `skip_visibility_check` skips the
-    /// redundant per-item visibility filter when the caller has already
-    /// filtered the input set.
+    /// Port of `GetBaseItemDtos(...)`. With a user, `false` keeps the rows
+    /// `IsVisible` passes; `skip_visibility_check` skips that filter when the
+    /// caller has already filtered the input set.
     async fn get_base_item_dtos(
         &self,
         items: &[BaseItemEntity],
