@@ -1,5 +1,6 @@
 //! Live transcode registry, ffmpeg startup, progress and runtime controls.
 
+mod ffmpeg_log;
 pub mod fs_wait;
 pub mod manager;
 pub mod progress;

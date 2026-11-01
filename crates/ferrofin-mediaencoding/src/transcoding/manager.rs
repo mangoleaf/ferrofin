@@ -16,6 +16,7 @@ use ferrofin_model::session::TranscodingInfo;
 
 use crate::encoding_helper::EncodingJobInfo;
 
+use super::ffmpeg_log::shown_arguments;
 use super::fs_wait::FsWaiter;
 use super::segment_transcoder::{SegmentTranscoder, SpawnRequest, TranscodeChild};
 
@@ -97,7 +98,7 @@ fn trace_transcode_start(program: &str, state: &EncodingJobInfo, arguments: &[St
         args = arguments.len(),
         "transcode job starting"
     );
-    tracing::debug!(ffmpeg_args = ?arguments, "ffmpeg arguments");
+    tracing::debug!(ffmpeg_args = ?shown_arguments(arguments), "ffmpeg arguments");
     display
 }
 
@@ -2621,6 +2622,35 @@ mod start_ffmpeg_tests {
         assert_eq!(segment_file_extension(Some("MP4")), ".mp4");
         assert_eq!(segment_file_extension(Some("  ")), ".ts");
         assert_eq!(segment_file_extension(None), ".ts");
+    }
+
+    /// The debug line follows `arguments`, which the spawn still gets whole.
+    #[test]
+    fn the_ffmpeg_args_line_names_a_remote_source_by_its_host() {
+        use crate::configuration::reader::tests::CapturedLogs;
+
+        let source = "http://USER:SECRET@127.0.0.1:9/live/USER/SECRET/1.m3u8";
+        let arguments: Vec<String> = ["-user_agent", "Box/1 SECRET", "-i", source, "-c:v", "copy"]
+            .map(str::to_owned)
+            .into();
+        let logs = CapturedLogs::default();
+        let st = state(Path::new("/t/out.m3u8"), None);
+        {
+            let _guard = logs.install();
+            super::trace_transcode_start("ffmpeg", &st, &arguments);
+        }
+        let lines = logs.lines_at("DEBUG");
+        let line = lines
+            .iter()
+            .find(|line| line.contains("ffmpeg_args"))
+            .expect("the debug line");
+        assert!(
+            line.contains(
+                r#"["-user_agent", "<redacted>", "-i", "http://127.0.0.1:9", "-c:v", "copy"]"#
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("SECRET"), "{line}");
     }
 
     #[test]
