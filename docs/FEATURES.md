@@ -81,6 +81,11 @@ Checked against a real Jellyfin server by the retired v2 runtime diff:
   the **WebSocket push** messages clients rely on (`UserDataChanged`, session updates, …).
 - **Playlists & collections** — create/edit/reorder/share, membership, stored in Jellyfin's
   `Data`-JSON shape, the same source of truth Jellyfin itself reads.
+  - **Accepted divergence:** a playlist's items listing and a reorder leave out a member from a
+    library the user was not given, where Jellyfin lists it and hides only what the member's
+    rating or tags rule out. Library access is a boundary here. What is stored stays: adding
+    still stores an item from such a library, and `GET /Playlists/{id}` still lists every
+    member in `ItemIds`.
   - **Accepted divergence (a fix, not a gap):** a reorder counts positions among the members
     the user can see, as Jellyfin's `MoveItemAsync` does, but Jellyfin anchors on the list
     before the moved entry is taken out and lands it one place short when it moves down past
