@@ -202,6 +202,13 @@ ferrofin:
     # OTEL_EXPORTER_OTLP_ENDPOINT: "http://<otel-collector>.<namespace>.svc.cluster.local:4317"
     # OTEL_TRACES_SAMPLER_ARG: "0.25"
 
+    # What one image may cost in memory; past a limit, clients get the original
+    # file instead of a thumbnail. Lower them for a small memory limit: the
+    # decode limit is per image, the resize budget is shared.
+    # FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS: "200"
+    # FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB: "512"
+    # FERROFIN_IMAGE_RESIZE_BUDGET_MB: "2048"
+
     # WASM plugins (sandboxed, runtime-installed): install from a plugin
     # repository in the dashboard (Plugins → Repositories → Catalog), or place
     # .wasm components at {data_dir}/plugins/ — under the DATA volume above —

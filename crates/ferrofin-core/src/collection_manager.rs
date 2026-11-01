@@ -55,7 +55,9 @@ use ferrofin_traits::collections::{
     PlaylistManager,
 };
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{LibraryManager, SelfWrite, SelfWriteGuard, UserManager};
+use ferrofin_traits::library::{
+    LibraryManager, SelfWrite, SelfWriteGuard, UserManager, VirtualFolderManager,
+};
 use ferrofin_traits::options::InternalItemsQuery;
 use ferrofin_traits::persistence::{ItemPersistenceService, ItemRepository, LinkedChildrenService};
 use ferrofin_traits::providers::{
@@ -63,6 +65,7 @@ use ferrofin_traits::providers::{
 };
 use ferrofin_traits::system::ServerApplicationPaths;
 
+use crate::collections_library::{CollectionsFolder, CollectionsLibrary};
 use crate::db_error::db_err;
 use crate::item_data;
 use crate::item_type_lookup::{kind_from_type_name, stored_type_name};
@@ -304,50 +307,6 @@ async fn container_identity(
     Ok((mode, root))
 }
 
-/// The `Data` blob the auto-provisioned "Collections" library carries, and the
-/// only key of it Ferrofin reads or writes.
-///
-/// 10.11.8 keeps a `CollectionFolder`'s `CollectionType` in that column
-/// (`DtoService.AttachBasicFields` reads `IHasCollectionType.CollectionType`,
-/// `CollectionFolder.cs:32`), and its own row for this library says
-/// `"CollectionType":"boxsets"` because `CollectionManager.EnsureLibraryFolder`
-/// creates it with `CollectionTypeOptions.boxsets`. Only written over an EMPTY
-/// `Data` column — see `item_persistence_service::backfill_container_data` for
-/// why an adopted database's richer blob must survive untouched.
-const COLLECTIONS_FOLDER_DATA: &str = r#"{"CollectionType":"boxsets"}"#;
-
-/// The "Collections" library a created box set belongs to, adopting any
-/// orphans a previous version left behind.
-///
-/// `name` is the name a new library takes; an existing one keeps its own.
-async fn collections_folder(
-    db: &Database,
-    paths: &Arc<dyn ServerApplicationPaths>,
-    name: &str,
-) -> Result<Option<Uuid>, ServiceError> {
-    let path = format!("{}/collections", paths.data_path());
-    let (mode, root) = container_identity(db, paths).await?;
-    let container = crate::item_persistence_service::ensure_container(
-        db,
-        BaseItemKind::CollectionFolder,
-        name,
-        &path,
-        &mode,
-        root,
-        // Upstream provisions this library through
-        // `AddVirtualFolder(name, CollectionTypeOptions.boxsets, …)`
-        // (v10.11.8 CollectionManager.cs:81-109), which is what puts
-        // `"CollectionType":"boxsets"` in the row's `Data` blob. Without it the
-        // folder went out with a null `CollectionType` everywhere it is listed.
-        Some(COLLECTIONS_FOLDER_DATA),
-    )
-    .await?;
-    if let Some(id) = container {
-        crate::item_persistence_service::adopt_orphans(db, BaseItemKind::BoxSet, id).await?;
-    }
-    Ok(container)
-}
-
 /// The playlists folder a created playlist belongs to, and the id derivation
 /// its playlists are keyed by.
 ///
@@ -530,6 +489,14 @@ pub struct FerrofinCollectionManager {
     /// Names a new Collections library in the server UI culture
     /// ([`Self::collections_name`]). `None` in unit tests: "Collections".
     localization: Option<Arc<dyn ferrofin_traits::localization::LocalizationManager>>,
+    /// Holds the Collections library. `None` in unit tests: only its folder
+    /// is made, with no library listing it.
+    virtual_folders: Option<Arc<dyn VirtualFolderManager>>,
+    /// Reads the tokens an adopted folder row stores in its path.
+    virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    /// One provision at a time: two first creates at once would otherwise each
+    /// add a library (`Collections`, `Collections2`).
+    provisioning: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for FerrofinCollectionManager {
@@ -557,7 +524,29 @@ impl FerrofinCollectionManager {
             providers: None,
             self_writes: None,
             localization: None,
+            virtual_folders: None,
+            virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
+            provisioning: Arc::default(),
         }
+    }
+
+    /// Lets the first box set make the Collections library. Called once by the
+    /// composition root.
+    #[must_use]
+    pub fn with_virtual_folders(mut self, virtual_folders: Arc<dyn VirtualFolderManager>) -> Self {
+        self.virtual_folders = Some(virtual_folders);
+        self
+    }
+
+    /// Expands the `%AppDataPath%` an adopted folder row stores (and that a
+    /// provisioned one stores too). Called once by the composition root.
+    #[must_use]
+    pub fn with_virtual_paths(
+        mut self,
+        virtual_paths: crate::virtual_paths::VirtualPathExpander,
+    ) -> Self {
+        self.virtual_paths = virtual_paths;
+        self
     }
 
     /// Names a new Collections library in the server UI culture. Called once
@@ -569,6 +558,57 @@ impl FerrofinCollectionManager {
     ) -> Self {
         self.localization = Some(localization);
         self
+    }
+
+    /// The Collections library of this database.
+    async fn collections_library(&self) -> Result<CollectionsLibrary, ServiceError> {
+        let (mode, _) = container_identity(&self.db, &self.paths).await?;
+        Ok(CollectionsLibrary::new(
+            self.db.clone(),
+            mode,
+            &self.paths.data_path(),
+            &self.paths.root_folder_path(),
+            self.virtual_paths.clone(),
+        ))
+    }
+
+    /// `EnsureLibraryFolder(path, true)`
+    /// (v12.4 `CollectionManager.cs:88-118`): the folder box sets go in, with
+    /// the library it belongs to, making both when there is no folder, and
+    /// adopting any orphan box sets a previous version left behind.
+    ///
+    /// `AddVirtualFolder(…, true)` ends with a background library scan, which is
+    /// queued here; a scan that cannot be queued does not fail the create, the
+    /// next one reaches the library.
+    async fn ensure_collections_folder(
+        &self,
+    ) -> Result<(CollectionsLibrary, Option<CollectionsFolder>), ServiceError> {
+        let library = self.collections_library().await?;
+        let mut folder = library.find().await?;
+        if folder.is_none() {
+            let _one_at_a_time = self.provisioning.lock().await;
+            folder = library.find().await?;
+            if folder.is_none() {
+                if let Some(virtual_folders) = &self.virtual_folders {
+                    library
+                        .ensure_library(virtual_folders.as_ref(), &self.collections_name())
+                        .await?;
+                }
+                folder = library.ensure_folder().await?;
+                if let Err(err) = self.library_manager.queue_library_scan().await {
+                    tracing::warn!(%err, "could not queue a scan of the new collections library");
+                }
+            }
+        }
+        if let Some(folder) = &folder {
+            crate::item_persistence_service::adopt_orphans(
+                &self.db,
+                BaseItemKind::BoxSet,
+                folder.id,
+            )
+            .await?;
+        }
+        Ok((library, folder))
     }
 
     /// The name a new Collections library takes:
@@ -625,6 +665,21 @@ impl FerrofinCollectionManager {
         .await
     }
 
+    /// `AddToCollectionAsync`'s check, made for every id before any is linked:
+    /// an id naming no item (the empty one included, which upstream's
+    /// `GetItemById` also refuses) is an `ArgumentException`, a 400, and no
+    /// link is stored.
+    async fn require_items(&self, ids: &[Uuid]) -> Result<(), ServiceError> {
+        for id in ids {
+            if self.library_manager.get_item_by_id(*id).await?.is_none() {
+                return Err(ServiceError::invalid_input(format!(
+                    "No item exists with the supplied Id {id}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `AddToCollectionAsync`/`RemoveFromCollectionAsync`: an id that is not
     /// a box set's is an `ArgumentException` (→ `400`).
     async fn require_box_set(&self, id: Uuid) -> Result<(), ServiceError> {
@@ -643,10 +698,27 @@ impl CollectionManager for FerrofinCollectionManager {
         &self,
         options: &CollectionCreationOptions,
     ) -> Result<BaseItemEntity, ServiceError> {
-        let parent = collections_folder(&self.db, &self.paths, &self.collections_name()).await?;
+        let (library, parent) = self.ensure_collections_folder().await?;
         let (mode, _) = container_identity(&self.db, &self.paths).await?;
-        // `GetCollectionsFolderPath()`: `{data}/collections`.
-        let collections = format!("{}/collections", self.paths.data_path());
+        // `Path.Combine(parentFolder.Path, folderName)`: `{data}/collections`,
+        // or the library location above it that `FindFolders` found.
+        let collections = parent.as_ref().map_or_else(
+            || format!("{}/collections", self.paths.data_path()),
+            |folder| folder.path.clone(),
+        );
+        // A box set under a legacy container gets its ancestors when the
+        // container is retired.
+        let ancestors = match &parent {
+            Some(folder) if !folder.legacy => {
+                let owner = match &self.virtual_folders {
+                    Some(virtual_folders) => library.library_at(virtual_folders.as_ref()).await?,
+                    None => None,
+                };
+                library.ancestors(folder, owner.as_ref())
+            }
+            _ => Vec::new(),
+        };
+        let parent = parent.map(|folder| folder.id);
         let (path, id) =
             new_box_set_folder_and_id(&self.db, &mode, &collections, &options.name).await?;
         // `ReportFileSystemChangeBeginning(path)` around the whole create.
@@ -668,6 +740,7 @@ impl CollectionManager for FerrofinCollectionManager {
             crate::item_persistence_service::set_item_path_in(&mut tx, id, &path)
                 .await
                 .map_err(db_err)?;
+            crate::library_structure_repository::add_ancestors_in(&mut tx, id, &ancestors).await?;
             tx.commit().await.map_err(db_err)
         }
         .await;
@@ -684,6 +757,8 @@ impl CollectionManager for FerrofinCollectionManager {
             .get_item_by_id(id)
             .await?
             .ok_or_else(|| ServiceError::backend(format!("box set {id} vanished after create")))?;
+        // A refusal leaves the box set just stored in place, as upstream's does.
+        self.require_items(&options.item_id_list).await?;
         for item_id in &options.item_id_list {
             self.linked_children
                 .upsert_linked_child(id, *item_id, LINKED_CHILD_MANUAL)
@@ -725,6 +800,7 @@ impl CollectionManager for FerrofinCollectionManager {
         item_ids: &[Uuid],
     ) -> Result<(), ServiceError> {
         self.require_box_set(collection_id).await?;
+        self.require_items(item_ids).await?;
         let current = self
             .linked_children
             .get_linked_children_ids(collection_id, None)
@@ -891,35 +967,18 @@ impl CollectionManager for FerrofinCollectionManager {
         create_if_needed: bool,
     ) -> Result<Option<BaseItemEntity>, ServiceError> {
         // Port of `CollectionManager.EnsureLibraryFolder`
-        // (v10.11.8 Emby.Server.Implementations/Collections/CollectionManager.cs
-        // :81-109): look the library up BY PATH (then by its derived id, for a
-        // data directory that moved), and provision it — directory,
-        // row, boxsets collection type and all — only when the caller asked for
-        // it. This used to answer `Ok(None)` unconditionally under a "documented
-        // deferral" comment; the tree it was said to need is the same
-        // `ensure_container` the create path has been using all along.
-        let path = format!("{}/collections", self.paths.data_path());
-        let id = if create_if_needed {
-            collections_folder(&self.db, &self.paths, &self.collections_name()).await?
-        } else if let Some(id) =
-            crate::item_persistence_service::container_at(&self.db, &path).await?
-        {
-            Some(id)
+        // (v12.4 Emby.Server.Implementations/Collections/CollectionManager.cs
+        // :88-118): the folder by its path, and the library and folder made
+        // only when the caller asked for them.
+        let folder = if create_if_needed {
+            self.ensure_collections_folder().await?.1
         } else {
-            // A data directory that moved left the row at its old path (gl-922).
-            let (mode, _) = container_identity(&self.db, &self.paths).await?;
-            crate::item_persistence_service::moved_container(
-                &self.db,
-                BaseItemKind::CollectionFolder,
-                &path,
-                &mode,
-            )
-            .await?
+            self.collections_library().await?.find().await?
         };
-        let Some(id) = id else {
+        let Some(folder) = folder else {
             return Ok(None);
         };
-        crate::item_persistence_service::container_row(&self.db, id).await
+        crate::item_persistence_service::container_row(&self.db, folder.id).await
     }
 }
 
@@ -1996,10 +2055,7 @@ mod tests {
     use crate::linked_children_service::FerrofinLinkedChildrenService;
     use crate::test_support::{item_repository_over, library_manager_over, seed_item, test_db};
 
-    use super::{
-        COLLECTIONS_FOLDER_DATA, FerrofinCollectionManager, FerrofinPlaylistManager,
-        collections_folder,
-    };
+    use super::{FerrofinCollectionManager, FerrofinPlaylistManager};
 
     /// A playlist owned by the empty GUID — one the library scan found — is
     /// open to read for every caller and owned by none of them; even an empty
@@ -2052,92 +2108,9 @@ mod tests {
         )
     }
 
-    /// A created playlist has to stay reachable too, and must reuse the
-    /// playlists folder the user-view manager already provisions.
-    ///
-    /// Ferrofin writes that folder as `ManualPlaylistsFolder` and an adopted
-    /// database carries a `PlaylistsFolder` — at the same path. If the two
-    /// provisioners disagreed there would be two rows, and a playlist parented
-    /// to the one the query scope does not accept simply vanishes.
-    /// A container provisioned before the user root existed is adopted by it
-    /// later, rather than staying parentless forever because the row is already
-    /// there.
-    #[tokio::test]
-    async fn a_parentless_container_is_attached_once_the_root_appears() {
-        let db = test_db().await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root_dir = tmp.path().to_string_lossy().into_owned();
-        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
-            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
-                root_dir.clone(),
-                format!("{root_dir}/log"),
-                format!("{root_dir}/config"),
-                format!("{root_dir}/cache"),
-                format!("{root_dir}/web"),
-            ));
-        let mode = crate::item_type_lookup::IdDerivation::from_meta(
-            Some("jellyfin-10.11.8"),
-            Some(paths.program_data_path()),
-        );
-        let root =
-            crate::item_type_lookup::user_root_folder_id(&mode, &paths.default_user_views_path())
-                .expect("root id");
-        let path = format!("{}/collections", paths.data_path());
-
-        // First provision: the root does not exist yet, so the row is created
-        // without a parent rather than failing the foreign key.
-        let id = crate::item_persistence_service::ensure_container(
-            &db,
-            BaseItemKind::CollectionFolder,
-            "Collections",
-            &path,
-            &mode,
-            Some(root),
-            Some(COLLECTIONS_FOLDER_DATA),
-        )
-        .await
-        .expect("provision")
-        .expect("an id");
-        assert!(
-            crate::test_support::fetch_item(&db, id)
-                .await
-                .parent_id
-                .is_none(),
-            "nothing to parent to yet"
-        );
-
-        // The root appears, and the next provision adopts the existing row.
-        crate::test_support::seed_named_item(
-            &db,
-            root,
-            BaseItemKind::UserRootFolder,
-            "Media Folders",
-        )
-        .await;
-        let again = crate::item_persistence_service::ensure_container(
-            &db,
-            BaseItemKind::CollectionFolder,
-            "Collections",
-            &path,
-            &mode,
-            Some(root),
-            Some(COLLECTIONS_FOLDER_DATA),
-        )
-        .await
-        .expect("provision")
-        .expect("an id");
-        assert_eq!(again, id, "the same row, not a second one");
-        assert_eq!(
-            crate::test_support::fetch_item(&db, id).await.parent_id,
-            Some(ferrofin_db::store::guid_to_db(root)),
-            "…now attached to the root"
-        );
-    }
-
     /// `get_collections_folder` is the real `EnsureLibraryFolder`: it answers
     /// `None` before the library exists when the caller did not ask for it to be
-    /// created, and the provisioned row afterwards. It used to answer `None`
-    /// unconditionally.
+    /// created, and the folder box sets hang off afterwards.
     #[tokio::test]
     async fn get_collections_folder_looks_up_and_provisions() {
         let db = test_db().await;
@@ -2155,8 +2128,11 @@ mod tests {
             .await
             .expect("provision")
             .expect("a row");
-        assert_eq!(made.name.as_deref(), Some("Collections"));
-        assert_eq!(made.data.as_deref(), Some(COLLECTIONS_FOLDER_DATA));
+        assert_eq!(made.name.as_deref(), Some("collections"));
+        assert_eq!(
+            made.type_,
+            crate::item_type_lookup::stored_type_name(BaseItemKind::Folder).unwrap_or_default()
+        );
         let found = manager
             .get_collections_folder(false)
             .await
@@ -2172,16 +2148,21 @@ mod tests {
     async fn the_collections_library_takes_the_server_culture() {
         let db = test_db().await;
         let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = test_paths_in(tmp.path());
+        let libraries = paths.default_user_views_path();
         let manager = FerrofinCollectionManager::new(
             db.clone(),
             library_manager_over(db.clone()),
             Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
-            test_paths_in(tmp.path()),
+            paths,
         )
+        .with_virtual_folders(Arc::new(crate::FerrofinVirtualFolderManager::new(
+            libraries.clone(),
+        )))
         .with_localization(Arc::new(
             crate::LocalizationManager::default().with_ui_culture("de"),
         ));
-        let made = ferrofin_util::current_culture::scope_with_ui(
+        ferrofin_util::current_culture::scope_with_ui(
             "fr".into(),
             Some("fr".into()),
             manager.get_collections_folder(true),
@@ -2189,13 +2170,17 @@ mod tests {
         .await
         .expect("provision")
         .expect("a row");
-        assert_eq!(made.name.as_deref(), Some("Sammlungen"));
+        assert!(
+            std::path::Path::new(&libraries)
+                .join("Sammlungen/boxsets.collection")
+                .is_file()
+        );
     }
 
-    /// gl-922: the Collections library's id comes from its program-data-relative
-    /// path, its stored `Path` from the absolute one, so a data directory that
-    /// moved leaves the row at its old path under the same id. Both lookups
-    /// find it there and move it to the new path: box-set grouping keeps
+    /// gl-922: the collections folder's id comes from its program-data-relative
+    /// path, a stored resolved `Path` from the absolute one, so a data directory
+    /// that moved leaves such a row at its old path under the same id. Both
+    /// lookups find it there and move it to the new path: box-set grouping keeps
     /// finding its collections, and a create no longer fails on the primary key.
     #[tokio::test]
     async fn a_moved_data_directory_keeps_its_collections_library() {
@@ -2282,133 +2267,6 @@ mod tests {
             let row = crate::test_support::fetch_item(&db, id).await;
             assert_eq!(row.path.as_deref(), Some(old));
         }
-    }
-
-    /// The auto-provisioned Collections library carries
-    /// `"CollectionType":"boxsets"` in `Data` — the column 10.11.8 reads that
-    /// field from.
-    ///
-    /// Without it, `/Items?parentId={root}`, `/UserViews` and
-    /// `/Library/MediaFolders` all sent a null `CollectionType` for the folder
-    /// where Jellyfin sends `boxsets` (measured on the parity pair 2026-08-31).
-    #[tokio::test]
-    async fn the_collections_library_carries_the_boxsets_collection_type() {
-        let db = test_db().await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root_dir = tmp.path().to_string_lossy().into_owned();
-        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
-            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
-                root_dir.clone(),
-                format!("{root_dir}/log"),
-                format!("{root_dir}/config"),
-                format!("{root_dir}/cache"),
-                format!("{root_dir}/web"),
-            ));
-        let id = collections_folder(&db, &paths, "Collections")
-            .await
-            .expect("provision")
-            .expect("an id");
-        let data = crate::test_support::fetch_item(&db, id).await.data;
-        assert_eq!(
-            data.as_deref(),
-            Some(COLLECTIONS_FOLDER_DATA),
-            "the provisioned row carries the boxsets collection type"
-        );
-        // …and the DTO layer really reads it back as `boxsets`, which is the
-        // observable the parity pair measures.
-        let parsed: serde_json::Value =
-            serde_json::from_str(data.as_deref().expect("data")).expect("valid json");
-        assert_eq!(
-            parsed.get("CollectionType").and_then(|v| v.as_str()),
-            Some("boxsets")
-        );
-
-        // The other half — that an ADOPTED database's richer blob survives
-        // re-provisioning — lives in `item_persistence_service`'s own tests,
-        // because seeding it is SQL and SQL stays behind that boundary.
-    }
-
-    /// The provisioned container carries the id JELLYFIN would compute for that
-    /// directory, its directory exists, and it hangs off the user root.
-    ///
-    /// The id is the one that matters for drop-in: `ensure_container` used to
-    /// derive it with `IdDerivation::LegacyLowercase` whatever the database
-    /// said, so on an adopted (Jellyfin-parity) database Jellyfin would look for
-    /// its own id, miss, and create a SECOND Collections library beside ours —
-    /// with the round-trip guarantee going with it.
-    #[tokio::test]
-    async fn a_provisioned_container_is_shaped_the_way_jellyfin_expects() {
-        let db = test_db().await;
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root_dir = tmp.path().to_string_lossy().into_owned();
-        let paths: Arc<dyn ferrofin_traits::system::ServerApplicationPaths> =
-            Arc::new(crate::app_paths::FerrofinServerApplicationPaths::new(
-                root_dir.clone(),
-                format!("{root_dir}/log"),
-                format!("{root_dir}/config"),
-                format!("{root_dir}/cache"),
-                format!("{root_dir}/web"),
-            ));
-
-        // A parity database, as a fresh or adopted one is.
-        db.meta_set("item_id_derivation", "jellyfin-10.11.8")
-            .await
-            .expect("mode");
-        // The user root has to exist for the container to be parented to it.
-        let mode = crate::item_type_lookup::IdDerivation::from_meta(
-            Some("jellyfin-10.11.8"),
-            Some(paths.program_data_path()),
-        );
-        let root =
-            crate::item_type_lookup::user_root_folder_id(&mode, &paths.default_user_views_path())
-                .expect("root id");
-        crate::test_support::seed_named_item(
-            &db,
-            root,
-            BaseItemKind::UserRootFolder,
-            "Media Folders",
-        )
-        .await;
-
-        let path = format!("{}/collections", paths.data_path());
-        let id = crate::item_persistence_service::ensure_container(
-            &db,
-            BaseItemKind::CollectionFolder,
-            "Collections",
-            &path,
-            &mode,
-            Some(root),
-            Some(COLLECTIONS_FOLDER_DATA),
-        )
-        .await
-        .expect("provision")
-        .expect("an id");
-
-        // The id Jellyfin derives for that directory, under the same rule.
-        let expected = crate::item_type_lookup::derive_item_id_with(
-            &mode,
-            BaseItemKind::CollectionFolder,
-            &path,
-        )
-        .expect("expected id");
-        assert_eq!(id, expected, "the container carries Jellyfin's id");
-        assert_ne!(
-            id,
-            crate::item_type_lookup::derive_item_id(BaseItemKind::CollectionFolder, &path)
-                .expect("legacy id"),
-            "…which is NOT the legacy-lowercase one, or this test proves nothing"
-        );
-
-        assert!(
-            tokio::fs::metadata(&path).await.is_ok(),
-            "the directory the row describes exists"
-        );
-        let row = crate::test_support::fetch_item(&db, id).await;
-        assert_eq!(
-            row.parent_id.as_deref(),
-            Some(ferrofin_db::store::guid_to_db(root).as_str()),
-            "and it hangs off the user root"
-        );
     }
 
     #[tokio::test]
@@ -2762,19 +2620,90 @@ mod tests {
         assert_eq!(
             row.top_parent_id.as_deref(),
             Some(parent.as_str()),
-            "the library is also the top parent"
+            "the library's folder is also the top parent"
         );
         let container = crate::test_support::fetch_item(
             &db,
             Uuid::parse_str(&parent).expect("the parent id is a guid"),
         )
         .await;
-        assert_eq!(container.name.as_deref(), Some("Collections"));
+        assert_eq!(container.name.as_deref(), Some("collections"));
         assert_eq!(
             container.type_,
-            crate::item_type_lookup::stored_type_name(BaseItemKind::CollectionFolder)
-                .expect("kind is known")
+            crate::item_type_lookup::stored_type_name(BaseItemKind::Folder).expect("kind is known")
         );
+    }
+
+    /// `AddToCollectionAsync` checks every id before it links any, so a list
+    /// naming a missing item (the empty id is one) is refused with nothing
+    /// linked, on a create and on an add. The create's box set stays stored,
+    /// as `CreateCollectionAsync` has saved it by then.
+    #[rstest::rstest]
+    #[case::unknown(Uuid::from_u128(0x404))]
+    #[case::empty(Uuid::nil())]
+    #[tokio::test]
+    async fn a_list_naming_no_item_links_nothing(#[case] missing: Uuid) {
+        use ferrofin_traits::error::ServiceError;
+        use ferrofin_traits::persistence::LinkedChildrenService as _;
+        let db = test_db().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mgr = FerrofinCollectionManager::new(
+            db.clone(),
+            library_manager_over(db.clone()),
+            Arc::new(FerrofinLinkedChildrenService::new(db.clone())),
+            test_paths_in(tmp.path()),
+        );
+        let links = FerrofinLinkedChildrenService::new(db.clone());
+        let member = Uuid::from_u128(0x401);
+        seed_item(&db, member, BaseItemKind::Movie).await;
+        let names = |name: &str| CollectionCreationOptions {
+            name: name.to_owned(),
+            ..Default::default()
+        };
+
+        let empty = mgr
+            .create_collection(&names("Empty"))
+            .await
+            .expect("create");
+        let empty = Uuid::parse_str(&empty.id).expect("id");
+        let refused = mgr.add_to_collection(empty, &[member, missing]).await;
+        assert!(
+            matches!(refused, Err(ServiceError::InvalidInput(_))),
+            "{refused:?}"
+        );
+        let linked = links
+            .get_linked_children_ids(empty, None)
+            .await
+            .expect("links");
+        assert_eq!(linked, Vec::<Uuid>::new());
+
+        let refused = mgr
+            .create_collection(&CollectionCreationOptions {
+                item_id_list: vec![member, missing],
+                ..names("Mixed")
+            })
+            .await;
+        assert!(
+            matches!(refused, Err(ServiceError::InvalidInput(_))),
+            "{refused:?}"
+        );
+        let stored = item_repository_over(db.clone())
+            .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
+                include_item_types: vec![BaseItemKind::BoxSet],
+                ..Default::default()
+            })
+            .await
+            .expect("box sets");
+        let mixed = stored
+            .iter()
+            .find(|row| row.name.as_deref() == Some("Mixed"))
+            .expect("the box set stays stored");
+        let mixed = Uuid::parse_str(&mixed.id).expect("id");
+        let linked = links
+            .get_linked_children_ids(mixed, None)
+            .await
+            .expect("links");
+        assert_eq!(linked, Vec::<Uuid>::new());
     }
 
     /// C# `CreateCollectionAsync` gives a new box set its own folder,
@@ -2847,11 +2776,11 @@ mod tests {
         assert_eq!(parents[0], parents[1]);
         let containers = crate::test_support::item_repository_over(db.clone())
             .get_item_list(&ferrofin_traits::options::InternalItemsQuery {
-                include_item_types: vec![BaseItemKind::CollectionFolder],
+                include_item_types: vec![BaseItemKind::Folder],
                 ..Default::default()
             })
             .await
-            .expect("libraries");
+            .expect("folders");
         assert_eq!(containers.len(), 1, "provisioned once, then reused");
     }
 

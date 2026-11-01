@@ -13,8 +13,8 @@ pub const LATEST_ITEMS_FALLBACK_LIMIT: i32 = 10;
 /// Port of C# `MediaBrowser.Model.Querying.LatestItemsQuery` — the request
 /// behind `GET /Items/Latest`.
 ///
-/// The manager runs **one** query across every parent (the user's views, or
-/// the `parent_id` folder), over-fetching `limit * 5` rows ordered
+/// The manager runs **one** query across every parent (the root folders the
+/// user may open, or the `parent_id` folder), over-fetching `limit * 5` rows ordered
 /// `DateCreated DESC, SortName DESC, ProductionYear DESC`, and then groups the
 /// rows by their index container (episode → series, track → album, photo →
 /// photo album) until `limit` groups exist. `is_played` is pushed into the SQL
@@ -25,7 +25,7 @@ pub struct LatestItemsQuery {
     /// user-specific query context; `None` only for user-less in-process calls.
     pub user: Option<UserEntity>,
     /// Localizes the search to one folder (C# `ParentId`; `None`/nil = the
-    /// user's views). A library folder scopes by `TopParentId`; any other folder
+    /// root folders the user may open). A library folder scopes by `TopParentId`; any other folder
     /// (a series, a season) scopes by the `AncestorIds` closure.
     pub parent_id: Option<Uuid>,
     /// Restrict the underlying rows to these kinds (C# `IncludeItemTypes`).
@@ -46,7 +46,7 @@ pub struct LatestItemsQuery {
     pub group_items: bool,
     /// The view ids the user excluded from "latest" (C#
     /// `PreferenceKind.LatestItemExcludes`); only consulted when the parents
-    /// are the user's views.
+    /// are the user's root folders.
     pub latest_item_excludes: Vec<Uuid>,
 }
 

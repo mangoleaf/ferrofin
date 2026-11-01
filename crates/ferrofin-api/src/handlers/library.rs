@@ -617,8 +617,8 @@ async fn get_available_options(
 /// `GET /Library/MediaFolders` — the server's media (collection) folders.
 ///
 /// Port of `LibraryController.GetMediaFolders`: the user-root collection folders,
-/// name-sorted, projected to [`BaseItemDto`] as a
-/// [`QueryResult`](ferrofin_model::querying::QueryResult).
+/// less the libraries whose options disable them, name-sorted, projected to
+/// [`BaseItemDto`] as a [`QueryResult`](ferrofin_model::querying::QueryResult).
 ///
 /// Upstream reads no user here: the folders are the same for every caller, an
 /// API key with no user included, and carry no user data. Ferrofin does not
@@ -634,7 +634,7 @@ async fn get_available_options(
 )]
 async fn get_media_folders(
     State(state): State<AppState>,
-    RequireAdmin(auth): RequireAdmin,
+    RequireAdmin(_auth): RequireAdmin,
     Query(query): Query<MediaFoldersQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     // The media folders are the user-root children — the collection folders plus
@@ -645,9 +645,8 @@ async fn get_media_folders(
         Vec::new()
     } else {
         // Upstream reads no user here (`LibraryController.GetMediaFolders`),
-        // so an API key with none is served like an administrator; the id is
-        // the caller's, and the folders do not depend on it.
-        state.user_views.get_media_folders(auth.user_id()).await?
+        // so an API key with none is served like an administrator.
+        state.user_views.get_media_folders().await?
     };
     let options = DtoOptions::default();
     // NO user, matching C# `GetMediaFolders`:

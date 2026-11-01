@@ -19,6 +19,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use ferrofin_drawing::ImageLimits;
 use ferrofin_providers::rate_limit::RequestLimits;
 use serde::Deserialize;
 
@@ -148,6 +149,9 @@ struct FileConfig {
     musicbrainz_base_url: Option<String>,
     provider_timeout_seconds: Option<u64>,
     provider_max_wait_seconds: Option<u64>,
+    image_decode_max_megapixels: Option<u32>,
+    image_decode_max_memory_mb: Option<u32>,
+    image_resize_budget_mb: Option<u32>,
     ffmpeg_path: Option<PathBuf>,
     ffprobe_path: Option<PathBuf>,
     ffmpeg_img_extract_perf_tradeoff: Option<bool>,
@@ -434,6 +438,25 @@ pub struct Config {
     /// with a warning; applied as
     /// [`provider_timeout_seconds`](Self::provider_timeout_seconds) is.
     pub provider_max_wait_seconds: u64,
+
+    /// The largest image decoded, in megapixels (width × height). Resolved
+    /// `FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS` env >
+    /// `image_decode_max_megapixels` in `config.toml` > 200, clamped to
+    /// [`ImageLimits::DECODE_MEGAPIXELS`] with a warning. A larger image is
+    /// served as its original file.
+    pub image_decode_max_megapixels: u32,
+
+    /// The most memory one image decode may take, in MiB. Resolved
+    /// `FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB` env > `image_decode_max_memory_mb`
+    /// in `config.toml` > 512, clamped to [`ImageLimits::DECODE_MEMORY_MB`]
+    /// with a warning.
+    pub image_decode_max_memory_mb: u32,
+
+    /// The memory all image resizes in flight share, in MiB. Resolved
+    /// `FERROFIN_IMAGE_RESIZE_BUDGET_MB` env > `image_resize_budget_mb` in
+    /// `config.toml` > 2048, clamped to [`ImageLimits::RESIZE_BUDGET_MB`] with
+    /// a warning. A resize that alone needs more serves the original file.
+    pub image_resize_budget_mb: u32,
 
     /// Explicit `ffmpeg` executable path. `None` falls back to `system.json`
     /// then `$PATH` during discovery.
@@ -868,21 +891,51 @@ impl Config {
             .or(file.musicbrainz_base_url)
             .unwrap_or_default();
 
-        let provider_timeout_seconds = resolve_provider_seconds(
+        let provider_timeout_seconds = resolve_clamped(
             env,
             "FERROFIN_PROVIDER_TIMEOUT_SECONDS",
             "provider_timeout_seconds",
             file.provider_timeout_seconds,
             RequestLimits::DEFAULT_TIMEOUT_SECONDS,
             RequestLimits::TIMEOUT_SECONDS,
+            "seconds",
         );
-        let provider_max_wait_seconds = resolve_provider_seconds(
+        let provider_max_wait_seconds = resolve_clamped(
             env,
             "FERROFIN_PROVIDER_MAX_WAIT_SECONDS",
             "provider_max_wait_seconds",
             file.provider_max_wait_seconds,
             RequestLimits::DEFAULT_MAX_WAIT_SECONDS,
             RequestLimits::MAX_WAIT_SECONDS,
+            "seconds",
+        );
+
+        let image_decode_max_megapixels = resolve_clamped(
+            env,
+            "FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS",
+            "image_decode_max_megapixels",
+            file.image_decode_max_megapixels,
+            ImageLimits::DEFAULT_DECODE_MEGAPIXELS,
+            ImageLimits::DECODE_MEGAPIXELS,
+            "megapixels",
+        );
+        let image_decode_max_memory_mb = resolve_clamped(
+            env,
+            "FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB",
+            "image_decode_max_memory_mb",
+            file.image_decode_max_memory_mb,
+            ImageLimits::DEFAULT_DECODE_MEMORY_MB,
+            ImageLimits::DECODE_MEMORY_MB,
+            "MiB",
+        );
+        let image_resize_budget_mb = resolve_clamped(
+            env,
+            "FERROFIN_IMAGE_RESIZE_BUDGET_MB",
+            "image_resize_budget_mb",
+            file.image_resize_budget_mb,
+            ImageLimits::DEFAULT_RESIZE_BUDGET_MB,
+            ImageLimits::RESIZE_BUDGET_MB,
+            "MiB",
         );
 
         let ffmpeg_path = cli
@@ -952,6 +1005,9 @@ impl Config {
             musicbrainz_base_url,
             provider_timeout_seconds,
             provider_max_wait_seconds,
+            image_decode_max_megapixels,
+            image_decode_max_memory_mb,
+            image_resize_budget_mb,
             ffmpeg_path,
             ffprobe_path,
             ffmpeg_img_extract_perf_tradeoff: parse_bool_var(
@@ -1231,6 +1287,9 @@ impl Config {
             musicbrainz_base_url: OFFLINE_PROVIDER_URL.to_owned(),
             provider_timeout_seconds: RequestLimits::DEFAULT_TIMEOUT_SECONDS,
             provider_max_wait_seconds: RequestLimits::DEFAULT_MAX_WAIT_SECONDS,
+            image_decode_max_megapixels: ImageLimits::DEFAULT_DECODE_MEGAPIXELS,
+            image_decode_max_memory_mb: ImageLimits::DEFAULT_DECODE_MEMORY_MB,
+            image_resize_budget_mb: ImageLimits::DEFAULT_RESIZE_BUDGET_MB,
             ffmpeg_path: None,
             ffprobe_path: None,
             ffmpeg_img_extract_perf_tradeoff: false,
@@ -1284,23 +1343,27 @@ fn keep_running<T: Clone + PartialEq>(
     }
 }
 
-/// Resolves a provider request limit in seconds: the `env_key` env var >
-/// `file_key` in `config.toml` > `default`, clamped to `range`. A value
-/// outside the range warns ([`Env::warn`]) and takes the nearest bound, as
-/// the limit always did; one that does not parse warns and is unset.
-fn resolve_provider_seconds(
+/// Resolves a number with a range: `env_key` when it parses, else `file`, else
+/// `default`, clamped to `range`. A value outside warns, naming both layers'
+/// keys and `unit`, and the server starts on the clamped one: a limit never
+/// stops a boot.
+fn resolve_clamped<T>(
     env: &dyn Env,
     env_key: &str,
     file_key: &str,
-    file: Option<u64>,
-    default: u64,
-    range: std::ops::RangeInclusive<u64>,
-) -> u64 {
-    let seconds = parse_var(env, env_key).or(file).unwrap_or(default);
-    let clamped = seconds.clamp(*range.start(), *range.end());
-    if clamped != seconds {
+    file: Option<T>,
+    default: T,
+    range: std::ops::RangeInclusive<T>,
+    unit: &str,
+) -> T
+where
+    T: Copy + Ord + std::fmt::Display + std::str::FromStr,
+{
+    let value = parse_var(env, env_key).or(file).unwrap_or(default);
+    let clamped = value.clamp(*range.start(), *range.end());
+    if clamped != value {
         env.warn(format!(
-            "{env_key} / {file_key} `{seconds}` is outside {} to {} seconds; using {clamped}",
+            "{env_key} / {file_key} `{value}` is outside {} to {} {unit}; using {clamped}",
             range.start(),
             range.end()
         ));
@@ -2431,6 +2494,71 @@ mod tests {
             )
         );
         assert_eq!(cfg.log_format, LogFormat::Json);
+    }
+
+    /// The image limits: `config.toml`, then the variables, then the defaults
+    /// the drawing crate defines; a value out of range warns and is clamped.
+    #[test]
+    fn the_image_limits_resolve_like_the_provider_limits() {
+        let image_limits = |cfg: &Config| {
+            (
+                cfg.image_decode_max_megapixels,
+                cfg.image_decode_max_memory_mb,
+                cfg.image_resize_budget_mb,
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "image_decode_max_megapixels = 300\nimage_decode_max_memory_mb = 1024\n\
+             image_resize_budget_mb = 4096\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            config_file: Some(path),
+            ..Cli::default()
+        };
+        let cfg = Config::load_from(cli.clone(), &FakeEnv::new()).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(image_limits(&cfg), (300, 1024, 4096));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS", "100")
+            .with("FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB", "256")
+            .with("FERROFIN_IMAGE_RESIZE_BUDGET_MB", "1024");
+        let cfg = Config::load_from(cli.clone(), &env).unwrap();
+        assert!(cfg.load_warnings.is_empty(), "{:?}", cfg.load_warnings);
+        assert_eq!(image_limits(&cfg), (100, 256, 1024));
+
+        let env = FakeEnv::new()
+            .with("FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS", "1")
+            .with("FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB", "999999")
+            .with("FERROFIN_IMAGE_RESIZE_BUDGET_MB", "lots");
+        let cfg = Config::load_from(cli, &env).unwrap();
+        assert_eq!(image_limits(&cfg), (16, 2048, 4096));
+        assert_eq!(cfg.load_warnings.len(), 3, "{:?}", cfg.load_warnings);
+        for variable in [
+            "FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS",
+            "FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB",
+            "FERROFIN_IMAGE_RESIZE_BUDGET_MB",
+        ] {
+            assert!(
+                cfg.load_warnings.iter().any(|w| w.contains(variable)),
+                "{variable}: {:?}",
+                cfg.load_warnings
+            );
+        }
+
+        let cfg = Config::load_from(Cli::default(), &FakeEnv::new()).unwrap();
+        assert_eq!(
+            image_limits(&cfg),
+            (
+                ImageLimits::DEFAULT_DECODE_MEGAPIXELS,
+                ImageLimits::DEFAULT_DECODE_MEMORY_MB,
+                ImageLimits::DEFAULT_RESIZE_BUDGET_MB
+            )
+        );
     }
 
     /// The config file is TOML: a file named for another format is refused,

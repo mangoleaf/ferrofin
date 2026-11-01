@@ -58,6 +58,91 @@ pub(crate) async fn require_visible_item(
         .ok_or_else(|| ApiError::NotFound(format!("item {item_id}")))
 }
 
+/// Refuses a scope the user may not open, as `ItemsController` refuses a
+/// library: a `401`, before the query runs.
+///
+/// Divergence (owner decision 2026-10-31, gl-1091): library access is a hard
+/// boundary on every route that takes a scope, where upstream applies
+/// `IsVisible` on `GET /Items` alone. A library or a view keeps `IsVisible`, so
+/// the hottest browse pays nothing more; anything else takes
+/// `IsVisibleStandalone`, which walks up to the library. An API key is exempt,
+/// as upstream ("api keys can always access all folders"), and with no user
+/// there is nobody to refuse.
+pub(crate) async fn require_scope_visible(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    scope: &BaseItemEntity,
+    user: Option<&UserEntity>,
+) -> Result<(), ApiError> {
+    let Some(user) = user.filter(|_| !auth.is_api_key) else {
+        return Ok(());
+    };
+    let visible = if matches!(
+        short_type(scope),
+        "CollectionFolder" | "UserView" | "UserRootFolder" | "AggregateFolder"
+    ) {
+        state.library.is_item_visible(scope, user).await?
+    } else {
+        state
+            .library
+            .is_item_visible_standalone(scope, user)
+            .await?
+    };
+    if visible {
+        Ok(())
+    } else {
+        Err(ApiError::Unauthorized("Unauthorized access".into()))
+    }
+}
+
+/// [`require_scope_visible`] for a scope a route holds only the id of. An id
+/// naming no item passes: each route answers that as it always has.
+pub(crate) async fn require_scope_id_visible(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    scope: Option<Uuid>,
+    user: Option<&UserEntity>,
+) -> Result<(), ApiError> {
+    if user.is_none() || auth.is_api_key {
+        return Ok(());
+    }
+    let Some(id) = scope.filter(|id| !id.is_nil()) else {
+        return Ok(());
+    };
+    match state.library.get_item_by_id(id).await? {
+        Some(item) => require_scope_visible(state, auth, &item, user).await,
+        None => Ok(()),
+    }
+}
+
+/// Reduces `query.item_ids` to the items the user may open, under the same
+/// divergence and exemptions as [`require_scope_visible`]. `false` when the
+/// request named ids and none is left: the caller must answer an empty page,
+/// because an empty `item_ids` means no id filter and the query would list the
+/// whole library.
+pub(crate) async fn retain_visible_ids(
+    state: &AppState,
+    auth: &AuthorizationInfo,
+    query: &mut InternalItemsQuery,
+) -> Result<bool, ApiError> {
+    if query.item_ids.is_empty() || auth.is_api_key {
+        return Ok(true);
+    }
+    let Some(user) = query.user.as_ref() else {
+        return Ok(true);
+    };
+    query.item_ids = state
+        .library
+        .get_visible_item_ids(&query.item_ids, user)
+        .await?;
+    Ok(!query.item_ids.is_empty())
+}
+
+/// The page [`retain_visible_ids`] calls for when no id is left.
+pub(crate) fn empty_page(query: &InternalItemsQuery) -> QueryResult<BaseItemDto> {
+    QueryResult::new(Some(query.start_index.unwrap_or(0)), Some(0), Vec::new())
+}
+
 /// The effective user id for a request, porting C#
 /// `RequestHelpers.GetUserId` (v10.11.8 `Jellyfin.Api/Helpers/RequestHelpers.cs`
 /// lines 67-85) in both of its halves:
@@ -703,6 +788,10 @@ async fn get_items(
         // BoxSet/Playlist redirect, but bypass parent/view child selection.
         internal.set_parent(None);
         internal.user_root_children = false;
+    }
+    // Last, so a request the checks above refuse is still refused.
+    if !retain_visible_ids(&state, &auth, &mut internal).await? {
+        return Ok(Json(empty_page(&internal)));
     }
 
     let mut result = state.library.query_items(&internal).await?;
@@ -1847,6 +1936,7 @@ async fn get_resume_items(
         ..InternalItemsQuery::default()
     };
     if let Some(parent) = query.parent_id {
+        require_scope_id_visible(&state, &auth, Some(parent), internal.user.as_ref()).await?;
         internal.parent_id = parent;
     }
 
@@ -1928,9 +2018,10 @@ fn is_direct_children_browse(short_type_name: &str) -> bool {
     )
 }
 
-/// ItemsController uses IsVisible on its explicit parent, not standalone
-/// lookup. It returns 401 for a hidden parent, and API keys bypass this gate.
-/// Container-only browses re-root to UserRootFolder before the upstream check.
+/// ItemsController refuses an explicit parent the user may not open with a 401,
+/// and API keys bypass this gate; see [`require_scope_visible`], which is
+/// stricter than upstream's `IsVisible`. Container-only browses re-root to
+/// UserRootFolder before the check.
 /// Whether the parent is itself a library, and a `boxsets` one, is left in
 /// `library` for the library browse defaults ([`apply_library_browse_defaults`]).
 async fn check_parent_visibility(
@@ -1954,13 +2045,8 @@ async fn check_parent_visibility(
         query.include_item_types.as_slice(),
         [BaseItemKind::BoxSet | BaseItemKind::Playlist]
     ) && !matches!(kind, "BoxSet" | "Playlist");
-    if !auth.is_api_key
-        && kind != "UserRootFolder"
-        && !rerooted
-        && let Some(user) = query.user.as_ref()
-        && !state.library.is_item_visible(&parent, user).await?
-    {
-        return Err(ApiError::Unauthorized("Unauthorized access".into()));
+    if kind != "UserRootFolder" && !rerooted {
+        require_scope_visible(state, auth, &parent, query.user.as_ref()).await?;
     }
     let kind_from = |row: &ferrofin_db::entities::base_items::BaseItemEntity| {
         serde_json::from_value(serde_json::Value::String(

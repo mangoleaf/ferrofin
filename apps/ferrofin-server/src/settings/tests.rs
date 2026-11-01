@@ -570,6 +570,56 @@ fn a_file_changed_since_the_start_shows_its_saved_value() {
 }
 
 #[test]
+fn auto_saved_over_a_running_count_shows_as_the_saved_value() {
+    let data = DataDir::new(&[
+        "db_pool = 8".to_owned(),
+        "trickplay_concurrency = \"auto\"".to_owned(),
+    ]);
+    let env = FakeEnv::new();
+    let running = load(data.cli(), &env);
+    std::fs::write(
+        data.config_file(),
+        "db_pool = \"auto\"\ntrickplay_concurrency = \"auto\"\n",
+    )
+    .expect("edit");
+    let shown = report(&running, &env);
+
+    // `auto` is no running value, but it is what the file holds.
+    let pool = entry(&shown, "db_pool");
+    assert_eq!(pool.value, Some(json!(8)), "the running value");
+    assert_eq!(pool.saved_value, Some(json!("auto")));
+    // Auto in the file and in use: nothing saved apart.
+    let trickplay = entry(&shown, "trickplay_concurrency");
+    assert_eq!(trickplay.value, None);
+    assert_eq!(trickplay.saved_value, None);
+
+    // A variable's count outranks it: the file's `auto` is saved underneath.
+    let env = FakeEnv::new().with("FERROFIN_DB_POOL", "16");
+    let outranked = report(&load(data.cli(), &env), &env);
+    let pool = entry(&outranked, "db_pool");
+    assert_eq!(pool.source, Source::Environment);
+    assert_eq!(pool.value, Some(json!(16)));
+    assert_eq!(pool.saved_value, Some(json!("auto")));
+}
+
+/// The page is driven by the report, so a new setting needs no page change. A
+/// key the script named would be a quoted string; a bare word may be English
+/// (`port` is in "report").
+#[test]
+fn the_settings_page_names_no_setting() {
+    use ferrofin_extensions::Extension as _;
+
+    let pages = ferrofin_extensions::ferrofin_settings::FerrofinSettingsExtension.config_pages();
+    let html = String::from_utf8_lossy(&pages[0].bytes);
+    for spec in SETTINGS {
+        for quote in ['\'', '"', '`'] {
+            let quoted = format!("{quote}{}{quote}", spec.key);
+            assert!(!html.contains(&quoted), "the page names {quoted}");
+        }
+    }
+}
+
+#[test]
 fn secrets_are_reported_in_plain_text() {
     let data = DataDir::new(&[
         "omdb_api_key = \"omdb-secret\"".to_owned(),

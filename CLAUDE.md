@@ -283,6 +283,16 @@ Both of these need an ffmpeg with libx264, and `subtitle_streams_ffmpeg` also ne
 5.1 or later. CI does not run them (CI never sets `FERROFIN_FFMPEG_TESTS`): run them by hand
 for changes to those paths.
 
+The image limits have the same kind of gate. `image_limits_cgroup` boots the real binary in a
+`systemd-run --user --scope` with a hard memory cap and swap off, and checks that each limit holds
+there: the pixel limit, the resize budget, the memory limit on a Photo item, and the budget shared
+by concurrent resizes. It needs a systemd user session and CI does not run it: run it by hand for
+changes to `ferrofin-drawing/src/limits.rs`:
+
+```bash
+FERROFIN_CGROUP_TESTS=1 cargo test -p ferrofin-server --test image_limits_cgroup
+```
+
 Similarly, the end-to-end WASM plugin test builds the reference guest from source (needs the
 `wasm32-wasip2` target — the `examples/wasm-hello/` toolchain island provides it; the root
 toolchain stays server-only). It skips with a message when the target is absent; CI always

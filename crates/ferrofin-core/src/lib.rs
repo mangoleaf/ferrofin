@@ -175,6 +175,7 @@ pub mod chapter_manager;
 pub mod chapter_repository;
 pub mod client_event_logger;
 pub mod collection_manager;
+mod collections_library;
 pub mod config_import;
 pub mod configuration_manager;
 pub mod db_error;

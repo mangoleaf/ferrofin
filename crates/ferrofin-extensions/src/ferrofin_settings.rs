@@ -7,9 +7,10 @@
 //! contributes no tasks, hooks or providers, only a `/Plugins` entry and its
 //! settings page (Dashboard → Plugins → Ferrofin, and the dashboard menu's
 //! Ferrofin entry), which the dashboard's Disable toggle still turns off. The
-//! page lists every setting `GET /Ferrofin/Settings` reports, read-only. The
-//! settings themselves live in the server binary, which owns the
-//! configuration, behind the
+//! page lists every setting `GET /Ferrofin/Settings` reports, edits the ones
+//! that route marks editable, saves them with `POST /Ferrofin/Settings`, and
+//! restarts the server to apply them. The settings themselves live in the
+//! server binary, which owns the configuration, behind the
 //! [`ServerSettingsManager`](ferrofin_traits::server_settings::ServerSettingsManager)
 //! seam; the extension is what gives them a plugin identity and an enabled
 //! flag, which that manager reads (a disabled plugin's routes answer `404`).
@@ -165,6 +166,30 @@ mod tests {
             ".html(",
         ] {
             assert!(!html.contains(sink), "the page uses `{sink}`");
+        }
+    }
+
+    #[test]
+    fn the_settings_page_saves_through_the_settings_route_and_restarts() {
+        let html = settings_html();
+        // Save posts the changes, the server's one refusal shows beside the
+        // setting: a browser's own bubble for `Min`/`Max` would stop the form
+        // before the server could judge the value.
+        assert!(html.contains("novalidate"), "{html}");
+        assert!(html.contains("type: 'POST'"), "{html}");
+        assert!(html.contains("{ Changes: "), "{html}");
+        assert!(html.contains("ApiClient.restartServer()"), "{html}");
+        // A control for each kind that is not plain text.
+        for kind in ["Bool", "Integer", "CountOrAuto", "PathList", "NumberList"] {
+            assert!(
+                html.contains(&format!("case '{kind}':")),
+                "no control for {kind}"
+            );
+        }
+        // jellyfin-web upgrades these once they are in the document, and
+        // `emby-input` needs its parent by then.
+        for element in ["emby-input", "emby-checkbox", "emby-button"] {
+            assert!(html.contains(&format!("'is', '{element}'")), "{element}");
         }
     }
 

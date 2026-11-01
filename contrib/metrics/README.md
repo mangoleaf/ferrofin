@@ -36,6 +36,11 @@ The endpoint is unauthenticated when enabled
 (Jellyfin parity); the bounded-cardinality label rules are what keep that safe —
 nothing user-identifying appears in the exposition.
 
+It sits behind the same network rules as the API, as in Jellyfin. A scraper on the
+local network (the private address ranges, or `LocalNetworkSubnets` if set) is
+always allowed, as are loopback and the machine itself. One outside it gets `503`
+with `EnableRemoteAccess` off, and is judged by the remote IP filter with it on.
+
 ```bash
 curl http://localhost:8096/metrics
 ```
