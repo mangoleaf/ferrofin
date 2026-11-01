@@ -21,6 +21,18 @@ one of them a client gets the original file instead of a thumbnail:
 
 A photo library with larger panoramas may want `FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS` raised.
 
+## Remote images
+
+Downloading artwork from a URL is now bounded, and the bounds are settings
+([Remote images](CONFIG.md#remote-images)). Three things change:
+
+- an image over 64 MiB is no longer downloaded, and the scan takes the provider's next image. A
+  logo over it logs a warning naming `image_download_max_mb`;
+- a response has to be an image, whatever type it declares. An error page sent as `image/png`, or
+  a format Ferrofin does not recognise, used to be stored and is now refused;
+- a logo URL that gave no image is left alone for an hour, so a logo fixed at its source can take
+  that long to appear. Lower `FERROFIN_IMAGE_NEGATIVE_CACHE_TTL_SECS`, or restart, to retry sooner.
+
 ## Kubernetes: stop the old pod first for heavy migrations
 
 The Helm chart's default rolling update keeps the old pod serving and writing the database
@@ -104,6 +116,17 @@ Dashboard → Libraries, with box sets under a plain folder for that directory.
   lands in the new folder. A user's library access saved through it in that moment can name the old
   id, which nothing moves afterwards, so check such a user or
   [stop the old pod first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
+
+## Unreleased — Live TV artwork must be a URL
+
+Usually nothing to do. A playlist's `tvg-logo` or `logo` and a guide's `<icon>` or `<image>` are
+now kept only when they are `http` or `https` URLs. Any other value, such as a path on the server
+or a `file:` URL, is ignored, and each guide refresh logs a warning with how many it left out. If
+your logos were local files, serve them over HTTP or set them on the channel in the metadata
+editor. Logos you set that way, and the ones an adopted Jellyfin database downloaded, are
+unaffected. An image that an earlier version stored from such a value is no longer served. On a
+channel, the next guide refresh removes it if the playlist or guide still gives that value; on a
+programme, it goes when the programme next changes or leaves the guide.
 
 ## Unreleased — a mount that does not answer is left out of the drive list
 
