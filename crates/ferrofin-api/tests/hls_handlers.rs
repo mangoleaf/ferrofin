@@ -1825,7 +1825,16 @@ async fn a_token_does_not_override_the_account_policy(
         user_policy: Some(Arc::new(policy)),
         ..ok_auth_info()
     });
-    for path in progressive_routes() {
+    // A static, subtitle or attachment read takes no credential, but one that
+    // names a user is held to that account as a transcode is (gl-1090).
+    let reads = [
+        format!("/Videos/{ITEM_ID}/stream?static=true"),
+        format!("/Audio/{ITEM_ID}/stream?static=true"),
+        format!("/Videos/{ITEM_ID}/{ITEM_ID}/Subtitles/0/Stream.srt"),
+        format!("/Videos/{ITEM_ID}/{ITEM_ID}/Subtitles/0/0/Stream.srt"),
+        format!("/Videos/{ITEM_ID}/{ITEM_ID}/Attachments/0"),
+    ];
+    for path in progressive_routes().into_iter().chain(reads) {
         let rec = Arc::new(Recorded::default());
         let app =
             router_no_static_with_auth(ok_hls("/unused", Arc::clone(&rec)), Arc::new(auth.clone()));
@@ -1837,6 +1846,34 @@ async fn a_token_does_not_override_the_account_policy(
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), expected, "{path}");
         assert!(rec.last.lock().unwrap().is_none(), "{path} was dispatched");
+    }
+}
+
+/// An API key names no user, so no account rule binds it, whatever policy the
+/// resolved identity happens to carry (gl-1090).
+#[tokio::test]
+async fn an_api_key_is_held_to_no_account() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("movie.mkv");
+    std::fs::write(&file, b"bytes").unwrap();
+    let auth = PolicyAuth(AuthorizationInfo {
+        is_api_key: true,
+        user_policy: Some(Arc::new(ferrofin_model::users::UserPolicy {
+            is_disabled: true,
+            ..ferrofin_model::users::UserPolicy::default()
+        })),
+        ..ok_auth_info()
+    });
+    let app = router_no_static_with_auth(
+        ok_hls(file.to_str().unwrap(), Arc::new(Recorded::default())),
+        Arc::new(auth),
+    );
+    for (method, path) in [
+        ("GET", format!("/Videos/{ITEM_ID}/{ITEM_ID}/Attachments/0")),
+        ("HEAD", format!("/Videos/{ITEM_ID}/stream.mp4")),
+    ] {
+        let response = app.clone().oneshot(authed(method, &path)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
     }
 }
 
