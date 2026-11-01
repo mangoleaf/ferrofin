@@ -2207,7 +2207,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetLatestMedia",
         ferrofin: "handlers/user_library.rs get_latest_media → ferrofin-core \
                user_view_manager.rs get_latest_items, items_for_latest_items, latest_parents \
-               (UserViewManager.GetItemsForLatestItems)",
+               (UserViewManager.GetItemsForLatestItems, LibraryManager.GetLatestItemList, \
+               SetTopParentIdsOrAncestors)",
         date: "2026-10-31",
         divergences: &[
             "A grouped request whose parents carry no collection type (a mixed library) takes \
@@ -2216,9 +2217,6 @@ pub const VERIFIED: &[Verified] = &[
             "The plain query over-fetches 10.11.8's limit * 5 where v12 fetches limit * 2, so \
          a request answered by it can reach containers upstream's cut leaves out. Fix path: \
          gl-303.",
-            "A UserView parent reports no collection type, so a grouped movies or TV view is \
-         neither narrowed to Movie or Episode nor short-circuited, where upstream reads \
-         UserView.CollectionType. Fix path: gl-1108.",
             "A Channel parent answers empty: upstream's channel manager reads plugin channels, \
          and Ferrofin has none (native .NET plugin loading is out of scope).",
             "The 400 (an API key with no userId, or a value the query binder cannot convert), \
