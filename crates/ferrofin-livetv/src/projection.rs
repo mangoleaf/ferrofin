@@ -386,6 +386,18 @@ pub fn channel_item_update(
     (item != *stored).then_some(item)
 }
 
+/// Whether a tuner's or guide's artwork value may become an image row: an
+/// absolute `http` or `https` URL.
+///
+/// Upstream's `SetImagePath` also accepts a local file path here; Ferrofin keeps
+/// only URLs. Jellyfin bug not ported; see the `images` row of
+/// `handlers::VERIFIED_SUBSYSTEMS`. Every source's artwork (M3U, XMLTV, Schedules
+/// Direct; an HDHomeRun lineup has none) reaches an image row only through
+/// [`channel_images_update`] and [`program_images_update`], which apply this.
+pub(crate) fn is_artwork_url(value: &str) -> bool {
+    crate::fetch::has_scheme(value, &["http", "https"])
+}
+
 /// A remote image row for `url`: upstream's `new ItemImageInfo { Path = url,
 /// Type = type }`. The image routes serve it through the remote-image cache.
 fn remote_image(image_type: ImageType, url: &str) -> ItemImageInfo {
@@ -419,19 +431,34 @@ fn set_first_image(images: &mut Vec<ItemImageInfo>, image: ItemImageInfo) {
 /// downloaded logo, or one set in the metadata editor) never equals the URL,
 /// so it is replaced by the tuner's or guide's logo, as upstream replaces it
 /// on every refresh.
+///
+/// A logo that is not a URL ([`is_artwork_url`]) sets nothing. A Primary an
+/// earlier version stored from that same value is removed: the image routes
+/// no longer serve it, and the old version can store it again beside this one
+/// during a rolling update, so it goes on a refresh, not once.
 #[must_use]
 pub fn channel_images_update(
     current: &[ItemImageInfo],
     image_url: Option<&str>,
 ) -> Option<Vec<ItemImageInfo>> {
     let url = image_url.filter(|url| !url.trim().is_empty())?;
-    let primary = current.iter().find(|i| i.image_type == ImageType::Primary);
-    if primary.is_some_and(|p| p.path == url) {
-        return None;
+    let primary = current
+        .iter()
+        .position(|i| i.image_type == ImageType::Primary);
+    let stored = primary.filter(|&index| current[index].path == url);
+    match (is_artwork_url(url), stored) {
+        (true, Some(_)) | (false, None) => None,
+        (true, None) => {
+            let mut images = current.to_vec();
+            set_first_image(&mut images, remote_image(ImageType::Primary, url));
+            Some(images)
+        }
+        (false, Some(index)) => {
+            let mut images = current.to_vec();
+            images.remove(index);
+            Some(images)
+        }
     }
-    let mut images = current.to_vec();
-    set_first_image(&mut images, remote_image(ImageType::Primary, url));
-    Some(images)
 }
 
 /// The artwork a listing supplies for one programme: `ProgramInfo.ImageUrl`
@@ -447,6 +474,28 @@ pub struct ProgramImages {
     pub backdrop: Option<String>,
 }
 
+impl ProgramImages {
+    /// The listing's URLs, in `UpdateImages` order, with a value that is no URL
+    /// ([`is_artwork_url`]) read as none.
+    fn urls(&self) -> [(ImageType, Option<&str>); 3] {
+        [
+            (ImageType::Primary, &self.primary),
+            (ImageType::Thumb, &self.thumb),
+            (ImageType::Backdrop, &self.backdrop),
+        ]
+        .map(|(image_type, url)| (image_type, url.as_deref().filter(|url| is_artwork_url(url))))
+    }
+
+    /// How many of the listing's values are neither blank nor a URL.
+    pub(crate) fn refused(&self) -> usize {
+        [&self.primary, &self.thumb, &self.backdrop]
+            .into_iter()
+            .flatten()
+            .filter(|value| !value.trim().is_empty() && !is_artwork_url(value))
+            .count()
+    }
+}
+
 /// The programme's image list after `GuideManager.UpdateImages`, or `None`
 /// when nothing is to be written.
 ///
@@ -457,7 +506,8 @@ pub struct ProgramImages {
 /// a programme's Logo goes too. A removal alone does not mark the programme
 /// updated upstream (`UpdateImage` returns `false`), so it is only written
 /// when the programme's other fields changed (`item_updated`) — then the item,
-/// removal included, is saved.
+/// removal included, is saved. A listing value that is not a URL
+/// ([`is_artwork_url`]) counts as none.
 #[must_use]
 pub fn program_images_update(
     current: &[ItemImageInfo],
@@ -467,12 +517,8 @@ pub fn program_images_update(
     let mut images = current.to_vec();
     let mut updated = false;
     let mut removed = false;
-    for (image_type, url) in [
-        (ImageType::Primary, listing.primary.as_deref()),
-        (ImageType::Thumb, listing.thumb.as_deref()),
-        (ImageType::Logo, None),
-        (ImageType::Backdrop, listing.backdrop.as_deref()),
-    ] {
+    let [primary, thumb, backdrop] = listing.urls();
+    for (image_type, url) in [primary, thumb, (ImageType::Logo, None), backdrop] {
         let first = images.iter().position(|i| i.image_type == image_type);
         let same = first
             .zip(url)
@@ -480,7 +526,7 @@ pub fn program_images_update(
         if same {
             continue;
         }
-        match (url.filter(|url| !url.trim().is_empty()), first) {
+        match (url, first) {
             (Some(url), _) => {
                 set_first_image(&mut images, remote_image(image_type, url));
                 updated = true;
@@ -862,6 +908,73 @@ mod tests {
         );
         assert_eq!(channel_images_update(&[logo], Some("  ")), None);
         assert_eq!(channel_images_update(&[], None), None);
+    }
+
+    /// Artwork is an absolute `http` or `https` URL and nothing else.
+    #[rstest::rstest]
+    #[case::absolute_path("/var/lib/art.png", false)]
+    #[case::relative_path("art/logo.png", false)]
+    #[case::parent_path("../art.png", false)]
+    #[case::windows_path(r"C:\art\logo.png", false)]
+    #[case::file_url("file:///var/lib/art.png", false)]
+    #[case::file_url_without_authority("file:/var/lib/art.png", false)]
+    #[case::another_scheme("ftp://img/a.png", false)]
+    #[case::starts_like_http("httpfoo/a.png", false)]
+    #[case::scheme_without_slashes("http:/a.png", false)]
+    #[case::padded(" http://img/a.png", false)]
+    #[case::scheme_relative("//img/a.png", false)]
+    #[case::blank("  ", false)]
+    #[case::http("http://img/a.png", true)]
+    #[case::https("https://img/a.png", true)]
+    #[case::any_case("HTTPS://IMG/A.PNG", true)]
+    fn artwork_is_a_url(#[case] value: &str, #[case] expected: bool) {
+        assert_eq!(is_artwork_url(value), expected);
+    }
+
+    /// A logo that is no URL sets nothing, and takes the row an earlier version
+    /// stored from it, but no other.
+    #[test]
+    fn a_channel_logo_that_is_no_url_sets_nothing() {
+        let refused = "/var/lib/art.png";
+        assert_eq!(channel_images_update(&[], Some(refused)), None);
+        // A logo from the metadata editor, or a URL, stays.
+        for path in ["/meta/library/primary.png", "http://img/a.png"] {
+            let primary = image(ImageType::Primary, path);
+            assert_eq!(channel_images_update(&[primary], Some(refused)), None);
+        }
+        let backdrop = image(ImageType::Backdrop, "/meta/b.jpg");
+        assert_eq!(
+            channel_images_update(
+                &[image(ImageType::Primary, refused), backdrop.clone()],
+                Some(refused)
+            ),
+            Some(vec![backdrop])
+        );
+    }
+
+    /// A listing value that is no URL is a listing without that image.
+    #[test]
+    fn a_programme_value_that_is_no_url_counts_as_none() {
+        let refused = "file:///var/lib/art.png";
+        let listing = ProgramImages {
+            primary: Some(refused.to_owned()),
+            thumb: Some("  ".to_owned()),
+            backdrop: Some("http://img/b.jpg".to_owned()),
+        };
+        assert_eq!(listing.refused(), 1);
+        let backdrop = image(ImageType::Backdrop, "http://img/b.jpg");
+        assert_eq!(
+            program_images_update(&[], &listing, false),
+            Some(vec![backdrop.clone()])
+        );
+        // The row an earlier version stored from it goes as a removal does:
+        // only with a programme that is written anyway.
+        let stored = [image(ImageType::Primary, refused), backdrop.clone()];
+        assert_eq!(program_images_update(&stored, &listing, false), None);
+        assert_eq!(
+            program_images_update(&stored, &listing, true),
+            Some(vec![backdrop])
+        );
     }
 
     /// `GuideManager.UpdateImages`/`UpdateImage`.

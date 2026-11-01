@@ -476,19 +476,23 @@ pub trait LibraryManager: Send + Sync {
         Ok(Vec::new())
     }
 
-    /// [`Self::get_item_images`] in the same read as whether they are
-    /// auto-oriented when served; delegates to
-    /// [`ItemRepository::get_image_infos_with_auto_orient`](crate::persistence::ItemRepository::get_image_infos_with_auto_orient).
-    /// The default reads the images and orients nothing.
+    /// [`Self::get_item_images`] in the same read as what the item decides about
+    /// serving them; delegates to
+    /// [`ItemRepository::get_image_infos_to_serve`](crate::persistence::ItemRepository::get_image_infos_to_serve).
+    /// The default reads the images alone: nothing oriented, no Live TV owner,
+    /// so a manager over Live TV items must override it.
     ///
     /// # Errors
     ///
     /// [`ServiceError`] on a storage failure.
-    async fn get_item_images_with_auto_orient(
+    async fn get_item_images_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
-        Ok((self.get_item_images(item_id).await?, false))
+    ) -> Result<crate::options::ItemImagesToServe, ServiceError> {
+        Ok(crate::options::ItemImagesToServe {
+            images: self.get_item_images(item_id).await?,
+            ..Default::default()
+        })
     }
 
     /// The image of the item's `index`-th chapter, if it has one.

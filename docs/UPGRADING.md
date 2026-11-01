@@ -117,6 +117,17 @@ Dashboard → Libraries, with box sets under a plain folder for that directory.
   id, which nothing moves afterwards, so check such a user or
   [stop the old pod first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
 
+## Unreleased — Live TV artwork must be a URL
+
+Usually nothing to do. A playlist's `tvg-logo` or `logo` and a guide's `<icon>` or `<image>` are
+now kept only when they are `http` or `https` URLs. Any other value, such as a path on the server
+or a `file:` URL, is ignored, and each guide refresh logs a warning with how many it left out. If
+your logos were local files, serve them over HTTP or set them on the channel in the metadata
+editor. Logos you set that way, and the ones an adopted Jellyfin database downloaded, are
+unaffected. An image that an earlier version stored from such a value is no longer served. On a
+channel, the next guide refresh removes it if the playlist or guide still gives that value; on a
+programme, it goes when the programme next changes or leaves the guide.
+
 ## Unreleased — a mount that does not answer is left out of the drive list
 
 Nothing to do, unless your network storage is slow to answer. The library wizard's drive list

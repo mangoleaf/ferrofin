@@ -3905,11 +3905,11 @@ impl ItemRepository for FerrofinItemRepository {
         Ok(map)
     }
 
-    async fn get_image_infos_with_auto_orient(
+    async fn get_image_infos_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
-        /// An image row with its owner's photo facts.
+    ) -> Result<ferrofin_traits::options::ItemImagesToServe, ServiceError> {
+        /// An image row with its owner's facts.
         #[derive(sqlx::FromRow)]
         struct Row {
             #[sqlx(flatten)]
@@ -3918,11 +3918,14 @@ impl ItemRepository for FerrofinItemRepository {
             is_photo: bool,
             #[sqlx(rename = "PhotoData")]
             photo_data: Option<String>,
+            #[sqlx(rename = "IsLiveTv")]
+            is_live_tv: bool,
         }
         // The image read of `get_image_infos`, plus the owner by primary key.
         let rows = sqlx::query_as::<_, Row>(
             r#"SELECT ii.*, bi."Type" = ?2 AS "IsPhoto",
-                    CASE WHEN bi."Type" = ?2 THEN bi."Data" END AS "PhotoData"
+                    CASE WHEN bi."Type" = ?2 THEN bi."Data" END AS "PhotoData",
+                    bi."Type" IN (?3, ?4) AS "IsLiveTv"
                 FROM "BaseItemImageInfos" ii
                 JOIN "BaseItems" bi ON bi."Id" = ii."ItemId"
                 WHERE ii."ItemId" = ?1
@@ -3930,6 +3933,8 @@ impl ItemRepository for FerrofinItemRepository {
         )
         .bind(guid_to_db(item_id))
         .bind(BaseItemKind::Photo.stored_type_name())
+        .bind(BaseItemKind::LiveTvChannel.stored_type_name())
+        .bind(BaseItemKind::LiveTvProgram.stored_type_name())
         .fetch_all(self.db.pool())
         .await
         .map_err(db_err)?;
@@ -3944,11 +3949,16 @@ impl ItemRepository for FerrofinItemRepository {
                     .as_deref(),
                 )
         });
+        let live_tv = rows.first().is_some_and(|row| row.is_live_tv);
         let images = rows
             .into_iter()
             .map(|row| image_info_from_row(row.image, &self.virtual_paths))
             .collect();
-        Ok((images, auto_orient))
+        Ok(ferrofin_traits::options::ItemImagesToServe {
+            images,
+            auto_orient,
+            live_tv,
+        })
     }
 
     async fn swap_item_images(
