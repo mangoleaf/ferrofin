@@ -38,6 +38,12 @@ test clip a two-hour film went from about 8 MiB to about 59 MiB, and grainy film
 200 MiB of memory to pack, where a 320 tile takes about 60 MiB. A scan packs several at once, so
 a memory-limited install may want `FERROFIN_TRICKPLAY_CONCURRENCY` set.
 
+## Restarting the server needs an administrator
+
+`POST /System/Restart` now requires an administrator or an API key from every address, as
+`POST /System/Shutdown` always has. An ordinary account on the local network could use it
+before and now gets a `403`, so a script that restarts the server with one needs an API key.
+
 ## Image limits
 
 Decoding and resizing images are now bounded, and the bounds are settings
@@ -94,6 +100,20 @@ database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
 
+## Unreleased — a progressive transcode needs a token
+
+Usually nothing to do. A `GET` on `/Videos/{id}/stream[.{container}]` or
+`/Audio/{id}/stream[.{container}]` that would start ffmpeg now needs a user token or an API key,
+in the `Authorization` header or the `ApiKey` query parameter. With neither it answers `401`. This
+differs from Jellyfin on purpose, where these routes are anonymous. The usual account rules apply
+to it too: a disabled account gets `401`, and a user outside their access schedule, or remote with
+remote access off, gets `403`.
+
+- Clients that follow the server's `TranscodingUrl` are unaffected: it carries `ApiKey`.
+- `HEAD` requests and static reads (`static=true`) stay anonymous, as on Jellyfin. The exception
+  is a static read of a Blu-ray or DVD folder, which only ffmpeg can serve, so it needs a token too.
+- A script or player that builds its own transcode URL has to add `ApiKey=`. The lowercase
+  `api_key=` counts only with `EnableLegacyAuthorization` on, which is off by default.
 ## Unreleased — a photo's image follows its file
 
 A photo's image now carries the file's date and is measured again each time the photo refreshes,

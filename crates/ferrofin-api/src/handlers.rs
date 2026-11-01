@@ -927,7 +927,9 @@ pub const VERIFIED_SUBSYSTEMS_AGAINST_EARLIER_PIN: &[(&str, &str)] = &[];
 /// and operation rows name it in [`Verified::refs`]. `websocket-streams` is
 /// the `/socket` dashboard streams, which no contract operation describes;
 /// `scan-failure-isolation` is what the library scan does about a row or a
-/// write that fails, which no operation's response shows.
+/// write that fails, which no operation's response shows;
+/// `progressive-transcode` is who may reach ffmpeg through the stream routes,
+/// whose operations have no row of their own yet.
 pub const SUBSYSTEM_KEYS: &[&str] = &[
     "query-translation",
     "dto-fields",
@@ -937,6 +939,7 @@ pub const SUBSYSTEM_KEYS: &[&str] = &[
     "paging-sort",
     "websocket-streams",
     "scan-failure-isolation",
+    "progressive-transcode",
 ];
 
 /// One shared subsystem whose Ferrofin implementation was compared against the
@@ -1185,6 +1188,36 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              IsVisibleStandalone. Upstream applies IsVisible alone, on GET /Items and GET \
              /Trailers. A BoxSet or Playlist browse that re-roots to the user root skips the \
              check, as upstream. Jellyfin bug not ported (owner decision 2026-10-31, gl-1091).",
+        ],
+    },
+    VerifiedSubsystem {
+        key: "progressive-transcode",
+        upstream_file: "Jellyfin.Api/Controllers/VideosController.cs",
+        upstream_method: "GetVideoStream",
+        ferrofin: "Which GET and HEAD requests on the /Videos and /Audio stream routes reach \
+                   ffmpeg, and who may send them; the query parameters of those operations are \
+                   not part of this row. handlers/streaming.rs stream_route_container (the \
+                   stream.{container} literal, in any case, as ASP.NET matches it), \
+                   static_or_transcode and serve_static_source (the static branches of \
+                   VideosController.GetVideoStream and AudioHelper.GetAudioStream: open live \
+                   stream, remote source, other protocol, file, and for video alone the \
+                   disc-folder exception) and handlers/hls.rs transcode_stream_fallback \
+                   (FileStreamResponseHelpers.GetTranscodedFile, which answers a HEAD before \
+                   ffmpeg), which the transcode branch of /Audio/{itemId}/universal also \
+                   reaches (UniversalAudioController, [Authorize]); the default policy is \
+                   auth.rs RequireAuth (DefaultAuthorizationHandler)",
+        date: "2026-10-31",
+        divergences: &[
+            "A GET that would start a transcode on /Videos/{itemId}/stream, \
+             /Videos/{itemId}/stream.{container}, /Audio/{itemId}/stream or \
+             /Audio/{itemId}/stream.{container} needs a caller, and so does a static video \
+             request for a Blu-ray or DVD folder, which only ffmpeg reads: with no user and no \
+             API key it answers 401, and the default policy runs (a disabled account 401, \
+             remote access and the access schedule 403). Upstream's actions are anonymous \
+             and start ffmpeg for such a request. A HEAD and a static read stay anonymous as \
+             upstream, and a TranscodingUrl carries ApiKey. The lowercase api_key counts only \
+             with EnableLegacyAuthorization on, so it is no caller by default. Deliberate \
+             divergence (owner decision 2026-10-31, gl-1089).",
         ],
     },
 ];
@@ -2206,6 +2239,26 @@ pub const VERIFIED: &[Verified] = &[
             "The 400 (no name), 404 (no such log, or one gone before it was opened) and 500 (one \
          that cannot be opened) bodies are Ferrofin's error shape, not upstream's (a \
          \"Log file not found.\" string for the first 404). Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
+        path: "/System/Restart",
+        upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
+        upstream_method: "RestartApplication",
+        ferrofin: "handlers/system.rs restart_application (auth.rs RequireAdmin) → ferrofin-core \
+               system_manager.rs restart → apps/ferrofin-server state.rs \
+               FerrofinLifecycleController stop, lib.rs announce_shutdown",
+        date: "2026-11-01",
+        divergences: &[
+            "Stricter than upstream by owner decision (gl-1103), not a gap to port: an \
+         administrator or API key is required whatever the source address, as on \
+         /System/Shutdown. Upstream's LocalAccessOrRequiresElevation also admits any caller \
+         on the local network, with or without a token; here that caller gets 401 without \
+         a token and 403 without the administrator role.",
+            "Connected clients get ServerShuttingDown; upstream pushes ServerRestarting for a \
+         restart. Fix path: gl-1123.",
         ],
         refs: &[],
     },
