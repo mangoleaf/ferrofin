@@ -33,7 +33,7 @@
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, RawQuery, Request, State};
+use axum::extract::{FromRequestParts, Path, RawQuery, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use axum::routing::{delete, get};
@@ -521,6 +521,14 @@ pub(crate) fn validate_stream_request(request: &HlsStreamRequest) -> Result<(), 
 /// `is_audio` selects the audio transcode path. The caller passes the already
 /// axum-extracted `HlsQuery` (the direct-play handlers extract it) so this needs
 /// no extra query parser.
+///
+/// Everything that starts ffmpeg on these routes comes through here, the static
+/// disc-folder request included, so a `GET` must carry a caller: a request with
+/// no user and no API key is `401`, and the default policy runs as it does on
+/// the HLS routes (disabled account, remote access, access schedule). This
+/// diverges from upstream on purpose, whose stream actions are anonymous; a
+/// `HEAD` is answered before ffmpeg starts and stays anonymous, as do static
+/// reads, which never come here.
 pub(crate) async fn transcode_stream_fallback(
     state: &AppState,
     item_id: Uuid,
@@ -533,6 +541,13 @@ pub(crate) async fn transcode_stream_fallback(
     validate_stream_request(&req)?;
     req.requested_url = Some(request.uri().path().to_owned());
     req.is_head_request = request.method() == axum::http::Method::HEAD;
+    let request = if req.is_head_request {
+        request
+    } else {
+        let (mut parts, body) = request.into_parts();
+        RequireAuth::from_request_parts(&mut parts, state).await?;
+        Request::from_parts(parts, body)
+    };
     let file = state.hls.transcode_stream(&req, is_audio).await?;
     let mut response = if req.is_head_request {
         Response::new(Body::empty())
