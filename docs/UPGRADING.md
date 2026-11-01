@@ -8,6 +8,19 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Other accounts' policy and configuration
+
+`GET /Users`, `GET /Users/Public` and `GET /Users/{userId}` now leave `Policy` and
+`Configuration` out of a user's row unless the caller is that user, an administrator or an
+API key. Signed out, every row on `GET /Users/Public` lacks them. Jellyfin sends both to
+everyone, so this is a deliberate difference.
+
+jellyfin-web, Android TV and Wholphin need no change. A script that reads another account's
+`Policy` with a regular user's token has to use an administrator's token or an API key.
+
+The same lists, the login screen's included, now sort names as Jellyfin does: `Zoe` comes after
+`admin`, where capitals used to sort first.
+
 ## Image limits
 
 Decoding and resizing images are now bounded, and the bounds are settings
