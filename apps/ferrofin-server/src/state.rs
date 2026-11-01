@@ -984,7 +984,8 @@ pub async fn build_app_state(
         Arc::new(FerrofinDisplayPreferencesManager::new(db.clone()));
     let search: Arc<dyn ferrofin_traits::library::SearchManager> = Arc::new(
         FerrofinSearchManager::new(Arc::clone(&item_repository), Arc::clone(&users))
-            .with_image_processor(Arc::clone(&image_processor)),
+            .with_image_processor(Arc::clone(&image_processor))
+            .with_metadata_root(metadata_root.clone()),
     );
     // Kept concrete so the "Migrate Trickplay Image Location" task can call the
     // inherent `move_generated_trickplay_data` helper.
@@ -2199,6 +2200,7 @@ pub async fn build_app_state(
         // Jellyfin's link providers use the plugin's configured server.
         .with_musicbrainz_server(&config.musicbrainz_base_url)
         .with_virtual_paths(virtual_paths)
+        .with_metadata_root(metadata_root.clone())
         // The `MediaSources`' default-stream selection normalizes languages
         // through the same localization the media-source manager does.
         .with_localization(Arc::clone(&localization))

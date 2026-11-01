@@ -1125,8 +1125,9 @@ pub struct LocalProviderManager {
     /// Named plugin implementations used by automatic path-less image refresh.
     dynamic_image_providers: Vec<Arc<dyn ferrofin_traits::providers::DynamicMetadataProvider>>,
     remote_search_providers: Vec<Arc<dyn RemoteSearchProvider>>,
-    /// The item-image store (rows) + the directory uploaded images are written
-    /// to. Present enables the `save_image`/`delete_image` write paths.
+    /// The item-image store (rows) + the item-art root (`{metadata}/library`)
+    /// uploaded images are written to. Present enables the
+    /// `save_image`/`delete_image` write paths.
     image_store: Option<Arc<dyn ItemPersistenceService>>,
     metadata_dir: Option<DirectoryPath>,
     /// Where [`ProviderManager::cached_remote_image`] keeps remote images:
@@ -3386,6 +3387,18 @@ impl LocalProviderManager {
         }
     }
 
+    /// [`live_tv_image_is_internal`](ferrofin_traits::options::live_tv_image_is_internal)
+    /// over the internal metadata directory, the parent of the item-art root.
+    async fn in_metadata_directory(&self, path: &str) -> bool {
+        let Some(art_root) = self.metadata_dir.as_ref().map(DirectoryPath::resolve) else {
+            return false;
+        };
+        let Some(metadata_root) = art_root.parent() else {
+            return false;
+        };
+        ferrofin_traits::options::live_tv_image_is_internal(path, metadata_root).await
+    }
+
     /// The error for an image operation on a manager built without the
     /// item-image store / TMDB client it needs (unit tests, hosts that never
     /// wired them) — a configuration error naming the op.
@@ -4932,6 +4945,11 @@ impl ProviderManager for LocalProviderManager {
         let Some(store) = &self.image_store else {
             return Err(Self::unwired("delete_image"));
         };
+        // Read before the rows go: `live_tv` comes from the item's image rows.
+        let live_tv = match &self.items {
+            Some(items) => items.get_image_infos_to_serve(item_id).await?.live_tv,
+            None => false,
+        };
         // Remove the DB rows, then the files they pointed at (best-effort — a
         // missing file must not fail the delete).
         let paths = store
@@ -4943,6 +4961,10 @@ impl ProviderManager for LocalProviderManager {
             return Ok(());
         }
         for path in paths {
+            // `info.IsLocalFile`: a remote row has no file.
+            if !ItemImageInfo::is_local_path(&path) {
+                continue;
+            }
             // Shared files can belong to a previous metadata root. Their
             // persisted layout, not today's root, identifies shared ownership.
             if std::path::Path::new(&path)
@@ -4951,6 +4973,14 @@ impl ProviderManager for LocalProviderManager {
                 .and_then(std::path::Path::file_name)
                 .is_some_and(|name| name == SHARED_ALBUM_ARTWORK_DIR)
             {
+                continue;
+            }
+            if live_tv && !self.in_metadata_directory(&path).await {
+                tracing::warn!(
+                    item_id = %item_id,
+                    path,
+                    "left the file of a Live TV image row outside the metadata directory"
+                );
                 continue;
             }
             let _ = std::fs::remove_file(&path);

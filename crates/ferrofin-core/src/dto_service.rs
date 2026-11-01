@@ -79,9 +79,12 @@ use ferrofin_traits::error::ServiceError;
 use ferrofin_traits::library::{
     ContentPermissions, LibraryManager, MediaSourceManager, UserDataManager,
 };
-use ferrofin_traits::options::{DtoOptions, InternalItemsQuery, ItemImageInfo};
+use ferrofin_traits::options::{
+    DtoOptions, InternalItemsQuery, ItemImageInfo, live_tv_image_is_internal,
+};
 use ferrofin_traits::persistence::{ExtraCounts, ItemCountService, NameItemRow};
 use ferrofin_traits::trickplay::TrickplayManager;
+use ferrofin_util::directory_path::DirectoryPath;
 
 use crate::db_error::db_err;
 use crate::item_type_lookup::kind_from_type_name;
@@ -1318,6 +1321,9 @@ pub struct FerrofinDtoService {
     /// Expands `%MetadataPath%`/`%AppDataPath%` in adopted image rows (see
     /// [`FerrofinDtoService::with_virtual_paths`]).
     virtual_paths: VirtualPathExpander,
+    /// The internal metadata directory, the only place a Live TV item's image
+    /// file is opened from ([`primary_image_aspect_ratio`]).
+    metadata_root: Option<DirectoryPath>,
     /// The MusicBrainz root the "Links" row points music items at — the
     /// configured mirror, as C# uses `Plugin.Instance.Configuration.Server`.
     musicbrainz_server: String,
@@ -1378,11 +1384,21 @@ impl FerrofinDtoService {
             chapters,
             trickplay,
             virtual_paths: VirtualPathExpander::identity(),
+            metadata_root: None,
             musicbrainz_server: ferrofin_providers::musicbrainz::DEFAULT_BASE_URL.to_owned(),
             live_tv: Arc::new(OnceLock::new()),
             localization: None,
             configuration: None,
         }
+    }
+
+    /// Installs the internal metadata directory, the only place a Live TV
+    /// item's image file is opened from. Called once by the composition root;
+    /// without it no such file is opened.
+    #[must_use]
+    pub fn with_metadata_root(mut self, metadata_root: impl Into<DirectoryPath>) -> Self {
+        self.metadata_root = Some(metadata_root.into());
+        self
     }
 
     /// Installs the server configuration whose `PathSubstitutions` map the
@@ -1834,7 +1850,14 @@ impl FerrofinDtoService {
         kind: BaseItemKind,
         images: &[ItemImageInfo],
     ) -> Option<f64> {
-        primary_image_aspect_ratio(self.image_processor.as_ref(), item_id, kind, images).await
+        primary_image_aspect_ratio(
+            self.image_processor.as_ref(),
+            self.metadata_root.as_ref(),
+            item_id,
+            kind,
+            images,
+        )
+        .await
     }
 
     /// Computes the cache tag of one image of the item at `item_path` (its
@@ -3842,8 +3865,13 @@ fn to_trickplay_dto(
 /// dimensions cannot be read (`Series` 2/3, `BaseItem` 0 — emitted as `0`, as
 /// upstream does); else width / height. Shared with the search hints, which
 /// upstream fill through the same `IDtoService` call.
+///
+/// A Live TV item's row with no stored size is probed only from `metadata_root`
+/// ([`live_tv_image_is_internal`]). Any other file counts as unreadable, so a
+/// row reveals nothing of the file it names. Upstream opens it.
 pub(crate) async fn primary_image_aspect_ratio(
     processor: &dyn ImageProcessor,
+    metadata_root: Option<&DirectoryPath>,
     item_id: Uuid,
     kind: BaseItemKind,
     images: &[ItemImageInfo],
@@ -3851,6 +3879,16 @@ pub(crate) async fn primary_image_aspect_ratio(
     let primary = images.iter().find(|i| i.image_type == ImageType::Primary)?;
     if !primary.is_local_file() {
         return Some(kinds::default_primary_image_aspect_ratio(kind));
+    }
+    let probes_the_file = primary.width <= 0 || primary.height <= 0;
+    if probes_the_file && (is_live_tv_channel(kind) || is_live_tv_program(kind)) {
+        let internal = match metadata_root {
+            Some(root) => live_tv_image_is_internal(&primary.path, &root.resolve()).await,
+            None => false,
+        };
+        if !internal {
+            return Some(kinds::default_primary_image_aspect_ratio(kind));
+        }
     }
     match processor.get_item_image_dimensions(item_id, primary).await {
         Ok(dim) if dim.width > 0 && dim.height > 0 => {

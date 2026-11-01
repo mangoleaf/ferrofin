@@ -4289,7 +4289,7 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         let disc = image_type_to_disc(image_type);
         // Select and remove one slot atomically on the writer. Insertion order
         // matches get_image_infos, and RETURNING names only the deleted file.
-        sqlx::query_scalar(
+        let paths: Vec<String> = sqlx::query_scalar(
             r#"DELETE FROM "BaseItemImageInfos" WHERE "Id" = (
                 SELECT "Id" FROM "BaseItemImageInfos"
                 WHERE "ItemId" = ?1 AND "ImageType" = ?2
@@ -4301,7 +4301,13 @@ impl ItemPersistenceService for FerrofinItemPersistenceService {
         .bind(index)
         .fetch_all(self.db.writer())
         .await
-        .map_err(db_err)
+        .map_err(db_err)?;
+        // `BaseItemRepository.Map`'s `ExpandVirtualPath`: an adopted row names
+        // its file by `%MetadataPath%`, and the caller deletes that file.
+        Ok(paths
+            .iter()
+            .map(|path| self.virtual_paths.expand(path))
+            .collect())
     }
 
     async fn reattach_user_data(&self, item: &BaseItemEntity) -> Result<(), ServiceError> {

@@ -1074,8 +1074,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    PrimaryImageTag); image serving and processing are compared per \
                    operation, apart from the Live TV artwork rule below (ferrofin-livetv \
                    projection.rs is_artwork_url, channel_images_update, \
-                   program_images_update, manager.rs add_provider_metadata; handlers/images.rs \
-                   live_tv_image_is_servable). ferrofin-drawing processor.rs \
+                   program_images_update, manager.rs add_provider_metadata; ferrofin-traits \
+                   item_image_info.rs live_tv_image_is_internal, read by handlers/images.rs \
+                   live_tv_image_is_servable, ferrofin-providers provider_manager.rs \
+                   delete_image and ferrofin-core dto_service.rs primary_image_aspect_ratio \
+                   and dynamic_images.rs local_images). ferrofin-drawing processor.rs \
                    get_image_cache_tag (the owning \
                    item's path, null as empty) and get_image_cache_tag_for_path (md5 of the \
                    UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
@@ -1088,10 +1091,14 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    (the profile image's own path). Item paths as item_repository.rs mapped \
                    reads them (BaseItemMapper.Map's ExpandVirtualPath). Compared with \
                    Emby.Server.Implementations/Dto/DtoService.cs (GetImageCacheTag, \
+                   GetPrimaryImageAspectRatio, \
                    GetTagAndFillBlurhash, AddInheritedImages, AttachPeople), \
                    Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
                    Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
                    Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
+                   MediaBrowser.Controller/Entities/BaseItem.cs (DeleteImageAsync), \
+                   Emby.Server.Implementations/Images/BaseDynamicImageProvider.cs \
+                   (GetStripCollageImagePaths), \
                    src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag), \
                    src/Jellyfin.LiveTv/Guide/GuideManager.cs (GetChannel, UpdateImage), \
                    MediaBrowser.Controller/Entities/BaseItemExtensions.cs (SetImagePath) and \
@@ -1105,6 +1112,12 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              channel's or programme's stored row that is neither a URL nor a file in the \
              internal metadata directory is neither served nor listed. Upstream's SetImagePath \
              also accepts a local file path there. Jellyfin bug not ported.",
+            "The other uses of such a stored row stop at the same directory. DELETE removes the \
+             row and leaves the file, where DeleteImageAsync deletes any local file. A Primary \
+             with no stored size reports the kind's default PrimaryImageAspectRatio, as a file \
+             that cannot be read does, where GetPrimaryImageAspectRatio opens it. A collage \
+             skips it, where GetStripCollageImagePaths draws any local file. Same Jellyfin bug \
+             as the entry above, not ported.",
         ],
     },
     VerifiedSubsystem {
