@@ -1220,9 +1220,9 @@ async fn get_playback_info(
         ..PlaybackRequest::default()
     };
     let client = super::system::context_from_parts(&state, &parts);
-    Ok(Json(
-        playback_info(&state, &auth, &client, item_id, request).await?,
-    ))
+    let mut response = playback_info(&state, &auth, &client, item_id, request).await?;
+    hide_live_source_urls(&state, &auth, &mut response.media_sources).await?;
+    Ok(Json(response))
 }
 
 /// The `POST /Items/{itemId}/PlaybackInfo` body — the client's device profile,
@@ -1366,9 +1366,9 @@ async fn post_playback_info(
         flags: flags_from(&query, Some(&body)),
     };
     let client = super::system::context_from_parts(&state, &parts);
-    Ok(Json(
-        playback_info(&state, &auth, &client, item_id, request).await?,
-    ))
+    let mut response = playback_info(&state, &auth, &client, item_id, request).await?;
+    hide_live_source_urls(&state, &auth, &mut response.media_sources).await?;
+    Ok(Json(response))
 }
 
 /// Query parameters for `POST /LiveStreams/Open`.
@@ -1505,8 +1505,40 @@ async fn open_live_stream(
     let effective = effective_user_id(&state, &auth, query.user_id.or(dto.user_id)).await?;
     let request = live_stream_request(query, dto, effective);
     let client = super::system::context_from_parts(&state, &parts);
-    let media_source = open_media_source(&state, &auth, &client, &request).await?;
+    let mut media_source = open_media_source(&state, &auth, &client, &request).await?;
+    hide_live_source_urls(&state, &auth, std::slice::from_mut(&mut media_source)).await?;
     Ok(Json(LiveStreamResponse::new(media_source)))
+}
+
+/// Blanks, for a caller who is not an administrator, the `Path` of each Live
+/// TV source that is still to be opened (`RequiresOpening`). A client never
+/// plays such a source from its `Path`: it redeems the `OpenToken` through
+/// `POST /LiveStreams/Open` (or `AutoOpenLiveStream`) and plays the source
+/// that comes back.
+///
+/// That `Path` is the tuner's upstream channel URL, and an IPTV service's
+/// usually carries the account's user name and password
+/// (`http://host/live/USER/PASS/1.ts`). Upstream hands it to every user with
+/// Live TV access; this follows the owner decision behind the `livetv`
+/// configuration blanking. An opened source keeps its `Path`: it is the
+/// server's own `LiveStreamFiles` URL, or the URL a direct-playing client
+/// fetches itself.
+async fn hide_live_source_urls(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    sources: &mut [MediaSourceInfo],
+) -> Result<(), ApiError> {
+    let hidden = |source: &MediaSourceInfo| {
+        source.requires_opening
+            && source.protocol == ferrofin_model::media_info::MediaProtocol::Http
+    };
+    if !sources.iter().any(hidden) || crate::auth::is_administrator_identity(state, auth).await? {
+        return Ok(());
+    }
+    for source in sources.iter_mut().filter(|source| hidden(source)) {
+        source.path = Some(String::new());
+    }
+    Ok(())
 }
 
 /// Folds the query and the posted body into one [`LiveStreamRequest`].

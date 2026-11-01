@@ -1570,6 +1570,29 @@ async fn auto_open_live_stream_opens_a_source_that_requires_opening() {
     );
 }
 
+/// An unopened Live TV source's `Path` is the tuner's upstream channel URL,
+/// which for an IPTV service carries the account's credentials. A caller who
+/// is not an administrator gets it blank; the client opens the source by its
+/// `OpenToken` and plays what that returns.
+#[tokio::test]
+async fn unopened_live_source_path_is_hidden_from_a_caller_who_is_not_an_administrator() {
+    let item_id = Uuid::from_u128(0xABCD);
+    let channel = MediaSourceInfo {
+        id: Some("channel".to_owned()),
+        path: Some("http://iptv.example/live/user/secret/1.ts".to_owned()),
+        protocol: ferrofin_model::media_info::MediaProtocol::Http,
+        requires_opening: true,
+        is_infinite_stream: true,
+        open_token: Some("tok".to_owned()),
+        ..MediaSourceInfo::default()
+    };
+    let json = post_versions(item_id, versioned(vec![channel]), &serde_json::json!({})).await;
+    let source = &json["MediaSources"][0];
+    assert_eq!(source["Id"], "channel", "{json}");
+    assert_eq!(source["Path"], "", "{source}");
+    assert_eq!(source["OpenToken"], "tok", "{source}");
+}
+
 /// A [`DeviceManager`](ferrofin_traits::devices::DeviceManager) whose stored
 /// capabilities carry the web profile, recording which device was asked for.
 struct ProfileDevices {
