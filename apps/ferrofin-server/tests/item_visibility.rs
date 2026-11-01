@@ -2330,3 +2330,152 @@ async fn library_option_and_library_row_edits_reach_the_next_request() {
         "the library's tag is blocked"
     );
 }
+
+/// The names of a listing's `Playlist` rows, sorted.
+fn playlist_names(listing: &Value) -> Vec<String> {
+    let mut names: Vec<String> = listing["Items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no Items: {listing}"))
+        .iter()
+        .filter(|item| item["Type"] == "Playlist")
+        .map(|item| item["Name"].as_str().unwrap().to_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// A playlist of the fixture's visible movie, private unless `public`, as `token`.
+async fn create_playlist(f: &Fixture, token: &str, name: &str, public: bool) -> String {
+    let (status, created) = call(
+        &f.router,
+        "POST",
+        "/Playlists",
+        Some(token),
+        Some(json!({"Name": name, "Ids": [f.allowed], "IsPublic": public})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{name}: {created}");
+    created["Id"].as_str().unwrap().to_owned()
+}
+
+/// gl-831: a listing that is not limited to playlists hides the ones a user
+/// cannot see, in the SQL that pages and counts it, whichever rule shows them
+/// the others: their own, a share, open access. An administrator's mixed
+/// listing keeps Jellyfin's answer, and `/Items/Suggestions` takes Jellyfin's
+/// `IsVisible` for everyone.
+#[allow(clippy::too_many_lines)]
+#[tokio::test]
+async fn listings_hide_the_playlists_a_user_cannot_see() {
+    let f = fixture().await;
+    let private = create_playlist(&f, &f.admin, "Admin private", false).await;
+    let shared = create_playlist(&f, &f.admin, "Admin shared", false).await;
+    create_playlist(&f, &f.admin, "Admin open", true).await;
+    create_playlist(&f, &f.viewer, "Viewer own", false).await;
+    let (status, body) = call(
+        &f.router,
+        "POST",
+        &format!("/Playlists/{shared}/Users/{}", f.viewer_id),
+        Some(&f.admin),
+        Some(json!({"CanEdit": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let visible = ["Admin open", "Admin shared", "Viewer own"];
+    let viewer = format!("userId={}", f.viewer_id);
+
+    // A mixed listing, and the playlist-only one that always hid them.
+    for filter in [
+        "",
+        "&includeItemTypes=Playlist,Movie",
+        "&includeItemTypes=Playlist",
+    ] {
+        let uri = format!("/Items?{viewer}&recursive=true{filter}");
+        let (status, listing) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {listing}");
+        assert_eq!(playlist_names(&listing), visible, "{uri}");
+    }
+
+    // The count and the pages agree with the listing: two movies, three playlists.
+    let mut paged = Vec::new();
+    for start in [0, 2, 4] {
+        let uri = format!(
+            "/Items?{viewer}&recursive=true&includeItemTypes=Playlist,Movie\
+             &sortBy=SortName&limit=2&startIndex={start}&enableTotalRecordCount=true"
+        );
+        let (_, page) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+        assert_eq!(page["TotalRecordCount"], 5, "{uri}: {page}");
+        paged.extend(playlist_names(&page));
+    }
+    paged.sort();
+    assert_eq!(paged, visible);
+
+    // Library-wide search reads the same rows.
+    let uri = format!("/Search/Hints?{viewer}&searchTerm=Admin");
+    let (_, hints) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+    let mut names: Vec<&str> = hints["SearchHints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|hint| hint["Name"].as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["Admin open", "Admin shared"], "{hints}");
+
+    // Suggestions: `SuggestionsController` passes no skip, and the total stays
+    // right because the rows never reach the page.
+    for filter in ["", "&type=Playlist"] {
+        let uri = format!("/Items/Suggestions?{viewer}&enableTotalRecordCount=true{filter}");
+        let (status, listing) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {listing}");
+        assert_eq!(playlist_names(&listing), visible, "{uri}");
+    }
+    let uri =
+        format!("/Items/Suggestions?{viewer}&type=Playlist&limit=2&enableTotalRecordCount=true");
+    let (_, page) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+    assert_eq!(page["TotalRecordCount"], 3, "{page}");
+    assert_eq!(page["Items"].as_array().unwrap().len(), 2, "{page}");
+
+    // By id, the item stays out of reach.
+    let uri = format!("/Items?{viewer}&ids={private}");
+    let (status, listing) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{uri}: {listing}");
+    assert_eq!(playlist_names(&listing), Vec::<String>::new(), "{uri}");
+
+    // An administrator's mixed listing (`userId` defaults to the caller) is
+    // Jellyfin's: nothing is taken out of it…
+    let (_, listing) = call(
+        &f.router,
+        "GET",
+        "/Items?recursive=true",
+        Some(&f.admin),
+        None,
+    )
+    .await;
+    assert_eq!(
+        playlist_names(&listing),
+        ["Admin open", "Admin private", "Admin shared", "Viewer own"]
+    );
+    // …while `IsVisible` has no administrator arm, so Suggestions and the
+    // playlist-only listing leave out another user's private playlist.
+    for uri in [
+        "/Items/Suggestions",
+        "/Items?recursive=true&includeItemTypes=Playlist",
+    ] {
+        let (_, me) = call(&f.router, "GET", "/Users/Me", Some(&f.admin), None).await;
+        let separator = if uri.contains('?') { '&' } else { '?' };
+        let uri = format!("{uri}{separator}userId={}", me["Id"].as_str().unwrap());
+        let (_, listing) = call(&f.router, "GET", &uri, Some(&f.admin), None).await;
+        assert_eq!(
+            playlist_names(&listing),
+            ["Admin open", "Admin private", "Admin shared"],
+            "{uri}"
+        );
+    }
+
+    // A user no playlist names sees what is open to everyone.
+    create_user(&f.router, &f.admin, "plain", "plain-pw").await;
+    let (plain, plain_id) = login(&f.router, "plain", "plain-pw").await;
+    let uri = format!("/Items?userId={plain_id}&recursive=true");
+    let (_, listing) = call(&f.router, "GET", &uri, Some(&plain), None).await;
+    assert_eq!(playlist_names(&listing), ["Admin open"], "{uri}: {listing}");
+}
