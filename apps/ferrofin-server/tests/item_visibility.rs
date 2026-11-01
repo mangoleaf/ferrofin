@@ -1824,7 +1824,8 @@ fn scope_routes(id: &str, viewer_id: &str) -> Vec<String> {
     routes
 }
 
-// Divergence (owner decision 2026-10-31, gl-1091): see `require_scope_visible`.
+// Divergence (owner decisions 2026-10-31 and 2026-11-01, gl-1091, gl-1136): see
+// `require_scope_visible`.
 #[tokio::test]
 async fn a_scope_inside_a_library_the_user_cannot_open_lists_nothing() {
     let f = fixture().await;
