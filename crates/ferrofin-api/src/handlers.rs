@@ -2161,6 +2161,26 @@ pub const VERIFIED: &[Verified] = &[
         refs: &[],
     },
     Verified {
+        method: "post",
+        path: "/System/Restart",
+        upstream_file: "Jellyfin.Api/Controllers/SystemController.cs",
+        upstream_method: "RestartApplication",
+        ferrofin: "handlers/system.rs restart_application (auth.rs RequireAdmin) → ferrofin-core \
+               system_manager.rs restart → apps/ferrofin-server state.rs \
+               FerrofinLifecycleController stop, lib.rs announce_shutdown",
+        date: "2026-11-01",
+        divergences: &[
+            "Stricter than upstream by owner decision (gl-1103), not a gap to port: an \
+         administrator or API key is required whatever the source address, as on \
+         /System/Shutdown. Upstream's LocalAccessOrRequiresElevation also admits any caller \
+         on the local network, with or without a token; here that caller gets 401 without \
+         a token and 403 without the administrator role.",
+            "Connected clients get ServerShuttingDown; upstream pushes ServerRestarting for a \
+         restart. Fix path: gl-1123.",
+        ],
+        refs: &[],
+    },
+    Verified {
         method: "get",
         path: "/FallbackFont/Fonts",
         upstream_file: "Jellyfin.Api/Controllers/SubtitleController.cs",

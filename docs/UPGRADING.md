@@ -8,6 +8,12 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Restarting the server needs an administrator
+
+`POST /System/Restart` now requires an administrator or an API key from every address, as
+`POST /System/Shutdown` always has. An ordinary account on the local network could use it
+before and now gets a `403`, so a script that restarts the server with one needs an API key.
+
 ## Image limits
 
 Decoding and resizing images are now bounded, and the bounds are settings
