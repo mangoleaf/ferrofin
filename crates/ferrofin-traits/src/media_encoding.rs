@@ -282,6 +282,10 @@ pub trait TrickplayFrameExtractor: Send + Sync {
 /// so an anamorphic source has to be un-stretched from its aspect ratio first.
 /// Without it the extractor can only take the software path.
 #[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent switches, each a setting of its own"
+)]
 pub struct TrickplayExtraction<'a> {
     /// The source media path.
     pub input_path: &'a str,
@@ -316,6 +320,11 @@ pub struct TrickplayExtraction<'a> {
     /// only. Most of the speedup, and the one thing that can fail on a file
     /// with a broken keyframe index; the extractor retries without it.
     pub keyframe_only: bool,
+    /// `FERROFIN_TRICKPLAY_FULL_CHROMA`: write 4:4:4 frames on the software
+    /// path (`build_trickplay_args`). A job on the hardware path keeps its
+    /// chain's 4:2:0. So does one whose source the GPU cannot decode, which
+    /// could be 4:4:4: that is open work (gl-1132).
+    pub full_chroma: bool,
 }
 
 /// Compile-time assertion that [`TrickplayFrameExtractor`] is object-safe.

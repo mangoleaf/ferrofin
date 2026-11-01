@@ -46,6 +46,12 @@
 //!   `fps=` for an interlaced source; `setpts`, `fps=`, scale otherwise) rather
 //!   than through `sw_vid_filter_chain` and `video_processing_filter_args`, so
 //!   it keeps the `dar`-aware scale expression above. The order is upstream's.
+//! - With `TrickplayExtraction::full_chroma`, the software graph holds frames
+//!   at 4:4:4 from the scale on (`format=yuvj444p`), by owner decision. With it
+//!   off the graph has no format filter, where upstream's chain ends in
+//!   `format=yuv420p`. The hardware path stays 4:2:0. So does a job on it whose
+//!   source the GPU cannot decode, which could be 4:4:4: that is open work
+//!   (gl-1132).
 //! - The C# creates the temp output directory itself; here the caller owns the
 //!   output directory (the trickplay manager passes a temp dir and cleans it
 //!   up), so the extractor only creates and fills it.
@@ -235,6 +241,11 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
 /// `IsDeinterlaceAvailable`). It goes ahead of the scale, and the sampling
 /// `fps=` (with `setpts` in front) then moves to the end, behind it, as
 /// `GetVideoProcessingFilterParam` places it (PR 17058).
+///
+/// `full_chroma` has no upstream counterpart: it holds the frame at 4:4:4 from
+/// the scale on (`FERROFIN_TRICKPLAY_FULL_CHROMA`). A 16x16 chroma block is
+/// about 5% of a 320px thumbnail wide, and frames are only the input to the
+/// tile, so subsampling them is loss the tile can never win back.
 #[must_use]
 #[allow(
     clippy::too_many_arguments,
@@ -253,6 +264,7 @@ pub fn build_trickplay_args(
     pts_frame_rate: Option<f32>,
     map_index: Option<i32>,
     deinterlace: Option<&str>,
+    full_chroma: bool,
 ) -> String {
     // ffmpeg qscale is 1 (best) – 31 (worst); C# clamps the configured value.
     let qscale = qscale.clamp(1, 31);
@@ -272,7 +284,11 @@ pub fn build_trickplay_args(
     let setpts = pts_frame_rate.map(pts_normalizer).unwrap_or_default();
     let map = map_argument(map_index);
     let sample = format!("{setpts}fps=1000/{interval_ms}");
-    let scale = format!("scale=trunc(min(max(iw\\,ih*dar)\\,{max_width})/2)*2:trunc(ow/dar/2)*2");
+    let mut scale =
+        format!("scale=trunc(min(max(iw\\,ih*dar)\\,{max_width})/2)*2:trunc(ow/dar/2)*2");
+    if full_chroma {
+        scale.push_str(",format=yuvj444p");
+    }
     let filters = match deinterlace {
         Some(deinterlace) => format!("{deinterlace},{scale},{sample}"),
         None => format!("{sample},{scale}"),
@@ -898,6 +914,7 @@ impl<T: Transcoder> TrickplayFrameExtractorImpl<T> {
                 pts_frame_rate,
                 map_index,
                 deinterlace,
+                request.full_chroma,
             ),
             env: Vec::new(),
             hardware: false,
@@ -1141,6 +1158,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         assert_eq!(
             args,
@@ -1169,6 +1187,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         let tokens = crate::encoder::split_args(&args).unwrap();
         let i = tokens.iter().position(|a| a == "-i").unwrap();
@@ -1183,26 +1202,104 @@ mod tests {
         // or not hardware is in play, so a job that dropped to software
         // because its accelerator cannot skip keyframes still skips them here.
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, true, None, None, None,
+            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, true, None, None, None, false,
         );
         assert!(
             args.starts_with("-loglevel error -skip_frame nokey -threads 1 -i "),
             "{args}"
         );
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, false, None, None, None,
+            "/m/v.mkv", 10_000, 320, 4, 1, "o", None, false, None, None, None, false,
         );
         assert!(!args.contains("-skip_frame"), "{args}");
+    }
+
+    /// 4:4:4 frames come straight off the scale, so nothing downstream ever
+    /// holds subsampled chroma, whichever side of it the sampler sits.
+    #[rstest::rstest]
+    #[case::progressive(
+        None,
+        "fps=1000/10000,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2,format=yuvj444p"
+    )]
+    #[case::interlaced(
+        Some("yadif=0:-1:0"),
+        "yadif=0:-1:0,scale=trunc(min(max(iw\\,ih*dar)\\,320)/2)*2:trunc(ow/dar/2)*2,format=yuvj444p,fps=1000/10000"
+    )]
+    fn full_chroma_asks_for_444_right_after_the_scale(
+        #[case] deinterlace: Option<&str>,
+        #[case] filters: &str,
+    ) {
+        let args = build_trickplay_args(
+            "/m/v.mkv",
+            10_000,
+            320,
+            4,
+            1,
+            "/tmp/out/%08d.jpg",
+            Some(FfmpegVersion::with_build(7, 0, 1)),
+            false,
+            None,
+            None,
+            deinterlace,
+            true,
+        );
+        assert!(args.contains(&format!("-vf \"{filters}\"")), "{args}");
+    }
+
+    /// Off adds no format filter, so the frame is whatever ffmpeg negotiates:
+    /// 4:2:0 for a 4:2:0 source.
+    #[test]
+    fn jellyfin_chroma_leaves_the_format_to_ffmpeg() {
+        let args = build_trickplay_args(
+            "/m/v.mkv",
+            10_000,
+            320,
+            4,
+            1,
+            "/tmp/out/%08d.jpg",
+            Some(FfmpegVersion::with_build(7, 0, 1)),
+            false,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(!args.contains("format="), "{args}");
+    }
+
+    /// The request's chroma reaches the software run ffmpeg is given.
+    #[tokio::test]
+    async fn full_chroma_reaches_the_software_run() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out = tmp.path().join("frames");
+        let transcoder = Arc::new(RecordingTranscoder::new(1, ""));
+        let extractor = TrickplayFrameExtractorImpl::new(Arc::clone(&transcoder), "ffmpeg", None);
+        let out_dir = out.to_string_lossy();
+        let req = ferrofin_traits::media_encoding::TrickplayExtraction {
+            full_chroma: true,
+            ..request("/m/v.mkv", &out_dir)
+        };
+
+        extractor
+            .extract_trickplay_frames(&req)
+            .await
+            .expect("frames");
+
+        assert!(
+            transcoder.recorded()[0].contains(",format=yuvj444p"),
+            "{:?}",
+            transcoder.recorded()
+        );
     }
 
     #[test]
     fn qscale_is_clamped_to_ffmpeg_range() {
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 0, 0, "o", None, false, None, None, None,
+            "/m/v.mkv", 10_000, 320, 0, 0, "o", None, false, None, None, None, false,
         );
         assert!(args.contains("-qscale:v 1 "), "low clamp in {args}");
         let args = build_trickplay_args(
-            "/m/v.mkv", 10_000, 320, 99, 0, "o", None, false, None, None, None,
+            "/m/v.mkv", 10_000, 320, 99, 0, "o", None, false, None, None, None, false,
         );
         assert!(args.contains("-qscale:v 31 "), "high clamp in {args}");
     }
@@ -1222,6 +1319,7 @@ mod tests {
             allow_hw_accel: false,
             enable_hw_encoding: false,
             keyframe_only: false,
+            full_chroma: false,
         }
     }
 

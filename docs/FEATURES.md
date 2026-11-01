@@ -337,8 +337,6 @@ the season's folder change asks the season providers.
   location that is missing, empty or cannot be listed (an unmounted drive or share).
 - **Artwork is downloaded only for an item that has none.** Jellyfin also downloads each
   missing image type of an item that has some, such as a backdrop beside an existing poster.
-- **Replace existing trickplay images** does nothing during a scan yet: trickplay images
-  come only from the **Generate Trickplay Images** scheduled task.
 
 ### After an upgrade or an adoption
 

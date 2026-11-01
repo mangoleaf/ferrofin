@@ -774,10 +774,15 @@ impl Default for TrickplayOptions {
             scan_behavior: TrickplayScanBehavior::NonBlocking,
             process_priority: ProcessPriorityClass::BelowNormal,
             interval: 10_000,
-            width_resolutions: vec![320],
+            // Above upstream's `[320]` and `4` by owner decision (gl-1128).
+            // jellyfin-web takes the largest width at or under 20% of the
+            // physical screen width, so 320 serves phones and 1080p screens
+            // and 640 serves 4K ones. 2 is the best `Qscale` it accepts, and
+            // the best ffmpeg gives: its default `qmin` clamps 1 to 2.
+            width_resolutions: vec![320, 640],
             tile_width: 10,
             tile_height: 10,
-            qscale: 4,
+            qscale: 2,
             jpeg_quality: 90,
             process_threads: 1,
         }
@@ -1615,10 +1620,10 @@ mod tests {
     fn trickplay_options_default() {
         let opts = TrickplayOptions::default();
         assert_eq!(opts.interval, 10_000);
-        assert_eq!(opts.width_resolutions, vec![320]);
+        assert_eq!(opts.width_resolutions, vec![320, 640]);
         assert_eq!(opts.tile_width, 10);
         assert_eq!(opts.tile_height, 10);
-        assert_eq!(opts.qscale, 4);
+        assert_eq!(opts.qscale, 2);
         assert_eq!(opts.jpeg_quality, 90);
         assert_eq!(opts.process_threads, 1);
         assert_eq!(opts.scan_behavior, TrickplayScanBehavior::NonBlocking);

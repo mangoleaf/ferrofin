@@ -87,7 +87,8 @@ pub(super) fn sample(spec: &SettingSpec) -> String {
         "log_format" => "\"text\"".to_owned(),
         "wasm_private_http_allow" => "\"*\"".to_owned(),
         _ => match spec.kind {
-            SettingKind::Bool => "true".to_owned(),
+            // Whichever a row does not default to, so the file changes something.
+            SettingKind::Bool => (spec.default != "true").to_string(),
             SettingKind::Integer { min, .. } => (min + 1).to_string(),
             SettingKind::CountOrAuto => "2".to_owned(),
             SettingKind::Text | SettingKind::Secret => "\"sample\"".to_owned(),

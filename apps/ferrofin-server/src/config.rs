@@ -177,6 +177,7 @@ struct FileConfig {
     auth_cache_ttl_secs: Option<u32>,
     row_cache_ttl_secs: Option<u32>,
     trickplay_concurrency: Option<CountOrAuto>,
+    trickplay_full_chroma: Option<bool>,
     wasm_call_timeout_secs: Option<u32>,
     wasm_memory_limit_mb: Option<u32>,
     wasm_event_queue_capacity: Option<u32>,
@@ -642,6 +643,13 @@ pub struct Config {
     /// `trickplay_concurrency` in `config.toml` (integer or `"auto"`) > auto.
     pub trickplay_concurrency: Option<u32>,
 
+    /// Whether trickplay tiles, and the software path's frames, keep full
+    /// chroma (4:4:4) rather than Jellyfin's 4:2:0. Sharper previews with fewer
+    /// colour blocks, and larger tiles. Reaches only newly generated tiles. Resolved
+    /// `FERROFIN_TRICKPLAY_FULL_CHROMA` env > `trickplay_full_chroma` in
+    /// `config.toml` > `true`.
+    pub trickplay_full_chroma: bool,
+
     /// Per-guest-call deadline for WASM plugins, in seconds. `None` = the
     /// 30 s default (`ferrofin_wasm::WasmSettings`). Resolved
     /// `FERROFIN_WASM_CALL_TIMEOUT_SECS` env > `wasm_call_timeout_secs` in
@@ -1100,6 +1108,9 @@ impl Config {
                 file.row_cache_ttl_secs,
             )?,
             trickplay_concurrency: resolve_trickplay_concurrency(env, file.trickplay_concurrency)?,
+            trickplay_full_chroma: parse_bool_var(env, "FERROFIN_TRICKPLAY_FULL_CHROMA")
+                .or(file.trickplay_full_chroma)
+                .unwrap_or(true),
             wasm_call_timeout_secs: parse_var(env, "FERROFIN_WASM_CALL_TIMEOUT_SECS")
                 .or(file.wasm_call_timeout_secs),
             wasm_memory_limit_mb: parse_var(env, "FERROFIN_WASM_MEMORY_LIMIT_MB")
@@ -1349,6 +1360,7 @@ impl Config {
             auth_cache_ttl_secs: None,
             row_cache_ttl_secs: None,
             trickplay_concurrency: None,
+            trickplay_full_chroma: true,
             wasm_call_timeout_secs: None,
             wasm_memory_limit_mb: None,
             wasm_event_queue_capacity: None,
@@ -2990,6 +3002,28 @@ mod tests {
         };
         let err = Config::load_from(cli, &FakeEnv::new()).unwrap_err();
         assert!(err.to_string().contains("at least one connection"));
+    }
+
+    /// On unless a variable or the file turns it off, the variable winning,
+    /// and a value that does not parse is ignored.
+    #[test]
+    fn trickplay_full_chroma_is_on_unless_turned_off() {
+        const VAR: &str = "FERROFIN_TRICKPLAY_FULL_CHROMA";
+        let load =
+            |cli: Cli, env: &FakeEnv| Config::load_from(cli, env).unwrap().trickplay_full_chroma;
+        assert!(load(Cli::default(), &FakeEnv::new()));
+        assert!(!load(Cli::default(), &FakeEnv::new().with(VAR, "false")));
+        assert!(load(Cli::default(), &FakeEnv::new().with(VAR, "maybe")));
+
+        let dir = tempfile::tempdir().unwrap();
+        let toml = dir.path().join("config.toml");
+        std::fs::write(&toml, "trickplay_full_chroma = false\n").unwrap();
+        let cli = || Cli {
+            config_file: Some(toml.clone()),
+            ..Cli::default()
+        };
+        assert!(!load(cli(), &FakeEnv::new()));
+        assert!(load(cli(), &FakeEnv::new().with(VAR, "on")));
     }
 
     #[test]

@@ -530,6 +530,17 @@ pub static SETTINGS: &[SettingSpec] = &[
         ..ROW
     },
     SettingSpec {
+        key: "trickplay_full_chroma",
+        env: Some("FERROFIN_TRICKPLAY_FULL_CHROMA"),
+        env_read: PARSED_BOOL,
+        kind: SettingKind::Bool,
+        default: "true",
+        description: "Keep full colour detail (4:4:4) in new trickplay images: sharper, with \
+                      fewer colour blocks, and about twice the size. Off writes Jellyfin's 4:2:0.",
+        running: |c| json!(c.trickplay_full_chroma),
+        ..ROW
+    },
+    SettingSpec {
         key: "playback_metrics_queue",
         env: Some("FERROFIN_PLAYBACK_METRICS_QUEUE"),
         env_read: PARSED_U32,
