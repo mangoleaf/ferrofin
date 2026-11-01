@@ -662,19 +662,13 @@ async fn authenticate_direct_opens_a_session_and_mints_a_token() {
 async fn unknown_user_and_wrong_password_fail_with_one_message() {
     let db = test_db().await;
     let mgr = manager(&db);
-    let user = seed_named_user(&db, Uuid::new_v4(), "bob").await;
+    let user_id = Uuid::new_v4();
+    let user = seed_named_user(&db, user_id, "bob").await;
     set_permission(&db, &user.id, PermissionKind::EnableRemoteAccess, true)
         .await
         .unwrap();
-    sqlx::query(r#"UPDATE "Users" SET "Password" = ?1 WHERE "Id" = ?2"#)
-        .bind(
-            crate::auth_providers::DefaultAuthenticationProvider::new()
-                .format_password_hash("right")
-                .await
-                .unwrap(),
-        )
-        .bind(&user.id)
-        .execute(db.pool())
+    FerrofinUserManager::new(db.clone())
+        .change_password(user_id, "right")
         .await
         .unwrap();
 
@@ -745,7 +739,18 @@ async fn refused_logins_log_their_reason() {
     assert!(matches!(refused, Err(ServiceError::Forbidden(_))));
 
     // One session allowed, and the first login holds it.
-    let capped = seed_named_user(&db, Uuid::new_v4(), "capped").await;
+    let capped_id = Uuid::new_v4();
+    let capped = seed_named_user(&db, capped_id, "capped").await;
+    FerrofinUserManager::new(db.clone())
+        .update_policy(
+            capped_id,
+            &ferrofin_model::users::UserPolicy {
+                max_active_sessions: 1,
+                ..ferrofin_model::users::UserPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
     for permission in [
         PermissionKind::EnableRemoteAccess,
         PermissionKind::EnableAllDevices,
@@ -754,11 +759,6 @@ async fn refused_logins_log_their_reason() {
             .await
             .unwrap();
     }
-    sqlx::query(r#"UPDATE "Users" SET "MaxActiveSessions" = 1 WHERE "Id" = ?1"#)
-        .bind(&capped.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
     let request = attempt("capped", "127.0.0.1");
     mgr.authenticate_new_session(&request).await.unwrap();
     let refused = mgr.authenticate_new_session(&request).await;
