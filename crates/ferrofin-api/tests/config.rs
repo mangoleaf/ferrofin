@@ -522,6 +522,14 @@ fn state_with_config(
     )
 }
 
+/// Application paths whose configuration directory is `dir`.
+fn paths_at(dir: &std::path::Path) -> StubPaths {
+    StubPaths {
+        log_dir: String::new(),
+        config_dir: dir.to_string_lossy().into_owned(),
+    }
+}
+
 /// Sends an authenticated GET and returns `(status, body-bytes)`.
 async fn get(app: AppState, uri: &str) -> (StatusCode, Vec<u8>) {
     let response = create_router(app)
@@ -1047,84 +1055,363 @@ impl ferrofin_traits::stubs::LiveTvManager for ScriptedLiveTv {
     }
 }
 
-/// Tuner URLs (an IPTV playlist's usually carries the account's user name and
-/// password) and listing-provider passwords (Schedules Direct accepts the
-/// stored hash as the credential) are blanked for a caller who is not an
-/// administrator; only the dashboard's admin pages read them. Upstream serves
-/// them to every signed-in user (owner decision 2026-10-23).
+/// Each string member of the tuner row in [`live_tv_rows`] that a caller who is
+/// not an administrator reads, with its value.
+const OPEN_TUNER_MEMBERS: [(&str, &str); 5] = [
+    ("Id", "tuner"),
+    ("Type", "m3u"),
+    ("DeviceId", "device"),
+    ("FriendlyName", "Lounge"),
+    ("Source", "m3u"),
+];
+/// Each string member of that tuner row that reads empty for that caller, with
+/// the value an administrator reads.
+const BLANKED_TUNER_MEMBERS: [(&str, &str); 2] = [
+    ("Url", "http://iptv.example/get.php?username=u&password=p"),
+    ("UserAgent", "tuner-agent"),
+];
+
+/// Each string member of the listing provider row in [`live_tv_rows`] that a
+/// caller who is not an administrator reads, with its value.
+const OPEN_PROVIDER_MEMBERS: [(&str, &str); 5] = [
+    ("Id", "provider"),
+    ("Type", "schedulesdirect"),
+    ("Country", "USA"),
+    ("MoviePrefix", "Movie: "),
+    ("PreferredLanguage", "en"),
+];
+/// Each string member of that provider row that reads empty for that caller,
+/// with the value an administrator reads.
+const BLANKED_PROVIDER_MEMBERS: [(&str, &str); 6] = [
+    ("Username", "sd-user"),
+    ("Password", "5f4dcc3b5aa765d61d8327deb882cf99"),
+    ("ListingsId", "USA-OTA-90210"),
+    ("ZipCode", "90210"),
+    ("Path", "http://iptv.example/u/p/xmltv.php"),
+    ("UserAgent", "provider-agent"),
+];
+
+/// A row of type `T` holding `members`.
+fn row<T: serde::de::DeserializeOwned>(members: &[&[(&str, &str)]]) -> T {
+    let members: serde_json::Map<_, _> = members
+        .iter()
+        .copied()
+        .flatten()
+        .map(|(name, value)| ((*name).to_owned(), (*value).into()))
+        .collect();
+    serde_json::from_value(members.into()).unwrap()
+}
+
+/// One tuner and one listing provider holding every string member.
+fn live_tv_rows() -> (
+    Vec<ferrofin_model::live_tv::TunerHostInfo>,
+    Vec<ferrofin_model::live_tv::ListingsProviderInfo>,
+) {
+    use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
+    (
+        vec![TunerHostInfo {
+            tuner_count: 2,
+            ..row(&[&OPEN_TUNER_MEMBERS, &BLANKED_TUNER_MEMBERS])
+        }],
+        vec![ListingsProviderInfo {
+            enabled_tuners: vec!["tuner".to_owned()],
+            channel_mappings: vec![ferrofin_model::dto::NameValuePair::new("1", "one")],
+            ..row(&[&OPEN_PROVIDER_MEMBERS, &BLANKED_PROVIDER_MEMBERS])
+        }],
+    )
+}
+
+/// `livetv` holds what the server needs to reach the household's IPTV and guide
+/// accounts. A caller who is not an administrator reads none of it, whole
+/// values and not just a query string: an Xtream URL carries the account in its
+/// path too, and a Schedules Direct lineup id holds the ZIP code. Only the
+/// dashboard's admin pages read these members, and upstream's plain
+/// `[Authorize]` serves them to every signed-in user.
 #[tokio::test]
 async fn live_tv_credentials_are_blanked_for_a_caller_who_is_not_an_administrator() {
-    use ferrofin_model::live_tv::{ListingsProviderInfo, TunerHostInfo};
-    let rows = || {
-        Some((
-            vec![TunerHostInfo {
-                id: Some("tuner".to_owned()),
-                url: Some("http://iptv.example/get.php?username=u&password=p".to_owned()),
-                ..TunerHostInfo::default()
-            }],
-            vec![ListingsProviderInfo {
-                id: Some("provider".to_owned()),
-                username: Some("sd-user".to_owned()),
-                password: Some("5f4dcc3b5aa765d61d8327deb882cf99".into()),
-                ..ListingsProviderInfo::default()
-            }],
-        ))
-    };
-
     let (status, body) = get(
-        full_state().with_live_tv(Arc::new(ScriptedLiveTv(rows()))),
+        full_state().with_live_tv(Arc::new(ScriptedLiveTv(Some(live_tv_rows())))),
         "/System/Configuration/livetv",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let value = json(&body);
-    assert_eq!(value["TunerHosts"][0]["Id"], "tuner");
-    assert_eq!(value["TunerHosts"][0]["Url"], "");
-    assert_eq!(value["ListingProviders"][0]["Username"], "sd-user");
-    assert_eq!(value["ListingProviders"][0]["Password"], "");
+    let tuner = &value["TunerHosts"][0];
+    for (member, expected) in OPEN_TUNER_MEMBERS {
+        assert_eq!(tuner[member], expected, "tuner {member}");
+    }
+    for (member, _) in BLANKED_TUNER_MEMBERS {
+        assert_eq!(tuner[member], "", "tuner {member}");
+    }
+    assert_eq!(tuner["TunerCount"], 2, "a number cannot carry a credential");
+    let provider = &value["ListingProviders"][0];
+    for (member, expected) in OPEN_PROVIDER_MEMBERS {
+        assert_eq!(provider[member], expected, "provider {member}");
+    }
+    for (member, _) in BLANKED_PROVIDER_MEMBERS {
+        assert_eq!(provider[member], "", "provider {member}");
+    }
+    assert_eq!(provider["EnabledTuners"], serde_json::json!(["tuner"]));
+    assert_eq!(provider["EnableAllTuners"], true);
+    assert_eq!(provider["ChannelMappings"], serde_json::json!([]));
+    for list in [
+        "NewsCategories",
+        "SportsCategories",
+        "KidsCategories",
+        "MovieCategories",
+    ] {
+        assert!(
+            !provider[list].as_array().unwrap().is_empty(),
+            "{list} stays"
+        );
+    }
 
     let (status, body) = get(
         state_with(StubPaths::default(), Arc::new(FakeAdminUsers))
-            .with_live_tv(Arc::new(ScriptedLiveTv(rows()))),
+            .with_live_tv(Arc::new(ScriptedLiveTv(Some(live_tv_rows())))),
         "/System/Configuration/livetv",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let value = json(&body);
+    for (member, expected) in BLANKED_TUNER_MEMBERS {
+        assert_eq!(value["TunerHosts"][0][member], expected, "tuner {member}");
+    }
+    for (member, expected) in BLANKED_PROVIDER_MEMBERS {
+        assert_eq!(
+            value["ListingProviders"][0][member], expected,
+            "provider {member}"
+        );
+    }
     assert_eq!(
-        value["TunerHosts"][0]["Url"],
-        "http://iptv.example/get.php?username=u&password=p"
-    );
-    assert_eq!(
-        value["ListingProviders"][0]["Password"],
-        "5f4dcc3b5aa765d61d8327deb882cf99"
+        value["ListingProviders"][0]["ChannelMappings"],
+        serde_json::json!([{"Name": "1", "Value": "one"}])
     );
 
     // The lists a dashboard save left in the stored document are blanked too,
-    // when no Live TV manager supplies its own.
+    // when no Live TV manager supplies its own, and so are the post-processor
+    // command lines the document holds itself.
     let dir = tempfile::tempdir().unwrap();
     write_named_config(
         dir.path(),
         "livetv",
-        br#"{"TunerHosts":[{"Id":"tuner","Url":"http://iptv.example/u/p"},{"Id":"bare"}],
-            "ListingProviders":[{"Id":"provider","Password":"hash"}]}"#,
+        br#"{"RecordingPath":"/recordings","MovieRecordingPath":"/recordings/movies",
+            "SeriesRecordingPath":"/recordings/series","MediaLocationsCreated":["/recordings"],
+            "RecordingPostProcessor":"/usr/local/bin/notify",
+            "RecordingPostProcessorArguments":"--token t {path}",
+            "TunerHosts":[{"Id":"tuner","Url":"http://iptv.example/u/p"},{"Id":"bare"}],
+            "ListingProviders":[{"Id":"provider","Path":"http://iptv.example/u/p/xmltv.php"}]}"#,
     );
     let (status, body) = get(
-        state_with_paths(StubPaths {
-            log_dir: String::new(),
-            config_dir: dir.path().to_string_lossy().into_owned(),
-        }),
-        "/System/Configuration/livetv",
+        state_with_paths(paths_at(dir.path())),
+        "/System/Configuration/LiveTV",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let value = json(&body);
+    assert_eq!(value["RecordingPath"], "/recordings");
+    assert_eq!(value["MovieRecordingPath"], "/recordings/movies");
+    assert_eq!(value["SeriesRecordingPath"], "/recordings/series");
+    assert_eq!(
+        value["MediaLocationsCreated"],
+        serde_json::json!(["/recordings"])
+    );
+    assert_eq!(value["RecordingPostProcessor"], "");
+    assert_eq!(value["RecordingPostProcessorArguments"], "");
     assert_eq!(value["TunerHosts"][0]["Url"], "");
     assert!(
         value["TunerHosts"][1].get("Url").is_none(),
         "absent stays absent"
     );
-    assert_eq!(value["ListingProviders"][0]["Password"], "");
+    assert_eq!(value["ListingProviders"][0]["Path"], "");
+}
+
+/// `network` holds the password `tls.rs` opens the certificate with, and the
+/// path of the file it opens. Everything else in the document stays readable,
+/// and both members stay strings: `jellyfin-sdk-kotlin` declares them non-null.
+#[tokio::test]
+async fn the_certificate_is_blanked_for_a_caller_who_is_not_an_administrator() {
+    let dir = tempfile::tempdir().unwrap();
+    write_named_config(
+        dir.path(),
+        "network",
+        br#"{"BaseUrl":"/media","EnableHttps":true,"InternalHttpsPort":8920,
+            "CertificatePath":"/etc/ferrofin/server.pfx","CertificatePassword":"pfx-password",
+            "EnableRemoteAccess":false,"KnownProxies":["10.0.0.1"],
+            "LocalNetworkSubnets":["10.0.0.0/8"],"LocalNetworkAddresses":["10.0.0.2"],
+            "PublishedServerUriBySubnet":["all=https://media.example"],
+            "RemoteIPFilter":["203.0.113.0/24"],"VirtualInterfaceNames":["veth"]}"#,
+    );
+    for uri in [
+        "/System/Configuration/network",
+        "/System/Configuration/NETWORK",
+    ] {
+        let (status, body) = get(state_with_paths(paths_at(dir.path())), uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let value = json(&body);
+        assert_eq!(value["CertificatePath"], "", "{uri}");
+        assert_eq!(value["CertificatePassword"], "", "{uri}");
+        assert_eq!(value["BaseUrl"], "/media");
+        assert_eq!(value["EnableHttps"], true);
+        assert_eq!(value["InternalHttpsPort"], 8920);
+        assert_eq!(value["EnableRemoteAccess"], false);
+        for (member, expected) in [
+            ("KnownProxies", "10.0.0.1"),
+            ("LocalNetworkSubnets", "10.0.0.0/8"),
+            ("LocalNetworkAddresses", "10.0.0.2"),
+            ("PublishedServerUriBySubnet", "all=https://media.example"),
+            ("RemoteIPFilter", "203.0.113.0/24"),
+            ("VirtualInterfaceNames", "veth"),
+        ] {
+            assert_eq!(value[member], serde_json::json!([expected]), "{member}");
+        }
+    }
+
+    let (status, body) = get(
+        admin_state_with_paths(paths_at(dir.path())),
+        "/System/Configuration/network",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(value["CertificatePath"], "/etc/ferrofin/server.pfx");
+    assert_eq!(value["CertificatePassword"], "pfx-password");
+}
+
+/// A member nobody has classified reads blank: a port that adds a field to one
+/// of these documents cannot hand it to every signed-in user by accident.
+/// Listing it in `handlers/config.rs` opens it. A number or a flag cannot carry
+/// a credential, so those stay.
+#[tokio::test]
+async fn a_member_not_listed_as_open_is_blanked_for_a_caller_who_is_not_an_administrator() {
+    let dir = tempfile::tempdir().unwrap();
+    let unlisted = r#""NewKey":"k","NewList":["k"],"NewObject":{"Key":"k"},"NewNumber":7,"NewFlag":true,"NewNull":null"#;
+    write_named_config(dir.path(), "network", format!("{{{unlisted}}}").as_bytes());
+    write_named_config(
+        dir.path(),
+        "livetv",
+        format!(
+            r#"{{{unlisted},"TunerHosts":[{{{unlisted}}}],"ListingProviders":[{{{unlisted}}}]}}"#
+        )
+        .as_bytes(),
+    );
+    let blanked = serde_json::json!({
+        "NewKey": "", "NewList": [], "NewObject": {},
+        "NewNumber": 7, "NewFlag": true, "NewNull": null,
+    });
+    let whole: serde_json::Value = serde_json::from_str(&format!("{{{unlisted}}}")).unwrap();
+
+    let reader = state_with_paths(paths_at(dir.path()));
+    let (_, network) = get(reader.clone(), "/System/Configuration/network").await;
+    assert_eq!(json(&network), blanked);
+    let (_, live_tv) = get(reader, "/System/Configuration/livetv").await;
+    let live_tv = json(&live_tv);
+    assert_eq!(live_tv["NewKey"], "");
+    assert_eq!(live_tv["TunerHosts"][0], blanked);
+    assert_eq!(live_tv["ListingProviders"][0], blanked);
+
+    let admin = admin_state_with_paths(paths_at(dir.path()));
+    let (_, network) = get(admin.clone(), "/System/Configuration/network").await;
+    assert_eq!(json(&network), whole);
+    let (_, live_tv) = get(admin, "/System/Configuration/livetv").await;
+    assert_eq!(json(&live_tv)["TunerHosts"][0], whole);
+}
+
+/// The player reads `encoding` for every viewer
+/// (`htmlVideoPlayer/plugin.js`: `EnableFallbackFont`), so the route and this
+/// document stay open to an ordinary account.
+#[tokio::test]
+async fn the_encoding_configuration_stays_open_to_a_caller_who_is_not_an_administrator() {
+    let dir = tempfile::tempdir().unwrap();
+    write_named_config(
+        dir.path(),
+        "encoding",
+        br#"{"EnableFallbackFont":true,"FallbackFontPath":"/fonts"}"#,
+    );
+    let (status, body) = get(
+        state_with_paths(paths_at(dir.path())),
+        "/System/Configuration/encoding",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value = json(&body);
+    assert_eq!(value["EnableFallbackFont"], true);
+    assert_eq!(value["FallbackFontPath"], "/fonts");
+}
+
+/// The dashboard saves a whole document it just read. An administrator reads
+/// the real values, so that round trip keeps them, and everyone else still
+/// reads them blank afterwards.
+#[tokio::test]
+async fn an_administrators_save_keeps_what_other_callers_read_blank() {
+    let dir = tempfile::tempdir().unwrap();
+    let admin = admin_state_with_paths(paths_at(dir.path()));
+    let documents = [
+        (
+            "network",
+            serde_json::json!({
+                "CertificatePath": "/etc/ferrofin/server.pfx",
+                "CertificatePassword": "pfx-password",
+            }),
+        ),
+        (
+            "livetv",
+            serde_json::json!({
+                "RecordingPostProcessorArguments": "--token t {path}",
+                "TunerHosts": [{"Id": "tuner", "Url": "http://iptv.example/u/p"}],
+                "ListingProviders": [{
+                    "Id": "provider",
+                    "Username": "sd-user",
+                    "Password": "hash",
+                    "ListingsId": "USA-OTA-90210",
+                    "ZipCode": "90210",
+                    "Path": "http://iptv.example/u/p/xmltv.php",
+                }],
+            }),
+        ),
+    ];
+    for (key, document) in &documents {
+        let uri = format!("/System/Configuration/{key}");
+        assert_eq!(
+            post(admin.clone(), &uri, document).await,
+            StatusCode::NO_CONTENT,
+            "{key}"
+        );
+        let (_, read) = get(admin.clone(), &uri).await;
+        let read = json(&read);
+        assert_eq!(
+            post(admin.clone(), &uri, &read).await,
+            StatusCode::NO_CONTENT,
+            "{key}"
+        );
+        let (_, again) = get(admin.clone(), &uri).await;
+        assert_eq!(json(&again), read, "{key} changed across the round trip");
+    }
+    let (_, network) = get(admin.clone(), "/System/Configuration/network").await;
+    let network = json(&network);
+    assert_eq!(network["CertificatePath"], "/etc/ferrofin/server.pfx");
+    assert_eq!(network["CertificatePassword"], "pfx-password");
+    let (_, live_tv) = get(admin.clone(), "/System/Configuration/livetv").await;
+    let live_tv = json(&live_tv);
+    assert_eq!(
+        live_tv["RecordingPostProcessorArguments"],
+        "--token t {path}"
+    );
+    assert_eq!(live_tv["TunerHosts"][0]["Url"], "http://iptv.example/u/p");
+    let provider = &live_tv["ListingProviders"][0];
+    assert_eq!(provider["Username"], "sd-user");
+    assert_eq!(provider["Password"], "hash");
+    assert_eq!(provider["ListingsId"], "USA-OTA-90210");
+    assert_eq!(provider["ZipCode"], "90210");
+    assert_eq!(provider["Path"], "http://iptv.example/u/p/xmltv.php");
+
+    let reader = state_with_paths(paths_at(dir.path()));
+    let (_, network) = get(reader.clone(), "/System/Configuration/network").await;
+    assert_eq!(json(&network)["CertificatePassword"], "");
+    let (_, live_tv) = get(reader, "/System/Configuration/livetv").await;
+    let live_tv = json(&live_tv);
+    assert_eq!(live_tv["TunerHosts"][0]["Url"], "");
+    assert_eq!(live_tv["ListingProviders"][0]["Password"], "");
 }
 
 #[tokio::test]
