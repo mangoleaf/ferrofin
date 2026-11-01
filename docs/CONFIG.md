@@ -1,8 +1,9 @@
 # Configuration
 
 Every runtime setting below is listed in jellyfin-web under **Dashboard → Plugins → Ferrofin →
-Settings** ([Seeing what is set](#seeing-what-is-set)). The page is read-only so far: a setting
-is changed in one of the three places below.
+Settings** ([Seeing what is set](#seeing-what-is-set)). That page edits the ones it may change and
+saves them to `config.toml` ([Editing settings from the dashboard](#editing-settings-from-the-dashboard)),
+the last of the three places below; the first two are set where the server is started.
 
 Ferrofin is configured three ways, **highest precedence first**:
 
@@ -59,9 +60,54 @@ disabled.
 
 That plugin's settings page shows the report: open it from the plugin's Settings link or the
 dashboard menu's **Ferrofin** entry. It lists the settings in groups (Paths, Network and
-identity, ffmpeg, Library and database, Observability, Metadata providers, WASM plugins), each
+identity, ffmpeg, Library and database, Observability, Metadata providers, Images, WASM plugins), each
 with its value, default, source, variable and flag, and the reason for any it may not change;
 secrets are marked as secrets. Disabling the plugin hides the page and the menu entry.
+
+### Editing settings from the dashboard
+
+The same page edits the settings it may change, and saves them to `config.toml`: the file it
+names at the top, chosen as [above](#configuration). When the server cannot write that file the
+page says so beside its name, and a save fails with a message naming it.
+
+Each editable setting has a control for its kind: a checkbox for on or off, a number box with the
+setting's limits, an **Auto** checkbox with a number box for a count that can be `auto`, a text
+box for text, a URL or a path, and a text box with its items separated by commas for a list (so a
+list here cannot hold a path with a comma in it). A secret is a plain text box, marked as a
+secret: administrators see these values.
+
+**Save** sends only the settings changed ([`POST /Ferrofin/Settings`](#saving-from-the-web)). The
+server checks them, not the browser, and a refused change shows the server's message next to the
+setting it names, or at the top of the page when it names none, such as a file that cannot be
+written. Nothing is saved then, and every edit stays on the page to correct. **Reset to default**
+marks a setting `config.toml` holds, and Save removes its key, so the default applies after the
+restart. Restarting with edits not yet saved asks first, since it drops them.
+
+Flags and variables outrank `config.toml`, so a setting one of them sets has no control. The page
+shows it locked, with a note naming the flag or variable and where that is changed. These have no
+control whatever sets them, each with its reason on the page:
+
+- the directories (`data_dir`, `config_dir`, `cache_dir`, `web_dir`): changing one from the web
+  could point the server at other files;
+- `ffmpeg_path` and `ffprobe_path`: the web may not choose an executable the server runs;
+- the first-boot seed settings (`library_roots`, `admin_user`, `admin_password`): they are used
+  only when the database is created;
+- `disable_extensions`: a measurement switch, set where a benchmark starts the server;
+- `wasm_private_http_allow`: it lets the plugins it names reach private addresses, so it is set by
+  hand in `config.toml` or its variable, and an admin session alone cannot grant it;
+- the settings jellyfin-web's own pages cover: `bind_addr`, `published_url`, `port`, `https_port`
+  and `base_url` under Dashboard → Networking, `server_name` and `enable_metrics` under
+  Dashboard → General (Networking does not drive `port`, `https_port` and `base_url` yet, so their
+  notes say to set them by hand in `config.toml`, or with their variable or flag);
+- the OpenTelemetry variables, which `config.toml` has no key for.
+
+A saved change [applies at the next restart](#when-a-change-applies). After a save the page shows
+the new value beside the one in use, marked as saved, and a **Restart now** button beside the
+pending-restart notice. It runs the in-process restart, waits for the server to answer again and
+shows the values now in effect. The settings the in-process restart keeps (`log_level`,
+`log_format`, `metrics_scan_duration_buckets`) say so on their row before and after saving, and
+the notice lists any just saved: they need a full process restart, so restart the container or
+service.
 
 ### When a change applies
 
@@ -225,6 +271,27 @@ when the server process restarts.
 
 A change applies at the next restart, the dashboard's in-process restart included.
 See [provider rate limiting](PROVIDER_RATE_LIMITING.md) for retry and cooldown policy.
+
+## Image limits
+
+What an image costs in memory depends on its dimensions, not its file size, so these bound what
+one image can cost. They cover every image Ferrofin turns into pixels: thumbnails, blur
+hashes, photos, trickplay frames, collages and the splashscreen. An image over a limit is never
+an error for a client: it gets the original file instead of a thumbnail. An image too large to
+decode also has no blur hash, and a collage or the splashscreen leaves it out. Reading an image's
+dimensions decodes nothing, so it needs no limit.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS` | `200` | The largest image Ferrofin decodes, in megapixels (width × height), clamped to `16`–`1000` (a value outside logs a warning). The file's header gives the size, so a larger image costs no memory. The `config.toml` key is `image_decode_max_megapixels`. |
+| `FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB` | `512` | The memory one decode may take, in MiB, clamped to `128`–`2048` (a value outside logs a warning). An image takes its width × height × its bytes per pixel, which is 3 for an ordinary colour photo, so the default stops those at about 178 megapixels. Each decode has its own allowance, so the most that decoded images can hold together is this times the images being worked on at once: one per CPU at most, and for thumbnails **Parallel image encoding limit** on the dashboard (`ParallelImageEncodingLimit`) when that is lower. The `config.toml` key is `image_decode_max_memory_mb`. |
+| `FERROFIN_IMAGE_RESIZE_BUDGET_MB` | `2048` | The working memory all resizes in flight share, in MiB, clamped to `256`–`16384` (a value outside logs a warning). A resize takes 16 bytes per pixel of the source's width by the output's height, whatever the file's format: a thumbnail 267 pixels tall of an image 6000 pixels wide takes about 24 MiB, and a 2160-pixel-tall view of an image 7680 pixels wide about 253 MiB. The default holds about 13000 by 10000. A resize that alone needs more serves the original file; one that fits but not beside the others waits for them. The `config.toml` key is `image_resize_budget_mb`. |
+
+Raise a limit for photos or panoramas that come back at full size. Lower them on a host with
+little memory: under a container's memory limit, keep the budget and the decode limit well below
+it, or the server can reach the limit first. At log level `debug`, a thumbnail refused names the
+image and the setting that refused it. A change applies at the next restart, the dashboard's
+in-process restart included.
 
 ## Remote metadata provider keys
 

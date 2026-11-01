@@ -69,6 +69,16 @@ pub fn create_router(state: AppState) -> Router {
     // Mount the real First-Light handlers over the (now-skipped) stub slots.
     api = handlers::register(api);
 
+    // `/health` is behind the IP filter, as `MapHealthChecks` is upstream. The
+    // probes are Ferrofin's own and are not: an orchestrator's address need not
+    // be on the list an operator keeps for clients, and a refused probe
+    // restarts the server.
+    let (health_check, health_probes) = ferrofin_health::health_routers(health_checkers);
+    let health_check = health_check.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        crate::ip_access::ip_access_layer,
+    ));
+
     let response_time_state = state.clone();
     api.layer(middleware::from_fn_with_state(
         state.clone(),
@@ -87,7 +97,8 @@ pub fn create_router(state: AppState) -> Router {
         crate::request_culture::request_culture_layer,
     ))
     .with_state(state)
-    .merge(ferrofin_health::health_router(health_checkers))
+    .merge(health_check)
+    .merge(health_probes)
     .merge(spec_router())
     // `ExceptionMiddleware`: a panic below is answered `500` instead of
     // dropping the connection. Startup runs it outside the response-time,

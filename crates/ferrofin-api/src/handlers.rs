@@ -1095,6 +1095,13 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto)",
         date: "2026-10-30",
         divergences: &[
+            "Decoding and resizing run under limits upstream does not have (owner decision \
+             2026-10-31, gl-1097), the settings image_decode_max_megapixels, \
+             image_decode_max_memory_mb and image_resize_budget_mb, because a failed allocation, \
+             which Skia reports as an exception, ends a Rust process. An image past one is \
+             served as its original file, as ImageProcessor.ProcessImage's catch-all does with \
+             any failed encode, and one too large to decode has no blur hash and is left out of \
+             a collage or the splashscreen.",
             "Timers, series timers and the new-timer defaults carry no image tags: \
              LiveTvDtoService.FillImages (the program's and the library series' Primary, Thumb \
              and Backdrop tags) is not ported. Fix path: gl-853.",
@@ -1356,6 +1363,31 @@ pub const VERIFIED: &[Verified] = &[
         date: "2026-10-30",
         divergences: SESSIONS_DIVERGENCES,
         refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/UserImage",
+        upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
+        upstream_method: "GetUserImage",
+        ferrofin: "handlers/images.rs get_user_image → serve_image_file (GetImageInternal, \
+               GetImageResult) → ferrofin-drawing processor.rs process_image \
+               (ImageProcessor.ProcessImage) → image_encoder.rs encode_image \
+               (SkiaEncoder.EncodeImage) → limits.rs ImageMemory (SkiaEncoder.Decode, GetBitmap). \
+               userId falls back to the caller, a nil result is a 400, no user or no profile \
+               image a 404, and no credentials are needed, as upstream",
+        date: "2026-10-31",
+        divergences: &[
+            "width, height, maxWidth, maxHeight, fillWidth, fillHeight, blur and quality are \
+         honoured, and a malformed one is a 400, where upstream binds only userId, tag and \
+         format and ignores them; the default quality is 100 where upstream passes 90. Fix \
+         path: gl-1114.",
+            "A request naming no transform is served the stored file without reaching the \
+         processor, where upstream calls ProcessImage and re-encodes a source format the \
+         client's output formats do not list. Fix path: gl-1114.",
+            "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: \
+         gl-666.",
+        ],
+        refs: &["images"],
     },
     Verified {
         method: "post",
