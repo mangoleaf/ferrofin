@@ -1590,10 +1590,11 @@ impl FerrofinDtoService {
     /// Every `CollectionFolder` with the paths `GetCollectionFoldersInternal`
     /// matches on. Read per page, and only when a walk runs out of parents
     /// (`needs_folders`) — on an adopted Jellyfin DB that is the common shape.
-    /// The rows come from the library set the visibility check caches
-    /// (`ferrofin_db::row_cache`) when one is live: the library mutation hooks
-    /// that keep it current are what a cache here needs, since a stale one
-    /// would show the wrong inherited images. With none cached they are read.
+    /// The rows and their stored locations come from the library set the
+    /// visibility check caches (`ferrofin_db::row_cache`) when one is live: the
+    /// library mutation hooks that keep it current are what a cache here needs,
+    /// since a stale one would show the wrong inherited images. With none
+    /// cached the rows are read and parsed.
     async fn collection_folder_locations(
         &self,
     ) -> Result<Vec<CollectionFolderLocations>, ServiceError> {
@@ -1603,41 +1604,40 @@ impl FerrofinDtoService {
             return Ok(Vec::new());
         };
         // The visibility check's cached library set (`ferrofin_db::row_cache`), when one is live:
-        // the same rows, kept current by the library mutation hooks.
-        let rows = match self.db.cached_libraries() {
-            Some(set) => set
+        // the same rows, kept current by the library mutation hooks, their locations parsed.
+        // `rating_libraries` gives every row an entry, an empty one for a library with no list.
+        if let Some(set) = self.db.cached_libraries() {
+            return Ok(set
                 .rows
                 .iter()
-                .map(|row| (row.id.clone(), row.path.clone(), row.data.clone()))
-                .collect(),
-            None => self
-                .db
-                .rows_of_type(type_name)
-                .await
-                .map_err(|e| ServiceError::Backend(e.to_string()))?,
-        };
+                .filter_map(|row| {
+                    let id = Uuid::parse_str(&row.id).ok()?;
+                    Some(CollectionFolderLocations {
+                        id,
+                        path: row.path.clone(),
+                        physical_locations: set
+                            .physical_locations
+                            .get(&id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    })
+                })
+                .collect());
+        }
+        let rows = self
+            .db
+            .rows_of_type(type_name)
+            .await
+            .map_err(|e| ServiceError::Backend(e.to_string()))?;
         Ok(rows
             .into_iter()
             .filter_map(|(id, path, data)| {
-                let id = Uuid::parse_str(&id).ok()?;
-                let physical_locations = data
-                    .as_deref()
-                    .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-                    .as_ref()
-                    .and_then(|v| v.get("PhysicalLocationsList"))
-                    .and_then(serde_json::Value::as_array)
-                    .map(|locations| {
-                        locations
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
                 Some(CollectionFolderLocations {
-                    id,
+                    id: Uuid::parse_str(&id).ok()?,
                     path,
-                    physical_locations,
+                    physical_locations: crate::item_data::stored_physical_locations(
+                        data.as_deref(),
+                    ),
                 })
             })
             .collect())
@@ -12985,6 +12985,66 @@ mod tests {
                 let on_a_page = want || row.id == guid_to_db(playlist);
                 assert_eq!(dto.can_delete, Some(on_a_page), "{what}: page DTO");
             }
+        }
+    }
+
+    /// `collection_folder_locations` takes each library's locations from the cached set, with no
+    /// parse and in their stored form, which `protected_paths` expands itself. With none cached
+    /// it reads and parses the rows (gl-1060).
+    #[tokio::test]
+    async fn collection_folders_take_their_stored_locations_from_the_cached_set() {
+        use crate::item_data::physical_location_parses;
+        let db = test_db().await;
+        db.enable_row_cache(ferrofin_db::row_cache::ROW_CACHE_TTL);
+        let library = Uuid::from_u128(0xC0);
+        crate::test_support::seed_item_with_data(
+            &db,
+            library,
+            BaseItemKind::CollectionFolder,
+            "Movies",
+            r#"{"PhysicalLocationsList":["%MetadataPath%/films","/media/films"]}"#,
+        )
+        .await;
+        let root = tempfile::tempdir().expect("tmp");
+        let paths = crate::app_paths::test_paths(root.path());
+        let metadata =
+            ferrofin_traits::system::ServerApplicationPaths::internal_metadata_path(&*paths);
+        let svc = service(db.clone())
+            .with_virtual_paths(VirtualPathExpander::from_paths(Arc::clone(&paths)));
+        let stored = ["%MetadataPath%/films", "/media/films"];
+
+        let parses = physical_location_parses();
+        let read = svc.collection_folder_locations().await.expect("read");
+        assert_eq!(physical_location_parses() - parses, 1, "nothing cached");
+        assert_eq!(read[0].physical_locations, stored);
+
+        let _ = crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            crate::test_support::item_repository_over(db.clone()),
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            "/data".to_owned(),
+        )
+        .rating_libraries()
+        .await
+        .expect("libraries");
+        assert!(db.cached_libraries().is_some(), "the set is cached");
+
+        let parses = physical_location_parses();
+        let cached = svc.collection_folder_locations().await.expect("cached");
+        assert_eq!(physical_location_parses() - parses, 0, "the set's lists");
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].id, library);
+        assert_eq!(cached[0].path, read[0].path);
+        assert_eq!(cached[0].physical_locations, stored);
+
+        let protected = svc.protected_paths().await.expect("protected");
+        assert_eq!(physical_location_parses() - parses, 0, "the set's lists");
+        for location in [
+            "%MetadataPath%/films".to_owned(),
+            format!("{metadata}/films"),
+            "/media/films".to_owned(),
+        ] {
+            assert!(protected.covers(&location), "{location}");
         }
     }
 

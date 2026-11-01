@@ -895,9 +895,6 @@ pub const VERIFIED_AGAINST_EARLIER_PIN: &[(&str, &str, &str)] = &[
     ("delete", "/Audio/{itemId}/Lyrics", "v12.2"),
     ("get", "/Audio/{itemId}/RemoteSearch/Lyrics", "v12.2"),
     ("post", "/Items/{itemId}/ContentType", "v12.2"),
-    // gl-1031: a malformed unrelated query parameter is a 400.
-    ("post", "/UserImage", "v12.2"),
-    ("delete", "/UserImage", "v12.2"),
     // gl-1027: a padded lyric extension is trimmed and saved.
     ("post", "/Audio/{itemId}/Lyrics", "v12.2"),
     // gl-1028: a whitespace-only route id is not the validation 400.
@@ -1075,7 +1072,11 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Album* and People[] tags, ImageBlurHashes' keys, Chapters[].ImageTag, \
                    search hints, GET /Items/{itemId}/Images, ChannelPrimaryImageTag, a user's \
                    PrimaryImageTag); image serving and processing are compared per \
-                   operation. ferrofin-drawing processor.rs get_image_cache_tag (the owning \
+                   operation, apart from the Live TV artwork rule below (ferrofin-livetv \
+                   projection.rs is_artwork_url, channel_images_update, \
+                   program_images_update, manager.rs add_provider_metadata; handlers/images.rs \
+                   live_tv_image_is_servable). ferrofin-drawing processor.rs \
+                   get_image_cache_tag (the owning \
                    item's path, null as empty) and get_image_cache_tag_for_path (md5 of the \
                    UTF-16 path + DateModified ticks, as a .NET Guid \"N\") ← ferrofin-core \
                    dto_service.rs image_tag, tag_and_fill_blur_hash (attach_images, \
@@ -1091,9 +1092,15 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    Jellyfin.Server.Implementations/Item/ChapterRepository.cs (Map), \
                    Jellyfin.Api/Controllers/ImageController.cs (GetItemImageInfos), \
                    Jellyfin.Api/Controllers/SearchController.cs (GetSearchHintResult), \
-                   src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag) and \
-                   Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto)",
-        date: "2026-10-30",
+                   src/Jellyfin.LiveTv/LiveTvDtoService.cs (GetImageTag), \
+                   src/Jellyfin.LiveTv/Guide/GuideManager.cs (GetChannel, UpdateImage), \
+                   MediaBrowser.Controller/Entities/BaseItemExtensions.cs (SetImagePath) and \
+                   Jellyfin.Server.Implementations/Users/UserManager.cs (GetUserDto). Also the \
+                   download of a remote image: ferrofin-providers image_download.rs \
+                   open_image, provider_manager.rs cached_remote_image, compared with \
+                   MediaBrowser.Providers/Manager/ProviderManager.cs (SaveImage) and \
+                   Emby.Server.Implementations/Library/LibraryManager.cs (ConvertImageToLocal)",
+        date: "2026-10-31",
         divergences: &[
             "Decoding and resizing run under limits upstream does not have (owner decision \
              2026-10-31, gl-1097), the settings image_decode_max_megapixels, \
@@ -1102,9 +1109,32 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
              served as its original file, as ImageProcessor.ProcessImage's catch-all does with \
              any failed encode, and one too large to decode has no blur hash and is left out of \
              a collage or the splashscreen.",
+            "A remote image is downloaded under a limit upstream does not have (owner decision \
+             2026-10-31, gl-1095), the setting image_download_max_mb: ProviderManager.SaveImage \
+             reads any body into memory. Past the limit it is refused and the read stops. \
+             cached_remote_image streams to a file, so it holds no body in memory. As upstream, \
+             one request at a time downloads a URL (_imageSaveLock, around cached_remote_image \
+             and save_image_from_url), but its 10 s memory cache of the bytes is not ported: an \
+             image request has the file instead, and a second save of a URL downloads it again.",
+            "A remote image's first bytes must be an image whatever the response declares \
+             (owner decision 2026-10-31, gl-1095), where SaveImage trusts any image/* type: the \
+             first file stored for a URL or an item stays there. The formats are listed in \
+             image_download.rs is_image, with SVG and tvheadend's untyped /imagecache/ URLs \
+             allowed.",
+            "A row whose URLs all gave no image stays, and each URL is left alone for \
+             image_negative_cache_ttl_secs (owner decision 2026-10-31, gl-1095), where \
+             LibraryManager.ConvertImageToLocal's removeOnFailure removes the row, for the same \
+             reason, so that a refresh must bring it back. The same answers count: a 404, a 403 \
+             and a non-image, plus a body past the limit or failing the content check. Any \
+             other failure throws there and moves on to the next URL here, and neither removes \
+             the row or remembers the URL.",
             "Timers, series timers and the new-timer defaults carry no image tags: \
              LiveTvDtoService.FillImages (the program's and the library series' Primary, Thumb \
              and Backdrop tags) is not ported. Fix path: gl-853.",
+            "A tuner's or guide's artwork is kept only as an absolute http or https URL, and a \
+             channel's or programme's stored row that is neither a URL nor a file in the \
+             internal metadata directory is neither served nor listed. Upstream's SetImagePath \
+             also accepts a local file path there. Jellyfin bug not ported.",
         ],
     },
     VerifiedSubsystem {
@@ -1369,21 +1399,23 @@ pub const VERIFIED: &[Verified] = &[
         path: "/UserImage",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "GetUserImage",
-        ferrofin: "handlers/images.rs get_user_image → serve_image_file (GetImageInternal, \
+        ferrofin: "handlers/images.rs get_user_image (UserImageQuery; ImageQuery::tagged, \
+               no sizes and quality 90) → serve_image_file (GetImageInternal, \
                GetImageResult) → ferrofin-drawing processor.rs process_image \
                (ImageProcessor.ProcessImage) → image_encoder.rs encode_image \
                (SkiaEncoder.EncodeImage) → limits.rs ImageMemory (SkiaEncoder.Decode, GetBitmap). \
-               userId falls back to the caller, a nil result is a 400, no user or no profile \
-               image a 404, and no credentials are needed, as upstream",
+               Only userId, tag and format are bound, so a size or a quality has no effect \
+               and a malformed one is no 400; every request reaches the processor. userId \
+               falls back to the caller, a nil result is a 400, no user or no profile image \
+               a 404, and no credentials are needed, as upstream. The hidden \
+               get_user_image_legacy and get_user_image_by_index_legacy \
+               (LegacyUserImageQuery; GetUserImageLegacy, GetUserImageByIndexLegacy) take \
+               userId from the route and bind every member those actions declare, then pass \
+               on only tag and format: measured on 12.4, a malformed size, quality, blur, \
+               percentPlayed or unplayedCount is a 400 there, a valid one has no effect, and \
+               imageIndex is a query member only on the form with no index in its route",
         date: "2026-10-31",
         divergences: &[
-            "width, height, maxWidth, maxHeight, fillWidth, fillHeight, blur and quality are \
-         honoured, and a malformed one is a 400, where upstream binds only userId, tag and \
-         format and ignores them; the default quality is 100 where upstream passes 90. Fix \
-         path: gl-1114.",
-            "A request naming no transform is served the stored file without reaching the \
-         processor, where upstream calls ProcessImage and re-encodes a source format the \
-         client's output formats do not list. Fix path: gl-1114.",
             "The 400 and 404 bodies are Ferrofin's error shape, not upstream's. Fix path: \
          gl-666.",
         ],
@@ -1394,12 +1426,15 @@ pub const VERIFIED: &[Verified] = &[
         path: "/UserImage",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "PostUserImage",
-        ferrofin: "handlers/images.rs post_user_image → handlers/items.rs resolve_user, \
-               handlers/users.rs assert_can_update_user, handlers/image_upload.rs \
-               (try_get_image_extension_from_content_type → ferrofin-model mime_types.rs \
-               to_extension, decode_base64) → ferrofin-core user_manager.rs \
-               save_profile_image",
-        date: "2026-10-24",
+        ferrofin: "handlers/images.rs post_user_image (UserIdQuery, userId alone) → \
+               handlers/items.rs resolve_user, handlers/users.rs assert_can_update_user, \
+               handlers/image_upload.rs (try_get_image_extension_from_content_type → \
+               ferrofin-model mime_types.rs to_extension, decode_base64) → ferrofin-core \
+               user_manager.rs save_profile_image. The hidden post_user_image_legacy and \
+               post_user_image_by_index_legacy (PostUserImageLegacy, \
+               PostUserImageByIndexLegacy) take userId from the route and bind no query \
+               member, measured on 12.4",
+        date: "2026-10-31",
         divergences: &[
             "The body is decoded in full before anything is written, so a body the decoder \
          rejects is a 400 that changes nothing. Upstream clears the old profile image row \
@@ -1418,6 +1453,11 @@ pub const VERIFIED: &[Verified] = &[
          cap) is a 413; upstream's ExceptionMiddleware maps no BadHttpRequestException, so \
          Kestrel's \"request body too large\" reaches the client as a plain-text 500. \
          Jellyfin bug not ported.",
+            "The 400 (a nil effective user, a Content-Type that is not an image type, a body \
+         that is not base64, a username outside the users directory, or a value the query \
+         binder cannot convert), 403 (another user's id without the administrator role, or \
+         a user without EnableUserPreferenceAccess) and 404 (no such user) bodies are \
+         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1426,11 +1466,20 @@ pub const VERIFIED: &[Verified] = &[
         path: "/UserImage",
         upstream_file: "Jellyfin.Api/Controllers/ImageController.cs",
         upstream_method: "DeleteUserImage",
-        ferrofin: "handlers/images.rs delete_user_image → handlers/items.rs resolve_user, \
-               handlers/users.rs assert_can_update_user → ferrofin-core user_manager.rs \
-               clear_profile_image",
-        date: "2026-10-20",
-        divergences: &[],
+        ferrofin: "handlers/images.rs delete_user_image (UserIdQuery, userId alone) → \
+               handlers/items.rs resolve_user, handlers/users.rs assert_can_update_user → \
+               ferrofin-core user_manager.rs clear_profile_image. The hidden \
+               delete_user_image_legacy (DeleteUserImageLegacy) and \
+               delete_user_image_by_index_legacy (DeleteUserImageByIndexLegacy) take userId \
+               from the route; the first binds its one query member, int? index, and drops \
+               it, so ?index=x is a 400 there, and the second binds none, measured on 12.4",
+        date: "2026-10-31",
+        divergences: &[
+            "The 400 (a nil effective user, or a value the query binder cannot convert), 403 \
+         (another user's id without the administrator role, or a user without \
+         EnableUserPreferenceAccess) and 404 (no such user) bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+        ],
         refs: &[],
     },
     Verified {
@@ -2260,7 +2309,8 @@ pub const VERIFIED: &[Verified] = &[
         upstream_method: "GetLatestMedia",
         ferrofin: "handlers/user_library.rs get_latest_media → ferrofin-core \
                user_view_manager.rs get_latest_items, items_for_latest_items, latest_parents \
-               (UserViewManager.GetItemsForLatestItems)",
+               (UserViewManager.GetItemsForLatestItems, LibraryManager.GetLatestItemList, \
+               SetTopParentIdsOrAncestors)",
         date: "2026-10-31",
         divergences: &[
             "A grouped request whose parents carry no collection type (a mixed library) takes \
@@ -2269,12 +2319,6 @@ pub const VERIFIED: &[Verified] = &[
             "The plain query over-fetches 10.11.8's limit * 5 where v12 fetches limit * 2, so \
          a request answered by it can reach containers upstream's cut leaves out. Fix path: \
          gl-303.",
-            "A UserView parent reports no collection type, so a grouped movies or TV view is \
-         neither narrowed to Movie or Episode nor short-circuited, where upstream reads \
-         UserView.CollectionType. Fix path: gl-1108.",
-            "The playlists folder sorts among the libraries, where upstream appends it after \
-         them, so it can be an unscoped grouped request's first typed parent, which then \
-         takes the plain query. Fix path: gl-1110.",
             "A Channel parent answers empty: upstream's channel manager reads plugin channels, \
          and Ferrofin has none (native .NET plugin loading is out of scope).",
             "The 400 (an API key with no userId, or a value the query binder cannot convert), \

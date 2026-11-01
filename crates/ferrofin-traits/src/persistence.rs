@@ -540,19 +540,22 @@ pub trait ItemRepository: Send + Sync {
         Ok(map)
     }
 
-    /// [`Self::get_image_infos`] in the same read as whether the item's images
-    /// are auto-oriented when served: `ImageProcessor.ProcessImage`'s
-    /// `autoOrient`, true for a `Photo` whose stored orientation is unknown or
-    /// not `TopLeft`. The default reads the rows and orients nothing.
+    /// [`Self::get_image_infos`] in the same read as what the item's owner
+    /// decides about serving them. The default reads the rows alone: nothing
+    /// oriented, no Live TV owner, so a repository that stores Live TV items
+    /// must override it.
     ///
     /// # Errors
     ///
     /// [`ServiceError`] on a storage failure.
-    async fn get_image_infos_with_auto_orient(
+    async fn get_image_infos_to_serve(
         &self,
         item_id: Uuid,
-    ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
-        Ok((self.get_image_infos(item_id).await?, false))
+    ) -> Result<crate::options::ItemImagesToServe, ServiceError> {
+        Ok(crate::options::ItemImagesToServe {
+            images: self.get_image_infos(item_id).await?,
+            ..Default::default()
+        })
     }
 
     /// Swaps the two `image_type` images at `index1` and `index2` for an item,

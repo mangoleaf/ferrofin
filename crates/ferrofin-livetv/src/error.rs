@@ -30,12 +30,12 @@ use thiserror::Error;
 pub enum LiveTvError {
     /// An HTTP failure while fetching an M3U/XMLTV source over `http(s)://` —
     /// transport, a non-success status, or reading the response body.
-    /// `context` names the operation and URL.
+    /// `context` names the operation and the source, redacted.
     #[error("{context}: {source}")]
     Http {
-        /// The operation and URL, e.g. `"fetch http://tuner/playlist.m3u"`.
+        /// The operation and redacted source, e.g. `"fetch http://tuner"`.
         context: String,
-        /// The underlying `reqwest` failure.
+        /// The underlying `reqwest` failure, without its URL.
         #[source]
         source: reqwest::Error,
     },
@@ -65,10 +65,15 @@ pub enum LiveTvError {
 
 impl LiveTvError {
     /// Builds a [`LiveTvError::Http`] tagging `source` with a `context` label.
+    ///
+    /// A source's URL can carry its account, so `source` loses the URL it
+    /// holds (its `Display` prints the path and the query), and `context`
+    /// names the source only through
+    /// [`redact_url`](ferrofin_util::source_url::redact_url).
     pub fn http(context: impl Into<String>, source: reqwest::Error) -> Self {
         Self::Http {
             context: context.into(),
-            source,
+            source: source.without_url(),
         }
     }
 
@@ -150,5 +155,23 @@ mod tests {
         let svc: ServiceError = err.into();
         assert!(matches!(svc, ServiceError::BackendSource(_)));
         assert!(svc.source().is_some());
+    }
+
+    /// `reqwest::Error`'s `Display` and `Debug` print the URL with its path and
+    /// query: the context alone names the source.
+    #[tokio::test]
+    async fn http_variant_drops_the_url_reqwest_kept() {
+        let source = reqwest::Client::new()
+            .get("http://127.0.0.1:0/live/path-secret/1.ts?password=query-secret")
+            .send()
+            .await
+            .expect_err("connect must fail");
+        assert!(source.to_string().contains("query-secret"), "{source}");
+
+        let err = LiveTvError::http("fetch http://127.0.0.1:0", source);
+
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains("path-secret"), "{shown}");
+        assert!(!shown.contains("query-secret"), "{shown}");
     }
 }

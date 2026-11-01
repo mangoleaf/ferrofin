@@ -9,6 +9,7 @@
 #![cfg(test)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
@@ -19,6 +20,7 @@ pub struct MockServer {
     /// The `http://127.0.0.1:{port}` base to point a client at.
     pub base_url: String,
     handle: tokio::task::JoinHandle<()>,
+    requests: Arc<AtomicUsize>,
 }
 
 impl Drop for MockServer {
@@ -68,6 +70,7 @@ impl MockServer {
         Self {
             base_url: format!("http://127.0.0.1:{port}"),
             handle,
+            requests: Arc::default(),
         }
     }
 
@@ -115,6 +118,69 @@ impl MockServer {
         Self {
             base_url: format!("http://127.0.0.1:{port}"),
             handle,
+            requests: Arc::default(),
         }
+    }
+
+    /// A server that answers the nth request with the nth of `responses`,
+    /// complete raw HTTP, and every later one with the last of them. With
+    /// `stall`, it then keeps the connection open and sends nothing more.
+    async fn start_raw_inner(responses: Vec<Vec<u8>>, stall: bool) -> Self {
+        let responses = Arc::new(responses);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = tokio::spawn({
+            let requests = Arc::clone(&requests);
+            async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    let (responses, requests) = (Arc::clone(&responses), Arc::clone(&requests));
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        let _ = sock.read(&mut buf).await;
+                        let nth = requests.fetch_add(1, Ordering::SeqCst);
+                        let response = &responses[nth.min(responses.len() - 1)];
+                        let _ = sock.write_all(response).await;
+                        if stall {
+                            let _ = sock.read(&mut buf).await;
+                        }
+                        let _ = sock.shutdown().await;
+                    });
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://127.0.0.1:{port}"),
+            handle,
+            requests,
+        }
+    }
+
+    /// See [`start_raw_inner`](Self::start_raw_inner).
+    pub async fn start_raw(responses: Vec<Vec<u8>>) -> Self {
+        Self::start_raw_inner(responses, false).await
+    }
+
+    /// See [`start_raw_inner`](Self::start_raw_inner).
+    pub async fn start_stalled(response: Vec<u8>) -> Self {
+        Self::start_raw_inner(vec![response], true).await
+    }
+
+    /// The requests a [`start_raw`](Self::start_raw) server has had.
+    pub fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+
+    /// A raw `200` response with `headers`, closed after `body`.
+    pub fn raw_ok(headers: &str, body: &[u8]) -> Vec<u8> {
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\n{headers}Connection: close\r\n\r\n").into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// A raw response with no body, of `status`.
+    pub fn raw_status(status: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
     }
 }

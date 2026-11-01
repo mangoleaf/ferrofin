@@ -317,11 +317,11 @@ pub(crate) mod tests {
         ) -> Result<HashMap<Uuid, Vec<ItemImageInfo>>, ServiceError> {
             self.0.get_image_infos_batch(item_ids).await
         }
-        async fn get_image_infos_with_auto_orient(
+        async fn get_image_infos_to_serve(
             &self,
             item_id: Uuid,
-        ) -> Result<(Vec<ItemImageInfo>, bool), ServiceError> {
-            self.0.get_image_infos_with_auto_orient(item_id).await
+        ) -> Result<ferrofin_traits::options::ItemImagesToServe, ServiceError> {
+            self.0.get_image_infos_to_serve(item_id).await
         }
         async fn get_media_stream_languages_by_type(
             &self,

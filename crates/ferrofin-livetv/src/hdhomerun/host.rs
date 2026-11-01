@@ -25,7 +25,7 @@ use ferrofin_model::media_info::MediaProtocol;
 use ferrofin_traits::error::ServiceError;
 
 use crate::error::LiveTvError;
-use crate::fetch::SourceFetcher;
+use crate::fetch::{SourceFetcher, redact_url};
 use crate::hdhomerun::types::{DiscoverResponse, LineupChannel};
 use crate::tuner_host::{ChannelStream, ChannelStreamKind, StoredChannel, TunerChannel, TunerHost};
 
@@ -256,14 +256,14 @@ impl HdHomerunHost {
         if !opened.is_success() {
             // `response.EnsureSuccessStatusCode()`.
             return Err(ServiceError::backend(format!(
-                "hdhomerun {url} answered {status}"
+                "hdhomerun discover.json from {} answered {status}",
+                redact_url(&url)
             )));
         }
 
-        let discover: DiscoverResponse = opened
-            .read_json()
-            .await
-            .map_err(|e| LiveTvError::serialize(format!("parse {url}"), e))?;
+        let discover: DiscoverResponse = opened.read_json().await.map_err(|e| {
+            LiveTvError::serialize(format!("parse discover.json from {}", redact_url(&url)), e)
+        })?;
         if !cache_key.is_empty() {
             self.cache().insert(cache_key, discover.clone());
         }
@@ -297,7 +297,8 @@ impl HdHomerunHost {
         // naming a local file fails there and is never opened as one here.
         if !crate::fetch::is_http(&url) {
             return Err(ServiceError::backend(format!(
-                "the device's lineup address is not an HTTP URL: {url}"
+                "the device's lineup address is not an HTTP URL: {}",
+                redact_url(&url)
             )));
         }
         // Read as it arrives, whatever the status (v12.2
@@ -309,7 +310,9 @@ impl HdHomerunHost {
             .await?
             .read_json::<Option<Vec<LineupChannel>>>()
             .await
-            .map_err(|e| LiveTvError::serialize(format!("parse {url}"), e))?
+            .map_err(|e| {
+                LiveTvError::serialize(format!("parse lineup.json from {}", redact_url(&url)), e)
+            })?
             .unwrap_or_default();
         Ok(lineup
             .into_iter()
@@ -690,7 +693,10 @@ fn device_ip(api_url: &str) -> Result<IpAddr, ServiceError> {
     });
     let host = host.trim_start_matches('[').trim_end_matches(']');
     host.parse::<IpAddr>().map_err(|_| {
-        ServiceError::InvalidInput(format!("hdhomerun device address {host} is not an IP"))
+        ServiceError::InvalidInput(format!(
+            "hdhomerun device address {} is not an IP",
+            redact_url(api_url)
+        ))
     })
 }
 
@@ -805,6 +811,17 @@ mod tests {
     fn a_hostname_is_not_a_device_address() {
         // `IPAddress.Parse(new Uri(...).Host)` throws on a name upstream too.
         assert!(device_ip("http://device.local:80").is_err());
+    }
+
+    /// The refusal is a `400`, whose text reaches the response body.
+    #[test]
+    fn a_refused_device_address_shows_only_the_host() {
+        let error = device_ip("http://acct-user:info-secret@device.local:80/path-secret")
+            .expect_err("a name");
+        assert_eq!(
+            error.to_string(),
+            "invalid input: hdhomerun device address http://device.local is not an IP"
+        );
     }
 
     fn channel() -> StoredChannel {
