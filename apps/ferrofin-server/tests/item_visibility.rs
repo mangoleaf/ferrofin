@@ -2019,6 +2019,49 @@ async fn explicit_ids_keep_to_what_the_user_can_open() {
     );
 }
 
+/// A playlist's listing leaves out a member of a library its caller was not
+/// granted, and pages and counts what is left.
+#[tokio::test]
+async fn a_playlist_listing_leaves_out_members_of_hidden_libraries() {
+    let f = fixture().await;
+    let (status, created) = call(
+        &f.router,
+        "POST",
+        "/Playlists",
+        Some(&f.viewer),
+        Some(json!({
+            "Name": "mixed",
+            "Ids": [f.allowed],
+            "UserId": f.viewer_id,
+            "MediaType": "Video",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let playlist = created["Id"].as_str().expect("id").to_owned();
+    let (status, _) = call(
+        &f.router,
+        "POST",
+        &format!(
+            "/Playlists/{playlist}/Items?ids={}&userId={}",
+            f.hidden, f.viewer_id
+        ),
+        Some(&f.viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let uri = format!("/Playlists/{playlist}/Items?userId={}", f.viewer_id);
+    let (status, items) = call(&f.router, "GET", &uri, Some(&f.viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{items}");
+    assert_eq!(
+        item_ids(&items["Items"]),
+        [uuid::Uuid::parse_str(&f.allowed).expect("id")],
+        "{items}"
+    );
+    assert_eq!(items["TotalRecordCount"], 1, "{items}");
+}
+
 /// The viewer's `GET /Items/{allowed}` status.
 async fn viewer_reads_allowed(f: &Fixture) -> StatusCode {
     call(
