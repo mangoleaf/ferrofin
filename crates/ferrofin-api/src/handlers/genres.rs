@@ -47,7 +47,7 @@ async fn get_genres(
     Query(query): Query<ByNameListQuery>,
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
-    let parent = query.parent(&state).await?;
+    let parent = query.parent(&state, &auth, user.as_ref()).await?;
     let internal = query.base_query(user.clone())?;
     let result = if is_music_collection_folder(parent.as_ref()) {
         state.library.get_music_genres(&internal).await?

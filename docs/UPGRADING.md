@@ -20,6 +20,19 @@ If you change a recording path, or its directory goes missing (a share not mount
 starts counts), the library Ferrofin made for it is removed, as on Jellyfin. A library you made
 yourself, or one adopted from Jellyfin whose path is not a recording folder here, stays.
 
+## Image limits
+
+Decoding and resizing images are now bounded, and the bounds are settings
+([Image limits](CONFIG.md#image-limits)). The defaults keep what most libraries do, but past
+one of them a client gets the original file instead of a thumbnail:
+
+- an image over 200 megapixels, which also gets no blur hash;
+- a Photo item needing more than 512 MiB to decode, which other images were already held to;
+- a resize needing more than 2 GiB of working memory, about 13000 pixels of source width by
+  10000 of output height.
+
+A photo library with larger panoramas may want `FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS` raised.
+
 ## Kubernetes: stop the old pod first for heavy migrations
 
 The Helm chart's default rolling update keeps the old pod serving and writing the database
@@ -50,6 +63,75 @@ is marked failed while the migration goes on running. Do not use `--atomic` or
 database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
+
+## Unreleased — `/health` and `/metrics` follow the network access rules
+
+`/health` and, when metrics are on, `/metrics` now obey `EnableRemoteAccess` and the remote IP
+filter, as they do in Jellyfin. A client those rules refuse gets `503`, like every API route.
+
+A client on the local network is never refused. That network is the private address ranges, or
+what `LocalNetworkSubnets` names if it is set.
+
+**Do this if** you turned remote access off or set a remote IP filter, and a Prometheus server or
+an uptime check reads either route from outside the local network:
+
+- with remote access on, allow it in the remote IP filter;
+- with remote access off, the filter is not read, so it must be on the local network. If you add
+  it to `LocalNetworkSubnets`, list your LAN subnets too: a non-empty list replaces the private
+  ranges, and any client left out of it becomes remote and is refused;
+- or point an uptime check at `/health/ready`, which runs the same checks as `/health` and is not
+  filtered. `/health/live` is not filtered either, but it only says the process is up.
+
+`/health/live` and `/health/ready` stay unfiltered, so Kubernetes probes keep working. Loopback
+and the machine itself are always allowed. While the server is still starting, `/health` answers
+`Degraded` to everyone, as Jellyfin's does.
+
+## Unreleased — the Collections library becomes a real library
+
+Usually nothing to do. A server that has made a collection stored its Collections library as a
+bare database row at `{data}/collections`, which the dashboard did not list and which had no
+settings. A one-time repair at the first boot on this release replaces it with a library like
+Jellyfin's: `root/default/Collections` with a shortcut to `{data}/collections`, listed under
+Dashboard → Libraries, with box sets under a plain folder for that directory.
+
+- The library's id changes, and with it the `ParentId` of every box set. Users keep their access:
+  a user's enabled and blocked libraries and their other library lists move to the new id, and
+  so do the old row's user data and image.
+- A library that already lists `{data}/collections`, such as one adopted from Jellyfin, is kept
+  under its own name, and the box sets of both rows end up together in it. Otherwise the new
+  library takes the old row's name. If a library of yours with other locations already has that
+  name, it is left alone and the new one is numbered (`Collections2`), as Jellyfin numbers it.
+- Removing the Collections library from the dashboard now removes its box sets from the
+  database at the next scan, as it does on Jellyfin. Unlike Jellyfin, Ferrofin does not read
+  them back from `{data}/collections` when the library is made again (gl-1072), so do not remove
+  it to rename or reset it. Their folders on disk stay.
+- Before it changes anything, the boot copies the database beside itself as
+  `<database>.pre-collections-library` (`ferrofin.db.pre-collections-library` on most servers). It
+  is safe to delete once the server has run well on this release. It is not a way back to Jellyfin:
+  that is `jellyfin.db.pre-ferrofin`.
+- If the library cannot be made (the `root` directory is read-only, for one) or the copy cannot be
+  written, the log says so with a warning, the server starts and works as it did, and the next boot
+  tries again.
+- On a Kubernetes rolling update the old pod is still serving while this runs. A box set it creates
+  lands in the new folder. A user's library access saved through it in that moment can name the old
+  id, which nothing moves afterwards, so check such a user or
+  [stop the old pod first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
+
+## Unreleased — a mount that does not answer is left out of the drive list
+
+Nothing to do, unless your network storage is slow to answer. The library wizard's drive list
+(`GET /Environment/Drives`) now gives each mount 2 s and lists the ones that answered. A mount
+that hangs no longer freezes the server, and it returns to the list once it answers. A mount
+that regularly takes longer than 2 s, such as a NAS waking its disks, is missing from the list
+even though it is healthy: type its path into the folder picker instead.
+
+While a mount hangs, the folder picker, the log pages and the fallback fonts can stop until it
+answers, for local disks too, once 32 calls are stuck on it. Everything else keeps working.
+
+If a script calls these routes, some answers changed to match Jellyfin 12.4:
+`GET /Environment/DirectoryContents` is a `404` for a path that is no directory (it was an empty
+list), and `POST /Environment/ValidatePath` with `ValidateWritable` is a `500` for a read-only
+directory and a `404` when the path is a file (both were `400`).
 
 ## Unreleased — the Helm chart's notes on rolling updates and RWX volumes are corrected
 
@@ -192,7 +274,8 @@ upgrade.
   `0007`, `0032` and `0044`, and the adoption copy `jellyfin.db.pre-ferrofin`, still stop
   the boot when they cannot be written.
 - **No cut-short copies.** Every copy (`jellyfin.db.pre-ferrofin`, `.pre-NNNN`, and the boot
-  repairs' `.pre-rehome`, `.pre-season-ids`, `.pre-playlist-folders` and `.pre-harmonize`)
+  repairs' `.pre-rehome`, `.pre-season-ids`, `.pre-playlist-folders`, `.pre-collections-library`
+  and `.pre-harmonize`)
   is written to `<name>.partial`, flushed to disk and only then renamed. A full disk or a
   killed server therefore never leaves a partial file under the real name. The next attempt
   at that copy deletes a leftover `.partial`; you can also delete one yourself while the
@@ -257,6 +340,13 @@ way cannot have their profile or policy saved from the dashboard until both are 
 a sign-in restores `AuthenticationProviderId`; set `PasswordResetProviderId` (normally
 `Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider`) with a
 `POST /Users/{userId}/Policy` that carries the user's full policy.
+
+A policy body that leaves other members out now saves Jellyfin's default for each one
+(`new UserPolicy()`: media playback, all libraries, all devices and remote access allowed, no
+login lockout, among others), where an earlier Ferrofin saved `false` or `0`. A script that
+relied on an omitted member being `false` must now send it. A user an earlier Ferrofin saved
+from such a body keeps that stripped policy until it is saved again in full, from the
+dashboard or with the user's complete policy.
 
 ## Unreleased — library tiles are drawn as Jellyfin 12.2 draws them
 

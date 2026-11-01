@@ -149,12 +149,10 @@ pub struct FerrofinUserViewManager {
     /// provisions it once at startup, as upstream's
     /// `LibraryManager.CreateRootFolder` does. `None` in unit tests.
     persistence: Option<Arc<dyn ItemPersistenceService>>,
-    /// The user-root provisioner. [`get_media_folders`] settles it on first
-    /// read so the `UserRootFolder` row this endpoint browses exists even on a
-    /// server that has never resolved `GET /Items/Root`. The store memoizes, so
-    /// this costs nothing after the first call. `None` in unit tests.
-    ///
-    /// [`get_media_folders`]: UserViewManager::get_media_folders
+    /// The user-root provisioner. `root_children` settles it on first read so
+    /// the `UserRootFolder` row those reads browse exists even on a server that
+    /// has never resolved `GET /Items/Root`. The store memoizes, so this costs
+    /// nothing after the first call. `None` in unit tests.
     user_root: Option<crate::user_root_folder::UserRootFolderStore>,
     /// The per-database item-id derivation mode (see
     /// [`item_type_lookup::IdDerivation`]).
@@ -410,7 +408,8 @@ impl FerrofinUserViewManager {
         self
     }
 
-    /// Shares the library's batched `IsVisible` evaluator for home views.
+    /// Shares the library's batched `IsVisible` evaluator for home views and
+    /// the user-root children.
     #[must_use]
     pub fn with_visibility(
         mut self,
@@ -453,10 +452,11 @@ impl FerrofinUserViewManager {
     }
 
     /// Attaches the user-root provisioner, so
-    /// [`get_media_folders`](UserViewManager::get_media_folders) settles the
-    /// `UserRootFolder` row on first read. The playlists plugin folder it also
-    /// lists is not this store's: startup provisions it. Called once by the
-    /// composition root.
+    /// [`get_media_folders`](UserViewManager::get_media_folders) and
+    /// [`get_user_root_children`](UserViewManager::get_user_root_children)
+    /// settle the `UserRootFolder` row on first read. The playlists plugin
+    /// folder they also list is not this store's: startup provisions it.
+    /// Called once by the composition root.
     #[must_use]
     pub fn with_user_root(mut self, store: crate::user_root_folder::UserRootFolderStore) -> Self {
         self.user_root = Some(store);
@@ -1056,48 +1056,30 @@ impl UserViewManager for FerrofinUserViewManager {
         self.provision_live_tv_view().await
     }
 
-    async fn get_media_folders(&self, user_id: Uuid) -> Result<Vec<BaseItemEntity>, ServiceError> {
-        // Jellyfin's LibraryController.GetMediaFolders returns
-        // GetUserRootFolder().Children sorted by SortName — the library collection
-        // folders plus the playlists plugin folder `CreateRootFolder()` parents
-        // to the `AggregateFolder`. That folder is provisioned once at startup
-        // (`AggregateFolderStore::ensure`), as upstream's `RootFolder` runs
-        // `CreateRootFolder` once per process, so this read never writes it.
-        // Settle the user root on first read (lazy, self-healing, memoized by
-        // the store), then project the user-root child kinds, name-sorted.
-        if let Some(root) = &self.user_root {
-            root.ensure().await?;
+    async fn get_media_folders(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let folders = self.root_children().await?;
+        // An administrator's list, so a manager with no evaluator only skips
+        // the `Enabled` filter; `get_user_root_children` must refuse instead.
+        match &self.visibility {
+            Some(visibility) => visibility.without_disabled_libraries(folders).await,
+            None => Ok(folders),
         }
-        let query = InternalItemsQuery {
-            // `GetUserRootFolder().Children` holds the libraries and the
-            // playlists folder — never a `UserView` (those are derived views,
-            // not root children; the query scope in
-            // `item_repository::visible_views` still admits them).
-            include_item_types: vec![
-                BaseItemKind::CollectionFolder,
-                // Both kinds of playlists folder: Ferrofin and Jellyfin both
-                // store `PlaylistsFolder`, but a row an earlier Ferrofin
-                // wrote as `ManualPlaylistsFolder` survives when startup
-                // finds the correct row beside it and does not re-key it.
-                BaseItemKind::ManualPlaylistsFolder,
-                BaseItemKind::PlaylistsFolder,
-            ],
-            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
-            ..Default::default()
-        };
-        // Upstream returns `GetUserRootFolder().Children`, which never contains
-        // the Live TV view — that one is created parentless under
-        // `{InternalMetadataPath}/views/` and only `GetUserViews` appends it.
-        // The exclusion is UNCONDITIONAL, not the Live-TV-disabled gate
-        // `get_user_views` applies: an enabled tuner puts the view in
-        // `/UserViews`, never in `/Library/MediaFolders`. The folders are the
-        // same for every caller (upstream reads no user), so `user_id` is
-        // unused.
-        let _ = user_id;
-        let folders = self.items.get_item_list(&query).await?;
+    }
+
+    async fn get_user_root_children(
+        &self,
+        user: &UserEntity,
+    ) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        let visibility = self
+            .visibility
+            .as_ref()
+            .ok_or_else(|| ServiceError::backend("item visibility is not configured"))?;
+        let folders = self.root_children().await?;
+        let visible = visibility.visible(&folders, user, false).await?;
         Ok(folders
             .into_iter()
-            .filter(|f| !is_live_tv_view_row(f))
+            .zip(visible)
+            .filter_map(|(folder, allowed)| allowed.then_some(folder))
             .collect())
     }
 
@@ -1436,6 +1418,48 @@ impl FerrofinUserViewManager {
             .collect())
     }
 
+    /// Every user-root child, whoever asks: Jellyfin's
+    /// `GetUserRootFolder().Children` sorted by `SortName` — the library
+    /// collection folders plus the playlists plugin folder `CreateRootFolder()`
+    /// parents to the `AggregateFolder`. That folder is provisioned once at
+    /// startup (`AggregateFolderStore::ensure`), as upstream's `RootFolder`
+    /// runs `CreateRootFolder` once per process, so this read never writes it.
+    /// Settles the user root on first read (lazy, self-healing, memoized by
+    /// the store), then projects the user-root child kinds, name-sorted.
+    async fn root_children(&self) -> Result<Vec<BaseItemEntity>, ServiceError> {
+        if let Some(root) = &self.user_root {
+            root.ensure().await?;
+        }
+        let query = InternalItemsQuery {
+            // `GetUserRootFolder().Children` holds the libraries and the
+            // playlists folder — never a `UserView` (those are derived views,
+            // not root children; the query scope in
+            // `item_repository::visible_views` still admits them).
+            include_item_types: vec![
+                BaseItemKind::CollectionFolder,
+                // Both kinds of playlists folder: Ferrofin and Jellyfin both
+                // store `PlaylistsFolder`, but a row an earlier Ferrofin
+                // wrote as `ManualPlaylistsFolder` survives when startup
+                // finds the correct row beside it and does not re-key it.
+                BaseItemKind::ManualPlaylistsFolder,
+                BaseItemKind::PlaylistsFolder,
+            ],
+            order_by: vec![(ItemSortBy::SortName, SortOrder::Ascending)],
+            ..Default::default()
+        };
+        // Upstream returns `GetUserRootFolder().Children`, which never contains
+        // the Live TV view — that one is created parentless under
+        // `{InternalMetadataPath}/views/` and only `GetUserViews` appends it.
+        // The exclusion is UNCONDITIONAL, not the Live-TV-disabled gate
+        // `get_user_views` applies: an enabled tuner puts the view in
+        // `/UserViews`, never in `/Library/MediaFolders`.
+        let folders = self.items.get_item_list(&query).await?;
+        Ok(folders
+            .into_iter()
+            .filter(|f| !is_live_tv_view_row(f))
+            .collect())
+    }
+
     /// The parents of a latest-items request (C# `GetItemsForLatestItems`,
     /// first half): the `parent_id` folder when it is one, else the user's
     /// root media folders minus `latest_item_excludes`. Also settles `is_played`,
@@ -1485,14 +1509,13 @@ impl FerrofinUserViewManager {
         }
 
         if parents.is_empty() {
-            let user_id = query
-                .user
-                .as_ref()
-                .and_then(|u| Uuid::parse_str(&u.id).ok())
-                .unwrap_or_default();
-            parents = self
-                .get_media_folders(user_id)
-                .await?
+            // No user is an unscoped read, as on `InternalItemsQuery`:
+            // `get_latest_media` always names one.
+            let folders = match &query.user {
+                Some(user) => self.get_user_root_children(user).await?,
+                None => self.get_media_folders().await?,
+            };
+            parents = folders
                 .iter()
                 .filter_map(classify)
                 .filter(|p| !query.latest_item_excludes.contains(&p.id))
@@ -1567,13 +1590,15 @@ impl FerrofinUserViewManager {
             // or presentation keys (movies) rather than rows.
             //
             // "First" is the parents' order, and with no `parentId` the parents
-            // are the user's whole view list — so on a server whose first view
-            // by `SortName` is a movies library, the UNSCOPED `/Items/Latest`
+            // are every root folder the user may open — so on a server whose
+            // first by `SortName` is a movies library, the UNSCOPED `/Items/Latest`
             // (the home row) is the movies arm too: the newest `limit` rows of
             // EVERY library, one per key, grouped below — a burst of new tracks
             // can fill it with a few album cards. That is upstream's behaviour
             // (the owner chose to follow v12 here on 2026-10-24), not an
-            // artifact of this port.
+            // artifact of this port. Upstream's parents end with the playlists
+            // folder, though, and here it sorts among the libraries, so it can
+            // be the first typed parent and take the plain query: gl-1110.
             //
             // The `null`-collection-type arm v12 added beside them
             // (`:425-429`, a MIXED library's latest movies and shows) is not
@@ -1819,6 +1844,16 @@ mod tests {
     /// (`Playlist.IsSharedItem`) one, visible by owner, shares and `OpenAccess`.
     const DATA: &str = "/config/data";
 
+    /// The evaluator the composition root wires into the manager.
+    fn visibility(db: &Database) -> Arc<crate::item_visibility::ItemVisibility> {
+        Arc::new(crate::item_visibility::ItemVisibility::new(
+            db.clone(),
+            crate::test_support::item_repository_over(db.clone()),
+            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
+            DATA.to_owned(),
+        ))
+    }
+
     /// A manager wired as the composition root wires it for `GetUserViews`.
     fn manager_with_visibility(
         db: &Database,
@@ -1828,12 +1863,6 @@ mod tests {
             Arc::new(crate::user_manager::FerrofinUserManager::new(db.clone()));
         let persistence: Arc<dyn ItemPersistenceService> =
             Arc::new(FerrofinItemPersistenceService::new(db.clone()));
-        let visibility = Arc::new(crate::item_visibility::ItemVisibility::new(
-            db.clone(),
-            crate::test_support::item_repository_over(db.clone()),
-            Arc::new(crate::localization_manager::LocalizationManager::new("US")),
-            DATA.to_owned(),
-        ));
         manager(db)
             .with_database(db.clone())
             .with_item_store(persistence)
@@ -1842,7 +1871,7 @@ mod tests {
                 program_data_path: Some("/config".to_owned()),
             })
             .with_users(users)
-            .with_visibility(visibility)
+            .with_visibility(visibility(db))
     }
 
     /// Saves one row through the real upsert.
@@ -3170,7 +3199,7 @@ mod tests {
         let db = test_db().await;
         seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
         seed_named_item(&db, MUSIC, BaseItemKind::CollectionFolder, "Music").await;
-        let user = seed_user(&db, Uuid::from_u128(0x9)).await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0x9)).await;
         let played: Vec<Uuid> = (1..=6).map(|n| Uuid::from_u128(0x910 + n)).collect();
         let names: Vec<String> = (1..=6).map(|n| format!("Seen {n}")).collect();
         let (fresh, track) = (Uuid::from_u128(0x920), Uuid::from_u128(0x921));
@@ -3192,7 +3221,8 @@ mod tests {
                 (MOVIES, Some(CollectionTypeOptions::movies)),
                 (MUSIC, Some(CollectionTypeOptions::music)),
             ],
-        );
+        )
+        .with_visibility(visibility(&db));
 
         for group_items in [false, true] {
             let unplayed = latest(
@@ -3424,9 +3454,11 @@ mod tests {
             )],
         )
         .await;
-        let mgr = manager(&db).with_database(db.clone());
+        let mgr = manager(&db)
+            .with_database(db.clone())
+            .with_visibility(visibility(&db));
         let mut query = LatestItemsQuery {
-            user: Some(user),
+            user: Some(user.clone()),
             ..Default::default()
         };
         let expected = vec![(None, vec![movie])];
@@ -3443,9 +3475,9 @@ mod tests {
         let user_views = mgr.get_user_views(user_id).await.expect("home views");
         assert!(user_views.is_empty(), "{user_views:?}");
         assert_eq!(
-            mgr.get_media_folders(user_id)
+            mgr.get_user_root_children(&user)
                 .await
-                .expect("media folders")
+                .expect("root children")
                 .len(),
             1
         );
@@ -3466,6 +3498,40 @@ mod tests {
             expected,
             "an explicit parent remains browsable regardless of home preferences"
         );
+    }
+
+    /// `GetChildren(user, true)` takes the virtual children too, and
+    /// `Folder.IsVisible` exempts a plugin folder from the library rules.
+    #[tokio::test]
+    async fn a_blocked_library_leaves_the_user_root_children_and_the_playlists_folder_stays() {
+        let db = test_db().await;
+        let user_id = Uuid::from_u128(0xAA22);
+        let user = crate::test_support::seed_user_with_defaults(&db, user_id).await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        let playlists = Uuid::from_u128(0xAA23);
+        seed_named_item(&db, playlists, BaseItemKind::PlaylistsFolder, "Playlists").await;
+        seed_named_item(&db, MUSIC, BaseItemKind::CollectionFolder, "Music").await;
+        block_folders(&db, user_id, &[MOVIES]).await;
+        let mgr = manager(&db).with_visibility(visibility(&db));
+        let children = mgr.get_user_root_children(&user).await.expect("children");
+        let names: Vec<_> = children
+            .iter()
+            .filter_map(|row| row.name.as_deref())
+            .collect();
+        assert_eq!(names, ["Music", "Playlists"]);
+    }
+
+    /// Every library is not a fallback for an evaluator that was never wired.
+    #[tokio::test]
+    async fn the_user_root_children_refuse_to_answer_without_an_evaluator() {
+        let db = test_db().await;
+        seed_named_item(&db, MOVIES, BaseItemKind::CollectionFolder, "Movies").await;
+        let user = crate::test_support::seed_user_with_defaults(&db, Uuid::from_u128(0xAA21)).await;
+        let error = manager(&db)
+            .get_user_root_children(&user)
+            .await
+            .expect_err("no evaluator");
+        assert!(error.to_string().contains("item visibility"), "{error}");
     }
 
     /// Stored view ids are uppercase-hyphenated (`guid_to_db`); a `parentId`
@@ -3680,10 +3746,7 @@ mod tests {
         provision_at_startup(&db, tmp.path()).await;
         let mgr = media_folders_manager(&db, tmp.path().join("root").join("default"));
 
-        let folders = mgr
-            .get_media_folders(Uuid::from_u128(9))
-            .await
-            .expect("media folders");
+        let folders = mgr.get_media_folders().await.expect("media folders");
 
         // The user-root children are the libraries plus the Playlists folder
         // startup provisioned (C# GetUserRootFolder().Children).
@@ -3735,10 +3798,7 @@ mod tests {
             .await
             .expect("rename the provisioned row");
 
-        let again = mgr
-            .get_media_folders(Uuid::from_u128(9))
-            .await
-            .expect("media folders again");
+        let again = mgr.get_media_folders().await.expect("media folders again");
         assert_eq!(again.len(), libraries + 1);
         let renamed = again
             .iter()
@@ -3785,10 +3845,7 @@ mod tests {
             let mgr = media_folders_manager(&db, tmp.path().join("root").join("default"));
 
             for _ in 0..2 {
-                let folders = mgr
-                    .get_media_folders(Uuid::from_u128(9))
-                    .await
-                    .expect("media folders");
+                let folders = mgr.get_media_folders().await.expect("media folders");
                 let playlists: Vec<_> = folders
                     .iter()
                     .filter(|f| {

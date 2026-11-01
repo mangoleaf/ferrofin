@@ -525,7 +525,15 @@ pub async fn build_app_state(
     // honoured instead of serving the full-size original.
     // One encoder for the processor, trickplay and the scan's splashscreen
     // pass, which writes `{data}/splashscreen.png`.
-    let image_encoder = Arc::new(ImageCrateEncoder::new().with_data_path(paths.data_path()));
+    let image_encoder = Arc::new(
+        ImageCrateEncoder::new()
+            .with_data_path(paths.data_path())
+            .with_limits(ferrofin_drawing::ImageLimits::from_settings(
+                config.image_decode_max_megapixels,
+                config.image_decode_max_memory_mb,
+                config.image_resize_budget_mb,
+            )),
+    );
     let image_processor: Arc<dyn ferrofin_traits::drawing::ImageProcessor> = Arc::new(
         ImageProcessor::new(Arc::clone(&image_encoder) as _, cache_root.child("images"))
             .with_encoding_limit(image_encoding_limit),
@@ -1068,6 +1076,17 @@ pub async fn build_app_state(
     let virtual_folders: Arc<dyn ferrofin_traits::library::VirtualFolderManager> =
         virtual_folders_impl.clone();
     trickplay_impl.attach_virtual_folders(Arc::clone(&virtual_folders));
+    // A bare `CollectionFolder` an older build made for the Collections library
+    // becomes the real library: before any scan, and before the sweep below
+    // reads the libraries' locations.
+    ferrofin_core::adoption_repairs::run_merge_legacy_collections_library(
+        db,
+        &virtual_folders_impl,
+        &id_derivation,
+        (&paths.data_path(), &paths.root_folder_path()),
+        &virtual_paths,
+    )
+    .await;
     // One-shot (Jellyfin 12.2 `20260915120000_MigrateRatingLevels`): recompute
     // every row's inherited parental-rating columns from its OWN
     // `OfficialRating` through `GetRatingScore`, so a rating string an older
@@ -1264,8 +1283,8 @@ pub async fn build_app_state(
             // The playlists folder it lists is `aggregate_store.ensure()`'s,
             // made once above, as `CreateRootFolder` makes it once per process.
             .with_item_store(Arc::clone(&item_persistence_service))
-            // Settles the `UserRootFolder` row on the first
-            // `GET /Library/MediaFolders`, memoized by the store.
+            // Settles the `UserRootFolder` row on the first read of the root
+            // folders, memoized by the store.
             .with_user_root(user_root_store.clone())
             .with_metadata_path(metadata_root.clone())
             .with_id_derivation(id_derivation.clone())
@@ -1615,7 +1634,10 @@ pub async fn build_app_state(
         .with_providers(Arc::clone(&providers))
         .with_self_writes(Arc::clone(&self_writes_guard))
         // …and names a new Collections library in the server's language.
-        .with_localization(Arc::clone(&localization)),
+        .with_localization(Arc::clone(&localization))
+        // …which the first box set makes, like any library.
+        .with_virtual_folders(Arc::clone(&virtual_folders))
+        .with_virtual_paths(virtual_paths.clone()),
     );
     library_impl.attach_collections(&collections);
     library_scanner.attach_collections(&collections);

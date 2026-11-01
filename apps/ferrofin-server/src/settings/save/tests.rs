@@ -511,6 +511,13 @@ fn an_invalid_value_leaves_the_file_byte_identical() {
         ("scan_probe_concurrency", json!("4"), "whole number from 0"),
         ("scan_probe_concurrency", json!(true), "whole number from 0"),
         ("auth_cache_ttl_secs", json!(4), "from 5 to 300"),
+        ("image_decode_max_megapixels", json!(15), "from 16 to 1000"),
+        (
+            "image_decode_max_memory_mb",
+            json!(4096),
+            "from 128 to 2048",
+        ),
+        ("image_resize_budget_mb", json!(0), "from 256 to 16384"),
         (
             "ffmpeg_img_extract_perf_tradeoff",
             json!("yes"),

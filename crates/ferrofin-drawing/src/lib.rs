@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod image_encoder;
+pub mod limits;
 pub mod null_encoder;
 pub mod photo_provider;
 pub mod processor;
@@ -13,6 +14,7 @@ mod splashscreen;
 
 pub use error::DrawingError;
 pub use image_encoder::ImageCrateEncoder;
+pub use limits::ImageLimits;
 pub use null_encoder::NullImageEncoder;
 pub use photo_provider::{DirectoryService, FileInfo, PhotoItem, PhotoProvider, is_exif_candidate};
 pub use processor::{FileMeta, ImageProcessor, StdFileMeta};

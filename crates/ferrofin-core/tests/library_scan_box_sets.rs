@@ -442,3 +442,119 @@ async fn an_item_refresh_runs_no_box_set_pass() {
         .expect("scan");
     assert!(lab.refreshes.refreshed.lock().expect("log").is_empty());
 }
+
+/// The shape `EnsureLibraryFolder` leaves survives what a library scan does to
+/// it: the library's `Folder` stays a child of the root, and the box sets
+/// under it stay, an empty directory walk not being a deletion. A box set with
+/// no folder of its own, as an older Ferrofin made them, stays too.
+#[allow(clippy::too_many_lines)] // one fixture: the real library, scanner and manager
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scan_keeps_the_library_and_its_box_sets() {
+    use ferrofin_core::item_type_lookup::IdDerivation;
+    use ferrofin_core::{AggregateFolderStore, FerrofinCollectionManager};
+    use ferrofin_traits::collections::{CollectionCreationOptions, CollectionManager as _};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let program = tmp.path().to_string_lossy().into_owned();
+    let db = Database::connect_in_memory().await.expect("connect");
+    db.run_migrations().await.expect("migrate");
+    db.meta_set("item_id_derivation", "jellyfin-10.11.8")
+        .await
+        .expect("mode");
+    let mode = IdDerivation::from_meta(Some("jellyfin-10.11.8"), Some(program));
+    let paths = Arc::new(ferrofin_core::FerrofinServerApplicationPaths::new(
+        tmp.path(),
+        tmp.path().join("log"),
+        tmp.path().join("config"),
+        tmp.path().join("cache"),
+        tmp.path().join("web"),
+    ));
+    let expander =
+        ferrofin_core::virtual_paths::VirtualPathExpander::from_paths(Arc::clone(&paths));
+    let ids = AggregateFolderStore::new(
+        db.clone(),
+        mode.clone(),
+        tmp.path().join("root"),
+        tmp.path().join("data"),
+    )
+    .ensure()
+    .await
+    .expect("roots");
+    let persistence = Arc::new(
+        FerrofinItemPersistenceService::new(db.clone()).with_virtual_paths(expander.clone()),
+    );
+    let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+        FerrofinVirtualFolderManager::new(tmp.path().join("root/default"))
+            .with_item_store(persistence.clone())
+            .with_id_derivation(mode.clone())
+            .with_virtual_paths(expander.clone()),
+    );
+    let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+        db.clone(),
+        Arc::new(ItemTypeLookup::new()),
+    ));
+    let scanner = LibraryScanner::new(
+        Arc::clone(&vf),
+        Arc::new(ferrofin_core::file_system::FerrofinFileSystem::new()),
+        persistence.clone(),
+    )
+    .with_items(Arc::clone(&items))
+    .with_id_derivation(mode)
+    .with_root_folder(ids.aggregate)
+    .with_virtual_paths(expander.clone());
+    let library = Arc::new(ferrofin_core::FerrofinLibraryManager::new(
+        Arc::clone(&items),
+        Arc::new(ferrofin_core::FerrofinItemCountService::new(db.clone())),
+        persistence.clone(),
+        Arc::new(ferrofin_core::FerrofinPeopleRepository::new(db.clone())),
+    ));
+    let manager = FerrofinCollectionManager::new(
+        db.clone(),
+        library,
+        Arc::new(ferrofin_core::FerrofinLinkedChildrenService::new(
+            db.clone(),
+        )),
+        paths,
+    )
+    .with_virtual_folders(Arc::clone(&vf))
+    .with_virtual_paths(expander);
+    let box_set = manager
+        .create_collection(&CollectionCreationOptions {
+            name: "Heist".to_owned(),
+            ..CollectionCreationOptions::default()
+        })
+        .await
+        .expect("create");
+    let folderless = Uuid::new_v4();
+    persistence
+        .save_items(&[BaseItemEntity {
+            id: guid_to_db(folderless),
+            type_: BOX_SET.to_owned(),
+            name: Some("Old".to_owned()),
+            parent_id: box_set.parent_id.clone(),
+            top_parent_id: box_set.parent_id.clone(),
+            is_folder: true,
+            ..BaseItemEntity::default()
+        }])
+        .await
+        .expect("a box set with no folder");
+
+    for _ in 0..2 {
+        scanner
+            .scan_with(None, &MetadataRefreshOptions::default())
+            .await
+            .expect("scan");
+    }
+
+    for id in [Uuid::parse_str(&box_set.id).expect("id"), folderless] {
+        let row = items.retrieve_item(id).await.expect("read").expect("kept");
+        assert_eq!(row.parent_id, box_set.parent_id);
+    }
+    let folder = box_set.parent_id.as_deref().expect("parent");
+    let folder = items
+        .retrieve_item(Uuid::parse_str(folder).expect("id"))
+        .await
+        .expect("read")
+        .expect("the folder stays");
+    assert_eq!(folder.parent_id, Some(guid_to_db(ids.aggregate)));
+}

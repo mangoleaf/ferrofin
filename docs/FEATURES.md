@@ -1,7 +1,7 @@
 # Feature status
 
-**Parity: 23 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
-22 compared against v12.2 and owed a re-check, 4 subsystem rows (as of 2026-10-30; the
+**Parity: 30 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+19 compared against v12.2 and owed a re-check, 5 subsystem rows (as of 2026-10-31; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
 Ferrofin answers the way Jellyfin does (identical, in another order, a known difference, filed, new), is in
@@ -157,9 +157,11 @@ Wired and working, with a documented limitation or lighter verification:
   Ferrofin entry, lists every Ferrofin setting in groups with the value in use, its default, where
   it comes from (default, `config.toml`, environment variable or flag), its variable and flag,
   and, for each one the page may not change, why and where it is changed instead. Secrets are
-  shown to administrators, marked as secrets. Read-only so far: settings change in `config.toml`,
-  the environment or the command line ([`CONFIG.md`](CONFIG.md#seeing-what-is-set)). Disabling the
-  Ferrofin plugin hides the page.
+  shown to administrators, marked as secrets. The rest are edited there: Save writes the changes
+  to `config.toml`, a refused value shows the server's message next to it, Reset to default removes
+  the key, and Restart now applies them, all but the few that need a full process restart, which
+  say so ([`CONFIG.md`](CONFIG.md#editing-settings-from-the-dashboard)). Disabling the Ferrofin
+  plugin hides the page.
 - **`LiveTv/Programs` filter params** — a few query params (3 ops) are accepted but not yet
   honored as filters.
 - **Similar items** — the local weighted genre/tag/people scorer always runs; the remote

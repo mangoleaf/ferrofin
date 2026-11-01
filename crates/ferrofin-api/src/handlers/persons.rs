@@ -130,6 +130,10 @@ async fn get_persons(
 ) -> Result<Json<QueryResult<BaseItemDto>>, ApiError> {
     let user = resolve_user_or_api_key(&state, &auth, query.user_id).await?;
     let user_id = user.as_ref().map(user_uuid).transpose()?;
+    for scope in [query.parent_id, query.appears_in_item_id] {
+        crate::handlers::items::require_scope_id_visible(&state, &auth, scope, user.as_ref())
+            .await?;
+    }
     // C# folds `filters ∋ IsFavorite` onto the tri-state when `isFavorite` is
     // absent (PersonsController: `!isFavorite.HasValue && isFavoriteInFilters`).
     let filters = parse_csv_enums_lenient::<ItemFilter>(query.filters.as_deref());

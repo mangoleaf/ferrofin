@@ -1290,7 +1290,7 @@ fn enable_metrics_endpoint(
         }
     }
     let process = process.as_ref()?;
-    *router = metrics_wiring::mount(std::mem::take(router), &process.handle);
+    *router = metrics_wiring::mount(std::mem::take(router), &process.handle, state);
     Some(metrics_wiring::spawn_sampler(
         process.gauges.clone(),
         Arc::clone(&state.sessions),
