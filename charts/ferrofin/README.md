@@ -77,7 +77,8 @@ with a `FERROFIN_ADMIN_PASSWORD` key, through `ferrofin.envFrom`.
 Health probes target Ferrofin's real endpoints: `GET /health/live` is process-only, and
 `GET /health/ready` checks that the database answers. Jellyfin's own `/health` (plain-text
 `Healthy`, or `Unhealthy` with a 503) runs the same check, so healthchecks written for
-Jellyfin keep working.
+Jellyfin keep working. Like Jellyfin's, it obeys `EnableRemoteAccess` and the remote IP filter,
+so a check from an address those refuse gets a 503. The two probes above are not filtered.
 
 ## Upgrades and the database
 
