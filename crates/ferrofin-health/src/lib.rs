@@ -12,6 +12,8 @@
 //!   (runs all checkers; plain-text `Healthy` / `Unhealthy`, `200` / `503`),
 //!   `GET /health/live` (process-only `200`) and `GET /health/ready` (runs all
 //!   checkers; `200` when all pass, `503` with the failing names otherwise).
+//! - [`health_routers`] — the same routes in two parts, so a server can put
+//!   Jellyfin's `/health` behind middleware its own probes stay outside.
 //! - [`HealthApi`] — a [`utoipa::OpenApi`] document for the probe endpoints and
 //!   their response schemas.
 //!
@@ -36,7 +38,7 @@ mod router;
 
 pub use checker::{FnChecker, HealthChecker};
 pub use response::{LiveResponse, ReadyResponse};
-pub use router::{STARTUP_CHECK, health_router, startup_router};
+pub use router::{STARTUP_CHECK, health_router, health_routers, startup_router};
 
 /// The build identity baked in at compile time by this crate's `build.rs`:
 /// `FERROFIN_GIT_DESCRIBE` when supplied (Docker builds without `.git`), else

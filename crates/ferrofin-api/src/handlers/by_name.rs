@@ -17,11 +17,11 @@
 use ferrofin_db::entities::users::UserEntity;
 use ferrofin_model::dto::BaseItemDto;
 use ferrofin_model::querying::QueryResult;
-use ferrofin_traits::options::DtoOptions;
+use ferrofin_traits::options::{AuthorizationInfo, DtoOptions};
 use ferrofin_traits::persistence::ItemWithCounts;
 
 use crate::error::ApiError;
-use crate::handlers::items::parse_order_by;
+use crate::handlers::items::{parse_order_by, require_scope_visible};
 use crate::state::AppState;
 
 /// The paging + name-range query parameters shared by every by-name **list**
@@ -270,12 +270,14 @@ impl ByNameListQuery {
     ///
     /// # Errors
     ///
-    /// `400` for an id naming no item.
+    /// `400` for an id naming no item, `401` for one the user may not open.
     pub(crate) async fn parent(
         &self,
         state: &AppState,
+        auth: &AuthorizationInfo,
+        user: Option<&UserEntity>,
     ) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
-        resolve_parent(state, self.parent_id).await
+        resolve_parent(state, auth, self.parent_id, user).await
     }
 
     /// [`Self::base_query`] for `GET /Artists` and `GET /Artists/AlbumArtists`,
@@ -341,10 +343,13 @@ impl ByNameListQuery {
 ///
 /// # Errors
 ///
-/// `400` for an id naming no item, the zero id included.
+/// `400` for an id naming no item, the zero id included, and `401` for one the
+/// user may not open ([`require_scope_visible`]).
 pub(crate) async fn resolve_parent(
     state: &AppState,
+    auth: &AuthorizationInfo,
     parent_id: Option<uuid::Uuid>,
+    user: Option<&UserEntity>,
 ) -> Result<Option<ferrofin_db::entities::base_items::BaseItemEntity>, ApiError> {
     let Some(parent_id) = parent_id else {
         return Ok(None);
@@ -353,7 +358,10 @@ pub(crate) async fn resolve_parent(
         return Err(ApiError::BadRequest("Guid can't be empty".to_owned()));
     }
     match state.library.get_item_by_id(parent_id).await? {
-        Some(parent) => Ok(Some(parent)),
+        Some(parent) => {
+            require_scope_visible(state, auth, &parent, user).await?;
+            Ok(Some(parent))
+        }
         None => Err(ApiError::BadRequest(format!(
             "Invalid parent id: {parent_id}"
         ))),

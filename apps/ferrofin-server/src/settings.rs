@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrofin_core::system_manager::LifecycleController;
+use ferrofin_drawing::ImageLimits;
 use ferrofin_model::server_settings::{
     ServerSettingApplies as Applies, ServerSettingDto, ServerSettingGroup as Group,
     ServerSettingKind, ServerSettingSource as Source, ServerSettingsDto, ServerSettingsUpdateDto,
@@ -788,6 +789,43 @@ pub static SETTINGS: &[SettingSpec] = &[
         running: |c| json!(c.provider_max_wait_seconds),
         ..ROW
     },
+    // ---- Images -----------------------------------------------------------
+    SettingSpec {
+        key: "image_decode_max_megapixels",
+        env: Some("FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS"),
+        env_read: PARSED_U32,
+        group: Group::Images,
+        kind: image_limit(ImageLimits::DECODE_MEGAPIXELS),
+        default: "200",
+        description: "Largest image decoded, in megapixels; a larger one is served as its \
+                      original file.",
+        running: |c| json!(c.image_decode_max_megapixels),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_decode_max_memory_mb",
+        env: Some("FERROFIN_IMAGE_DECODE_MAX_MEMORY_MB"),
+        env_read: PARSED_U32,
+        group: Group::Images,
+        kind: image_limit(ImageLimits::DECODE_MEMORY_MB),
+        default: "512",
+        description: "Memory one image decode may take, in MiB; an image needing more is \
+                      served as its original file.",
+        running: |c| json!(c.image_decode_max_memory_mb),
+        ..ROW
+    },
+    SettingSpec {
+        key: "image_resize_budget_mb",
+        env: Some("FERROFIN_IMAGE_RESIZE_BUDGET_MB"),
+        env_read: PARSED_U32,
+        group: Group::Images,
+        kind: image_limit(ImageLimits::RESIZE_BUDGET_MB),
+        default: "2048",
+        description: "Memory all image resizes in flight share, in MiB; a resize needing more \
+                      alone serves the original file.",
+        running: |c| json!(c.image_resize_budget_mb),
+        ..ROW
+    },
     // ---- WASM plugins -----------------------------------------------------
     SettingSpec {
         key: "wasm_call_timeout_secs",
@@ -924,6 +962,14 @@ pub static SETTINGS: &[SettingSpec] = &[
 // The bounds are a few hundred seconds, and `i64::try_from` is not const.
 #[allow(clippy::cast_possible_wrap)]
 const fn provider_seconds(range: std::ops::RangeInclusive<u64>) -> SettingKind {
+    SettingKind::Integer {
+        min: *range.start() as i64,
+        max: *range.end() as i64,
+    }
+}
+
+/// An image limit's bounds, from `ferrofin_drawing::ImageLimits`.
+const fn image_limit(range: std::ops::RangeInclusive<u32>) -> SettingKind {
     SettingKind::Integer {
         min: *range.start() as i64,
         max: *range.end() as i64,
@@ -1079,6 +1125,18 @@ fn present(value: Value) -> Option<Value> {
     (!value.is_null()).then_some(value)
 }
 
+/// The value `file`, `config.toml` as it is now, gives `spec`, when `in_use` is
+/// the value in use. A count's `auto` runs as no value, so it is named here:
+/// the file holds it, and the page shows it as saved.
+fn file_value(spec: &SettingSpec, file: &Config, in_use: Option<&Value>) -> Option<Value> {
+    match (spec.running)(file) {
+        Value::Null if spec.kind == SettingKind::CountOrAuto && in_use.is_some() => {
+            Some(json!("auto"))
+        }
+        value => present(value),
+    }
+}
+
 /// What the page receives for `spec`. `running` is the configuration in use;
 /// `saved` is `config.toml` as it is now, loaded alone, when it has keys.
 fn setting(
@@ -1104,7 +1162,7 @@ fn setting(
         .filter(|_| {
             spec.access != SettingAccess::EnvOnly && file_keys.iter().any(|key| key == spec.key)
         })
-        .and_then(|saved| present((spec.running)(saved)))
+        .and_then(|saved| file_value(spec, saved, value.as_ref()))
         .filter(|saved| Some(saved) != value.as_ref());
     let locked_reason = locked_reason(spec, source, env);
     let (kind, min, max) = spec.kind.to_dto();
