@@ -20,6 +20,14 @@ If you change a recording path, or its directory goes missing (a share not mount
 starts counts), the library Ferrofin made for it is removed, as on Jellyfin. A library you made
 yourself, or one adopted from Jellyfin whose path is not a recording folder here, stays.
 
+On a database adopted from Jellyfin, the first start of this version drops every location that is
+not a recording folder here from Jellyfin's list of the locations it made libraries for, once, so
+the libraries over those locations stay. During a rolling update the old pod can write the old list
+back if the Live TV settings are saved on it, and the new pod would then remove those libraries the
+next time a restart, a Live TV settings save or a guide refresh checks the recording folders. Do not
+save those settings until the old pod has gone, or
+[stop it first](#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
+
 ## Image limits
 
 Decoding and resizing images are now bounded, and the bounds are settings
