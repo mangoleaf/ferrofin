@@ -8,6 +8,19 @@ Ferrofin's own database upgrades in place: start the new version against the sam
 data directory and its migrations run on boot. Back up the data directory before a
 major-version upgrade.
 
+## Image limits
+
+Decoding and resizing images are now bounded, and the bounds are settings
+([Image limits](CONFIG.md#image-limits)). The defaults keep what most libraries do, but past
+one of them a client gets the original file instead of a thumbnail:
+
+- an image over 200 megapixels, which also gets no blur hash;
+- a Photo item needing more than 512 MiB to decode, which other images were already held to;
+- a resize needing more than 2 GiB of working memory, about 13000 pixels of source width by
+  10000 of output height.
+
+A photo library with larger panoramas may want `FERROFIN_IMAGE_DECODE_MAX_MEGAPIXELS` raised.
+
 ## Kubernetes: stop the old pod first for heavy migrations
 
 The Helm chart's default rolling update keeps the old pod serving and writing the database
