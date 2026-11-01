@@ -92,10 +92,23 @@ pub(crate) async fn static_source(
     })
 }
 
+/// The container a `stream.{container}` route segment names, or `None` when the
+/// segment is not that route.
+///
+/// The route registers as one capture (`routes::to_axum_path`), so the literal
+/// is checked here, in any case, as ASP.NET matches a route's literals. The
+/// container keeps the case it was sent in.
+pub(crate) fn stream_route_container(segment: &str) -> Option<&str> {
+    const LITERAL: &str = "stream.";
+    let (literal, container) = segment.split_at_checked(LITERAL.len())?;
+    (literal.eq_ignore_ascii_case(LITERAL) && !container.is_empty()).then_some(container)
+}
+
 /// The shared body of `VideosController.GetVideoStream` and
 /// `AudioHelper.GetAudioStream`: a `Static=true` request is served from the
 /// source it names; anything else, and a static video request for a disc
-/// folder (which only ffmpeg reads), is transcoded.
+/// folder (which only ffmpeg reads), is transcoded, which needs a caller
+/// ([`transcode_stream_fallback`]).
 pub(crate) async fn static_or_transcode(
     state: &AppState,
     item_id: Uuid,
