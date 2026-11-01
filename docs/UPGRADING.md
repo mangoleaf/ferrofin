@@ -64,6 +64,17 @@ database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
 
+## Unreleased — a photo's image follows its file
+
+A photo's image now carries the file's date and is measured again each time the photo refreshes,
+as in Jellyfin. A photo edited in place gets its new size, aspect ratio, blur hash and image tag
+on the next scan, and clients fetch the new picture. A plain scan of an unchanged library still
+reads no photo. A full refresh now reads every photo it covers, once.
+
+**Do this if** you edited photos in place on an earlier version: they keep their old size and blur
+hash until they next refresh, because nothing tells a scan they changed. Refresh those photos, or
+the library, with **Replace all metadata** or **Search for missing metadata**.
+
 ## Unreleased — `/health` and `/metrics` follow the network access rules
 
 `/health` and, when metrics are on, `/metrics` now obey `EnableRemoteAccess` and the remote IP
