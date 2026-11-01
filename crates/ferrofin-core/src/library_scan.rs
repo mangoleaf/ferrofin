@@ -11999,21 +11999,11 @@ impl LibraryScanner {
                 // `TvdbEpisodeProvider` names no `ResultLanguage`.
                 let mut answer = RemoteAnswer::for_row(row, None);
                 apply_tvdb_episode(&mut answer.item, &ep, display_order.is_empty());
-                // TVDB's per-episode record credits only guest stars and
-                // crew (directors/writers); the series' regular actors live
-                // on the series record. TMDB per-episode credits include
-                // regulars, so when TMDB runs first the fold already has
-                // actors. But when this TVDB answer is the only source —
-                // the series has no TMDB id, or TMDB returned nothing — the
-                // episode page would show no actors at all. Merge the
-                // cached series' actors in ahead of the episode credits,
-                // deduplicating anyone the episode already credits.
-                let series_people = cache
-                    .series_tvdb
-                    .get(&series_id)
-                    .map(|d| d.people.as_slice())
-                    .unwrap_or_default();
-                answer.people = Some(merge_series_cast(tvdb_people(&ep.people), series_people));
+                // `MapEpisodeToResult` `ResetPeople`s and maps the episode's
+                // own `Characters` (`TvdbEpisodeProvider.cs:225,272-308`): a
+                // list, empty when TVDB credits nobody. Nothing upstream adds
+                // the series' regulars to an episode.
+                answer.people = Some(tvdb_people(&ep.people));
                 // `TvdbEpisodeProvider` sets the episode's Tvdb id and the
                 // IMDb id its remote ids carry.
                 answer
@@ -22829,30 +22819,6 @@ fn dedup_images_by_type(images: Vec<RemoteImage>) -> Vec<RemoteImage> {
         .collect()
 }
 
-/// Merges a series' regular actors into an episode's own TVDB credits.
-///
-/// TVDB's per-episode record only carries guest stars and crew; the series
-/// regulars live on the series record. Series actors (in TVDB billing order)
-/// come first, then the episode's own credits. A regular already credited on
-/// the episode keeps the episode's entry (its role is the more specific one).
-fn merge_series_cast(
-    episode_people: Vec<PeopleEntity>,
-    series_people: &[ferrofin_providers::TvdbPerson],
-) -> Vec<PeopleEntity> {
-    let credited: std::collections::HashSet<String> = episode_people
-        .iter()
-        .map(|p| p.name.to_lowercase())
-        .collect();
-    let mut people: Vec<PeopleEntity> = tvdb_people(series_people)
-        .into_iter()
-        .filter(|p| {
-            p.person_type.as_deref() == Some("Actor") && !credited.contains(&p.name.to_lowercase())
-        })
-        .collect();
-    people.extend(episode_people);
-    people
-}
-
 /// Maps TVDB credited people to persistable [`PeopleEntity`] rows. TVDB carries
 /// no numeric person provider id (so `provider_id` is `None`, and the TMDB bio
 /// enrichment skips them); their profile image URL is preserved.
@@ -29498,52 +29464,6 @@ mod tests {
         assert_eq!(named.name.as_deref(), Some("The Real Title"));
     }
 
-    #[test]
-    fn merge_series_cast_prepends_regulars_and_dedupes() {
-        use ferrofin_providers::TvdbPerson;
-        let ep_people = super::tvdb_people(&[
-            TvdbPerson {
-                name: "Guest Star".into(),
-                person_type: "GuestStar".into(),
-                role: Some("Villain".into()),
-                image_url: None,
-            },
-            TvdbPerson {
-                name: "Bill Burr".into(),
-                person_type: "Actor".into(),
-                role: Some("Frank (voice)".into()),
-                image_url: None,
-            },
-        ]);
-        let series_people = vec![
-            TvdbPerson {
-                name: "Bill Burr".into(),
-                person_type: "Actor".into(),
-                role: Some("Frank Murphy".into()),
-                image_url: None,
-            },
-            TvdbPerson {
-                name: "Laura Dern".into(),
-                person_type: "Actor".into(),
-                role: Some("Sue Murphy".into()),
-                image_url: None,
-            },
-            TvdbPerson {
-                name: "Series Writer".into(),
-                person_type: "Writer".into(),
-                role: None,
-                image_url: None,
-            },
-        ];
-        let merged = super::merge_series_cast(ep_people, &series_people);
-        let names: Vec<&str> = merged.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, vec!["Laura Dern", "Guest Star", "Bill Burr"]);
-        let bill = merged.iter().find(|p| p.name == "Bill Burr").unwrap();
-        assert_eq!(bill.role.as_deref(), Some("Frank (voice)"));
-        let alone = super::merge_series_cast(super::tvdb_people(&series_people[..1]), &[]);
-        assert_eq!(alone.len(), 1);
-    }
-
     /// A TVDB stand-in's body for an episode lookup: the series' episode
     /// list and the episode record, crediting `characters` (a JSON array).
     fn tvdb_episode_body(characters: &str) -> &'static str {
@@ -29670,6 +29590,42 @@ mod tests {
             tmdb_and_tvdb_episode_fixture(&nobody, tvdb_episode_body("[]"), tmp.path()).await;
         let result = fold_episode(&scanner, &mut cache, &mut episode, None).await;
         assert_eq!(credited(&result.credits), [None, Some(Vec::new())]);
+    }
+
+    /// TheTVDB's answer for an episode is the episode's own `Characters`
+    /// (`MapEpisodeToResult`, `TvdbEpisodeProvider.cs:225,272-308`), whatever
+    /// the scan already knows about the series. A series record fetched
+    /// earlier in the scan adds nothing to it, so the same episode gets the
+    /// same credits from every scan.
+    #[tokio::test]
+    async fn a_tvdb_first_episode_gets_only_its_own_characters() {
+        let credits = r#"[{"personName":"Guest Star","peopleType":"Guest Star","name":"Villain"}]"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let (tmdb, _hits, _all) = spawn_tmdb_server(Some(SEASON_JSON), Some(CREDITS_JSON));
+        let (scanner, mut cache, mut episode) =
+            tmdb_and_tvdb_episode_fixture(&tmdb, tvdb_episode_body(credits), tmp.path()).await;
+        cache.series_tvdb.insert(
+            "SERIES".to_owned(),
+            ferrofin_providers::TvdbSeriesDetails {
+                tvdb_id: 121_361,
+                people: vec![ferrofin_providers::TvdbPerson {
+                    name: "Series Regular".into(),
+                    person_type: "Actor".into(),
+                    role: Some("Lead".into()),
+                    image_url: None,
+                }],
+                ..Default::default()
+            },
+        );
+
+        let tvdb_first = tvdb_first_options();
+        let result = fold_episode(&scanner, &mut cache, &mut episode, Some(&tvdb_first)).await;
+
+        assert_eq!(
+            credited(&result.credits).first(),
+            Some(&Some(vec!["Guest Star".to_owned()])),
+            "TheTVDB's answer is the episode's characters alone"
+        );
     }
 
     // ---------------------------------------------------------------------
