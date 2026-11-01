@@ -551,4 +551,87 @@ mod tests {
         assert!(panicking.join().is_err());
         drop(memory.hold(100));
     }
+
+    /// A PNG of only a signature, an `IHDR` declaring `width`×`height` 8-bit
+    /// RGBA, an `IDAT` holding a bare zlib header, and `IEND`: a few dozen
+    /// bytes that claim any size, the shape of a decode bomb. The limits are
+    /// checked before pixel data is inflated, so no pixels are needed.
+    fn header_only_png(width: u32, height: u32) -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for &byte in bytes {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        fn chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
+            out.extend_from_slice(&u32::try_from(data.len()).expect("len").to_be_bytes());
+            let start = out.len();
+            out.extend_from_slice(&kind);
+            out.extend_from_slice(data);
+            let crc = crc32(&out[start..]);
+            out.extend_from_slice(&crc.to_be_bytes());
+        }
+        let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        chunk(&mut out, *b"IHDR", &ihdr);
+        // A zlib header and nothing after it: enough for the PNG header read to
+        // succeed, after which the limits judge the declared size.
+        chunk(&mut out, *b"IDAT", &[0x78, 0x9c]);
+        chunk(&mut out, *b"IEND", &[]);
+        out
+    }
+
+    /// A tiny PNG declaring more than the default limits allow is refused by
+    /// both decodes, from its header and not on its missing pixel data.
+    /// 15000² is 225 MP, over the 200 MP default; 13000² is 169 MP, under it,
+    /// but 676 MB as RGBA, over the 512 MiB default.
+    #[rstest]
+    #[case::over_the_pixel_limit(15_000, 15_000, "image_decode_max_megapixels")]
+    #[case::over_the_memory_limit(13_000, 13_000, "image_decode_max_memory_mb")]
+    fn a_header_alone_is_refused_at_the_default_limits(
+        #[case] width: u32,
+        #[case] height: u32,
+        #[case] setting: &str,
+    ) {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("bomb.png");
+        std::fs::write(&path, header_only_png(width, height)).expect("write");
+        let path = path.to_str().expect("utf8");
+        let memory = ImageMemory::new(ImageLimits::default());
+        for result in [memory.decode(path), memory.decode_oriented(path)] {
+            match result {
+                Err(ServiceError::InvalidInput(message)) => {
+                    assert!(message.contains(setting), "{message}");
+                }
+                other => panic!("expected a limit error, got {other:?}"),
+            }
+        }
+    }
+
+    /// The same header-only file at a small size fails on its missing pixel
+    /// data, not on a limit: the control for the test above.
+    #[test]
+    fn a_small_header_alone_is_not_a_limit_error() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let path = dir.path().join("small.png");
+        std::fs::write(&path, header_only_png(64, 64)).expect("write");
+        let memory = ImageMemory::new(ImageLimits::default());
+        match memory.decode(path.to_str().expect("utf8")) {
+            Err(ServiceError::InvalidInput(message)) => {
+                assert!(!message.contains("image_decode_max"), "{message}");
+            }
+            other => panic!("expected a decode error, got {other:?}"),
+        }
+    }
 }
