@@ -66,6 +66,12 @@ use crate::user_entity_ext::{
 pub const DEFAULT_PASSWORD_RESET_PROVIDER_ID: &str =
     "Jellyfin.Server.Implementations.Users.DefaultPasswordResetProvider";
 
+/// The one message every failed username/password login answers with
+/// (`UserManager.AuthenticateUser` and `SessionManager` both throw it,
+/// v12.4), whether the username was unknown or the password wrong, so the
+/// response does not tell a caller which usernames exist.
+pub(crate) const INVALID_CREDENTIALS_MESSAGE: &str = "Invalid username or password entered.";
+
 /// The default username assigned during first-run bootstrap when the host user
 /// name is unusable (C# `"MyJellyfinUser"`).
 const DEFAULT_BOOTSTRAP_USERNAME: &str = "MyJellyfinUser";
@@ -1174,9 +1180,7 @@ impl UserManager for FerrofinUserManager {
             // No such user: an auth failure regardless of provider result. Security
             // audit trail — never log the attempted password.
             tracing::warn!(username, reason = "unknown_user", "login failed");
-            return Err(ServiceError::unauthorized(
-                "Invalid username or password entered.",
-            ));
+            return Err(ServiceError::unauthorized(INVALID_CREDENTIALS_MESSAGE));
         };
 
         if has_permission(self.db.pool(), &user.id, PermissionKind::IsDisabled).await? {

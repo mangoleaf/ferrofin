@@ -2724,8 +2724,9 @@ impl FerrofinSessionManager {
                 )
                 .await?;
         }
-        let user =
-            user.ok_or_else(|| ServiceError::unauthorized("invalid username or password entered"))?;
+        let user = user.ok_or_else(|| {
+            ServiceError::unauthorized(crate::user_manager::INVALID_CREDENTIALS_MESSAGE)
+        })?;
 
         if !self
             .device_manager
