@@ -4125,6 +4125,14 @@ pub struct LibraryScanner {
     /// named after an item whose kind (and so id) changed. `None` until
     /// [`with_path_manager`](Self::with_path_manager): those folders stay.
     path_manager: Option<Arc<dyn ferrofin_traits::system::PathManager>>,
+    /// The cleanup `LibraryManager.DeleteItem` runs before a row goes — its
+    /// metadata folders, then its extracted data (trickplay tiles in both
+    /// locations, chapter images, subtitle and attachment caches) — which
+    /// every row a scan removes takes too
+    /// ([`delete_with_item_data`](Self::delete_with_item_data)). `None` until
+    /// [`with_item_data_cleanup`](Self::with_item_data_cleanup) (unit tests),
+    /// or with no item repository: a removal deletes rows only.
+    item_data: Option<Arc<crate::item_data_cleanup::ItemDataCleanup>>,
     /// Reads the server-wide per-kind `MetadataOptions`
     /// (`ServerConfiguration.MetadataOptions`), live: the fetcher gate for a
     /// kind a library saved no `TypeOptions` entry for, and for an item in no
@@ -4344,6 +4352,7 @@ impl LibraryScanner {
             change_notifier: None,
             virtual_paths: crate::virtual_paths::VirtualPathExpander::identity(),
             path_manager: None,
+            item_data: None,
             root_folder: None,
             metadata_options: None,
             metadata_locale: None,
@@ -4644,6 +4653,17 @@ impl LibraryScanner {
         path_manager: Arc<dyn ferrofin_traits::system::PathManager>,
     ) -> Self {
         self.path_manager = Some(path_manager);
+        self
+    }
+
+    /// The library manager's delete cleanup (the item's metadata folders and
+    /// extracted data), which every row a scan removes takes before it goes.
+    #[must_use]
+    pub fn with_item_data_cleanup(
+        mut self,
+        cleanup: Arc<crate::item_data_cleanup::ItemDataCleanup>,
+    ) -> Self {
+        self.item_data = Some(cleanup);
         self
     }
 
@@ -5251,7 +5271,10 @@ impl LibraryScanner {
         if orphans.is_empty() {
             return Vec::new();
         }
-        match self.persistence.delete_items(&orphans).await {
+        // The removed library's items go with their data, the trickplay
+        // folders beside their media included, as upstream's `DeleteItem`
+        // of the location's folder takes its children's.
+        match self.delete_with_item_data(&orphans, false).await {
             Ok(deleted) => {
                 tracing::info!(
                     removed = deleted.len(),
@@ -9462,7 +9485,7 @@ impl LibraryScanner {
             }),
             _ => Vec::new(),
         };
-        let deleted = self.persistence.delete_items(ids).await?;
+        let deleted = self.delete_with_item_data(ids, false).await?;
         if let Some(notifier) = &self.change_notifier {
             let gone: std::collections::HashSet<&Uuid> = deleted.iter().collect();
             let rows: Vec<BaseItemEntity> = rows
@@ -9472,6 +9495,125 @@ impl LibraryScanner {
             notifier.record_removed(&rows);
         }
         Ok(deleted)
+    }
+
+    /// Deletes `ids` and everything the delete takes with them
+    /// ([`ItemPersistenceService::delete_items`]), each of those rows first
+    /// losing its metadata folders and extracted data, in upstream's order
+    /// (`DeleteItem`/`DeleteItemsUnsafeFast`: metadata paths, then
+    /// `DeleteExternalItemFiles`, then the rows). The rows cleaned are the
+    /// ones the delete takes, listed just before it
+    /// ([`ItemPersistenceService::deletion_closure_ids`]), so a row a re-key
+    /// moved to a new id, or one this scan keeps, is never touched; they are
+    /// read and cleaned a batch at a time, so removing a library does not
+    /// hold every row it had.
+    ///
+    /// With `keep_shared_media`, a row's trickplay folder beside its media
+    /// stays while a video file it is named after is still on disk
+    /// ([`media_folders_in_use`]): the folder is named after the file
+    /// without its extension, so the item now at that file (the same file
+    /// resolved anew, `Movie.mp4` replacing `Movie.mkv`, a case-only rename
+    /// on a case-insensitive mount) shares it, whether or not this scan
+    /// planned that item. Upstream deletes the stale item before the new one
+    /// is built; here the prune runs after the walk, when the new item may
+    /// already have its tiles. The row's own file counts too: a row the scan
+    /// removes while its file is still there (excluded, or taken by another
+    /// item) keeps that folder, which may be another item's, where upstream
+    /// would delete it.
+    ///
+    /// Every row the delete takes is cleaned, the extras and versions it
+    /// owns included, where upstream's `DeleteItem` (and `DELETE /Items`
+    /// here) cleans the item and the rows below it only: an owned row's data
+    /// would otherwise stay on disk for good.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Backend`] when the rows cannot be listed or deleted;
+    /// when the listing fails nothing is touched. A batch whose rows cannot
+    /// be read (a row that does not decode) is logged and deleted without
+    /// its cleanup, so one bad row never stops a library's prune. A delete
+    /// that fails after the cleanup leaves its rows without that data, as
+    /// upstream's does: its files go first too.
+    async fn delete_with_item_data(
+        &self,
+        ids: &[Uuid],
+        keep_shared_media: bool,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        if let (Some(item_data), Some(items)) = (&self.item_data, &self.item_repository) {
+            let closure = self.persistence.deletion_closure_ids(ids).await?;
+            for batch in closure.chunks(ferrofin_db::BATCH_BIND_CHUNK) {
+                let rows = match items.retrieve_items(batch).await {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        tracing::warn!(
+                            %err,
+                            rows = batch.len(),
+                            "could not read removed rows; their extracted data and metadata folders stay"
+                        );
+                        continue;
+                    }
+                };
+                let kept = if keep_shared_media {
+                    self.media_folders_in_use(&rows).await
+                } else {
+                    std::collections::HashSet::new()
+                };
+                let rows: Vec<&BaseItemEntity> = rows.iter().collect();
+                item_data
+                    .delete_item_data(&rows, &|row: &BaseItemEntity| kept.contains(&row.id))
+                    .await;
+            }
+        }
+        self.persistence.delete_items(ids).await
+    }
+
+    /// The ids of the `rows` whose trickplay folder beside their media is on
+    /// disk and named after a video file still beside it (the same name
+    /// without its extension, case-folded): the item at that file, if any,
+    /// uses that folder too. Checked on the blocking pool, one listing per
+    /// directory holding such a folder; a folder whose directory cannot be
+    /// listed is counted in use.
+    async fn media_folders_in_use(
+        &self,
+        rows: &[BaseItemEntity],
+    ) -> std::collections::HashSet<String> {
+        let folders: Vec<(String, std::path::PathBuf)> = rows
+            .iter()
+            .filter_map(|row| {
+                let path = self.virtual_paths.expand(row.path.as_deref()?);
+                let containing_folder =
+                    crate::video_versions::containing_folder_path_at(row, &path);
+                let folder = crate::path_manager::trickplay_folder_beside(
+                    ferrofin_traits::system::MediaLocation {
+                        path: &path,
+                        containing_folder: &containing_folder,
+                    },
+                )?;
+                Some((row.id.clone(), folder))
+            })
+            .collect();
+        if folders.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let checked = tokio::task::spawn_blocking(move || {
+            let mut naming = None;
+            let mut stems = VideoStemsByDir::default();
+            folders
+                .into_iter()
+                .filter(|(_, folder)| folder.is_dir())
+                .filter(|(_, folder)| {
+                    let naming = naming.get_or_insert_with(NamingOptions::new);
+                    stems.in_use(folder, naming)
+                })
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .await;
+        checked.unwrap_or_else(|err| {
+            // Nothing is known to be free: keep every such folder.
+            tracing::warn!(%err, "checking the trickplay folders beside removed media failed");
+            rows.iter().map(|row| row.id.clone()).collect()
+        })
     }
 
     /// The dynamic image providers over this scanner's stores, when it has all
@@ -9889,8 +10031,10 @@ impl LibraryScanner {
                 continue;
             }
             // Exactly what went: the rows and everything the delete took
-            // with them (the extras `delete_items` removes with an owner).
-            match self.persistence.delete_items(&ids).await {
+            // with them (the extras `delete_items` removes with an owner),
+            // each with its metadata folders and extracted data, but never a
+            // trickplay folder beside media a video file still on disk shares.
+            match self.delete_with_item_data(&ids, true).await {
                 Ok(deleted) => {
                     if scope.is_some() {
                         log_pruned(&deleted, &existing, &children);
@@ -19122,6 +19266,45 @@ fn kept_row(ids: &[Uuid], weights: &HashMap<Uuid, ItemUserWeight>) -> Option<Uui
             .unwrap_or_else(|| ItemUserWeight::none(id))
             .keep_rank()
     })
+}
+
+/// The video files' names without their extension, case-folded, in each
+/// directory asked about, each listed once: a trickplay folder beside media,
+/// `{stem}.trickplay`, is still in use while its directory holds a video
+/// file named `{stem}` ([`Self::in_use`]).
+#[derive(Default)]
+struct VideoStemsByDir(HashMap<std::path::PathBuf, Option<std::collections::HashSet<String>>>);
+
+impl VideoStemsByDir {
+    /// Whether a video file named like `folder` is beside it. A directory
+    /// that cannot be listed counts as holding one, so nothing is deleted on
+    /// a guess.
+    fn in_use(&mut self, folder: &std::path::Path, naming: &NamingOptions) -> bool {
+        let (Some(dir), Some(name)) = (folder.parent(), folder.file_name()) else {
+            return false;
+        };
+        let stem = crate::path_manager::file_stem(&name.to_string_lossy()).to_lowercase();
+        self.0
+            .entry(dir.to_path_buf())
+            .or_insert_with(|| {
+                // An entry that cannot be read fails the whole listing.
+                let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+                    .ok()?
+                    .collect::<Result<_, _>>()
+                    .ok()?;
+                Some(
+                    entries
+                        .iter()
+                        .filter(|entry| entry.path().is_file())
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .filter(|name| video_resolver::is_video_file(name, naming))
+                        .map(|name| crate::path_manager::file_stem(&name).to_lowercase())
+                        .collect(),
+                )
+            })
+            .as_ref()
+            .is_none_or(|stems| stems.contains(&stem))
+    }
 }
 
 /// Whether the stored type name `type_name` is a kind the scan plans a video
@@ -38342,6 +38525,124 @@ mod tests {
             count_type_like(&db, "%TV.Episode").await,
             1,
             "unreachable location skips the prune"
+        );
+    }
+
+    /// Records each `DeleteExternalItemFiles` call's id and media path.
+    #[derive(Default)]
+    struct RecordingExternalData {
+        calls: std::sync::Mutex<Vec<(uuid::Uuid, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ferrofin_traits::system::ExternalDataManager for RecordingExternalData {
+        async fn delete_external_item_data(
+            &self,
+            _item_id: uuid::Uuid,
+            _media: ferrofin_traits::system::MediaLocation<'_>,
+        ) -> Result<(), ServiceError> {
+            unimplemented!("a scan removal only removes the files")
+        }
+
+        async fn delete_external_item_files(
+            &self,
+            item_id: uuid::Uuid,
+            media: ferrofin_traits::system::MediaLocation<'_>,
+        ) -> Result<(), ServiceError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((item_id, media.path.to_owned()));
+            Ok(())
+        }
+    }
+
+    /// A scan removal cleans every row the delete takes, past one batch of
+    /// reads, before the rows go. With the shared-media guard, a row's media
+    /// path is withheld (so the trickplay folder beside it stays) only while
+    /// that folder is on disk and a video file of its name is beside it: a
+    /// container swap keeps it, a sidecar of the same name does not.
+    #[tokio::test]
+    async fn a_scan_removal_cleans_every_row_it_deletes_and_spares_shared_media() {
+        use crate::item_repository::FerrofinItemRepository;
+        use crate::item_type_lookup::ItemTypeLookup;
+        use ferrofin_traits::persistence::ItemRepository;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Database::connect_in_memory().await.unwrap();
+        db.run_migrations().await.unwrap();
+        let persistence = Arc::new(FerrofinItemPersistenceService::new(db.clone()));
+        let vf: Arc<dyn VirtualFolderManager> = Arc::new(
+            FerrofinVirtualFolderManager::new(tmp.path().join("default"))
+                .with_item_store(persistence.clone()),
+        );
+        let items: Arc<dyn ItemRepository> = Arc::new(FerrofinItemRepository::new(
+            db.clone(),
+            Arc::new(ItemTypeLookup::new()),
+        ));
+        let external = Arc::new(RecordingExternalData::default());
+        let cleanup = Arc::new(crate::item_data_cleanup::ItemDataCleanup::new(
+            crate::app_paths::test_paths(tmp.path()),
+        ));
+        cleanup.set_external_data(external.clone());
+        let scanner = LibraryScanner::new(vf, Arc::new(FerrofinFileSystem::new()), persistence)
+            .with_items(items)
+            .with_item_data_cleanup(cleanup);
+
+        // More rows than one batch reads.
+        let many: Vec<uuid::Uuid> = (0..=ferrofin_db::BATCH_BIND_CHUNK)
+            .map(|_| uuid::Uuid::new_v4())
+            .collect();
+        for id in &many {
+            crate::test_support::seed_item(&db, *id, BaseItemKind::Movie).await;
+        }
+        let mut deleted = scanner.delete_with_item_data(&many, false).await.unwrap();
+        deleted.sort_unstable();
+        let mut cleaned: Vec<uuid::Uuid> = external
+            .calls
+            .lock()
+            .unwrap()
+            .drain(..)
+            .map(|(id, _)| id)
+            .collect();
+        cleaned.sort_unstable();
+        let mut expected = many.clone();
+        expected.sort_unstable();
+        assert_eq!(deleted, expected, "every row deleted");
+        assert_eq!(cleaned, expected, "every row cleaned, across batches");
+
+        // `Mike.mkv` became `Mike.mp4`; `Kilo.mkv` is gone, its NFO stays;
+        // `Lima.mkv` is still there (excluded, or taken by another item).
+        let media = tmp.path().join("media");
+        for path in ["Mike.mp4", "Kilo.nfo", "Lima.mkv"] {
+            std::fs::create_dir_all(&media).unwrap();
+            std::fs::write(media.join(path), b"").unwrap();
+        }
+        for folder in ["Mike.trickplay", "Kilo.trickplay", "Lima.trickplay"] {
+            std::fs::create_dir_all(media.join(folder)).unwrap();
+        }
+        let (mike, kilo, lima) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        for (id, name) in [(mike, "Mike.mkv"), (kilo, "Kilo.mkv"), (lima, "Lima.mkv")] {
+            crate::test_support::seed_item(&db, id, BaseItemKind::Movie).await;
+            let path = media.join(name).to_string_lossy().into_owned();
+            crate::test_support::set_item_path(&db, id, &path).await;
+        }
+        scanner
+            .delete_with_item_data(&[mike, kilo, lima], true)
+            .await
+            .unwrap();
+        let calls: std::collections::HashMap<uuid::Uuid, String> =
+            external.calls.lock().unwrap().drain(..).collect();
+        assert_eq!(calls[&mike], "", "Mike.trickplay is the new Mike.mp4's");
+        assert_eq!(calls[&lima], "", "Lima.mkv is still there");
+        assert_eq!(
+            calls[&kilo],
+            media.join("Kilo.mkv").to_string_lossy(),
+            "no video named Kilo is left"
         );
     }
 
