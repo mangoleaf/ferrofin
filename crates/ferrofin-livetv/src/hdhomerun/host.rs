@@ -1010,6 +1010,9 @@ mod tests {
                 .expect("stream");
             assert_eq!(chosen.kind, ChannelStreamKind::Http);
             assert_eq!(chosen.source.path.as_deref(), Some(expected));
+            // Only an M3U tuner's URL is private: this one names a device on
+            // the local network and no account.
+            assert!(!chosen.source.path_is_private);
         }
     }
 
