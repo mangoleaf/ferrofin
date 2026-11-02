@@ -31,13 +31,18 @@ pub trait Extension: Send + Sync {
     fn descriptor(&self) -> PluginDescriptor;              // name, version, description
     fn default_config(&self) -> Vec<u8>;                   // seed config on first run
     fn config_pages(&self) -> Vec<PluginConfigPage> { … }  // its settings page(s)
+    fn media_segment_providers(&self, cx: &ExtensionContext)
+        -> Vec<Arc<dyn MediaSegmentProvider>> { … }        // intro/credit producers
+    fn auth_providers(&self, cx: &ExtensionContext)
+        -> Vec<Arc<dyn AuthenticationManager>> { … }       // sign-in backends
     fn tasks(&self, cx: &ExtensionContext) -> Vec<Arc<dyn ScheduledTask>>;
 }
 ```
 
 An extension receives **only manager trait objects**, never concrete types — an
 `ExtensionContext` bundling the `LibraryManager`, `MediaSegmentManager`, `PluginManager`,
-`MergeVersionsManager`, an optional audio `Fingerprinter`, and a per-extension cache dir. It
+`MergeVersionsManager`, `UserManager`, an optional audio `Fingerprinter`, and a per-extension
+cache dir. It
 is the same dependency-injection seam the rest of the server uses (see
 [`ARCHITECTURE.md`](ARCHITECTURE.md)), so an extension can do real work — scan the library,
 persist media segments, register background tasks — without reaching into implementation
@@ -57,6 +62,15 @@ no discovery, no filesystem scan, no dynamic loading. Consequences:
   (no network fetch). Refresh with `FERROFIN_REFRESH_PLUGIN_ASSETS=1 cargo build -p ferrofin-extensions`.
   The Ferrofin extension's own page is the exception: it is authored here
   ([below](#the-ferrofin-extension)).
+- **Authentication providers join sign-in late.** The user manager is built before the
+  extensions, so the composition root hands it every extension's `auth_providers` once
+  they are wired (`register_auth_providers`). Sign-in consults them after the built-in
+  default, and `GET /Auth/Providers` lists each enabled one by its display name and the id a
+  user's `AuthenticationProviderId` stores, which may differ. A provider reports the
+  user's administrator flag in its result rather than saving the user's policy itself
+  (which would wait forever on the login lock it is called under). The user manager applies
+  it through `UserManager::apply_external_administrator`, which sign-in paths outside the
+  password flow call too, and never demotes the last administrator.
 - **The `CanUninstall=true` quirk.** jellyfin-web gates the enable/disable toggle on the
   plugin reporting `CanUninstall=true`, so compiled-in extensions report `true` to surface
   the toggle — even though the actual uninstall call is still rejected (you can't uninstall
@@ -498,8 +512,9 @@ host capabilities are issues on this repository and land as additive WIT changes
 
 ## Non-goals for the WASM tier
 
-- **Authentication providers (SSO/LDAP)** — security-critical core surface; if wanted it
-  becomes a core feature, never sandbox-hosted third-party code.
+- **Authentication providers (SSO/LDAP)** — security-critical surface: they are internal
+  plugins (compiled-in extensions, through `Extension::auth_providers`) or core features,
+  never sandbox-hosted third-party code.
 - **DLNA** — needs SSDP/UDP sockets; the sandbox has no sockets by design.
 - **Item mutation/linking** (Merge-Versions-shaped) — item identity stays host-owned;
   plugins contribute metadata, they never restructure the library.

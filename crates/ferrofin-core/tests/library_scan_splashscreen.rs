@@ -119,6 +119,7 @@ impl ImageEncoder for RecordingEncoder {
         _: i32,
         _: i32,
         _: Option<i32>,
+        _: bool,
     ) -> Result<i32, ServiceError> {
         Ok(0)
     }

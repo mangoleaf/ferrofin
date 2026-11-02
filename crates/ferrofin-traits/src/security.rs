@@ -12,6 +12,9 @@
 //!   pre-resolved user, and [`AuthenticationManager::new_user_policy`] exposes
 //!   the default policy. `ProviderAuthenticationResult` is ported as
 //!   [`ProviderAuthenticationResult`].
+//! - The C# `GetType().FullName` a user's `AuthenticationProviderId` stores
+//!   becomes [`AuthenticationManager::id`], beside the display
+//!   [`name`](AuthenticationManager::name).
 //! - [`QuickConnect::get_authorized_request`] returns the
 //!   [`AuthenticationResultData`] (session and token) of the C#
 //!   `AuthenticationResult`; the API layer adds its `User` and `ServerId`.
@@ -34,7 +37,8 @@ use crate::session::AuthenticationResultData;
 /// The result of a successful provider authentication.
 ///
 /// Port of `ProviderAuthenticationResult`: the resolved canonical username plus
-/// an optional display name.
+/// an optional display name, and an administrator flag the C# result does not
+/// carry ([`administrator`](Self::administrator)).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ProviderAuthenticationResult {
     /// The canonical username the credentials resolved to.
@@ -42,6 +46,22 @@ pub struct ProviderAuthenticationResult {
 
     /// An optional display name supplied by the provider.
     pub display_name: Option<String>,
+
+    /// Whether the signed-in user should be an administrator, or `None` to
+    /// leave their flag as it is. Once this provider has authenticated the
+    /// user, before the account checks (disabled, remote access, schedule),
+    /// the user manager applies it through
+    /// [`UserManager::apply_external_administrator`](crate::library::UserManager::apply_external_administrator),
+    /// which never demotes the last administrator: the user stays one and a
+    /// warning is logged.
+    ///
+    /// Upstream's LDAP plugin sets the flag itself, calling
+    /// `IUserManager.UpdateUserAsync` from inside `Authenticate`, which works
+    /// because upstream's user lock nests. The login lock Ferrofin holds
+    /// across a provider does not, so a provider that saved the policy of the
+    /// user it is signing in would wait on that lock forever. It reports the
+    /// flag here instead.
+    pub administrator: Option<bool>,
 }
 
 /// A pluggable authentication backend (built-in, LDAP, …).
@@ -51,8 +71,18 @@ pub struct ProviderAuthenticationResult {
 /// grouping; concrete providers register in `ferrofin-core`.
 #[async_trait]
 pub trait AuthenticationManager: Send + Sync {
-    /// The provider's display name.
+    /// The provider's display name, the `Name` `GET /Auth/Providers` lists.
     fn name(&self) -> &str;
+
+    /// The id a user's `AuthenticationProviderId` stores to select this
+    /// provider, the `Id` `GET /Auth/Providers` lists (C# `GetType().FullName`).
+    ///
+    /// Defaults to [`name`](Self::name). A provider whose display name and
+    /// stored id differ overrides it: LDAP-Auth shows `LDAP-Authentication`
+    /// and stores `Jellyfin.Plugin.LDAP_Auth.LdapAuthenticationProviderPlugin`.
+    fn id(&self) -> &str {
+        self.name()
+    }
 
     /// Whether the provider is currently enabled.
     async fn is_enabled(&self) -> Result<bool, ServiceError>;
@@ -153,6 +183,7 @@ mod tests {
         let r = ProviderAuthenticationResult::default();
         assert_eq!(r.username, "");
         assert_eq!(r.display_name, None);
+        assert_eq!(r.administrator, None, "no flag leaves the user's alone");
     }
 
     #[test]
@@ -160,8 +191,10 @@ mod tests {
         let r = ProviderAuthenticationResult {
             username: "alice".to_owned(),
             display_name: Some("Alice".to_owned()),
+            administrator: Some(true),
         };
         assert_eq!(r.username, "alice");
         assert_eq!(r.display_name.as_deref(), Some("Alice"));
+        assert_eq!(r.administrator, Some(true));
     }
 }

@@ -877,7 +877,9 @@ pub async fn build_app_state(
             // receivers — jellyfin-web shows no cast devices without one.
             .with_configuration(Arc::clone(&config_trait)),
     );
-    let users: Arc<dyn ferrofin_traits::library::UserManager> = users_impl;
+    // Kept concrete until the extensions exist: their authentication providers
+    // join it late (`register_auth_providers`, below).
+    let users: Arc<dyn ferrofin_traits::library::UserManager> = users_impl.clone();
     // Kept concrete until the session manager exists: the versions a
     // played-state change propagates to are announced through it (below).
     let user_data_impl = Arc::new(FerrofinUserDataManager::new(
@@ -2034,7 +2036,12 @@ pub async fn build_app_state(
         intro_skipper_runtime: Arc::default(),
         virtual_folders: Arc::clone(&virtual_folders),
         chapters: Arc::clone(&chapters),
+        users: Arc::clone(&users),
     };
+    // The user manager was built long before the extensions: their
+    // authentication providers fill its one late slot now, before the server
+    // takes a request. Every clone of the manager shares that slot.
+    ferrofin_extensions::register_auth_providers(&extensions, &extension_cx, &users_impl);
     let intro_skipper_analysis = ferrofin_extensions::intro_skipper::analysis(&extension_cx);
     subscribe_intro_skipper(&event_bus, &intro_skipper_analysis);
     // Register actual loaded producers before the core "Media Segment Scan"

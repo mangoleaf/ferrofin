@@ -31,7 +31,7 @@
 
 use ferrofin_util::directory_path::DirectoryPath;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
 use async_trait::async_trait;
 use ferrofin_db::Database;
@@ -47,12 +47,13 @@ use sqlx::{Sqlite, SqliteExecutor};
 use uuid::Uuid;
 
 use ferrofin_traits::error::ServiceError;
-use ferrofin_traits::library::{PolicyGuardState, PolicySaved, UserManager, policy_update_refusal};
+use ferrofin_traits::library::{
+    AdminFlagOutcome, PolicyGuardState, PolicySaved, UserManager, policy_update_refusal,
+};
 use ferrofin_traits::security::AuthenticationManager;
 
 use crate::auth_providers::{
-    DEFAULT_AUTH_PROVIDER_ID, DefaultAuthenticationProvider, INVALID_AUTH_PROVIDER_ID,
-    InvalidAuthProvider,
+    DEFAULT_AUTH_PROVIDER_ID, DefaultAuthenticationProvider, InvalidAuthProvider,
 };
 use crate::db_error::db_err;
 use crate::user_entity_ext::{
@@ -84,7 +85,11 @@ mod user_repository;
 ///
 /// Holds the registered [`AuthenticationManager`] providers by shared reference
 /// so the composition root can supply LDAP/other backends alongside the
-/// built-in default; the built-in [`DefaultAuthenticationProvider`] is kept
+/// built-in default, those of compiled-in extensions joining late
+/// ([`set_extension_providers`](Self::set_extension_providers)). A provider
+/// is stored and selected by its [`id`](AuthenticationManager::id) and shown
+/// by its [`name`](AuthenticationManager::name). The built-in
+/// [`DefaultAuthenticationProvider`] is kept
 /// separately for its password-hash formatting helper (which is not on the
 /// object-safe trait).
 #[derive(Clone)]
@@ -95,6 +100,12 @@ pub struct FerrofinUserManager {
     default_provider: DefaultAuthenticationProvider,
     invalid_provider: InvalidAuthProvider,
     providers: Vec<Arc<dyn AuthenticationManager>>,
+    /// The providers compiled-in extensions contribute, consulted after
+    /// [`providers`](Self::providers). The manager is built long before the
+    /// extensions are, so the composition root fills this once they are
+    /// wired ([`set_extension_providers`](Self::set_extension_providers)).
+    /// It is behind an `Arc` so every clone of the manager sees that fill.
+    extension_providers: Arc<OnceLock<Vec<Arc<dyn AuthenticationManager>>>>,
     /// This server's stable id, stamped onto every [`UserDto.ServerId`] when the
     /// caller does not supply one. The web client keys its per-server api-client
     /// on it and throws (`getApiClient(null)`) if it is missing. Set by the
@@ -122,7 +133,7 @@ pub struct FerrofinUserManager {
 impl std::fmt::Debug for FerrofinUserManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FerrofinUserManager")
-            .field("provider_count", &self.providers.len())
+            .field("provider_count", &self.registered_providers().count())
             .finish_non_exhaustive()
     }
 }
@@ -167,7 +178,23 @@ impl FerrofinUserManager {
         }
     }
 
+    /// Every registered provider in the order sign-in consults them (C#
+    /// `_authenticationProviders`, the built-in types before the plugins'): the
+    /// built-in default, any [`with_providers`](Self::with_providers) extras,
+    /// then the extensions' ([`set_extension_providers`](Self::set_extension_providers)).
+    fn registered_providers(&self) -> impl Iterator<Item = &dyn AuthenticationManager> {
+        self.providers
+            .iter()
+            .chain(self.extension_providers.get().into_iter().flatten())
+            .map(Arc::as_ref)
+    }
+
     /// Enabled providers selected by the saved ID; an unknown ID fails closed.
+    ///
+    /// The id is matched before `is_enabled` is asked, the reverse of C#'s
+    /// `Where(IsEnabled)` then `Where(id)`, with the same result: a provider
+    /// another user's sign-in never selects is not consulted, so an extension
+    /// provider whose `is_enabled` fails cannot fail a local account's sign-in.
     async fn authentication_providers_for(
         &self,
         user: Option<&UserEntity>,
@@ -176,11 +203,11 @@ impl FerrofinUserManager {
             .map(|u| u.authentication_provider_id.as_str())
             .filter(|id| !id.is_empty());
         let mut candidates: Vec<&dyn AuthenticationManager> = Vec::new();
-        for provider in &self.providers {
-            if provider.is_enabled().await?
-                && wanted.is_none_or(|id| provider_id(provider.name()).eq_ignore_ascii_case(id))
+        for provider in self.registered_providers() {
+            if wanted.is_none_or(|id| provider.id().eq_ignore_ascii_case(id))
+                && provider.is_enabled().await?
             {
-                candidates.push(provider.as_ref());
+                candidates.push(provider);
             }
         }
         if candidates.is_empty() {
@@ -206,7 +233,7 @@ impl FerrofinUserManager {
                 Err(ServiceError::Unauthorized(_)) => continue,
                 Err(error) => return Err(error),
             };
-            let id = provider_id(provider.name());
+            let id = provider.id();
             let mut resolved = if let Some(user) = &user {
                 self.fetch_user(
                     Uuid::parse_str(&user.id)
@@ -235,6 +262,17 @@ impl FerrofinUserManager {
                     .map_err(db_err)?;
                 id.clone_into(&mut user.authentication_provider_id);
                 self.users_changed();
+            }
+            // After the new-user policy, so the provider's flag is the last word.
+            // As upstream's LDAP plugin sets it inside `Authenticate`, this
+            // comes before the disabled, remote-access and schedule checks.
+            if let Some(administrator) = result.administrator
+                && let Some(user) = &resolved
+            {
+                let uid = Uuid::parse_str(&user.id)
+                    .map_err(|error| ServiceError::backend(error.to_string()))?;
+                self.apply_external_administrator(uid, administrator)
+                    .await?;
             }
             return Ok((resolved, true));
         }
@@ -307,12 +345,31 @@ impl FerrofinUserManager {
             default_provider: DefaultAuthenticationProvider::new(),
             invalid_provider: InvalidAuthProvider::new(),
             providers,
+            extension_providers: Arc::default(),
             server_id: None,
             activity: None,
             config: None,
             profile_image_dir: None,
             image_processor: None,
             auth_cache: Arc::new(crate::auth_cache::AuthCache::default()),
+        }
+    }
+
+    /// Registers the authentication providers compiled-in extensions
+    /// contribute, consulted after the built-in default and any
+    /// [`with_providers`](Self::with_providers) extras, in the order given.
+    ///
+    /// Called once by the composition root after the extensions are wired:
+    /// the manager exists long before they do. Every clone of this manager,
+    /// earlier or later, sees the providers. A second call is a no-op and
+    /// logs a warning.
+    ///
+    /// A provider may hold the user manager it is registered with, a
+    /// reference cycle. Both live for the whole process, so it is never freed,
+    /// which is harmless.
+    pub fn set_extension_providers(&self, providers: Vec<Arc<dyn AuthenticationManager>>) {
+        if self.extension_providers.set(providers).is_err() {
+            tracing::warn!("extension authentication providers were already registered; ignoring");
         }
     }
 
@@ -776,18 +833,6 @@ impl FerrofinUserManager {
     }
 }
 
-/// The stored provider id for a provider `name` (C# `GetType().FullName`). The
-/// two built-in providers map to their canonical `Jellyfin.*` type names so a
-/// migrated database matches; any other provider is assumed to already report
-/// its fully-qualified id as its name.
-fn provider_id(name: &str) -> &str {
-    match name {
-        "Default" => DEFAULT_AUTH_PROVIDER_ID,
-        "InvalidOrMissingAuthenticationProvider" => INVALID_AUTH_PROVIDER_ID,
-        other => other,
-    }
-}
-
 /// The C# `ValidUsernameRegex` (`^(?!\s)[\w\ \-'._@+]+(?<!\s)$`,
 /// `UserManager.cs:119`) without its lookarounds, which [`valid_username`]
 /// checks itself. .NET's `\w` is `[\p{L}\p{Mn}\p{Nd}\p{Pc}]`, narrower than
@@ -1136,7 +1181,7 @@ impl UserManager for FerrofinUserManager {
         let candidates = self.authentication_providers_for(Some(&user)).await?;
         let provider = candidates[0]; // The invalid-provider fallback guarantees a candidate.
         provider.change_password(&user, new_password).await?;
-        if provider_id(provider.name()) != DEFAULT_AUTH_PROVIDER_ID {
+        if provider.id() != DEFAULT_AUTH_PROVIDER_ID {
             self.users_changed();
             return Ok(());
         }
@@ -1264,19 +1309,37 @@ impl UserManager for FerrofinUserManager {
 
     async fn get_authentication_providers(&self) -> Result<Vec<NameIdPair>, ServiceError> {
         let mut pairs = Vec::new();
-        for provider in &self.providers {
+        for provider in self.registered_providers() {
             if provider.is_enabled().await? {
                 pairs.push(NameIdPair {
                     name: Some(provider.name().to_owned()),
-                    id: Some(provider_id(provider.name()).to_owned()),
+                    id: Some(provider.id().to_owned()),
                 });
             }
         }
-        // Default provider first, then by name (C# ordering).
+        // C# `OrderBy(i => i is DefaultAuthenticationProvider ? 0 : 1)
+        // .ThenBy(i => i.Name)`: a stable sort, the names compared in the
+        // current culture (`Comparer<string>.Default`). A stock server lists
+        // Default alone, which needs no comparer.
+        if pairs.len() < 2 {
+            return Ok(pairs);
+        }
+        let comparer =
+            ferrofin_util::current_culture::comparer(&ferrofin_util::current_culture::capture())
+                .ok();
         pairs.sort_by(|a, b| {
             let rank =
                 |p: &NameIdPair| i32::from(p.id.as_deref() != Some(DEFAULT_AUTH_PROVIDER_ID));
-            rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name))
+            let (a_name, b_name) = (
+                a.name.as_deref().unwrap_or_default(),
+                b.name.as_deref().unwrap_or_default(),
+            );
+            rank(a).cmp(&rank(b)).then_with(|| {
+                comparer.as_ref().map_or_else(
+                    || a_name.cmp(b_name),
+                    |comparer| comparer.compare(a_name, b_name),
+                )
+            })
         });
         Ok(pairs)
     }
@@ -1471,6 +1534,44 @@ impl UserManager for FerrofinUserManager {
         policy: &UserPolicy,
     ) -> Result<PolicySaved, ServiceError> {
         self.save_policy(user_id, policy, true).await
+    }
+
+    /// One writer transaction reads the flag, counts the administrators and
+    /// writes, so concurrent sign-ins cannot both demote one of the last two
+    /// administrators. It takes no login lock: the password path calls it
+    /// while holding the user's, which does not nest (`save_policy` would wait
+    /// on it forever).
+    async fn apply_external_administrator(
+        &self,
+        user_id: Uuid,
+        administrator: bool,
+    ) -> Result<AdminFlagOutcome, ServiceError> {
+        let id = guid_to_db(user_id);
+        let mut tx = self.db.writer().begin().await.map_err(db_err)?;
+        let user = Self::fetch_user_on(&mut *tx, user_id)
+            .await?
+            .ok_or_else(|| ServiceError::not_found(format!("user {user_id}")))?;
+        if has_permission(&mut *tx, &id, PermissionKind::IsAdministrator).await? == administrator {
+            return Ok(AdminFlagOutcome::Unchanged);
+        }
+        if !administrator && Self::admin_count_on(&mut *tx).await? <= 1 {
+            tracing::warn!(
+                user_id = %user.id,
+                username = %user.username,
+                "sign-in would demote the last administrator; keeping them one"
+            );
+            return Ok(AdminFlagOutcome::KeptLastAdministrator);
+        }
+        set_permission_tx(&mut tx, &id, PermissionKind::IsAdministrator, administrator).await?;
+        tx.commit().await.map_err(db_err)?;
+        self.users_changed();
+        tracing::info!(
+            user_id = %user.id,
+            username = %user.username,
+            administrator,
+            "sign-in set the administrator flag"
+        );
+        Ok(AdminFlagOutcome::Applied)
     }
 
     async fn save_profile_image(

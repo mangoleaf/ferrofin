@@ -1,6 +1,6 @@
 # Feature status
 
-**Parity: 39 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
+**Parity: 40 / 412 operations deep-verified against Jellyfin v12.4** (`83d0d0e7f7`), plus
 17 compared against v12.2 and owed a re-check, 6 subsystem rows (as of 2026-11-02; the
 `contract_superset` test prints the current line).
 **Live parity:** the latest release's overview, how many of the requests jellyfin-web makes
@@ -344,8 +344,6 @@ the season's folder change asks the season providers.
   location that is missing, empty or cannot be listed (an unmounted drive or share).
 - **Artwork is downloaded only for an item that has none.** Jellyfin also downloads each
   missing image type of an item that has some, such as a backdrop beside an existing poster.
-- **Replace existing trickplay images** does nothing during a scan yet: trickplay images
-  come only from the **Generate Trickplay Images** scheduled task.
 
 ### After an upgrade or an adoption
 
