@@ -1138,13 +1138,13 @@ fn from_hex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// Reads a plugin's state map from disk, leniently: missing OR corrupt
-/// file = empty. Only safe for READS — see [`read_state_for_write`].
-fn read_state(path: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+/// Reads a plugin's state map from disk; `None` when the file is missing,
+/// unreadable or corrupt, which READS treat as empty. Writes go through
+/// [`read_state_for_write`] instead.
+fn read_state(path: &std::path::Path) -> Option<std::collections::BTreeMap<String, String>> {
     std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
 }
 
 /// Reads the state map for a WRITE: only a genuinely-absent file may read
@@ -1162,10 +1162,31 @@ fn read_state_for_write(
     }
 }
 
-/// Executes `get-state` for a guest.
+/// Executes `get-state` for a guest. A missing or corrupt state file reads
+/// as empty. The parsed map is kept between calls and used while the file's
+/// length, modified time and (on unix) inode are unchanged, so polling a key
+/// costs a `stat`, not a read and parse of the whole file.
 #[must_use]
 pub fn get_state(path: Option<&std::path::Path>, key: &str) -> Option<Vec<u8>> {
-    read_state(path?).get(key).and_then(|v| from_hex(v))
+    let path = path?;
+    let slot = state_slot(path);
+    let mut kept = slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(stamp) = StateStamp::of(path) else {
+        // Missing (an uninstall removes it), or no modified time to check a
+        // kept map against: read it and keep nothing.
+        *kept = None;
+        return from_hex(read_state(path)?.get(key)?);
+    };
+    if kept.as_ref().is_none_or(|old| old.stamp != stamp) {
+        // Drop the stale map first, so it and the new one are never held at
+        // once. An unreadable or corrupt file is not kept: it reads as empty
+        // now and is read again next time.
+        *kept = None;
+        *kept = read_state(path).map(|map| KeptState { stamp, map });
+    }
+    from_hex(kept.as_ref()?.map.get(key)?)
 }
 
 /// Executes `set-state` for a guest: `None` deletes; writes are atomic
@@ -1181,22 +1202,67 @@ pub fn set_state(
     set_state_capped(path, key, value, STATE_TOTAL_DEFAULT)
 }
 
-type StateWriteLocks =
-    std::collections::HashMap<std::path::PathBuf, std::sync::Weak<std::sync::Mutex<()>>>;
+/// A state file's length, modified time and (on unix) inode: what
+/// [`get_state`] checks a kept map against before using it. A write made
+/// here replaces the kept map itself ([`set_state_capped`]), so the stamp
+/// only has to notice the file changing elsewhere: a backup restore rewrites
+/// it, an uninstall removes it, and while a rolling update runs two servers
+/// the other one's `set-state` renames a new file over it, which the inode
+/// tells apart even inside one modified-time tick.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StateStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    inode: u64,
+}
 
-fn state_write_lock(path: &Path) -> Arc<std::sync::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<std::sync::Mutex<StateWriteLocks>> =
-        std::sync::OnceLock::new();
-    let mut locks = LOCKS
-        .get_or_init(|| std::sync::Mutex::new(StateWriteLocks::new()))
+impl StateStamp {
+    /// The stamp of the file at `path`; `None` when it is missing or has no
+    /// modified time.
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(&meta),
+        })
+    }
+}
+
+/// A state map as read from, or last written to, the file with `stamp`.
+struct KeptState {
+    stamp: StateStamp,
+    map: std::collections::BTreeMap<String, String>,
+}
+
+/// One state file's lock, taken by its reads and writes alike, guarding the
+/// map last read or written there.
+type StateSlot = Arc<std::sync::Mutex<Option<KeptState>>>;
+
+type StateSlots = std::collections::HashMap<std::path::PathBuf, StateSlot>;
+
+/// The slot for the state file at `path`. Slots live as long as the
+/// process, one per state path (one per plugin), so each plugin keeps about
+/// the size of its state file in memory, plus per-entry overhead; a removed
+/// plugin's map stays until the process exits or its path is read again.
+/// Reads take the slot's lock too: a read racing a write cannot keep the
+/// older map after the write replaced it, which the stamp alone cannot tell
+/// apart when both files have the same length, modified time and inode (a
+/// freed inode number can be reused).
+fn state_slot(path: &Path) -> StateSlot {
+    static SLOTS: std::sync::OnceLock<std::sync::Mutex<StateSlots>> = std::sync::OnceLock::new();
+    let mut slots = SLOTS
+        .get_or_init(|| std::sync::Mutex::new(StateSlots::new()))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(lock) = locks.get(path).and_then(std::sync::Weak::upgrade) {
-        return lock;
+    if let Some(slot) = slots.get(path) {
+        return Arc::clone(slot);
     }
-    let lock = Arc::new(std::sync::Mutex::new(()));
-    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
-    lock
+    let slot = StateSlot::default();
+    slots.insert(path.to_path_buf(), Arc::clone(&slot));
+    slot
 }
 
 /// [`set_state`] with an explicit total cap (the host passes the
@@ -1211,15 +1277,23 @@ pub fn set_state_capped(
     total_cap: usize,
 ) -> Result<(), String> {
     let path = path.ok_or("state is not available in this context")?;
-    let lock = state_write_lock(path);
-    let _guard = lock
+    let slot = state_slot(path);
+    let mut kept = slot
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let map = state_after_set(path, key, value, total_cap)?;
     let bytes = serde_json::to_vec(&map).map_err(|e| format!("serialize state: {e}"))?;
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, bytes).map_err(|e| format!("write state: {e}"))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))
+    // Stamped before the rename, which keeps length, modified time and
+    // inode: the stamp is this write's file even if another server renames
+    // its own over it straight after.
+    let stamp = StateStamp::of(&tmp);
+    std::fs::rename(&tmp, path).map_err(|e| format!("commit state: {e}"))?;
+    // Keep what was just written: the next read needs no parse, and a
+    // rewrite inside one modified-time tick cannot pass for the old file.
+    *kept = stamp.map(|stamp| KeptState { stamp, map });
+    Ok(())
 }
 
 /// The would-be state map after setting `key` to `value`, refused at the
