@@ -632,6 +632,13 @@ fake_library_manager!(FakeLibrary {
     ) -> Result<bool, ferrofin_traits::error::ServiceError> {
         Ok(true)
     }
+    async fn get_visible_item_ids(
+        &self,
+        ids: &[Uuid],
+        _user: &ferrofin_db::entities::users::UserEntity,
+    ) -> Result<Vec<Uuid>, ServiceError> {
+        Ok(ids.to_vec())
+    }
 });
 
 /// [`FakeLibrary`] in the middle of a full library validation

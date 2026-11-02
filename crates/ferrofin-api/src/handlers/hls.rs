@@ -43,6 +43,7 @@ use uuid::Uuid;
 use crate::auth::RequireAuth;
 use crate::error::ApiError;
 use crate::extract::Query;
+use crate::handlers::streaming::require_streamable_item;
 use crate::state::AppState;
 
 /// The MIME type for an HLS playlist (`.m3u8`), matching Jellyfin's
@@ -702,6 +703,25 @@ fn master_playlist_response(method: &axum::http::Method, playlist: String) -> Re
     response
 }
 
+/// [`require_streamable_item`] for the version an HLS query names.
+async fn require_query_item(
+    state: &AppState,
+    auth: &ferrofin_traits::options::AuthorizationInfo,
+    parts: &axum::http::request::Parts,
+    item_id: Uuid,
+    query: &HlsQuery,
+) -> Result<(), ApiError> {
+    require_streamable_item(
+        state,
+        auth,
+        &parts.extensions,
+        &parts.headers,
+        item_id,
+        query.media_source_id.as_deref(),
+    )
+    .await
+}
+
 /// `GET|HEAD /Videos/{itemId}/master.m3u8` — the video master playlist.
 async fn get_video_master_playlist(
     State(state): State<AppState>,
@@ -711,6 +731,7 @@ async fn get_video_master_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    require_query_item(&state, &auth, &parts, item_id, &query).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.master_playlist(&req, false).await?;
@@ -726,6 +747,7 @@ async fn get_video_variant_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    require_query_item(&state, &auth, &parts, item_id, &query).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_request(item_id, query, raw, ctx);
     let playlist = state.hls.variant_playlist(&req, false).await?;
@@ -741,6 +763,7 @@ async fn get_video_live_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    require_query_item(&state, &auth, &parts, item_id, &query).await?;
     // `GetLiveHlsStream` defaults `EnableSubtitlesInManifest` to true.
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, true);
     let req = build_request(item_id, query, raw, ctx);
@@ -757,6 +780,7 @@ async fn get_audio_master_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    require_query_item(&state, &auth, &parts, item_id, &query).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_audio_request(item_id, query, raw, ctx);
     let playlist = state.hls.master_playlist(&req, true).await?;
@@ -772,6 +796,7 @@ async fn get_audio_variant_playlist(
     RawQuery(raw): RawQuery,
     parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
+    require_query_item(&state, &auth, &parts, item_id, &query).await?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let req = build_audio_request(item_id, query, raw, ctx);
     let playlist = state.hls.variant_playlist(&req, true).await?;
@@ -807,8 +832,9 @@ async fn get_video_hls_segment(
     RawQuery(raw): RawQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let index = parse_segment_index(&segment_id)?;
     let (parts, body) = request.into_parts();
+    require_query_item(&state, &auth, &parts, item_id, &query).await?;
+    let index = parse_segment_index(&segment_id)?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let request = Request::from_parts(parts, body);
     let req = build_request(item_id, query, raw, ctx);
@@ -826,8 +852,9 @@ async fn get_audio_hls_segment(
     RawQuery(raw): RawQuery,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let index = parse_segment_index(&segment_id)?;
     let (parts, body) = request.into_parts();
+    require_query_item(&state, &auth, &parts, item_id, &query).await?;
+    let index = parse_segment_index(&segment_id)?;
     let ctx = HlsRequestContext::from_parts(&state, &auth, &parts, false);
     let request = Request::from_parts(parts, body);
     let req = build_audio_request(item_id, query, raw, ctx);
@@ -941,16 +968,21 @@ async fn stop_encoding_process(
 /// `application/octet-stream`). A missing item/attachment is `404`.
 async fn get_video_attachment(
     State(state): State<AppState>,
-    auth: Result<crate::auth::AuthenticatedIdentity, ApiError>,
+    axum::Extension(auth): axum::Extension<ferrofin_traits::options::AuthorizationInfo>,
     Path((video_id, media_source_id, index)): Path<(Uuid, String, i32)>,
+    parts: axum::http::request::Parts,
 ) -> Result<Response, ApiError> {
-    let user = auth.ok().and_then(|auth| auth.0.user);
-    if state
-        .library
-        .get_item_by_id_for_user(video_id, user.as_ref())
-        .await?
-        .is_none()
-    {
+    // No token on a font URL: anonymous, as upstream.
+    require_streamable_item(
+        &state,
+        &auth,
+        &parts.extensions,
+        &parts.headers,
+        video_id,
+        Some(&media_source_id),
+    )
+    .await?;
+    if state.library.get_item_by_id(video_id).await?.is_none() {
         return Err(ApiError::NotFound(format!("video {video_id}")));
     }
     let extracted = state
