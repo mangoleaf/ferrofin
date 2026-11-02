@@ -34,6 +34,7 @@ pub mod ffmpeg;
 pub mod file_transformation;
 pub mod fingerprint;
 pub mod intro_skipper;
+pub mod ldap_auth;
 mod library_pages;
 pub mod merge_versions;
 
@@ -83,8 +84,9 @@ pub struct ExtensionContext {
 pub trait Extension: Send + Sync {
     /// Stable id — also the plugin id in `/Plugins`.
     fn id(&self) -> Uuid;
-    /// The `/Plugins` presentation (name, version, description). `enabled` is set
-    /// by the plugin manager from persisted state, so the value here is ignored.
+    /// The `/Plugins` presentation (name, version, description). `enabled` is the
+    /// plugin's default: the plugin manager reports it until an administrator
+    /// enables or disables the plugin, and the persisted choice after that.
     fn descriptor(&self) -> PluginDescriptor;
     /// The seed configuration written on first run (the plugin config schema).
     fn default_config(&self) -> Vec<u8>;
@@ -132,6 +134,7 @@ pub fn builtin_extensions() -> Vec<Arc<dyn Extension>> {
         Arc::new(file_transformation::FileTransformationExtension),
         Arc::new(merge_versions::MergeVersionsExtension),
         Arc::new(ferrofin_settings::FerrofinSettingsExtension),
+        Arc::new(ldap_auth::LdapAuthExtension),
     ]
 }
 
@@ -502,7 +505,7 @@ mod tests {
     #[test]
     fn registered_plugins_carry_each_extensions_seed_config_and_pages() {
         let extensions = builtin_extensions();
-        assert_eq!(extensions.len(), 4);
+        assert_eq!(extensions.len(), 5);
         let plugins = registered_plugins(&extensions);
         assert_eq!(plugins.len(), extensions.len());
         for (plugin, ext) in plugins.iter().zip(&extensions) {
@@ -522,7 +525,27 @@ mod tests {
     fn extension_ids_are_unique() {
         let ids: std::collections::HashSet<Uuid> =
             builtin_extensions().iter().map(|e| e.id()).collect();
-        assert_eq!(ids.len(), 4, "plugin ids double as /Plugins keys");
+        assert_eq!(ids.len(), 5, "plugin ids double as /Plugins keys");
+    }
+
+    #[tokio::test]
+    async fn ldap_auth_is_listed_under_the_upstream_guid_and_off_by_default() {
+        let id = Uuid::parse_str("958aad66-3784-4d2a-b89a-a7b6fab6e25c").expect("guid");
+        let ldap = builtin_extensions()
+            .into_iter()
+            .find(|e| e.id() == id)
+            .expect("LDAP-Auth is a built-in extension");
+        let descriptor = ldap.descriptor();
+        assert_eq!(descriptor.name, "LDAP-Auth");
+        assert!(
+            !descriptor.enabled,
+            "D3: disabled until an admin enables it"
+        );
+        // Nobody signs in through it yet, so `GET /Auth/Providers` is unchanged.
+        let cx = context().await;
+        assert!(ldap.auth_providers(&cx).is_empty());
+        assert!(ldap.password_reset_providers(&cx).is_empty());
+        assert!(ldap.tasks(&cx).is_empty());
     }
 
     #[tokio::test]
