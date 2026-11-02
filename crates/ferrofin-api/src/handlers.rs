@@ -1178,9 +1178,24 @@ pub const VERIFIED_SUBSYSTEMS: &[VerifiedSubsystem] = &[
                    UserRootFolder.GetEligibleChildrenForRecursiveChildren); handlers/items.rs \
                    require_scope_visible, require_scope_id_visible, retain_visible_ids at the \
                    routes that take a scope (ItemsController.GetItems, \
-                   LibraryManager.AddUserToQuery)",
-        date: "2026-10-31",
+                   LibraryManager.AddUserToQuery); item_repository.rs \
+                   resolve_views_with_parent and item_visibility.rs hidden_playlists on \
+                   listings that can hold a playlist (Folder.QueryRecursive, \
+                   Folder.QueryWithPostFiltering, Playlist.IsVisible); dto_service.rs \
+                   get_base_item_dtos' IsVisible pass (DtoService.GetBaseItemDtos), which of \
+                   the handlers only GET /Items/Suggestions asks for, as its controller does",
+        date: "2026-11-01",
         divergences: &[
+            "A listing with a user leaves out the playlists that fail \
+             Playlist.IsVisibleStandalone, by id in its SQL, so its paging and \
+             TotalRecordCount stay right: GET /Items, GET /Search/Hints and the facet routes \
+             over the same query. Upstream checks only a recursive query limited to BoxSet \
+             and Playlist, so a mixed one lists every user's private playlists. GET \
+             /Items/Suggestions hides them upstream too, through IsVisible on the page; here \
+             they leave the SQL as well, so these rows no longer shorten a non-administrator's \
+             page or count in its total. An administrator keeps upstream's answer on every \
+             one of these routes. Jellyfin bug not ported (owner decision 2026-10-31, gl-831). TODO(gl-1127): box sets \
+             hidden by BoxSet.IsVisible are still listed, as upstream.",
             "A request naming an item as its scope (parentId, ids, seriesId, appearsInItemId) \
              stops at the libraries the user may open, on every route that takes one: a \
              library or view must pass IsVisible and anything else IsVisibleStandalone, or \
@@ -1621,21 +1636,47 @@ pub const VERIFIED: &[Verified] = &[
     },
     Verified {
         method: "post",
+        path: "/Users/AuthenticateByName",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "AuthenticateUserByName",
+        ferrofin: "handlers/users.rs authenticate_by_name, authenticate, login_failure, \
+               authentication_result → ferrofin-core session_manager.rs authenticate_internal \
+               (AuthenticateNewSessionInternal), admit_session → user_manager.rs \
+               authenticate_user (UserManager.AuthenticateUser); a 401 or 403 answers as \
+               ExceptionMiddleware does outside Development, the same on a live 12.4 for \
+               each refusal. Compared: user lookup and lock, provider order, the disabled, \
+               remote and schedule checks, the failure counter and lockout, the device and \
+               session limits, token rotation and session activity. The UserDto and \
+               SessionInfoDto builders are shared with other routes and not compared here",
+        date: "2026-11-01",
+        divergences: &[
+            "The 400 (no client identity, an empty username) and 500 bodies are Ferrofin's error \
+         shape, not upstream's. Fix path: gl-666.",
+            "Every failed login writes the dashboard's AuthenticationFailed entry, where upstream \
+         publishes AuthenticationRequestEventArgs only for a wrong password: an exception from \
+         AuthenticateUser (an unknown user, a disabled account) or a device or session-limit \
+         refusal skips it, so those attempts never reach the Alerts feed. Jellyfin bug not \
+         ported.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "post",
         path: "/Users/AuthenticateWithQuickConnect",
         upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
         upstream_method: "AuthenticateWithQuickConnect",
-        ferrofin: "handlers/users.rs authenticate_with_quick_connect, authentication_result → \
-               ferrofin-core quick_connect_manager.rs get_authorized_request (the result \
-               authorize_request stored)",
-        date: "2026-10-28",
+        ferrofin: "handlers/users.rs authenticate_with_quick_connect, login_failure, \
+               authentication_result → ferrofin-core quick_connect_manager.rs \
+               get_authorized_request (the result authorize_request stored)",
+        date: "2026-11-01",
         divergences: &[
             "The User member is built at the exchange, from the user as it is then, where \
          upstream returns the UserDto it snapshotted when the code was authorized, up to \
          10 minutes stale (a user deleted meanwhile gets the bare id/name DTO); the \
          session, token and ServerId are the stored ones on both. Jellyfin bug not \
          ported.",
-            "The 401 (Quick Connect disabled) and 404 (unknown or expired secret) bodies are \
-         Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+            "The 404 (unknown or expired secret) body is Ferrofin's error shape, not \
+         upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -1834,6 +1875,58 @@ pub const VERIFIED: &[Verified] = &[
          ported.",
             "The 400 (nil user id), 403 (a guard refused) and 404 (unknown user) bodies are \
          Ferrofin's error shape, not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Users",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "GetUsers",
+        ferrofin: "handlers/users.rs get_users → filtered_user_dtos (the private Get with \
+               filterByDevice and filterByNetwork off: IsHidden and IsDisabled through the \
+               projected policy; OrderBy(u => u.Username), the current culture's comparer) → \
+               ferrofin-core user_manager.rs get_user_dto (UserManager.GetUserDto: \
+               build_user_policy, resolve_cast_receiver_id); strip_other_accounts",
+        date: "2026-11-01",
+        divergences: &[
+            USER_FIELDS_STRIPPED,
+            USER_LYRIC_MANAGEMENT,
+            "The 400 (a value the query binder cannot convert) body is Ferrofin's error shape, \
+         not upstream's. Fix path: gl-666.",
+        ],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Users/Public",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "GetPublicUsers",
+        ferrofin: "handlers/users.rs get_public_users (Get(false, false, false, false) until \
+               the wizard is done, then Get(false, false, true, true): the device from the \
+               authenticated claim only, and the live network policy's remote-access filter) → \
+               filtered_user_dtos → ferrofin-core user_manager.rs get_user_dto; \
+               strip_other_accounts, after the filters that read Policy",
+        date: "2026-11-01",
+        divergences: &[USER_FIELDS_STRIPPED, USER_LYRIC_MANAGEMENT],
+        refs: &[],
+    },
+    Verified {
+        method: "get",
+        path: "/Users/{userId}",
+        upstream_file: "Jellyfin.Api/Controllers/UserController.cs",
+        upstream_method: "GetUserById",
+        ferrofin: "handlers/users.rs get_user_by_id (RequireAuthIgnoringSchedule: \
+               IgnoreParentalControl; load_user: GetUserById's 400 for a nil id) → ferrofin-core \
+               user_manager.rs get_user_dto; strip_other_accounts",
+        date: "2026-11-01",
+        divergences: &[
+            USER_FIELDS_STRIPPED,
+            USER_LYRIC_MANAGEMENT,
+            "A route id padded with spaces is a 400; upstream's GuidConverter trims it. Fix \
+         path: gl-1038.",
+            "The 400 (a nil or malformed user id) and 404 (unknown user) bodies are Ferrofin's \
+         error shape, not upstream's. Fix path: gl-666.",
         ],
         refs: &[],
     },
@@ -2423,6 +2516,18 @@ const SESSIONS_DIVERGENCES: &[&str] = &[
      400 (a value the query binder cannot convert) bodies are Ferrofin's error shape, not \
      upstream's. Fix path: gl-666.",
 ];
+
+/// `GET /Users`, `/Users/Public` and `/Users/{userId}` leave other accounts'
+/// private fields out (handlers/users.rs strip_other_accounts).
+const USER_FIELDS_STRIPPED: &str = "Policy and Configuration are left out of every row but the \
+     caller's own, unless the caller is an administrator or an API key, and out of every row \
+     for an anonymous caller. Upstream sends both to every caller. Owner decision (gl-1102, \
+     2026-10-31).";
+
+/// `UserManager.GetUserDto` never copies this permission into its `UserPolicy`.
+const USER_LYRIC_MANAGEMENT: &str = "Policy.EnableLyricManagement reads the stored permission. \
+     Upstream's GetUserDto leaves it out, so it always reads false, and a client saving the \
+     policy it read clears the permission. Jellyfin bug not ported.";
 
 /// What `/UserItems/Resume` — and its legacy twin `/Users/{userId}/Items/Resume`,
 /// the same handler with the user from the route, which is hidden from the

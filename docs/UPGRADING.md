@@ -38,6 +38,19 @@ test clip a two-hour film went from about 8 MiB to about 59 MiB, and grainy film
 200 MiB of memory to pack, where a 320 tile takes about 60 MiB. A scan packs several at once, so
 a memory-limited install may want `FERROFIN_TRICKPLAY_CONCURRENCY` set.
 
+## Other accounts' policy and configuration
+
+`GET /Users`, `GET /Users/Public` and `GET /Users/{userId}` now leave `Policy` and
+`Configuration` out of a user's row unless the caller is that user, an administrator or an
+API key. Signed out, every row on `GET /Users/Public` lacks them. Jellyfin sends both to
+everyone, so this is a deliberate difference.
+
+jellyfin-web, Android TV and Wholphin need no change. A script that reads another account's
+`Policy` with a regular user's token has to use an administrator's token or an API key.
+
+The same lists, the login screen's included, now sort names as Jellyfin does: `Zoe` comes after
+`admin`, where capitals used to sort first.
+
 ## Restarting the server needs an administrator
 
 `POST /System/Restart` now requires an administrator or an API key from every address, as
@@ -99,6 +112,22 @@ is marked failed while the migration goes on running. Do not use `--atomic` or
 database the new one has already migrated.
 
 Back up the data directory first, as for any major upgrade.
+
+## Unreleased — a refused login no longer says why
+
+`POST /Users/AuthenticateByName`, `POST /Users/{userId}/Authenticate` and
+`POST /Users/AuthenticateWithQuickConnect` now answer a `401` or `403` as Jellyfin does: the
+`text/plain` body `Error processing request.`, where they used to send a JSON `error` message
+that told an unknown user from a wrong password and named a disabled account. The statuses are
+unchanged: `401` for bad credentials or Quick Connect being off, `403` for an account that may
+not sign in. jellyfin-web and the Jellyfin Kotlin SDK read only the status. A script that reads
+the `error` field of a failed login needs to read the status instead.
+
+The reason is in the server log, as a `login failed` warning with a `reason` field:
+`unknown_user`, `bad_password`, `disabled`, `remote_access`, `parental_schedule`, `device` or
+`max_sessions`. A Quick Connect exchange refused because Quick Connect is off is logged at
+`debug` only. Other failures on these routes (`400`, `404`, `500`) and every other route keep
+their bodies.
 
 ## Unreleased — a progressive transcode needs a token
 
