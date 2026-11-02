@@ -856,6 +856,7 @@ mod tests {
             _quality: i32,
             _img_width: i32,
             _img_height: Option<i32>,
+            _full_chroma: bool,
         ) -> Result<i32, ServiceError> {
             Ok(0)
         }
@@ -1392,6 +1393,7 @@ mod tests {
                 _q: i32,
                 _w: i32,
                 _h: Option<i32>,
+                _c: bool,
             ) -> Result<i32, ServiceError> {
                 Ok(0)
             }

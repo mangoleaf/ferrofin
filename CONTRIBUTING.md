@@ -128,8 +128,8 @@ migration lock is a no-op. Only SQLite's own file locks apply. Write for that:
 - **Never answer this with a refusal or a process-long lock.** With `maxUnavailable: 0` the old
   pod stays until the new one is ready, so a new pod that waits for the old one to leave never
   starts. Boot-time safety checks need a fallback that cannot wedge a rollout, plus a warning.
-- **Say so in `docs/UPGRADING.md`** when a migration or repair is heavy, or when rows written
-  during the overlap stay wrong, so Kubernetes users know to
+- **Say so in the pull request's [upgrade note](#upgrade-notes)** when a migration or repair is
+  heavy, or when rows written during the overlap stay wrong, so Kubernetes users know to
   [stop the old pod first](docs/UPGRADING.md#kubernetes-stop-the-old-pod-first-for-heavy-migrations).
 
 Nothing tests two versions running against one database at the same time, so a review is the
@@ -170,6 +170,21 @@ git commit -s
 4. If you add or rename an HTTP route, keep the contract-superset test green
    (`crates/ferrofin-api/tests/contract_superset.rs`) — the registered route table
    must remain a superset of the vendored Jellyfin OpenAPI spec.
+5. Write the pull request's upgrade note (below).
+
+### Upgrade notes
+
+A pull request does not edit `docs/UPGRADING.md`. It says in its description, on the
+**Upgrade note** line of the template, what an operator has to do, or plan for, when they
+upgrade to a release that contains it, in a line or two:
+
+- a manual step, such as stopping the old pod first for a heavy migration or repair;
+- something that stops working until they act, such as a script that now gets `403`;
+- a one-time cost to plan for, such as every client downloading its artwork again.
+
+Otherwise it writes `none`. A change that only behaves differently, with nothing to do, is
+`none`: the release notes cover it. When a release is cut, its section of `docs/UPGRADING.md`
+is written from these notes.
 
 ## Reporting bugs and security issues
 
