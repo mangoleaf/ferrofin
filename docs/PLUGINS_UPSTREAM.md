@@ -160,13 +160,21 @@ Conventions:
   hiding each alternate from its own series' list and skewing season counts.
   The bulk episode task self-heals links whose key no longer matches their
   primary's (unlink + regroup within the series). The key's title fallback (no
-  provider id, no episode number) also carries the episode's air date
-  (`PremiereDate`): upstream's `title:{SeriesName}:{SeasonName}:{Name}:{ProductionYear}`
+  provider id, no episode number) also carries the core resolver's version
+  key read from the episode's file name (`GetEpisodeVersionKey`: `D{yyyyMMdd}`
+  for a name by air date, `S{n}E{n}` for one with both numbers): upstream's
+  `title:{SeriesName}:{SeasonName}:{Name}:{ProductionYear}`
   is the same for every airing of a show whose files are named by date —
   `IsByDate` clears the number, the name is the series', the year the
   series' — so the task merged a whole season of airings into one episode.
-  Two copies of one airing still merge, as the core resolver's `D{date}`
-  version key groups them. For the same reason movie
+  Two copies of one airing still merge, as the core resolver groups them. The
+  stored `PremiereDate` is not used: an NFO, or a row adopted from Jellyfin
+  (server-local midnight), can store an airing's date on another day. A file
+  name with no such key keeps upstream's key. The self-heal also undoes a
+  group made by hand through `POST /Videos/MergeVersions` of two airings, or
+  of two copies only one of whose file names carries the key; the playlist
+  and collection entries that merge rerouted to the primary stay on it.
+  For the same two-libraries reason as the series-row scoping, movie
   grouping is keyed by (owning library `TopParentId`, `Tmdb` id) rather than
   the `Tmdb` id alone: the same film held in a cold (NAS) and a hot (local)
   library is two intentional entries, and merging them hid one behind the

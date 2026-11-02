@@ -3,6 +3,23 @@
 use ferrofin_model::entities::ExtraType;
 use ferrofin_naming::common::NamingOptions;
 use ferrofin_naming::video::{FileStack, VideoFileInfo, VideoListResolver, video_resolver};
+use rstest::rstest;
+
+// Not ported: upstream's `GetEpisodeVersionKey` is private and only tested
+// through `Resolve`. `D{yyyyMMdd}` for a name by air date, `S{n}E{n}` with
+// both numbers, and no key (never grouped) otherwise.
+#[rstest]
+#[case(
+    "/tv/Show (1975)/Season 49/Show (1975) - 2024-03-31 06 00 00 - Guest A.ts",
+    Some("D20240331")
+)]
+#[case("/tv/Show/Season 1/Show - S01E02 - Pilot.mkv", Some("S1E2"))]
+#[case("/tv/Show/Season 1/Pilot.mkv", None)]
+fn test_episode_version_key(#[case] path: &str, #[case] key: Option<&str>) {
+    let options = NamingOptions::new();
+    let resolver = VideoListResolver::new(&options);
+    assert_eq!(resolver.episode_version_key(path).as_deref(), key);
+}
 
 /// Resolves the file list into `VideoFileInfo`s (mirrors the C# per-file
 /// `VideoResolver.Resolve(..., false)` + `OfType<VideoFileInfo>`).
